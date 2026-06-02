@@ -1,0 +1,39 @@
+[package]
+name = "waltr-server"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+test = []
+
+[dependencies]
+axum.workspace = true
+waltr = { path = "../waltr", version = "0.1.0", default-features = false, features = ["grpc"] }
+notify.workspace = true
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+pyroscope.workspace = true
+serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+toml.workspace = true
+tower.workspace = true
+tower-http = { workspace = true, features = ["trace"] }
+tonic.workspace = true
+tonic-otel-layer.workspace = true
+tonic-tracing-opentelemetry.workspace = true
+tonic-web.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+reqwest = { workspace = true, features = ["json"] }
+tonic = { workspace = true, features = ["transport"] }
