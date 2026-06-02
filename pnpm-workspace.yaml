@@ -1,0 +1,7 @@
+packages:
+  - "crates/waltr-web"
+
+onlyBuiltDependencies:
+  - esbuild
+allowBuilds:
+  esbuild: set this to true or false

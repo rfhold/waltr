@@ -1,0 +1,13 @@
+{
+  "name": "waltr-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.5.0",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "node scripts/dev-web.mjs",
+    "build": "pnpm --filter @rfhold/waltr-web build",
+    "test": "pnpm --filter @rfhold/waltr-web test",
+    "test:web:integration": "node scripts/test-web-integration.mjs"
+  },
+  "devDependencies": {}
+}

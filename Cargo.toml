@@ -1,0 +1,81 @@
+[workspace]
+members = [
+    "crates/waltr",
+    "crates/waltr-client",
+    "crates/waltr-server",
+    "crates/waltr-tui",
+    "crates/waltr-web",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+axum = { version = "0.8.9", features = ["http2"] }
+futures-core = "0.3.31"
+futures-channel = "0.3.31"
+futures-util = "0.3.31"
+http = "1.4.1"
+insta = "1.44.1"
+waltr = { version = "0.1.0", path = "crates/waltr" }
+waltr-client = { version = "0.1.0", path = "crates/waltr-client" }
+waltr-server = { version = "0.1.0", path = "crates/waltr-server" }
+notify = "8.2.0"
+opentelemetry = "0.32.0"
+opentelemetry-appender-tracing = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"] }
+opentelemetry-semantic-conventions = "0.32.0"
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+prost = "0.14.1"
+pyroscope = { version = "2.0.6", features = ["backend-pprof-rs"] }
+reqwest = { version = "0.13.4", default-features = false }
+ratatui = "0.30.0"
+serde = "1.0.228"
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+tokio = "1.52.3"
+tokio-stream = "0.1.18"
+toml = "1.1.2"
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router"] }
+tonic-otel-layer = "0.2.0"
+tonic-prost = "0.14.2"
+tonic-tracing-opentelemetry = { version = "0.38.0", features = ["tracing_level_info"] }
+tonic-web = "0.14.6"
+tonic-web-wasm-client = "0.9.1"
+tower = "0.5.2"
+tower-http = "0.6.11"
+tracing = "0.1.44"
+tracing-opentelemetry = "0.33.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+ts-rs = { version = "11.1.0", features = ["serde-compat"] }
+wasm-bindgen = "0.2.122"
+wasm-bindgen-futures = "0.4.52"
+
+[workspace.lints.rust]
+deprecated_safe = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+keyword_idents = { level = "deny", priority = -1 }
+let_underscore = { level = "deny", priority = -1 }
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+unsafe_code = "forbid"
+unused = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
