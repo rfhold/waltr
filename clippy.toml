@@ -1,0 +1,11 @@
+# Keep lint levels in Cargo.toml. This file configures Clippy lints that need
+# project-specific thresholds or policy values.
+cognitive-complexity-threshold = 20
+enum-variant-size-threshold = 128
+pass-by-value-size-limit = 128
+single-char-binding-names-threshold = 3
+too-large-for-stack = 200
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 80
+trivial-copy-size-limit = 64
+type-complexity-threshold = 200
