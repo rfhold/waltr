@@ -1,0 +1,10 @@
+version: v2
+plugins:
+  - local: protoc-gen-prost
+    out: crates/waltr/src/grpc
+    opt:
+      - type_attribute=.waltr.config.v1=#[derive(serde::Serialize\, serde::Deserialize)]
+      - type_attribute=.waltr.status.v1=#[derive(serde::Serialize\, serde::Deserialize)]
+  - local: protoc-gen-tonic
+    out: crates/waltr/src/grpc
+    opt: [no_transport=true]

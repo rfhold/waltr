@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package waltr.status.v1;
+
+service StatusService {
+  rpc WatchStatus(WatchStatusRequest) returns (stream WatchStatusResponse);
+}
+
+message SystemStatus {
+  bool ready = 1;
+}
+
+message WatchStatusRequest {}
+
+message WatchStatusResponse {
+  SystemStatus status = 1;
+}
