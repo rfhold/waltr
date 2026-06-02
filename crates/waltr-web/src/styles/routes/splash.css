@@ -1,0 +1,32 @@
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  min-height: 100vh;
+  align-content: center;
+  gap: 1.5rem;
+  place-items: center;
+  background:
+    radial-gradient(circle at center, rgba(190, 132, 242, 0.2), transparent 34rem),
+    var(--color-bg);
+}
+
+.splash__logo {
+  margin: 0;
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+  font-size: clamp(0.66rem, 2.5vw, 1.25rem);
+  line-height: 1.05;
+  white-space: pre;
+  text-align: center;
+  text-shadow: 0 0 2rem rgba(190, 132, 242, 0.72);
+}
+
+.splash__status {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
