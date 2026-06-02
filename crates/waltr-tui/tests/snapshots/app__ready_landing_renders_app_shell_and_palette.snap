@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app.rs
+expression: render_app(&app)
+---
+"                             Ready to configure Waltr                            "
+"                                                                                "
+"                     Connect providers, tune local settings,                    "
+"                  and keep the runtime in sync from one shell.                  "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                   ┌ Commands ──────────────────────────────┐                   "
+"                   │Ctrl-X c  open configuration            │                   "
+"                   │Ctrl-X q  quit Waltr                     │                   "
+"                   │                                        │                   "
+"                   │                                        │                   "
+"                   │                                        │                   "
+"                   └────────────────────────────────────────┘                   "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"Ctrl-X q  quit                                                       Waltr  ready"

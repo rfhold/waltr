@@ -1,0 +1,985 @@
+//! Self-contained provider config section: state, input, and rendering.
+//!
+//! This module owns the provider list selection, the create/edit form, and the
+//! delete confirmation. It is hosted by the config surface shell behind the
+//! "Providers" tab and does not depend on the surrounding tab chrome.
+
+use std::collections::BTreeMap;
+
+use waltr_client::{
+    ClientCommand, ConfigView, ModelCapabilitiesView, ModelLimitsView, ModelOptionsView,
+    ModelTypeView, ModelView, ProviderKindView, ProviderView,
+};
+use ratatui::{
+    Frame,
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    layout::Rect,
+    style::Modifier,
+    text::{Line, Span},
+    widgets::{Clear, Paragraph, Wrap},
+};
+
+use crate::{theme::THEME, ui};
+
+/// Outcome of routing an input event into the provider section.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SectionAction {
+    /// The section handled the event; keep running.
+    Continue,
+    /// The section did not handle the event; let the host handle it.
+    Unhandled,
+    /// Dispatch a shared client command.
+    ClientCommand(ClientCommand),
+}
+
+/// Provider form mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderFormMode {
+    /// Create a new provider.
+    Create,
+    /// Edit the selected provider.
+    Edit,
+}
+
+/// Active provider form state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderForm {
+    /// Form mode.
+    pub mode: ProviderFormMode,
+    /// Active field index.
+    pub field: usize,
+    /// Original provider name for edits.
+    pub original_name: Option<String>,
+    /// Provider name draft.
+    pub name: String,
+    /// Provider kind draft.
+    pub kind: ProviderKindView,
+    /// Provider URL draft.
+    pub url: String,
+    headers: BTreeMap<String, String>,
+    models: BTreeMap<String, ModelView>,
+    selected_model: usize,
+    model_form: Option<ModelForm>,
+    delete_model: Option<String>,
+}
+
+const PROVIDER_FIELD_COUNT: usize = 3;
+
+impl ProviderForm {
+    const fn create() -> Self {
+        Self {
+            mode: ProviderFormMode::Create,
+            field: 0,
+            original_name: None,
+            name: String::new(),
+            kind: ProviderKindView::Anthropic,
+            url: String::new(),
+            headers: BTreeMap::new(),
+            models: BTreeMap::new(),
+            selected_model: 0,
+            model_form: None,
+            delete_model: None,
+        }
+    }
+
+    fn edit((_index, provider): (usize, &ProviderView)) -> Self {
+        Self {
+            mode: ProviderFormMode::Edit,
+            field: 0,
+            original_name: Some(provider.name.clone()),
+            name: provider.name.clone(),
+            kind: provider.kind,
+            url: provider.url.clone(),
+            headers: provider.headers.clone(),
+            models: provider.models.clone(),
+            selected_model: 0,
+            model_form: None,
+            delete_model: None,
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> FormAction {
+        match key.code {
+            KeyCode::Tab | KeyCode::Down => self.move_focus_next(),
+            KeyCode::BackTab => {
+                self.move_focus_previous();
+            }
+            KeyCode::Up => self.move_focus_previous(),
+            KeyCode::Right | KeyCode::Enter if self.focused_model_index().is_some() => {
+                self.open_model_edit_form();
+            }
+            KeyCode::Backspace | KeyCode::Delete if self.focused_model_index().is_some() => {
+                self.arm_model_delete();
+            }
+            KeyCode::Backspace if self.field != 1 => self.active_text_mut().pop().map_or((), drop),
+            KeyCode::Left | KeyCode::Right if self.field == 1 => self.toggle_kind(),
+            KeyCode::Enter => return FormAction::Submit,
+            KeyCode::Char(character) if matches!(self.field, 0 | 2) => {
+                self.active_text_mut().push(character);
+            }
+            _ => {}
+        }
+
+        FormAction::Continue
+    }
+
+    fn move_focus_next(&mut self) {
+        self.field = (self.field + 1) % self.focus_count();
+        self.sync_selected_model_to_focus();
+    }
+
+    fn move_focus_previous(&mut self) {
+        let focus_count = self.focus_count();
+        self.field = (self.field + focus_count - 1) % focus_count;
+        self.sync_selected_model_to_focus();
+    }
+
+    fn focus_count(&self) -> usize {
+        PROVIDER_FIELD_COUNT + self.models.len()
+    }
+
+    fn focused_model_index(&self) -> Option<usize> {
+        self.field
+            .checked_sub(PROVIDER_FIELD_COUNT)
+            .filter(|index| *index < self.models.len())
+    }
+
+    fn model_is_focused(&self) -> bool {
+        self.focused_model_index().is_some()
+    }
+
+    fn sync_selected_model_to_focus(&mut self) {
+        if let Some(index) = self.focused_model_index() {
+            self.selected_model = index.min(self.models.len().saturating_sub(1));
+        }
+    }
+
+    fn provider(self) -> ProviderView {
+        ProviderView {
+            kind: self.kind,
+            name: self.name,
+            url: self.url,
+            headers: self.headers,
+            models: self.models,
+        }
+    }
+
+    const fn model_form(&self) -> Option<&ModelForm> {
+        self.model_form.as_ref()
+    }
+
+    fn open_model_create_form(&mut self) {
+        self.delete_model = None;
+        self.model_form = Some(ModelForm::create());
+    }
+
+    fn open_model_edit_form(&mut self) {
+        let Some((key, model)) = self.selected_model_view() else {
+            return;
+        };
+        let form = ModelForm::edit(key, model);
+        self.delete_model = None;
+        self.model_form = Some(form);
+    }
+
+    fn arm_model_delete(&mut self) {
+        self.model_form = None;
+        self.delete_model = self.selected_model_view().map(|(key, _)| key.clone());
+    }
+
+    fn submit_model_form(&mut self) -> FormAction {
+        let Some(form) = &self.model_form else {
+            return FormAction::Continue;
+        };
+
+        if !form.has_type() {
+            return FormAction::Continue;
+        }
+
+        let new_key = form.key.clone();
+        let original_key = form.original_key.clone();
+        let model = form.model();
+        if let Some(original_key) = original_key
+            && original_key != new_key
+        {
+            self.models.remove(&original_key);
+        }
+        self.models.insert(new_key, model);
+        self.selected_model = self.selected_model.min(self.models.len().saturating_sub(1));
+        self.field = PROVIDER_FIELD_COUNT + self.selected_model;
+        self.model_form = None;
+        FormAction::Continue
+    }
+
+    fn delete_selected_model(&mut self, model_key: &str) {
+        self.delete_model = None;
+        self.models.remove(model_key);
+        self.selected_model = self.selected_model.min(self.models.len().saturating_sub(1));
+        self.field = if self.models.is_empty() {
+            PROVIDER_FIELD_COUNT - 1
+        } else {
+            PROVIDER_FIELD_COUNT + self.selected_model
+        };
+    }
+
+    fn selected_model_view(&self) -> Option<(&String, &ModelView)> {
+        self.models.iter().nth(self.selected_model)
+    }
+
+    const fn active_text_mut(&mut self) -> &mut String {
+        if self.field == 2 {
+            &mut self.url
+        } else {
+            &mut self.name
+        }
+    }
+
+    const fn toggle_kind(&mut self) {
+        self.kind = match self.kind {
+            ProviderKindView::Anthropic => ProviderKindView::OpenAi,
+            _ => ProviderKindView::Anthropic,
+        };
+    }
+}
+
+enum FormAction {
+    Continue,
+    Submit,
+}
+
+/// Model form mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelFormMode {
+    /// Create a new model.
+    Create,
+    /// Edit the selected model.
+    Edit,
+}
+
+/// Active model form state.
+///
+/// Models are a keyed collection inside a provider. Saving rides inside an
+/// [`ClientCommand::UpdateProvider`] carrying the whole provider; there are no
+/// model-level commands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelForm {
+    /// Form mode.
+    pub mode: ModelFormMode,
+    /// Active field index.
+    pub field: usize,
+    /// Original model key for edits.
+    pub original_key: Option<String>,
+    /// Model key draft.
+    pub key: String,
+    /// Model display name draft.
+    pub name: String,
+    /// Model type draft. `None` until the user picks one.
+    pub kind: Option<ModelTypeView>,
+    /// Sampling temperature draft.
+    pub temperature: String,
+    /// Maximum context window draft.
+    pub context: String,
+    /// Maximum output token draft.
+    pub output: String,
+    /// Tool-calling capability draft.
+    pub tools: bool,
+    /// Image-input capability draft.
+    pub image: bool,
+}
+
+const MODEL_FIELD_COUNT: usize = 7;
+
+impl ModelForm {
+    const fn create() -> Self {
+        Self {
+            mode: ModelFormMode::Create,
+            field: 0,
+            original_key: None,
+            key: String::new(),
+            name: String::new(),
+            kind: None,
+            temperature: String::new(),
+            context: String::new(),
+            output: String::new(),
+            tools: false,
+            image: false,
+        }
+    }
+
+    fn edit(key: &str, model: &ModelView) -> Self {
+        Self {
+            mode: ModelFormMode::Edit,
+            field: 0,
+            original_key: Some(key.to_owned()),
+            key: key.to_owned(),
+            name: model.name.clone(),
+            kind: Some(model.kind),
+            temperature: model
+                .options
+                .temperature
+                .map_or_else(String::new, |value| value.to_string()),
+            context: model
+                .limits
+                .context
+                .map_or_else(String::new, |value| value.to_string()),
+            output: model
+                .limits
+                .output
+                .map_or_else(String::new, |value| value.to_string()),
+            tools: model.capabilities.tools,
+            image: model.capabilities.image,
+        }
+    }
+
+    /// Whether the form has a model type selected. Saving is blocked while this
+    /// is false.
+    #[must_use]
+    pub const fn has_type(&self) -> bool {
+        self.kind.is_some()
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> FormAction {
+        match key.code {
+            KeyCode::Tab | KeyCode::Down => self.field = (self.field + 1) % MODEL_FIELD_COUNT,
+            KeyCode::BackTab | KeyCode::Up => {
+                self.field = (self.field + MODEL_FIELD_COUNT - 1) % MODEL_FIELD_COUNT;
+            }
+            KeyCode::Left | KeyCode::Right if self.field == 2 => self.cycle_kind(),
+            KeyCode::Left | KeyCode::Right if self.field == 5 => self.tools = !self.tools,
+            KeyCode::Left | KeyCode::Right if self.field == 6 => self.image = !self.image,
+            KeyCode::Backspace if self.is_text_field() => drop(self.active_text_mut().pop()),
+            KeyCode::Enter => return FormAction::Submit,
+            KeyCode::Char(character) if self.is_text_field() => {
+                self.active_text_mut().push(character);
+            }
+            _ => {}
+        }
+
+        FormAction::Continue
+    }
+
+    const fn is_text_field(&self) -> bool {
+        matches!(self.field, 0 | 1 | 3 | 4)
+    }
+
+    const fn active_text_mut(&mut self) -> &mut String {
+        match self.field {
+            1 => &mut self.name,
+            3 => &mut self.temperature,
+            4 => &mut self.context,
+            _ => &mut self.key,
+        }
+    }
+
+    const fn cycle_kind(&mut self) {
+        self.kind = Some(match self.kind {
+            None
+            | Some(ModelTypeView::Tts | ModelTypeView::Unspecified | ModelTypeView::Unknown) => {
+                ModelTypeView::Llm
+            }
+            Some(ModelTypeView::Llm) => ModelTypeView::Embedding,
+            Some(ModelTypeView::Embedding) => ModelTypeView::Stt,
+            Some(ModelTypeView::Stt) => ModelTypeView::Tts,
+        });
+    }
+
+    fn model(&self) -> ModelView {
+        ModelView {
+            name: self.name.clone(),
+            kind: self.kind.unwrap_or(ModelTypeView::Unspecified),
+            options: ModelOptionsView {
+                temperature: self.temperature.trim().parse().ok(),
+                top_p: None,
+                top_k: None,
+                min_p: None,
+                presence_penalty: None,
+                repetition_penalty: None,
+            },
+            limits: ModelLimitsView {
+                context: self.context.trim().parse().ok(),
+                output: self.output.trim().parse().ok(),
+            },
+            capabilities: ModelCapabilitiesView {
+                tools: self.tools,
+                image: self.image,
+            },
+        }
+    }
+}
+
+/// Self-contained provider config section state and behavior.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProviderSection {
+    config_form: Option<ProviderForm>,
+    delete_provider: Option<String>,
+    selected_provider: usize,
+    pending_patch: bool,
+    patch_error: Option<String>,
+}
+
+impl ProviderSection {
+    /// Create an empty provider section.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            config_form: None,
+            delete_provider: None,
+            selected_provider: 0,
+            pending_patch: false,
+            patch_error: None,
+        }
+    }
+
+    /// Return the selected provider index.
+    #[must_use]
+    pub const fn selected_provider(&self) -> usize {
+        self.selected_provider
+    }
+
+    /// Return the active provider form, if any.
+    #[must_use]
+    pub const fn config_form(&self) -> Option<&ProviderForm> {
+        self.config_form.as_ref()
+    }
+
+    /// Return the provider pending delete confirmation, if any.
+    #[must_use]
+    pub fn delete_provider(&self) -> Option<&str> {
+        self.delete_provider.as_deref()
+    }
+
+    /// Whether a transient overlay (form or delete prompt) is active.
+    #[must_use]
+    pub fn has_overlay(&self) -> bool {
+        self.config_form
+            .as_ref()
+            .is_some_and(|form| form.model_form.is_some() || form.delete_model.is_some())
+            || self.config_form.is_some()
+            || self.delete_provider.is_some()
+    }
+
+    /// Reconcile a submitted patch against the shared reducer operation state.
+    pub fn reconcile_patch(&mut self, status: &str, error: Option<&str>) {
+        if !self.pending_patch {
+            return;
+        }
+
+        match status {
+            "ready" => {
+                self.pending_patch = false;
+                self.patch_error = None;
+                self.config_form = None;
+                self.delete_provider = None;
+            }
+            "failed" => {
+                self.pending_patch = false;
+                self.patch_error = Some(error.unwrap_or("config patch failed").to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the model sub-editor is open for some provider.
+    #[must_use]
+    pub const fn in_model_editor(&self) -> bool {
+        false
+    }
+
+    /// Return the active model form, if any.
+    #[must_use]
+    pub fn model_form(&self) -> Option<&ModelForm> {
+        self.config_form.as_ref().and_then(ProviderForm::model_form)
+    }
+
+    /// Clamp the selection to the available providers after a snapshot update.
+    pub const fn sync_selection(&mut self, provider_count: usize) {
+        if provider_count == 0 {
+            self.selected_provider = 0;
+        } else if self.selected_provider >= provider_count {
+            self.selected_provider = provider_count - 1;
+        }
+    }
+
+    /// Dismiss any active overlay. Returns true if something was dismissed.
+    ///
+    /// Provider-owned model overlays dismiss before the provider form itself.
+    pub fn dismiss_overlay(&mut self) -> bool {
+        if self.pending_patch {
+            return false;
+        }
+
+        if let Some(form) = &mut self.config_form
+            && (form.model_form.take().is_some() || form.delete_model.take().is_some())
+        {
+            return true;
+        }
+
+        let dismissed = self.config_form.take().is_some() || self.delete_provider.take().is_some();
+        if dismissed {
+            self.patch_error = None;
+        }
+        dismissed
+    }
+
+    /// Open the selected provider form so its model list can be edited.
+    pub fn open_model_editor(&mut self, config: Option<&ConfigView>) {
+        if self.pending_patch {
+            return;
+        }
+
+        self.delete_provider = None;
+        self.patch_error = None;
+        self.config_form = self.selected_provider_view(config).map(ProviderForm::edit);
+    }
+
+    /// Open a create form. When a provider form is open this creates a model;
+    /// otherwise it creates a provider.
+    pub fn open_create_form(&mut self) {
+        if self.pending_patch {
+            return;
+        }
+
+        if let Some(form) = &mut self.config_form {
+            form.open_model_create_form();
+            return;
+        }
+
+        self.delete_provider = None;
+        self.patch_error = None;
+        self.config_form = Some(ProviderForm::create());
+    }
+
+    /// Arm the delete confirmation for the current selection. When a provider
+    /// editor is open this targets the selected model; otherwise the provider.
+    pub fn arm_delete(&mut self, config: Option<&ConfigView>) {
+        if self.pending_patch {
+            return;
+        }
+
+        if let Some(form) = &mut self.config_form {
+            if form.model_is_focused() {
+                form.arm_model_delete();
+            }
+            return;
+        }
+
+        self.config_form = None;
+        self.patch_error = None;
+        self.delete_provider = self.selected_provider_name(config);
+    }
+
+    /// Route a key event into the section, using the current config snapshot.
+    pub fn handle_key(&mut self, key: KeyEvent, config: Option<&ConfigView>) -> SectionAction {
+        if self.pending_patch {
+            return SectionAction::Continue;
+        }
+
+        if key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return SectionAction::Unhandled;
+        }
+
+        if let Some(form) = &mut self.config_form {
+            if let Some(model_form) = &mut form.model_form {
+                if matches!(model_form.handle_key(key), FormAction::Submit) {
+                    form.submit_model_form();
+                }
+                return SectionAction::Continue;
+            }
+
+            if let Some(key_name) = form.delete_model.clone() {
+                return match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        form.delete_selected_model(&key_name);
+                        SectionAction::Continue
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => {
+                        form.delete_model = None;
+                        SectionAction::Continue
+                    }
+                    _ => SectionAction::Continue,
+                };
+            }
+
+            return match form.handle_key(key) {
+                FormAction::Continue => SectionAction::Continue,
+                FormAction::Submit => self.submit_form(),
+            };
+        }
+
+        if let Some(name) = self.delete_provider.clone() {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.delete_selected(&name),
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.delete_provider = None;
+                    SectionAction::Continue
+                }
+                _ => SectionAction::Continue,
+            };
+        }
+
+        match key.code {
+            KeyCode::Up => {
+                self.selected_provider = self.selected_provider.saturating_sub(1);
+                SectionAction::Continue
+            }
+            KeyCode::Down => {
+                let max = provider_count(config).saturating_sub(1);
+                self.selected_provider = (self.selected_provider + 1).min(max);
+                SectionAction::Continue
+            }
+            KeyCode::Right | KeyCode::Enter => {
+                self.open_model_editor(config);
+                SectionAction::Continue
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.arm_delete(config);
+                SectionAction::Continue
+            }
+            _ => SectionAction::Unhandled,
+        }
+    }
+
+    fn submit_form(&mut self) -> SectionAction {
+        let Some(form) = &self.config_form else {
+            return SectionAction::Continue;
+        };
+
+        let mode = form.mode;
+        let original_name = form.original_name.clone();
+        let provider = form.clone().provider();
+        self.pending_patch = true;
+        self.patch_error = None;
+        match mode {
+            ProviderFormMode::Create => {
+                SectionAction::ClientCommand(ClientCommand::AddProvider { provider })
+            }
+            ProviderFormMode::Edit => {
+                let Some(original_name) = original_name else {
+                    return SectionAction::Continue;
+                };
+                SectionAction::ClientCommand(ClientCommand::UpdateProvider {
+                    original_name,
+                    provider,
+                })
+            }
+        }
+    }
+
+    fn delete_selected(&mut self, name: &str) -> SectionAction {
+        self.pending_patch = true;
+        self.patch_error = None;
+        SectionAction::ClientCommand(ClientCommand::DeleteProvider {
+            name: name.to_owned(),
+        })
+    }
+
+    fn selected_provider_view<'a>(
+        &self,
+        config: Option<&'a ConfigView>,
+    ) -> Option<(usize, &'a ProviderView)> {
+        config?
+            .providers
+            .values()
+            .nth(self.selected_provider)
+            .map(|provider| (self.selected_provider, provider))
+    }
+
+    fn selected_provider_name(&self, config: Option<&ConfigView>) -> Option<String> {
+        self.selected_provider_view(config)
+            .map(|(_, provider)| provider.name.clone())
+    }
+
+    /// Render the section content (provider list) into `area`.
+    ///
+    /// `loaded` indicates the watch stream has delivered config; when false the
+    /// section shows a waiting placeholder.
+    pub fn render_content(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        config: Option<&ConfigView>,
+        loaded: bool,
+    ) {
+        let lines = if loaded {
+            config.map_or_else(loading_lines, |config| {
+                config_lines(
+                    config,
+                    self.selected_provider,
+                    self.delete_provider(),
+                    self.pending_patch,
+                    self.patch_error.as_deref(),
+                )
+            })
+        } else {
+            loading_lines()
+        };
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(THEME.text_style())
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    /// Render the create/edit form overlay, if active.
+    pub fn render_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        if let Some(form) = self.model_form() {
+            let form_area = ui::centered_percent_rect(area, 70, 11);
+            frame.render_widget(Clear, form_area);
+            frame.render_widget(model_form_widget(form), form_area);
+            return;
+        }
+
+        if let Some(form) = &self.config_form {
+            let form_area = ui::centered_percent_rect(area, 70, 15);
+            frame.render_widget(Clear, form_area);
+            frame.render_widget(
+                form_widget(form, self.pending_patch, self.patch_error.as_deref()),
+                form_area,
+            );
+        }
+    }
+}
+
+fn provider_count(config: Option<&ConfigView>) -> usize {
+    config.map_or(0, |config| config.providers.len())
+}
+
+fn loading_lines() -> Vec<Line<'static>> {
+    vec![ui::loading_line("Waiting for configuration...")]
+}
+
+fn config_lines(
+    config: &ConfigView,
+    selected_provider: usize,
+    delete_provider: Option<&str>,
+    pending_patch: bool,
+    patch_error: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    if config.providers.is_empty() {
+        lines.push(ui::loading_line("No providers configured."));
+        return lines;
+    }
+
+    for (index, provider) in config.providers.values().enumerate() {
+        lines.push(provider_line(
+            provider,
+            index == selected_provider,
+            delete_provider == Some(provider.name.as_str()),
+            pending_patch,
+            patch_error,
+        ));
+    }
+
+    lines
+}
+
+fn provider_line(
+    provider: &ProviderView,
+    selected: bool,
+    deleting: bool,
+    pending_patch: bool,
+    patch_error: Option<&str>,
+) -> Line<'static> {
+    if deleting {
+        return Line::from(vec![
+            ui::selection_marker(selected),
+            Span::raw(" "),
+            ui::selected_title(provider.name.clone()),
+            Span::raw("  "),
+            ui::delete_prompt_span(ui::delete_prompt_text(pending_patch, patch_error)),
+        ]);
+    }
+
+    Line::from(vec![
+        ui::selection_marker(selected),
+        Span::raw(" "),
+        ui::selected_title(provider.name.clone()),
+        Span::raw("  "),
+        Span::styled(provider_kind_name(provider.kind), THEME.focus_style()),
+        Span::raw("  "),
+        Span::styled(provider_url(provider), THEME.text_style()),
+    ])
+}
+
+fn provider_url(provider: &ProviderView) -> String {
+    if provider.url.is_empty() {
+        "no-url".to_owned()
+    } else {
+        provider.url.clone()
+    }
+}
+
+fn form_widget(
+    form: &ProviderForm,
+    pending_patch: bool,
+    patch_error: Option<&str>,
+) -> Paragraph<'static> {
+    let title = match form.mode {
+        ProviderFormMode::Create => " Create provider ",
+        ProviderFormMode::Edit => " Edit provider ",
+    };
+
+    Paragraph::new(form_lines(form, pending_patch, patch_error))
+        .block(
+            ui::modal_block(
+                title,
+                " Tab focus  C-x c model  Model: Right/Enter edit  Backspace/Delete delete  Esc cancel ",
+            )
+            .style(THEME.text_style()),
+        )
+        .style(THEME.text_style())
+        .wrap(Wrap { trim: false })
+}
+
+fn form_lines(
+    form: &ProviderForm,
+    pending_patch: bool,
+    patch_error: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        form_line(0, form.field, "name", &form.name),
+        form_line(1, form.field, "type", provider_kind_name(form.kind)),
+        form_line(2, form.field, "url", &form.url),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Models staged in this provider draft",
+            THEME.accent_bold(),
+        )),
+    ];
+
+    if form.models.is_empty() {
+        lines.push(ui::loading_line("No models configured."));
+    } else {
+        for (index, (key, model)) in form.models.iter().enumerate() {
+            lines.push(model_line(
+                key,
+                model,
+                form.focused_model_index() == Some(index),
+                form.delete_model.as_deref() == Some(key.as_str()),
+            ));
+        }
+    }
+
+    if pending_patch {
+        lines.push(ui::saving_line());
+    } else if let Some(error) = patch_error {
+        lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            THEME.danger_style().add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines
+}
+
+fn form_line(index: usize, active: usize, label: &'static str, value: &str) -> Line<'static> {
+    ui::form_field_row(index, active, label, value)
+}
+
+const fn provider_kind_name(kind: ProviderKindView) -> &'static str {
+    match kind {
+        ProviderKindView::Unspecified => "unspecified",
+        ProviderKindView::Anthropic => "anthropic",
+        ProviderKindView::OpenAi => "openai",
+        ProviderKindView::Unknown => "unknown",
+    }
+}
+
+fn model_line(key: &str, model: &ModelView, selected: bool, deleting: bool) -> Line<'static> {
+    let display = if model.name.is_empty() {
+        key.to_owned()
+    } else {
+        model.name.clone()
+    };
+
+    if deleting {
+        return Line::from(vec![
+            ui::selection_marker(selected),
+            Span::raw(" "),
+            ui::selected_title(display),
+            Span::raw("  "),
+            ui::delete_prompt_span(ui::DELETE_CONFIRMATION_HINT),
+        ]);
+    }
+
+    Line::from(vec![
+        ui::selection_marker(selected),
+        Span::raw(" "),
+        ui::selected_title(display),
+        Span::raw("  "),
+        Span::styled(model_type_name(model.kind), THEME.focus_style()),
+    ])
+}
+
+fn model_form_widget(form: &ModelForm) -> Paragraph<'static> {
+    let title = match form.mode {
+        ModelFormMode::Create => " Create model ",
+        ModelFormMode::Edit => " Edit model ",
+    };
+
+    Paragraph::new(model_form_lines(form))
+        .block(
+            ui::modal_block(
+                title,
+                " Tab field  Left/Right toggle  Enter save  Esc cancel ",
+            )
+            .style(THEME.text_style()),
+        )
+        .style(THEME.text_style())
+        .wrap(Wrap { trim: false })
+}
+
+fn model_form_lines(form: &ModelForm) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        form_line(0, form.field, "key", &form.key),
+        form_line(1, form.field, "name", &form.name),
+        model_type_line(2, form.field, form.kind),
+        form_line(3, form.field, "temperature", &form.temperature),
+        form_line(4, form.field, "context", &form.context),
+        model_bool_line(5, form.field, "tools", form.tools),
+        model_bool_line(6, form.field, "image", form.image),
+    ];
+
+    if !form.has_type() {
+        lines.push(Line::from(Span::styled(
+            "type required before saving",
+            THEME.danger_style().add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines
+}
+
+fn model_type_line(index: usize, active: usize, kind: Option<ModelTypeView>) -> Line<'static> {
+    let (value, style) = kind.map_or_else(
+        || {
+            (
+                "<unset>".to_owned(),
+                THEME.danger_style().add_modifier(Modifier::BOLD),
+            )
+        },
+        |kind| (model_type_name(kind).to_owned(), THEME.text_style()),
+    );
+
+    ui::form_field_row_styled(index, active, "type", value, style)
+}
+
+fn model_bool_line(index: usize, active: usize, label: &'static str, value: bool) -> Line<'static> {
+    let text = if value { "yes" } else { "no" };
+    ui::form_field_row(index, active, label, text)
+}
+
+const fn model_type_name(kind: ModelTypeView) -> &'static str {
+    match kind {
+        ModelTypeView::Unspecified => "unspecified",
+        ModelTypeView::Llm => "llm",
+        ModelTypeView::Embedding => "embedding",
+        ModelTypeView::Stt => "stt",
+        ModelTypeView::Tts => "tts",
+        ModelTypeView::Unknown => "unknown",
+    }
+}
