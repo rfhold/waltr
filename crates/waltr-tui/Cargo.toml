@@ -1,0 +1,17 @@
+[package]
+name = "waltr-tui"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+waltr-client.workspace = true
+ratatui = { workspace = true, features = ["palette", "scrolling-regions"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+insta.workspace = true
+waltr-server = { workspace = true, features = ["test"] }
+
+[lints]
+workspace = true
