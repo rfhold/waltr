@@ -1,0 +1,70 @@
+:root {
+  --color-bg: #05040a;
+  --color-surface: rgba(10, 8, 18, 0.86);
+  --color-surface-soft: rgba(246, 241, 255, 0.05);
+  --color-text: #f6f1ff;
+  --color-text-muted: rgba(246, 241, 255, 0.68);
+  --color-text-subtle: rgba(246, 241, 255, 0.58);
+  --color-accent: rgb(190, 132, 242);
+  --color-accent-soft: rgba(190, 132, 242, 0.12);
+  --color-accent-hover: rgba(190, 132, 242, 0.22);
+  --color-accent-muted: rgba(190, 132, 242, 0.08);
+  --color-accent-strong: rgb(104, 67, 153);
+  --color-accent-strong-hover: rgb(119, 78, 174);
+  --color-danger: rgb(255, 118, 118);
+  --color-danger-text: rgb(255, 182, 182);
+  --color-danger-bg: rgba(255, 118, 118, 0.08);
+  --color-danger-soft: rgba(255, 118, 118, 0.14);
+  --color-danger-hover: rgba(255, 118, 118, 0.24);
+  --color-control-bg: rgb(39, 34, 55);
+  --color-control-bg-hover: rgb(48, 42, 68);
+  --color-input-bg: rgba(5, 4, 10, 0.75);
+  --color-success: rgb(116, 232, 166);
+  --color-warning: rgb(252, 211, 77);
+  --border-subtle: rgba(246, 241, 255, 0.1);
+  --border-control: rgba(246, 241, 255, 0.22);
+  --border-accent: rgba(190, 132, 242, 0.42);
+  --border-danger: rgba(255, 118, 118, 0.5);
+  --shadow-dialog: 0 1.5rem 4rem rgba(0, 0, 0, 0.42);
+  --focus-ring: 0 0 0 3px rgba(190, 132, 242, 0.36);
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Code", "Liberation Mono", Menlo, monospace;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --radius-sm: 0.28rem;
+  --radius-md: 0.36rem;
+  --radius-lg: 0.75rem;
+  color: var(--color-text);
+  background: var(--color-bg);
+  font-family: var(--font-mono);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+  box-shadow: var(--focus-ring);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

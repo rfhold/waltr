@@ -1,0 +1,8 @@
+[package]
+name = "waltr-web"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true

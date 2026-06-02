@@ -1,0 +1,26 @@
+{
+  "name": "@rfhold/waltr-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm wasm:build && pnpm dev:vite",
+    "dev:vite": "vite --host 0.0.0.0",
+    "build": "pnpm wasm:build && tsc --noEmit && vite build",
+    "test": "vitest run --environment happy-dom",
+    "wasm:build": "cargo build -p waltr-client --lib --features wasm --target wasm32-unknown-unknown && wasm-bindgen --target web --out-dir generated/wasm --out-name waltr_client ../../target/wasm32-unknown-unknown/debug/waltr_client.wasm"
+  },
+  "dependencies": {
+    "@solidjs/router": "0.16.1",
+    "solid-js": "1.9.13",
+    "vite": "7.2.4",
+    "vite-plugin-solid": "2.11.8"
+  },
+  "devDependencies": {
+    "@solidjs/testing-library": "0.8.10",
+    "@types/node": "24.10.1",
+    "happy-dom": "20.9.0",
+    "typescript": "5.9.3",
+    "vitest": "4.0.14"
+  }
+}
