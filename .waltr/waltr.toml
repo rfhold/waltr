@@ -1,0 +1,26 @@
+etag = ""
+
+[providers.anthropic]
+type = 1
+name = "anthropic"
+url = "https://api.anthropic.com"
+
+[providers.anthropic.headers]
+
+[providers.anthropic.models."gpt-5.5"]
+name = "GPT 5.5"
+type = 1
+
+[providers.anthropic.models."gpt-5.5".options]
+
+[providers.anthropic.models."gpt-5.5".limits]
+
+[providers.anthropic.models."gpt-5.5".capabilities]
+tools = false
+image = false
+
+[mcp_servers.re-search]
+name = "re-search"
+type = 2
+command = ""
+url = "https://re-search.holdenitdown.net/mcp"
