@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/waltr",
+    "crates/waltr-agent",
     "crates/waltr-client",
     "crates/waltr-server",
     "crates/waltr-tui",
@@ -21,6 +22,7 @@ futures-util = "0.3.31"
 http = "1.4.1"
 insta = "1.44.1"
 waltr = { version = "0.1.0", path = "crates/waltr" }
+waltr-agent = { version = "0.1.0", path = "crates/waltr-agent" }
 waltr-client = { version = "0.1.0", path = "crates/waltr-client" }
 waltr-server = { version = "0.1.0", path = "crates/waltr-server" }
 notify = "8.2.0"
@@ -38,6 +40,7 @@ serde_json = "1.0.150"
 sha2 = "0.11.0"
 tokio = "1.52.3"
 tokio-stream = "0.1.18"
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1.2"
 tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router"] }
 tonic-otel-layer = "0.2.0"
