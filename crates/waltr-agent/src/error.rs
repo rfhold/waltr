@@ -1,0 +1,100 @@
+//! Error types for LLM streaming providers.
+
+use std::{error::Error, fmt, io};
+
+/// Result type used by LLM streaming providers.
+pub type Result<T> = std::result::Result<T, LlmError>;
+
+/// Error returned by LLM streaming providers.
+#[derive(Debug)]
+pub enum LlmError {
+    /// Required configuration was not provided.
+    MissingConfig {
+        /// Configuration key name.
+        name: &'static str,
+    },
+    /// An HTTP request failed.
+    Http(reqwest::Error),
+    /// A websocket operation failed.
+    WebSocket(tokio_tungstenite::tungstenite::Error),
+    /// An HTTP or websocket request could not be built.
+    Request(http::Error),
+    /// JSON serialization or parsing failed.
+    Json(serde_json::Error),
+    /// A filesystem operation failed.
+    Io(io::Error),
+    /// The provider returned an API error.
+    Api {
+        /// Provider that returned the error.
+        provider: &'static str,
+        /// Provider error message.
+        message: String,
+    },
+    /// The provider returned an unsupported or unexpected event.
+    Protocol {
+        /// Provider that returned the protocol error.
+        provider: &'static str,
+        /// Protocol error message.
+        message: String,
+    },
+}
+
+impl fmt::Display for LlmError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingConfig { name } => write!(formatter, "missing required config: {name}"),
+            Self::Http(error) => write!(formatter, "http error: {error}"),
+            Self::WebSocket(error) => write!(formatter, "websocket error: {error}"),
+            Self::Request(error) => write!(formatter, "request error: {error}"),
+            Self::Json(error) => write!(formatter, "json error: {error}"),
+            Self::Io(error) => write!(formatter, "io error: {error}"),
+            Self::Api { provider, message } => write!(formatter, "{provider} api error: {message}"),
+            Self::Protocol { provider, message } => {
+                write!(formatter, "{provider} protocol error: {message}")
+            }
+        }
+    }
+}
+
+impl Error for LlmError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Http(error) => Some(error),
+            Self::WebSocket(error) => Some(error),
+            Self::Request(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::MissingConfig { .. } | Self::Api { .. } | Self::Protocol { .. } => None,
+        }
+    }
+}
+
+impl From<reqwest::Error> for LlmError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error)
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for LlmError {
+    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(error)
+    }
+}
+
+impl From<http::Error> for LlmError {
+    fn from(error: http::Error) -> Self {
+        Self::Request(error)
+    }
+}
+
+impl From<serde_json::Error> for LlmError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+impl From<io::Error> for LlmError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
