@@ -1,17 +1,13 @@
-//! `OpenAI` Responses HTTP streaming provider.
+//! `OpenAI` Responses streaming providers.
 
 mod http;
 mod parser;
 mod request;
 mod websocket;
 
-use crate::stream::LlmStream;
+pub use websocket::OpenAiResponsesWebSocket;
 
-use crate::stream::CompletionRequest;
-
-use super::{
-    OpenAiReasoningConfig, RESPONSES_NAME, ResponsesParser, responses_body, stream_openai_http,
-};
+use super::reasoning::OpenAiReasoningConfig;
 
 /// `OpenAI` Responses HTTP streaming provider.
 #[derive(Debug, Clone)]
@@ -45,28 +41,5 @@ impl OpenAiResponses {
     pub const fn with_reasoning(mut self, config: OpenAiReasoningConfig) -> Self {
         self.reasoning = Some(config);
         self
-    }
-}
-
-impl LlmStream for OpenAiResponses {
-    fn name(&self) -> &'static str {
-        RESPONSES_NAME
-    }
-
-    fn stream_request<'a>(
-        &'a self,
-        request: CompletionRequest<'a>,
-    ) -> crate::stream::BoxStreamFuture<'a> {
-        Box::pin(async move {
-            let mut parser = ResponsesParser::default();
-            stream_openai_http(
-                RESPONSES_NAME,
-                &self.responses_url,
-                &self.api_key,
-                responses_body(&self.model, self.reasoning.as_ref(), &request),
-                move |data| parser.parse_event(data),
-            )
-            .await
-        })
     }
 }

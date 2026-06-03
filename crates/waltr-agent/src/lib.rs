@@ -38,8 +38,8 @@ pub use stream::{
     ToolDefinition, ToolResult,
 };
 pub use tools::filesystem;
-pub use tools::filesystem_skills::{SkillDefinition, SkillsConfig};
 pub use tools::question;
+pub use tools::skills::{SkillDefinition, SkillsConfig};
 
 #[cfg(feature = "shell")]
 pub use tools::shell;

@@ -1,4 +1,22 @@
-//! TODO: Move run-time agent context state here.
-//!
-//! This module should own AGENTS.md context tracking, skill visibility/loading
-//! state, and other context made available to tool handlers during a run.
+//! Run-time agent context state.
+
+use std::{collections::HashSet, path::PathBuf};
+
+use crate::SkillDefinition;
+
+/// Mutable context shared across tool executions in one agent run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentToolContext {
+    /// `AGENTS.md` files already loaded into the static system prompt.
+    pub agents_system_paths: HashSet<PathBuf>,
+    /// `AGENTS.md` files dynamically loaded by tools in this run.
+    pub agents_loaded_paths: HashSet<PathBuf>,
+    /// Agent Skills visible to the skill loading tool in this run.
+    pub visible_skills: Vec<SkillDefinition>,
+    /// Whether Agent Skills support is enabled for this run.
+    pub skills_enabled: bool,
+    /// `.agents/skills` roots already revealed by tools in this run.
+    pub skills_revealed_roots: HashSet<PathBuf>,
+    /// `SKILL.md` files already loaded by the skill loading tool in this run.
+    pub skills_loaded_paths: HashSet<PathBuf>,
+}
