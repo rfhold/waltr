@@ -3,17 +3,22 @@
 use std::{env, fmt::Write};
 
 use futures_util::StreamExt;
-use waltr_agent::{Agent, AgentEvent, AgentState, LlmError, LlmStream, ToolResult};
+use waltr_agent::{
+    Agent, AgentEvent, AgentState, LlmError, LlmStream, ToolResult,
+    middleware::ExternalRequestDraft,
+};
 
 #[allow(dead_code)]
 pub const REPORT_TOOL_ERRORS_ENV: &str = "WALTR_AGENT_REPORT_TOOL_ERRORS";
 pub const TEST_HARNESS_SYSTEM_PROMPT: &str = "You are running inside an automated test harness. Follow the user instructions exactly. Use tools when the user explicitly asks you to use them. When asked to report exact values, include those values verbatim. Keep final answers concise and do not add extra commentary unless requested.";
 
 #[derive(Debug, Default)]
+// TODO(agent-runtime): Replace helper-only state with durable AgentSession resume assertions.
 pub struct AgentTestSession {
     pub text: String,
     pub final_state: Option<AgentState>,
     pub saw_text_after_tool_result: bool,
+    pub external_requests: Vec<ExternalRequestDraft>,
     tool_calls: usize,
     tool_results: usize,
     tool_errors: Vec<ToolResult>,
@@ -39,6 +44,7 @@ impl AgentTestSession {
         provider: &impl LlmStream,
         prompt: &str,
     ) -> waltr_agent::Result<Self> {
+        // TODO(agent-runtime): Exercise suspension, resume input, and pending external requests.
         let mut stream = agent
             .prompt(provider, prompt)
             .with_system_prompt_fragment(TEST_HARNESS_SYSTEM_PROMPT)
@@ -61,6 +67,9 @@ impl AgentTestSession {
                     if result.content.starts_with("Tool error:") {
                         session.tool_errors.push(result);
                     }
+                }
+                AgentEvent::ExternalRequest { request, .. } => {
+                    session.external_requests.push(request);
                 }
                 AgentEvent::ThinkingDelta { .. } | AgentEvent::TurnFinished { .. } => {}
                 AgentEvent::Finished { state } => session.final_state = Some(state),

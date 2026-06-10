@@ -11,7 +11,7 @@ pub const BASE_SYSTEM_PROMPT: &str = "You are Waltr Agent, a careful coding and 
 /// Default local instruction filename.
 pub const AGENTS_INSTRUCTION_FILE: &str = "AGENTS.md";
 
-/// Builder for deterministic system prompt construction.
+/// Builder for deterministic compatibility system prompt construction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemPromptBuilder {
     fragments: Vec<String>,
@@ -111,6 +111,7 @@ impl AgentsPromptConfig {
     /// Render this configuration as a system prompt fragment.
     #[must_use]
     pub fn system_prompt(&self) -> Option<String> {
+        // Compatibility renderer; `AgentsSystemPromptMiddleware` provides the request boundary.
         let instructions = self.instructions();
         if instructions.is_empty() {
             None
@@ -184,6 +185,7 @@ impl FilesystemPromptConfig {
     /// Render this configuration as a system prompt fragment.
     #[must_use]
     pub fn system_prompt(&self) -> String {
+        // Compatibility renderer; `FilesystemSystemPromptMiddleware` provides the request boundary.
         let root = display_path(&self.root);
         let mut prompt = format!(
             "Filesystem tools are available when exposed in the tool list. Paths are scoped to this filesystem root: {root}. Prefer relative paths under the root unless the user gives an absolute path inside the root."
@@ -265,6 +267,7 @@ impl ShellPromptConfig {
     /// Render this configuration as a system prompt fragment.
     #[must_use]
     pub fn system_prompt(&self) -> String {
+        // Compatibility renderer; `ShellSystemPromptMiddleware` provides the request boundary.
         format!(
             "The shell tool executes commands on {} using {}. The shell program is {}. The default working directory is {}. Relative workdirs and path-like command arguments resolve under root {}. Use Bash/POSIX shell syntax.",
             self.os,

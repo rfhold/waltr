@@ -2,7 +2,7 @@
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentEvent, LlmError, LlmStream, ModelApi, ModelRef,
+    Agent, AgentEvent, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef, SessionStore,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
         OpenAiReasoningEffort, OpenAiReasoningSummary,
@@ -62,9 +62,13 @@ async fn assert_provider_thinking(
     expect_thinking: bool,
 ) -> waltr_agent::Result<()> {
     let agent = Agent::builder(model).build();
-    let mut stream = agent
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let mut stream = sessions
         .prompt(
             &provider,
+            session_id.clone(),
             format!("Think briefly if supported, then answer exactly: {EXPECTED_TEXT}"),
         )
         .with_system_prompt_fragment(
@@ -79,6 +83,7 @@ async fn assert_provider_thinking(
             AgentEvent::ThinkingDelta { .. } => thinking_delta_count += 1,
             AgentEvent::Finished { state } => final_state = Some(state),
             AgentEvent::TextDelta { .. }
+            | AgentEvent::ExternalRequest { .. }
             | AgentEvent::ToolCall { .. }
             | AgentEvent::ToolResult { .. }
             | AgentEvent::TurnFinished { .. } => {}
@@ -92,7 +97,15 @@ async fn assert_provider_thinking(
     let text = state.last_assistant_text();
     assert!(text.contains(EXPECTED_TEXT), "{}: {text}", provider.name());
 
-    let saw_thinking = thinking_delta_count > 0 || !state.thinking_blocks.is_empty();
+    let stored = store
+        .load(&session_id)
+        .await
+        .map_err(|error| LlmError::Protocol {
+            provider: provider.name(),
+            message: error.to_string(),
+        })?;
+    let saw_thinking =
+        thinking_delta_count > 0 || stored.snapshot.thinking_blocks().next().is_some();
     assert_eq!(saw_thinking, expect_thinking, "{}", provider.name());
 
     Ok(())

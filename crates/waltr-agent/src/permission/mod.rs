@@ -2,7 +2,6 @@
 
 mod claim;
 mod engine;
-mod handler;
 mod level;
 mod pattern;
 mod policy;
@@ -12,19 +11,17 @@ mod selector;
 
 pub use claim::{PermissionClaim, PermissionOperation, PermissionResource};
 pub use engine::PermissionEngine;
-pub use handler::{PermissionDecision, PermissionHandler, SharedPermissionHandler};
 pub use level::{PermissionEffect, PermissionLevel};
 pub use pattern::{
     PermissionCommandPattern, PermissionPathPattern, PermissionPattern, PermissionResourcePattern,
 };
 pub use policy::PermissionPolicy;
-pub use request::{PermissionCheckContext, PermissionRequest};
 pub use rule::{
     PermissionClassRule, PermissionCommandRule, PermissionDirectoryRule, PermissionToolRule,
 };
 pub use selector::PermissionToolSelector;
 
-pub(in crate::permission) use request::{denial_message, policy_denial_message};
+pub(in crate::permission) use request::policy_denial_message;
 
 #[cfg(test)]
 mod tests {
@@ -33,9 +30,9 @@ mod tests {
     use crate::ToolCall;
 
     use super::{
-        PermissionClaim, PermissionCommandPattern, PermissionDecision, PermissionEffect,
-        PermissionEngine, PermissionLevel, PermissionOperation, PermissionPathPattern,
-        PermissionPattern, PermissionPolicy, PermissionResource, PermissionToolSelector,
+        PermissionClaim, PermissionCommandPattern, PermissionEffect, PermissionEngine,
+        PermissionLevel, PermissionOperation, PermissionPathPattern, PermissionPolicy,
+        PermissionResource, PermissionToolSelector,
     };
 
     #[test]
@@ -176,14 +173,11 @@ mod tests {
 
     #[test]
     fn policy_denial_messages_are_preserved() {
-        let mut engine = PermissionEngine::new(
-            PermissionPolicy::default().with_command_rule(
-                PermissionToolSelector::exact("bash"),
-                PermissionCommandPattern::Name("git".to_owned()),
-                PermissionEffect::deny_with_message("do not interact with git"),
-            ),
-            None,
-        );
+        let mut engine = PermissionEngine::new(PermissionPolicy::default().with_command_rule(
+            PermissionToolSelector::exact("bash"),
+            PermissionCommandPattern::Name("git".to_owned()),
+            PermissionEffect::deny_with_message("do not interact with git"),
+        ));
         let call = ToolCall::new("call_1", "bash", json!({ "command": "git status" }));
         let claim = PermissionClaim::new(
             PermissionOperation::Execute,
@@ -224,17 +218,8 @@ mod tests {
     }
 
     #[test]
-    fn allow_always_pattern_is_reused() {
-        let mut engine = PermissionEngine::new(
-            PermissionPolicy::new(PermissionLevel::Ask),
-            Some(std::sync::Arc::new(|request| {
-                assert_eq!(request.claims.len(), 1);
-                PermissionDecision::AllowAlways(vec![PermissionPattern::filesystem_prefix(
-                    PermissionOperation::Read,
-                    "/tmp/waltr-shared",
-                )])
-            })),
-        );
+    fn ask_permissions_require_external_suspension() {
+        let mut engine = PermissionEngine::new(PermissionPolicy::new(PermissionLevel::Ask));
         let call = ToolCall::new("call_1", "read", json!({}));
         let claim = PermissionClaim::new(
             PermissionOperation::Read,
@@ -242,18 +227,15 @@ mod tests {
             "read /tmp/waltr-shared/a.txt",
         );
 
-        engine
+        let error = engine
             .check(&call, &[claim])
-            .expect("first check asks and stores approval");
-        assert_eq!(engine.patterns().len(), 1);
-
-        let reused_claim = PermissionClaim::new(
-            PermissionOperation::Read,
-            PermissionResource::FilesystemPath("/tmp/waltr-shared/nested/b.txt".into()),
-            "read /tmp/waltr-shared/nested/b.txt",
+            .expect_err("ask permissions should suspend before execution");
+        assert!(
+            error
+                .to_string()
+                .contains("permission denied: read /tmp/waltr-shared/a.txt"),
+            "unexpected error: {error}"
         );
-        engine
-            .check(&call, &[reused_claim])
-            .expect("stored approval is reused");
+        assert!(engine.patterns().is_empty());
     }
 }

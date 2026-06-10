@@ -1,0 +1,179 @@
+//! Tool-list middleware helpers.
+
+use crate::{PermissionLevel, PermissionPolicy, Result, ToolDefinition};
+
+use super::{AgentMiddleware, context::RequestContext, context::ToolDraft};
+
+/// Middleware that appends captured tool definitions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StaticToolRegistryMiddleware {
+    tools: Vec<ToolDefinition>,
+}
+
+impl StaticToolRegistryMiddleware {
+    /// Create middleware from provider-neutral tool definitions.
+    pub(crate) fn new(tools: Vec<ToolDefinition>) -> Self {
+        Self { tools }
+    }
+}
+
+impl AgentMiddleware for StaticToolRegistryMiddleware {
+    async fn list_tools(&self, _ctx: &mut RequestContext<'_>, draft: &mut ToolDraft) -> Result<()> {
+        draft.tools.extend(self.tools.iter().cloned());
+        Ok(())
+    }
+}
+
+/// Middleware that exposes registered tools according to the active permission policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PermissionFilteredToolRegistryMiddleware {
+    tools: Vec<ToolDefinition>,
+    policy: PermissionPolicy,
+    ask_available: bool,
+}
+
+impl PermissionFilteredToolRegistryMiddleware {
+    /// Create middleware from provider-neutral tool definitions and permission visibility inputs.
+    pub(crate) fn new(
+        tools: Vec<ToolDefinition>,
+        policy: PermissionPolicy,
+        ask_available: bool,
+    ) -> Self {
+        Self {
+            tools,
+            policy,
+            ask_available,
+        }
+    }
+}
+
+impl AgentMiddleware for PermissionFilteredToolRegistryMiddleware {
+    async fn list_tools(&self, _ctx: &mut RequestContext<'_>, draft: &mut ToolDraft) -> Result<()> {
+        draft.tools.extend(
+            self.tools
+                .iter()
+                .filter(|tool| tool_is_visible(&self.policy, tool, self.ask_available))
+                .cloned(),
+        );
+        Ok(())
+    }
+}
+
+/// Return true when a tool should be visible to the model for the given permission setup.
+pub(crate) fn tool_is_visible(
+    policy: &PermissionPolicy,
+    definition: &ToolDefinition,
+    ask_available: bool,
+) -> bool {
+    match policy.evaluate_tool(&definition.name) {
+        PermissionLevel::Allow => true,
+        PermissionLevel::Ask => ask_available,
+        PermissionLevel::Deny => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::{AgentState, ModelId, middleware::context::RequestContext};
+
+    use super::*;
+
+    fn request_context<'a>(model_id: &'a ModelId, session: &'a AgentState) -> RequestContext<'a> {
+        RequestContext {
+            session_id: "session-1",
+            revision: 0,
+            model_id,
+            provider_id: None,
+            turn: 0,
+            session,
+        }
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition::new(
+            name,
+            format!("{name} description"),
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn appends_static_tool_definitions() {
+        let first = tool("first");
+        let second = tool("second");
+        let middleware = StaticToolRegistryMiddleware::new(vec![second.clone()]);
+        let model_id = ModelId::new("test-model");
+        let session = AgentState::default();
+        let mut ctx = request_context(&model_id, &session);
+        let mut draft = ToolDraft::default();
+        draft.push(first.clone());
+
+        middleware
+            .list_tools(&mut ctx, &mut draft)
+            .await
+            .expect("static tool middleware should run");
+
+        assert_eq!(draft.tools, vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn filters_tool_definitions_by_permission_visibility() {
+        use crate::{PermissionEffect, PermissionToolSelector};
+
+        let allowed = tool("allowed");
+        let ask = tool("ask");
+        let denied = tool("denied");
+        let policy = PermissionPolicy::default()
+            .with_tool_rule(
+                PermissionToolSelector::exact("ask"),
+                PermissionEffect::ask(),
+            )
+            .with_tool_rule(
+                PermissionToolSelector::exact("denied"),
+                PermissionEffect::deny(),
+            );
+        let model_id = ModelId::new("test-model");
+        let session = AgentState::default();
+        let mut ctx = request_context(&model_id, &session);
+        let mut draft = ToolDraft::default();
+
+        PermissionFilteredToolRegistryMiddleware::new(
+            vec![allowed.clone(), ask.clone(), denied],
+            policy,
+            true,
+        )
+        .list_tools(&mut ctx, &mut draft)
+        .await
+        .expect("filtered tool middleware should run");
+
+        assert_eq!(draft.tools, vec![allowed, ask]);
+    }
+
+    #[tokio::test]
+    async fn hides_ask_tool_definitions_without_ask_path() {
+        use crate::{PermissionEffect, PermissionToolSelector};
+
+        let allowed = tool("allowed");
+        let ask = tool("ask");
+        let policy = PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("ask"),
+            PermissionEffect::ask(),
+        );
+        let model_id = ModelId::new("test-model");
+        let session = AgentState::default();
+        let mut ctx = request_context(&model_id, &session);
+        let mut draft = ToolDraft::default();
+
+        PermissionFilteredToolRegistryMiddleware::new(vec![allowed.clone(), ask], policy, false)
+            .list_tools(&mut ctx, &mut draft)
+            .await
+            .expect("filtered tool middleware should run");
+
+        assert_eq!(draft.tools, vec![allowed]);
+    }
+}

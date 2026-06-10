@@ -1,39 +1,26 @@
 //! Agent permission integration tests.
 
-use std::{
-    env, fs,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{env, fs, path::PathBuf, sync::Mutex};
 
 use futures_util::{StreamExt, stream};
 use waltr_agent::{
     Agent, AgentEvent, BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
-    LlmStream, ModelApi, ModelRef, PermissionDecision, PermissionEffect, PermissionOperation,
-    PermissionPattern, PermissionPolicy, PermissionToolSelector, ProviderId, ToolCall,
+    LlmStream, ModelApi, ModelRef, PermissionEffect, PermissionPolicy, PermissionToolSelector,
+    ProviderId, ToolCall,
+    middleware::ExternalRequestKind,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
-use waltr_agent::{PermissionCommandPattern, PermissionResourcePattern, tools::shell::ShellConfig};
+use waltr_agent::{PermissionCommandPattern, tools::shell::ShellConfig};
 use serde_json::json;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
-const DENIED_MESSAGE: &str = "external access denied by test";
-
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn filesystem_permissions_cover_default_allow_ask_allow_always_and_deny()
+// TODO(agent-runtime): Add coverage that permission prompts survive durable suspension/resume.
+async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
 -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
-    let handler_calls = Arc::new(Mutex::new(Vec::new()));
-    #[cfg(feature = "shell")]
-    let shell_handler_calls = Arc::new(Mutex::new(Vec::new()));
-    let handler = permission_handler(
-        &fixture,
-        Arc::clone(&handler_calls),
-        #[cfg(feature = "shell")]
-        Arc::clone(&shell_handler_calls),
-    );
     let policy =
         PermissionPolicy::filesystem_external(fixture.root.path(), PermissionEffect::ask());
     #[cfg(feature = "shell")]
@@ -61,7 +48,7 @@ async fn filesystem_permissions_cover_default_allow_ask_allow_always_and_deny()
         );
     #[cfg(feature = "shell")]
     let agent = agent.with_shell_tool(ShellConfig::new(fixture.root.path()));
-    let agent = agent.with_permission_handler(handler).build();
+    let agent = agent.build();
     let provider = ScriptedPermissionProvider;
     #[cfg(not(feature = "shell"))]
     let prompt = "exercise filesystem permission allow, ask, allow-always, and deny".to_owned();
@@ -78,13 +65,14 @@ async fn filesystem_permissions_cover_default_allow_ask_allow_always_and_deny()
 
     let mut stream = agent.prompt(&provider, &prompt).stream();
     let mut results = Vec::new();
-    let mut final_text = String::new();
+    let mut external_requests = Vec::new();
 
     while let Some(event) = stream.next().await {
         match event? {
             AgentEvent::ToolResult { result, .. } => results.push(result.content),
-            AgentEvent::TextDelta { delta, .. } => final_text.push_str(&delta),
+            AgentEvent::ExternalRequest { request, .. } => external_requests.push(request),
             AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::TextDelta { .. }
             | AgentEvent::ToolCall { .. }
             | AgentEvent::TurnFinished { .. }
             | AgentEvent::Finished { .. } => {}
@@ -97,87 +85,13 @@ async fn filesystem_permissions_cover_default_allow_ask_allow_always_and_deny()
             .any(|result| result.contains("root-allowed-101")),
         "{results:#?}"
     );
-    assert!(
-        results
-            .iter()
-            .any(|result| result.contains("external-once-202")),
-        "{results:#?}"
-    );
-    assert!(
-        results
-            .iter()
-            .any(|result| result.contains("external-nested-303")),
-        "{results:#?}"
-    );
-    assert!(
-        results
-            .iter()
-            .any(|result| result.contains("external-another-404")),
-        "{results:#?}"
-    );
-    assert!(
-        results.iter().any(|result| result.contains(DENIED_MESSAGE)),
-        "{results:#?}"
-    );
-    #[cfg(feature = "shell")]
-    {
-        assert!(results.iter().any(|result| result.contains("shell-one")));
-        assert!(results.iter().any(|result| result.contains("shell-two")));
-        assert!(
-            results
-                .iter()
-                .any(|result| result.contains("external-shell-walk-606")),
-            "{results:#?}"
-        );
-        assert!(
-            results
-                .iter()
-                .filter(|result| result.contains(DENIED_MESSAGE))
-                .count()
-                >= 2,
-            "filesystem and shell denied path attempts should both be denied: {results:#?}"
-        );
-        assert!(
-            !results
-                .iter()
-                .any(|result| result.contains("external-denied-505")),
-            "denied shell path should not leak file contents: {results:#?}"
-        );
-        assert!(
-            results
-                .iter()
-                .any(|result| result.contains("do not interact with git"))
-        );
-    }
-    assert!(final_text.contains("permission-flow-complete"));
-
-    let calls = handler_calls.lock().expect("handler calls").clone();
-    #[cfg(not(feature = "shell"))]
-    let expected_calls = 3;
-    #[cfg(feature = "shell")]
-    let expected_calls = 4;
-    assert_eq!(
-        calls.len(),
-        expected_calls,
-        "allow-always nested approval should be reused, while denied shell path still asks"
-    );
-    assert_eq!(calls[0], fixture.outside.path().join("external.txt"));
-    assert_eq!(
-        calls[1],
-        fixture.outside.path().join("nested/external-nested.txt")
-    );
-    assert_eq!(calls[2], fixture.outside.path().join("denied.txt"));
-    #[cfg(feature = "shell")]
-    assert_eq!(calls[3], fixture.outside.path().join("denied.txt"));
-    #[cfg(feature = "shell")]
-    assert_eq!(
-        shell_handler_calls
-            .lock()
-            .expect("shell handler calls")
-            .as_slice(),
-        &["printf shell-one".to_owned()],
-        "allow-always shell approval should be reused"
-    );
+    let [request] = external_requests.as_slice() else {
+        panic!("expected one permission external request: {external_requests:#?}");
+    };
+    assert_eq!(request.kind, ExternalRequestKind::Permission);
+    assert_eq!(request.tool_call_id.as_deref(), Some("call_2"));
+    assert!(request.prompt.contains("external.txt"), "{request:#?}");
+    assert!(request.id.starts_with("permission:ephemeral:1:call_2"));
 
     Ok(())
 }
@@ -238,7 +152,7 @@ async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
 }
 
 #[tokio::test]
-async fn multi_claim_denial_blocks_execution() -> waltr_agent::Result<()> {
+async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
     let denied = fixture.outside.path().join("denied.txt");
     #[cfg(feature = "shell")]
@@ -254,9 +168,7 @@ async fn multi_claim_denial_blocks_execution() -> waltr_agent::Result<()> {
         );
     #[cfg(feature = "shell")]
     let agent = agent.with_shell_tool(ShellConfig::new(fixture.root.path()));
-    let agent = agent
-        .with_permission_handler(move |_| PermissionDecision::Deny(DENIED_MESSAGE.to_owned()))
-        .build();
+    let agent = agent.build();
     let provider = PatchDeniedProvider {
         allowed: fixture.root.path().join("allowed.txt"),
         denied,
@@ -265,84 +177,27 @@ async fn multi_claim_denial_blocks_execution() -> waltr_agent::Result<()> {
     };
 
     let mut stream = agent.prompt(&provider, "patch denied").stream();
-    let mut result = String::new();
+    let mut external_requests = Vec::new();
     while let Some(event) = stream.next().await {
-        if let AgentEvent::ToolResult {
-            result: tool_result,
-            ..
-        } = event?
-        {
-            result = tool_result.content;
+        if let AgentEvent::ExternalRequest { request, .. } = event? {
+            external_requests.push(request);
         }
     }
 
-    assert!(result.contains(DENIED_MESSAGE));
+    let [request] = external_requests.as_slice() else {
+        panic!("expected one permission external request: {external_requests:#?}");
+    };
+    assert_eq!(request.kind, ExternalRequestKind::Permission);
+    assert_eq!(request.tool_call_id.as_deref(), Some("call_1"));
+    assert!(
+        request.prompt.contains("Write filesystem path"),
+        "{request:#?}"
+    );
     assert_eq!(fixture.root.read("allowed.txt")?, "root-allowed-101\n");
     #[cfg(feature = "shell")]
     assert!(!shell_denied.exists());
 
     Ok(())
-}
-
-fn permission_handler(
-    fixture: &PermissionFixture,
-    calls: Arc<Mutex<Vec<PathBuf>>>,
-    #[cfg(feature = "shell")] shell_calls: Arc<Mutex<Vec<String>>>,
-) -> impl Fn(&waltr_agent::PermissionRequest) -> PermissionDecision + Send + Sync + 'static {
-    let external = fixture.outside.path().join("external.txt");
-    let nested_file = fixture.outside.path().join("nested/external-nested.txt");
-    let nested_dir = fixture.outside.path().join("nested");
-    move |request| {
-        #[cfg(feature = "shell")]
-        if let Some(command) = shell_claim_command(request) {
-            shell_calls
-                .lock()
-                .expect("shell handler calls")
-                .push(command);
-            return PermissionDecision::AllowAlways(vec![PermissionPattern {
-                operation: Some(PermissionOperation::Execute),
-                resource: PermissionResourcePattern::ShellCommandPrefix("printf ".to_owned()),
-            }]);
-        }
-
-        let path = filesystem_claim_path(request).expect("filesystem path claim");
-        calls.lock().expect("handler calls").push(path.clone());
-        if path == external {
-            PermissionDecision::AllowOnce
-        } else if path == nested_file {
-            PermissionDecision::AllowAlways(vec![PermissionPattern::filesystem_prefix(
-                PermissionOperation::Read,
-                nested_dir.clone(),
-            )])
-        } else {
-            PermissionDecision::Deny(DENIED_MESSAGE.to_owned())
-        }
-    }
-}
-
-#[cfg(feature = "shell")]
-fn shell_claim_command(request: &waltr_agent::PermissionRequest) -> Option<String> {
-    request
-        .claims
-        .iter()
-        .find_map(|claim| match &claim.resource {
-            waltr_agent::PermissionResource::ShellCommand(command) => Some(command.clone()),
-            waltr_agent::PermissionResource::FilesystemPath(_)
-            | waltr_agent::PermissionResource::FilesystemPathPrefix(_)
-            | waltr_agent::PermissionResource::WorkingDirectory(_) => None,
-        })
-}
-
-fn filesystem_claim_path(request: &waltr_agent::PermissionRequest) -> Option<PathBuf> {
-    request
-        .claims
-        .iter()
-        .find_map(|claim| match &claim.resource {
-            waltr_agent::PermissionResource::FilesystemPath(path)
-            | waltr_agent::PermissionResource::FilesystemPathPrefix(path) => Some(path.clone()),
-            waltr_agent::PermissionResource::WorkingDirectory(_)
-            | waltr_agent::PermissionResource::ShellCommand(_) => None,
-        })
 }
 
 struct ScriptedPermissionProvider;
@@ -353,8 +208,9 @@ impl LlmStream for ScriptedPermissionProvider {
     }
 
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        // TODO(agent-runtime): Drive scripted turns from request records, not tool_result counts.
         Box::pin(async move {
-            let step = request.tool_results.len();
+            let step = request.tool_results().count();
             let events = match step {
                 0 => vec![Ok(CompletionEvent::ToolCall(read_call(
                     "call_1",
@@ -457,8 +313,9 @@ impl LlmStream for PatchDeniedProvider {
     }
 
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        // TODO(agent-runtime): Verify denied multi-claim work records are canceled durably.
         Box::pin(async move {
-            let events = match request.tool_results.len() {
+            let events = match request.tool_results().count() {
                 0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                     "call_1",
                     "apply_patch",

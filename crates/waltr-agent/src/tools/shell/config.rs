@@ -91,6 +91,7 @@ impl ShellConfig {
             .root
             .canonicalize()
             .unwrap_or_else(|_| self.root.clone());
+        // TODO(agent-runtime): Move root-specific shell hints into dedicated edit_tool_metadata middleware.
         write!(
             definition.description,
             " Relative workdirs and path-like command arguments resolve from root: {}.",
@@ -119,6 +120,7 @@ impl ShellConfig {
     }
 
     fn permission_claims(&self, call: &ToolCall) -> Result<Vec<PermissionClaim>> {
+        // TODO(agent-runtime): Move shell permission scans into before_tool_call middleware.
         let input = tool_input::<ShellInput>(call)?;
         Ok(self.scan(&input)?.claims)
     }

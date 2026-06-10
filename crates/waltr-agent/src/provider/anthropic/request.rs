@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::{CompletionRequest, ThinkingBlockKind, ToolDefinition};
+use crate::{CompletionRequest, ThinkingBlockKind, ToolDefinition, TurnItem};
 
 use super::thinking::{AnthropicThinkingConfig, anthropic_thinking};
 
@@ -28,41 +28,49 @@ pub(super) fn messages_request(
 
 fn anthropic_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     let mut messages = vec![json!({ "role": "user", "content": request.prompt })];
-    if request.tool_calls.is_empty() {
-        return messages;
+    let mut assistant_content: Vec<Value> = Vec::new();
+    let mut tool_results: Vec<Value> = Vec::new();
+    for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
+        match item {
+            TurnItem::Thinking(block) if block.kind == ThinkingBlockKind::Anthropic => {
+                flush_tool_results(&mut messages, &mut tool_results);
+                assistant_content.push(block.payload.clone());
+            }
+            TurnItem::Thinking(_) => {}
+            TurnItem::ToolCall(call) => {
+                flush_tool_results(&mut messages, &mut tool_results);
+                assistant_content.push(json!({
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }));
+            }
+            TurnItem::ToolResult(result) => {
+                flush_assistant_content(&mut messages, &mut assistant_content);
+                tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": result.call_id,
+                    "content": result.content,
+                }));
+            }
+        }
     }
-
-    let mut assistant_content = request
-        .thinking_blocks
-        .iter()
-        .filter(|block| block.kind == ThinkingBlockKind::Anthropic)
-        .map(|block| block.payload.clone())
-        .collect::<Vec<_>>();
-    assistant_content.extend(request.tool_calls.iter().map(|call| {
-        json!({
-            "type": "tool_use",
-            "id": call.id,
-            "name": call.name,
-            "input": call.arguments,
-        })
-    }));
-    messages.push(json!({
-        "role": "assistant",
-        "content": assistant_content
-    }));
-    messages.push(json!({
-        "role": "user",
-        "content": request
-            .tool_results
-            .iter()
-            .map(|result| json!({
-                "type": "tool_result",
-                "tool_use_id": result.call_id,
-                "content": result.content,
-            }))
-            .collect::<Vec<_>>()
-    }));
+    flush_assistant_content(&mut messages, &mut assistant_content);
+    flush_tool_results(&mut messages, &mut tool_results);
     messages
+}
+
+fn flush_assistant_content(messages: &mut Vec<Value>, content: &mut Vec<Value>) {
+    if !content.is_empty() {
+        messages.push(json!({ "role": "assistant", "content": std::mem::take(content) }));
+    }
+}
+
+fn flush_tool_results(messages: &mut Vec<Value>, results: &mut Vec<Value>) {
+    if !results.is_empty() {
+        messages.push(json!({ "role": "user", "content": std::mem::take(results) }));
+    }
 }
 
 fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
@@ -80,7 +88,12 @@ fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use crate::CompletionRequest;
+    use serde_json::json;
+
+    use crate::{
+        CompletionRequest, CompletionTurn, ThinkingBlock, ThinkingBlockKind, ToolCall, ToolResult,
+        TurnItem,
+    };
 
     use super::{AnthropicThinkingConfig, messages_request};
     use crate::provider::anthropic::AnthropicThinkingDisplay;
@@ -114,5 +127,71 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 1024);
         assert_eq!(body["thinking"]["display"], "summarized");
+    }
+
+    #[test]
+    fn request_replays_turns_as_alternating_assistant_and_user_messages() {
+        let mut request = CompletionRequest::new("hello");
+        request.turns = vec![
+            CompletionTurn {
+                turn: 0,
+                metadata: None,
+                items: vec![
+                    TurnItem::Thinking(ThinkingBlock {
+                        kind: ThinkingBlockKind::Anthropic,
+                        text: "first thought".to_owned(),
+                        payload: json!({
+                            "type": "thinking",
+                            "thinking": "first thought",
+                            "signature": "sig-0",
+                        }),
+                    }),
+                    TurnItem::ToolCall(ToolCall::new("call-0", "echo", json!({ "value": "a" }))),
+                    TurnItem::ToolResult(ToolResult::new("call-0", "echo", "a")),
+                ],
+            },
+            CompletionTurn {
+                turn: 1,
+                metadata: None,
+                items: vec![
+                    TurnItem::Thinking(ThinkingBlock {
+                        kind: ThinkingBlockKind::OpenAiResponses,
+                        text: "foreign".to_owned(),
+                        payload: json!({ "type": "reasoning", "id": "rs-1" }),
+                    }),
+                    TurnItem::Thinking(ThinkingBlock {
+                        kind: ThinkingBlockKind::Anthropic,
+                        text: "second thought".to_owned(),
+                        payload: json!({
+                            "type": "thinking",
+                            "thinking": "second thought",
+                            "signature": "sig-1",
+                        }),
+                    }),
+                    TurnItem::ToolCall(ToolCall::new("call-1", "echo", json!({ "value": "b" }))),
+                    TurnItem::ToolResult(ToolResult::new("call-1", "echo", "b")),
+                ],
+            },
+        ];
+
+        let body = messages_request("claude-test", 256, None, &request);
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["type"], "thinking");
+        assert_eq!(messages[1]["content"][0]["signature"], "sig-0");
+        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][1]["id"], "call-0");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "call-0");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"][0]["signature"], "sig-1");
+        assert_eq!(messages[3]["content"][1]["id"], "call-1");
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(messages[4]["content"][0]["tool_use_id"], "call-1");
     }
 }

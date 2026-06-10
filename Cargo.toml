@@ -16,6 +16,8 @@ version = "0.1.0"
 
 [workspace.dependencies]
 axum = { version = "0.8.9", features = ["http2"] }
+aws-config = "1.8.12"
+aws-sdk-s3 = "1.115.0"
 futures-core = "0.3.31"
 futures-channel = "0.3.31"
 futures-util = "0.3.31"
@@ -31,14 +33,21 @@ opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"] }
 opentelemetry-semantic-conventions = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+opendal = { version = "0.57.0", features = ["services-fs", "services-s3", "services-postgresql"] }
 prost = "0.14.1"
 pyroscope = { version = "2.0.6", features = ["backend-pprof-rs"] }
 reqwest = { version = "0.13.4", default-features = false }
+refinery = "0.8.16"
 ratatui = "0.30.0"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 serde = "1.0.228"
 serde_json = "1.0.150"
 sha2 = "0.11.0"
+scylla = "1.6.0"
+tempfile = "3.23.0"
+testcontainers = "0.25.2"
 tokio = "1.52.3"
+tokio-postgres = "0.7.15"
 tokio-stream = "0.1.18"
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 toml = "1.1.2"
@@ -54,8 +63,10 @@ tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 ts-rs = { version = "11.1.0", features = ["serde-compat"] }
+uuid = "1.19.0"
 wasm-bindgen = "0.2.122"
 wasm-bindgen-futures = "0.4.52"
+webpki-roots = "1"
 
 [workspace.lints.rust]
 deprecated_safe = { level = "deny", priority = -1 }

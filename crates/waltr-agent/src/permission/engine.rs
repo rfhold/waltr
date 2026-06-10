@@ -5,8 +5,7 @@ use std::fmt;
 use crate::{LlmError, Result, ToolCall};
 
 use super::{
-    PermissionClaim, PermissionDecision, PermissionLevel, PermissionPattern, PermissionPolicy,
-    PermissionRequest, SharedPermissionHandler, denial_message, policy_denial_message,
+    PermissionClaim, PermissionLevel, PermissionPattern, PermissionPolicy, policy_denial_message,
 };
 
 /// Run-scoped permission engine.
@@ -14,17 +13,15 @@ use super::{
 pub struct PermissionEngine {
     patterns: Vec<PermissionPattern>,
     policy: PermissionPolicy,
-    handler: Option<SharedPermissionHandler>,
 }
 
 impl PermissionEngine {
     /// Create a permission engine.
     #[must_use]
-    pub fn new(policy: PermissionPolicy, handler: Option<SharedPermissionHandler>) -> Self {
+    pub fn new(policy: PermissionPolicy) -> Self {
         Self {
             patterns: Vec::new(),
             policy,
-            handler,
         }
     }
 
@@ -34,18 +31,11 @@ impl PermissionEngine {
         &self.patterns
     }
 
-    /// Return true if an ask handler is configured.
-    #[must_use]
-    pub const fn has_handler(&self) -> bool {
-        self.handler.is_some()
-    }
-
-    /// Check claims for a tool call, mutating run-scoped approvals as needed.
+    /// Check claims for a tool call.
     ///
     /// # Errors
     ///
-    /// Returns an error when a claim is denied, when a claim requires `Ask` but no handler is
-    /// configured, or when the handler denies the request.
+    /// Returns an error when a claim is denied or requires a durable external permission response.
     pub fn check(&mut self, tool_call: &ToolCall, claims: &[PermissionClaim]) -> Result<()> {
         let unmatched = claims
             .iter()
@@ -82,32 +72,11 @@ impl PermissionEngine {
             return Ok(());
         }
 
-        let Some(handler) = &self.handler else {
-            return Err(permission_error(denial_message(
-                "permission denied: no permission handler configured",
-                &ask,
-            )));
-        };
-        let request = PermissionRequest {
-            tool_call: tool_call.clone(),
-            claims: ask.clone(),
-            summary: ask
-                .iter()
-                .map(|claim| claim.summary.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
-        };
-        match handler(&request) {
-            PermissionDecision::AllowOnce => Ok(()),
-            PermissionDecision::AllowAlways(patterns) => {
-                self.patterns.extend(patterns);
-                Ok(())
-            }
-            PermissionDecision::Deny(message) => Err(permission_error(denial_message(
-                &format!("permission denied: {message}"),
-                &ask,
-            ))),
-        }
+        Err(permission_error(policy_denial_message(
+            &ask.into_iter()
+                .map(|claim| (claim, super::PermissionEffect::ask()))
+                .collect::<Vec<_>>(),
+        )))
     }
 }
 
@@ -117,7 +86,6 @@ impl fmt::Debug for PermissionEngine {
             .debug_struct("PermissionEngine")
             .field("patterns", &self.patterns)
             .field("policy", &self.policy)
-            .field("has_handler", &self.handler.is_some())
             .finish()
     }
 }

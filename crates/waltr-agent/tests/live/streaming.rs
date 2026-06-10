@@ -52,7 +52,9 @@ async fn assert_provider_streams_expected_text(provider: impl LlmStream) -> walt
                     message: format!("provider emitted unexpected tool call: {}", tool_call.name),
                 });
             }
-            CompletionEvent::ThinkingDelta(_) | CompletionEvent::ThinkingBlock(_) => {}
+            CompletionEvent::ThinkingDelta(_)
+            | CompletionEvent::ThinkingBlock(_)
+            | CompletionEvent::ProviderMetadata(_) => {}
             CompletionEvent::Finished => finished = true,
         }
     }

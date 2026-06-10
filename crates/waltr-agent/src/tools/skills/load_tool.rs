@@ -13,6 +13,7 @@ use super::{
 };
 
 pub(super) fn load_skill_definition() -> ToolDefinition {
+    // TODO(agent-runtime): Move skill visibility hints into dedicated edit_tool_metadata middleware.
     ToolDefinition::new(
         "load_skill",
         "Load full instructions for one visible Agent Skill. Use this before following a skill's instructions.",
@@ -41,6 +42,7 @@ struct LoadSkillInput {
 }
 
 pub(super) fn load_skill(call: &ToolCall, context: &mut AgentToolContext) -> Result<String> {
+    // TODO(agent-runtime): Persist loaded skills in middleware state across suspend/resume.
     let input: LoadSkillInput = serde_json::from_value(call.arguments.clone())?;
     let skill = resolve_skill(&input, &context.visible_skills)?.clone();
     if !context.skills_loaded_paths.insert(skill.skill_path.clone()) {

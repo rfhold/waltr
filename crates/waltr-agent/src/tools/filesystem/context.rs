@@ -14,6 +14,7 @@ use crate::{
 use super::FilesystemConfig;
 
 impl FilesystemConfig {
+    // TODO(agent-runtime): Replace tool-local AGENTS reads with read-hook middleware state.
     pub(super) fn append_agents_read_context(
         &self,
         target: &Path,
@@ -72,6 +73,7 @@ impl FilesystemConfig {
         context: &mut AgentToolContext,
         output: &mut String,
     ) -> Result<()> {
+        // TODO(agent-runtime): Replace tool-result skill reminders with middleware state updates.
         if !context.skills_enabled {
             return Ok(());
         }

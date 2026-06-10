@@ -1,7 +1,9 @@
 //! Provider and model identity types.
 
+use serde::{Deserialize, Serialize};
+
 /// Provider identifier used for provider-aware behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderId {
     /// Anthropic provider.
     Anthropic,
@@ -10,7 +12,7 @@ pub enum ProviderId {
 }
 
 /// Model API surface used by the provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelApi {
     /// Anthropic Messages API.
     AnthropicMessages,
@@ -23,7 +25,7 @@ pub enum ModelApi {
 }
 
 /// Model identifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelId(String);
 
 impl ModelId {
@@ -52,7 +54,7 @@ impl From<String> for ModelId {
 }
 
 /// Provider, model, and API identity used while configuring tools.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelRef {
     /// Provider that owns the model.
     pub provider: ProviderId,

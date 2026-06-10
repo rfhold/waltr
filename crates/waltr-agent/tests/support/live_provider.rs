@@ -48,6 +48,15 @@ impl LlmStream for LiveProvider {
         }
     }
 
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<serde_json::Value> {
+        match self {
+            Self::AnthropicMessages(provider) => provider.project_request(request),
+            Self::OpenAiChatCompletions(provider) => provider.project_request(request),
+            Self::OpenAiResponses(provider) => provider.project_request(request),
+            Self::OpenAiResponsesWebSocket(provider) => provider.project_request(request),
+        }
+    }
+
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
         match self {
             Self::AnthropicMessages(provider) => provider.stream_request(request),

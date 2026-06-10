@@ -2,13 +2,14 @@
 
 use std::{fmt, path::PathBuf};
 
-use crate::{LlmStream, ModelRef, PermissionPolicy, SharedPermissionHandler};
+use crate::{LlmStream, ModelRef, PermissionPolicy, middleware::chain::MiddlewareChain};
 
 mod builder;
 mod context;
 mod event;
 mod r#loop;
 mod run;
+pub mod session;
 mod state;
 mod tool;
 
@@ -16,6 +17,15 @@ pub use builder::AgentBuilder;
 pub use context::AgentToolContext;
 pub use event::{AgentEvent, BoxAgentEventStream};
 pub use run::AgentRunBuilder;
+pub use session::{
+    AgentSession, AgentSessionRuntime, AgentSessions, CancelReason, ExternalRequest,
+    ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse,
+    FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
+    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
+    S3SessionStore, ScyllaSessionStore, SessionEvent, SessionId, SessionRecord, SessionSnapshot,
+    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, Suspension,
+    opendal_postgresql_session_store, run_postgresql_migrations,
+};
 pub use state::{AgentState, AgentTranscriptEvent};
 pub use tool::AgentTool;
 
@@ -25,13 +35,15 @@ use crate::SkillDefinition;
 #[derive(Clone)]
 pub struct Agent {
     pub(super) model: ModelRef,
+    // TODO(agent-runtime): Shrink Agent to model/base tools/middleware; move run state out.
     pub(super) tools: Vec<AgentTool>,
+    pub(super) middleware_chain: MiddlewareChain,
     pub(super) system_prompt: Option<String>,
+    // TODO(agent-runtime): Move AGENTS/skills tracking into durable AgentSession context.
     pub(super) agents_system_paths: Vec<PathBuf>,
     pub(super) visible_skills: Vec<SkillDefinition>,
     pub(super) skills_enabled: bool,
     pub(super) permission_policy: PermissionPolicy,
-    pub(super) permission_handler: Option<SharedPermissionHandler>,
 }
 
 impl Agent {
@@ -59,6 +71,14 @@ impl Agent {
         AgentRunBuilder::new(self, provider, prompt.into())
     }
 
+    /// Bind this agent configuration to a durable session store.
+    pub fn sessions<S>(self, store: S) -> AgentSessions<S>
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        AgentSessions::new(self, store)
+    }
+
     /// Return configured host tools.
     #[must_use]
     pub fn tools(&self) -> &[AgentTool] {
@@ -72,12 +92,12 @@ impl fmt::Debug for Agent {
             .debug_struct("Agent")
             .field("model", &self.model)
             .field("tools", &self.tools)
+            .field("middleware_chain_len", &self.middleware_chain.len())
             .field("system_prompt", &self.system_prompt)
             .field("agents_system_paths", &self.agents_system_paths)
             .field("visible_skills", &self.visible_skills)
             .field("skills_enabled", &self.skills_enabled)
             .field("permission_policy", &self.permission_policy)
-            .field("has_permission_handler", &self.permission_handler.is_some())
             .finish()
     }
 }
@@ -96,12 +116,45 @@ mod tests {
 
     use crate::{
         AgentsPromptConfig, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-        CompletionRequest, FilesystemPromptConfig, LlmError, ModelApi, ModelRef, ProviderId,
+        CompletionRequest, ExternalRequestId, ExternalResponse, FilesystemPromptConfig, LlmError,
+        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionStore,
         SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, ToolCall, ToolDefinition,
-        tools::filesystem::FilesystemConfig,
+        middleware::{AgentMiddleware, ExternalRequestKind, chain::MiddlewareChain},
+        tools::{
+            filesystem::FilesystemConfig,
+            question::{QUESTION_TOOL_NAME, QuestionConfig},
+        },
     };
 
     use super::{Agent, AgentEvent, AgentTool};
+
+    struct NoopMiddleware;
+
+    impl AgentMiddleware for NoopMiddleware {}
+
+    #[test]
+    fn builder_stores_default_middleware_chain() {
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+
+        let agent = Agent::builder(model).build();
+
+        assert!(agent.middleware_chain.is_empty());
+    }
+
+    #[test]
+    fn builder_accepts_middleware_chain() {
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let mut chain = MiddlewareChain::new();
+        chain.push(NoopMiddleware);
+
+        let agent = Agent::builder(model.clone())
+            .with_middleware(NoopMiddleware)
+            .build();
+        let chain_agent = Agent::builder(model).with_middleware_chain(chain).build();
+
+        assert_eq!(agent.middleware_chain.len(), 1);
+        assert_eq!(chain_agent.middleware_chain.len(), 1);
+    }
 
     #[test]
     fn filesystem_tools_are_opt_in() {
@@ -116,6 +169,298 @@ mod tests {
                 .iter()
                 .any(|tool| tool.definition().name == "apply_patch")
         );
+    }
+
+    #[tokio::test]
+    async fn durable_session_resume_continues_same_agent_loop() {
+        let provider = DurableResumeProvider::default();
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = Agent::builder(model)
+            .with_question_tool(QuestionConfig::new())
+            .build();
+        let store = MemorySessionStore::new();
+        let sessions = agent.sessions(store.clone());
+        let session = sessions.create().await.expect("created session");
+        let session_id = session.id().clone();
+
+        let mut stream = sessions
+            .prompt(&provider, session_id.clone(), "ask then continue")
+            .stream();
+        let mut request_id = None;
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::ExternalRequest { request, .. } = event.expect("agent event") {
+                assert_eq!(request.kind, ExternalRequestKind::Question);
+                request_id = Some(request.id);
+            }
+        }
+        let request_id = request_id.expect("question request");
+        assert!(
+            store
+                .load(&session_id)
+                .await
+                .expect("stored session")
+                .snapshot
+                .external_requests
+                .iter()
+                .any(|request| request.kind == super::ExternalRequestKind::Question)
+        );
+
+        let mut resumed = sessions
+            .resume(
+                &provider,
+                session_id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id: ExternalRequestId::new(request_id),
+                    response: ExternalResponse::new(json!("resume-answer-123")),
+                },
+            )
+            .stream();
+        let mut text = String::new();
+        while let Some(event) = resumed.next().await {
+            if let AgentEvent::TextDelta { delta, .. } = event.expect("agent event") {
+                text.push_str(&delta);
+            }
+        }
+
+        assert_eq!(text, "resumed-with-answer");
+        assert!(provider.saw_resumed_tool_result());
+        assert!(
+            store
+                .load(&session_id)
+                .await
+                .expect("stored session")
+                .snapshot
+                .tool_results()
+                .any(|result| result.name == QUESTION_TOOL_NAME
+                    && result.content == "resume-answer-123")
+        );
+    }
+
+    #[derive(Default)]
+    struct DurableResumeProvider {
+        requests: Mutex<usize>,
+        saw_resumed_tool_result: Mutex<bool>,
+    }
+
+    impl DurableResumeProvider {
+        fn saw_resumed_tool_result(&self) -> bool {
+            *self
+                .saw_resumed_tool_result
+                .lock()
+                .expect("resume flag lock")
+        }
+    }
+
+    impl crate::LlmStream for DurableResumeProvider {
+        fn name(&self) -> &'static str {
+            "durable_resume_provider"
+        }
+
+        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            let mut requests = self.requests.lock().expect("request lock");
+            let events = match *requests {
+                0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                    "question-call-1",
+                    QUESTION_TOOL_NAME,
+                    json!({
+                        "questions": [
+                            {
+                                "question": "Choose a path",
+                                "header": "Path",
+                                "options": [
+                                    {
+                                        "label": "Resume",
+                                        "description": "Continue the durable session"
+                                    }
+                                ],
+                                "multiple": false
+                            }
+                        ]
+                    }),
+                )))],
+                1 => {
+                    assert!(
+                        request
+                            .tool_results()
+                            .any(|result| result.name == QUESTION_TOOL_NAME
+                                && result.content == "resume-answer-123"),
+                        "resumed provider request did not include question answer: {request:?}"
+                    );
+                    *self
+                        .saw_resumed_tool_result
+                        .lock()
+                        .expect("resume flag lock") = true;
+                    vec![
+                        Ok(CompletionEvent::Delta("resumed-with-answer".to_owned())),
+                        Ok(CompletionEvent::Finished),
+                    ]
+                }
+                turn => panic!("unexpected provider request turn {turn}"),
+            };
+            *requests += 1;
+            Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
+        }
+    }
+
+    fn expected_turn_metadata() -> crate::ProviderTurnMetadata {
+        crate::ProviderTurnMetadata {
+            provider: "metadata_provider".to_owned(),
+            url: "memory://metadata-provider".to_owned(),
+            model: "metadata-model".to_owned(),
+            usage: Some(crate::TokenUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(3),
+            }),
+            resume: json!({ "response_id": "resp-1" }),
+        }
+    }
+
+    #[derive(Default)]
+    struct MetadataEmittingProvider {
+        requests: Mutex<usize>,
+    }
+
+    impl crate::LlmStream for MetadataEmittingProvider {
+        fn name(&self) -> &'static str {
+            "metadata_provider"
+        }
+
+        fn project_request(&self, request: &CompletionRequest<'_>) -> Option<serde_json::Value> {
+            Some(json!({ "wire": "projected", "prompt": request.prompt }))
+        }
+
+        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            let mut requests = self.requests.lock().expect("request lock");
+            let events = match *requests {
+                0 => vec![
+                    Ok(CompletionEvent::Delta("first".to_owned())),
+                    Ok(CompletionEvent::ProviderMetadata(expected_turn_metadata())),
+                    Ok(CompletionEvent::Finished),
+                ],
+                1 => {
+                    assert_eq!(
+                        request
+                            .turns
+                            .first()
+                            .and_then(|turn| turn.metadata.as_ref()),
+                        Some(&expected_turn_metadata()),
+                        "same-family provider should see prior turn metadata"
+                    );
+                    vec![
+                        Ok(CompletionEvent::Delta("second".to_owned())),
+                        Ok(CompletionEvent::Finished),
+                    ]
+                }
+                turn => panic!("unexpected provider request {turn}"),
+            };
+            *requests += 1;
+            Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
+        }
+    }
+
+    struct ForeignMetadataProvider;
+
+    impl crate::LlmStream for ForeignMetadataProvider {
+        fn name(&self) -> &'static str {
+            "other_provider"
+        }
+
+        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            assert_eq!(
+                request
+                    .turns
+                    .first()
+                    .and_then(|turn| turn.metadata.as_ref()),
+                Some(&expected_turn_metadata()),
+                "generic agent loop should not filter provider metadata: {request:?}"
+            );
+            let events = vec![Ok(CompletionEvent::Finished)];
+            Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
+        }
+    }
+
+    async fn drain<S>(mut stream: S)
+    where
+        S: futures_util::Stream<Item = crate::Result<AgentEvent>> + Unpin,
+    {
+        while let Some(event) = stream.next().await {
+            event.expect("agent event");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_projection_and_turn_metadata_are_journaled() {
+        let provider = MetadataEmittingProvider::default();
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = Agent::builder(model).build();
+        let store = MemorySessionStore::new();
+        let sessions = agent.sessions(store.clone());
+        let session_id = sessions
+            .create()
+            .await
+            .expect("created session")
+            .id()
+            .clone();
+
+        drain(
+            sessions
+                .prompt(&provider, session_id.clone(), "hello")
+                .stream(),
+        )
+        .await;
+
+        let record = store.load(&session_id).await.expect("stored session");
+        let request = record.requests.first().expect("journaled request record");
+        assert_eq!(
+            request.projected_request,
+            json!({ "wire": "projected", "prompt": "hello" }),
+            "projected request must be the provider wire payload"
+        );
+        assert_ne!(request.projected_request, request.canonical_request);
+        assert_eq!(
+            record
+                .snapshot
+                .turns
+                .first()
+                .and_then(|turn| turn.metadata.clone()),
+            Some(expected_turn_metadata())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_turn_metadata_is_forwarded_without_agent_filtering() {
+        let provider = MetadataEmittingProvider::default();
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = Agent::builder(model).build();
+        let store = MemorySessionStore::new();
+        let sessions = agent.sessions(store.clone());
+        let session_id = sessions
+            .create()
+            .await
+            .expect("created session")
+            .id()
+            .clone();
+
+        drain(
+            sessions
+                .prompt(&provider, session_id.clone(), "first prompt")
+                .stream(),
+        )
+        .await;
+        // Same provider sees the journaled metadata (asserted in-provider).
+        drain(
+            sessions
+                .prompt(&provider, session_id.clone(), "second prompt")
+                .stream(),
+        )
+        .await;
+        // Filtering is provider-owned, not performed by the generic agent loop.
+        drain(
+            sessions
+                .prompt(&ForeignMetadataProvider, session_id, "third prompt")
+                .stream(),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -494,7 +839,7 @@ mod tests {
 
         fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
             Box::pin(async move {
-                let events = match request.tool_results.len() {
+                let events = match request.tool_results().count() {
                     0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                         "read_once",
                         "read",
@@ -524,7 +869,7 @@ mod tests {
         fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
             let root = self.root.display().to_string();
             Box::pin(async move {
-                let events = match request.tool_results.len() {
+                let events = match request.tool_results().count() {
                     0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                         "read_once",
                         "read",
@@ -615,7 +960,7 @@ mod tests {
         }
 
         fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            let is_continuation = !request.tool_results.is_empty();
+            let is_continuation = request.tool_results().next().is_some();
             Box::pin(async move {
                 let events = if is_continuation {
                     vec![
@@ -732,6 +1077,7 @@ mod tests {
                 }
                 AgentEvent::TextDelta { delta, .. } => final_text.push_str(&delta),
                 AgentEvent::ThinkingDelta { .. }
+                | AgentEvent::ExternalRequest { .. }
                 | AgentEvent::ToolCall { .. }
                 | AgentEvent::TurnFinished { .. }
                 | AgentEvent::Finished { .. } => {}
@@ -759,6 +1105,7 @@ mod tests {
                 }
                 AgentEvent::Finished { state } => final_state = Some(state),
                 AgentEvent::TextDelta { .. }
+                | AgentEvent::ExternalRequest { .. }
                 | AgentEvent::ToolCall { .. }
                 | AgentEvent::ToolResult { .. }
                 | AgentEvent::TurnFinished { .. } => {}
@@ -772,7 +1119,6 @@ mod tests {
             state.events[0],
             super::AgentTranscriptEvent::Thinking { ref text, .. } if text == "hidden thought"
         ));
-        assert_eq!(state.thinking_blocks.len(), 1);
     }
 
     struct ThinkingProvider;
@@ -861,7 +1207,7 @@ mod tests {
                     ])) as BoxCompletionStream)
                 } else {
                     *self.saw_replayed_thinking.lock().expect("lock") =
-                        request.thinking_blocks.len() == 1;
+                        request.thinking_blocks().count() == 1;
                     Ok(Box::pin(stream::iter(vec![
                         Ok(CompletionEvent::Delta("done".to_owned())),
                         Ok(CompletionEvent::Finished),
@@ -880,7 +1226,7 @@ mod tests {
 
         fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
             Box::pin(async move {
-                let events = if request.tool_results.is_empty() {
+                let events = if request.tool_results().next().is_none() {
                     vec![
                         Ok(CompletionEvent::ToolCall(ToolCall::new(
                             "call_1",
@@ -891,7 +1237,10 @@ mod tests {
                     ]
                 } else {
                     assert!(
-                        request.tool_results[0]
+                        request
+                            .tool_results()
+                            .next()
+                            .expect("tool result")
                             .content
                             .contains("validation failed")
                     );

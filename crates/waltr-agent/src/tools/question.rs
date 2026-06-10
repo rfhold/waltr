@@ -1,6 +1,6 @@
 //! Structured user question tool configuration.
 
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::fmt;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -10,46 +10,27 @@ use crate::{AgentTool, LlmError, Result, ToolCall, ToolDefinition};
 /// Provider-facing question tool name.
 pub const QUESTION_TOOL_NAME: &str = "question";
 
-type QuestionFuture = Pin<Box<dyn Future<Output = Result<QuestionOutput>> + Send>>;
-type QuestionHandler = dyn Fn(QuestionInput) -> QuestionFuture + Send + Sync;
-
 /// Configuration for the structured user question tool.
-#[derive(Clone)]
-pub struct QuestionConfig {
-    handler: Arc<QuestionHandler>,
-}
+#[derive(Clone, Default)]
+pub struct QuestionConfig;
 
 impl QuestionConfig {
-    /// Create question tool configuration with a synchronous host callback.
-    pub fn new(
-        handler: impl Fn(QuestionInput) -> Result<QuestionOutput> + Send + Sync + 'static,
-    ) -> Self {
-        Self::new_async(move |input| std::future::ready(handler(input)))
-    }
-
-    /// Create question tool configuration with an asynchronous host callback.
-    pub fn new_async<F, Fut>(handler: F) -> Self
-    where
-        F: Fn(QuestionInput) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<QuestionOutput>> + Send + 'static,
-    {
-        Self {
-            handler: Arc::new(move |input| Box::pin(handler(input))),
-        }
+    /// Create question tool configuration.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Convert this configuration into the `question` agent tool.
     #[must_use]
     pub fn into_agent_tool(self) -> AgentTool {
-        let handler = self.handler;
-        AgentTool::new_async(question_definition(), move |call| {
-            let handler = Arc::clone(&handler);
-            Box::pin(async move {
-                let input = tool_input::<QuestionInput>(call)?;
-                input.validate()?;
-                let output = handler(input).await?;
-                Ok(serde_json::to_string(&output)?)
-            })
+        AgentTool::new(question_definition(), move |call| {
+            let input = tool_input::<QuestionInput>(call)?;
+            input.validate()?;
+            Err(question_error(format!(
+                "question tool call {} must suspend for external response",
+                call.id
+            )))
         })
     }
 }

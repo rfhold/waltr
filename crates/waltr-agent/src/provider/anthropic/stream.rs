@@ -8,6 +8,13 @@ pub(super) async fn send_request(
     provider: &AnthropicMessages,
     request: CompletionRequest<'_>,
 ) -> Result<BoxCompletionStream> {
+    // Must stay in lockstep with `LlmStream::project_request`: the journaled
+    // projection is the exact payload sent here.
+    let request = request.for_provider_identity(
+        super::ANTHROPIC_MESSAGES_NAME,
+        &provider.messages_url,
+        &provider.model,
+    );
     let mut request_builder = provider
         .client
         .post(&provider.messages_url)
@@ -35,17 +42,26 @@ pub(super) async fn send_request(
         });
     }
 
-    Ok(completion_stream(response.bytes_stream()))
+    Ok(completion_stream(
+        response.bytes_stream(),
+        AnthropicParser::new(
+            super::ANTHROPIC_MESSAGES_NAME,
+            &provider.messages_url,
+            &provider.model,
+        ),
+    ))
 }
 
-fn completion_stream<S, B>(bytes_stream: S) -> BoxCompletionStream
+fn completion_stream<S, B>(bytes_stream: S, parser: AnthropicParser) -> BoxCompletionStream
 where
     S: Stream<Item = std::result::Result<B, reqwest::Error>> + Send + 'static,
     B: AsRef<[u8]> + Send + 'static,
 {
+    // Parser progress is intentionally not persisted: crash recovery retries
+    // the whole turn from the journaled request record.
     let bytes_stream = Box::pin(bytes_stream);
     Box::pin(futures_stream::unfold(
-        (bytes_stream, Vec::new(), AnthropicParser::default(), false),
+        (bytes_stream, Vec::new(), parser, false),
         |(mut bytes_stream, mut buffer, mut parser, done)| async move {
             if done {
                 return None;

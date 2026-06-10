@@ -2,17 +2,40 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use crate::{CompletionEvent, LlmError, Result, ThinkingDelta, ToolCall};
+use crate::{
+    CompletionEvent, LlmError, ProviderTurnMetadata, Result, ThinkingDelta, TokenUsage, ToolCall,
+};
 
 use super::{PROVIDER, thinking::AnthropicThinkingBlock};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct AnthropicParser {
+    provider: &'static str,
+    url: String,
+    model: String,
     tool_call: Option<AnthropicToolCall>,
     thinking_blocks: HashMap<usize, AnthropicThinkingBlock>,
+    message_id: Option<String>,
+    input_tokens: Option<u64>,
 }
 
 impl AnthropicParser {
+    pub(super) fn new(
+        provider: &'static str,
+        url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            url: url.into(),
+            model: model.into(),
+            tool_call: None,
+            thinking_blocks: HashMap::new(),
+            message_id: None,
+            input_tokens: None,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn map_event(&mut self, value: &Value) -> Result<Option<CompletionEvent>> {
         match value.get("type").and_then(Value::as_str) {
@@ -94,6 +117,24 @@ impl AnthropicParser {
                     .map(AnthropicToolCall::into_event)
                     .transpose()
             }
+            Some("message_start") => {
+                let message = &value["message"];
+                self.message_id = message["id"].as_str().map(str::to_owned);
+                self.input_tokens = message["usage"]["input_tokens"].as_u64();
+                Ok(None)
+            }
+            Some("message_delta") => Ok(Some(CompletionEvent::ProviderMetadata(
+                ProviderTurnMetadata {
+                    provider: self.provider.to_owned(),
+                    url: self.url.clone(),
+                    model: self.model.clone(),
+                    usage: Some(TokenUsage {
+                        input_tokens: self.input_tokens.take(),
+                        output_tokens: value["usage"]["output_tokens"].as_u64(),
+                    }),
+                    resume: json!({ "message_id": self.message_id.take() }),
+                },
+            ))),
             Some("message_stop") => Ok(Some(CompletionEvent::Finished)),
             Some("error") => Err(LlmError::Api {
                 provider: PROVIDER,
@@ -121,6 +162,55 @@ impl AnthropicToolCall {
         Ok(CompletionEvent::ToolCall(ToolCall::new(
             self.id, self.name, arguments,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::provider::anthropic::ANTHROPIC_MESSAGES_NAME;
+
+    use super::*;
+
+    #[test]
+    fn message_delta_emits_provider_metadata_with_usage_and_message_id() {
+        let mut parser = AnthropicParser::new(
+            ANTHROPIC_MESSAGES_NAME,
+            "https://example.test/v1/messages",
+            "claude-test",
+        );
+
+        let started = parser
+            .map_event(&json!({
+                "type": "message_start",
+                "message": { "id": "msg_123", "usage": { "input_tokens": 7 } },
+            }))
+            .expect("message_start parses");
+        assert!(started.is_none());
+
+        let event = parser
+            .map_event(&json!({
+                "type": "message_delta",
+                "usage": { "output_tokens": 9 },
+            }))
+            .expect("message_delta parses")
+            .expect("message_delta emits metadata");
+
+        let CompletionEvent::ProviderMetadata(metadata) = event else {
+            panic!("expected provider metadata, got {event:?}");
+        };
+        assert_eq!(metadata.provider, ANTHROPIC_MESSAGES_NAME);
+        assert_eq!(metadata.url, "https://example.test/v1/messages");
+        assert_eq!(metadata.model, "claude-test");
+        assert_eq!(
+            metadata.usage,
+            Some(TokenUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(9),
+            })
+        );
+        assert_eq!(metadata.resume, json!({ "message_id": "msg_123" }));
     }
 }
 

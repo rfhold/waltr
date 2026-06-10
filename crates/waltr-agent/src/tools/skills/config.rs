@@ -33,6 +33,7 @@ impl SkillsConfig {
     /// Render a system prompt catalog for initially visible skills.
     #[must_use]
     pub fn system_prompt(&self) -> Option<String> {
+        // TODO(agent-runtime): Build skill catalogs through durable middleware state.
         render_skills_catalog(&self.discover(), "Available skills:")
     }
 

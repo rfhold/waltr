@@ -32,6 +32,7 @@ impl FilesystemConfig {
         input: &ReadInput,
         context: &mut AgentToolContext,
     ) -> Result<String> {
+        // TODO(agent-runtime): Move AGENTS/skills injections to read-hook tool-result middleware.
         let path = self.resolved_existing_path(&model_path(&input.file_path))?;
         let mut output = Self::read_path(input, &path)?;
         if self.agents_read_context && path.is_file() {

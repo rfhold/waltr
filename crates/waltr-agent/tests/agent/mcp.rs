@@ -136,7 +136,7 @@ impl LlmStream for ScriptedMcpProvider {
     }
 
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        let step = request.tool_results.len();
+        let step = request.tool_results().count();
         Box::pin(
             async move { Ok(Box::pin(stream::iter(direct_events(step))) as BoxCompletionStream) },
         )

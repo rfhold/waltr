@@ -5,11 +5,14 @@ mod request;
 mod stream;
 mod thinking;
 
+use serde_json::Value;
+
 use crate::{CompletionRequest, LlmStream, stream::BoxStreamFuture};
 
 pub use thinking::{AnthropicThinkingConfig, AnthropicThinkingDisplay};
 
 const PROVIDER: &str = "anthropic";
+const ANTHROPIC_MESSAGES_NAME: &str = "anthropic_messages";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const DEFAULT_MAX_TOKENS: u32 = 256;
 
@@ -61,7 +64,18 @@ impl AnthropicMessages {
 
 impl LlmStream for AnthropicMessages {
     fn name(&self) -> &'static str {
-        "anthropic_messages"
+        ANTHROPIC_MESSAGES_NAME
+    }
+
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<Value> {
+        let request =
+            request.for_provider_identity(ANTHROPIC_MESSAGES_NAME, &self.messages_url, &self.model);
+        Some(request::messages_request(
+            &self.model,
+            self.max_tokens,
+            self.thinking.as_ref(),
+            &request,
+        ))
     }
 
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {

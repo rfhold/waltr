@@ -1,28 +1,6 @@
 //! Permission request types.
 
-use crate::ToolCall;
-
 use super::{PermissionClaim, PermissionEffect};
-
-/// Permission check context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PermissionCheckContext<'a> {
-    /// Tool name being checked.
-    pub tool_name: &'a str,
-    /// Claims being checked.
-    pub claims: &'a [PermissionClaim],
-}
-
-/// Permission request passed to an ask handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionRequest {
-    /// Tool call being checked.
-    pub tool_call: ToolCall,
-    /// Claims requiring a decision.
-    pub claims: Vec<PermissionClaim>,
-    /// Human-readable request summary.
-    pub summary: String,
-}
 
 pub(in crate::permission) fn denial_message(prefix: &str, claims: &[PermissionClaim]) -> String {
     let summaries = claims

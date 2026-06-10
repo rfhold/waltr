@@ -1,7 +1,7 @@
 //! Model registry, pricing, and usage metadata.
 //!
-//! TODO: Keep static `ModelRef` compatibility in `model.rs` while this module
-//! grows the dynamic catalog and cost-tracking support.
+//! Static `ModelRef` compatibility remains in `model.rs` while this module grows
+//! the dynamic catalog and cost-tracking support.
 
 pub mod catalog;
 pub mod models_dev;
