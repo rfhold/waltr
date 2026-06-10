@@ -1,11 +1,13 @@
 //! `OpenAI` Responses websocket transport.
 
+use std::sync::Arc;
+
 use futures_util::{SinkExt, StreamExt, stream};
 use http::HeaderValue;
-use serde_json::json;
-use tokio_tungstenite::connect_async;
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 
 use crate::LlmError;
 use crate::provider::openai::reasoning::{OpenAiReasoningConfig, openai_reasoning};
@@ -54,9 +56,62 @@ impl OpenAiResponsesWebSocket {
     }
 }
 
+/// Build a TLS connector with an explicit crypto provider so the library never
+/// depends on (or mutates) the process-level rustls default.
+fn tls_connector() -> Result<Connector, LlmError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| LlmError::Protocol {
+        provider: RESPONSES_WEBSOCKET_NAME,
+        message: format!("failed to configure TLS: {error}"),
+    })?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
+fn response_create_payload(
+    model: &str,
+    reasoning: Option<&OpenAiReasoningConfig>,
+    request: &CompletionRequest<'_>,
+) -> Value {
+    let mut create = json!({
+        "type": "response.create",
+        "model": model,
+        "store": false,
+        "input": responses_input(request),
+        "tools": responses_tools(&request.tools),
+        // With store:false, reasoning items can only be replayed when they
+        // carry encrypted content, so always ask for it: reasoning models emit
+        // reasoning items even without an explicit reasoning config.
+        "include": ["reasoning.encrypted_content"],
+    });
+    if let Some(reasoning) = reasoning {
+        create["reasoning"] = openai_reasoning(reasoning);
+    }
+    create
+}
+
 impl LlmStream for OpenAiResponsesWebSocket {
     fn name(&self) -> &'static str {
         RESPONSES_WEBSOCKET_NAME
+    }
+
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<Value> {
+        let request = request.for_provider_identity(
+            RESPONSES_WEBSOCKET_NAME,
+            &self.responses_url,
+            &self.model,
+        );
+        Some(response_create_payload(
+            &self.model,
+            self.reasoning.as_ref(),
+            &request,
+        ))
     }
 
     fn stream_request<'a>(
@@ -64,6 +119,11 @@ impl LlmStream for OpenAiResponsesWebSocket {
         request: CompletionRequest<'a>,
     ) -> crate::stream::BoxStreamFuture<'a> {
         Box::pin(async move {
+            let request = request.for_provider_identity(
+                RESPONSES_WEBSOCKET_NAME,
+                &self.responses_url,
+                &self.model,
+            );
             let mut websocket_request = self.responses_url.as_str().into_client_request()?;
             if !self.api_key.is_empty() {
                 let authorization = HeaderValue::from_str(&format!("Bearer {}", self.api_key))
@@ -75,22 +135,21 @@ impl LlmStream for OpenAiResponsesWebSocket {
                     .headers_mut()
                     .insert("Authorization", authorization);
             }
-            let (mut websocket, _) = connect_async(websocket_request).await?;
-            let mut create = json!({
-                "type": "response.create",
-                "model": self.model,
-                "store": false,
-                "input": responses_input(&request),
-                "tools": responses_tools(&request.tools),
-            });
-            if let Some(reasoning) = &self.reasoning {
-                create["reasoning"] = openai_reasoning(reasoning);
-                create["include"] = json!(["reasoning.encrypted_content"]);
-            }
+            let (mut websocket, _) = connect_async_tls_with_config(
+                websocket_request,
+                None,
+                false,
+                Some(tls_connector()?),
+            )
+            .await?;
+            // The projected turn payload; connection negotiation stays out of
+            // the projection.
+            let create = response_create_payload(&self.model, self.reasoning.as_ref(), &request);
             websocket
                 .send(Message::Text(create.to_string().into()))
                 .await?;
-            let parser = ResponsesParser::default();
+            let parser =
+                ResponsesParser::new(RESPONSES_WEBSOCKET_NAME, &self.responses_url, &self.model);
 
             Ok(Box::pin(stream::unfold(
                 (websocket, parser, Vec::<CompletionEvent>::new(), false),

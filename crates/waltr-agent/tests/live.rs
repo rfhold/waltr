@@ -5,6 +5,8 @@ mod live_provider;
 #[path = "agent/session.rs"]
 mod session;
 
+#[path = "live/agent/coding_agent.rs"]
+mod coding_agent;
 #[path = "live/agent/context.rs"]
 mod context;
 #[path = "live/agent/filesystem.rs"]
@@ -17,6 +19,10 @@ mod mcp;
 mod permissions;
 #[path = "live/agent/question.rs"]
 mod question;
+#[path = "live/agent/session_providers.rs"]
+mod session_providers;
+#[path = "live/agent/session_storage.rs"]
+mod session_storage;
 #[cfg(feature = "shell")]
 #[path = "live/agent/shell.rs"]
 mod shell;

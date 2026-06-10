@@ -3,12 +3,12 @@
 mod parser;
 mod request;
 
-use serde_json::json;
+use serde_json::Value;
 
 use crate::stream::{CompletionRequest, LlmStream};
 
 use self::parser::ChatParser;
-use self::request::{chat_messages, chat_tools};
+use self::request::chat_body;
 use super::shared::{CHAT_COMPLETIONS_NAME, stream_openai_http};
 
 /// `OpenAI` Chat Completions HTTP streaming provider.
@@ -45,19 +45,28 @@ impl LlmStream for OpenAiChatCompletions {
         CHAT_COMPLETIONS_NAME
     }
 
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<Value> {
+        let request = request.for_provider_identity(
+            CHAT_COMPLETIONS_NAME,
+            &self.completions_url,
+            &self.model,
+        );
+        Some(chat_body(&self.model, &request))
+    }
+
     fn stream_request<'a>(
         &'a self,
         request: CompletionRequest<'a>,
     ) -> crate::stream::BoxStreamFuture<'a> {
         Box::pin(async move {
-            let body = json!({
-                "model": self.model,
-                "stream": true,
-                "store": false,
-                "messages": chat_messages(&request),
-                "tools": chat_tools(&request.tools),
-            });
-            let mut parser = ChatParser::default();
+            let request = request.for_provider_identity(
+                CHAT_COMPLETIONS_NAME,
+                &self.completions_url,
+                &self.model,
+            );
+            let body = chat_body(&self.model, &request);
+            let mut parser =
+                ChatParser::new(CHAT_COMPLETIONS_NAME, &self.completions_url, &self.model);
 
             stream_openai_http(
                 CHAT_COMPLETIONS_NAME,

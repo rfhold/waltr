@@ -1,14 +1,13 @@
 //! Agent state and transcript types.
 
-use crate::{ThinkingBlock, ToolCall, ToolResult};
+use crate::{ToolCall, ToolResult};
+use serde::{Deserialize, Serialize};
 
-/// Accumulated agent state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Accumulated agent transcript state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentState {
     /// Ordered transcript events accumulated by the agent loop.
     pub events: Vec<AgentTranscriptEvent>,
-    /// Provider-specific thinking/reasoning blocks accumulated for replay.
-    pub thinking_blocks: Vec<ThinkingBlock>,
 }
 
 impl AgentState {
@@ -40,7 +39,7 @@ impl AgentState {
 }
 
 /// Ordered persisted agent transcript event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentTranscriptEvent {
     /// Thinking/reasoning emitted by the model.
     Thinking {

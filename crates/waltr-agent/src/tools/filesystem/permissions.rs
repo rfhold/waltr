@@ -16,6 +16,7 @@ impl FilesystemConfig {
         kind: FilesystemToolKind,
         call: &ToolCall,
     ) -> Result<Vec<PermissionClaim>> {
+        // TODO(agent-runtime): Produce and evaluate claims in before_tool_call middleware.
         match kind {
             FilesystemToolKind::Read => {
                 let input = tool_input::<ReadInput>(call)?;

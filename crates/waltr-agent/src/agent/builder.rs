@@ -1,10 +1,11 @@
 //! Agent construction and configuration.
 
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{fmt, path::PathBuf};
 
 use crate::{
-    ModelRef, PermissionPolicy, Result, SharedPermissionHandler, SystemPromptBuilder,
+    ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
     mcp::McpConfig,
+    middleware::{AgentMiddleware, chain::MiddlewareChain},
     prompt::{AgentsPromptConfig, FilesystemPromptConfig},
     tools::{
         filesystem::FilesystemConfig,
@@ -22,14 +23,16 @@ use super::{Agent, AgentTool};
 #[derive(Clone)]
 pub struct AgentBuilder {
     model: ModelRef,
+    // TODO(agent-runtime): Agent should keep only model/base tools/middleware defaults.
     tools: Vec<AgentTool>,
+    middleware_chain: MiddlewareChain,
     system_prompt: SystemPromptBuilder,
+    // TODO(agent-runtime): Persist AGENTS/skills state in session context, not Agent config.
     agents_system_paths: Vec<PathBuf>,
     visible_skills: Vec<SkillDefinition>,
     skills_enabled: bool,
     permission_policy: PermissionPolicy,
     explicit_permission_policy: bool,
-    permission_handler: Option<SharedPermissionHandler>,
 }
 
 impl AgentBuilder {
@@ -39,13 +42,13 @@ impl AgentBuilder {
         Self {
             model,
             tools: Vec::new(),
+            middleware_chain: MiddlewareChain::new(),
             system_prompt: SystemPromptBuilder::new(),
             agents_system_paths: Vec::new(),
             visible_skills: Vec::new(),
             skills_enabled: false,
             permission_policy: PermissionPolicy::default(),
             explicit_permission_policy: false,
-            permission_handler: None,
         }
     }
 
@@ -132,6 +135,8 @@ impl AgentBuilder {
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_question_tool(mut self, config: QuestionConfig) -> Self {
         self.tools.push(config.into_agent_tool());
+        self.middleware_chain
+            .push(crate::middleware::question_suspension::QuestionSuspensionMiddleware);
         self
     }
 
@@ -164,13 +169,22 @@ impl AgentBuilder {
         self
     }
 
-    /// Add a permission request handler for contextual ask decisions.
+    /// Add middleware to the agent's default middleware chain.
     #[must_use]
-    pub fn with_permission_handler(
-        mut self,
-        handler: impl Fn(&crate::PermissionRequest) -> crate::PermissionDecision + Send + Sync + 'static,
-    ) -> Self {
-        self.permission_handler = Some(Arc::new(handler));
+    #[allow(dead_code)]
+    pub(crate) fn with_middleware<M>(mut self, middleware: M) -> Self
+    where
+        M: AgentMiddleware + 'static,
+    {
+        self.middleware_chain.push(middleware);
+        self
+    }
+
+    /// Replace the agent's default middleware chain.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn with_middleware_chain(mut self, middleware_chain: MiddlewareChain) -> Self {
+        self.middleware_chain = middleware_chain;
         self
     }
 
@@ -185,15 +199,16 @@ impl AgentBuilder {
     /// Build the agent configuration.
     #[must_use]
     pub fn build(self) -> Agent {
+        // TODO(agent-runtime): Construct a slim Agent plus session defaults instead.
         Agent {
             model: self.model,
             tools: self.tools,
+            middleware_chain: self.middleware_chain,
             system_prompt: self.system_prompt.build(),
             agents_system_paths: self.agents_system_paths,
             visible_skills: self.visible_skills,
             skills_enabled: self.skills_enabled,
             permission_policy: self.permission_policy,
-            permission_handler: self.permission_handler,
         }
     }
 }
@@ -204,6 +219,7 @@ impl fmt::Debug for AgentBuilder {
             .debug_struct("AgentBuilder")
             .field("model", &self.model)
             .field("tools", &self.tools)
+            .field("middleware_chain_len", &self.middleware_chain.len())
             .field("system_prompt", &self.system_prompt)
             .field("agents_system_paths", &self.agents_system_paths)
             .field("visible_skills", &self.visible_skills)
@@ -213,7 +229,6 @@ impl fmt::Debug for AgentBuilder {
                 "explicit_permission_policy",
                 &self.explicit_permission_policy,
             )
-            .field("has_permission_handler", &self.permission_handler.is_some())
             .finish()
     }
 }

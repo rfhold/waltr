@@ -2,7 +2,7 @@
 
 use futures_util::Stream;
 
-use crate::{Result, ToolCall, ToolResult};
+use crate::{Result, ToolCall, ToolResult, middleware::ExternalRequestDraft};
 
 use super::AgentState;
 
@@ -41,12 +41,20 @@ pub enum AgentEvent {
         /// Tool result returned by the host.
         result: ToolResult,
     },
+    /// External request emitted because runtime progress is suspended.
+    ExternalRequest {
+        /// Model turn that originated the external request.
+        turn: usize,
+        /// External request draft emitted to the host.
+        request: ExternalRequestDraft,
+    },
     /// Current model turn finished.
     TurnFinished {
         /// Model turn that finished.
         turn: usize,
     },
     /// Agent loop finished with final state.
+    // TODO(agent-runtime): Completion should expose session state, not ad hoc AgentState.
     Finished {
         /// Final accumulated agent state.
         state: AgentState,

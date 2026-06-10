@@ -1,25 +1,50 @@
 //! `OpenAI` Chat Completions parser.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::Result;
 use crate::stream::CompletionEvent;
+use crate::{ProviderTurnMetadata, Result, TokenUsage};
 
 use super::super::shared::{CHAT_COMPLETIONS_NAME, PartialToolCall, api_error};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct ChatParser {
+    provider: &'static str,
+    url: String,
+    model: String,
     tool_calls: Vec<PartialToolCall>,
 }
 
 impl ChatParser {
+    pub(super) fn new(
+        provider: &'static str,
+        url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider,
+            url: url.into(),
+            model: model.into(),
+            tool_calls: Vec::new(),
+        }
+    }
+
     pub(super) fn parse_event(&mut self, data: &str) -> Result<Vec<CompletionEvent>> {
-        parse_chat_event(data, &mut self.tool_calls)
+        parse_chat_event(
+            data,
+            self.provider,
+            &self.url,
+            &self.model,
+            &mut self.tool_calls,
+        )
     }
 }
 
 fn parse_chat_event(
     data: &str,
+    provider: &str,
+    url: &str,
+    model: &str,
     tool_calls: &mut Vec<PartialToolCall>,
 ) -> Result<Vec<CompletionEvent>> {
     if data == "[DONE]" {
@@ -29,6 +54,23 @@ fn parse_chat_event(
     let value: Value = serde_json::from_str(data)?;
     if let Some(error) = value.get("error") {
         return Err(api_error(CHAT_COMPLETIONS_NAME, error));
+    }
+
+    // The usage chunk (`stream_options.include_usage`) has an empty `choices`
+    // array and arrives before `[DONE]`.
+    if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+        return Ok(vec![CompletionEvent::ProviderMetadata(
+            ProviderTurnMetadata {
+                provider: provider.to_owned(),
+                url: url.to_owned(),
+                model: model.to_owned(),
+                usage: Some(TokenUsage {
+                    input_tokens: usage["prompt_tokens"].as_u64(),
+                    output_tokens: usage["completion_tokens"].as_u64(),
+                }),
+                resume: json!({ "completion_id": value["id"] }),
+            },
+        )]);
     }
 
     let Some(choice) = value["choices"].get(0) else {
@@ -86,4 +128,41 @@ fn parse_chat_text_event(data: &str) -> Result<Vec<CompletionEvent>> {
         .and_then(|choice| choice["delta"]["content"].as_str())
         .map(|delta| vec![CompletionEvent::Delta(delta.to_owned())])
         .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_chunk_emits_provider_metadata_before_done() {
+        let mut parser = ChatParser::new(
+            CHAT_COMPLETIONS_NAME,
+            "https://example.test/v1/chat/completions",
+            "gpt-test",
+        );
+
+        let events = parser
+            .parse_event(
+                r#"{"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3}}"#,
+            )
+            .expect("usage chunk parses");
+
+        assert_eq!(
+            events,
+            vec![CompletionEvent::ProviderMetadata(ProviderTurnMetadata {
+                provider: CHAT_COMPLETIONS_NAME.to_owned(),
+                url: "https://example.test/v1/chat/completions".to_owned(),
+                model: "gpt-test".to_owned(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(3),
+                }),
+                resume: json!({ "completion_id": "chatcmpl-1" }),
+            })]
+        );
+
+        let done = parser.parse_event("[DONE]").expect("done parses");
+        assert_eq!(done, vec![CompletionEvent::Finished]);
+    }
 }

@@ -13,18 +13,22 @@ mod stream;
 pub mod tools;
 
 pub use agent::{
-    Agent, AgentBuilder, AgentEvent, AgentRunBuilder, AgentState, AgentTool, AgentToolContext,
-    AgentTranscriptEvent, BoxAgentEventStream,
+    Agent, AgentBuilder, AgentEvent, AgentRunBuilder, AgentSession, AgentSessionRuntime,
+    AgentSessions, AgentState, AgentTool, AgentToolContext, AgentTranscriptEvent,
+    BoxAgentEventStream, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
+    ExternalRequestStatus, ExternalResponse, FilesystemSessionStore, MemorySessionStore,
+    OpenDalSessionStore, PendingWork, PendingWorkStatus, RequestId, RequestRecord, ResumeInput,
+    Revision, RuntimeResumeOutput, S3SessionStore, ScyllaSessionStore, SessionEvent, SessionId,
+    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionStoreError,
+    SessionStoreResult, Suspension, opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
 pub use permission::{
-    PermissionCheckContext, PermissionClaim, PermissionClassRule, PermissionCommandPattern,
-    PermissionCommandRule, PermissionDecision, PermissionDirectoryRule, PermissionEffect,
-    PermissionEngine, PermissionHandler, PermissionLevel, PermissionOperation,
-    PermissionPathPattern, PermissionPattern, PermissionPolicy, PermissionRequest,
+    PermissionClaim, PermissionClassRule, PermissionCommandPattern, PermissionCommandRule,
+    PermissionDirectoryRule, PermissionEffect, PermissionEngine, PermissionLevel,
+    PermissionOperation, PermissionPathPattern, PermissionPattern, PermissionPolicy,
     PermissionResource, PermissionResourcePattern, PermissionToolRule, PermissionToolSelector,
-    SharedPermissionHandler,
 };
 #[cfg(feature = "shell")]
 pub use prompt::ShellPromptConfig;
@@ -34,8 +38,8 @@ pub use prompt::{
 };
 pub use stream::{
     BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
-    CompletionRequestBuilder, LlmStream, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, ToolCall,
-    ToolDefinition, ToolResult,
+    CompletionRequestBuilder, CompletionTurn, LlmStream, ProviderTurnMetadata, ThinkingBlock,
+    ThinkingBlockKind, ThinkingDelta, TokenUsage, ToolCall, ToolDefinition, ToolResult, TurnItem,
 };
 pub use tools::filesystem;
 pub use tools::question;

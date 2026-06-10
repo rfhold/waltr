@@ -19,6 +19,8 @@ pub(super) async fn stream_openai_http(
     body: Value,
     parse_event: impl FnMut(&str) -> Result<Vec<CompletionEvent>> + Send + 'static,
 ) -> Result<BoxCompletionStream> {
+    // `body` is the projected payload journaled by the agent loop; crash
+    // recovery retries the whole turn rather than resuming mid-stream.
     let mut request_builder = reqwest::Client::new().post(url).json(&body);
     if !api_key.is_empty() {
         request_builder = request_builder.bearer_auth(api_key);
@@ -141,6 +143,8 @@ impl SseBuffer {
     }
 }
 
+// Transient parser state only; crash recovery retries the turn from the
+// journaled request record, so partial tool calls are never persisted.
 #[derive(Debug, Clone, Default)]
 pub(super) struct PartialToolCall {
     pub(super) id: String,

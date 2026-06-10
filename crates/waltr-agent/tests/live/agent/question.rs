@@ -1,17 +1,13 @@
 //! Agent question tool integration tests.
 
 use waltr_agent::{
-    Agent, AgentTranscriptEvent, BoxStreamFuture, CompletionRequest, LlmStream, ModelRef,
-    ToolDefinition,
-    tools::question::{
-        QUESTION_TOOL_NAME, QuestionAnswer, QuestionConfig, QuestionInput, QuestionOutput,
-    },
+    Agent, BoxStreamFuture, CompletionRequest, LlmStream, ModelRef, ToolDefinition,
+    middleware::ExternalRequestKind,
+    tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::{live_provider, session::AgentTestSession};
-
-const QUESTION_LIVE_FLOW_COMPLETE: &str = "question-live-flow-complete";
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
@@ -22,56 +18,24 @@ async fn live_question_agent_loop_asks_and_uses_structured_answers() -> waltr_ag
 }
 
 async fn run_live_question(provider: impl LlmStream, model: ModelRef) -> waltr_agent::Result<()> {
-    let callback_inputs = Arc::new(Mutex::new(Vec::new()));
-    let handler_inputs = Arc::clone(&callback_inputs);
     let provider = ToolCapturingProvider::new(provider);
     let agent = Agent::builder(model)
-        .with_question_tool(QuestionConfig::new(move |input| {
-            let output = live_answers(&input);
-            handler_inputs.lock().expect("callback inputs").push(input);
-            Ok(output)
-        }))
+        .with_question_tool(QuestionConfig::new())
         .build();
-    let prompt = "Use the question tool exactly once to ask the user which implementation path to choose and which tests to include. After the question tool returns, report a concise final status containing every exact marker returned by the question tool: question-live-choice-101, question-live-test-202, question-live-custom-303, and question-live-flow-complete.";
+    let prompt = "Use the question tool exactly once to ask the user which implementation path to choose and which tests to include.";
 
     let session = AgentTestSession::run(&agent, &provider, prompt).await?;
-    session.require_tool_execution(provider.name())?;
     crate::session::report_tool_errors(&provider, &session, "question live test");
     let context = test_context(&provider, &session);
 
     assert_tool_was_surfaced(&provider, QUESTION_TOOL_NAME);
-    assert_question_tool_call(&session, &context);
+    assert!(session.final_state.is_none(), "{context}");
     assert!(
-        tool_result_text(&session).contains("question-live-choice-101"),
+        session
+            .external_requests
+            .iter()
+            .any(|request| request.kind == ExternalRequestKind::Question),
         "{context}"
-    );
-    assert!(
-        tool_result_text(&session).contains("question-live-test-202"),
-        "{context}"
-    );
-    assert!(
-        tool_result_text(&session).contains("question-live-custom-303"),
-        "{context}"
-    );
-    assert!(
-        session.text.contains("question-live-choice-101"),
-        "{context}"
-    );
-    assert!(session.text.contains("question-live-test-202"), "{context}");
-    assert!(
-        session.text.contains("question-live-custom-303"),
-        "{context}"
-    );
-    assert!(
-        session.text.contains(QUESTION_LIVE_FLOW_COMPLETE),
-        "{context}"
-    );
-
-    let inputs = callback_inputs.lock().expect("callback inputs").clone();
-    assert!(!inputs.is_empty(), "{context}");
-    assert!(
-        inputs.iter().any(|input| !input.questions.is_empty()),
-        "{inputs:#?}"
     );
 
     Ok(())
@@ -136,70 +100,12 @@ impl<P: LlmStream> LlmStream for ToolCapturingProvider<P> {
     }
 }
 
-fn live_answers(input: &QuestionInput) -> QuestionOutput {
-    QuestionOutput {
-        answers: input
-            .questions
-            .iter()
-            .map(|prompt| QuestionAnswer {
-                header: prompt.header.clone(),
-                selections: if prompt.multiple {
-                    vec![
-                        "question-live-choice-101".to_owned(),
-                        "question-live-test-202".to_owned(),
-                    ]
-                } else {
-                    vec!["question-live-choice-101".to_owned()]
-                },
-                custom: Some("question-live-test-202 question-live-custom-303".to_owned()),
-            })
-            .collect(),
-    }
-}
-
 fn assert_tool_was_surfaced(provider: &ToolCapturingProvider<impl LlmStream>, name: &str) {
     assert!(
         provider.all_tools().iter().any(|tool| tool.name == name),
         "{}",
         provider.tool_context()
     );
-}
-
-fn assert_question_tool_call(session: &AgentTestSession, context: &str) {
-    let Some(state) = &session.final_state else {
-        panic!("missing final state\n{context}");
-    };
-    assert!(
-        state.events.iter().any(|event| matches!(
-            event,
-            AgentTranscriptEvent::ToolCall { call, .. } if call.name == QUESTION_TOOL_NAME
-        )),
-        "{context}"
-    );
-    assert!(
-        state.events.iter().any(|event| matches!(
-            event,
-            AgentTranscriptEvent::ToolResult { result, .. } if result.name == QUESTION_TOOL_NAME
-        )),
-        "{context}"
-    );
-}
-
-fn tool_result_text(session: &AgentTestSession) -> String {
-    let Some(state) = &session.final_state else {
-        return String::new();
-    };
-    state
-        .events
-        .iter()
-        .filter_map(|event| match event {
-            AgentTranscriptEvent::ToolResult { result, .. } => Some(result.content.as_str()),
-            AgentTranscriptEvent::Thinking { .. }
-            | AgentTranscriptEvent::Text { .. }
-            | AgentTranscriptEvent::ToolCall { .. } => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn test_context(

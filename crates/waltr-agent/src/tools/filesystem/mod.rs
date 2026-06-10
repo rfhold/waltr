@@ -42,6 +42,7 @@ impl FilesystemConfig {
 
     fn into_agent_tool(self, kind: FilesystemToolKind) -> AgentTool {
         let mut definition = kind.definition();
+        // TODO(agent-runtime): Move filesystem root hints into dedicated edit_tool_metadata middleware.
         let root = self
             .root
             .canonicalize()

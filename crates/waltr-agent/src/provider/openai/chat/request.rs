@@ -2,7 +2,18 @@
 
 use serde_json::{Value, json};
 
-use crate::stream::{CompletionRequest, ToolCall, ToolDefinition, ToolResult};
+use crate::stream::{CompletionRequest, ToolCall, ToolDefinition, ToolResult, TurnItem};
+
+pub(super) fn chat_body(model: &str, request: &CompletionRequest<'_>) -> Value {
+    json!({
+        "model": model,
+        "stream": true,
+        "store": false,
+        "stream_options": { "include_usage": true },
+        "messages": chat_messages(request),
+        "tools": chat_tools(&request.tools),
+    })
+}
 
 pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     let mut messages = Vec::new();
@@ -10,22 +21,30 @@ pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
         messages.push(json!({ "role": "system", "content": system_prompt }));
     }
     messages.push(json!({ "role": "user", "content": request.prompt }));
-    if request.tool_calls.is_empty() {
-        return messages;
+
+    let mut pending_calls: Vec<Value> = Vec::new();
+    for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
+        match item {
+            TurnItem::Thinking(_) => {}
+            TurnItem::ToolCall(call) => pending_calls.push(chat_tool_call(call)),
+            TurnItem::ToolResult(result) => {
+                flush_assistant_tool_calls(&mut messages, &mut pending_calls);
+                messages.push(chat_tool_result(result));
+            }
+        }
     }
-
-    messages.push(json!({
-        "role": "assistant",
-        "content": null,
-        "tool_calls": request
-            .tool_calls
-            .iter()
-            .map(chat_tool_call)
-            .collect::<Vec<_>>()
-    }));
-
-    messages.extend(request.tool_results.iter().map(chat_tool_result));
+    flush_assistant_tool_calls(&mut messages, &mut pending_calls);
     messages
+}
+
+fn flush_assistant_tool_calls(messages: &mut Vec<Value>, calls: &mut Vec<Value>) {
+    if !calls.is_empty() {
+        messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": std::mem::take(calls),
+        }));
+    }
 }
 
 fn chat_tool_call(call: &ToolCall) -> Value {
@@ -65,7 +84,9 @@ pub(super) fn chat_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use crate::CompletionRequest;
+    use serde_json::json;
+
+    use crate::{CompletionRequest, CompletionTurn, ToolCall, ToolResult, TurnItem};
 
     use super::chat_messages;
 
@@ -80,5 +101,40 @@ mod tests {
         assert_eq!(messages[0]["content"], "system text");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[1]["content"], "hello");
+    }
+
+    #[test]
+    fn chat_messages_replay_turns_as_alternating_assistant_and_tool_messages() {
+        let mut request = CompletionRequest::new("hello");
+        request.turns = vec![
+            CompletionTurn {
+                turn: 0,
+                metadata: None,
+                items: vec![
+                    TurnItem::ToolCall(ToolCall::new("call-0", "echo", json!({ "value": "a" }))),
+                    TurnItem::ToolResult(ToolResult::new("call-0", "echo", "a")),
+                ],
+            },
+            CompletionTurn {
+                turn: 1,
+                metadata: None,
+                items: vec![
+                    TurnItem::ToolCall(ToolCall::new("call-1", "echo", json!({ "value": "b" }))),
+                    TurnItem::ToolResult(ToolResult::new("call-1", "echo", "b")),
+                ],
+            },
+        ];
+
+        let messages = chat_messages(&request);
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-0");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-0");
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["tool_call_id"], "call-1");
     }
 }

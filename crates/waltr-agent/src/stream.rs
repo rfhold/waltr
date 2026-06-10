@@ -3,6 +3,7 @@
 use std::{fmt, future::Future, pin::Pin};
 
 use futures_util::Stream;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::Result;
@@ -25,8 +26,37 @@ pub enum CompletionEvent {
     ThinkingBlock(ThinkingBlock),
     /// The provider requested a tool call.
     ToolCall(ToolCall),
+    /// Provider response metadata for the turn (usage, resume hints).
+    ProviderMetadata(ProviderTurnMetadata),
     /// The provider signaled that the completion is finished.
     Finished,
+}
+
+/// Provider response metadata captured for one turn.
+///
+/// Metadata is an optimization hint: replay correctness never depends on it,
+/// and providers that surface none are valid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTurnMetadata {
+    /// Provider family that produced this metadata.
+    pub provider: String,
+    /// Resolved provider endpoint URL that produced this metadata.
+    pub url: String,
+    /// Provider model that produced this metadata.
+    pub model: String,
+    /// Token usage reported by the provider, when available.
+    pub usage: Option<TokenUsage>,
+    /// Opaque provider-native resume payload (response identifiers, etc.).
+    pub resume: Value,
+}
+
+/// Typed token usage reported by a provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Input/prompt tokens consumed by the request.
+    pub input_tokens: Option<u64>,
+    /// Output/completion tokens produced by the response.
+    pub output_tokens: Option<u64>,
 }
 
 /// Provider-neutral completion request.
@@ -38,12 +68,8 @@ pub struct CompletionRequest<'a> {
     pub system_prompt: Option<&'a str>,
     /// Tools made available to the model.
     pub tools: Vec<ToolDefinition>,
-    /// Tool calls requested by earlier agent loop turns.
-    pub tool_calls: Vec<ToolCall>,
-    /// Tool results returned by earlier agent loop turns.
-    pub tool_results: Vec<ToolResult>,
-    /// Provider-specific thinking/reasoning blocks returned by earlier turns.
-    pub thinking_blocks: Vec<ThinkingBlock>,
+    /// Completed agent loop turns to replay, in turn order.
+    pub turns: Vec<CompletionTurn>,
 }
 
 impl<'a> CompletionRequest<'a> {
@@ -54,22 +80,120 @@ impl<'a> CompletionRequest<'a> {
             prompt,
             system_prompt: None,
             tools: Vec::new(),
-            tool_calls: Vec::new(),
-            tool_results: Vec::new(),
-            thinking_blocks: Vec::new(),
+            turns: Vec::new(),
         }
+    }
+
+    /// Tool calls across all replayed turns, in emission order.
+    pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.turns.iter().flat_map(CompletionTurn::tool_calls)
+    }
+
+    /// Tool results across all replayed turns, in emission order.
+    pub fn tool_results(&self) -> impl Iterator<Item = &ToolResult> {
+        self.turns.iter().flat_map(CompletionTurn::tool_results)
+    }
+
+    /// Thinking blocks across all replayed turns, in emission order.
+    pub fn thinking_blocks(&self) -> impl Iterator<Item = &ThinkingBlock> {
+        self.turns.iter().flat_map(CompletionTurn::thinking_blocks)
+    }
+
+    /// Clone this request, retaining provider metadata only when it matches the
+    /// exact provider identity that will encode the request.
+    #[must_use]
+    pub fn for_provider_identity(&self, provider: &str, url: &str, model: &str) -> Self {
+        let mut request = self.clone();
+        for turn in &mut request.turns {
+            if turn.metadata.as_ref().is_some_and(|metadata| {
+                metadata.provider != provider || metadata.url != url || metadata.model != model
+            }) {
+                turn.metadata = None;
+            }
+        }
+        request
     }
 }
 
+/// One completed provider turn, preserving item emission order for replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionTurn {
+    /// Zero-based agent loop turn index.
+    pub turn: u64,
+    /// Items produced during the turn, in emission order.
+    pub items: Vec<TurnItem>,
+    /// Provider response metadata recorded for the turn, when surfaced.
+    pub metadata: Option<ProviderTurnMetadata>,
+}
+
+impl CompletionTurn {
+    /// Create an empty turn record.
+    #[must_use]
+    pub const fn new(turn: u64) -> Self {
+        Self {
+            turn,
+            items: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    /// Find or create the record for `turn`, keeping the list ordered by turn.
+    pub fn entry(turns: &mut Vec<Self>, turn: u64) -> &mut Self {
+        let position = match turns.binary_search_by_key(&turn, |record| record.turn) {
+            Ok(position) => position,
+            Err(position) => {
+                turns.insert(position, Self::new(turn));
+                position
+            }
+        };
+        &mut turns[position]
+    }
+
+    /// Thinking blocks recorded during the turn, in emission order.
+    pub fn thinking_blocks(&self) -> impl Iterator<Item = &ThinkingBlock> {
+        self.items.iter().filter_map(|item| match item {
+            TurnItem::Thinking(block) => Some(block),
+            _ => None,
+        })
+    }
+
+    /// Tool calls recorded during the turn, in emission order.
+    pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
+        self.items.iter().filter_map(|item| match item {
+            TurnItem::ToolCall(call) => Some(call),
+            _ => None,
+        })
+    }
+
+    /// Tool results recorded during the turn, in emission order.
+    pub fn tool_results(&self) -> impl Iterator<Item = &ToolResult> {
+        self.items.iter().filter_map(|item| match item {
+            TurnItem::ToolResult(result) => Some(result),
+            _ => None,
+        })
+    }
+}
+
+/// One replayable item produced during a provider turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnItem {
+    /// Provider thinking/reasoning block.
+    Thinking(ThinkingBlock),
+    /// Tool call requested by the model.
+    ToolCall(ToolCall),
+    /// Tool result returned by the host.
+    ToolResult(ToolResult),
+}
+
 /// Provider-neutral thinking/reasoning text delta.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingDelta {
     /// Incremental thinking/reasoning text suitable for live display.
     pub text: String,
 }
 
 /// Provider-specific thinking/reasoning block preserved for replay.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingBlock {
     /// Provider family that produced this block.
     pub kind: ThinkingBlockKind,
@@ -80,7 +204,7 @@ pub struct ThinkingBlock {
 }
 
 /// Provider family for replayable thinking/reasoning payloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThinkingBlockKind {
     /// Anthropic Messages thinking block.
     Anthropic,
@@ -152,7 +276,7 @@ where
 }
 
 /// Provider-neutral tool definition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     /// Tool name.
     pub name: String,
@@ -178,7 +302,7 @@ impl ToolDefinition {
 }
 
 /// Provider-neutral tool call emitted by a model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Provider tool call identifier.
     pub id: String,
@@ -189,7 +313,7 @@ pub struct ToolCall {
 }
 
 /// Provider-neutral tool result returned by the host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     /// Provider tool call identifier.
     pub call_id: String,
@@ -243,18 +367,115 @@ pub trait LlmStream: Send + Sync {
         self.stream_request(CompletionRequest::new(prompt))
     }
 
+    /// Project the provider-native wire payload for a request without sending it.
+    ///
+    /// Providers that implement this must guarantee `stream_request` sends
+    /// exactly this payload for the same input. Returns `None` when the
+    /// provider has no native projection.
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<Value> {
+        let _ = request;
+        None
+    }
+
     /// Stream a completion request.
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CompletionRequest;
+    use serde_json::json;
+
+    use super::{
+        CompletionRequest, CompletionTurn, ProviderTurnMetadata, ThinkingBlock, ThinkingBlockKind,
+        TurnItem,
+    };
 
     #[test]
-    fn new_request_initializes_empty_thinking_blocks() {
+    fn new_request_initializes_empty_turns() {
         let request = CompletionRequest::new("hello");
 
-        assert!(request.thinking_blocks.is_empty());
+        assert!(request.turns.is_empty());
+    }
+
+    #[test]
+    fn turn_entry_creates_and_orders_records() {
+        let mut turns = Vec::new();
+
+        CompletionTurn::entry(&mut turns, 1)
+            .items
+            .push(TurnItem::Thinking(ThinkingBlock {
+                kind: ThinkingBlockKind::Anthropic,
+                text: "later".to_owned(),
+                payload: json!({}),
+            }));
+        CompletionTurn::entry(&mut turns, 0)
+            .items
+            .push(TurnItem::Thinking(ThinkingBlock {
+                kind: ThinkingBlockKind::Anthropic,
+                text: "earlier".to_owned(),
+                payload: json!({}),
+            }));
+        CompletionTurn::entry(&mut turns, 1)
+            .items
+            .push(TurnItem::ToolResult(super::ToolResult::new(
+                "call-1", "echo", "ok",
+            )));
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn, 0);
+        assert_eq!(turns[1].turn, 1);
+        assert_eq!(turns[1].items.len(), 2);
+        assert_eq!(turns[1].thinking_blocks().count(), 1);
+        assert_eq!(turns[1].tool_results().count(), 1);
+    }
+
+    #[test]
+    fn provider_identity_filter_keeps_exact_metadata_match() {
+        let mut request =
+            request_with_metadata("openai_responses", "https://a.test/v1/responses", "gpt-a");
+
+        request = request.for_provider_identity(
+            "openai_responses",
+            "https://a.test/v1/responses",
+            "gpt-a",
+        );
+
+        assert!(request.turns[0].metadata.is_some());
+    }
+
+    #[test]
+    fn provider_identity_filter_drops_url_or_model_mismatch() {
+        let request =
+            request_with_metadata("openai_responses", "https://a.test/v1/responses", "gpt-a");
+
+        let wrong_url = request.for_provider_identity(
+            "openai_responses",
+            "https://b.test/v1/responses",
+            "gpt-a",
+        );
+        let wrong_model = request.for_provider_identity(
+            "openai_responses",
+            "https://a.test/v1/responses",
+            "gpt-b",
+        );
+
+        assert!(wrong_url.turns[0].metadata.is_none());
+        assert!(wrong_model.turns[0].metadata.is_none());
+    }
+
+    fn request_with_metadata(provider: &str, url: &str, model: &str) -> CompletionRequest<'static> {
+        let mut request = CompletionRequest::new("hello");
+        request.turns = vec![CompletionTurn {
+            turn: 0,
+            items: Vec::new(),
+            metadata: Some(ProviderTurnMetadata {
+                provider: provider.to_owned(),
+                url: url.to_owned(),
+                model: model.to_owned(),
+                usage: None,
+                resume: json!({ "id": "resume-1" }),
+            }),
+        }];
+        request
     }
 }

@@ -1,5 +1,7 @@
 //! `OpenAI` Responses HTTP transport.
 
+use serde_json::Value;
+
 use crate::stream::{CompletionRequest, LlmStream};
 
 use super::OpenAiResponses;
@@ -12,12 +14,24 @@ impl LlmStream for OpenAiResponses {
         RESPONSES_NAME
     }
 
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<Value> {
+        let request =
+            request.for_provider_identity(RESPONSES_NAME, &self.responses_url, &self.model);
+        Some(responses_body(
+            &self.model,
+            self.reasoning.as_ref(),
+            &request,
+        ))
+    }
+
     fn stream_request<'a>(
         &'a self,
         request: CompletionRequest<'a>,
     ) -> crate::stream::BoxStreamFuture<'a> {
         Box::pin(async move {
-            let mut parser = ResponsesParser::default();
+            let request =
+                request.for_provider_identity(RESPONSES_NAME, &self.responses_url, &self.model);
+            let mut parser = ResponsesParser::new(RESPONSES_NAME, &self.responses_url, &self.model);
             stream_openai_http(
                 RESPONSES_NAME,
                 &self.responses_url,
