@@ -2,8 +2,6 @@
 
 use std::{fs, path::Path};
 
-use crate::AgentToolContext;
-
 use super::definition::{
     SKILL_FILE, SKILLS_DIRECTORY, SkillDefinition, canonicalize_or_clone, parse_skill_frontmatter,
 };
@@ -41,36 +39,6 @@ pub fn discover_skills_dir(root: &Path, skills_dir: &Path) -> Vec<SkillDefinitio
             .then_with(|| left.skill_dir.cmp(&right.skill_dir))
     });
     skills
-}
-
-/// Discover a `.agents/skills` root and insert newly visible skills into context.
-pub fn reveal_skills_root(
-    context: &mut AgentToolContext,
-    root: &Path,
-) -> Option<Vec<SkillDefinition>> {
-    if !context.skills_enabled {
-        return None;
-    }
-    let root = canonicalize_or_clone(root);
-    let skills_dir = root.join(SKILLS_DIRECTORY);
-    let skills_dir = canonicalize_or_clone(&skills_dir);
-    if !skills_dir.is_dir() || context.skills_revealed_roots.contains(&skills_dir) {
-        return None;
-    }
-    context.skills_revealed_roots.insert(skills_dir.clone());
-    let skills = discover_skills_dir(&root, &skills_dir);
-    let mut added = Vec::new();
-    for skill in skills {
-        if !context
-            .visible_skills
-            .iter()
-            .any(|visible| visible.skill_path == skill.skill_path)
-        {
-            context.visible_skills.push(skill.clone());
-            added.push(skill);
-        }
-    }
-    if added.is_empty() { None } else { Some(added) }
 }
 
 fn read_skill_definition(

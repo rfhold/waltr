@@ -4,7 +4,7 @@ use futures_util::Stream;
 
 use crate::{Result, ToolCall, ToolResult, middleware::ExternalRequestDraft};
 
-use super::AgentState;
+use super::session::SessionSnapshot;
 
 /// Boxed stream of agent loop events.
 pub type BoxAgentEventStream<'a> =
@@ -53,10 +53,9 @@ pub enum AgentEvent {
         /// Model turn that finished.
         turn: usize,
     },
-    /// Agent loop finished with final state.
-    // TODO(agent-runtime): Completion should expose session state, not ad hoc AgentState.
+    /// Agent loop finished with the final persisted session snapshot.
     Finished {
-        /// Final accumulated agent state.
-        state: AgentState,
+        /// Final session snapshot as persisted to the session store.
+        snapshot: SessionSnapshot,
     },
 }

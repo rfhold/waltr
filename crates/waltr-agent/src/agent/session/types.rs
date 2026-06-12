@@ -2,6 +2,8 @@
 
 #![allow(missing_docs)]
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,6 +19,7 @@ pub struct SessionId(String);
 
 impl SessionId {
     /// Generate a new durable session identifier.
+    #[must_use]
     pub fn generate() -> Self {
         Self(format!("session_{}", uuid::Uuid::now_v7()))
     }
@@ -27,6 +30,7 @@ impl SessionId {
     }
 
     /// Borrow the session identifier string.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -55,16 +59,19 @@ impl Revision {
     pub const ZERO: Self = Self(0);
 
     /// Create a revision from its raw value.
+    #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
     /// Return the raw revision value.
+    #[must_use]
     pub const fn get(self) -> u64 {
         self.0
     }
 
     /// Return the next revision.
+    #[must_use]
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
     }
@@ -81,6 +88,7 @@ impl RequestId {
     }
 
     /// Borrow the provider request identifier string.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -109,6 +117,7 @@ impl ExternalRequestId {
     }
 
     /// Borrow the external request identifier string.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -135,16 +144,19 @@ pub struct AgentSession {
 
 impl AgentSession {
     /// Create an agent session from a stored record.
-    pub fn new(record: SessionRecord) -> Self {
+    #[must_use]
+    pub const fn new(record: SessionRecord) -> Self {
         Self { record }
     }
 
     /// Return the session id.
-    pub fn id(&self) -> &SessionId {
+    #[must_use]
+    pub const fn id(&self) -> &SessionId {
         &self.record.id
     }
 
     /// Return the current revision.
+    #[must_use]
     pub const fn revision(&self) -> Revision {
         self.record.revision
     }
@@ -218,10 +230,14 @@ pub struct SessionSnapshot {
     pub pending_work: Vec<PendingWork>,
     /// External requests created by suspensions.
     pub external_requests: Vec<ExternalRequest>,
+    /// Namespaced durable middleware state blobs.
+    #[serde(default)]
+    pub middleware_state: BTreeMap<String, Value>,
 }
 
 impl SessionSnapshot {
     /// Create an empty session snapshot.
+    #[must_use]
     pub fn new(id: SessionId) -> Self {
         Self {
             id,
@@ -234,6 +250,7 @@ impl SessionSnapshot {
             status: SessionStatus::Idle,
             pending_work: Vec::new(),
             external_requests: Vec::new(),
+            middleware_state: BTreeMap::new(),
         }
     }
 
@@ -266,7 +283,7 @@ impl SessionSnapshot {
             SessionEvent::ProviderTextDelta { turn, delta }
             | SessionEvent::TextDelta { turn, delta } => {
                 self.state.events.push(AgentTranscriptEvent::Text {
-                    turn: *turn as usize,
+                    turn: turn_index(*turn),
                     text: delta.clone(),
                 });
                 self.status = SessionStatus::StreamingProvider;
@@ -274,7 +291,7 @@ impl SessionSnapshot {
             SessionEvent::ProviderThinkingDelta { turn, delta }
             | SessionEvent::ThinkingDelta { turn, delta } => {
                 self.state.events.push(AgentTranscriptEvent::Thinking {
-                    turn: *turn as usize,
+                    turn: turn_index(*turn),
                     text: delta.clone(),
                 });
                 self.status = SessionStatus::StreamingProvider;
@@ -290,83 +307,30 @@ impl SessionSnapshot {
                 self.status = SessionStatus::StreamingProvider;
             }
             SessionEvent::ToolCallRecorded { turn, call }
-            | SessionEvent::ToolCall { turn, call } => {
-                self.state.events.push(AgentTranscriptEvent::ToolCall {
-                    turn: *turn as usize,
-                    call: call.clone(),
-                });
-                CompletionTurn::entry(&mut self.turns, *turn)
-                    .items
-                    .push(TurnItem::ToolCall(call.clone()));
-                self.pending_work.push(PendingWork {
-                    id: call.id.clone(),
-                    turn: *turn,
-                    tool_call: Some(call.clone()),
-                    status: PendingWorkStatus::Pending,
-                });
-                self.status = SessionStatus::EvaluatingToolCall;
-            }
+            | SessionEvent::ToolCall { turn, call } => self.record_tool_call(*turn, call),
             SessionEvent::ToolResultRecorded { turn, result }
-            | SessionEvent::ToolResult { turn, result } => {
-                self.state.events.push(AgentTranscriptEvent::ToolResult {
-                    turn: *turn as usize,
-                    result: result.clone(),
-                });
-                CompletionTurn::entry(&mut self.turns, *turn)
-                    .items
-                    .push(TurnItem::ToolResult(result.clone()));
-                if let Some(work) = self
-                    .pending_work
-                    .iter_mut()
-                    .rev()
-                    .find(|work| work.id == result.call_id)
-                {
-                    work.status = PendingWorkStatus::Finished(result.clone());
-                }
-                self.status = SessionStatus::RunningTool;
+            | SessionEvent::ToolResult { turn, result } => self.record_tool_result(*turn, result),
+            SessionEvent::MiddlewareStateUpdated { namespace, state } => {
+                self.middleware_state
+                    .insert(namespace.clone(), state.clone());
             }
             SessionEvent::ExternalRequestCreated { request } => {
                 upsert_external_request(&mut self.external_requests, request.clone());
                 self.status = SessionStatus::Suspended(Suspension::AwaitingExternalInput {
-                    request: request.clone(),
+                    request: Box::new(request.clone()),
                 });
             }
             SessionEvent::ExternalRequestResponded {
                 request_id,
                 response,
-            } => {
-                if let Some(request) = self
-                    .external_requests
-                    .iter_mut()
-                    .rev()
-                    .find(|request| request.id == *request_id)
-                {
-                    request.status = ExternalRequestStatus::Responded(response.clone());
-                }
-                self.status = SessionStatus::RunningTool;
-            }
+            } => self.respond_external_request(request_id, response),
             SessionEvent::ExternalRequestCanceled { request_id, reason } => {
-                if let Some(request) = self
-                    .external_requests
-                    .iter_mut()
-                    .rev()
-                    .find(|request| request.id == *request_id)
-                {
-                    request.status = ExternalRequestStatus::Canceled(reason.clone());
-                }
+                self.cancel_external_request(request_id, reason);
             }
             SessionEvent::Suspended { suspension } => {
                 self.status = SessionStatus::Suspended(suspension.clone());
             }
-            SessionEvent::WorkCanceled { work_id, reason } => {
-                if let Some(work) = self
-                    .pending_work
-                    .iter_mut()
-                    .find(|work| work.id == *work_id)
-                {
-                    work.status = PendingWorkStatus::Canceled(reason.clone());
-                }
-            }
+            SessionEvent::WorkCanceled { work_id, reason } => self.cancel_work(work_id, reason),
             SessionEvent::Interrupted => {
                 self.status = SessionStatus::Suspended(Suspension::Interrupted {
                     work: self.pending_work.clone(),
@@ -384,6 +348,79 @@ impl SessionSnapshot {
                     message: message.clone(),
                 };
             }
+        }
+    }
+
+    fn record_tool_call(&mut self, turn: u64, call: &ToolCall) {
+        self.state.events.push(AgentTranscriptEvent::ToolCall {
+            turn: turn_index(turn),
+            call: call.clone(),
+        });
+        CompletionTurn::entry(&mut self.turns, turn)
+            .items
+            .push(TurnItem::ToolCall(call.clone()));
+        self.pending_work.push(PendingWork {
+            id: call.id.clone(),
+            turn,
+            tool_call: Some(call.clone()),
+            status: PendingWorkStatus::Pending,
+        });
+        self.status = SessionStatus::EvaluatingToolCall;
+    }
+
+    fn record_tool_result(&mut self, turn: u64, result: &ToolResult) {
+        self.state.events.push(AgentTranscriptEvent::ToolResult {
+            turn: turn_index(turn),
+            result: result.clone(),
+        });
+        CompletionTurn::entry(&mut self.turns, turn)
+            .items
+            .push(TurnItem::ToolResult(result.clone()));
+        if let Some(work) = self
+            .pending_work
+            .iter_mut()
+            .rev()
+            .find(|work| work.id == result.call_id)
+        {
+            work.status = PendingWorkStatus::Finished(result.clone());
+        }
+        self.status = SessionStatus::RunningTool;
+    }
+
+    fn respond_external_request(
+        &mut self,
+        request_id: &ExternalRequestId,
+        response: &ExternalResponse,
+    ) {
+        if let Some(request) = self
+            .external_requests
+            .iter_mut()
+            .rev()
+            .find(|request| request.id == *request_id)
+        {
+            request.status = ExternalRequestStatus::Responded(response.clone());
+        }
+        self.status = SessionStatus::RunningTool;
+    }
+
+    fn cancel_external_request(&mut self, request_id: &ExternalRequestId, reason: &CancelReason) {
+        if let Some(request) = self
+            .external_requests
+            .iter_mut()
+            .rev()
+            .find(|request| request.id == *request_id)
+        {
+            request.status = ExternalRequestStatus::Canceled(reason.clone());
+        }
+    }
+
+    fn cancel_work(&mut self, work_id: &str, reason: &CancelReason) {
+        if let Some(work) = self
+            .pending_work
+            .iter_mut()
+            .find(|work| work.id == *work_id)
+        {
+            work.status = PendingWorkStatus::Canceled(reason.clone());
         }
     }
 
@@ -448,6 +485,8 @@ pub enum SessionEvent {
     ToolCall { turn: u64, call: ToolCall },
     /// Tool result was appended.
     ToolResult { turn: u64, result: ToolResult },
+    /// Middleware namespace state was replaced wholesale.
+    MiddlewareStateUpdated { namespace: String, state: Value },
     /// External request was recorded before suspension was emitted.
     ExternalRequestCreated { request: ExternalRequest },
     /// External request received a durable response.
@@ -497,7 +536,7 @@ pub enum Suspension {
     /// Runtime is waiting for tool results.
     AwaitingToolResults { work: Vec<PendingWork> },
     /// Runtime is waiting for an external response.
-    AwaitingExternalInput { request: ExternalRequest },
+    AwaitingExternalInput { request: Box<ExternalRequest> },
     /// Runtime was interrupted while work was active.
     Interrupted { work: Vec<PendingWork> },
 }
@@ -554,6 +593,7 @@ pub struct ExternalResponse {
 
 impl ExternalResponse {
     /// Create an external response from provider-neutral JSON payload.
+    #[must_use]
     pub const fn new(payload: Value) -> Self {
         Self { payload }
     }
@@ -613,6 +653,10 @@ pub struct RequestRecord {
     pub projected_request: Value,
 }
 
+fn turn_index(turn: u64) -> usize {
+    usize::try_from(turn).unwrap_or(usize::MAX)
+}
+
 fn upsert_external_request(requests: &mut Vec<ExternalRequest>, request: ExternalRequest) {
     if let Some(existing) = requests
         .iter_mut()
@@ -632,17 +676,16 @@ mod tests {
     use super::*;
     use crate::{AgentTranscriptEvent, ThinkingBlockKind};
 
-    #[test]
-    fn snapshot_rebuilds_provider_facts_from_events() {
-        let id = SessionId::new("session-1");
-        let call = ToolCall::new("call-1", "read", json!({ "path": "README.md" }));
-        let result = ToolResult::new("call-1", "read", "contents");
-        let block = ThinkingBlock {
+    fn sample_thinking_block() -> ThinkingBlock {
+        ThinkingBlock {
             kind: ThinkingBlockKind::OpenAiResponses,
             text: "reasoning".to_owned(),
             payload: json!({ "id": "thinking-1" }),
-        };
-        let metadata = crate::ProviderTurnMetadata {
+        }
+    }
+
+    fn sample_turn_metadata() -> crate::ProviderTurnMetadata {
+        crate::ProviderTurnMetadata {
             provider: "openai_responses".to_owned(),
             url: "https://api.openai.com/v1/responses".to_owned(),
             model: "gpt-test".to_owned(),
@@ -651,8 +694,11 @@ mod tests {
                 output_tokens: Some(2),
             }),
             resume: json!({ "response_id": "resp-1" }),
-        };
-        let events = vec![
+        }
+    }
+
+    fn provider_fact_events(call: &ToolCall, result: &ToolResult) -> Vec<SessionEvent> {
+        vec![
             SessionEvent::PromptAppended {
                 prompt: "summarize".to_owned(),
             },
@@ -666,7 +712,7 @@ mod tests {
             },
             SessionEvent::ThinkingBlockRecorded {
                 turn: 0,
-                block: block.clone(),
+                block: sample_thinking_block(),
             },
             SessionEvent::ToolCallRecorded {
                 turn: 0,
@@ -678,14 +724,21 @@ mod tests {
             },
             SessionEvent::ProviderTurnMetadataRecorded {
                 turn: 0,
-                metadata: metadata.clone(),
+                metadata: sample_turn_metadata(),
             },
             SessionEvent::TurnFinished { turn: 0 },
             SessionEvent::Finished,
-        ];
+        ]
+    }
+
+    #[test]
+    fn snapshot_rebuilds_provider_facts_from_events() {
+        let id = SessionId::new("session-1");
+        let call = ToolCall::new("call-1", "read", json!({ "path": "README.md" }));
+        let result = ToolResult::new("call-1", "read", "contents");
 
         let mut snapshot = SessionSnapshot::new(id);
-        snapshot.apply_events(&events);
+        snapshot.apply_events(&provider_fact_events(&call, &result));
 
         assert_eq!(snapshot.current_prompt.as_deref(), Some("summarize"));
         assert_eq!(snapshot.prompts, ["summarize"]);
@@ -693,9 +746,9 @@ mod tests {
             snapshot.turns,
             [CompletionTurn {
                 turn: 0,
-                metadata: Some(metadata),
+                metadata: Some(sample_turn_metadata()),
                 items: vec![
-                    TurnItem::Thinking(block),
+                    TurnItem::Thinking(sample_thinking_block()),
                     TurnItem::ToolCall(call.clone()),
                     TurnItem::ToolResult(result.clone()),
                 ],
@@ -710,7 +763,7 @@ mod tests {
             [PendingWork {
                 id: "call-1".to_owned(),
                 turn: 0,
-                tool_call: Some(call.clone()),
+                tool_call: Some(call),
                 status: PendingWorkStatus::Finished(result),
             }]
         );
@@ -723,5 +776,84 @@ mod tests {
                 AgentTranscriptEvent::ToolResult { .. },
             ]
         ));
+    }
+
+    #[test]
+    fn middleware_state_fold_replaces_namespace_wholesale() {
+        let events = vec![
+            SessionEvent::MiddlewareStateUpdated {
+                namespace: "agents".to_owned(),
+                state: json!({ "loaded": ["a"], "stale": true }),
+            },
+            SessionEvent::MiddlewareStateUpdated {
+                namespace: "cost".to_owned(),
+                state: json!({ "tokens": 10 }),
+            },
+            SessionEvent::MiddlewareStateUpdated {
+                namespace: "agents".to_owned(),
+                state: json!({ "loaded": ["a", "b"] }),
+            },
+        ];
+
+        let mut snapshot = SessionSnapshot::new(SessionId::new("session-1"));
+        snapshot.apply_events(&events);
+
+        assert_eq!(
+            snapshot.middleware_state.get("agents"),
+            Some(&json!({ "loaded": ["a", "b"] })),
+            "later writes must replace the namespace blob, not merge it"
+        );
+        assert_eq!(
+            snapshot.middleware_state.get("cost"),
+            Some(&json!({ "tokens": 10 }))
+        );
+
+        let mut incremental = std::collections::BTreeMap::new();
+        for event in &events {
+            if let SessionEvent::MiddlewareStateUpdated { namespace, state } = event {
+                incremental.insert(namespace.clone(), state.clone());
+            }
+        }
+        assert_eq!(snapshot.middleware_state, incremental);
+    }
+
+    #[test]
+    fn middleware_state_fold_does_not_change_status() {
+        let mut snapshot = SessionSnapshot::new(SessionId::new("session-1"));
+        snapshot.apply_event(&SessionEvent::MiddlewareStateUpdated {
+            namespace: "agents".to_owned(),
+            state: json!({}),
+        });
+
+        assert_eq!(snapshot.status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn snapshot_without_middleware_state_field_deserializes_to_empty_map() {
+        let mut value = serde_json::to_value(SessionSnapshot::new(SessionId::new("session-1")))
+            .expect("serialize snapshot");
+        value
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("middleware_state")
+            .expect("field present in current schema");
+
+        let snapshot: SessionSnapshot = serde_json::from_value(value).expect("legacy snapshot");
+
+        assert!(snapshot.middleware_state.is_empty());
+    }
+
+    #[test]
+    fn middleware_state_round_trips_through_serde() {
+        let mut snapshot = SessionSnapshot::new(SessionId::new("session-1"));
+        snapshot.apply_event(&SessionEvent::MiddlewareStateUpdated {
+            namespace: "permissions".to_owned(),
+            state: json!({ "grants": ["shell"] }),
+        });
+
+        let value = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let restored: SessionSnapshot = serde_json::from_value(value).expect("restore snapshot");
+
+        assert_eq!(restored.middleware_state, snapshot.middleware_state);
     }
 }

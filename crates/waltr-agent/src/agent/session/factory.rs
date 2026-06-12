@@ -25,6 +25,10 @@ where
     }
 
     /// Create a new durable session with a generated id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session store rejects the new record.
     pub async fn create(&self) -> Result<AgentSession> {
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime.create_session(SessionId::generate()).await?;
@@ -32,6 +36,10 @@ where
     }
 
     /// Load an existing durable session by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
     pub async fn load(&self, id: &SessionId) -> Result<AgentSession> {
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime.load_session(id).await?;

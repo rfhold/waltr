@@ -40,19 +40,16 @@ impl McpRuntime {
                     ),
                     tool.input_schema.clone(),
                 );
-                tools.push(AgentTool::with_context_async(
-                    definition,
-                    move |call, _context| {
-                        let runtime = Arc::clone(&runtime);
-                        let server_name = server_name.clone();
-                        let tool_name = tool_name.clone();
-                        Box::pin(async move {
-                            runtime
-                                .call_tool(&server_name, &tool_name, call.arguments.clone())
-                                .await
-                        })
-                    },
-                ));
+                tools.push(AgentTool::new_async(definition, move |call| {
+                    let runtime = Arc::clone(&runtime);
+                    let server_name = server_name.clone();
+                    let tool_name = tool_name.clone();
+                    Box::pin(async move {
+                        runtime
+                            .call_tool(&server_name, &tool_name, call.arguments.clone())
+                            .await
+                    })
+                }));
             }
         }
         Ok(tools)

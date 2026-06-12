@@ -165,6 +165,24 @@ impl AnthropicToolCall {
     }
 }
 
+fn anthropic_error_message(value: &Value) -> String {
+    let Some(error) = value.get("error") else {
+        return value.to_string();
+    };
+
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let error_type = error.get("type").and_then(Value::as_str).map(str::to_owned);
+
+    match (error_type, message) {
+        (Some(error_type), Some(message)) => format!("{error_type}: {message}"),
+        (None, Some(message)) => message,
+        _ => error.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -211,23 +229,5 @@ mod tests {
             })
         );
         assert_eq!(metadata.resume, json!({ "message_id": "msg_123" }));
-    }
-}
-
-fn anthropic_error_message(value: &Value) -> String {
-    let Some(error) = value.get("error") else {
-        return value.to_string();
-    };
-
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let error_type = error.get("type").and_then(Value::as_str).map(str::to_owned);
-
-    match (error_type, message) {
-        (Some(error_type), Some(message)) => format!("{error_type}: {message}"),
-        (None, Some(message)) => message,
-        _ => error.to_string(),
     }
 }

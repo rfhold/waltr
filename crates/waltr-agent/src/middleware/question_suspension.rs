@@ -60,7 +60,10 @@ fn parse_question_input(call: &ToolCall) -> Result<QuestionInput> {
 mod tests {
     use serde_json::json;
 
-    use crate::{AgentState, ToolCall, ToolDefinition, middleware::context::ToolCallContext};
+    use crate::{
+        AgentState, ToolCall, ToolDefinition,
+        middleware::context::{MiddlewareStateLog, ToolCallContext},
+    };
 
     use super::*;
 
@@ -80,6 +83,8 @@ mod tests {
                 }]
             }),
         );
+        let mut claims = Vec::new();
+        let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
             session_id: "session-1",
             revision: 0,
@@ -87,7 +92,8 @@ mod tests {
             session: &session,
             call: &mut call,
             tool_definition: Some(&definition),
-            permission_claims: Some(&[]),
+            permission_claims: &mut claims,
+            middleware_state: &mut middleware_state,
         };
 
         let outcome = QuestionSuspensionMiddleware::suspend_question_call(&ctx)
@@ -111,6 +117,8 @@ mod tests {
     fn non_question_call_continues() {
         let session = AgentState::default();
         let mut call = ToolCall::new("call-1", "lookup", json!({}));
+        let mut claims = Vec::new();
+        let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
             session_id: "session-1",
             revision: 0,
@@ -118,7 +126,8 @@ mod tests {
             session: &session,
             call: &mut call,
             tool_definition: None,
-            permission_claims: None,
+            permission_claims: &mut claims,
+            middleware_state: &mut middleware_state,
         };
 
         assert!(
@@ -132,6 +141,8 @@ mod tests {
     fn invalid_question_call_errors() {
         let session = AgentState::default();
         let mut call = ToolCall::new("call-1", QUESTION_TOOL_NAME, json!({ "questions": [] }));
+        let mut claims = Vec::new();
+        let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
             session_id: "session-1",
             revision: 0,
@@ -139,7 +150,8 @@ mod tests {
             session: &session,
             call: &mut call,
             tool_definition: None,
-            permission_claims: None,
+            permission_claims: &mut claims,
+            middleware_state: &mut middleware_state,
         };
 
         let error = QuestionSuspensionMiddleware::suspend_question_call(&ctx)

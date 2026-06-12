@@ -19,6 +19,7 @@ pub struct MemorySessionStore {
 
 impl MemorySessionStore {
     /// Create an empty process-memory session store.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -48,6 +49,7 @@ impl MemorySessionStore {
         let next_revision = record.revision.next();
         let value = update(record, next_revision);
         record.revision = next_revision;
+        drop(records);
 
         Ok((next_revision, value))
     }
@@ -70,6 +72,7 @@ impl SessionStore for MemorySessionStore {
             }
 
             records.insert(record.id.clone(), record);
+            drop(records);
             Ok(())
         }
     }
@@ -89,7 +92,7 @@ impl SessionStore for MemorySessionStore {
             records
                 .get(&id)
                 .cloned()
-                .ok_or_else(|| SessionStoreError::NotFound { id })
+                .ok_or(SessionStoreError::NotFound { id })
         }
     }
 

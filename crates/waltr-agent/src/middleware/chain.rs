@@ -15,55 +15,55 @@ use super::{
 type BoxHookFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 trait ChainMiddleware: Send + Sync {
-    fn build_system_prompt<'a, 'ctx>(
+    fn build_system_prompt<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         prompt: &'a mut SystemPromptParts,
     ) -> BoxHookFuture<'a, ()>;
 
-    fn list_tools<'a, 'ctx>(
+    fn list_tools<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         tools: &'a mut ToolDraft,
     ) -> BoxHookFuture<'a, ()>;
 
-    fn edit_tool_metadata<'a, 'ctx>(
+    fn edit_tool_metadata<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         tools: &'a mut ToolDraft,
     ) -> BoxHookFuture<'a, ()>;
 
-    fn before_provider_request<'a, 'ctx>(
+    fn before_provider_request<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         request: &'a mut ModelRequestDraft,
     ) -> BoxHookFuture<'a, HookOutcome>;
 
-    fn on_provider_event<'a, 'ctx>(
+    fn on_provider_event<'a>(
         &'a self,
-        ctx: &'a mut StreamContext<'ctx>,
+        ctx: &'a mut StreamContext<'_>,
         event: &'a mut ModelEvent,
     ) -> BoxHookFuture<'a, HookOutcome>;
 
-    fn before_tool_call<'a, 'ctx>(
+    fn before_tool_call<'a>(
         &'a self,
-        ctx: &'a mut ToolCallContext<'ctx>,
+        ctx: &'a mut ToolCallContext<'_>,
     ) -> BoxHookFuture<'a, HookOutcome>;
 
-    fn after_tool_call<'a, 'ctx>(
+    fn after_tool_call<'a>(
         &'a self,
-        ctx: &'a mut ToolResultContext<'ctx>,
+        ctx: &'a mut ToolResultContext<'_>,
     ) -> BoxHookFuture<'a, HookOutcome>;
 
-    fn on_suspend<'a, 'ctx>(
+    fn on_suspend<'a>(
         &'a self,
-        ctx: &'a mut RunContext<'ctx>,
+        ctx: &'a mut RunContext<'_>,
         suspension: &'a mut Suspension,
     ) -> BoxHookFuture<'a, ()>;
 
-    fn on_resume<'a, 'ctx>(
+    fn on_resume<'a>(
         &'a self,
-        ctx: &'a mut RunContext<'ctx>,
+        ctx: &'a mut RunContext<'_>,
         input: &'a mut ResumeInput,
     ) -> BoxHookFuture<'a, ()>;
 }
@@ -72,71 +72,71 @@ impl<T> ChainMiddleware for T
 where
     T: AgentMiddleware + 'static,
 {
-    fn build_system_prompt<'a, 'ctx>(
+    fn build_system_prompt<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         prompt: &'a mut SystemPromptParts,
     ) -> BoxHookFuture<'a, ()> {
         Box::pin(AgentMiddleware::build_system_prompt(self, ctx, prompt))
     }
 
-    fn list_tools<'a, 'ctx>(
+    fn list_tools<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         tools: &'a mut ToolDraft,
     ) -> BoxHookFuture<'a, ()> {
         Box::pin(AgentMiddleware::list_tools(self, ctx, tools))
     }
 
-    fn edit_tool_metadata<'a, 'ctx>(
+    fn edit_tool_metadata<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         tools: &'a mut ToolDraft,
     ) -> BoxHookFuture<'a, ()> {
         Box::pin(AgentMiddleware::edit_tool_metadata(self, ctx, tools))
     }
 
-    fn before_provider_request<'a, 'ctx>(
+    fn before_provider_request<'a>(
         &'a self,
-        ctx: &'a mut RequestContext<'ctx>,
+        ctx: &'a mut RequestContext<'_>,
         request: &'a mut ModelRequestDraft,
     ) -> BoxHookFuture<'a, HookOutcome> {
         Box::pin(AgentMiddleware::before_provider_request(self, ctx, request))
     }
 
-    fn on_provider_event<'a, 'ctx>(
+    fn on_provider_event<'a>(
         &'a self,
-        ctx: &'a mut StreamContext<'ctx>,
+        ctx: &'a mut StreamContext<'_>,
         event: &'a mut ModelEvent,
     ) -> BoxHookFuture<'a, HookOutcome> {
         Box::pin(AgentMiddleware::on_provider_event(self, ctx, event))
     }
 
-    fn before_tool_call<'a, 'ctx>(
+    fn before_tool_call<'a>(
         &'a self,
-        ctx: &'a mut ToolCallContext<'ctx>,
+        ctx: &'a mut ToolCallContext<'_>,
     ) -> BoxHookFuture<'a, HookOutcome> {
         Box::pin(AgentMiddleware::before_tool_call(self, ctx))
     }
 
-    fn after_tool_call<'a, 'ctx>(
+    fn after_tool_call<'a>(
         &'a self,
-        ctx: &'a mut ToolResultContext<'ctx>,
+        ctx: &'a mut ToolResultContext<'_>,
     ) -> BoxHookFuture<'a, HookOutcome> {
         Box::pin(AgentMiddleware::after_tool_call(self, ctx))
     }
 
-    fn on_suspend<'a, 'ctx>(
+    fn on_suspend<'a>(
         &'a self,
-        ctx: &'a mut RunContext<'ctx>,
+        ctx: &'a mut RunContext<'_>,
         suspension: &'a mut Suspension,
     ) -> BoxHookFuture<'a, ()> {
         Box::pin(AgentMiddleware::on_suspend(self, ctx, suspension))
     }
 
-    fn on_resume<'a, 'ctx>(
+    fn on_resume<'a>(
         &'a self,
-        ctx: &'a mut RunContext<'ctx>,
+        ctx: &'a mut RunContext<'_>,
         input: &'a mut ResumeInput,
     ) -> BoxHookFuture<'a, ()> {
         Box::pin(AgentMiddleware::on_resume(self, ctx, input))
@@ -376,7 +376,12 @@ mod tests {
         }
     }
 
-    fn request_context<'a>(model_id: &'a ModelId, session: &'a AgentState) -> RequestContext<'a> {
+    fn request_context<'a>(
+        model_id: &'a ModelId,
+        session: &'a AgentState,
+        middleware_state: &'a mut crate::middleware::context::MiddlewareStateLog,
+        system_prompt_override: &'a mut Option<crate::middleware::prompt::SystemPromptOverride>,
+    ) -> RequestContext<'a> {
         RequestContext {
             session_id: "session-1",
             revision: 0,
@@ -384,6 +389,8 @@ mod tests {
             provider_id: None,
             turn: 0,
             session,
+            middleware_state,
+            system_prompt_override,
         }
     }
 
@@ -403,7 +410,14 @@ mod tests {
 
         let model_id = ModelId::new("test-model");
         let session = AgentState::default();
-        let mut ctx = request_context(&model_id, &session);
+        let mut middleware_state = crate::middleware::context::MiddlewareStateLog::default();
+        let mut system_prompt_override = None;
+        let mut ctx = request_context(
+            &model_id,
+            &session,
+            &mut middleware_state,
+            &mut system_prompt_override,
+        );
         let mut prompt = SystemPromptParts::default();
 
         chain
@@ -441,7 +455,14 @@ mod tests {
 
         let model_id = ModelId::new("test-model");
         let session = AgentState::default();
-        let mut ctx = request_context(&model_id, &session);
+        let mut middleware_state = crate::middleware::context::MiddlewareStateLog::default();
+        let mut system_prompt_override = None;
+        let mut ctx = request_context(
+            &model_id,
+            &session,
+            &mut middleware_state,
+            &mut system_prompt_override,
+        );
         let mut request = ModelRequestDraft::default();
 
         let outcome = chain

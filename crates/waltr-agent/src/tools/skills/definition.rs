@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::LlmError;
 
 /// Directory under a filesystem root that contains Agent Skills.
@@ -11,7 +13,7 @@ pub const SKILLS_DIRECTORY: &str = ".agents/skills";
 pub const SKILL_FILE: &str = "SKILL.md";
 
 /// Discovered Agent Skill metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillDefinition {
     /// Skill name from frontmatter.
     pub name: String,
@@ -84,11 +86,11 @@ fn valid_skill_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-pub(super) fn canonicalize_or_clone(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_or_clone(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-pub(super) fn skills_error(message: impl Into<String>) -> LlmError {
+pub(crate) fn skills_error(message: impl Into<String>) -> LlmError {
     LlmError::Protocol {
         provider: "skills",
         message: message.into(),

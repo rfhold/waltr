@@ -1,14 +1,16 @@
-use std::{fmt::Write as _, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{ShellCommandParser, ShellScan, tool_input};
-use crate::{AgentTool, PermissionClaim, Result, ToolCall, ToolDefinition};
+use crate::{
+    AgentTool, Result, ToolCall, ToolDefinition, middleware::tool_metadata::RootHintsMiddleware,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 20 * 1024;
-const SHELL_TOOL_NAME: &str = "shell";
+pub const SHELL_TOOL_NAME: &str = "shell";
 
 /// Shell tool configuration for an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,10 +58,25 @@ impl ShellConfig {
         self
     }
 
+    /// Build the per-request root-hint metadata middleware for the `shell` tool.
+    pub(crate) fn root_hints_middleware(&self) -> RootHintsMiddleware {
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        RootHintsMiddleware::new(
+            vec![SHELL_TOOL_NAME.to_owned()],
+            format!(
+                " Relative workdirs and path-like command arguments resolve from root: {}.",
+                root.display()
+            ),
+        )
+    }
+
     /// Convert this configuration into the `shell` agent tool.
     #[must_use]
     pub fn into_agent_tool(self) -> AgentTool {
-        let mut definition = ToolDefinition::new(
+        let definition = ToolDefinition::new(
             SHELL_TOOL_NAME,
             "Execute a Bash/POSIX shell command on the host after permission checks. Commands run with /bin/bash -lc. Provide a short description explaining why the command is needed.",
             json!({
@@ -87,21 +104,7 @@ impl ShellConfig {
                 "additionalProperties": false
             }),
         );
-        let root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
-        // TODO(agent-runtime): Move root-specific shell hints into dedicated edit_tool_metadata middleware.
-        write!(
-            definition.description,
-            " Relative workdirs and path-like command arguments resolve from root: {}.",
-            root.display()
-        )
-        .expect("write tool description");
-
-        let claims_config = self.clone();
         AgentTool::new(definition, move |call| self.call_agent_tool(call))
-            .with_permission_claims(move |call| claims_config.permission_claims(call))
     }
 
     /// Scan a shell command and return parsed commands, claims, and reusable patterns.
@@ -117,12 +120,6 @@ impl ShellConfig {
 
     fn call_agent_tool(&self, call: &ToolCall) -> Result<String> {
         self.execute(&tool_input(call)?)
-    }
-
-    fn permission_claims(&self, call: &ToolCall) -> Result<Vec<PermissionClaim>> {
-        // TODO(agent-runtime): Move shell permission scans into before_tool_call middleware.
-        let input = tool_input::<ShellInput>(call)?;
-        Ok(self.scan(&input)?.claims)
     }
 }
 

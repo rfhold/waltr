@@ -29,6 +29,10 @@ where
     }
 
     /// Create a new durable session record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store rejects the new record or the reload fails.
     pub async fn create_session(&self, id: SessionId) -> Result<SessionRecord> {
         let record = SessionRecord::new(id.clone());
         self.store
@@ -39,11 +43,19 @@ where
     }
 
     /// Load a durable session record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
     pub async fn load_session(&self, id: &SessionId) -> Result<SessionRecord> {
         self.store.load(id).await.map_err(session_store_error)
     }
 
     /// Apply resume input to a persisted session and return the durable checkpoint reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is stale or invalid, or when the store fails.
     pub async fn resume(&self, id: &SessionId, input: ResumeInput) -> Result<RuntimeResumeOutput> {
         let record = self.load_session(id).await?;
         match input {
@@ -232,7 +244,7 @@ fn pending_work_ids(snapshot: &SessionSnapshot) -> Vec<String> {
         .collect()
 }
 
-fn request_tool_name(kind: &super::ExternalRequestKind) -> &'static str {
+const fn request_tool_name(kind: &super::ExternalRequestKind) -> &'static str {
     match kind {
         super::ExternalRequestKind::Question => "question",
         super::ExternalRequestKind::Permission => "permission",
@@ -243,11 +255,10 @@ fn request_tool_name(kind: &super::ExternalRequestKind) -> &'static str {
 }
 
 fn external_response_content(response: &ExternalResponse) -> String {
-    if let Some(text) = response.payload.as_str() {
-        text.to_owned()
-    } else {
-        response.payload.to_string()
-    }
+    response
+        .payload
+        .as_str()
+        .map_or_else(|| response.payload.to_string(), str::to_owned)
 }
 
 fn session_store_error(error: impl std::fmt::Display) -> LlmError {
@@ -303,7 +314,7 @@ mod tests {
                     },
                     SessionEvent::Suspended {
                         suspension: Suspension::AwaitingExternalInput {
-                            request: external_request("question-1"),
+                            request: Box::new(external_request("question-1")),
                         },
                     },
                 ],

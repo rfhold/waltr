@@ -34,6 +34,10 @@ impl ScyllaSessionStore {
     }
 
     /// Create the table used by this store if it does not already exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema statement fails.
     pub async fn create_schema(&self) -> SessionStoreResult<()> {
         self.session
             .query_unpaged(

@@ -29,7 +29,7 @@ async fn run_live_question(provider: impl LlmStream, model: ModelRef) -> waltr_a
     let context = test_context(&provider, &session);
 
     assert_tool_was_surfaced(&provider, QUESTION_TOOL_NAME);
-    assert!(session.final_state.is_none(), "{context}");
+    assert!(session.final_snapshot.is_none(), "{context}");
     assert!(
         session
             .external_requests

@@ -62,7 +62,7 @@ async fn run_live_coding_agent(
     assert_tool_was_surfaced(&provider, QUESTION_TOOL_NAME);
     assert_tool_was_surfaced(&provider, "read");
     assert_tool_was_surfaced(&provider, "load_skill");
-    assert!(first.final_state_seen.is_none(), "{first_context}");
+    assert!(first.final_snapshot_seen.is_none(), "{first_context}");
     let question_request = first
         .external_requests
         .iter()
@@ -150,7 +150,7 @@ async fn run_live_coding_agent(
 #[derive(Debug, Default)]
 struct DurableLiveSession {
     text: String,
-    final_state_seen: Option<waltr_agent::AgentState>,
+    final_snapshot_seen: Option<waltr_agent::SessionSnapshot>,
     external_requests: Vec<ExternalRequestDraft>,
     tool_errors: Vec<waltr_agent::ToolResult>,
 }
@@ -201,7 +201,7 @@ impl DurableLiveSession {
                 AgentEvent::ExternalRequest { request, .. } => {
                     session.external_requests.push(request);
                 }
-                AgentEvent::Finished { state } => session.final_state_seen = Some(state),
+                AgentEvent::Finished { snapshot } => session.final_snapshot_seen = Some(snapshot),
                 AgentEvent::ToolCall { .. }
                 | AgentEvent::ThinkingDelta { .. }
                 | AgentEvent::TurnFinished { .. } => {}
@@ -214,9 +214,13 @@ impl DurableLiveSession {
 impl crate::session::AgentTestSession {
     fn from_durable(session: &DurableLiveSession) -> Self {
         let mut converted = Self::default();
-        converted.text = session.text.clone();
-        converted.final_state = session.final_state_seen.clone();
-        converted.external_requests = session.external_requests.clone();
+        converted.text.clone_from(&session.text);
+        converted
+            .final_snapshot
+            .clone_from(&session.final_snapshot_seen);
+        converted
+            .external_requests
+            .clone_from(&session.external_requests);
         converted
     }
 }

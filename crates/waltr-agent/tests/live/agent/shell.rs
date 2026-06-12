@@ -62,9 +62,9 @@ async fn assert_provider_runs_shell_agent(
     let context = crate::session::session_context(&provider, &session);
 
     let events = session
-        .final_state
+        .final_snapshot
         .as_ref()
-        .map(|state| state.events.as_slice())
+        .map(|snapshot| snapshot.state.events.as_slice())
         .unwrap_or_default();
     assert!(
         events.iter().any(|event| matches!(

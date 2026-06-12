@@ -51,8 +51,7 @@ pub fn render_skills_reminder(skills: &[SkillDefinition], root: &Path) -> Option
     )
 }
 
-pub(super) fn render_loaded_skill(skill: &SkillDefinition) -> Result<String> {
-    // TODO(agent-runtime): Return loaded skill content through durable middleware state.
+pub(crate) fn render_loaded_skill(skill: &SkillDefinition) -> Result<String> {
     let content = fs::read_to_string(&skill.skill_path)?;
     let resources = collect_resource_paths(skill)?;
     let mut output = String::new();

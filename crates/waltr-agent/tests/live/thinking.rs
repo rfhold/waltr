@@ -77,11 +77,11 @@ async fn assert_provider_thinking(
         .stream();
 
     let mut thinking_delta_count = 0_u16;
-    let mut final_state = None;
+    let mut final_snapshot = None;
     while let Some(event) = stream.next().await {
         match event? {
             AgentEvent::ThinkingDelta { .. } => thinking_delta_count += 1,
-            AgentEvent::Finished { state } => final_state = Some(state),
+            AgentEvent::Finished { snapshot } => final_snapshot = Some(snapshot),
             AgentEvent::TextDelta { .. }
             | AgentEvent::ExternalRequest { .. }
             | AgentEvent::ToolCall { .. }
@@ -90,11 +90,11 @@ async fn assert_provider_thinking(
         }
     }
 
-    let state = final_state.ok_or_else(|| LlmError::Protocol {
+    let snapshot = final_snapshot.ok_or_else(|| LlmError::Protocol {
         provider: provider.name(),
-        message: "agent stream ended without final state".to_owned(),
+        message: "agent stream ended without final snapshot".to_owned(),
     })?;
-    let text = state.last_assistant_text();
+    let text = snapshot.state.last_assistant_text();
     assert!(text.contains(EXPECTED_TEXT), "{}: {text}", provider.name());
 
     let stored = store
