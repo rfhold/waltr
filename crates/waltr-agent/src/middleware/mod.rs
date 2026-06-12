@@ -10,12 +10,14 @@ pub(crate) mod claims;
 pub mod context;
 pub mod cost;
 pub mod otel;
+pub mod pricing;
 pub(crate) mod prompt;
 pub(crate) mod question_suspension;
 pub mod secrets;
 pub(crate) mod skills;
 pub(crate) mod tool_metadata;
 pub(crate) mod tools;
+pub mod usage;
 
 use crate::{CompletionEvent, LlmError, Result, ToolResult};
 

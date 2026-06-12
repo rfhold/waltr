@@ -2,7 +2,7 @@
 
 mod config;
 mod formatting;
-mod lsp_hints;
+pub mod lsp;
 mod ops;
 mod patch;
 mod path;

@@ -2,7 +2,6 @@
 
 pub mod filesystem;
 pub mod filesystem_skills;
-pub mod lsp;
 pub mod question;
 pub mod skills;
 pub mod task;
