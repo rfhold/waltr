@@ -6,4 +6,5 @@
 pub mod config;
 pub mod diagnostics;
 pub mod formatting;
+pub mod hints;
 pub mod tools;
