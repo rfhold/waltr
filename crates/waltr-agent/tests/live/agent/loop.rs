@@ -1,6 +1,8 @@
 //! Live provider agent-loop integration tests.
 
-use waltr_agent::{Agent, AgentState, AgentTool, LlmError, LlmStream, ModelRef, ToolDefinition};
+use waltr_agent::{
+    Agent, AgentTool, LlmError, LlmStream, ModelRef, SessionSnapshot, SessionStatus, ToolDefinition,
+};
 use serde_json::json;
 
 use crate::{live_provider, session::AgentTestSession};
@@ -49,15 +51,15 @@ async fn assert_provider_runs_status_agent(
     crate::session::report_tool_errors(&provider, &session, "status loop");
     let context = crate::session::session_context(&provider, &session);
 
-    let final_state = session
-        .final_state
+    let final_snapshot = session
+        .final_snapshot
         .as_ref()
         .ok_or_else(|| LlmError::Protocol {
             provider: provider.name(),
-            message: "agent stream ended without final state".to_owned(),
+            message: "agent stream ended without final snapshot".to_owned(),
         })?;
 
-    assert_agent_state(final_state, &context);
+    assert_final_snapshot(final_snapshot, &context);
     assert!(session.saw_text_after_tool_result, "{context}");
 
     Ok(())
@@ -78,16 +80,21 @@ fn get_status_tool() -> AgentTool {
     )
 }
 
-fn assert_agent_state(state: &AgentState, context: &str) {
-    assert_eq!(state.last_assistant_text().trim(), STATUS, "{context}");
+fn assert_final_snapshot(snapshot: &SessionSnapshot, context: &str) {
+    assert_eq!(snapshot.status, SessionStatus::Finished, "{context}");
+    assert_eq!(
+        snapshot.state.last_assistant_text().trim(),
+        STATUS,
+        "{context}"
+    );
     assert!(
-        state.events.iter().any(
+        snapshot.state.events.iter().any(
             |event| matches!(event, waltr_agent::AgentTranscriptEvent::ToolCall { call, .. } if call.name == "get_status")
         ),
         "{context}"
     );
     assert!(
-        state.events.iter().any(
+        snapshot.state.events.iter().any(
             |event| matches!(event, waltr_agent::AgentTranscriptEvent::ToolResult { result, .. } if result.name == "get_status" && result.content == STATUS)
         ),
         "{context}"

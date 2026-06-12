@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{AgentToolContext, Result};
+use crate::Result;
 
 use super::{
     DeleteInput, EditInput, FilesystemConfig, GlobInput, GrepInput, GrepMatch, GrepSearch,
@@ -27,21 +27,9 @@ impl FilesystemConfig {
         Self::read_path(input, &path)
     }
 
-    pub(super) fn read_unscoped(
-        &self,
-        input: &ReadInput,
-        context: &mut AgentToolContext,
-    ) -> Result<String> {
-        // TODO(agent-runtime): Move AGENTS/skills injections to read-hook tool-result middleware.
+    pub(super) fn read_unscoped(&self, input: &ReadInput) -> Result<String> {
         let path = self.resolved_existing_path(&model_path(&input.file_path))?;
-        let mut output = Self::read_path(input, &path)?;
-        if self.agents_read_context && path.is_file() {
-            self.append_agents_read_context(&path, context, &mut output)?;
-        }
-        if self.skills_context {
-            self.append_skills_context(&path, false, context, &mut output)?;
-        }
-        Ok(output)
+        Self::read_path(input, &path)
     }
 
     fn read_path(input: &ReadInput, path: &Path) -> Result<String> {
@@ -96,18 +84,10 @@ impl FilesystemConfig {
         Self::glob_path(input, &base)
     }
 
-    pub(super) fn glob_unscoped(
-        &self,
-        input: &GlobInput,
-        context: &mut AgentToolContext,
-    ) -> Result<String> {
+    pub(super) fn glob_unscoped(&self, input: &GlobInput) -> Result<String> {
         let base =
             self.resolved_existing_path(&model_path(input.path.as_deref().unwrap_or(".")))?;
-        let mut output = Self::glob_path(input, &base)?;
-        if self.skills_context {
-            self.append_skills_context(&base, true, context, &mut output)?;
-        }
-        Ok(output)
+        Self::glob_path(input, &base)
     }
 
     fn glob_path(input: &GlobInput, base: &Path) -> Result<String> {
@@ -134,18 +114,10 @@ impl FilesystemConfig {
         Self::grep_path(input, &base)
     }
 
-    pub(super) fn grep_unscoped(
-        &self,
-        input: &GrepInput,
-        context: &mut AgentToolContext,
-    ) -> Result<String> {
+    pub(super) fn grep_unscoped(&self, input: &GrepInput) -> Result<String> {
         let base =
             self.resolved_existing_path(&model_path(input.path.as_deref().unwrap_or(".")))?;
-        let mut output = Self::grep_path(input, &base)?;
-        if self.skills_context {
-            self.append_skills_context(&base, true, context, &mut output)?;
-        }
-        Ok(output)
+        Self::grep_path(input, &base)
     }
 
     fn grep_path(input: &GrepInput, base: &Path) -> Result<String> {

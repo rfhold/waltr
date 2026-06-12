@@ -33,8 +33,8 @@ async fn question_agent_loop_surfaces_tool_and_suspends_for_external_answers()
 
     assert_question_schema(&question_tool, &context);
     assert!(
-        session.final_state.is_none(),
-        "suspended run should not emit final state\n{context}"
+        session.final_snapshot.is_none(),
+        "suspended run should not emit final snapshot\n{context}"
     );
     assert!(
         session.text.is_empty(),
@@ -277,10 +277,11 @@ fn assert_schema_value(schema: &Value, pointer: &str, expected: &Value, context:
 }
 
 fn tool_result_text(session: &AgentTestSession) -> String {
-    let Some(state) = &session.final_state else {
+    let Some(snapshot) = &session.final_snapshot else {
         return String::new();
     };
-    state
+    snapshot
+        .state
         .events
         .iter()
         .filter_map(|event| match event {

@@ -3,55 +3,22 @@
 use crate::{LlmStream, ModelRef, PermissionPolicy};
 
 use super::{ResumeInput, SessionId, SessionStore};
-use crate::middleware::chain::MiddlewareChain;
+use crate::middleware::{chain::MiddlewareChain, prompt::SystemPromptOverride};
 
-use super::super::{AgentTool, AgentToolContext};
+use super::super::AgentTool;
 
-pub(crate) struct EphemeralSessionRun<'a, P, S>
+pub struct EphemeralSessionRun<'a, P, S>
 where
     P: LlmStream + ?Sized,
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    pub(crate) provider: &'a P,
-    pub(crate) model: ModelRef,
-    pub(crate) input: ResumeInput,
-    pub(crate) system_prompt: Option<String>,
-    pub(crate) tools: Vec<AgentTool>,
-    pub(crate) middleware_chain: MiddlewareChain,
-    pub(crate) tool_context: AgentToolContext,
-    pub(crate) permission_policy: PermissionPolicy,
-    pub(crate) session_id: SessionId,
-    pub(crate) session_store: S,
-}
-
-impl<'a, P, S> EphemeralSessionRun<'a, P, S>
-where
-    P: LlmStream + ?Sized,
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
-    pub(crate) fn new(
-        provider: &'a P,
-        model: ModelRef,
-        input: ResumeInput,
-        system_prompt: Option<String>,
-        tools: Vec<AgentTool>,
-        middleware_chain: MiddlewareChain,
-        tool_context: AgentToolContext,
-        permission_policy: PermissionPolicy,
-        session_id: SessionId,
-        session_store: S,
-    ) -> Self {
-        Self {
-            provider,
-            model,
-            input,
-            system_prompt,
-            tools,
-            middleware_chain,
-            tool_context,
-            permission_policy,
-            session_id,
-            session_store,
-        }
-    }
+    pub provider: &'a P,
+    pub model: ModelRef,
+    pub input: ResumeInput,
+    pub system_prompt_override: Option<SystemPromptOverride>,
+    pub tools: Vec<AgentTool>,
+    pub middleware_chain: MiddlewareChain,
+    pub permission_policy: PermissionPolicy,
+    pub session_id: SessionId,
+    pub session_store: S,
 }

@@ -1,7 +1,6 @@
 //! Filesystem tool configuration.
 
 mod config;
-mod context;
 mod formatting;
 mod lsp_hints;
 mod ops;
@@ -10,8 +9,6 @@ mod path;
 mod permissions;
 mod profile;
 mod schema;
-
-use std::fmt::Write as _;
 
 use serde::de::DeserializeOwned;
 
@@ -24,10 +21,13 @@ pub use schema::{
 
 use formatting::truncate_line;
 use patch::{patch_path, skip_patch_body};
-use path::{filesystem_error, include_relative_path, model_path};
+use path::{filesystem_error, include_relative_path};
+pub(crate) use path::{model_path, resolve_existing_path};
 use schema::GrepSearch;
 
-use crate::{AgentTool, AgentToolContext, ModelRef, Result, ToolCall};
+use crate::{
+    AgentTool, ModelRef, Result, ToolCall, middleware::tool_metadata::RootHintsMiddleware,
+};
 
 impl FilesystemConfig {
     /// Convert exposed filesystem capabilities into generic agent tools.
@@ -40,36 +40,38 @@ impl FilesystemConfig {
             .collect()
     }
 
-    fn into_agent_tool(self, kind: FilesystemToolKind) -> AgentTool {
-        let mut definition = kind.definition();
-        // TODO(agent-runtime): Move filesystem root hints into dedicated edit_tool_metadata middleware.
+    /// Build the per-request root-hint metadata middleware for the exposed tools.
+    pub(crate) fn root_hints_middleware(&self, model: &ModelRef) -> RootHintsMiddleware {
         let root = self
             .root
             .canonicalize()
             .unwrap_or_else(|_| self.root.clone());
-        write!(
-            definition.description,
-            " Paths must be relative to the filesystem root or absolute paths inside the filesystem root. Filesystem root: {}. Use path '.' or omit optional path fields to search the root. Never use '/', a parent directory, or any path outside this root.",
-            root.display()
+        let tool_names = self
+            .exposed_tools(model)
+            .all()
+            .into_iter()
+            .map(|kind| kind.name().to_owned())
+            .collect();
+        RootHintsMiddleware::new(
+            tool_names,
+            format!(
+                " Paths must be relative to the filesystem root or absolute paths inside the filesystem root. Filesystem root: {}. Use path '.' or omit optional path fields to search the root. Never use '/', a parent directory, or any path outside this root.",
+                root.display()
+            ),
         )
-        .expect("write tool description");
-        let claims_config = self.clone();
-        AgentTool::with_context(definition, move |call, context| {
-            self.call_agent_tool(kind, call, context)
-        })
-        .with_permission_claims(move |call| claims_config.permission_claims(kind, call))
     }
 
-    fn call_agent_tool(
-        &self,
-        kind: FilesystemToolKind,
-        call: &ToolCall,
-        context: &mut AgentToolContext,
-    ) -> Result<String> {
+    fn into_agent_tool(self, kind: FilesystemToolKind) -> AgentTool {
+        AgentTool::new(kind.definition(), move |call| {
+            self.call_agent_tool(kind, call)
+        })
+    }
+
+    fn call_agent_tool(&self, kind: FilesystemToolKind, call: &ToolCall) -> Result<String> {
         match kind {
-            FilesystemToolKind::Read => self.read_unscoped(&tool_input(call)?, context),
-            FilesystemToolKind::Glob => self.glob_unscoped(&tool_input(call)?, context),
-            FilesystemToolKind::Grep => self.grep_unscoped(&tool_input(call)?, context),
+            FilesystemToolKind::Read => self.read_unscoped(&tool_input(call)?),
+            FilesystemToolKind::Glob => self.glob_unscoped(&tool_input(call)?),
+            FilesystemToolKind::Grep => self.grep_unscoped(&tool_input(call)?),
             FilesystemToolKind::Edit => self.edit_unscoped(&tool_input(call)?),
             FilesystemToolKind::Write => self.write_unscoped(&tool_input(call)?),
             FilesystemToolKind::Delete => self.delete_unscoped(&tool_input(call)?),

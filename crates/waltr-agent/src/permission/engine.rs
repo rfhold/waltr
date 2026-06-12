@@ -18,7 +18,7 @@ pub struct PermissionEngine {
 impl PermissionEngine {
     /// Create a permission engine.
     #[must_use]
-    pub fn new(policy: PermissionPolicy) -> Self {
+    pub const fn new(policy: PermissionPolicy) -> Self {
         Self {
             patterns: Vec::new(),
             policy,

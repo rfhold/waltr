@@ -16,15 +16,15 @@ use crate::{
         self as middleware, HookOutcome,
         chain::MiddlewareChain,
         context::{
-            ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, ToolCallContext,
-            ToolDraft, ToolResultContext,
+            MiddlewareStateLog, ModelRequestDraft, RequestContext, RunContext, SystemPromptParts,
+            ToolCallContext, ToolDraft, ToolResultContext,
         },
         tools::tool_is_visible,
     },
 };
 
 use super::{
-    AgentEvent, AgentState, AgentTool, AgentToolContext, AgentTranscriptEvent,
+    AgentEvent, AgentState, AgentTool, AgentTranscriptEvent,
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, RequestId, RequestRecord, ResumeInput,
@@ -45,8 +45,6 @@ where
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
     turns: Vec<CompletionTurn>,
-    // TODO(agent-runtime): Persist AGENTS/skills context on AgentSession, not the transient loop.
-    tool_context: AgentToolContext,
     state: AgentState,
     turn: usize,
     phase: AgentLoopPhase,
@@ -56,6 +54,8 @@ where
     session_revision: Revision,
     session_store: S,
     session_initialized: bool,
+    middleware_state: MiddlewareStateLog,
+    system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
 }
 
 enum AgentLoopPhase {
@@ -63,6 +63,8 @@ enum AgentLoopPhase {
     Streaming(BoxCompletionStream),
     Done,
 }
+
+type ResolvedToolCall = std::result::Result<(usize, ToolDefinition), ToolResult>;
 
 enum PermissionOutcome {
     Allow,
@@ -84,7 +86,6 @@ where
         }
         .to_owned();
         let permission_policy = run.permission_policy;
-        let _system_prompt = run.system_prompt;
         Self {
             provider: run.provider,
             model: run.model,
@@ -93,7 +94,6 @@ where
             tools: run.tools,
             middleware_chain: run.middleware_chain,
             turns: Vec::new(),
-            tool_context: run.tool_context,
             state: AgentState::default(),
             turn: 0,
             phase: AgentLoopPhase::StartTurn,
@@ -103,6 +103,8 @@ where
             session_revision: Revision::ZERO,
             session_store: run.session_store,
             session_initialized: false,
+            middleware_state: MiddlewareStateLog::default(),
+            system_prompt_override: run.system_prompt_override,
         }
     }
 
@@ -249,13 +251,12 @@ where
                             turn: self.turn,
                             result: result.clone(),
                         });
-                        if let Err(error) = self
-                            .append_session_event(SessionEvent::ToolResultRecorded {
-                                turn: self.turn as u64,
-                                result: result.clone(),
-                            })
-                            .await
-                        {
+                        let mut events = self.middleware_state.drain_pending();
+                        events.push(SessionEvent::ToolResultRecorded {
+                            turn: self.turn as u64,
+                            result: result.clone(),
+                        });
+                        if let Err(error) = self.append_session_events(events).await {
                             return Some((Err(error), self));
                         }
                         self.pending.push_back(Ok(AgentEvent::ToolResult {
@@ -280,25 +281,22 @@ where
                         return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::Finished)) | None => {
-                        if let Err(error) = self
-                            .append_session_events(vec![
-                                SessionEvent::TurnFinished {
-                                    turn: self.turn as u64,
-                                },
-                                SessionEvent::Finished,
-                            ])
-                            .await
-                        {
+                        let mut events = self.middleware_state.drain_pending();
+                        events.push(SessionEvent::TurnFinished {
+                            turn: self.turn as u64,
+                        });
+                        events.push(SessionEvent::Finished);
+                        if let Err(error) = self.append_session_events(events).await {
                             return Some((Err(error), self));
                         }
                         self.pending
                             .push_back(Ok(AgentEvent::TurnFinished { turn: self.turn }));
-                        self.pending.push_back(Ok(AgentEvent::Finished {
-                            state: self.state.clone(),
-                        }));
-                        if let Err(error) = self.save_session_snapshot().await {
-                            return Some((Err(error), self));
-                        }
+                        let snapshot = match self.save_session_snapshot().await {
+                            Ok(snapshot) => snapshot,
+                            Err(error) => return Some((Err(error), self)),
+                        };
+                        self.pending
+                            .push_back(Ok(AgentEvent::Finished { snapshot }));
                         self.phase = AgentLoopPhase::Done;
                     }
                     Some(Err(error)) => {
@@ -319,6 +317,8 @@ where
             provider_id: Some(self.model.provider),
             turn: self.turn as u64,
             session: &self.state,
+            middleware_state: &mut self.middleware_state,
+            system_prompt_override: &mut self.system_prompt_override,
         };
 
         let mut prompt = SystemPromptParts::default();
@@ -336,7 +336,7 @@ where
 
         let mut request = ModelRequestDraft {
             prompt: self.prompt.clone(),
-            system_prompt: join_system_prompt(prompt),
+            system_prompt: join_system_prompt(&prompt),
             tools: tools.tools,
             turns: self.turns.clone(),
         };
@@ -348,42 +348,41 @@ where
         {
             HookOutcome::Continue => Ok(request),
             HookOutcome::Abort(error) => Err(error),
-            outcome => Err(unsupported_before_provider_request_outcome(outcome)),
+            outcome => Err(unsupported_before_provider_request_outcome(&outcome)),
         }
     }
 
-    async fn execute_tool(&mut self, call: &ToolCall) -> Option<ToolResult> {
-        let mut call = call.clone();
-        let Some(tool_index) = self
+    fn resolve_tool_call(&self, call: &ToolCall) -> Option<ResolvedToolCall> {
+        let tool_index = self
             .tools
             .iter()
-            .position(|tool| tool.definition().name == call.name)
-        else {
-            return Some(error_tool_result(
-                &call,
-                &LlmError::Protocol {
-                    provider: "agent",
-                    message: format!("unknown tool: {}", call.name),
-                },
-            ));
-        };
+            .position(|tool| tool.definition().name == call.name)?;
         let tool_definition = self.tools[tool_index].definition().clone();
 
         if !tool_is_visible(&self.permission_policy, &tool_definition, true) {
-            return Some(error_tool_result(
-                &call,
+            return Some(Err(error_tool_result(
+                call,
                 &LlmError::Protocol {
                     provider: "permission",
                     message: format!("tool is not permitted: {}", call.name),
                 },
-            ));
+            )));
         }
 
-        let claims = match self.tools[tool_index].claims(&call) {
-            Ok(claims) => claims,
-            Err(error) => return Some(error_tool_result(&call, &error)),
+        Some(Ok((tool_index, tool_definition)))
+    }
+
+    async fn execute_tool(&mut self, call: &ToolCall) -> Option<ToolResult> {
+        let mut call = call.clone();
+        let resolved = match self.resolve_tool_call(&call) {
+            Some(Ok(resolved)) => Some(resolved),
+            Some(Err(result)) => return Some(result),
+            None => None,
         };
 
+        // Claims-producing middleware fills this during before_tool_call; permission
+        // evaluation below runs after the full chain so it observes complete claims.
+        let mut claims = Vec::new();
         let before_outcome = {
             let mut ctx = ToolCallContext {
                 session_id: self.session_id.as_str(),
@@ -391,8 +390,9 @@ where
                 turn: self.turn as u64,
                 session: &self.state,
                 call: &mut call,
-                tool_definition: Some(&tool_definition),
-                permission_claims: Some(&claims),
+                tool_definition: resolved.as_ref().map(|(_, definition)| definition),
+                permission_claims: &mut claims,
+                middleware_state: &mut self.middleware_state,
             };
             self.middleware_chain.before_tool_call(&mut ctx).await
         };
@@ -401,6 +401,16 @@ where
             Ok(outcome) => return self.tool_result_from_hook_outcome(&call, outcome).await,
             Err(error) => return Some(error_tool_result(&call, &error)),
         }
+
+        let Some((tool_index, _)) = resolved else {
+            return Some(error_tool_result(
+                &call,
+                &LlmError::Protocol {
+                    provider: "agent",
+                    message: format!("unknown tool: {}", call.name),
+                },
+            ));
+        };
 
         match self.permission_outcome(&call, &claims) {
             PermissionOutcome::Allow => {}
@@ -424,10 +434,7 @@ where
             }
         }
 
-        let mut result = match self.tools[tool_index]
-            .call(&call, &mut self.tool_context)
-            .await
-        {
+        let mut result = match self.tools[tool_index].call(&call).await {
             Ok(content) => ToolResult::new(call.id.clone(), call.name.clone(), content),
             Err(error) => error_tool_result(&call, &error),
         };
@@ -440,6 +447,7 @@ where
                 session: &self.state,
                 call: Some(&call),
                 result: &mut result,
+                middleware_state: &mut self.middleware_state,
             };
             self.middleware_chain.after_tool_call(&mut ctx).await
         };
@@ -470,6 +478,7 @@ where
                     revision: self.session_revision.get(),
                     turn: self.turn as u64,
                     session: &self.state,
+                    middleware_state: &mut self.middleware_state,
                 };
                 if let Err(error) = self
                     .middleware_chain
@@ -483,14 +492,13 @@ where
                         return Some(error_tool_result(call, &error));
                     }
                     let session_request = external_request_from_draft(&request);
-                    if let Err(error) = self
-                        .append_session_event(SessionEvent::Suspended {
-                            suspension: SessionSuspension::AwaitingExternalInput {
-                                request: session_request,
-                            },
-                        })
-                        .await
-                    {
+                    let mut events = self.middleware_state.drain_pending();
+                    events.push(SessionEvent::Suspended {
+                        suspension: SessionSuspension::AwaitingExternalInput {
+                            request: Box::new(session_request),
+                        },
+                    });
+                    if let Err(error) = self.append_session_events(events).await {
                         return Some(error_tool_result(call, &error));
                     }
                     if let Err(error) = self.save_session_snapshot().await {
@@ -566,7 +574,7 @@ where
                 "cannot resume missing session without a prompt input",
             ));
         };
-        self.prompt = prompt.clone();
+        self.prompt.clone_from(&prompt);
         self.session_store
             .create(SessionRecord::new(self.session_id.clone()))
             .await
@@ -647,10 +655,11 @@ where
 
     fn hydrate_from_record(&mut self, record: SessionRecord) {
         let snapshot = record.snapshot;
+        self.middleware_state = MiddlewareStateLog::from_snapshot(&snapshot);
         self.prompt = snapshot.current_prompt.unwrap_or_default();
         self.turns = snapshot.turns;
         self.state = snapshot.state;
-        self.turn = snapshot.turn as usize;
+        self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
     }
 
@@ -667,7 +676,8 @@ where
         Ok(())
     }
 
-    async fn save_session_snapshot(&mut self) -> Result<()> {
+    // Returns the snapshot exactly as persisted: stores stamp the new revision on save.
+    async fn save_session_snapshot(&mut self) -> Result<SessionSnapshot> {
         let record = self
             .session_store
             .load(&self.session_id)
@@ -677,23 +687,23 @@ where
         snapshot.apply_events(&record.events);
         self.session_revision = self
             .session_store
-            .save_snapshot(&self.session_id, snapshot, self.session_revision)
+            .save_snapshot(&self.session_id, snapshot.clone(), self.session_revision)
             .await
             .map_err(session_store_error)?;
-        Ok(())
+        snapshot.revision = self.session_revision;
+        Ok(snapshot)
     }
 
     async fn pending_failed_session_event(&mut self, error: &LlmError) {
-        if self.session_initialized {
-            if self
+        if self.session_initialized
+            && self
                 .append_session_event(SessionEvent::Failed {
                     message: error.to_string(),
                 })
                 .await
                 .is_ok()
-            {
-                drop(self.save_session_snapshot().await);
-            }
+        {
+            drop(self.save_session_snapshot().await);
         }
     }
 
@@ -716,21 +726,18 @@ where
             canonical_request,
         };
 
+        // State writes that shaped this request must be durable before the request record.
+        let events = self.middleware_state.drain_pending();
+        if !events.is_empty() {
+            self.append_session_events(events).await?;
+        }
         self.session_revision = self
             .session_store
             .record_request(&self.session_id, request.clone(), self.session_revision)
             .await
             .map_err(session_store_error)?;
-        self.session_revision = self
-            .session_store
-            .append(
-                &self.session_id,
-                vec![SessionEvent::ProviderRequestRecorded { request }],
-                self.session_revision,
-            )
+        self.append_session_event(SessionEvent::ProviderRequestRecorded { request })
             .await
-            .map_err(session_store_error)?;
-        Ok(())
     }
 
     async fn persist_external_request(
@@ -746,20 +753,17 @@ where
             status: session_external_request_status(&request.status),
         };
 
+        let events = self.middleware_state.drain_pending();
+        if !events.is_empty() {
+            self.append_session_events(events).await?;
+        }
         self.session_revision = self
             .session_store
             .record_external_request(&self.session_id, request.clone(), self.session_revision)
             .await
             .map_err(session_store_error)?;
-        self.session_revision = self
-            .session_store
-            .append(
-                &self.session_id,
-                vec![SessionEvent::ExternalRequestCreated { request }],
-                self.session_revision,
-            )
-            .await
-            .map_err(session_store_error)?;
+        self.append_session_event(SessionEvent::ExternalRequestCreated { request })
+            .await?;
         Ok(())
     }
 }
@@ -923,7 +927,7 @@ fn session_store_error(error: impl std::fmt::Display) -> LlmError {
     }
 }
 
-fn join_system_prompt(prompt: SystemPromptParts) -> Option<String> {
+fn join_system_prompt(prompt: &SystemPromptParts) -> Option<String> {
     if prompt.parts.is_empty() {
         None
     } else {
@@ -940,7 +944,7 @@ fn completion_request_from_draft(draft: &ModelRequestDraft) -> CompletionRequest
     }
 }
 
-fn unsupported_before_provider_request_outcome(outcome: HookOutcome) -> LlmError {
+fn unsupported_before_provider_request_outcome(outcome: &HookOutcome) -> LlmError {
     LlmError::Protocol {
         provider: "middleware",
         message: format!(

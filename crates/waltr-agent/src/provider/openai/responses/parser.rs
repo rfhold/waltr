@@ -33,113 +33,109 @@ impl ResponsesParser {
 
     pub(super) fn parse_event(&mut self, data: &str) -> Result<Vec<CompletionEvent>> {
         let value: Value = serde_json::from_str(data)?;
-        parse_responses_event_value(
-            &value,
-            self.provider,
-            &self.url,
-            &self.model,
-            &mut self.tool_call,
-            &mut self.reasoning_item,
-        )
+        self.map_event(&value)
     }
-}
 
-fn parse_responses_event_value(
-    value: &Value,
-    provider: &str,
-    url: &str,
-    model: &str,
-    tool_call: &mut Option<PartialToolCall>,
-    reasoning_item: &mut Option<Value>,
-) -> Result<Vec<CompletionEvent>> {
-    match value["type"].as_str() {
-        Some("response.output_text.delta") => Ok(value["delta"]
-            .as_str()
-            .map(|delta| vec![CompletionEvent::Delta(delta.to_owned())])
-            .unwrap_or_default()),
-        Some("response.output_item.added") => {
-            let item = &value["item"];
-            if item["type"].as_str() == Some("function_call") {
-                let call = partial_tool_call_from_response_item(item);
-                *tool_call = Some(call);
-            } else if item["type"].as_str() == Some("reasoning") {
-                *reasoning_item = Some(item.clone());
+    fn map_event(&mut self, value: &Value) -> Result<Vec<CompletionEvent>> {
+        match value["type"].as_str() {
+            Some("response.output_text.delta") => Ok(value["delta"]
+                .as_str()
+                .map(|delta| vec![CompletionEvent::Delta(delta.to_owned())])
+                .unwrap_or_default()),
+            Some("response.output_item.added") => {
+                self.output_item_added(&value["item"]);
+                Ok(Vec::new())
             }
-            Ok(Vec::new())
-        }
-        Some("response.output_item.done") => {
-            let item = &value["item"];
-            if item["type"].as_str() == Some("reasoning") {
-                return Ok(vec![CompletionEvent::ThinkingBlock(openai_thinking_block(
-                    item,
-                ))]);
+            Some("response.output_item.done") => {
+                let item = &value["item"];
+                if item["type"].as_str() == Some("reasoning") {
+                    return Ok(vec![CompletionEvent::ThinkingBlock(openai_thinking_block(
+                        item,
+                    ))]);
+                }
+                Ok(Vec::new())
             }
-            Ok(Vec::new())
+            Some("response.reasoning_summary_text.delta") => Ok(value["delta"]
+                .as_str()
+                .map(|text| {
+                    vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
+                        text: text.to_owned(),
+                    })]
+                })
+                .unwrap_or_default()),
+            Some("response.reasoning_summary_text.done") => Ok(self.reasoning_summary_done(value)),
+            Some("response.function_call_arguments.delta") => {
+                let delta = value["delta"].as_str().unwrap_or_default();
+                if let Some(call) = self.tool_call.as_mut() {
+                    call.arguments.push_str(delta);
+                }
+                Ok(Vec::new())
+            }
+            Some("response.function_call_arguments.done") => self.function_call_done(value),
+            Some("response.completed") => Ok(self.response_completed(&value["response"])),
+            Some("error") => Err(api_error(
+                RESPONSES_NAME,
+                value.get("error").unwrap_or(value),
+            )),
+            _ => Ok(Vec::new()),
         }
-        Some("response.reasoning_summary_text.delta") => Ok(value["delta"]
+    }
+
+    fn output_item_added(&mut self, item: &Value) {
+        if item["type"].as_str() == Some("function_call") {
+            self.tool_call = Some(partial_tool_call_from_response_item(item));
+        } else if item["type"].as_str() == Some("reasoning") {
+            self.reasoning_item = Some(item.clone());
+        }
+    }
+
+    fn reasoning_summary_done(&mut self, value: &Value) -> Vec<CompletionEvent> {
+        value["text"]
             .as_str()
             .map(|text| {
-                vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
-                    text: text.to_owned(),
-                })]
-            })
-            .unwrap_or_default()),
-        Some("response.reasoning_summary_text.done") => Ok(value["text"]
-            .as_str()
-            .map(|text| {
-                if let Some(item) = reasoning_item.as_mut() {
+                if let Some(item) = self.reasoning_item.as_mut() {
                     item["summary"] = json!([{ "type": "summary_text", "text": text }]);
                 }
                 vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
                     text: text.to_owned(),
                 })]
             })
-            .unwrap_or_default()),
-        Some("response.function_call_arguments.delta") => {
-            let delta = value["delta"].as_str().unwrap_or_default();
-            if let Some(call) = tool_call.as_mut() {
-                call.arguments.push_str(delta);
-            }
-            Ok(Vec::new())
+            .unwrap_or_default()
+    }
+
+    fn function_call_done(&mut self, value: &Value) -> Result<Vec<CompletionEvent>> {
+        if let Some(arguments) = value["arguments"].as_str()
+            && let Some(call) = self.tool_call.as_mut()
+        {
+            arguments.clone_into(&mut call.arguments);
         }
-        Some("response.function_call_arguments.done") => {
-            if let Some(arguments) = value["arguments"].as_str()
-                && let Some(call) = tool_call.as_mut()
-            {
-                arguments.clone_into(&mut call.arguments);
-            }
-            Ok(tool_call
-                .take()
-                .map(PartialToolCall::into_event)
-                .transpose()?
-                .map(|event| vec![event])
-                .unwrap_or_default())
-        }
-        Some("response.completed") => {
-            let response = &value["response"];
-            let usage = response
-                .get("usage")
-                .filter(|usage| usage.is_object())
-                .map(|usage| TokenUsage {
-                    input_tokens: usage["input_tokens"].as_u64(),
-                    output_tokens: usage["output_tokens"].as_u64(),
-                });
-            Ok(vec![
-                CompletionEvent::ProviderMetadata(ProviderTurnMetadata {
-                    provider: provider.to_owned(),
-                    url: url.to_owned(),
-                    model: model.to_owned(),
-                    usage,
-                    resume: json!({ "response_id": response["id"] }),
-                }),
-                CompletionEvent::Finished,
-            ])
-        }
-        Some("error") => Err(api_error(
-            RESPONSES_NAME,
-            value.get("error").unwrap_or(value),
-        )),
-        _ => Ok(Vec::new()),
+        Ok(self
+            .tool_call
+            .take()
+            .map(PartialToolCall::into_event)
+            .transpose()?
+            .map(|event| vec![event])
+            .unwrap_or_default())
+    }
+
+    fn response_completed(&self, response: &Value) -> Vec<CompletionEvent> {
+        let usage = response
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .map(|usage| TokenUsage {
+                input_tokens: usage["input_tokens"].as_u64(),
+                output_tokens: usage["output_tokens"].as_u64(),
+            });
+        vec![
+            CompletionEvent::ProviderMetadata(ProviderTurnMetadata {
+                provider: self.provider.to_owned(),
+                url: self.url.clone(),
+                model: self.model.clone(),
+                usage,
+                resume: json!({ "response_id": response["id"] }),
+            }),
+            CompletionEvent::Finished,
+        ]
     }
 }
 

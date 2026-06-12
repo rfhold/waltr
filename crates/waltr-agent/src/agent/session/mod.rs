@@ -8,7 +8,7 @@ mod storage;
 mod title;
 mod types;
 
-pub(crate) use compat::EphemeralSessionRun;
+pub use compat::EphemeralSessionRun;
 pub use factory::AgentSessions;
 pub use runtime::{AgentSessionRuntime, RuntimeResumeOutput};
 pub use storage::{

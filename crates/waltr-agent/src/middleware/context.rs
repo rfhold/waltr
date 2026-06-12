@@ -2,10 +2,102 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
+
 use crate::{
-    AgentState, CompletionTurn, ModelId, PermissionClaim, ProviderId, ToolCall, ToolDefinition,
-    ToolResult,
+    AgentState, CompletionTurn, ModelId, PermissionClaim, ProviderId, Result, ToolCall,
+    ToolDefinition, ToolResult,
+    agent::session::{SessionEvent, SessionSnapshot},
 };
+
+use super::prompt::SystemPromptOverride;
+
+/// Loop-owned durable middleware state with pending journal writes.
+#[derive(Debug, Default)]
+pub(crate) struct MiddlewareStateLog {
+    current: BTreeMap<String, Value>,
+    pending: Vec<(String, Value)>,
+}
+
+impl MiddlewareStateLog {
+    /// Hydrate current state from a stored session snapshot.
+    pub(crate) fn from_snapshot(snapshot: &SessionSnapshot) -> Self {
+        Self {
+            current: snapshot.middleware_state.clone(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// Return the current state blob for a namespace.
+    pub(crate) fn get(&self, namespace: &str) -> Option<&Value> {
+        self.current.get(namespace)
+    }
+
+    /// Replace a namespace state blob and queue the durable write.
+    pub(crate) fn set(&mut self, namespace: impl Into<String>, state: Value) {
+        let namespace = namespace.into();
+        self.current.insert(namespace.clone(), state.clone());
+        self.pending.push((namespace, state));
+    }
+
+    /// Drain queued writes into journal events in write order.
+    pub(crate) fn drain_pending(&mut self) -> Vec<SessionEvent> {
+        self.pending
+            .drain(..)
+            .map(|(namespace, state)| SessionEvent::MiddlewareStateUpdated { namespace, state })
+            .collect()
+    }
+}
+
+/// Read/write access to durable middleware state from a middleware context.
+pub(crate) trait MiddlewareStateAccess {
+    /// Borrow the durable middleware state log.
+    fn state_log(&self) -> &MiddlewareStateLog;
+
+    /// Mutably borrow the durable middleware state log.
+    fn state_log_mut(&mut self) -> &mut MiddlewareStateLog;
+
+    /// Return durable middleware state for a namespace.
+    fn state(&self, namespace: &str) -> Option<&Value> {
+        self.state_log().get(namespace)
+    }
+
+    /// Replace durable middleware state for a namespace.
+    fn set_state(&mut self, namespace: impl Into<String>, state: Value) {
+        self.state_log_mut().set(namespace, state);
+    }
+
+    /// Return durable middleware state deserialized as `T`, when present.
+    fn state_as<T: DeserializeOwned>(&self, namespace: &str) -> Result<Option<T>> {
+        self.state_log()
+            .get(namespace)
+            .map(|state| serde_json::from_value(state.clone()))
+            .transpose()
+            .map_err(|error| crate::LlmError::Protocol {
+                provider: "middleware-state",
+                message: error.to_string(),
+            })
+    }
+
+    /// Replace durable middleware state for a namespace with serialized `T`.
+    fn set_state_as<T: Serialize>(
+        &mut self,
+        namespace: impl Into<String>,
+        state: &T,
+    ) -> Result<()> {
+        self.state_log_mut().set(
+            namespace,
+            serde_json::to_value(state).map_err(|error| crate::LlmError::Protocol {
+                provider: "middleware-state",
+                message: error.to_string(),
+            })?,
+        );
+        Ok(())
+    }
+}
 
 /// Mutable system prompt fragments assembled by middleware.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,6 +155,27 @@ pub(crate) struct RequestContext<'a> {
     pub(crate) turn: u64,
     /// Snapshot of durable session state for this phase.
     pub(crate) session: &'a AgentState,
+    /// Durable middleware state for this run.
+    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+    /// Pending per-run system prompt override, consumed by the system prompt middleware.
+    pub(crate) system_prompt_override: &'a mut Option<SystemPromptOverride>,
+}
+
+impl RequestContext<'_> {
+    /// Take the pending per-run system prompt override, when any.
+    pub(crate) const fn take_system_prompt_override(&mut self) -> Option<SystemPromptOverride> {
+        self.system_prompt_override.take()
+    }
+}
+
+impl MiddlewareStateAccess for RequestContext<'_> {
+    fn state_log(&self) -> &MiddlewareStateLog {
+        self.middleware_state
+    }
+
+    fn state_log_mut(&mut self) -> &mut MiddlewareStateLog {
+        self.middleware_state
+    }
 }
 
 /// Context shared by provider stream middleware phases.
@@ -80,6 +193,18 @@ pub(crate) struct StreamContext<'a> {
     pub(crate) turn: u64,
     /// Snapshot of durable session state for this phase.
     pub(crate) session: &'a AgentState,
+    /// Durable middleware state for this run; writes persist at loop persistence points.
+    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+}
+
+impl MiddlewareStateAccess for StreamContext<'_> {
+    fn state_log(&self) -> &MiddlewareStateLog {
+        self.middleware_state
+    }
+
+    fn state_log_mut(&mut self) -> &mut MiddlewareStateLog {
+        self.middleware_state
+    }
 }
 
 /// Context shared by tool-call middleware phases.
@@ -97,8 +222,20 @@ pub(crate) struct ToolCallContext<'a> {
     pub(crate) call: &'a mut ToolCall,
     /// Host tool definition selected for this call, when known.
     pub(crate) tool_definition: Option<&'a ToolDefinition>,
-    /// Permission claims derived for this call, when already available.
-    pub(crate) permission_claims: Option<&'a [PermissionClaim]>,
+    /// Permission claims appended by claims-producing middleware earlier in the chain.
+    pub(crate) permission_claims: &'a mut Vec<PermissionClaim>,
+    /// Durable middleware state for this run.
+    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+}
+
+impl MiddlewareStateAccess for ToolCallContext<'_> {
+    fn state_log(&self) -> &MiddlewareStateLog {
+        self.middleware_state
+    }
+
+    fn state_log_mut(&mut self) -> &mut MiddlewareStateLog {
+        self.middleware_state
+    }
 }
 
 /// Context shared by tool-result middleware phases.
@@ -116,6 +253,18 @@ pub(crate) struct ToolResultContext<'a> {
     pub(crate) call: Option<&'a ToolCall>,
     /// Tool result currently being evaluated.
     pub(crate) result: &'a mut ToolResult,
+    /// Durable middleware state for this run.
+    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+}
+
+impl MiddlewareStateAccess for ToolResultContext<'_> {
+    fn state_log(&self) -> &MiddlewareStateLog {
+        self.middleware_state
+    }
+
+    fn state_log_mut(&mut self) -> &mut MiddlewareStateLog {
+        self.middleware_state
+    }
 }
 
 /// Context shared by run-level middleware phases.
@@ -129,4 +278,16 @@ pub(crate) struct RunContext<'a> {
     pub(crate) turn: u64,
     /// Snapshot of durable session state for this phase.
     pub(crate) session: &'a AgentState,
+    /// Durable middleware state for this run.
+    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+}
+
+impl MiddlewareStateAccess for RunContext<'_> {
+    fn state_log(&self) -> &MiddlewareStateLog {
+        self.middleware_state
+    }
+
+    fn state_log_mut(&mut self) -> &mut MiddlewareStateLog {
+        self.middleware_state
+    }
 }

@@ -48,7 +48,7 @@ async fn s3_session_store_resumes_from_garage_container() -> waltr_agent::Result
 #[ignore = "requires Docker"]
 async fn scylla_session_store_resumes_from_container() -> waltr_agent::Result<()> {
     install_rustls_crypto_provider();
-    let scylla = ScyllaContainer::start().await?;
+    let scylla = Box::pin(ScyllaContainer::start()).await?;
     let store =
         ScyllaSessionStore::new(scylla.session.clone(), scylla.keyspace.clone(), "sessions");
     store.create_schema().await.map_err(store_error)?;
@@ -174,7 +174,7 @@ async fn collect(
         match event? {
             AgentEvent::TextDelta { delta, .. } => collected.text.push_str(&delta),
             AgentEvent::ExternalRequest { request, .. } => {
-                collected.external_request_ids.push(request.id)
+                collected.external_request_ids.push(request.id);
             }
             AgentEvent::Finished { .. } => collected.finished = true,
             AgentEvent::ThinkingDelta { .. }
@@ -187,7 +187,7 @@ async fn collect(
 }
 
 struct GarageContainer {
-    _container: testcontainers::ContainerAsync<GenericImage>,
+    container: testcontainers::ContainerAsync<GenericImage>,
     _config_dir: TempDir,
     endpoint: String,
     bucket: String,
@@ -232,7 +232,7 @@ api_bind_addr = "[::]:3900"
         let container = image.start().await.map_err(store_error)?;
         let endpoint = format!("http://127.0.0.1:{host_port}");
         let garage = Self {
-            _container: container,
+            container,
             _config_dir: config_dir,
             endpoint,
             bucket,
@@ -301,7 +301,7 @@ api_bind_addr = "[::]:3900"
     }
 
     async fn container_stdout(&self) -> String {
-        self._container
+        self.container
             .stdout_to_vec()
             .await
             .ok()
@@ -310,7 +310,7 @@ api_bind_addr = "[::]:3900"
     }
 
     async fn container_stderr(&self) -> String {
-        self._container
+        self.container
             .stderr_to_vec()
             .await
             .ok()
@@ -347,7 +347,7 @@ impl ScyllaContainer {
                 "127.0.0.1",
             ]);
         let container = image.start().await.map_err(store_error)?;
-        let session = Arc::new(connect_scylla_with_retry(9042).await?);
+        let session = Arc::new(Box::pin(connect_scylla_with_retry(9042)).await?);
         let keyspace = format!("waltr_storage_{}", std::process::id());
         session
             .query_unpaged(
@@ -396,7 +396,7 @@ async fn connect_scylla_with_retry(port: u16) -> waltr_agent::Result<Session> {
     let node = format!("127.0.0.1:{port}");
     let mut last_error = String::new();
     for _ in 0..60 {
-        match SessionBuilder::new().known_node(&node).build().await {
+        match Box::pin(SessionBuilder::new().known_node(&node).build()).await {
             Ok(session) => return Ok(session),
             Err(error) => {
                 last_error = error.to_string();

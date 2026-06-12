@@ -45,7 +45,7 @@ impl FilesystemConfig {
     }
 }
 
-pub(super) fn model_path(path: &str) -> PathBuf {
+pub fn model_path(path: &str) -> PathBuf {
     let mut path = path.trim();
 
     if let Some(start) = path.find("<path>") {
@@ -60,6 +60,15 @@ pub(super) fn model_path(path: &str) -> PathBuf {
         .trim_matches(|character| matches!(character, '`' | '"' | '\''));
 
     PathBuf::from(path.trim_end_matches(':'))
+}
+
+/// Resolve a model-supplied path against a canonical root, requiring it to exist.
+pub fn resolve_existing_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        path.canonicalize().ok()
+    } else {
+        root.join(path).canonicalize().ok()
+    }
 }
 
 fn normalize_path(path: &Path) -> PathBuf {

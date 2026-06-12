@@ -6,13 +6,13 @@ use super::{AgentMiddleware, context::RequestContext, context::ToolDraft};
 
 /// Middleware that appends captured tool definitions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StaticToolRegistryMiddleware {
+pub struct StaticToolRegistryMiddleware {
     tools: Vec<ToolDefinition>,
 }
 
 impl StaticToolRegistryMiddleware {
     /// Create middleware from provider-neutral tool definitions.
-    pub(crate) fn new(tools: Vec<ToolDefinition>) -> Self {
+    pub const fn new(tools: Vec<ToolDefinition>) -> Self {
         Self { tools }
     }
 }
@@ -26,7 +26,7 @@ impl AgentMiddleware for StaticToolRegistryMiddleware {
 
 /// Middleware that exposes registered tools according to the active permission policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PermissionFilteredToolRegistryMiddleware {
+pub struct PermissionFilteredToolRegistryMiddleware {
     tools: Vec<ToolDefinition>,
     policy: PermissionPolicy,
     ask_available: bool,
@@ -34,7 +34,7 @@ pub(crate) struct PermissionFilteredToolRegistryMiddleware {
 
 impl PermissionFilteredToolRegistryMiddleware {
     /// Create middleware from provider-neutral tool definitions and permission visibility inputs.
-    pub(crate) fn new(
+    pub const fn new(
         tools: Vec<ToolDefinition>,
         policy: PermissionPolicy,
         ask_available: bool,
@@ -60,7 +60,7 @@ impl AgentMiddleware for PermissionFilteredToolRegistryMiddleware {
 }
 
 /// Return true when a tool should be visible to the model for the given permission setup.
-pub(crate) fn tool_is_visible(
+pub fn tool_is_visible(
     policy: &PermissionPolicy,
     definition: &ToolDefinition,
     ask_available: bool,
@@ -76,11 +76,19 @@ pub(crate) fn tool_is_visible(
 mod tests {
     use serde_json::json;
 
-    use crate::{AgentState, ModelId, middleware::context::RequestContext};
+    use crate::{
+        AgentState, ModelId,
+        middleware::context::{MiddlewareStateLog, RequestContext},
+    };
 
     use super::*;
 
-    fn request_context<'a>(model_id: &'a ModelId, session: &'a AgentState) -> RequestContext<'a> {
+    fn request_context<'a>(
+        model_id: &'a ModelId,
+        session: &'a AgentState,
+        middleware_state: &'a mut MiddlewareStateLog,
+        system_prompt_override: &'a mut Option<crate::middleware::prompt::SystemPromptOverride>,
+    ) -> RequestContext<'a> {
         RequestContext {
             session_id: "session-1",
             revision: 0,
@@ -88,6 +96,8 @@ mod tests {
             provider_id: None,
             turn: 0,
             session,
+            middleware_state,
+            system_prompt_override,
         }
     }
 
@@ -109,7 +119,14 @@ mod tests {
         let middleware = StaticToolRegistryMiddleware::new(vec![second.clone()]);
         let model_id = ModelId::new("test-model");
         let session = AgentState::default();
-        let mut ctx = request_context(&model_id, &session);
+        let mut middleware_state = MiddlewareStateLog::default();
+        let mut system_prompt_override = None;
+        let mut ctx = request_context(
+            &model_id,
+            &session,
+            &mut middleware_state,
+            &mut system_prompt_override,
+        );
         let mut draft = ToolDraft::default();
         draft.push(first.clone());
 
@@ -139,7 +156,14 @@ mod tests {
             );
         let model_id = ModelId::new("test-model");
         let session = AgentState::default();
-        let mut ctx = request_context(&model_id, &session);
+        let mut middleware_state = MiddlewareStateLog::default();
+        let mut system_prompt_override = None;
+        let mut ctx = request_context(
+            &model_id,
+            &session,
+            &mut middleware_state,
+            &mut system_prompt_override,
+        );
         let mut draft = ToolDraft::default();
 
         PermissionFilteredToolRegistryMiddleware::new(
@@ -166,7 +190,14 @@ mod tests {
         );
         let model_id = ModelId::new("test-model");
         let session = AgentState::default();
-        let mut ctx = request_context(&model_id, &session);
+        let mut middleware_state = MiddlewareStateLog::default();
+        let mut system_prompt_override = None;
+        let mut ctx = request_context(
+            &model_id,
+            &session,
+            &mut middleware_state,
+            &mut system_prompt_override,
+        );
         let mut draft = ToolDraft::default();
 
         PermissionFilteredToolRegistryMiddleware::new(vec![allowed.clone(), ask], policy, false)

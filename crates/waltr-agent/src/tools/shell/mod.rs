@@ -9,6 +9,7 @@ mod permissions;
 
 use serde::de::DeserializeOwned;
 
+pub(crate) use config::SHELL_TOOL_NAME;
 pub use config::{ShellConfig, ShellInput};
 pub use parser::{ParsedShellCommand, ShellScan};
 

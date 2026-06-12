@@ -239,10 +239,11 @@ impl Drop for HttpMcpTestServer {
 }
 
 fn tool_result_text(session: &AgentTestSession) -> String {
-    let Some(state) = &session.final_state else {
+    let Some(snapshot) = &session.final_snapshot else {
         return String::new();
     };
-    state
+    snapshot
+        .state
         .events
         .iter()
         .filter_map(|event| match event {
@@ -262,21 +263,21 @@ fn assert_tool_call(
     name: &str,
     context: &str,
 ) -> waltr_agent::Result<()> {
-    let state = session
-        .final_state
+    let snapshot = session
+        .final_snapshot
         .as_ref()
         .ok_or_else(|| LlmError::Protocol {
             provider: "mcp",
-            message: "agent stream ended without final state".to_owned(),
+            message: "agent stream ended without final snapshot".to_owned(),
         })?;
     assert!(
-        state.events.iter().any(
+        snapshot.state.events.iter().any(
             |event| matches!(event, AgentTranscriptEvent::ToolCall { call, .. } if call.name == name)
         ),
         "{context}"
     );
     assert!(
-        state.events.iter().any(
+        snapshot.state.events.iter().any(
             |event| matches!(event, AgentTranscriptEvent::ToolResult { result, .. } if result.name == name)
         ),
         "{context}"

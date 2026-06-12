@@ -5,17 +5,23 @@ use std::{fmt, path::PathBuf};
 use crate::{
     ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
     mcp::McpConfig,
-    middleware::{AgentMiddleware, chain::MiddlewareChain},
+    middleware::{
+        AgentMiddleware, agents::AgentsInstructionsMiddleware, chain::MiddlewareChain,
+        claims::FilesystemClaimsMiddleware, prompt::SystemPromptMiddleware,
+        skills::SkillsMiddleware,
+    },
     prompt::{AgentsPromptConfig, FilesystemPromptConfig},
     tools::{
         filesystem::FilesystemConfig,
         question::QuestionConfig,
-        skills::{SkillDefinition, SkillsConfig, render_skills_catalog},
+        skills::{SkillDefinition, SkillsConfig},
     },
 };
 
 #[cfg(feature = "shell")]
-use crate::{prompt::ShellPromptConfig, tools::shell::ShellConfig};
+use crate::{
+    middleware::claims::ShellClaimsMiddleware, prompt::ShellPromptConfig, tools::shell::ShellConfig,
+};
 
 use super::{Agent, AgentTool};
 
@@ -23,14 +29,13 @@ use super::{Agent, AgentTool};
 #[derive(Clone)]
 pub struct AgentBuilder {
     model: ModelRef,
-    // TODO(agent-runtime): Agent should keep only model/base tools/middleware defaults.
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
     system_prompt: SystemPromptBuilder,
-    // TODO(agent-runtime): Persist AGENTS/skills state in session context, not Agent config.
-    agents_system_paths: Vec<PathBuf>,
-    visible_skills: Vec<SkillDefinition>,
-    skills_enabled: bool,
+    agents_prompt_configs: Vec<AgentsPromptConfig>,
+    agents_read_roots: Vec<PathBuf>,
+    skills_catalog: Option<Vec<SkillDefinition>>,
+    skills_reveal_roots: Vec<PathBuf>,
     permission_policy: PermissionPolicy,
     explicit_permission_policy: bool,
 }
@@ -44,9 +49,10 @@ impl AgentBuilder {
             tools: Vec::new(),
             middleware_chain: MiddlewareChain::new(),
             system_prompt: SystemPromptBuilder::new(),
-            agents_system_paths: Vec::new(),
-            visible_skills: Vec::new(),
-            skills_enabled: false,
+            agents_prompt_configs: Vec::new(),
+            agents_read_roots: Vec::new(),
+            skills_catalog: None,
+            skills_reveal_roots: Vec::new(),
             permission_policy: PermissionPolicy::default(),
             explicit_permission_policy: false,
         }
@@ -60,6 +66,16 @@ impl AgentBuilder {
                 .permission_policy
                 .merged(PermissionPolicy::filesystem_default(config.root.clone()));
         }
+        if config.agents_read_context {
+            self.agents_read_roots.push(config.root.clone());
+        }
+        if config.skills_context {
+            self.skills_reveal_roots.push(config.root.clone());
+        }
+        self.middleware_chain
+            .push(config.root_hints_middleware(&self.model));
+        self.middleware_chain
+            .push(FilesystemClaimsMiddleware::new(config.clone(), &self.model));
         self.tools.extend(config.into_agent_tools(&self.model));
         self
     }
@@ -93,15 +109,10 @@ impl AgentBuilder {
         self
     }
 
-    /// Opt into static `AGENTS.md` system prompt context.
+    /// Opt into durable `AGENTS.md` instruction context.
     #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
     pub fn with_agents_system_prompt(mut self, config: AgentsPromptConfig) -> Self {
-        let instructions = config.instructions();
-        for instruction in instructions {
-            self.agents_system_paths.push(instruction.path);
-            self.system_prompt = self.system_prompt.with_fragment(instruction.content);
-        }
+        self.agents_prompt_configs.push(config);
         self
     }
 
@@ -110,12 +121,9 @@ impl AgentBuilder {
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_skills(mut self, config: SkillsConfig) -> Self {
         let skills = config.discover();
-        if let Some(catalog) = render_skills_catalog(&skills, "Available skills:") {
-            self.system_prompt = self.system_prompt.with_fragment(catalog);
-        }
-        self.visible_skills.extend(skills);
-        self.skills_enabled = true;
-        self.tools.push(config.into_agent_tool());
+        self.skills_catalog
+            .get_or_insert_with(Vec::new)
+            .extend(skills);
         self
     }
 
@@ -149,6 +157,9 @@ impl AgentBuilder {
                 .permission_policy
                 .merged(PermissionPolicy::filesystem_default(config.root.clone()));
         }
+        self.middleware_chain.push(config.root_hints_middleware());
+        self.middleware_chain
+            .push(ShellClaimsMiddleware::new(config.clone()));
         self.tools.push(config.into_agent_tool());
         self
     }
@@ -197,17 +208,29 @@ impl AgentBuilder {
     }
 
     /// Build the agent configuration.
+    ///
+    /// Middleware assembly order is deterministic and affects provider request
+    /// hashes: the stateful system prompt middleware runs first, then feature
+    /// and custom middleware in registration order, then `AGENTS.md`
+    /// instructions, then skills.
     #[must_use]
     pub fn build(self) -> Agent {
-        // TODO(agent-runtime): Construct a slim Agent plus session defaults instead.
+        let mut middleware_chain = MiddlewareChain::new();
+        middleware_chain.push(SystemPromptMiddleware::new(self.system_prompt.build()));
+        middleware_chain.extend(self.middleware_chain);
+        if !self.agents_prompt_configs.is_empty() || !self.agents_read_roots.is_empty() {
+            middleware_chain.push(AgentsInstructionsMiddleware::new(
+                self.agents_prompt_configs,
+                self.agents_read_roots,
+            ));
+        }
+        if let Some(catalog) = self.skills_catalog {
+            middleware_chain.push(SkillsMiddleware::new(catalog, self.skills_reveal_roots));
+        }
         Agent {
             model: self.model,
             tools: self.tools,
-            middleware_chain: self.middleware_chain,
-            system_prompt: self.system_prompt.build(),
-            agents_system_paths: self.agents_system_paths,
-            visible_skills: self.visible_skills,
-            skills_enabled: self.skills_enabled,
+            middleware_chain,
             permission_policy: self.permission_policy,
         }
     }
@@ -221,9 +244,10 @@ impl fmt::Debug for AgentBuilder {
             .field("tools", &self.tools)
             .field("middleware_chain_len", &self.middleware_chain.len())
             .field("system_prompt", &self.system_prompt)
-            .field("agents_system_paths", &self.agents_system_paths)
-            .field("visible_skills", &self.visible_skills)
-            .field("skills_enabled", &self.skills_enabled)
+            .field("agents_prompt_configs", &self.agents_prompt_configs)
+            .field("agents_read_roots", &self.agents_read_roots)
+            .field("skills_catalog", &self.skills_catalog)
+            .field("skills_reveal_roots", &self.skills_reveal_roots)
             .field("permission_policy", &self.permission_policy)
             .field(
                 "explicit_permission_policy",

@@ -142,6 +142,15 @@ async fn assert_provider_durable_replay(
     );
 
     let stored = store.load(&session_id).await.map_err(store_error)?;
+    assert_stored_replay_facts(&stored, label, expect_thinking);
+    Ok(())
+}
+
+fn assert_stored_replay_facts(
+    stored: &waltr_agent::SessionRecord,
+    label: &str,
+    expect_thinking: bool,
+) {
     for answer in [FIRST_ANSWER, SECOND_ANSWER] {
         assert!(
             stored
@@ -157,19 +166,15 @@ async fn assert_provider_durable_replay(
         // require at least one turn-tagged thinking block rather than one per
         // turn. The later turns still prove replay validity: the provider
         // accepts requests that replay the earlier thinking payloads.
-        let thinking_turns: Vec<u64> = stored
-            .snapshot
-            .turns
-            .iter()
-            .filter(|turn| turn.thinking_blocks().next().is_some())
-            .map(|turn| turn.turn)
-            .collect();
         assert!(
-            !thinking_turns.is_empty(),
+            stored
+                .snapshot
+                .turns
+                .iter()
+                .any(|turn| turn.thinking_blocks().next().is_some()),
             "{label}: expected turn-tagged thinking blocks in the stored session: {stored:?}"
         );
     }
-    Ok(())
 }
 
 #[derive(Default)]
@@ -187,7 +192,7 @@ async fn collect(
         match event? {
             AgentEvent::TextDelta { delta, .. } => collected.text.push_str(&delta),
             AgentEvent::ExternalRequest { request, .. } => {
-                collected.external_request_ids.push(request.id)
+                collected.external_request_ids.push(request.id);
             }
             AgentEvent::Finished { .. } => collected.finished = true,
             AgentEvent::ThinkingDelta { .. }

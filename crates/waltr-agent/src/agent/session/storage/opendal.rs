@@ -8,7 +8,7 @@ use crate::agent::session::{
     SessionSnapshot,
 };
 
-/// Generic OpenDAL implementation of [`SessionStore`].
+/// Generic `OpenDAL` implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
 pub struct OpenDalSessionStore {
     operator: Operator,

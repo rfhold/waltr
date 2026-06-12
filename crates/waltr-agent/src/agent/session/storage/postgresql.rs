@@ -1,4 +1,4 @@
-//! PostgreSQL setup for OpenDAL-backed session storage.
+//! `PostgreSQL` setup for `OpenDAL`-backed session storage.
 
 use opendal::{Operator, services};
 
@@ -10,7 +10,11 @@ mod embedded {
     refinery::embed_migrations!("migrations/postgresql");
 }
 
-/// Run forward-only PostgreSQL session storage migrations.
+/// Run forward-only `PostgreSQL` session storage migrations.
+///
+/// # Errors
+///
+/// Returns an error when the connection or a migration fails.
 pub async fn run_postgresql_migrations(connection_string: &str) -> SessionStoreResult<()> {
     let (mut client, connection) =
         tokio_postgres::connect(connection_string, tokio_postgres::NoTls)
@@ -27,7 +31,11 @@ pub async fn run_postgresql_migrations(connection_string: &str) -> SessionStoreR
     Ok(())
 }
 
-/// Create an OpenDAL PostgreSQL session store after running required migrations.
+/// Create an `OpenDAL` `PostgreSQL` session store after running required migrations.
+///
+/// # Errors
+///
+/// Returns an error when migrations fail or the backend cannot be constructed.
 pub async fn opendal_postgresql_session_store(
     connection_string: &str,
     prefix: impl Into<String>,
