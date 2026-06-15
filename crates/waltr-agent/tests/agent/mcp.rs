@@ -1,15 +1,11 @@
 //! MCP agent integration tests.
 
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::Router;
-use futures_util::stream;
 use waltr_agent::{
-    Agent, AgentTranscriptEvent, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-    CompletionRequest, LlmError, LlmStream, ModelApi, ModelRef, ProviderId, ToolCall,
+    Agent, AgentTranscriptEvent, CompletionEvent, LlmError, LlmStream, ModelApi, ModelRef,
+    ProviderId, ToolCall,
     mcp::{McpConfig, McpServerConfig},
 };
 use rmcp::{
@@ -24,6 +20,7 @@ use rmcp::{
 use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot};
 
+use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
@@ -33,7 +30,10 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
 -> waltr_agent::Result<()> {
     let stdio_command = test_stdio_server_command();
     let http_server = HttpMcpTestServer::start().await?;
-    let provider = ToolCapturingProvider::new(ScriptedMcpProvider);
+    let provider =
+        CapturingProvider::new(ScriptedProvider::new("scripted_mcp_provider", |request| {
+            direct_events(request.tool_results().count())
+        }));
 
     let agent = Agent::builder(test_model())
         .with_mcp_servers(
@@ -76,73 +76,6 @@ fn stdio_server(command: &str) -> McpServerConfig {
     McpServerConfig::stdio("stdio_test", command, std::iter::empty::<&str>())
 }
 
-struct ToolCapturingProvider<P> {
-    inner: P,
-    tools_by_turn: Mutex<Vec<Vec<String>>>,
-}
-
-impl<P> ToolCapturingProvider<P> {
-    const fn new(inner: P) -> Self {
-        Self {
-            inner,
-            tools_by_turn: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn all_tool_names(&self) -> Vec<String> {
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .iter()
-            .flatten()
-            .cloned()
-            .collect()
-    }
-
-    fn tool_context(&self) -> String {
-        let turns = self.tools_by_turn.lock().expect("captured tools").clone();
-        if turns.is_empty() {
-            return "captured provider tools: no provider requests captured".to_owned();
-        }
-        let lines = turns
-            .iter()
-            .enumerate()
-            .map(|(index, tools)| format!("turn {index}: {}", tools.join(", ")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("captured provider tools:\n{lines}")
-    }
-}
-
-impl<P: LlmStream> LlmStream for ToolCapturingProvider<P> {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
-        self.inner.stream_request(request)
-    }
-}
-
-struct ScriptedMcpProvider;
-
-impl LlmStream for ScriptedMcpProvider {
-    fn name(&self) -> &'static str {
-        "scripted_mcp_provider"
-    }
-
-    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        let step = request.tool_results().count();
-        Box::pin(
-            async move { Ok(Box::pin(stream::iter(direct_events(step))) as BoxCompletionStream) },
-        )
-    }
-}
-
 fn direct_events(step: usize) -> Vec<waltr_agent::Result<CompletionEvent>> {
     match step {
         0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
@@ -162,7 +95,7 @@ fn direct_events(step: usize) -> Vec<waltr_agent::Result<CompletionEvent>> {
     }
 }
 
-fn assert_tool_was_surfaced(provider: &ToolCapturingProvider<impl LlmStream>, name: &str) {
+fn assert_tool_was_surfaced(provider: &CapturingProvider<impl LlmStream>, name: &str) {
     let tools = provider.all_tool_names();
     assert!(
         tools.iter().any(|tool| tool == name),
@@ -171,7 +104,7 @@ fn assert_tool_was_surfaced(provider: &ToolCapturingProvider<impl LlmStream>, na
     );
 }
 
-fn assert_tool_was_not_surfaced(provider: &ToolCapturingProvider<impl LlmStream>, name: &str) {
+fn assert_tool_was_not_surfaced(provider: &CapturingProvider<impl LlmStream>, name: &str) {
     let tools = provider.all_tool_names();
     assert!(
         !tools.iter().any(|tool| tool == name),

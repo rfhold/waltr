@@ -1,23 +1,26 @@
 //! Agent permission integration tests.
 
-use std::{env, fs, path::PathBuf, sync::Mutex};
+use std::{env, fs, path::PathBuf};
 
 use futures_util::{StreamExt, stream};
 use waltr_agent::{
-    Agent, AgentEvent, BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
-    LlmStream, ModelApi, ModelRef, PermissionEffect, PermissionPolicy, PermissionToolSelector,
-    ProviderId, ToolCall,
-    middleware::ExternalRequestKind,
+    Agent, AgentEvent, AgentSessionRuntime, BoxCompletionStream, BoxStreamFuture, CancelReason,
+    CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
+    ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
+    PendingWorkStatus, PermissionEffect, PermissionPolicy, PermissionToolSelector, ProviderId,
+    ResumeInput, RuntimeResumeOutput, SessionStatus, SessionStore, ToolCall,
+    middleware::ExternalRequestKind as MiddlewareExternalRequestKind,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
 use waltr_agent::{PermissionCommandPattern, tools::shell::ShellConfig};
 use serde_json::json;
 
+use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
+
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-// TODO(agent-runtime): Add coverage that permission prompts survive durable suspension/resume.
 async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
 -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
@@ -88,10 +91,113 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
     let [request] = external_requests.as_slice() else {
         panic!("expected one permission external request: {external_requests:#?}");
     };
-    assert_eq!(request.kind, ExternalRequestKind::Permission);
+    assert_eq!(request.kind, MiddlewareExternalRequestKind::Permission);
     assert_eq!(request.tool_call_id.as_deref(), Some("call_2"));
     assert!(request.prompt.contains("external.txt"), "{request:#?}");
     assert!(request.id.starts_with("permission:ephemeral:1:call_2"));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn permission_external_request_resumes_from_durable_session() -> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            fixture.root.path(),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(
+            FilesystemConfig::new(fixture.root.path())
+                .with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let provider = ScriptedProvider::new("permission_resume_provider", |request| {
+        if request
+            .tool_results()
+            .any(|result| result.call_id == "call_resume")
+        {
+            vec![
+                Ok(CompletionEvent::Delta(
+                    "permission-flow-complete".to_owned(),
+                )),
+                Ok(CompletionEvent::Finished),
+            ]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_resume",
+                "../outside/external.txt",
+            )))]
+        }
+    });
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "read external file")
+        .stream();
+    let mut request_id = None;
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::ExternalRequest { request, .. } = event? {
+            assert_eq!(request.kind, MiddlewareExternalRequestKind::Permission);
+            assert_eq!(request.tool_call_id.as_deref(), Some("call_resume"));
+            assert!(request.prompt.contains("external.txt"), "{request:#?}");
+            request_id = Some(request.id);
+        }
+    }
+    let request_id = request_id.expect("permission request");
+
+    let suspended = store.load(&session_id).await.expect("stored session");
+    let persisted_request = suspended
+        .snapshot
+        .external_requests
+        .iter()
+        .find(|request| request.id.as_str() == request_id)
+        .expect("persisted permission request");
+    assert_eq!(persisted_request.kind, ExternalRequestKind::Permission);
+    assert_eq!(persisted_request.status, ExternalRequestStatus::Pending);
+    assert!(matches!(
+        suspended.snapshot.status,
+        SessionStatus::Suspended(_)
+    ));
+    assert!(suspended.snapshot.pending_work.iter().any(|work| {
+        work.id == "call_resume" && matches!(work.status, PendingWorkStatus::Pending)
+    }));
+
+    let mut resumed = sessions
+        .resume(
+            &provider,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id: ExternalRequestId::new(request_id.clone()),
+                response: ExternalResponse::new(json!("allow-once")),
+            },
+        )
+        .stream();
+    let mut text = String::new();
+    while let Some(event) = resumed.next().await {
+        if let AgentEvent::TextDelta { delta, .. } = event? {
+            text.push_str(&delta);
+        }
+    }
+    assert_eq!(text, "permission-flow-complete");
+
+    let completed = store.load(&session_id).await.expect("stored session");
+    let responded_request = completed
+        .snapshot
+        .external_requests
+        .iter()
+        .find(|request| request.id.as_str() == request_id)
+        .expect("responded permission request");
+    assert!(matches!(
+        responded_request.status,
+        ExternalRequestStatus::Responded(_)
+    ));
+    assert!(completed.snapshot.pending_work.iter().any(|work| {
+        work.id == "call_resume" && matches!(work.status, PendingWorkStatus::Finished(_))
+    }));
 
     Ok(())
 }
@@ -130,14 +236,16 @@ async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
     #[cfg(feature = "shell")]
     let agent = agent.with_shell_tool(ShellConfig::new(fixture.root.path()));
     let agent = agent.build();
-    let provider = CaptureToolsProvider::default();
+    let provider = CapturingProvider::new(ScriptedProvider::new("capture_tools_provider", |_| {
+        vec![Ok(CompletionEvent::Finished)]
+    }));
 
     let mut stream = agent.prompt(&provider, "capture tools").stream();
     while let Some(event) = stream.next().await {
         drop(event?);
     }
 
-    let tools = provider.tools.lock().expect("captured tools").clone();
+    let tools = provider.all_tool_names();
     assert!(tools.iter().any(|name| name == "read"));
     assert!(tools.iter().any(|name| name == "glob"));
     assert!(tools.iter().any(|name| name == "grep"));
@@ -152,6 +260,7 @@ async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
     let denied = fixture.outside.path().join("denied.txt");
@@ -176,7 +285,12 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
         shell_denied: shell_denied.clone(),
     };
 
-    let mut stream = agent.prompt(&provider, "patch denied").stream();
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "patch denied")
+        .stream();
     let mut external_requests = Vec::new();
     while let Some(event) = stream.next().await {
         if let AgentEvent::ExternalRequest { request, .. } = event? {
@@ -187,15 +301,56 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     let [request] = external_requests.as_slice() else {
         panic!("expected one permission external request: {external_requests:#?}");
     };
-    assert_eq!(request.kind, ExternalRequestKind::Permission);
+    assert_eq!(request.kind, MiddlewareExternalRequestKind::Permission);
     assert_eq!(request.tool_call_id.as_deref(), Some("call_1"));
     assert!(
         request.prompt.contains("Write filesystem path"),
         "{request:#?}"
     );
+    let external_request_id = request.id.clone();
     assert_eq!(fixture.root.read("allowed.txt")?, "root-allowed-101\n");
     #[cfg(feature = "shell")]
     assert!(!shell_denied.exists());
+
+    let suspended = store.load(&session_id).await.expect("stored session");
+    assert!(
+        suspended.snapshot.pending_work.iter().any(|work| {
+            work.id == "call_1" && matches!(work.status, PendingWorkStatus::Pending)
+        })
+    );
+
+    match AgentSessionRuntime::new(&store)
+        .resume(
+            &session_id,
+            ResumeInput::Prompt("skip denied patch".to_owned()),
+        )
+        .await?
+    {
+        RuntimeResumeOutput::Resumed { .. } => {}
+        RuntimeResumeOutput::Suspended { .. } => panic!("prompt resume should cancel pending work"),
+    }
+
+    let canceled = store.load(&session_id).await.expect("stored session");
+    let persisted_request = canceled
+        .snapshot
+        .external_requests
+        .iter()
+        .find(|request| request.id.as_str() == external_request_id)
+        .expect("persisted permission request");
+    assert!(matches!(
+        persisted_request.status,
+        ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt)
+    ));
+    let work = canceled
+        .snapshot
+        .pending_work
+        .iter()
+        .find(|work| work.id == "call_1")
+        .expect("pending work record");
+    assert!(matches!(
+        work.status,
+        PendingWorkStatus::Canceled(CancelReason::SupersededByUserPrompt)
+    ));
 
     Ok(())
 }
@@ -208,96 +363,90 @@ impl LlmStream for ScriptedPermissionProvider {
     }
 
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        // TODO(agent-runtime): Drive scripted turns from request records, not tool_result counts.
         Box::pin(async move {
-            let step = request.tool_results().count();
-            let events = match step {
-                0 => vec![Ok(CompletionEvent::ToolCall(read_call(
+            let completed = request
+                .tool_results()
+                .map(|result| result.call_id.as_str())
+                .collect::<Vec<_>>();
+            let events = if !completed.contains(&"call_1") {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
                     "call_1",
                     "allowed.txt",
-                )))],
-                1 => vec![Ok(CompletionEvent::ToolCall(read_call(
+                )))]
+            } else if !completed.contains(&"call_2") {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
                     "call_2",
                     "../outside/external.txt",
-                )))],
-                2 => vec![Ok(CompletionEvent::ToolCall(read_call(
+                )))]
+            } else if !completed.contains(&"call_3") {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
                     "call_3",
                     "../outside/nested/external-nested.txt",
-                )))],
-                3 => vec![Ok(CompletionEvent::ToolCall(read_call(
+                )))]
+            } else if !completed.contains(&"call_4") {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
                     "call_4",
                     "../outside/nested/another.txt",
-                )))],
-                4 => vec![Ok(CompletionEvent::ToolCall(read_call(
+                )))]
+            } else if !completed.contains(&"call_5") {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
                     "call_5",
                     "../outside/denied.txt",
-                )))],
-                #[cfg(feature = "shell")]
-                5 => vec![Ok(CompletionEvent::ToolCall(shell_call(
-                    "call_6",
-                    "printf shell-one",
-                    "first shell command",
-                )))],
-                #[cfg(feature = "shell")]
-                6 => vec![Ok(CompletionEvent::ToolCall(shell_call(
-                    "call_7",
-                    "printf shell-two",
-                    "second shell command",
-                )))],
-                #[cfg(feature = "shell")]
-                7 => vec![Ok(CompletionEvent::ToolCall(shell_call(
-                    "call_8",
-                    "cat ../outside/nested/shell-walk.txt",
-                    "read a shell path covered by the approved nested directory",
-                )))],
-                #[cfg(feature = "shell")]
-                8 => vec![Ok(CompletionEvent::ToolCall(shell_call(
-                    "call_9",
-                    "cat ../outside/denied.txt",
-                    "read a shell path denied by external filesystem policy",
-                )))],
-                #[cfg(feature = "shell")]
-                9 => vec![Ok(CompletionEvent::ToolCall(shell_call(
-                    "call_10",
-                    "git status",
-                    "denied shell command",
-                )))],
-                _ => vec![
-                    Ok(CompletionEvent::Delta(
-                        "permission-flow-complete".to_owned(),
-                    )),
-                    Ok(CompletionEvent::Finished),
-                ],
+                )))]
+            } else {
+                scripted_shell_or_finished(&completed)
             };
             Ok(Box::pin(stream::iter(events)) as BoxCompletionStream)
         })
     }
 }
 
-struct CaptureToolsProvider {
-    tools: Mutex<Vec<String>>,
-}
-
-impl Default for CaptureToolsProvider {
-    fn default() -> Self {
-        Self {
-            tools: Mutex::new(Vec::new()),
+fn scripted_shell_or_finished(completed: &[&str]) -> Vec<waltr_agent::Result<CompletionEvent>> {
+    #[cfg(feature = "shell")]
+    {
+        if !completed.contains(&"call_6") {
+            return vec![Ok(CompletionEvent::ToolCall(shell_call(
+                "call_6",
+                "printf shell-one",
+                "first shell command",
+            )))];
+        }
+        if !completed.contains(&"call_7") {
+            return vec![Ok(CompletionEvent::ToolCall(shell_call(
+                "call_7",
+                "printf shell-two",
+                "second shell command",
+            )))];
+        }
+        if !completed.contains(&"call_8") {
+            return vec![Ok(CompletionEvent::ToolCall(shell_call(
+                "call_8",
+                "cat ../outside/nested/shell-walk.txt",
+                "read a shell path covered by the approved nested directory",
+            )))];
+        }
+        if !completed.contains(&"call_9") {
+            return vec![Ok(CompletionEvent::ToolCall(shell_call(
+                "call_9",
+                "cat ../outside/denied.txt",
+                "read a shell path denied by external filesystem policy",
+            )))];
+        }
+        if !completed.contains(&"call_10") {
+            return vec![Ok(CompletionEvent::ToolCall(shell_call(
+                "call_10",
+                "git status",
+                "denied shell command",
+            )))];
         }
     }
-}
 
-impl LlmStream for CaptureToolsProvider {
-    fn name(&self) -> &'static str {
-        "capture_tools_provider"
-    }
-
-    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        Box::pin(async move {
-            *self.tools.lock().expect("captured tools") =
-                request.tools.iter().map(|tool| tool.name.clone()).collect();
-            Ok(Box::pin(stream::iter(vec![Ok(CompletionEvent::Finished)])) as BoxCompletionStream)
-        })
-    }
+    vec![
+        Ok(CompletionEvent::Delta(
+            "permission-flow-complete".to_owned(),
+        )),
+        Ok(CompletionEvent::Finished),
+    ]
 }
 
 struct PatchDeniedProvider {
@@ -313,7 +462,6 @@ impl LlmStream for PatchDeniedProvider {
     }
 
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        // TODO(agent-runtime): Verify denied multi-claim work records are canceled durably.
         Box::pin(async move {
             let events = match request.tool_results().count() {
                 0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
