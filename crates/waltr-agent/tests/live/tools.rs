@@ -11,25 +11,43 @@ const ECHO_VALUE: &str = "waltr-tool-echo-7391";
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn anthropic_messages_streams_echo_tool_call() -> waltr_agent::Result<()> {
-    assert_provider_calls_echo_tool(live_provider::anthropic_messages()?.provider).await
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::anthropic_messages())?
+    else {
+        return Ok(());
+    };
+    assert_provider_calls_echo_tool(live.provider).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_chat_completions_streams_echo_tool_call() -> waltr_agent::Result<()> {
-    assert_provider_calls_echo_tool(live_provider::openai_chat_completions()?.provider).await
+    let Some(live) =
+        live_provider::skip_if_missing_config(live_provider::openai_chat_completions())?
+    else {
+        return Ok(());
+    };
+    assert_provider_calls_echo_tool(live.provider).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_streams_echo_tool_call() -> waltr_agent::Result<()> {
-    assert_provider_calls_echo_tool(live_provider::openai_responses()?.provider).await
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::openai_responses())?
+    else {
+        return Ok(());
+    };
+    assert_provider_calls_echo_tool(live.provider).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_websocket_streams_echo_tool_call() -> waltr_agent::Result<()> {
-    assert_provider_calls_echo_tool(live_provider::openai_responses_websocket()?.provider).await
+    let Some(live) =
+        live_provider::skip_if_missing_config(live_provider::openai_responses_websocket())?
+    else {
+        return Ok(());
+    };
+    assert_provider_calls_echo_tool(live.provider).await
 }
 
 async fn assert_provider_calls_echo_tool(provider: impl LlmStream) -> waltr_agent::Result<()> {

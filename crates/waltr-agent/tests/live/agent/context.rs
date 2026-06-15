@@ -14,8 +14,13 @@ const COMPLETION_MARKER: &str = "dynamic-context-flow-complete";
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn live_context_agent_loop() -> waltr_agent::Result<()> {
-    let live =
-        live_provider::selected_from_env("WALTR_AGENT_LIVE_PROVIDER", "openai_responses_websocket")?;
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::selected_from_env(
+        "WALTR_AGENT_LIVE_PROVIDER",
+        "openai_responses_websocket",
+    ))?
+    else {
+        return Ok(());
+    };
     run_live_context(live.provider, live.model).await
 }
 

@@ -1,12 +1,12 @@
 //! End-to-end live coding-agent durable runtime test.
 
-use std::{env, fmt::Write, fs, path::PathBuf, sync::Mutex};
+use std::{env, fmt::Write, fs, path::PathBuf};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentEvent, BoxStreamFuture, CompletionRequest, ExternalRequestId, ExternalResponse,
-    LlmError, LlmStream, MemorySessionStore, ModelRef, PermissionEffect, PermissionPolicy,
-    ResumeInput, SessionId, SessionRecord, SessionStore, ToolDefinition,
+    Agent, AgentEvent, ExternalRequestId, ExternalResponse, LlmError, LlmStream,
+    MemorySessionStore, ModelRef, PermissionEffect, PermissionPolicy, ResumeInput, SessionId,
+    SessionRecord, SessionStore,
     middleware::{ExternalRequestDraft, ExternalRequestKind as MiddlewareExternalRequestKind},
     tools::{
         filesystem::{FilesystemConfig, FilesystemToolProfile},
@@ -16,14 +16,21 @@ use waltr_agent::{
 };
 use serde_json::json;
 
-use crate::{live_provider, session::TEST_HARNESS_SYSTEM_PROMPT};
+use crate::{
+    live_provider, scripted_provider::CapturingProvider, session::TEST_HARNESS_SYSTEM_PROMPT,
+};
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn live_coding_agent_durable_resume_context_skills_permissions_and_questions()
 -> waltr_agent::Result<()> {
-    let live =
-        live_provider::selected_from_env("WALTR_AGENT_LIVE_PROVIDER", "openai_responses_websocket")?;
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::selected_from_env(
+        "WALTR_AGENT_LIVE_PROVIDER",
+        "openai_responses_websocket",
+    ))?
+    else {
+        return Ok(());
+    };
     run_live_coding_agent(live.provider, live.model).await
 }
 
@@ -33,7 +40,7 @@ async fn run_live_coding_agent(
     model: ModelRef,
 ) -> waltr_agent::Result<()> {
     let fixture = CodingAgentFixture::new()?;
-    let provider = ToolCapturingProvider::new(provider);
+    let provider = CapturingProvider::new(provider);
     let store = MemorySessionStore::new();
     let policy =
         PermissionPolicy::filesystem_external(fixture.root.path(), PermissionEffect::ask());
@@ -225,63 +232,7 @@ impl crate::session::AgentTestSession {
     }
 }
 
-struct ToolCapturingProvider<P> {
-    inner: P,
-    tools_by_turn: Mutex<Vec<Vec<String>>>,
-}
-
-impl<P> ToolCapturingProvider<P> {
-    const fn new(inner: P) -> Self {
-        Self {
-            inner,
-            tools_by_turn: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn all_tool_names(&self) -> Vec<String> {
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .iter()
-            .flatten()
-            .cloned()
-            .collect()
-    }
-
-    fn tool_context(&self) -> String {
-        let turns = self.tools_by_turn.lock().expect("captured tools").clone();
-        if turns.is_empty() {
-            return "captured provider tools: no provider requests captured".to_owned();
-        }
-        let lines = turns
-            .iter()
-            .enumerate()
-            .map(|(index, tools)| format!("turn {index}: {}", tools.join(", ")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("captured provider tools:\n{lines}")
-    }
-}
-
-impl<P: LlmStream> LlmStream for ToolCapturingProvider<P> {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .push(tool_names(&request.tools));
-        self.inner.stream_request(request)
-    }
-}
-
-fn tool_names(tools: &[ToolDefinition]) -> Vec<String> {
-    tools.iter().map(|tool| tool.name.clone()).collect()
-}
-
-fn assert_tool_was_surfaced(provider: &ToolCapturingProvider<impl LlmStream>, name: &str) {
+fn assert_tool_was_surfaced(provider: &CapturingProvider<impl LlmStream>, name: &str) {
     assert!(
         provider.all_tool_names().iter().any(|tool| tool == name),
         "{}",
@@ -300,7 +251,7 @@ where
 }
 
 fn test_context(
-    provider: &ToolCapturingProvider<impl LlmStream>,
+    provider: &CapturingProvider<impl LlmStream>,
     session: &DurableLiveSession,
 ) -> String {
     let mut report = format!(

@@ -15,8 +15,13 @@ use crate::{live_provider, session::AgentTestSession};
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn live_permissions_agent_loop() -> waltr_agent::Result<()> {
-    let live =
-        live_provider::selected_from_env("WALTR_AGENT_LIVE_PROVIDER", "openai_responses_websocket")?;
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::selected_from_env(
+        "WALTR_AGENT_LIVE_PROVIDER",
+        "openai_responses_websocket",
+    ))?
+    else {
+        return Ok(());
+    };
     run_live_permissions(live.provider, live.model).await
 }
 

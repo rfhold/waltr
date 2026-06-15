@@ -11,18 +11,9 @@ export default async function () {
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await waitForText(page, "#landing-title", "Waltr is ready.");
 
-    await page.locator('a[href="/config"]').click();
+    await page.locator('a[href="/config/provider"]').click();
     await waitForText(page, "#config-title", "Settings");
-    await page.evaluate(() => {
-      const tab = Array.from(document.querySelectorAll(".config__tab"))
-        .find((candidate) => candidate.textContent?.trim() === "MCP Servers");
-
-      if (!(tab instanceof HTMLElement)) {
-        throw new Error("MCP Servers tab not found");
-      }
-
-      tab.click();
-    });
+    await page.locator('a[href="/config/mcp"]').click();
     const mcpTabSelected = await mcpTabContextPreserved(page);
     await waitForText(page, '[aria-label="MCP server actions"]', "Create");
 
@@ -37,7 +28,7 @@ export default async function () {
     await page
       .locator('form[aria-label="Create MCP server"] select[name="kind"]')
       .selectOption("stdio");
-    await typeAndKeepFocus(
+    await setInputValue(
       page,
       'form[aria-label="Create MCP server"] input[name="command"]',
       "npx local-mcp",
@@ -51,7 +42,7 @@ export default async function () {
     const editServerRoute = await waitForPathname(page, "/config/mcp/edit/localstdio");
     const editServerTabSelected = await mcpTabContextPreserved(page);
     await page.locator('form[aria-label="Edit MCP server"] select[name="kind"]').selectOption("sse");
-    await typeAndKeepFocus(
+    await setInputValue(
       page,
       'form[aria-label="Edit MCP server"] input[name="url"]',
       "https://localhost:8787/sse",
@@ -135,9 +126,22 @@ async function waitForPathname(page, expectedPathname) {
   throw new Error(`Timed out waiting for route ${expectedPathname}; saw ${pathname}`);
 }
 
+async function setInputValue(page, selector, value) {
+  await page.evaluate(({ selector, value }) => {
+    const input = document.querySelector(selector);
+
+    if (!(input instanceof HTMLInputElement)) {
+      throw new Error(`Input not found: ${selector}`);
+    }
+
+    input.value = value;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+  }, { selector, value });
+}
+
 async function mcpTabContextPreserved(page) {
   return page.evaluate(() => {
-    const selectedTab = document.querySelector('.config__tab[aria-selected="true"]');
+    const selectedTab = document.querySelector('a[href="/config/mcp"][aria-selected="true"]');
     return selectedTab?.textContent?.trim() === "MCP Servers";
   });
 }
