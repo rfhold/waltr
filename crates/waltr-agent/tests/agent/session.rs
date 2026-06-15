@@ -13,7 +13,6 @@ pub const REPORT_TOOL_ERRORS_ENV: &str = "WALTR_AGENT_REPORT_TOOL_ERRORS";
 pub const TEST_HARNESS_SYSTEM_PROMPT: &str = "You are running inside an automated test harness. Follow the user instructions exactly. Use tools when the user explicitly asks you to use them. When asked to report exact values, include those values verbatim. Keep final answers concise and do not add extra commentary unless requested.";
 
 #[derive(Debug, Default)]
-// TODO(agent-runtime): Replace helper-only state with durable AgentSession resume assertions.
 pub struct AgentTestSession {
     pub text: String,
     pub final_snapshot: Option<SessionSnapshot>,
@@ -44,7 +43,6 @@ impl AgentTestSession {
         provider: &impl LlmStream,
         prompt: &str,
     ) -> waltr_agent::Result<Self> {
-        // TODO(agent-runtime): Exercise suspension, resume input, and pending external requests.
         let mut stream = agent
             .prompt(provider, prompt)
             .with_system_prompt_fragment(TEST_HARNESS_SYSTEM_PROMPT)
@@ -129,50 +127,17 @@ fn report_tool_errors_enabled() -> bool {
 
 #[cfg(test)]
 mod completion {
-    use std::sync::Mutex;
-
-    use futures_util::{StreamExt, stream};
+    use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, AgentTool, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-        CompletionRequest, LlmStream, MemorySessionStore, ModelApi, ModelRef, ProviderId,
-        SessionSnapshot, SessionStatus, SessionStore, ToolCall, ToolDefinition,
+        Agent, AgentEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi, ModelRef,
+        ProviderId, SessionSnapshot, SessionStatus, SessionStore, ToolCall, ToolDefinition,
     };
     use serde_json::json;
 
-    struct ScriptedProvider {
-        requests: Mutex<usize>,
-        script: Vec<Vec<CompletionEvent>>,
-    }
+    use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
-    impl ScriptedProvider {
-        fn new(script: Vec<Vec<CompletionEvent>>) -> Self {
-            Self {
-                requests: Mutex::new(0),
-                script,
-            }
-        }
-    }
-
-    impl LlmStream for ScriptedProvider {
-        fn name(&self) -> &'static str {
-            "scripted_provider"
-        }
-
-        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            let mut requests = self.requests.lock().expect("request lock");
-            let index = *requests;
-            *requests += 1;
-            drop(requests);
-            let events = self
-                .script
-                .get(index)
-                .unwrap_or_else(|| panic!("unexpected provider request {index}"))
-                .clone()
-                .into_iter()
-                .map(Ok)
-                .collect::<Vec<_>>();
-            Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
-        }
+    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
+        CapturingProvider::new(ScriptedProvider::from_turns("scripted_provider", script))
     }
 
     fn test_model() -> ModelRef {
@@ -220,7 +185,7 @@ mod completion {
     #[tokio::test]
     async fn finished_snapshot_matches_stored_snapshot() {
         let store = MemorySessionStore::new();
-        let provider = ScriptedProvider::new(tool_then_text_script());
+        let provider = scripted_provider(tool_then_text_script());
         let agent = Agent::builder(test_model()).with_tool(echo_tool()).build();
         let sessions = agent.sessions(store.clone());
         let session_id = sessions
@@ -246,7 +211,7 @@ mod completion {
 
     #[tokio::test]
     async fn ephemeral_run_emits_complete_snapshot() {
-        let provider = ScriptedProvider::new(tool_then_text_script());
+        let provider = scripted_provider(tool_then_text_script());
         let agent = Agent::builder(test_model())
             .with_system_prompt("ephemeral marker-prompt")
             .with_tool(echo_tool())
@@ -351,68 +316,24 @@ mod tool_projection {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use futures_util::{StreamExt, stream};
+    use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-        CompletionRequest, ExternalRequestId, ExternalResponse, LlmStream, MemorySessionStore,
-        ModelApi, ModelRef, ProviderId, ResumeInput, ToolCall, ToolDefinition,
+        Agent, AgentEvent, CompletionEvent, ExternalRequestId, ExternalResponse,
+        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, ToolCall,
         question::QuestionConfig, tools::filesystem::FilesystemConfig,
     };
     use serde_json::json;
 
-    struct CaptureToolsProvider {
-        script: Vec<Vec<CompletionEvent>>,
-        requests: Mutex<usize>,
-        tools: Mutex<Vec<Vec<ToolDefinition>>>,
-    }
+    use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
-    impl CaptureToolsProvider {
-        fn new(script: Vec<Vec<CompletionEvent>>) -> Self {
-            Self {
-                script,
-                requests: Mutex::new(0),
-                tools: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn tool_description(&self, request: usize, name: &str) -> String {
-            self.tools.lock().expect("captured tools")[request]
-                .iter()
-                .find(|tool| tool.name == name)
-                .unwrap_or_else(|| panic!("request {request} should expose tool {name}"))
-                .description
-                .clone()
-        }
-    }
-
-    impl LlmStream for CaptureToolsProvider {
-        fn name(&self) -> &'static str {
-            "capture_tools_provider"
-        }
-
-        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            let mut requests = self.requests.lock().expect("request lock");
-            let index = *requests;
-            *requests += 1;
-            drop(requests);
-            self.tools
-                .lock()
-                .expect("captured tools")
-                .push(request.tools);
-            let events = self
-                .script
-                .get(index)
-                .unwrap_or_else(|| panic!("unexpected provider request {index}"))
-                .clone()
-                .into_iter()
-                .map(Ok)
-                .collect::<Vec<_>>();
-            Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
-        }
+    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
+        CapturingProvider::new(ScriptedProvider::from_turns(
+            "capture_tools_provider",
+            script,
+        ))
     }
 
     fn test_model() -> ModelRef {
@@ -449,7 +370,7 @@ mod tool_projection {
         }
 
         let store = MemorySessionStore::new();
-        let provider = CaptureToolsProvider::new(vec![
+        let provider = scripted_provider(vec![
             vec![CompletionEvent::ToolCall(ToolCall::new(
                 "q-1",
                 "question",
@@ -548,18 +469,17 @@ mod tool_projection {
 
 #[cfg(test)]
 mod system_prompt_state {
-    use std::sync::Mutex;
-
-    use futures_util::{StreamExt, stream};
+    use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, AgentTool, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-        CompletionRequest, ExternalRequestId, ExternalResponse, LlmStream, MemorySessionStore,
-        ModelApi, ModelRef, PermissionEffect, PermissionPolicy, PermissionToolSelector, ProviderId,
-        ResumeInput, SessionEvent, SessionId, SessionRecord, SessionStore, ToolCall,
-        ToolDefinition,
+        Agent, AgentEvent, AgentTool, CompletionEvent, ExternalRequestId, ExternalResponse,
+        MemorySessionStore, ModelApi, ModelRef, PermissionEffect, PermissionPolicy,
+        PermissionToolSelector, ProviderId, ResumeInput, SessionEvent, SessionId, SessionRecord,
+        SessionStore, ToolCall, ToolDefinition,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
     };
     use serde_json::json;
+
+    use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
     fn test_model() -> ModelRef {
         ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses)
@@ -591,53 +511,8 @@ mod system_prompt_state {
         }
     }
 
-    struct ScriptedProvider {
-        requests: Mutex<usize>,
-        system_prompts: Mutex<Vec<Option<String>>>,
-        script: Vec<Vec<CompletionEvent>>,
-    }
-
-    impl ScriptedProvider {
-        fn new(script: Vec<Vec<CompletionEvent>>) -> Self {
-            Self {
-                requests: Mutex::new(0),
-                system_prompts: Mutex::new(Vec::new()),
-                script,
-            }
-        }
-
-        fn system_prompts(&self) -> Vec<Option<String>> {
-            self.system_prompts
-                .lock()
-                .expect("system prompt lock")
-                .clone()
-        }
-    }
-
-    impl LlmStream for ScriptedProvider {
-        fn name(&self) -> &'static str {
-            "scripted_provider"
-        }
-
-        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            let mut requests = self.requests.lock().expect("request lock");
-            let index = *requests;
-            *requests += 1;
-            drop(requests);
-            self.system_prompts
-                .lock()
-                .expect("system prompt lock")
-                .push(request.system_prompt.map(str::to_owned));
-            let events = self
-                .script
-                .get(index)
-                .unwrap_or_else(|| panic!("unexpected provider request {index}"))
-                .clone()
-                .into_iter()
-                .map(Ok)
-                .collect::<Vec<_>>();
-            Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
-        }
+    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
+        CapturingProvider::new(ScriptedProvider::from_turns("scripted_provider", script))
     }
 
     struct RunOutput {
@@ -709,7 +584,7 @@ mod system_prompt_state {
     #[tokio::test]
     async fn rebuilt_agent_renders_stored_prompt_on_initialized_session() {
         let store = MemorySessionStore::new();
-        let provider = ScriptedProvider::new(vec![
+        let provider = scripted_provider(vec![
             vec![question_call("q-1")],
             vec![
                 CompletionEvent::Delta("done".to_owned()),
@@ -769,7 +644,7 @@ mod system_prompt_state {
     #[tokio::test]
     async fn run_override_on_fresh_session_becomes_captured_first_turn_state() {
         let store = MemorySessionStore::new();
-        let provider = ScriptedProvider::new(vec![vec![
+        let provider = scripted_provider(vec![vec![
             CompletionEvent::Delta("ok".to_owned()),
             CompletionEvent::Finished,
         ]]);
@@ -809,7 +684,7 @@ mod system_prompt_state {
     #[tokio::test]
     async fn run_override_on_initialized_session_journals_update_and_replays() {
         let store = MemorySessionStore::new();
-        let provider = ScriptedProvider::new(vec![
+        let provider = scripted_provider(vec![
             vec![question_call("q-1")],
             vec![question_call("q-2")],
             vec![
@@ -888,7 +763,7 @@ mod system_prompt_state {
     #[tokio::test]
     async fn execution_only_overrides_apply_without_state_events() {
         let store = MemorySessionStore::new();
-        let provider = ScriptedProvider::new(vec![
+        let provider = scripted_provider(vec![
             vec![question_call("q-1")],
             vec![CompletionEvent::ToolCall(ToolCall::new(
                 "blocked-1",
@@ -976,20 +851,20 @@ mod agents_skills_state {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::Mutex,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use futures_util::{StreamExt, stream};
+    use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, AgentsPromptConfig, BoxCompletionStream, BoxStreamFuture,
-        CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse, LlmStream,
-        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionId, SkillsConfig,
-        ToolCall,
+        Agent, AgentEvent, AgentsPromptConfig, CompletionEvent, ExternalRequestId,
+        ExternalResponse, MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput,
+        SessionId, SkillsConfig, ToolCall,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
         tools::filesystem::FilesystemConfig,
     };
     use serde_json::json;
+
+    use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
     fn test_model() -> ModelRef {
         ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses)
@@ -1014,53 +889,8 @@ mod agents_skills_state {
         ))
     }
 
-    struct ScriptedProvider {
-        requests: Mutex<usize>,
-        system_prompts: Mutex<Vec<Option<String>>>,
-        script: Vec<Vec<CompletionEvent>>,
-    }
-
-    impl ScriptedProvider {
-        fn new(script: Vec<Vec<CompletionEvent>>) -> Self {
-            Self {
-                requests: Mutex::new(0),
-                system_prompts: Mutex::new(Vec::new()),
-                script,
-            }
-        }
-
-        fn system_prompts(&self) -> Vec<Option<String>> {
-            self.system_prompts
-                .lock()
-                .expect("system prompt lock")
-                .clone()
-        }
-    }
-
-    impl LlmStream for ScriptedProvider {
-        fn name(&self) -> &'static str {
-            "scripted_provider"
-        }
-
-        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-            let mut requests = self.requests.lock().expect("request lock");
-            let index = *requests;
-            *requests += 1;
-            drop(requests);
-            self.system_prompts
-                .lock()
-                .expect("system prompt lock")
-                .push(request.system_prompt.map(str::to_owned));
-            let events = self
-                .script
-                .get(index)
-                .unwrap_or_else(|| panic!("unexpected provider request {index}"))
-                .clone()
-                .into_iter()
-                .map(Ok)
-                .collect::<Vec<_>>();
-            Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
-        }
+    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
+        CapturingProvider::new(ScriptedProvider::from_turns("scripted_provider", script))
     }
 
     struct RunOutput {
@@ -1102,7 +932,7 @@ mod agents_skills_state {
         let other = TempRoot::new("waltr-session-agents-other");
         other.write("AGENTS.md", "Other instructions marker-other.\n");
         let store = MemorySessionStore::new();
-        let provider = ScriptedProvider::new(vec![
+        let provider = scripted_provider(vec![
             vec![question_call("q-1")],
             vec![
                 CompletionEvent::Delta("done".to_owned()),
@@ -1166,7 +996,7 @@ mod agents_skills_state {
                 json!({ "filePath": "src/main.rs" }),
             ))
         };
-        let provider = ScriptedProvider::new(vec![
+        let provider = scripted_provider(vec![
             vec![read_call("read-1")],
             vec![question_call("q-1")],
             vec![read_call("read-2")],
@@ -1235,7 +1065,7 @@ mod agents_skills_state {
                 json!({ "name": "example" }),
             ))
         };
-        let provider = ScriptedProvider::new(vec![
+        let provider = scripted_provider(vec![
             vec![load_call("load-1")],
             vec![load_call("load-2")],
             vec![question_call("q-1")],
@@ -1308,7 +1138,7 @@ mod agents_skills_state {
         let temp = TempRoot::new("waltr-session-agents-ephemeral");
         temp.write("AGENTS.md", "Ephemeral instructions marker-ephemeral.\n");
         let store = MemorySessionStore::new();
-        let provider = ScriptedProvider::new(vec![vec![
+        let provider = scripted_provider(vec![vec![
             CompletionEvent::Delta("ok".to_owned()),
             CompletionEvent::Finished,
         ]]);

@@ -1,26 +1,25 @@
 //! Agent question tool integration tests.
 
-use std::sync::Mutex;
-
-use futures_util::stream;
+use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentTranscriptEvent, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-    CompletionRequest, LlmStream, ModelApi, ModelRef, ProviderId, ToolCall, ToolDefinition,
-    middleware::ExternalRequestKind,
+    Agent, AgentEvent, AgentTranscriptEvent, CompletionEvent, ExternalRequestId,
+    ExternalRequestKind, ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore,
+    ModelApi, ModelRef, ProviderId, ResumeInput, SessionStatus, SessionStore, ToolCall,
+    ToolDefinition,
+    middleware::ExternalRequestKind as MiddlewareExternalRequestKind,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 use serde_json::{Value, json};
 
+use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
 #[tokio::test]
-// TODO(agent-runtime): Add durable question suspension/resume coverage around external requests.
 async fn question_agent_loop_surfaces_tool_and_suspends_for_external_answers()
 -> waltr_agent::Result<()> {
-    let provider = ToolCapturingProvider::new(ScriptedQuestionProvider::new(
-        structured_question_arguments(),
-    ));
+    let provider =
+        CapturingProvider::new(scripted_question_provider(structured_question_arguments()));
     let agent = Agent::builder(test_model())
         .with_question_tool(QuestionConfig::new())
         .build();
@@ -44,7 +43,7 @@ async fn question_agent_loop_surfaces_tool_and_suspends_for_external_answers()
     let [request] = session.external_requests.as_slice() else {
         panic!("expected one external question request: {context}");
     };
-    assert_eq!(request.kind, ExternalRequestKind::Question);
+    assert_eq!(request.kind, MiddlewareExternalRequestKind::Question);
     assert_eq!(request.tool_call_id.as_deref(), Some("ask_question"));
     assert!(request.id.starts_with("question:ephemeral:0:ask_question"));
     assert!(request.prompt.contains("Which implementation path"));
@@ -54,9 +53,109 @@ async fn question_agent_loop_surfaces_tool_and_suspends_for_external_answers()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn question_external_request_resumes_from_durable_session() -> waltr_agent::Result<()> {
+    let provider =
+        CapturingProvider::new(scripted_question_provider(structured_question_arguments()));
+    let agent = Agent::builder(test_model())
+        .with_question_tool(QuestionConfig::new())
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "ask structured questions")
+        .stream();
+    let mut request_id = None;
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::ExternalRequest { request, .. } = event? {
+            assert_eq!(request.kind, MiddlewareExternalRequestKind::Question);
+            assert_eq!(request.tool_call_id.as_deref(), Some("ask_question"));
+            request_id = Some(request.id);
+        }
+    }
+    let request_id = request_id.expect("question request");
+
+    let suspended = store.load(&session_id).await.expect("stored session");
+    let persisted_request = suspended
+        .snapshot
+        .external_requests
+        .iter()
+        .find(|request| request.id.as_str() == request_id)
+        .expect("persisted question request");
+    assert_eq!(persisted_request.kind, ExternalRequestKind::Question);
+    assert_eq!(
+        persisted_request.tool_call_id.as_deref(),
+        Some("ask_question")
+    );
+    assert_eq!(persisted_request.status, ExternalRequestStatus::Pending);
+    assert!(matches!(
+        suspended.snapshot.status,
+        SessionStatus::Suspended(_)
+    ));
+    assert!(
+        suspended
+            .snapshot
+            .pending_work
+            .iter()
+            .any(|work| work.id == "ask_question")
+    );
+    let request_record = suspended.requests.first().expect("request record");
+    assert_eq!(
+        request_record.projected_request,
+        json!({ "provider": "scripted_question_provider", "prompt": "ask structured questions" })
+    );
+
+    let mut resumed = sessions
+        .resume(
+            &provider,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id: ExternalRequestId::new(request_id.clone()),
+                response: ExternalResponse::new(json!(["Plan", "Deterministic"])),
+            },
+        )
+        .stream();
+    let mut text = String::new();
+    while let Some(event) = resumed.next().await {
+        if let AgentEvent::TextDelta { delta, .. } = event? {
+            text.push_str(&delta);
+        }
+    }
+    assert_eq!(text, "question-flow-complete");
+
+    let completed = store.load(&session_id).await.expect("stored session");
+    let responded_request = completed
+        .snapshot
+        .external_requests
+        .iter()
+        .find(|request| request.id.as_str() == request_id)
+        .expect("responded question request");
+    assert!(matches!(
+        responded_request.status,
+        ExternalRequestStatus::Responded(_)
+    ));
+    assert!(completed.snapshot.tool_results().any(|result| {
+        result.name == QUESTION_TOOL_NAME
+            && result.call_id == "ask_question"
+            && result.content.contains("Deterministic")
+    }));
+    assert_eq!(
+        provider.request_prompts(),
+        vec![
+            "ask structured questions".to_owned(),
+            "ask structured questions".to_owned(),
+        ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn question_tool_rejects_unanswerable_prompt_without_options_or_custom()
 -> waltr_agent::Result<()> {
-    let provider = ToolCapturingProvider::new(ScriptedQuestionProvider::new(json!({
+    let provider = CapturingProvider::new(scripted_question_provider(json!({
         "questions": [{
             "question": "How should this be answered?",
             "header": "Blocked",
@@ -82,98 +181,34 @@ async fn question_tool_rejects_unanswerable_prompt_without_options_or_custom()
     Ok(())
 }
 
-struct ToolCapturingProvider<P> {
-    inner: P,
-    tools_by_turn: Mutex<Vec<Vec<ToolDefinition>>>,
-}
-
-impl<P> ToolCapturingProvider<P> {
-    const fn new(inner: P) -> Self {
-        Self {
-            inner,
-            tools_by_turn: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn all_tools(&self) -> Vec<ToolDefinition> {
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .iter()
-            .flatten()
-            .cloned()
-            .collect()
-    }
-
-    fn tool_named(&self, name: &str) -> Option<ToolDefinition> {
-        self.all_tools().into_iter().find(|tool| tool.name == name)
-    }
-
-    fn tool_context(&self) -> String {
-        let turns = self.tools_by_turn.lock().expect("captured tools").clone();
-        if turns.is_empty() {
-            return "captured provider tools: no provider requests captured".to_owned();
-        }
-        let lines = turns
-            .iter()
-            .enumerate()
-            .map(|(index, tools)| {
-                let names = tools
-                    .iter()
-                    .map(|tool| tool.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("turn {index}: {names}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("captured provider tools:\n{lines}")
-    }
-}
-
-impl<P: LlmStream> LlmStream for ToolCapturingProvider<P> {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        // TODO(agent-runtime): Capture provider projections and request records, not only tools.
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .push(request.tools.clone());
-        self.inner.stream_request(request)
-    }
-}
-
-struct ScriptedQuestionProvider {
-    arguments: Value,
-}
-
-impl ScriptedQuestionProvider {
-    const fn new(arguments: Value) -> Self {
-        Self { arguments }
-    }
-}
-
-impl LlmStream for ScriptedQuestionProvider {
-    fn name(&self) -> &'static str {
-        "scripted_question_provider"
-    }
-
-    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        // TODO(agent-runtime): Resume scripted question flow from persisted pending request state.
-        let events = if request.tool_results().next().is_none() {
+fn scripted_question_provider(arguments: Value) -> ScriptedProvider {
+    ScriptedProvider::new("scripted_question_provider", move |request| {
+        if request.tool_results().next().is_none() {
             vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
                 "ask_question",
                 QUESTION_TOOL_NAME,
-                self.arguments.clone(),
+                arguments.clone(),
             )))]
         } else {
-            vec![Ok(CompletionEvent::Finished)]
-        };
-        Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
-    }
+            let result = request
+                .tool_results()
+                .find(|result| result.call_id == "ask_question")
+                .expect("resumed question result");
+            if !result.content.starts_with("Tool error:") {
+                assert!(result.content.contains("Deterministic"), "{result:?}");
+            }
+            vec![
+                Ok(CompletionEvent::Delta("question-flow-complete".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ]
+        }
+    })
+    .with_projection(|request| {
+        Some(json!({
+            "provider": "scripted_question_provider",
+            "prompt": request.prompt,
+        }))
+    })
 }
 
 fn structured_question_arguments() -> Value {
@@ -295,7 +330,7 @@ fn tool_result_text(session: &AgentTestSession) -> String {
 }
 
 fn test_context(
-    provider: &ToolCapturingProvider<impl LlmStream>,
+    provider: &CapturingProvider<impl LlmStream>,
     session: &AgentTestSession,
 ) -> String {
     format!(

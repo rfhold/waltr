@@ -1,5 +1,8 @@
 //! Deterministic agent integration tests.
 
+#[path = "support/scripted_provider.rs"]
+mod scripted_provider;
+
 #[path = "agent/loop.rs"]
 mod r#loop;
 #[path = "agent/mcp.rs"]
