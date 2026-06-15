@@ -2,6 +2,8 @@
 
 #[path = "support/live_provider.rs"]
 mod live_provider;
+#[path = "support/scripted_provider.rs"]
+mod scripted_provider;
 #[path = "agent/session.rs"]
 mod session;
 

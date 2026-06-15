@@ -162,6 +162,20 @@ pub fn selected_from_env(
     }
 }
 
+/// Convert missing live credentials into an explicit no-op skip for ignored tests.
+pub fn skip_if_missing_config<T>(result: waltr_agent::Result<T>) -> waltr_agent::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(LlmError::MissingConfig { name }) => {
+            eprintln!(
+                "skipping live test: missing {name}; set {name} or WALTR_AGENT_LIVE_GATEWAY=1"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Read a required environment variable for live tests.
 pub fn required_env(name: &'static str) -> waltr_agent::Result<String> {
     env::var(name).map_err(|_| LlmError::MissingConfig { name })

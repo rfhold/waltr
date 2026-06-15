@@ -98,8 +98,13 @@ async fn assert_resume_round_trip<S>(store: S, label: &str) -> waltr_agent::Resu
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    let live =
-        live_provider::selected_from_env("WALTR_AGENT_LIVE_PROVIDER", "openai_responses_websocket")?;
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::selected_from_env(
+        "WALTR_AGENT_LIVE_PROVIDER",
+        "openai_responses_websocket",
+    ))?
+    else {
+        return Ok(());
+    };
     let provider = live.provider;
     let agent = Agent::builder(live.model)
         .with_system_prompt(

@@ -12,28 +12,42 @@ const STATUS: &str = "operational-waltr-status-4821";
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn anthropic_messages_streams_agent_tool_loop() -> waltr_agent::Result<()> {
-    let live = live_provider::anthropic_messages()?;
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::anthropic_messages())?
+    else {
+        return Ok(());
+    };
     assert_provider_runs_status_agent(live.provider, live.model).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_chat_completions_streams_agent_tool_loop() -> waltr_agent::Result<()> {
-    let live = live_provider::openai_chat_completions()?;
+    let Some(live) =
+        live_provider::skip_if_missing_config(live_provider::openai_chat_completions())?
+    else {
+        return Ok(());
+    };
     assert_provider_runs_status_agent(live.provider, live.model).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_streams_agent_tool_loop() -> waltr_agent::Result<()> {
-    let live = live_provider::openai_responses()?;
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::openai_responses())?
+    else {
+        return Ok(());
+    };
     assert_provider_runs_status_agent(live.provider, live.model).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_websocket_streams_agent_tool_loop() -> waltr_agent::Result<()> {
-    let live = live_provider::openai_responses_websocket()?;
+    let Some(live) =
+        live_provider::skip_if_missing_config(live_provider::openai_responses_websocket())?
+    else {
+        return Ok(());
+    };
     assert_provider_runs_status_agent(live.provider, live.model).await
 }
 

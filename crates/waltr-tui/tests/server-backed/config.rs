@@ -1,9 +1,5 @@
 //! TUI config integration tests against a real Waltr server.
 
-#![allow(clippy::future_not_send)]
-
-mod support;
-
 #[path = "config/read.rs"]
 mod read;
 

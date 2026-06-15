@@ -1,24 +1,28 @@
 //! Agent question tool integration tests.
 
 use waltr_agent::{
-    Agent, BoxStreamFuture, CompletionRequest, LlmStream, ModelRef, ToolDefinition,
+    Agent, LlmStream, ModelRef,
     middleware::ExternalRequestKind,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
-use std::sync::Mutex;
 
-use crate::{live_provider, session::AgentTestSession};
+use crate::{live_provider, scripted_provider::CapturingProvider, session::AgentTestSession};
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn live_question_agent_loop_asks_and_uses_structured_answers() -> waltr_agent::Result<()> {
-    let live =
-        live_provider::selected_from_env("WALTR_AGENT_LIVE_PROVIDER", "openai_responses_websocket")?;
+    let Some(live) = live_provider::skip_if_missing_config(live_provider::selected_from_env(
+        "WALTR_AGENT_LIVE_PROVIDER",
+        "openai_responses_websocket",
+    ))?
+    else {
+        return Ok(());
+    };
     run_live_question(live.provider, live.model).await
 }
 
 async fn run_live_question(provider: impl LlmStream, model: ModelRef) -> waltr_agent::Result<()> {
-    let provider = ToolCapturingProvider::new(provider);
+    let provider = CapturingProvider::new(provider);
     let agent = Agent::builder(model)
         .with_question_tool(QuestionConfig::new())
         .build();
@@ -41,66 +45,7 @@ async fn run_live_question(provider: impl LlmStream, model: ModelRef) -> waltr_a
     Ok(())
 }
 
-struct ToolCapturingProvider<P> {
-    inner: P,
-    tools_by_turn: Mutex<Vec<Vec<ToolDefinition>>>,
-}
-
-impl<P> ToolCapturingProvider<P> {
-    const fn new(inner: P) -> Self {
-        Self {
-            inner,
-            tools_by_turn: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn all_tools(&self) -> Vec<ToolDefinition> {
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .iter()
-            .flatten()
-            .cloned()
-            .collect()
-    }
-
-    fn tool_context(&self) -> String {
-        let turns = self.tools_by_turn.lock().expect("captured tools").clone();
-        if turns.is_empty() {
-            return "captured provider tools: no provider requests captured".to_owned();
-        }
-        let lines = turns
-            .iter()
-            .enumerate()
-            .map(|(index, tools)| {
-                let names = tools
-                    .iter()
-                    .map(|tool| tool.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("turn {index}: {names}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("captured provider tools:\n{lines}")
-    }
-}
-
-impl<P: LlmStream> LlmStream for ToolCapturingProvider<P> {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
-        self.tools_by_turn
-            .lock()
-            .expect("captured tools")
-            .push(request.tools.clone());
-        self.inner.stream_request(request)
-    }
-}
-
-fn assert_tool_was_surfaced(provider: &ToolCapturingProvider<impl LlmStream>, name: &str) {
+fn assert_tool_was_surfaced(provider: &CapturingProvider<impl LlmStream>, name: &str) {
     assert!(
         provider.all_tools().iter().any(|tool| tool.name == name),
         "{}",
@@ -109,7 +54,7 @@ fn assert_tool_was_surfaced(provider: &ToolCapturingProvider<impl LlmStream>, na
 }
 
 fn test_context(
-    provider: &ToolCapturingProvider<impl LlmStream>,
+    provider: &CapturingProvider<impl LlmStream>,
     session: &AgentTestSession,
 ) -> String {
     format!(

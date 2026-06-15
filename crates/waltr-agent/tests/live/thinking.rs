@@ -16,12 +16,15 @@ const EXPECTED_TEXT: &str = "thinking-ok";
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn anthropic_messages_surfaces_thinking() -> waltr_agent::Result<()> {
-    let provider = live_provider::anthropic_messages_provider(2048)?.with_thinking(
-        AnthropicThinkingConfig::Enabled {
-            budget_tokens: 1024,
-            display: Some(AnthropicThinkingDisplay::Summarized),
-        },
-    );
+    let Some(provider) =
+        live_provider::skip_if_missing_config(live_provider::anthropic_messages_provider(2048))?
+    else {
+        return Ok(());
+    };
+    let provider = provider.with_thinking(AnthropicThinkingConfig::Enabled {
+        budget_tokens: 1024,
+        display: Some(AnthropicThinkingDisplay::Summarized),
+    });
     let model = live_provider::anthropic_model();
 
     assert_provider_thinking(provider, model, true).await
@@ -30,8 +33,12 @@ async fn anthropic_messages_surfaces_thinking() -> waltr_agent::Result<()> {
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_surfaces_reasoning() -> waltr_agent::Result<()> {
-    let provider =
-        live_provider::openai_responses_provider()?.with_reasoning(openai_reasoning_config());
+    let Some(provider) =
+        live_provider::skip_if_missing_config(live_provider::openai_responses_provider())?
+    else {
+        return Ok(());
+    };
+    let provider = provider.with_reasoning(openai_reasoning_config());
     let model = openai_model(ModelApi::OpenAiResponses);
 
     assert_provider_thinking(provider, model, true).await
@@ -40,8 +47,13 @@ async fn openai_responses_surfaces_reasoning() -> waltr_agent::Result<()> {
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_websocket_surfaces_reasoning() -> waltr_agent::Result<()> {
-    let provider = live_provider::openai_responses_websocket_provider()?
-        .with_reasoning(openai_reasoning_config());
+    let Some(provider) = live_provider::skip_if_missing_config(
+        live_provider::openai_responses_websocket_provider(),
+    )?
+    else {
+        return Ok(());
+    };
+    let provider = provider.with_reasoning(openai_reasoning_config());
     let model = openai_model(ModelApi::OpenAiResponsesWebSocket);
 
     assert_provider_thinking(provider, model, true).await
@@ -50,7 +62,11 @@ async fn openai_responses_websocket_surfaces_reasoning() -> waltr_agent::Result<
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_chat_completions_is_no_thinking_baseline() -> waltr_agent::Result<()> {
-    let provider = live_provider::openai_chat_completions_provider()?;
+    let Some(provider) =
+        live_provider::skip_if_missing_config(live_provider::openai_chat_completions_provider())?
+    else {
+        return Ok(());
+    };
     let model = openai_model(ModelApi::OpenAiChatCompletions);
 
     assert_provider_thinking(provider, model, false).await

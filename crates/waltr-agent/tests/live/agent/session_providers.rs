@@ -22,19 +22,26 @@ const SECOND_ANSWER: &str = "second-answer-ack";
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn anthropic_messages_replays_durable_session() -> waltr_agent::Result<()> {
-    let provider = live_provider::anthropic_messages_provider(2048)?.with_thinking(
-        AnthropicThinkingConfig::Enabled {
-            budget_tokens: 1024,
-            display: Some(AnthropicThinkingDisplay::Summarized),
-        },
-    );
+    let Some(provider) =
+        live_provider::skip_if_missing_config(live_provider::anthropic_messages_provider(2048))?
+    else {
+        return Ok(());
+    };
+    let provider = provider.with_thinking(AnthropicThinkingConfig::Enabled {
+        budget_tokens: 1024,
+        display: Some(AnthropicThinkingDisplay::Summarized),
+    });
     assert_provider_durable_replay(provider, live_provider::anthropic_model(), true).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_chat_completions_replays_durable_session() -> waltr_agent::Result<()> {
-    let provider = live_provider::openai_chat_completions_provider()?;
+    let Some(provider) =
+        live_provider::skip_if_missing_config(live_provider::openai_chat_completions_provider())?
+    else {
+        return Ok(());
+    };
     assert_provider_durable_replay(
         provider,
         openai_model(ModelApi::OpenAiChatCompletions),
@@ -46,16 +53,25 @@ async fn openai_chat_completions_replays_durable_session() -> waltr_agent::Resul
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_replays_durable_session() -> waltr_agent::Result<()> {
-    let provider =
-        live_provider::openai_responses_provider()?.with_reasoning(openai_reasoning_config());
+    let Some(provider) =
+        live_provider::skip_if_missing_config(live_provider::openai_responses_provider())?
+    else {
+        return Ok(());
+    };
+    let provider = provider.with_reasoning(openai_reasoning_config());
     assert_provider_durable_replay(provider, openai_model(ModelApi::OpenAiResponses), true).await
 }
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn openai_responses_websocket_replays_durable_session() -> waltr_agent::Result<()> {
-    let provider = live_provider::openai_responses_websocket_provider()?
-        .with_reasoning(openai_reasoning_config());
+    let Some(provider) = live_provider::skip_if_missing_config(
+        live_provider::openai_responses_websocket_provider(),
+    )?
+    else {
+        return Ok(());
+    };
+    let provider = provider.with_reasoning(openai_reasoning_config());
     assert_provider_durable_replay(
         provider,
         openai_model(ModelApi::OpenAiResponsesWebSocket),

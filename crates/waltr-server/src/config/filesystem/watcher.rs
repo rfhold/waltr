@@ -251,6 +251,7 @@ mod tests {
             spawn_config_watcher(store.clone(), pubsub.clone()).expect("watcher should start");
         let current = store.load().await.expect("get should work");
         let mut events = pubsub.subscribe();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let saved = store
             .save(config_with_provider("anthropic"))
@@ -349,6 +350,7 @@ mod tests {
         let _watcher =
             spawn_config_watcher(store.clone(), pubsub.clone()).expect("watcher should start");
         let mut events = pubsub.subscribe();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         for index in 0..(WATCH_EVENT_CHANNEL_CAPACITY * 2) {
             tokio::fs::write(

@@ -11,7 +11,7 @@ export default async function () {
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await waitForText(page, "#landing-title", "Waltr is ready.");
 
-    await page.locator('a[href="/config"]').click();
+    await page.locator('a[href="/config/provider"]').click();
     await waitForText(page, "#config-title", "Settings");
     await waitForText(page, '[aria-label="Provider actions"]', "Create");
 
@@ -31,7 +31,7 @@ export default async function () {
     );
     const modelsSelector = '[aria-label="Models for openai"]';
     await page.locator(`${modelsSelector} [aria-label="Model actions"] button`).click();
-    const createModelRoute = await waitForPathname(page, "/config/create/models/create");
+    const createModelRoute = await waitForPathname(page, "/config/provider/create/models/create");
     const createModelSeparate = await separateModelFormExists(page, modelsSelector, "Create model");
     const createModelActionsReachable = await modelFormActionsReachable(page, "Create model");
     await typeAndKeepFocus(
@@ -56,7 +56,7 @@ export default async function () {
     await page.locator('button[aria-label="Edit openai"]').click();
     const persistedCreatedModel = await waitForText(page, modelsSelector, "GPT-4o");
     await page.locator('button[aria-label="Edit model gpt4o"]').click();
-    const editModelRoute = await waitForPathname(page, "/config/edit/openai/models/edit/gpt4o");
+    const editModelRoute = await waitForPathname(page, "/config/provider/edit/openai/models/edit/gpt4o");
     const editModelSeparate = await separateModelFormExists(page, modelsSelector, "Edit model");
     const editModelActionsReachable = await modelFormActionsReachable(page, "Edit model");
     await setInputValue(
@@ -66,11 +66,11 @@ export default async function () {
     );
     await page.locator('form[aria-label="Edit model"] select[name="kind"]').selectOption("embedding");
     await submitForm(page, 'form[aria-label="Edit model"]');
-    const editModelReturnedToProviderRoute = await waitForPathname(page, "/config/edit/openai");
+    const editModelReturnedToProviderRoute = await waitForPathname(page, "/config/provider/edit/openai");
     const stagedEditedModelName = await waitForText(page, modelsSelector, "GPT-4o Embeddings");
     const stagedEditedModelKind = await waitForText(page, modelsSelector, "embedding");
     await page.locator('form[aria-label="Edit provider"] button[type="submit"]').click();
-    await waitForPathname(page, "/config");
+    await waitForPathname(page, "/config/provider");
 
     await page.locator('button[aria-label="Edit openai"]').click();
     const persistedEditedModelName = await waitForText(page, modelsSelector, "GPT-4o Embeddings");
@@ -88,7 +88,7 @@ export default async function () {
     await page.locator('button[aria-label="Confirm delete model gpt4o"]').click();
     const stagedDeletedModel = await waitForMissingText(page, modelsSelector, "GPT-4o Embeddings");
     await page.locator('form[aria-label="Edit provider"] button[type="submit"]').click();
-    await waitForPathname(page, "/config");
+    await waitForPathname(page, "/config/provider");
 
     await page.locator('button[aria-label="Edit openai"]').click();
     const persistedDeletedModel = await waitForMissingText(page, modelsSelector, "GPT-4o Embeddings");
@@ -105,76 +105,29 @@ export default async function () {
     await page.locator('button[aria-label="Confirm delete openai"]').click();
     await waitForMissingText(page, '[aria-label="Provider list"]', "openai");
 
-    check({
-      createdProvider,
-      createdUrl,
-      createModelRoute,
-      createModelSeparate,
-      createModelActionsReachable,
-      stagedCreateModel,
-      stagedCreateModelKind,
-      persistedCreatedModel,
-      editModelRoute,
-      editModelSeparate,
-      editModelActionsReachable,
-      editModelReturnedToProviderRoute,
-      stagedEditedModelName,
-      stagedEditedModelKind,
-      persistedEditedModelName,
-      persistedEditedModelKind,
-      deleteModelConfirm,
-      cancelledDeleteModel,
-      stagedDeletedModel,
-      persistedDeletedModel,
-      editedProvider,
-      deleteConfirm,
-    }, {
-      "provider create edit delete works": ({
-        createdProvider,
-        createdUrl,
-        createModelRoute,
-        createModelSeparate,
-        createModelActionsReachable,
-        stagedCreateModel,
-        stagedCreateModelKind,
-        persistedCreatedModel,
-        editModelRoute,
-        editModelSeparate,
-        editModelActionsReachable,
-        editModelReturnedToProviderRoute,
-        stagedEditedModelName,
-        stagedEditedModelKind,
-        persistedEditedModelName,
-        persistedEditedModelKind,
-        deleteModelConfirm,
-        cancelledDeleteModel,
-        stagedDeletedModel,
-        persistedDeletedModel,
-        editedProvider,
-        deleteConfirm,
-      }) =>
-        includesText(createdProvider, "openai") &&
-        includesText(createdUrl, "https://api.openai.com") &&
-        createModelRoute &&
-        createModelSeparate &&
-        createModelActionsReachable &&
-        includesText(stagedCreateModel, "GPT-4o") &&
-        includesText(stagedCreateModelKind, "llm") &&
-        includesText(persistedCreatedModel, "GPT-4o") &&
-        editModelRoute &&
-        editModelSeparate &&
-        editModelActionsReachable &&
-        editModelReturnedToProviderRoute &&
-        includesText(stagedEditedModelName, "GPT-4o Embeddings") &&
-        includesText(stagedEditedModelKind, "embedding") &&
-        includesText(persistedEditedModelName, "GPT-4o Embeddings") &&
-        includesText(persistedEditedModelKind, "embedding") &&
-        includesText(deleteModelConfirm, "Delete?") &&
-        includesText(cancelledDeleteModel, "GPT-4o Embeddings") &&
-        !includesText(stagedDeletedModel, "GPT-4o Embeddings") &&
-        !includesText(persistedDeletedModel, "GPT-4o Embeddings") &&
-        includesText(editedProvider, "anthropic") &&
-        includesText(deleteConfirm, "Delete?"),
+    check(null, {
+      "provider is created": () => includesText(createdProvider, "openai"),
+      "provider URL is created": () => includesText(createdUrl, "https://api.openai.com"),
+      "create model route is reached": () => createModelRoute,
+      "create model is separate": () => createModelSeparate,
+      "create model actions are reachable": () => createModelActionsReachable,
+      "created model is staged": () => includesText(stagedCreateModel, "GPT-4o"),
+      "created model kind is staged": () => includesText(stagedCreateModelKind, "llm"),
+      "created model persists": () => includesText(persistedCreatedModel, "GPT-4o"),
+      "edit model route is reached": () => editModelRoute,
+      "edit model is separate": () => editModelSeparate,
+      "edit model actions are reachable": () => editModelActionsReachable,
+      "edit model returns to provider route": () => editModelReturnedToProviderRoute,
+      "edited model name is staged": () => includesText(stagedEditedModelName, "GPT-4o Embeddings"),
+      "edited model kind is staged": () => includesText(stagedEditedModelKind, "embedding"),
+      "edited model name persists": () => includesText(persistedEditedModelName, "GPT-4o Embeddings"),
+      "edited model kind persists": () => includesText(persistedEditedModelKind, "embedding"),
+      "model delete confirmation appears": () => includesText(deleteModelConfirm, "Delete?"),
+      "cancelled model delete keeps model": () => includesText(cancelledDeleteModel, "GPT-4o Embeddings"),
+      "staged model delete removes model": () => !includesText(stagedDeletedModel, "GPT-4o Embeddings"),
+      "deleted model stays removed": () => !includesText(persistedDeletedModel, "GPT-4o Embeddings"),
+      "provider kind is edited": () => includesText(editedProvider, "anthropic"),
+      "provider delete confirmation appears": () => includesText(deleteConfirm, "Delete?"),
     });
   });
 }
@@ -212,14 +165,14 @@ async function waitForPathname(page, expectedPathname) {
 async function separateModelFormExists(page, modelsSelector, formLabel) {
   return page.evaluate(({ modelsSelector, formLabel }) => {
     const models = document.querySelector(modelsSelector);
-    const form = document.querySelector(`.config__model-form form[aria-label="${formLabel}"]`);
+    const form = document.querySelector(`.config__model-dialog form[aria-label="${formLabel}"]`);
     return Boolean(form) && !Boolean(models?.querySelector(`form[aria-label="${formLabel}"]`));
   }, { modelsSelector, formLabel });
 }
 
 async function modelFormActionsReachable(page, formLabel) {
   return page.evaluate((label) => {
-    const form = document.querySelector(`.config__model-form form[aria-label="${label}"]`);
+    const form = document.querySelector(`.config__model-dialog form[aria-label="${label}"]`);
 
     if (!(form instanceof HTMLElement)) {
       return false;
