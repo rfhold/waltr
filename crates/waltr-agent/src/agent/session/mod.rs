@@ -20,5 +20,5 @@ pub use types::{
     AgentSession, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, PendingWork, PendingWorkStatus, RequestId,
     RequestRecord, ResumeInput, Revision, SessionId, SessionJournalEvent, SessionRecord,
-    SessionSnapshot, SessionStatus, Suspension,
+    SessionSnapshot, SessionStatus, SessionSummary, Suspension,
 };

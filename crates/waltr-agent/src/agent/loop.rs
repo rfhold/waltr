@@ -130,6 +130,9 @@ where
     pub(super) async fn next(mut self) -> Option<(Result<AgentTimelineEvent>, Self)> {
         loop {
             if self.cancellation_token.is_cancelled() {
+                if let Err(error) = self.record_interrupted().await {
+                    return Some((Err(error), self));
+                }
                 self.phase = AgentLoopPhase::Done;
                 return None;
             }
@@ -161,6 +164,9 @@ where
                         biased;
 
                         () = self.cancellation_token.cancelled() => {
+                            if let Err(error) = self.record_interrupted().await {
+                                return Some((Err(error), self));
+                            }
                             self.phase = AgentLoopPhase::Done;
                             return None;
                         }
@@ -178,6 +184,9 @@ where
                     biased;
 
                     () = self.cancellation_token.cancelled() => {
+                        if let Err(error) = self.record_interrupted().await {
+                            return Some((Err(error), self));
+                        }
                         self.phase = AgentLoopPhase::Done;
                         return None;
                     }
@@ -322,6 +331,9 @@ where
                                 continue;
                             }
                             () = self.cancellation_token.cancelled() => {
+                                if let Err(error) = self.record_interrupted().await {
+                                    return Some((Err(error), self));
+                                }
                                 self.phase = AgentLoopPhase::Done;
                                 return None;
                             }
@@ -331,6 +343,9 @@ where
                             biased;
 
                             () = self.cancellation_token.cancelled() => {
+                                if let Err(error) = self.record_interrupted().await {
+                                    return Some((Err(error), self));
+                                }
                                 self.phase = AgentLoopPhase::Done;
                                 return None;
                             }
@@ -807,6 +822,17 @@ where
     async fn flush_middleware_state(&mut self) -> Result<()> {
         let events = self.middleware_state.drain_pending();
         self.append_journal_events(events).await
+    }
+
+    async fn record_interrupted(&mut self) -> Result<()> {
+        if !self.session_initialized {
+            return Ok(());
+        }
+        let record = AgentSessionRuntime::new(&self.session_store)
+            .interrupt(&self.session_id)
+            .await?;
+        self.hydrate_from_record(record);
+        Ok(())
     }
 
     async fn append_timeline_event(

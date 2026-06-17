@@ -4,10 +4,10 @@ use opendal::Operator;
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    timeline_item_text_from_record, timeline_query_slice,
+    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
-    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -55,6 +55,24 @@ impl OpenDalSessionStore {
             .await
             .map_err(backend_error)?;
         Ok(())
+    }
+
+    async fn list_records(&self) -> SessionStoreResult<Vec<SessionSummary>> {
+        let entries = self
+            .operator
+            .list(&self.prefix)
+            .await
+            .map_err(backend_error)?;
+        let mut records = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if !path.ends_with(".json") {
+                continue;
+            }
+            let bytes = self.operator.read(path).await.map_err(backend_error)?;
+            records.push(serde_json::from_slice(bytes.to_bytes().as_ref()).map_err(backend_error)?);
+        }
+        Ok(sorted_session_summaries(records))
     }
 
     async fn update_record<T: Send>(
@@ -107,6 +125,13 @@ impl SessionStore for OpenDalSessionStore {
         async move { store.load_record(&id).await }
     }
 
+    fn list(
+        &self,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
+        let store = self.clone();
+        async move { store.list_records().await }
+    }
+
     fn append_timeline(
         &self,
         id: &SessionId,
@@ -137,6 +162,7 @@ impl SessionStore for OpenDalSessionStore {
             let (revision, ()) = store
                 .update_record(&id, expected_revision, |record, _| {
                     record.append_journal_events(events);
+                    record.touch_activity();
                     Ok(())
                 })
                 .await?;

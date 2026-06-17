@@ -6,10 +6,10 @@ use scylla::client::session::Session;
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    timeline_item_text_from_record, timeline_query_slice,
+    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
-    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -105,6 +105,27 @@ impl ScyllaSessionStore {
         Ok(())
     }
 
+    async fn list_records(&self) -> SessionStoreResult<Vec<SessionSummary>> {
+        let rows = self
+            .session
+            .query_unpaged(
+                format!("SELECT record_json, revision FROM {}", self.table_name()),
+                (),
+            )
+            .await
+            .map_err(backend_error)?
+            .into_rows_result()
+            .map_err(backend_error)?;
+        let mut records = Vec::new();
+        for row in rows.rows::<(String, i64)>().map_err(backend_error)? {
+            let (json, revision) = row.map_err(backend_error)?;
+            let mut record: SessionRecord = serde_json::from_str(&json).map_err(backend_error)?;
+            record.revision = Revision::new(u64::try_from(revision).map_err(backend_error)?);
+            records.push(record);
+        }
+        Ok(sorted_session_summaries(records))
+    }
+
     async fn update_record<T: Send>(
         &self,
         id: &SessionId,
@@ -155,6 +176,13 @@ impl SessionStore for ScyllaSessionStore {
         async move { store.load_record(&id).await }
     }
 
+    fn list(
+        &self,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
+        let store = self.clone();
+        async move { store.list_records().await }
+    }
+
     fn append_timeline(
         &self,
         id: &SessionId,
@@ -185,6 +213,7 @@ impl SessionStore for ScyllaSessionStore {
             let (revision, ()) = store
                 .update_record(&id, expected_revision, |record, _| {
                     record.append_journal_events(events);
+                    record.touch_activity();
                     Ok(())
                 })
                 .await?;

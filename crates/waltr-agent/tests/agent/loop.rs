@@ -430,8 +430,18 @@ async fn cancellation_token_stops_running_tool_without_finishing_result() {
     );
     let record = store.load(&session_id).await.expect("stored session");
     assert!(record.snapshot().pending_work.iter().any(|work| {
-        work.id == "cancel-call" && matches!(work.status, waltr_agent::PendingWorkStatus::Pending)
+        work.id == "cancel-call"
+            && matches!(
+                work.status,
+                waltr_agent::PendingWorkStatus::Canceled(
+                    waltr_agent::CancelReason::SessionInterrupted
+                )
+            )
     }));
+    assert!(matches!(
+        record.snapshot().status,
+        waltr_agent::SessionStatus::Suspended(waltr_agent::Suspension::Interrupted { .. })
+    ));
 }
 
 #[cfg(feature = "shell")]

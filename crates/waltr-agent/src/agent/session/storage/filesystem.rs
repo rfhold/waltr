@@ -4,10 +4,10 @@ use std::{fs, path::PathBuf};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    timeline_item_text_from_record, timeline_query_slice,
+    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
-    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -50,6 +50,25 @@ impl FilesystemSessionStore {
         fs::write(&temp_path, bytes).map_err(backend_error)?;
         fs::rename(&temp_path, path).map_err(backend_error)?;
         Ok(())
+    }
+
+    fn list_sync(&self) -> SessionStoreResult<Vec<SessionSummary>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(backend_error(error)),
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(backend_error)?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(backend_error)?;
+            records.push(serde_json::from_slice::<SessionRecord>(&bytes).map_err(backend_error)?);
+        }
+        Ok(sorted_session_summaries(records))
     }
 
     fn update_sync<T>(
@@ -99,6 +118,13 @@ impl SessionStore for FilesystemSessionStore {
         async move { store.load_sync(&id) }
     }
 
+    fn list(
+        &self,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
+        let store = self.clone();
+        async move { store.list_sync() }
+    }
+
     fn append_timeline(
         &self,
         id: &SessionId,
@@ -126,6 +152,7 @@ impl SessionStore for FilesystemSessionStore {
         async move {
             let (revision, ()) = store.update_sync(&id, expected_revision, |record, _| {
                 record.append_journal_events(events);
+                record.touch_activity();
                 Ok(())
             })?;
             Ok(revision)
@@ -163,5 +190,57 @@ impl SessionStore for FilesystemSessionStore {
 fn backend_error(error: impl std::error::Error) -> SessionStoreError {
     SessionStoreError::Backend {
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_missing_root_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FilesystemSessionStore::new(temp.path().join("missing"));
+
+        let summaries = store.list().await.unwrap();
+
+        assert!(summaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_returns_persisted_summaries_newest_activity_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FilesystemSessionStore::new(temp.path());
+        let first = SessionId::new("session-first");
+        let second = SessionId::new("session-second");
+        let first_record = store.create(first.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        store.create(second.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        store
+            .append_journal(
+                &first,
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "again".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let reloaded_store = FilesystemSessionStore::new(temp.path());
+        let summaries = reloaded_store.list().await.unwrap();
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, first);
+        assert_eq!(summaries[0].revision, Revision::new(1));
+        assert_eq!(
+            summaries[0].status,
+            crate::agent::session::SessionStatus::BuildingRequest
+        );
+        assert_eq!(summaries[0].current_prompt.as_deref(), Some("again"));
+        assert_eq!(summaries[0].created_at, first_record.metadata.created_at);
+        assert!(summaries[0].last_activity_at > first_record.metadata.last_activity_at);
+        assert_eq!(summaries[1].id, second);
     }
 }

@@ -238,7 +238,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
 }
 
 #[tokio::test]
-async fn cancellation_after_permission_request_preserves_resume_path() -> waltr_agent::Result<()> {
+async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
     let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
         .with_permission_policy(PermissionPolicy::filesystem_external(
@@ -285,7 +285,18 @@ async fn cancellation_after_permission_request_preserves_resume_path() -> waltr_
         SessionStatus::Suspended(_)
     ));
     assert!(suspended_snapshot.pending_work.iter().any(|work| {
-        work.id == "call_cancel_resume" && matches!(work.status, PendingWorkStatus::Pending)
+        work.id == "call_cancel_resume"
+            && matches!(
+                work.status,
+                PendingWorkStatus::Canceled(CancelReason::SessionInterrupted)
+            )
+    }));
+    assert!(suspended_snapshot.external_requests.iter().any(|request| {
+        request.id == request_id
+            && matches!(
+                request.status,
+                ExternalRequestStatus::Canceled(CancelReason::SessionInterrupted)
+            )
     }));
 
     let mut resumed = sessions
@@ -293,36 +304,17 @@ async fn cancellation_after_permission_request_preserves_resume_path() -> waltr_
             &provider,
             session_id.clone(),
             ResumeInput::ExternalResponse {
-                request_id: request_id.clone(),
+                request_id,
                 response: ExternalResponse::new(json!("allow-once")),
             },
         )
         .stream();
-    let mut text = String::new();
-    let mut saw_tool_result = false;
-    while let Some(event) = resumed.next().await {
-        let event = event?;
-        if let TimelineContent::TextDelta { delta } = &event.content
-            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
-        {
-            text.push_str(delta);
-        }
-        if let TimelineContent::ToolResult { result } = &event.content
-            && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)
-            && result.call_id == "call_cancel_resume"
-        {
-            saw_tool_result = true;
-            assert!(result.content.contains("external-once-202"));
-        }
-    }
-
-    assert!(saw_tool_result, "approved original tool call should run");
-    assert_eq!(text, "resumed-after-cancel");
-    let completed = store.load(&session_id).await.expect("stored session");
-    assert!(matches!(
-        completed.snapshot().status,
-        SessionStatus::Finished
-    ));
+    let error = resumed
+        .next()
+        .await
+        .expect("late response should fail")
+        .unwrap_err();
+    assert!(error.to_string().contains("canceled"));
 
     Ok(())
 }
