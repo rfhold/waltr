@@ -13,4 +13,5 @@
 
 Use the documenting skill when updating docs or AGENTS.md files.
 Use the test-modification skill when modifying tests.
+Use the protobuf-generation skill when changing proto files, Buf config, or generated gRPC Rust.
 Use [CONTRIBUTING.md](CONTRIBUTING.md) for run, build, and test commands and commit guidance.

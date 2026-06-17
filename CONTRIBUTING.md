@@ -34,6 +34,12 @@ Build the web client:
 
 `pnpm --filter @rfhold/waltr-web build`
 
+# Protocol Buffers
+
+Proto contracts live under `proto/`, Buf configuration lives at the repository root, and generated Rust is committed under `crates/waltr/src/grpc/`.
+
+Run `buf lint` and `buf generate` after changing proto files.
+
 # Testing
 
 See [docs/testing.md](docs/testing.md) for test structure, commands, layering expectations, live-test setup, and container-backed test notes.
