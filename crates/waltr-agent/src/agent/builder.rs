@@ -1,11 +1,11 @@
 //! Agent construction and configuration.
 
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
+    LlmStream, ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
     mcp::McpConfig,
     middleware::{
         AgentMiddleware, agents::AgentsInstructionsMiddleware, chain::MiddlewareChain,
@@ -25,11 +25,12 @@ use crate::{
     middleware::claims::ShellClaimsMiddleware, prompt::ShellPromptConfig, tools::shell::ShellConfig,
 };
 
-use super::{Agent, AgentTool};
+use super::{AgentRuntime, AgentTool};
 
-/// Builder for an agent configuration.
+/// Builder for an agent runtime configuration.
 #[derive(Clone)]
-pub struct AgentBuilder {
+pub struct AgentRuntimeBuilder {
+    provider: Arc<dyn LlmStream>,
     model: ModelRef,
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
@@ -42,11 +43,15 @@ pub struct AgentBuilder {
     explicit_permission_policy: bool,
 }
 
-impl AgentBuilder {
+impl AgentRuntimeBuilder {
     /// Create a builder for a model.
     #[must_use]
-    pub fn new(model: ModelRef) -> Self {
+    pub fn new<P>(model: ModelRef, provider: Arc<P>) -> Self
+    where
+        P: LlmStream + 'static,
+    {
         Self {
+            provider,
             model,
             tools: Vec::new(),
             middleware_chain: MiddlewareChain::new(),
@@ -228,14 +233,14 @@ impl AgentBuilder {
         self
     }
 
-    /// Build the agent configuration.
+    /// Build the agent runtime configuration.
     ///
     /// Middleware assembly order is deterministic and affects provider request
     /// hashes: the stateful system prompt middleware runs first, then feature
     /// and custom middleware in registration order, then `AGENTS.md`
     /// instructions, then skills.
     #[must_use]
-    pub fn build(self) -> Agent {
+    pub fn build(self) -> AgentRuntime {
         let mut middleware_chain = MiddlewareChain::new();
         middleware_chain.push(SystemPromptMiddleware::new(self.system_prompt.build()));
         middleware_chain.extend(self.middleware_chain);
@@ -248,7 +253,8 @@ impl AgentBuilder {
         if let Some(catalog) = self.skills_catalog {
             middleware_chain.push(SkillsMiddleware::new(catalog, self.skills_reveal_roots));
         }
-        Agent {
+        AgentRuntime {
+            provider: self.provider,
             model: self.model,
             tools: self.tools,
             middleware_chain,
@@ -257,10 +263,11 @@ impl AgentBuilder {
     }
 }
 
-impl fmt::Debug for AgentBuilder {
+impl fmt::Debug for AgentRuntimeBuilder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("AgentBuilder")
+            .debug_struct("AgentRuntimeBuilder")
+            .field("provider", &self.provider.name())
             .field("model", &self.model)
             .field("tools", &self.tools)
             .field("middleware_chain_len", &self.middleware_chain.len())

@@ -1,8 +1,10 @@
 //! Live provider agent-loop integration tests.
 
+use std::sync::Arc;
+
 use waltr_agent::{
-    Agent, AgentTool, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef, TimelineContent,
-    ToolDefinition,
+    AgentRuntime, AgentTool, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef,
+    TimelineContent, ToolDefinition,
 };
 use serde_json::json;
 
@@ -53,10 +55,13 @@ async fn openai_responses_websocket_streams_agent_tool_loop() -> waltr_agent::Re
 }
 
 async fn assert_provider_runs_status_agent(
-    provider: impl LlmStream,
+    provider: impl LlmStream + 'static,
     model: ModelRef,
 ) -> waltr_agent::Result<()> {
-    let agent = Agent::builder(model).with_tool(get_status_tool()).build();
+    let provider = Arc::new(provider);
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
+        .with_tool(get_status_tool())
+        .build();
     let session = AgentTestSession::run(
         &agent,
         &provider,

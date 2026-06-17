@@ -1,12 +1,12 @@
-//! Agent permission integration tests.
+//! AgentRuntime permission integration tests.
 
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, sync::Arc};
 
 use futures_util::{Stream, StreamExt, stream};
 use waltr_agent::{
-    Agent, AgentSessionRuntime, AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture,
-    CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, CancelReason,
-    CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
+    AgentRuntime, AgentSessionRuntime, AgentSessions, AgentTimelineEvent, BoxCompletionStream,
+    BoxStreamFuture, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT,
+    CancelReason, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
     PendingWorkStatus, PermissionEffect, PermissionOperation, PermissionPattern, PermissionPolicy,
     PermissionResponse, PermissionToolSelector, ProviderId, ResumeInput, RuntimeResumeOutput,
@@ -45,7 +45,8 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
             PermissionCommandPattern::Name("git".to_owned()),
             PermissionEffect::deny_with_message("do not interact with git"),
         );
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(ScriptedPermissionProvider);
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(policy)
         .with_filesystem_tools(
             FilesystemConfig::new(fixture.root.path())
@@ -54,7 +55,6 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
     #[cfg(feature = "shell")]
     let agent = agent.with_shell_tool(ShellConfig::new(fixture.root.path()));
     let agent = agent.build();
-    let provider = ScriptedPermissionProvider;
     #[cfg(not(feature = "shell"))]
     let prompt = "exercise filesystem permission allow, ask, allow-always, and deny".to_owned();
     #[cfg(feature = "shell")]
@@ -68,7 +68,7 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
         fixture.outside.path().join("denied.txt").display(),
     );
 
-    let mut stream = agent.prompt(&provider, &prompt).stream();
+    let mut stream = agent.prompt(&prompt).stream();
     let mut results = Vec::new();
     let mut external_requests = Vec::new();
 
@@ -122,7 +122,27 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
 #[allow(clippy::too_many_lines)]
 async fn permission_external_request_resumes_from_durable_session() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(ScriptedProvider::new(
+        "permission_resume_provider",
+        |request| {
+            if request.tool_results().any(|result| {
+                result.call_id == "call_resume" && result.content.contains("external-once-202")
+            }) {
+                vec![
+                    Ok(CompletionEvent::Delta(
+                        "permission-flow-complete".to_owned(),
+                    )),
+                    Ok(CompletionEvent::Finished),
+                ]
+            } else {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "call_resume",
+                    "../outside/external.txt",
+                )))]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -132,29 +152,12 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
                 .with_profile(FilesystemToolProfile::StructuredPatch),
         )
         .build();
-    let provider = ScriptedProvider::new("permission_resume_provider", |request| {
-        if request.tool_results().any(|result| {
-            result.call_id == "call_resume" && result.content.contains("external-once-202")
-        }) {
-            vec![
-                Ok(CompletionEvent::Delta(
-                    "permission-flow-complete".to_owned(),
-                )),
-                Ok(CompletionEvent::Finished),
-            ]
-        } else {
-            vec![Ok(CompletionEvent::ToolCall(read_call(
-                "call_resume",
-                "../outside/external.txt",
-            )))]
-        }
-    });
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "read external file")
+        .prompt(&agent, session_id.clone(), "read external file")
         .stream();
     let mut request_id = None;
     while let Some(event) = stream.next().await {
@@ -188,7 +191,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id: ExternalRequestId::new(request_id.clone()),
@@ -240,7 +243,26 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
 #[tokio::test]
 async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(ScriptedProvider::new(
+        "permission_cancel_resume_provider",
+        |request| {
+            if request.tool_results().any(|result| {
+                result.call_id == "call_cancel_resume"
+                    && result.content.contains("external-once-202")
+            }) {
+                vec![
+                    Ok(CompletionEvent::Delta("resumed-after-cancel".to_owned())),
+                    Ok(CompletionEvent::Finished),
+                ]
+            } else {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "call_cancel_resume",
+                    "../outside/external.txt",
+                )))]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -250,28 +272,13 @@ async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_ag
                 .with_profile(FilesystemToolProfile::StructuredPatch),
         )
         .build();
-    let provider = ScriptedProvider::new("permission_cancel_resume_provider", |request| {
-        if request.tool_results().any(|result| {
-            result.call_id == "call_cancel_resume" && result.content.contains("external-once-202")
-        }) {
-            vec![
-                Ok(CompletionEvent::Delta("resumed-after-cancel".to_owned())),
-                Ok(CompletionEvent::Finished),
-            ]
-        } else {
-            vec![Ok(CompletionEvent::ToolCall(read_call(
-                "call_cancel_resume",
-                "../outside/external.txt",
-            )))]
-        }
-    });
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let cancellation = CancellationToken::new();
 
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "read external file")
+        .prompt(&agent, session_id.clone(), "read external file")
         .with_cancellation_token(cancellation.clone())
         .stream();
     let request_id = first_permission_request_id(&mut stream).await?;
@@ -301,7 +308,7 @@ async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_ag
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id,
@@ -324,7 +331,34 @@ async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_ag
 async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> waltr_agent::Result<()>
 {
     let fixture = PermissionFixture::new()?;
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(ScriptedProvider::new(
+        "permission_allow_always_provider",
+        |request| {
+            let has_first = request.tool_results().any(|result| {
+                result.call_id == "call_first" && result.content.contains("external-once-202")
+            });
+            let has_second = request.tool_results().any(|result| {
+                result.call_id == "call_second" && result.content.contains("external-another-404")
+            });
+            if has_second {
+                vec![
+                    Ok(CompletionEvent::Delta("allow-always-complete".to_owned())),
+                    Ok(CompletionEvent::Finished),
+                ]
+            } else if has_first {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "call_second",
+                    "../outside/nested/another.txt",
+                )))]
+            } else {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "call_first",
+                    "../outside/external.txt",
+                )))]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -334,36 +368,12 @@ async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> w
                 .with_profile(FilesystemToolProfile::StructuredPatch),
         )
         .build();
-    let provider = ScriptedProvider::new("permission_allow_always_provider", |request| {
-        let has_first = request.tool_results().any(|result| {
-            result.call_id == "call_first" && result.content.contains("external-once-202")
-        });
-        let has_second = request.tool_results().any(|result| {
-            result.call_id == "call_second" && result.content.contains("external-another-404")
-        });
-        if has_second {
-            vec![
-                Ok(CompletionEvent::Delta("allow-always-complete".to_owned())),
-                Ok(CompletionEvent::Finished),
-            ]
-        } else if has_first {
-            vec![Ok(CompletionEvent::ToolCall(read_call(
-                "call_second",
-                "../outside/nested/another.txt",
-            )))]
-        } else {
-            vec![Ok(CompletionEvent::ToolCall(read_call(
-                "call_first",
-                "../outside/external.txt",
-            )))]
-        }
-    });
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "read two external files")
+        .prompt(&agent, session_id.clone(), "read two external files")
         .stream();
     let mut request_id = None;
     while let Some(event) = stream.next().await {
@@ -376,7 +386,7 @@ async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> w
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id: ExternalRequestId::new(request_id),
@@ -440,7 +450,25 @@ async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> w
 #[allow(clippy::too_many_lines)]
 async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(ScriptedProvider::new(
+        "permission_allow_once_provider",
+        |request| {
+            if request.tool_results().any(|result| {
+                result.call_id == "call_once" && result.content.contains("external-once-202")
+            }) {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "call_later",
+                    "../outside/nested/another.txt",
+                )))]
+            } else {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "call_once",
+                    "../outside/external.txt",
+                )))]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -450,27 +478,12 @@ async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr
                 .with_profile(FilesystemToolProfile::StructuredPatch),
         )
         .build();
-    let provider = ScriptedProvider::new("permission_allow_once_provider", |request| {
-        if request.tool_results().any(|result| {
-            result.call_id == "call_once" && result.content.contains("external-once-202")
-        }) {
-            vec![Ok(CompletionEvent::ToolCall(read_call(
-                "call_later",
-                "../outside/nested/another.txt",
-            )))]
-        } else {
-            vec![Ok(CompletionEvent::ToolCall(read_call(
-                "call_once",
-                "../outside/external.txt",
-            )))]
-        }
-    });
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "read external files once")
+        .prompt(&agent, session_id.clone(), "read external files once")
         .stream();
     let mut request_id = None;
     while let Some(event) = stream.next().await {
@@ -483,7 +496,7 @@ async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id: ExternalRequestId::new(request_id),
@@ -534,7 +547,25 @@ async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr
 #[tokio::test]
 async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(ScriptedProvider::new(
+        "permission_deny_result_provider",
+        |request| {
+            if request.tool_results().any(|result| {
+                result.call_id == "call_deny" && result.content.contains("not this time")
+            }) {
+                vec![
+                    Ok(CompletionEvent::Delta("denial-observed".to_owned())),
+                    Ok(CompletionEvent::Finished),
+                ]
+            } else {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "call_deny",
+                    "../outside/external.txt",
+                )))]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -544,35 +575,19 @@ async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
                 .with_profile(FilesystemToolProfile::StructuredPatch),
         )
         .build();
-    let provider = ScriptedProvider::new("permission_deny_result_provider", |request| {
-        if request
-            .tool_results()
-            .any(|result| result.call_id == "call_deny" && result.content.contains("not this time"))
-        {
-            vec![
-                Ok(CompletionEvent::Delta("denial-observed".to_owned())),
-                Ok(CompletionEvent::Finished),
-            ]
-        } else {
-            vec![Ok(CompletionEvent::ToolCall(read_call(
-                "call_deny",
-                "../outside/external.txt",
-            )))]
-        }
-    });
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let request_id = first_permission_request_id(
         sessions
-            .prompt(&provider, session_id.clone(), "read denied external file")
+            .prompt(&agent, session_id.clone(), "read denied external file")
             .stream(),
     )
     .await?;
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id,
@@ -613,7 +628,16 @@ async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
 #[tokio::test]
 async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(ScriptedProvider::new(
+        "permission_deny_cancel_provider",
+        |_| {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_cancel",
+                "../outside/external.txt",
+            )))]
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -623,25 +647,19 @@ async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
                 .with_profile(FilesystemToolProfile::StructuredPatch),
         )
         .build();
-    let provider = ScriptedProvider::new("permission_deny_cancel_provider", |_| {
-        vec![Ok(CompletionEvent::ToolCall(read_call(
-            "call_cancel",
-            "../outside/external.txt",
-        )))]
-    });
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let request_id = first_permission_request_id(
         sessions
-            .prompt(&provider, session_id.clone(), "read canceled external file")
+            .prompt(&agent, session_id.clone(), "read canceled external file")
             .stream(),
     )
     .await?;
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id,
@@ -699,7 +717,11 @@ async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
         PermissionToolSelector::exact("shell"),
         PermissionEffect::deny(),
     );
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "capture_tools_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    )));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider.clone())
         .with_permission_policy(policy)
         .with_filesystem_tools(
             FilesystemConfig::new(fixture.root.path())
@@ -708,11 +730,8 @@ async fn blanket_denied_tools_are_not_surfaced() -> waltr_agent::Result<()> {
     #[cfg(feature = "shell")]
     let agent = agent.with_shell_tool(ShellConfig::new(fixture.root.path()));
     let agent = agent.build();
-    let provider = CapturingProvider::new(ScriptedProvider::new("capture_tools_provider", |_| {
-        vec![Ok(CompletionEvent::Finished)]
-    }));
 
-    let mut stream = agent.prompt(&provider, "capture tools").stream();
+    let mut stream = agent.prompt("capture tools").stream();
     while let Some(event) = stream.next().await {
         drop(event?);
     }
@@ -738,7 +757,13 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     let denied = fixture.outside.path().join("denied.txt");
     #[cfg(feature = "shell")]
     let shell_denied = fixture.outside.path().join("shell-denied.txt");
-    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+    let provider = Arc::new(PatchDeniedProvider {
+        allowed: fixture.root.path().join("allowed.txt"),
+        denied,
+        #[cfg(feature = "shell")]
+        shell_denied: shell_denied.clone(),
+    });
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
         .with_permission_policy(PermissionPolicy::filesystem_external(
             fixture.root.path(),
             PermissionEffect::ask(),
@@ -750,18 +775,12 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     #[cfg(feature = "shell")]
     let agent = agent.with_shell_tool(ShellConfig::new(fixture.root.path()));
     let agent = agent.build();
-    let provider = PatchDeniedProvider {
-        allowed: fixture.root.path().join("allowed.txt"),
-        denied,
-        #[cfg(feature = "shell")]
-        shell_denied: shell_denied.clone(),
-    };
 
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "patch denied")
+        .prompt(&agent, session_id.clone(), "patch denied")
         .stream();
     let mut external_requests = Vec::new();
     while let Some(event) = stream.next().await {

@@ -2,9 +2,9 @@
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, ExternalRequestId, ExternalResponse,
-    FilesystemSessionStore, LlmStream, ModelApi, ModelRef, ProviderId, ResumeInput, SessionStore,
-    TimelineContent, TimelineEventKind, TimelineStatus,
+    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST,
+    ExternalRequestId, ExternalResponse, FilesystemSessionStore, LlmStream, ModelApi, ModelRef,
+    ProviderId, ResumeInput, SessionStore, TimelineContent, TimelineEventKind, TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
         OpenAiReasoningEffort, OpenAiReasoningSummary,
@@ -82,26 +82,27 @@ async fn openai_responses_websocket_replays_durable_session() -> waltr_agent::Re
 }
 
 async fn assert_provider_durable_replay(
-    provider: impl LlmStream,
+    provider: impl LlmStream + 'static,
     model: ModelRef,
     expect_thinking: bool,
 ) -> waltr_agent::Result<()> {
     let label = provider.name();
+    let provider = std::sync::Arc::new(provider);
     let temp = TempDir::new()?;
     let store = FilesystemSessionStore::new(temp.path().join("sessions"));
-    let agent = Agent::builder(model)
+    let agent = AgentRuntime::builder(model, std::sync::Arc::clone(&provider))
         .with_system_prompt(
             "You are validating durable session replay. Follow the user instructions exactly.",
         )
         .with_question_tool(QuestionConfig::new())
         .build();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let first = collect(
         sessions
             .prompt(
-                &provider,
+                &agent,
                 session_id.clone(),
                 format!(
                     "Call the question tool exactly twice, one call at a time. First call it to \
@@ -122,7 +123,7 @@ async fn assert_provider_durable_replay(
     let second = collect(
         sessions
             .resume(
-                &provider,
+                &agent,
                 session_id.clone(),
                 ResumeInput::ExternalResponse {
                     request_id: first_request,
@@ -141,7 +142,7 @@ async fn assert_provider_durable_replay(
     let resumed = collect(
         sessions
             .resume(
-                &provider,
+                &agent,
                 session_id.clone(),
                 ResumeInput::ExternalResponse {
                     request_id: second_request,

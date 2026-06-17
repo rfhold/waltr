@@ -1,13 +1,13 @@
 //! End-to-end live coding-agent durable runtime test.
 
-use std::{env, fmt::Write, fs, path::PathBuf};
+use std::{env, fmt::Write, fs, path::PathBuf, sync::Arc};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, ExternalRequest,
-    ExternalRequestKind, ExternalResponse, LlmError, LlmStream, MemorySessionStore, ModelRef,
-    PermissionEffect, PermissionPolicy, ResumeInput, SessionId, SessionRecord, SessionStore,
-    TimelineContent, TimelineEventKind, TimelineStatus,
+    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST,
+    CHANNEL_TOOL_RESULT, ExternalRequest, ExternalRequestKind, ExternalResponse, LlmError,
+    LlmStream, MemorySessionStore, ModelRef, PermissionEffect, PermissionPolicy, ResumeInput,
+    SessionId, SessionRecord, SessionStore, TimelineContent, TimelineEventKind, TimelineStatus,
     tools::{
         filesystem::{FilesystemConfig, FilesystemToolProfile},
         filesystem_skills::SkillsConfig,
@@ -36,15 +36,15 @@ async fn live_coding_agent_durable_resume_context_skills_permissions_and_questio
 
 #[allow(clippy::too_many_lines)]
 async fn run_live_coding_agent(
-    provider: impl LlmStream,
+    provider: impl LlmStream + 'static,
     model: ModelRef,
 ) -> waltr_agent::Result<()> {
     let fixture = CodingAgentFixture::new()?;
-    let provider = CapturingProvider::new(provider);
+    let provider = Arc::new(CapturingProvider::new(provider));
     let store = MemorySessionStore::new();
     let policy =
         PermissionPolicy::filesystem_external(fixture.root.path(), PermissionEffect::ask());
-    let agent = Agent::builder(model)
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
         .with_system_prompt("You are a coding agent validating durable middleware execution.")
         .with_permission_policy(policy)
         .with_filesystem_tools(
@@ -56,7 +56,7 @@ async fn run_live_coding_agent(
         .with_skills(SkillsConfig::new(fixture.root.path()))
         .with_question_tool(QuestionConfig::new())
         .build();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session = sessions.create().await?;
     let session_id = session.id().clone();
     let prompt = format!(
@@ -64,7 +64,7 @@ async fn run_live_coding_agent(
         fixture.outside.path().join("external.txt").display()
     );
 
-    let first = DurableLiveSession::run_prompt(&sessions, &provider, &session_id, &prompt).await?;
+    let first = DurableLiveSession::run_prompt(&sessions, &agent, &session_id, &prompt).await?;
     let first_context = test_context(&provider, &first);
     assert_tool_was_surfaced(&provider, QUESTION_TOOL_NAME);
     assert_tool_was_surfaced(&provider, "read");
@@ -88,7 +88,7 @@ async fn run_live_coding_agent(
 
     let resumed = DurableLiveSession::resume(
         &sessions,
-        &provider,
+        &agent,
         &session_id,
         ResumeInput::ExternalResponse {
             request_id: question_request.id.clone(),
@@ -163,7 +163,7 @@ struct DurableLiveSession {
 impl DurableLiveSession {
     async fn run_prompt<S>(
         sessions: &waltr_agent::AgentSessions<S>,
-        provider: &impl LlmStream,
+        agent: &AgentRuntime,
         session_id: &SessionId,
         prompt: &str,
     ) -> waltr_agent::Result<Self>
@@ -171,7 +171,7 @@ impl DurableLiveSession {
         S: SessionStore + Clone + Send + Sync + 'static,
     {
         let stream = sessions
-            .prompt(provider, session_id.clone(), prompt)
+            .prompt(agent, session_id.clone(), prompt)
             .with_system_prompt_fragment(TEST_HARNESS_SYSTEM_PROMPT)
             .stream();
         Self::collect(stream).await
@@ -179,7 +179,7 @@ impl DurableLiveSession {
 
     async fn resume<S>(
         sessions: &waltr_agent::AgentSessions<S>,
-        provider: &impl LlmStream,
+        agent: &AgentRuntime,
         session_id: &SessionId,
         input: ResumeInput,
     ) -> waltr_agent::Result<Self>
@@ -187,7 +187,7 @@ impl DurableLiveSession {
         S: SessionStore + Clone + Send + Sync + 'static,
     {
         let stream = sessions
-            .resume(provider, session_id.clone(), input)
+            .resume(agent, session_id.clone(), input)
             .with_system_prompt_fragment(TEST_HARNESS_SYSTEM_PROMPT)
             .stream();
         Self::collect(stream).await

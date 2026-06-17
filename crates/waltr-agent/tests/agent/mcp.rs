@@ -5,8 +5,8 @@ use std::{fs, net::SocketAddr, sync::Arc, time::Duration};
 use axum::Router;
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, LlmError, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionStore, ToolCall,
+    AgentRuntime, AgentSessions, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, LlmError,
+    LlmStream, MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionStore, ToolCall,
     mcp::{McpConfig, McpServerConfig},
 };
 use rmcp::{
@@ -32,12 +32,12 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
 -> waltr_agent::Result<()> {
     let stdio_command = test_stdio_server_command();
     let http_server = HttpMcpTestServer::start().await?;
-    let provider =
-        CapturingProvider::new(ScriptedProvider::new("scripted_mcp_provider", |request| {
-            direct_events(request.tool_results().count())
-        }));
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "scripted_mcp_provider",
+        |request| direct_events(request.tool_results().count()),
+    )));
 
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
         .with_mcp_servers(
             McpConfig::new()
                 .with_server(stdio_server(&stdio_command))
@@ -79,7 +79,11 @@ async fn mcp_tool_discovery_observes_cancellation() -> waltr_agent::Result<()> {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
 
-    let error = Agent::builder(test_model())
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "unused_canceled_mcp_provider",
+        vec![vec![CompletionEvent::Finished]],
+    ));
+    let error = AgentRuntime::builder(test_model(), provider)
         .with_mcp_servers_with_cancellation(
             McpConfig::new().with_server(stdio_server("command-that-should-not-run")),
             cancellation,
@@ -103,7 +107,7 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
     let temp = tempfile::tempdir()?;
     let marker = temp.path().join("mcp-cancel-marker.txt");
     let stdio_command = test_stdio_server_command();
-    let provider = ScriptedProvider::from_turns(
+    let provider = Arc::new(ScriptedProvider::from_turns(
         "mcp_cancel_provider",
         vec![
             vec![CompletionEvent::ToolCall(ToolCall::new(
@@ -117,17 +121,17 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
             ))],
             vec![CompletionEvent::Finished],
         ],
-    );
-    let agent = Agent::builder(test_model())
+    ));
+    let agent = AgentRuntime::builder(test_model(), provider)
         .with_mcp_servers(McpConfig::new().with_server(stdio_server(&stdio_command)))
         .await?
         .build();
     let store = MemorySessionStore::new();
-    let sessions = agent.clone().sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let cancellation = CancellationToken::new();
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "run delayed MCP write")
+        .prompt(&agent, session_id.clone(), "run delayed MCP write")
         .with_cancellation_token(cancellation.clone())
         .stream();
 
@@ -176,7 +180,7 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
         waltr_agent::SessionStatus::Suspended(waltr_agent::Suspension::Interrupted { .. })
     ));
 
-    let recovery_provider = ScriptedProvider::from_turns(
+    let recovery_provider = Arc::new(ScriptedProvider::from_turns(
         "mcp_recovery_provider",
         vec![
             vec![CompletionEvent::ToolCall(ToolCall::new(
@@ -186,8 +190,13 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
             ))],
             vec![CompletionEvent::Finished],
         ],
-    );
-    let recovery = AgentTestSession::run(&agent, &recovery_provider, "recover MCP stdio").await?;
+    ));
+    let recovery_agent = AgentRuntime::builder(test_model(), recovery_provider.clone())
+        .with_mcp_servers(McpConfig::new().with_server(stdio_server(&stdio_command)))
+        .await?
+        .build();
+    let recovery =
+        AgentTestSession::run(&recovery_agent, &recovery_provider, "recover MCP stdio").await?;
     assert!(
         tool_result_text(&recovery).contains("stdio-after-cancel-909"),
         "{}",

@@ -9,11 +9,11 @@ use std::{
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_CALL,
-    CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse, FilesystemSessionStore,
-    OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore, SessionStore,
-    TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
-    opendal_postgresql_session_store,
+    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse,
+    FilesystemSessionStore, OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore,
+    SessionStore, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery,
+    TimelineStatus, opendal_postgresql_session_store,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 use opendal::{Operator, services};
@@ -108,22 +108,20 @@ where
     else {
         return Ok(());
     };
-    let provider = live.provider;
-    let agent = Agent::builder(live.model)
+    let provider = std::sync::Arc::new(live.provider);
+    let agent = AgentRuntime::builder(live.model, std::sync::Arc::clone(&provider))
         .with_system_prompt(
             "You are validating durable session storage. Follow the user instructions exactly.",
         )
         .with_question_tool(QuestionConfig::new())
         .build();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session = sessions.create().await?;
     let session_id = session.id().clone();
 
     let first = collect(
         sessions
-            .prompt(
-                &provider,
-                session_id.clone(),
+            .prompt(&agent, session_id.clone(),
                 "Call the question tool exactly once to ask: 'Confirm durable storage resume?'. Do not answer directly before the tool result. After the user response is provided on resume, reply with exactly: storage resume complete",
             )
             .stream(),
@@ -138,7 +136,7 @@ where
     let resumed = collect(
         sessions
             .resume(
-                &provider,
+                &agent,
                 session_id.clone(),
                 ResumeInput::ExternalResponse {
                     request_id: request,

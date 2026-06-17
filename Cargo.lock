@@ -2798,6 +2798,7 @@ dependencies = [
  "testcontainers",
  "tokio",
  "tokio-postgres",
+ "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
  "tree-sitter",

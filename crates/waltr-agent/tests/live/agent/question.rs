@@ -1,7 +1,9 @@
-//! Agent question tool integration tests.
+//! AgentRuntime question tool integration tests.
+
+use std::sync::Arc;
 
 use waltr_agent::{
-    Agent, ExternalRequestKind, LlmStream, ModelRef,
+    AgentRuntime, ExternalRequestKind, LlmStream, ModelRef,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 
@@ -20,9 +22,12 @@ async fn live_question_agent_loop_asks_and_uses_structured_answers() -> waltr_ag
     run_live_question(live.provider, live.model).await
 }
 
-async fn run_live_question(provider: impl LlmStream, model: ModelRef) -> waltr_agent::Result<()> {
-    let provider = CapturingProvider::new(provider);
-    let agent = Agent::builder(model)
+async fn run_live_question(
+    provider: impl LlmStream + 'static,
+    model: ModelRef,
+) -> waltr_agent::Result<()> {
+    let provider = Arc::new(CapturingProvider::new(provider));
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
         .with_question_tool(QuestionConfig::new())
         .build();
     let prompt = "Use the question tool exactly once to ask the user which implementation path to choose and which tests to include.";
@@ -44,7 +49,7 @@ async fn run_live_question(provider: impl LlmStream, model: ModelRef) -> waltr_a
     Ok(())
 }
 
-fn assert_tool_was_surfaced(provider: &CapturingProvider<impl LlmStream>, name: &str) {
+fn assert_tool_was_surfaced(provider: &Arc<CapturingProvider<impl LlmStream>>, name: &str) {
     assert!(
         provider.all_tools().iter().any(|tool| tool.name == name),
         "{}",
@@ -53,7 +58,7 @@ fn assert_tool_was_surfaced(provider: &CapturingProvider<impl LlmStream>, name: 
 }
 
 fn test_context(
-    provider: &CapturingProvider<impl LlmStream>,
+    provider: &Arc<CapturingProvider<impl LlmStream>>,
     session: &AgentTestSession,
 ) -> String {
     format!(

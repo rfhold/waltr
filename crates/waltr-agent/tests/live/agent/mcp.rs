@@ -4,7 +4,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::Router;
 use waltr_agent::{
-    Agent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmError, LlmStream, ModelRef, TimelineContent,
+    AgentRuntime, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmError, LlmStream, ModelRef,
+    TimelineContent,
     mcp::{McpConfig, McpServerConfig},
 };
 use rmcp::{
@@ -34,12 +35,15 @@ async fn live_mcp_agent_loop_covers_stdio_and_streamable_http_direct_tools()
     run_live_mcp(live.provider, live.model).await
 }
 
-async fn run_live_mcp(provider: impl LlmStream, model: ModelRef) -> waltr_agent::Result<()> {
+async fn run_live_mcp(
+    provider: impl LlmStream + 'static,
+    model: ModelRef,
+) -> waltr_agent::Result<()> {
     let stdio_command = test_stdio_server_command();
     let http_server = HttpMcpTestServer::start().await?;
-    let provider = CapturingProvider::new(provider);
+    let provider = Arc::new(CapturingProvider::new(provider));
 
-    let agent = Agent::builder(model)
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
         .with_mcp_servers(
             McpConfig::new()
                 .with_server(stdio_server(&stdio_command))
