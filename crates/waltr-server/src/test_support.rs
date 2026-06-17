@@ -1,6 +1,6 @@
 //! Shared integration test server setup.
 
-use crate::{build_app_with_config_service, config_service::ConfigService};
+use crate::{build_app_with_services, config_service::ConfigService, session};
 use std::{
     net::{SocketAddr, TcpListener},
     path::PathBuf,
@@ -31,21 +31,30 @@ impl TestServer {
 /// Start an isolated integration test server.
 #[must_use]
 pub fn setup_server() -> &'static TestServer {
-    let service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
-    setup_server_with_listener(service, listener)
+    setup_server_with_listener(config_service, listener)
 }
 
 /// Start an isolated integration test server at a fixed address.
 #[must_use]
 pub fn setup_server_at(addr: SocketAddr) -> &'static TestServer {
-    let service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
     let listener = TcpListener::bind(addr).expect("test server should bind fixed address");
-    setup_server_with_listener(service, listener)
+    setup_server_with_listener(config_service, listener)
+}
+
+/// Start an isolated integration test server with an explicit config service.
+#[must_use]
+pub fn setup_server_with_services(
+    config_service: std::sync::Arc<ConfigService>,
+) -> &'static TestServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    setup_server_with_listener(config_service, listener)
 }
 
 fn setup_server_with_listener(
-    service: std::sync::Arc<ConfigService>,
+    config_service: std::sync::Arc<ConfigService>,
     listener: TcpListener,
 ) -> &'static TestServer {
     listener
@@ -64,9 +73,12 @@ fn setup_server_with_listener(
         runtime.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener)
                 .expect("test server listener should become async");
-            axum::serve(listener, build_app_with_config_service(service))
-                .await
-                .expect("test server should run");
+            axum::serve(
+                listener,
+                build_app_with_services(config_service, session::add_default_service),
+            )
+            .await
+            .expect("test server should run");
         });
     });
 

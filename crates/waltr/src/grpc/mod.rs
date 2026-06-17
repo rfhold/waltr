@@ -6,6 +6,11 @@ pub mod waltr {
             include!("waltr/config/v1/waltr.config.v1.rs");
         }
     }
+    pub mod session {
+        pub mod v1 {
+            include!("waltr/session/v1/waltr.session.v1.rs");
+        }
+    }
     pub mod status {
         pub mod v1 {
             include!("waltr/status/v1/waltr.status.v1.rs");

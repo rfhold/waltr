@@ -35,6 +35,7 @@ opentelemetry-semantic-conventions = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opendal = { version = "0.57.0", features = ["services-fs", "services-s3", "services-postgresql"] }
 prost = "0.14.1"
+prost-types = "0.14.1"
 pyroscope = { version = "2.0.6", features = ["backend-pprof-rs"] }
 reqwest = { version = "0.13.4", default-features = false }
 refinery = "0.8.16"

@@ -5,11 +5,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-grpc = ["dep:prost", "dep:serde", "dep:tonic", "dep:tonic-prost"]
+grpc = ["dep:prost", "dep:prost-types", "dep:serde", "dep:tonic", "dep:tonic-prost"]
 default = ["grpc"]
 
 [dependencies]
 prost = { workspace = true, optional = true }
+prost-types = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }

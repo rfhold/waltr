@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package waltr.session.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service SessionService {
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
+}
+
+message CreateSessionRequest {}
+
+message CreateSessionResponse {
+  SessionSummary session = 1;
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated SessionSummary sessions = 1;
+}
+
+message WatchSessionsRequest {}
+
+message WatchSessionsResponse {
+  uint64 sequence = 1;
+  SessionSummary session = 2;
+}
+
+message SessionSummary {
+  string id = 1;
+  uint64 revision = 2;
+  SessionStatus status = 3;
+  optional string current_prompt = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  google.protobuf.Timestamp last_activity_at = 7;
+}
+
+message SessionStatus {
+  SessionPhase phase = 1;
+
+  // Set when phase == SESSION_PHASE_SUSPENDED.
+  Suspension suspension = 2;
+
+  // Set when phase == SESSION_PHASE_FAILED.
+  string failed_message = 3;
+}
+
+enum SessionPhase {
+  SESSION_PHASE_UNSPECIFIED = 0;
+  SESSION_PHASE_IDLE = 1;
+  SESSION_PHASE_BUILDING_REQUEST = 2;
+  SESSION_PHASE_STREAMING_PROVIDER = 3;
+  SESSION_PHASE_EVALUATING_TOOL_CALL = 4;
+  SESSION_PHASE_RUNNING_TOOL = 5;
+  SESSION_PHASE_SUSPENDED = 6;
+  SESSION_PHASE_FINISHED = 7;
+  SESSION_PHASE_FAILED = 8;
+}
+
+message Suspension {
+  SuspensionKind kind = 1;
+  repeated PendingWork work = 2;
+  ExternalRequest request = 3;
+}
+
+enum SuspensionKind {
+  SUSPENSION_KIND_UNSPECIFIED = 0;
+  SUSPENSION_KIND_AWAITING_TOOL_RESULTS = 1;
+  SUSPENSION_KIND_AWAITING_EXTERNAL_INPUT = 2;
+  SUSPENSION_KIND_INTERRUPTED = 3;
+}
+
+message PendingWork {
+  string id = 1;
+  uint64 turn = 2;
+  PendingWorkStatus status = 3;
+}
+
+enum PendingWorkStatus {
+  PENDING_WORK_STATUS_UNSPECIFIED = 0;
+  PENDING_WORK_STATUS_PENDING = 1;
+  PENDING_WORK_STATUS_CANCELED = 2;
+  PENDING_WORK_STATUS_FINISHED = 3;
+  PENDING_WORK_STATUS_FAILED = 4;
+}
+
+message ExternalRequest {
+  string id = 1;
+  ExternalRequestKind kind = 2;
+  optional string tool_call_id = 3;
+  string prompt = 4;
+
+  // JSON payload encoded as UTF-8 JSON until request payload protos stabilize.
+  string payload_json = 5;
+}
+
+enum ExternalRequestKind {
+  EXTERNAL_REQUEST_KIND_UNSPECIFIED = 0;
+  EXTERNAL_REQUEST_KIND_PERMISSION = 1;
+  EXTERNAL_REQUEST_KIND_QUESTION = 2;
+  EXTERNAL_REQUEST_KIND_TOOL_INPUT = 3;
+  EXTERNAL_REQUEST_KIND_CUSTOM = 4;
+}

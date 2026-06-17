@@ -10,13 +10,16 @@ test = []
 [dependencies]
 axum.workspace = true
 waltr = { path = "../waltr", version = "0.1.0", default-features = false, features = ["grpc"] }
+waltr-agent.workspace = true
 notify.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 pyroscope.workspace = true
+prost-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }

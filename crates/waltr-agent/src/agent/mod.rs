@@ -21,8 +21,8 @@ pub use session::{
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
     S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListSubscription,
     SessionListUpdate, SessionRecord, SessionSnapshot, SessionStatus, SessionStore,
-    SessionStoreError, SessionStoreResult, Suspension, opendal_postgresql_session_store,
-    run_postgresql_migrations,
+    SessionStoreError, SessionStoreResult, SessionSummary, Suspension,
+    opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 
