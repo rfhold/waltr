@@ -13,12 +13,13 @@ pub mod timeline;
 pub mod tools;
 
 pub use agent::{
-    Agent, AgentBuilder, AgentRunBuilder, AgentSession, AgentSessionRuntime, AgentSessions,
-    AgentTool, BoxAgentTimelineStream, CancelReason, ExternalRequest, ExternalRequestId,
-    ExternalRequestKind, ExternalRequestStatus, ExternalResponse, FilesystemSessionStore,
-    MemorySessionStore, OpenDalSessionStore, PendingWork, PendingWorkStatus, RequestId,
-    RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, S3SessionStore, ScyllaSessionStore,
-    SessionId, SessionJournalEvent, SessionRecord, SessionSnapshot, SessionStatus, SessionStore,
+    AgentRunBuilder, AgentRuntime, AgentRuntimeBuilder, AgentSession, AgentSessionRuntime,
+    AgentSessions, AgentTool, BoxAgentTimelineStream, CancelReason, ExternalRequest,
+    ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse,
+    FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
+    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
+    S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListSubscription,
+    SessionListUpdate, SessionRecord, SessionSnapshot, SessionStatus, SessionStore,
     SessionStoreError, SessionStoreResult, Suspension, ToolExecutionContext, ToolProgressSink,
     opendal_postgresql_session_store, run_postgresql_migrations,
 };

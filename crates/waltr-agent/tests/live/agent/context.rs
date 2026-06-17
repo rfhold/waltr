@@ -1,9 +1,9 @@
-//! Agent context-loading integration tests.
+//! AgentRuntime context-loading integration tests.
 
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, sync::Arc};
 
 use waltr_agent::{
-    Agent, LlmStream, ModelRef,
+    AgentRuntime, LlmStream, ModelRef,
     tools::{filesystem::FilesystemConfig, filesystem_skills::SkillsConfig},
 };
 
@@ -24,9 +24,13 @@ async fn live_context_agent_loop() -> waltr_agent::Result<()> {
     run_live_context(live.provider, live.model).await
 }
 
-async fn run_live_context(provider: impl LlmStream, model: ModelRef) -> waltr_agent::Result<()> {
+async fn run_live_context(
+    provider: impl LlmStream + 'static,
+    model: ModelRef,
+) -> waltr_agent::Result<()> {
     let fixture = ContextFixture::new()?;
-    let agent = Agent::builder(model)
+    let provider = Arc::new(provider);
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
         .with_system_prompt("You are a coding agent validating dynamic context loading.")
         .with_filesystem_tools(
             FilesystemConfig::new(fixture.root.path())

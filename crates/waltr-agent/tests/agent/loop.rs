@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -13,15 +13,15 @@ use waltr_agent::PermissionPolicy;
 #[cfg(feature = "shell")]
 use waltr_agent::tools::shell::ShellConfig;
 use waltr_agent::{
-    AGENTS_INSTRUCTION_FILE, Agent, AgentTimelineEvent, AgentTool, AgentsPromptConfig,
-    BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
-    CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO,
-    CHANNEL_TOOL_RESULT, CompletionEvent, CompletionRequest, ExternalRequestId,
-    ExternalRequestKind, ExternalResponse, FilesystemPromptConfig, LlmError, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, ProviderId, ProviderTurnMetadata, ResumeInput,
-    SessionStore, SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent,
-    TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition,
-    tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
+    AGENTS_INSTRUCTION_FILE, AgentRuntime, AgentSessions, AgentTimelineEvent, AgentTool,
+    AgentsPromptConfig, BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture,
+    CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL,
+    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent, CompletionRequest,
+    ExternalRequestId, ExternalRequestKind, ExternalResponse, FilesystemPromptConfig, LlmError,
+    LlmStream, MemorySessionStore, ModelApi, ModelRef, ProviderId, ProviderTurnMetadata,
+    ResumeInput, SessionStore, SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta,
+    TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall,
+    ToolDefinition, tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
 use serde_json::json;
@@ -31,12 +31,12 @@ use crate::scripted_provider::ScriptedProvider;
 
 #[tokio::test]
 async fn durable_session_resume_continues_same_agent_loop() {
-    let provider = DurableResumeProvider::default();
-    let agent = Agent::builder(test_model())
+    let provider = Arc::new(DurableResumeProvider::default());
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
         .with_question_tool(QuestionConfig::new())
         .build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions
         .create()
         .await
@@ -45,7 +45,7 @@ async fn durable_session_resume_continues_same_agent_loop() {
         .clone();
 
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "ask then continue")
+        .prompt(&agent, session_id.clone(), "ask then continue")
         .stream();
     let mut request_id = None;
     while let Some(event) = stream.next().await {
@@ -71,7 +71,7 @@ async fn durable_session_resume_continues_same_agent_loop() {
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id: ExternalRequestId::new(request_id),
@@ -103,15 +103,15 @@ async fn durable_session_resume_continues_same_agent_loop() {
 
 #[tokio::test]
 async fn provider_projection_and_turn_metadata_are_journaled() {
-    let provider = MetadataEmittingProvider::default();
-    let agent = Agent::builder(test_model()).build();
+    let agent =
+        AgentRuntime::builder(test_model(), Arc::new(MetadataEmittingProvider::default())).build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     drain(
         sessions
-            .prompt(&provider, session_id.clone(), "hello")
+            .prompt(&agent, session_id.clone(), "hello")
             .stream(),
     )
     .await;
@@ -139,27 +139,29 @@ async fn provider_projection_and_turn_metadata_are_journaled() {
 
 #[tokio::test]
 async fn provider_turn_metadata_is_forwarded_without_agent_filtering() {
-    let provider = MetadataEmittingProvider::default();
-    let agent = Agent::builder(test_model()).build();
+    let agent =
+        AgentRuntime::builder(test_model(), Arc::new(MetadataEmittingProvider::default())).build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     drain(
         sessions
-            .prompt(&provider, session_id.clone(), "first prompt")
+            .prompt(&agent, session_id.clone(), "first prompt")
             .stream(),
     )
     .await;
     drain(
         sessions
-            .prompt(&provider, session_id.clone(), "second prompt")
+            .prompt(&agent, session_id.clone(), "second prompt")
             .stream(),
     )
     .await;
+    let foreign_agent =
+        AgentRuntime::builder(test_model(), Arc::new(ForeignMetadataProvider)).build();
     drain(
         sessions
-            .prompt(&ForeignMetadataProvider, session_id, "third prompt")
+            .prompt(&foreign_agent, session_id, "third prompt")
             .stream(),
     )
     .await;
@@ -167,15 +169,15 @@ async fn provider_turn_metadata_is_forwarded_without_agent_filtering() {
 
 #[tokio::test]
 async fn durable_session_timeline_ranges_preserve_cursor_order() {
-    let provider = MetadataEmittingProvider::default();
-    let agent = Agent::builder(test_model()).build();
+    let agent =
+        AgentRuntime::builder(test_model(), Arc::new(MetadataEmittingProvider::default())).build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     drain(
         sessions
-            .prompt(&provider, session_id.clone(), "range prompt")
+            .prompt(&agent, session_id.clone(), "range prompt")
             .stream(),
     )
     .await;
@@ -243,13 +245,13 @@ async fn assistant_and_thinking_deltas_use_stable_items_and_reconstruct_text() {
             CompletionEvent::Finished,
         ]],
     );
-    let agent = Agent::builder(test_model()).build();
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider)).build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     let events = sessions
-        .prompt(&provider, session_id.clone(), "stream text")
+        .prompt(&agent, session_id.clone(), "stream text")
         .stream()
         .collect::<Vec<_>>()
         .await
@@ -329,10 +331,12 @@ async fn tool_progress_streams_between_call_preview_and_result() {
             })
         },
     );
-    let agent = Agent::builder(test_model()).with_tool(tool).build();
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_tool(tool)
+        .build();
 
     let events = agent
-        .prompt(&provider, "run progress tool")
+        .prompt("run progress tool")
         .stream()
         .collect::<Vec<_>>()
         .await
@@ -393,9 +397,11 @@ async fn cancellation_token_stops_running_tool_without_finishing_result() {
             })
         },
     );
-    let agent = Agent::builder(test_model()).with_tool(tool).build();
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_tool(tool)
+        .build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions
         .create()
         .await
@@ -404,7 +410,7 @@ async fn cancellation_token_stops_running_tool_without_finishing_result() {
         .clone();
     let cancellation = CancellationToken::new();
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "run cancel tool")
+        .prompt(&agent, session_id.clone(), "run cancel tool")
         .with_cancellation_token(cancellation.clone())
         .stream();
 
@@ -465,12 +471,12 @@ async fn shell_cancellation_kills_running_command() {
             vec![CompletionEvent::Finished],
         ],
     );
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
         .with_permission_policy(PermissionPolicy::default())
         .with_shell_tool(ShellConfig::new(temp.path()))
         .build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions
         .create()
         .await
@@ -479,7 +485,7 @@ async fn shell_cancellation_kills_running_command() {
         .clone();
     let cancellation = CancellationToken::new();
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "run shell cancel command")
+        .prompt(&agent, session_id.clone(), "run shell cancel command")
         .with_cancellation_token(cancellation.clone())
         .stream();
 
@@ -527,11 +533,11 @@ async fn agents_system_prompt_is_sent_to_provider() {
     let provider = AgentsSystemPromptProvider {
         expected_path: temp.path().join(AGENTS_INSTRUCTION_FILE),
     };
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
         .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
         .build();
 
-    let mut events = agent.prompt(&provider, "hello").stream();
+    let mut events = agent.prompt("hello").stream();
     let mut text = String::new();
     while let Some(event) = events.next().await {
         let event = event.expect("agent event");
@@ -551,12 +557,11 @@ async fn filesystem_read_agents_context_is_opt_in_and_loaded_once() {
     temp.write("AGENTS.md", "Root instructions.\n");
     temp.write("src/AGENTS.md", "Nested instructions.\n");
     temp.write("src/main.rs", "fn main() {}\n");
-    let provider = RepeatedReadProvider::default();
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(RepeatedReadProvider::default()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_agents_read_context())
         .build();
 
-    let mut events = agent.prompt(&provider, "read twice").stream();
+    let mut events = agent.prompt("read twice").stream();
     let mut tool_results = Vec::new();
     while let Some(event) = events.next().await {
         let event = event.expect("agent event");
@@ -580,12 +585,11 @@ async fn filesystem_read_agents_context_is_disabled_by_default() {
     temp.write("AGENTS.md", "Root instructions.\n");
     temp.write("src/AGENTS.md", "Nested instructions.\n");
     temp.write("src/main.rs", "fn main() {}\n");
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(SingleReadProvider))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()))
         .build();
 
-    let tool_result =
-        single_tool_result(agent.prompt(&SingleReadProvider, "read once").stream()).await;
+    let tool_result = single_tool_result(agent.prompt("read once").stream()).await;
 
     assert!(!tool_result.contains("<system-reminder>"));
     assert!(!tool_result.contains("Root instructions."));
@@ -598,13 +602,12 @@ async fn filesystem_read_agents_context_skips_static_root_instruction() {
     temp.write("AGENTS.md", "Root instructions.\n");
     temp.write("src/AGENTS.md", "Nested instructions.\n");
     temp.write("src/main.rs", "fn main() {}\n");
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(SingleReadProvider))
         .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_agents_read_context())
         .build();
 
-    let tool_result =
-        single_tool_result(agent.prompt(&SingleReadProvider, "read once").stream()).await;
+    let tool_result = single_tool_result(agent.prompt("read once").stream()).await;
 
     assert!(tool_result.contains("Nested instructions."));
     assert!(!tool_result.contains("Root instructions."));
@@ -621,11 +624,11 @@ async fn skills_system_prompt_lists_root_skills_and_exposes_loader() {
     let provider = SkillsSystemPromptProvider {
         expected_root: temp.path().canonicalize().expect("canonical temp root"),
     };
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
         .with_skills(SkillsConfig::new(temp.path()))
         .build();
 
-    drain(agent.prompt(&provider, "hello").stream()).await;
+    drain(agent.prompt("hello").stream()).await;
 }
 
 #[tokio::test]
@@ -637,19 +640,14 @@ async fn load_skill_loads_content_and_lists_resources_once() {
         "# Example\nFollow example steps.\n",
     );
     temp.write(".agents/skills/example/references/guide.md", "details\n");
-    let agent = Agent::builder(test_model())
-        .with_skills(SkillsConfig::new(temp.path()))
-        .build();
-
-    let tool_results = tool_results(
-        agent
-            .prompt(
-                &LoadSkillProvider::new(json!({ "name": "example" })),
-                "load skill",
-            )
-            .stream(),
+    let agent = AgentRuntime::builder(
+        test_model(),
+        Arc::new(LoadSkillProvider::new(json!({ "name": "example" }))),
     )
-    .await;
+    .with_skills(SkillsConfig::new(temp.path()))
+    .build();
+
+    let tool_results = tool_results(agent.prompt("load skill").stream()).await;
 
     assert_eq!(tool_results.len(), 2);
     assert!(tool_results[0].contains("<skill_content name=\"example\">"));
@@ -668,17 +666,12 @@ async fn duplicate_skill_names_require_root() {
     );
     temp.write("src/main.rs", "fn main() {}\n");
     temp.write("packages/app/src/main.rs", "fn main() {}\n");
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(DuplicateSkillProvider))
         .with_skills(SkillsConfig::new(temp.path()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
         .build();
 
-    let tool_results = tool_results(
-        agent
-            .prompt(&DuplicateSkillProvider, "read and load")
-            .stream(),
-    )
-    .await;
+    let tool_results = tool_results(agent.prompt("read and load").stream()).await;
 
     assert_eq!(tool_results.len(), 2);
     assert!(tool_results[0].contains("New skills are available"));
@@ -701,17 +694,15 @@ async fn duplicate_skill_names_load_with_root() {
         .join("packages/app")
         .canonicalize()
         .expect("canonical app root");
-    let agent = Agent::builder(test_model())
-        .with_skills(SkillsConfig::new(temp.path()))
-        .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
-        .build();
-
-    let tool_results = tool_results(
-        agent
-            .prompt(&RootedSkillProvider { root: app_root }, "read and load")
-            .stream(),
+    let agent = AgentRuntime::builder(
+        test_model(),
+        Arc::new(RootedSkillProvider { root: app_root }),
     )
-    .await;
+    .with_skills(SkillsConfig::new(temp.path()))
+    .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
+    .build();
+
+    let tool_results = tool_results(agent.prompt("read and load").stream()).await;
 
     assert_eq!(tool_results.len(), 2);
     assert!(tool_results[1].contains("<skill_content name=\"example\">"));
@@ -727,17 +718,12 @@ async fn glob_directory_walk_reveals_skills_once() {
         "---\nname: app-skill\ndescription: Use app skill.\n---\n# App Skill\n",
     );
     temp.write("packages/app/src/main.rs", "fn main() {}\n");
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(RepeatedGlobProvider::default()))
         .with_skills(SkillsConfig::new(temp.path()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()).with_skills_context())
         .build();
 
-    let tool_results = tool_results(
-        agent
-            .prompt(&RepeatedGlobProvider::default(), "glob twice")
-            .stream(),
-    )
-    .await;
+    let tool_results = tool_results(agent.prompt("glob twice").stream()).await;
 
     assert_eq!(tool_results.len(), 2);
     assert!(tool_results[0].contains("New skills are available"));
@@ -754,13 +740,12 @@ async fn dynamic_skills_discovery_is_opt_in() {
     );
     temp.write("src/main.rs", "fn main() {}\n");
     temp.write("packages/app/src/main.rs", "fn main() {}\n");
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(SingleReadProvider))
         .with_skills(SkillsConfig::new(temp.path()))
         .with_filesystem_tools(FilesystemConfig::new(temp.path()))
         .build();
 
-    let tool_result =
-        single_tool_result(agent.prompt(&SingleReadProvider, "read once").stream()).await;
+    let tool_result = single_tool_result(agent.prompt("read once").stream()).await;
 
     assert!(!tool_result.contains("New skills are available"));
     assert!(!tool_result.contains("Use app example."));
@@ -768,7 +753,7 @@ async fn dynamic_skills_discovery_is_opt_in() {
 
 #[tokio::test]
 async fn agent_system_prompt_fragments_are_sent_in_order() {
-    let agent = Agent::builder(test_model())
+    let agent = AgentRuntime::builder(test_model(), Arc::new(SystemPromptProvider))
         .with_base_system_prompt()
         .with_system_date("2026-06-02")
         .with_filesystem_system_prompt(FilesystemPromptConfig::new("/tmp/waltr-root"))
@@ -776,7 +761,7 @@ async fn agent_system_prompt_fragments_are_sent_in_order() {
         .build();
 
     let mut events = agent
-        .prompt(&SystemPromptProvider, "hello")
+        .prompt("hello")
         .with_system_prompt_fragment("run fragment")
         .stream();
     let mut text = String::new();
@@ -807,9 +792,11 @@ async fn tool_errors_are_reported_to_agent_for_recovery() {
             })
         },
     );
-    let agent = Agent::builder(test_model()).with_tool(tool).build();
+    let agent = AgentRuntime::builder(test_model(), Arc::new(RecoveringProvider))
+        .with_tool(tool)
+        .build();
 
-    let mut events = agent.prompt(&RecoveringProvider, "recover").stream();
+    let mut events = agent.prompt("recover").stream();
     let mut saw_error_result = false;
     let mut final_text = String::new();
     let mut timeline = Vec::new();
@@ -847,8 +834,8 @@ async fn tool_errors_are_reported_to_agent_for_recovery() {
 
 #[tokio::test]
 async fn agent_surfaces_and_stores_thinking_without_final_text_pollution() {
-    let agent = Agent::builder(test_model()).build();
-    let mut events = agent.prompt(&ThinkingProvider, "think").stream();
+    let agent = AgentRuntime::builder(test_model(), Arc::new(ThinkingProvider)).build();
+    let mut events = agent.prompt("think").stream();
     let mut saw_thinking_delta = false;
     let mut final_text = String::new();
     let mut saw_finished = false;
@@ -893,7 +880,7 @@ async fn agent_surfaces_and_stores_thinking_without_final_text_pollution() {
 
 #[tokio::test]
 async fn agent_replays_thinking_blocks_on_tool_continuation() {
-    let provider = ReplayThinkingProvider::default();
+    let provider = Arc::new(ReplayThinkingProvider::default());
     let tool = AgentTool::new(
         ToolDefinition::new(
             "lookup",
@@ -902,16 +889,18 @@ async fn agent_replays_thinking_blocks_on_tool_continuation() {
         ),
         |call| Ok(call.result("tool output")),
     );
-    let agent = Agent::builder(test_model()).with_tool(tool).build();
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
+        .with_tool(tool)
+        .build();
 
-    drain(agent.prompt(&provider, "use tool").stream()).await;
+    drain(agent.prompt("use tool").stream()).await;
 
     assert!(provider.saw_replayed_thinking());
 }
 
 #[tokio::test]
 async fn agent_replays_assistant_text_on_tool_continuation() {
-    let provider = ReplayAssistantTextProvider::default();
+    let provider = Arc::new(ReplayAssistantTextProvider::default());
     let tool = AgentTool::new(
         ToolDefinition::new(
             "lookup",
@@ -920,9 +909,11 @@ async fn agent_replays_assistant_text_on_tool_continuation() {
         ),
         |call| Ok(call.result("tool output")),
     );
-    let agent = Agent::builder(test_model()).with_tool(tool).build();
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
+        .with_tool(tool)
+        .build();
 
-    drain(agent.prompt(&provider, "use tool").stream()).await;
+    drain(agent.prompt("use tool").stream()).await;
 
     assert!(provider.saw_replayed_assistant_text());
 }

@@ -1,9 +1,9 @@
 //! Live provider agent filesystem integration tests.
 
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, sync::Arc};
 
 use waltr_agent::{
-    Agent, LlmStream, ModelRef,
+    AgentRuntime, LlmStream, ModelRef,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 
@@ -59,9 +59,10 @@ async fn openai_responses_websocket_runs_filesystem_agent_loop() -> waltr_agent:
 }
 
 async fn assert_provider_runs_filesystem_agent(
-    provider: impl LlmStream,
+    provider: impl LlmStream + 'static,
     model: ModelRef,
 ) -> waltr_agent::Result<()> {
+    let provider = Arc::new(provider);
     let root = TempRoot::new()?;
     root.write("alpha.txt", "alpha=one\n")?;
     root.write(
@@ -71,7 +72,7 @@ async fn assert_provider_runs_filesystem_agent(
     root.write("delete-me.txt", "remove this file\n")?;
     root.write("notes/nested.txt", "nested=present\n")?;
 
-    let agent = Agent::builder(model)
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
         .with_filesystem_tools(
             FilesystemConfig::new(root.path()).with_profile(FilesystemToolProfile::StructuredPatch),
         )
@@ -126,7 +127,7 @@ async fn assert_provider_runs_filesystem_agent(
 }
 
 async fn run_agent_session(
-    agent: &Agent,
+    agent: &AgentRuntime,
     provider: &impl LlmStream,
     prompt: &str,
 ) -> waltr_agent::Result<AgentTestSession> {

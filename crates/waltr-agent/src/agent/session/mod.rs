@@ -7,6 +7,7 @@ mod runtime;
 mod storage;
 mod title;
 mod types;
+mod watch;
 
 pub use compat::EphemeralSessionRun;
 pub use factory::AgentSessions;
@@ -22,3 +23,4 @@ pub use types::{
     RequestRecord, ResumeInput, Revision, SessionId, SessionJournalEvent, SessionRecord,
     SessionSnapshot, SessionStatus, SessionSummary, Suspension,
 };
+pub use watch::{SessionListSubscription, SessionListUpdate};

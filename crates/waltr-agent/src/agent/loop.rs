@@ -3,6 +3,7 @@
 use std::{
     collections::VecDeque,
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 use futures_util::StreamExt;
@@ -40,12 +41,11 @@ use super::{
     },
 };
 
-pub(super) struct AgentLoopState<'a, P, S>
+pub(super) struct AgentLoopState<S>
 where
-    P: LlmStream + ?Sized,
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    provider: &'a P,
+    provider: Arc<dyn LlmStream>,
     model: ModelRef,
     prompt: String,
     input: Option<ResumeInput>,
@@ -92,12 +92,11 @@ enum ToolExecution {
     Finished(Option<ToolResult>),
 }
 
-impl<'a, P, S> AgentLoopState<'a, P, S>
+impl<S> AgentLoopState<S>
 where
-    P: LlmStream + ?Sized,
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    pub(super) fn from_ephemeral_session(run: EphemeralSessionRun<'a, P, S>) -> Self {
+    pub(super) fn from_ephemeral_session(run: EphemeralSessionRun<S>) -> Self {
         let prompt = match &run.input {
             ResumeInput::Prompt(prompt) => prompt,
             ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => "",

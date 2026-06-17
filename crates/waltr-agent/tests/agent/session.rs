@@ -4,9 +4,9 @@ use std::{env, fmt::Write};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT,
-    ExternalRequest, LlmError, LlmStream, TimelineContent, TimelineEventKind, TimelineStatus,
-    ToolCall, ToolResult,
+    AgentRuntime, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_TOOL_CALL,
+    CHANNEL_TOOL_RESULT, ExternalRequest, LlmError, LlmStream, TimelineContent, TimelineEventKind,
+    TimelineStatus, ToolCall, ToolResult,
 };
 
 #[allow(dead_code)]
@@ -41,12 +41,12 @@ pub fn session_context(provider: &impl LlmStream, session: &AgentTestSession) ->
 
 impl AgentTestSession {
     pub async fn run(
-        agent: &Agent,
-        provider: &impl LlmStream,
+        agent: &AgentRuntime,
+        _provider: &impl LlmStream,
         prompt: &str,
     ) -> waltr_agent::Result<Self> {
         let mut stream = agent
-            .prompt(provider, prompt)
+            .prompt(prompt)
             .with_system_prompt_fragment(TEST_HARNESS_SYSTEM_PROMPT)
             .stream();
         let mut session = Self::default();
@@ -155,18 +155,26 @@ fn report_tool_errors_enabled() -> bool {
 
 #[cfg(test)]
 mod completion {
+    use std::sync::Arc;
+
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentTimelineEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi,
-        ModelRef, ProviderId, SessionId, SessionStatus, SessionStore, TimelineContent,
-        TimelineEventKind, TimelineStatus, ToolCall, ToolDefinition,
+        AgentRuntime, AgentSessions, AgentTimelineEvent, AgentTool, CompletionEvent,
+        MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionId, SessionStatus, SessionStore,
+        TimelineContent, TimelineEventKind, TimelineStatus, ToolCall, ToolDefinition,
     };
     use serde_json::json;
+    use tokio::time::{Duration, timeout};
 
     use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
-    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
-        CapturingProvider::new(ScriptedProvider::from_turns("scripted_provider", script))
+    fn scripted_provider(
+        script: Vec<Vec<CompletionEvent>>,
+    ) -> Arc<CapturingProvider<ScriptedProvider>> {
+        Arc::new(CapturingProvider::new(ScriptedProvider::from_turns(
+            "scripted_provider",
+            script,
+        )))
     }
 
     fn test_model() -> ModelRef {
@@ -216,11 +224,116 @@ mod completion {
     }
 
     #[tokio::test]
+    async fn create_emits_session_list_update() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let mut watch = sessions.watch_sessions();
+
+        let created = sessions.create().await.expect("created session");
+        let update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("session update")
+            .expect("session update item");
+        let listed = sessions.list().await.expect("listed sessions");
+
+        assert_eq!(update.sequence, 1);
+        assert_eq!(&update.session.id, created.id());
+        assert_eq!(update.session.status, created.record.summary().status);
+        assert!(listed.iter().any(|session| &session.id == created.id()));
+    }
+
+    #[tokio::test]
+    async fn create_updates_have_monotonic_sequences() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let mut watch = sessions.watch_sessions();
+
+        let first = sessions.create().await.expect("created first session");
+        let second = sessions.create().await.expect("created second session");
+        let first_update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("first update")
+            .expect("first update item");
+        let second_update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("second update")
+            .expect("second update item");
+        let listed = sessions.list().await.expect("listed sessions");
+
+        assert_eq!(first_update.sequence, 1);
+        assert_eq!(second_update.sequence, 2);
+        assert_eq!(&first_update.session.id, first.id());
+        assert_eq!(&second_update.session.id, second.id());
+        assert!(listed.iter().any(|session| &session.id == first.id()));
+        assert!(listed.iter().any(|session| &session.id == second.id()));
+    }
+
+    #[tokio::test]
+    async fn cloned_sessions_share_watch_stream() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let sessions_clone = sessions.clone();
+        let mut watch = sessions_clone.watch_sessions();
+
+        let created = sessions.create().await.expect("created session");
+        let update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("session update")
+            .expect("session update item");
+        let listed = sessions_clone.list().await.expect("listed sessions");
+
+        assert_eq!(update.sequence, 1);
+        assert_eq!(&update.session.id, created.id());
+        assert!(listed.iter().any(|session| &session.id == created.id()));
+    }
+
+    #[tokio::test]
+    async fn late_watchers_use_list_for_baseline() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let existing = sessions.create().await.expect("created existing session");
+        let mut watch = sessions.watch_sessions();
+        let baseline = sessions.list().await.expect("listed sessions");
+
+        assert!(baseline.iter().any(|session| &session.id == existing.id()));
+        assert!(
+            timeout(Duration::from_millis(25), watch.next())
+                .await
+                .is_err(),
+            "late watchers should not receive replayed session updates"
+        );
+
+        let created = sessions.create().await.expect("created new session");
+        let update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("session update")
+            .expect("session update item");
+
+        assert_eq!(update.sequence, 2);
+        assert_eq!(&update.session.id, created.id());
+    }
+
+    #[tokio::test]
+    async fn dropped_watchers_do_not_break_create() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let watch = sessions.watch_sessions();
+        drop(watch);
+
+        let created = sessions.create().await.expect("created session");
+        let listed = sessions.list().await.expect("listed sessions");
+
+        assert!(listed.iter().any(|session| &session.id == created.id()));
+    }
+
+    #[tokio::test]
     async fn finished_snapshot_matches_stored_snapshot() {
         let store = MemorySessionStore::new();
         let provider = scripted_provider(tool_then_text_script());
-        let agent = Agent::builder(test_model()).with_tool(echo_tool()).build();
-        let sessions = agent.sessions(store.clone());
+        let agent = AgentRuntime::builder(test_model(), provider)
+            .with_tool(echo_tool())
+            .build();
+        let sessions = AgentSessions::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -230,7 +343,7 @@ mod completion {
 
         let finished = saw_finished_status(
             sessions
-                .prompt(&provider, session_id.clone(), "run the tool")
+                .prompt(&agent, session_id.clone(), "run the tool")
                 .stream(),
         )
         .await;
@@ -250,14 +363,14 @@ mod completion {
         let store = MemorySessionStore::new();
         let session_id = SessionId::new("ephemeral-completion");
         let provider = scripted_provider(tool_then_text_script());
-        let agent = Agent::builder(test_model())
+        let agent = AgentRuntime::builder(test_model(), provider)
             .with_system_prompt("ephemeral marker-prompt")
             .with_tool(echo_tool())
             .build();
 
         let finished = saw_finished_status(
             agent
-                .prompt(&provider, "run the tool")
+                .prompt("run the tool")
                 .with_session_store(store.clone(), session_id.clone())
                 .stream(),
         )
@@ -360,32 +473,38 @@ mod tool_projection {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, CompletionEvent, ExternalRequestId, ExternalResponse, MemorySessionStore, ModelApi,
-        ModelRef, ProviderId, ResumeInput, TimelineContent, ToolCall, question::QuestionConfig,
-        tools::filesystem::FilesystemConfig,
+        AgentRuntime, AgentSessions, CompletionEvent, ExternalRequestId, ExternalResponse,
+        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, TimelineContent, ToolCall,
+        question::QuestionConfig, tools::filesystem::FilesystemConfig,
     };
     use serde_json::json;
 
     use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
-    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
-        CapturingProvider::new(ScriptedProvider::from_turns(
+    fn scripted_provider(
+        script: Vec<Vec<CompletionEvent>>,
+    ) -> Arc<CapturingProvider<ScriptedProvider>> {
+        Arc::new(CapturingProvider::new(ScriptedProvider::from_turns(
             "capture_tools_provider",
             script,
-        ))
+        )))
     }
 
     fn test_model() -> ModelRef {
         ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses)
     }
 
-    fn filesystem_agent(root: &Path) -> Agent {
-        Agent::builder(test_model())
+    fn filesystem_agent(
+        root: &Path,
+        provider: Arc<CapturingProvider<ScriptedProvider>>,
+    ) -> AgentRuntime {
+        AgentRuntime::builder(test_model(), provider)
             .with_filesystem_tools(FilesystemConfig::new(root))
             .with_question_tool(QuestionConfig::new())
             .build()
@@ -433,7 +552,8 @@ mod tool_projection {
             ],
         ]);
 
-        let sessions = filesystem_agent(&first_root.path()).sessions(store.clone());
+        let agent = filesystem_agent(&first_root.path(), provider.clone());
+        let sessions = AgentSessions::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -442,7 +562,7 @@ mod tool_projection {
             .clone();
         let mut request_id = None;
         let mut stream = sessions
-            .prompt(&provider, session_id.clone(), "hello")
+            .prompt(&agent, session_id.clone(), "hello")
             .stream();
         while let Some(event) = stream.next().await {
             if let TimelineContent::ExternalRequest { request } =
@@ -456,11 +576,11 @@ mod tool_projection {
         let projected = provider.tool_description(0, "read");
         assert!(projected.contains(&first_hint), "{projected}");
 
-        let resume_agent = filesystem_agent(&second_root.path());
-        let resume_sessions = resume_agent.sessions(store);
+        let resume_agent = filesystem_agent(&second_root.path(), provider.clone());
+        let resume_sessions = AgentSessions::new(store);
         let mut stream = resume_sessions
             .resume(
-                &provider,
+                &resume_agent,
                 session_id,
                 ResumeInput::ExternalResponse {
                     request_id: ExternalRequestId::new(request_id.expect("question request")),
@@ -515,12 +635,15 @@ mod tool_projection {
 
 #[cfg(test)]
 mod system_prompt_state {
+    use std::sync::Arc;
+
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentTimelineEvent, AgentTool, CompletionEvent, ExternalRequestId, ExternalResponse,
-        MemorySessionStore, ModelApi, ModelRef, PermissionEffect, PermissionPolicy,
-        PermissionToolSelector, ProviderId, ResumeInput, SessionId, SessionJournalEvent,
-        SessionRecord, SessionStore, TimelineContent, ToolCall, ToolDefinition,
+        AgentRuntime, AgentSessions, AgentTimelineEvent, AgentTool, CompletionEvent,
+        ExternalRequestId, ExternalResponse, MemorySessionStore, ModelApi, ModelRef,
+        PermissionEffect, PermissionPolicy, PermissionToolSelector, ProviderId, ResumeInput,
+        SessionId, SessionJournalEvent, SessionRecord, SessionStore, TimelineContent, ToolCall,
+        ToolDefinition,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
     };
     use serde_json::json;
@@ -557,8 +680,13 @@ mod system_prompt_state {
         }
     }
 
-    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
-        CapturingProvider::new(ScriptedProvider::from_turns("scripted_provider", script))
+    fn scripted_provider(
+        script: Vec<Vec<CompletionEvent>>,
+    ) -> Arc<CapturingProvider<ScriptedProvider>> {
+        Arc::new(CapturingProvider::new(ScriptedProvider::from_turns(
+            "scripted_provider",
+            script,
+        )))
     }
 
     struct RunOutput {
@@ -614,13 +742,11 @@ mod system_prompt_state {
             .collect()
     }
 
-    async fn create_session_id<S>(agent: &Agent, store: &S) -> SessionId
+    async fn create_session_id<S>(store: &S) -> SessionId
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        agent
-            .clone()
-            .sessions(store.clone())
+        AgentSessions::new(store.clone())
             .create()
             .await
             .expect("created session")
@@ -638,28 +764,26 @@ mod system_prompt_state {
                 CompletionEvent::Finished,
             ],
         ]);
-        let agent = Agent::builder(test_model())
+        let agent = AgentRuntime::builder(test_model(), provider.clone())
             .with_system_prompt("base prompt marker-first")
             .with_question_tool(QuestionConfig::new())
             .build();
-        let session_id = create_session_id(&agent, &store).await;
+        let session_id = create_session_id(&store).await;
         let run = drain_run(
-            agent
-                .sessions(store.clone())
-                .prompt(&provider, session_id.clone(), "hello")
+            AgentSessions::new(store.clone())
+                .prompt(&agent, session_id.clone(), "hello")
                 .stream(),
         )
         .await;
         let request_id = run.external_request_id.expect("question request");
 
-        let rebuilt = Agent::builder(test_model())
+        let rebuilt = AgentRuntime::builder(test_model(), provider.clone())
             .with_system_prompt("base prompt marker-second")
             .with_question_tool(QuestionConfig::new())
             .build();
         drain_run(
-            rebuilt
-                .sessions(store.clone())
-                .resume(&provider, session_id.clone(), question_answer(request_id))
+            AgentSessions::new(store.clone())
+                .resume(&rebuilt, session_id.clone(), question_answer(request_id))
                 .stream(),
         )
         .await;
@@ -698,15 +822,14 @@ mod system_prompt_state {
             CompletionEvent::Delta("ok".to_owned()),
             CompletionEvent::Finished,
         ]]);
-        let agent = Agent::builder(test_model())
+        let agent = AgentRuntime::builder(test_model(), provider.clone())
             .with_system_prompt("configured marker-configured")
             .build();
-        let session_id = create_session_id(&agent, &store).await;
+        let session_id = create_session_id(&store).await;
 
         drain_run(
-            agent
-                .sessions(store.clone())
-                .prompt(&provider, session_id.clone(), "hello")
+            AgentSessions::new(store.clone())
+                .prompt(&agent, session_id.clone(), "hello")
                 .with_system_prompt("override marker-override")
                 .stream(),
         )
@@ -743,16 +866,16 @@ mod system_prompt_state {
                 CompletionEvent::Finished,
             ],
         ]);
-        let agent = Agent::builder(test_model())
+        let agent = AgentRuntime::builder(test_model(), provider.clone())
             .with_system_prompt("configured marker-configured")
             .with_question_tool(QuestionConfig::new())
             .build();
-        let session_id = create_session_id(&agent, &store).await;
-        let sessions = agent.sessions(store.clone());
+        let session_id = create_session_id(&store).await;
+        let sessions = AgentSessions::new(store.clone());
 
         let first = drain_run(
             sessions
-                .prompt(&provider, session_id.clone(), "hello")
+                .prompt(&agent, session_id.clone(), "hello")
                 .stream(),
         )
         .await;
@@ -761,7 +884,7 @@ mod system_prompt_state {
         let second = drain_run(
             sessions
                 .resume(
-                    &provider,
+                    &agent,
                     session_id.clone(),
                     question_answer(first_request_id),
                 )
@@ -774,7 +897,7 @@ mod system_prompt_state {
         drain_run(
             sessions
                 .resume(
-                    &provider,
+                    &agent,
                     session_id.clone(),
                     question_answer(second_request_id),
                 )
@@ -832,15 +955,15 @@ mod system_prompt_state {
                 CompletionEvent::Finished,
             ],
         ]);
-        let agent = Agent::builder(test_model())
+        let agent = AgentRuntime::builder(test_model(), provider.clone())
             .with_question_tool(QuestionConfig::new())
             .build();
-        let session_id = create_session_id(&agent, &store).await;
-        let sessions = agent.sessions(store.clone());
+        let session_id = create_session_id(&store).await;
+        let sessions = AgentSessions::new(store.clone());
 
         let first = drain_run(
             sessions
-                .prompt(&provider, session_id.clone(), "hello")
+                .prompt(&agent, session_id.clone(), "hello")
                 .stream(),
         )
         .await;
@@ -862,7 +985,7 @@ mod system_prompt_state {
 
         let resumed = drain_run(
             sessions
-                .resume(&provider, session_id.clone(), question_answer(request_id))
+                .resume(&agent, session_id.clone(), question_answer(request_id))
                 .with_tool(extra_tool)
                 .with_tool(blocked_tool)
                 .with_permission_policy(policy)
@@ -903,14 +1026,15 @@ mod agents_skills_state {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentTimelineEvent, AgentsPromptConfig, CompletionEvent, ExternalRequestId,
-        ExternalResponse, MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput,
-        SessionId, SkillsConfig, TimelineContent, ToolCall,
+        AgentRuntime, AgentSessions, AgentTimelineEvent, AgentsPromptConfig, CompletionEvent,
+        ExternalRequestId, ExternalResponse, MemorySessionStore, ModelApi, ModelRef, ProviderId,
+        ResumeInput, SessionId, SkillsConfig, TimelineContent, ToolCall,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
         tools::filesystem::FilesystemConfig,
     };
@@ -941,8 +1065,13 @@ mod agents_skills_state {
         ))
     }
 
-    fn scripted_provider(script: Vec<Vec<CompletionEvent>>) -> CapturingProvider<ScriptedProvider> {
-        CapturingProvider::new(ScriptedProvider::from_turns("scripted_provider", script))
+    fn scripted_provider(
+        script: Vec<Vec<CompletionEvent>>,
+    ) -> Arc<CapturingProvider<ScriptedProvider>> {
+        Arc::new(CapturingProvider::new(ScriptedProvider::from_turns(
+            "scripted_provider",
+            script,
+        )))
     }
 
     struct RunOutput {
@@ -992,11 +1121,11 @@ mod agents_skills_state {
             ],
         ]);
 
-        let agent = Agent::builder(test_model())
+        let agent = AgentRuntime::builder(test_model(), provider.clone())
             .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
             .with_question_tool(QuestionConfig::new())
             .build();
-        let sessions = agent.sessions(store.clone());
+        let sessions = AgentSessions::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -1005,7 +1134,7 @@ mod agents_skills_state {
             .clone();
         let run = drain_run(
             sessions
-                .prompt(&provider, session_id.clone(), "hello")
+                .prompt(&agent, session_id.clone(), "hello")
                 .stream(),
         )
         .await;
@@ -1013,14 +1142,13 @@ mod agents_skills_state {
 
         temp.write("AGENTS.md", "Modified instructions marker-modified.\n");
 
-        let resume_agent = Agent::builder(test_model())
+        let resume_agent = AgentRuntime::builder(test_model(), provider.clone())
             .with_agents_system_prompt(AgentsPromptConfig::new(other.path()))
             .with_question_tool(QuestionConfig::new())
             .build();
         drain_run(
-            resume_agent
-                .sessions(store)
-                .resume(&provider, session_id, question_answer(request_id))
+            AgentSessions::new(store)
+                .resume(&resume_agent, session_id, question_answer(request_id))
                 .stream(),
         )
         .await;
@@ -1058,7 +1186,7 @@ mod agents_skills_state {
             ],
         ]);
         let build_agent = || {
-            Agent::builder(test_model())
+            AgentRuntime::builder(test_model(), provider.clone())
                 .with_filesystem_tools(
                     FilesystemConfig::new(temp.path()).with_agents_read_context(),
                 )
@@ -1066,7 +1194,8 @@ mod agents_skills_state {
                 .build()
         };
 
-        let sessions = build_agent().sessions(store.clone());
+        let agent = build_agent();
+        let sessions = AgentSessions::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -1075,7 +1204,7 @@ mod agents_skills_state {
             .clone();
         let run = drain_run(
             sessions
-                .prompt(&provider, session_id.clone(), "read it")
+                .prompt(&agent, session_id.clone(), "read it")
                 .stream(),
         )
         .await;
@@ -1087,9 +1216,8 @@ mod agents_skills_state {
         temp.write("src/AGENTS.md", "Changed instructions marker-changed.\n");
 
         let resumed = drain_run(
-            build_agent()
-                .sessions(store)
-                .resume(&provider, session_id, question_answer(request_id))
+            AgentSessions::new(store)
+                .resume(&build_agent(), session_id, question_answer(request_id))
                 .stream(),
         )
         .await;
@@ -1128,13 +1256,14 @@ mod agents_skills_state {
             ],
         ]);
         let build_agent = || {
-            Agent::builder(test_model())
+            AgentRuntime::builder(test_model(), provider.clone())
                 .with_skills(SkillsConfig::new(temp.path()))
                 .with_question_tool(QuestionConfig::new())
                 .build()
         };
 
-        let sessions = build_agent().sessions(store.clone());
+        let agent = build_agent();
+        let sessions = AgentSessions::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -1143,7 +1272,7 @@ mod agents_skills_state {
             .clone();
         let run = drain_run(
             sessions
-                .prompt(&provider, session_id.clone(), "load it")
+                .prompt(&agent, session_id.clone(), "load it")
                 .stream(),
         )
         .await;
@@ -1162,9 +1291,8 @@ mod agents_skills_state {
         );
 
         let resumed = drain_run(
-            build_agent()
-                .sessions(store)
-                .resume(&provider, session_id, question_answer(request_id))
+            AgentSessions::new(store)
+                .resume(&build_agent(), session_id, question_answer(request_id))
                 .stream(),
         )
         .await;
@@ -1194,13 +1322,13 @@ mod agents_skills_state {
             CompletionEvent::Delta("ok".to_owned()),
             CompletionEvent::Finished,
         ]]);
-        let agent = Agent::builder(test_model())
+        let agent = AgentRuntime::builder(test_model(), provider.clone())
             .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
             .build();
 
         drain_run(
             agent
-                .prompt(&provider, "hello")
+                .prompt("hello")
                 .with_session_store(store.clone(), SessionId::new("ephemeral-agents"))
                 .stream(),
         )

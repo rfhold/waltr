@@ -1,6 +1,6 @@
 //! Provider-neutral LLM streaming interface.
 
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
@@ -416,6 +416,23 @@ pub trait LlmStream: Send + Sync {
 
     /// Stream a completion request.
     fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a>;
+}
+
+impl<T> LlmStream for Arc<T>
+where
+    T: LlmStream + ?Sized,
+{
+    fn name(&self) -> &'static str {
+        self.as_ref().name()
+    }
+
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<Value> {
+        self.as_ref().project_request(request)
+    }
+
+    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        self.as_ref().stream_request(request)
+    }
 }
 
 #[cfg(test)]

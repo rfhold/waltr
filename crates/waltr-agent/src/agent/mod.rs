@@ -1,6 +1,6 @@
-//! Agent configuration and loop execution.
+//! AgentRuntime configuration and loop execution.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use crate::{LlmStream, ModelRef, PermissionPolicy, middleware::chain::MiddlewareChain};
 
@@ -11,7 +11,7 @@ mod run;
 pub mod session;
 mod tool;
 
-pub use builder::AgentBuilder;
+pub use builder::AgentRuntimeBuilder;
 pub use event::BoxAgentTimelineStream;
 pub use run::AgentRunBuilder;
 pub use session::{
@@ -19,52 +19,42 @@ pub use session::{
     ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse,
     FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
-    S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionRecord,
-    SessionSnapshot, SessionStatus, SessionStore, SessionStoreError, SessionStoreResult,
-    Suspension, opendal_postgresql_session_store, run_postgresql_migrations,
+    S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListSubscription,
+    SessionListUpdate, SessionRecord, SessionSnapshot, SessionStatus, SessionStore,
+    SessionStoreError, SessionStoreResult, Suspension, opendal_postgresql_session_store,
+    run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 
-/// Agent configuration and enabled capabilities.
+/// Executable agent runtime configuration and enabled capabilities.
 #[derive(Clone)]
-pub struct Agent {
+pub struct AgentRuntime {
+    pub(super) provider: Arc<dyn LlmStream>,
     pub(super) model: ModelRef,
     pub(super) tools: Vec<AgentTool>,
     pub(super) middleware_chain: MiddlewareChain,
     pub(super) permission_policy: PermissionPolicy,
 }
 
-impl Agent {
-    /// Start building an agent for a model.
+impl AgentRuntime {
+    /// Start building an agent runtime for a model.
     #[must_use]
-    pub fn builder(model: ModelRef) -> AgentBuilder {
-        AgentBuilder::new(model)
+    pub fn builder<P>(model: ModelRef, provider: Arc<P>) -> AgentRuntimeBuilder
+    where
+        P: LlmStream + 'static,
+    {
+        AgentRuntimeBuilder::new(model, provider)
     }
 
-    /// Return the model identity configured for this agent.
+    /// Return the model identity configured for this runtime.
     #[must_use]
     pub const fn model(&self) -> &ModelRef {
         &self.model
     }
 
     /// Start building an agent loop request.
-    pub fn prompt<'a, P>(
-        &'a self,
-        provider: &'a P,
-        prompt: impl Into<String>,
-    ) -> AgentRunBuilder<'a, P>
-    where
-        P: LlmStream + ?Sized,
-    {
-        AgentRunBuilder::new(self, provider, prompt.into())
-    }
-
-    /// Bind this agent configuration to a durable session store.
-    pub const fn sessions<S>(self, store: S) -> AgentSessions<S>
-    where
-        S: SessionStore + Clone + Send + Sync + 'static,
-    {
-        AgentSessions::new(self, store)
+    pub fn prompt(&self, prompt: impl Into<String>) -> AgentRunBuilder {
+        AgentRunBuilder::new(self, prompt.into())
     }
 
     /// Return configured host tools.
@@ -74,10 +64,11 @@ impl Agent {
     }
 }
 
-impl fmt::Debug for Agent {
+impl fmt::Debug for AgentRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("Agent")
+            .debug_struct("AgentRuntime")
+            .field("provider", &self.provider.name())
             .field("model", &self.model)
             .field("tools", &self.tools)
             .field("middleware_chain_len", &self.middleware_chain.len())
@@ -108,7 +99,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use std::sync::{Arc, Mutex};
 
-    use super::Agent;
+    use super::{AgentRuntime, AgentSessions};
 
     struct NoopMiddleware;
 
@@ -118,7 +109,7 @@ mod tests {
     fn builder_assembles_system_prompt_middleware_by_default() {
         let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
 
-        let agent = Agent::builder(model).build();
+        let agent = AgentRuntime::builder(model, Arc::new(TextOnlyProvider)).build();
 
         assert_eq!(agent.middleware_chain.len(), 1);
     }
@@ -129,10 +120,12 @@ mod tests {
         let mut chain = MiddlewareChain::new();
         chain.push(NoopMiddleware);
 
-        let agent = Agent::builder(model.clone())
+        let agent = AgentRuntime::builder(model.clone(), Arc::new(TextOnlyProvider))
             .with_middleware(NoopMiddleware)
             .build();
-        let chain_agent = Agent::builder(model).with_middleware_chain(chain).build();
+        let chain_agent = AgentRuntime::builder(model, Arc::new(TextOnlyProvider))
+            .with_middleware_chain(chain)
+            .build();
 
         assert_eq!(agent.middleware_chain.len(), 2);
         assert_eq!(chain_agent.middleware_chain.len(), 2);
@@ -142,9 +135,14 @@ mod tests {
     fn filesystem_tools_are_opt_in() {
         let model = ModelRef::new(ProviderId::OpenAi, "gpt-5-nano", ModelApi::OpenAiResponses);
 
-        assert!(Agent::builder(model.clone()).build().tools().is_empty());
         assert!(
-            Agent::builder(model)
+            AgentRuntime::builder(model.clone(), Arc::new(TextOnlyProvider))
+                .build()
+                .tools()
+                .is_empty()
+        );
+        assert!(
+            AgentRuntime::builder(model, Arc::new(TextOnlyProvider))
                 .with_filesystem_tools(FilesystemConfig::new("."))
                 .build()
                 .tools()
@@ -256,10 +254,10 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_state_write_is_journaled_before_provider_request_record() {
-        let provider = TextOnlyProvider;
+        let provider = Arc::new(TextOnlyProvider);
         let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
         let observed = Arc::new(Mutex::new(Vec::new()));
-        let agent = Agent::builder(model)
+        let agent = AgentRuntime::builder(model, provider)
             .with_middleware(StateRecordingMiddleware {
                 namespace: "test-state",
                 write: Some(json!({ "writes": 1 })),
@@ -267,7 +265,7 @@ mod tests {
             })
             .build();
         let store = MemorySessionStore::new();
-        let sessions = agent.sessions(store.clone());
+        let sessions = AgentSessions::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -277,7 +275,7 @@ mod tests {
 
         drain(
             sessions
-                .prompt(&provider, session_id.clone(), "hello")
+                .prompt(&agent, session_id.clone(), "hello")
                 .stream(),
         )
         .await;
@@ -314,12 +312,12 @@ mod tests {
     #[tokio::test]
     async fn middleware_state_written_before_suspension_is_observable_after_resume() {
         let store = MemorySessionStore::new();
-        let provider = DurableResumeProvider::default();
+        let provider = Arc::new(DurableResumeProvider::default());
         let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
         let written = json!({ "grants": ["shell"] });
 
         let writer_observed = Arc::new(Mutex::new(Vec::new()));
-        let writer_agent = Agent::builder(model.clone())
+        let writer_agent = AgentRuntime::builder(model.clone(), Arc::clone(&provider))
             .with_question_tool(QuestionConfig::new())
             .with_middleware(StateRecordingMiddleware {
                 namespace: "permissions",
@@ -327,7 +325,7 @@ mod tests {
                 observed: Arc::clone(&writer_observed),
             })
             .build();
-        let sessions = writer_agent.sessions(store.clone());
+        let sessions = AgentSessions::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -336,7 +334,7 @@ mod tests {
             .clone();
 
         let mut events = sessions
-            .prompt(&provider, session_id.clone(), "ask then continue")
+            .prompt(&writer_agent, session_id.clone(), "ask then continue")
             .stream();
         let mut request_id = None;
         while let Some(event) = events.next().await {
@@ -354,7 +352,7 @@ mod tests {
         );
 
         let reader_observed = Arc::new(Mutex::new(Vec::new()));
-        let reader_agent = Agent::builder(model)
+        let reader_agent = AgentRuntime::builder(model, Arc::clone(&provider))
             .with_question_tool(QuestionConfig::new())
             .with_middleware(StateRecordingMiddleware {
                 namespace: "permissions",
@@ -363,10 +361,9 @@ mod tests {
             })
             .build();
         drain(
-            reader_agent
-                .sessions(store.clone())
+            AgentSessions::new(store.clone())
                 .resume(
-                    &provider,
+                    &reader_agent,
                     session_id,
                     ResumeInput::ExternalResponse {
                         request_id: ExternalRequestId::new(request_id),

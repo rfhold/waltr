@@ -1,11 +1,13 @@
-//! Agent question tool integration tests.
+//! AgentRuntime question tool integration tests.
+
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CompletionEvent, ExternalRequestId,
-    ExternalRequestKind, ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore,
-    ModelApi, ModelRef, ProviderId, ResumeInput, SessionStatus, SessionStore, TimelineContent,
-    ToolCall, ToolDefinition,
+    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CompletionEvent,
+    ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionStatus, SessionStore,
+    TimelineContent, ToolCall, ToolDefinition,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 use serde_json::{Value, json};
@@ -17,9 +19,10 @@ const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
 #[tokio::test]
 async fn question_agent_loop_surfaces_tool_and_suspends_for_external_answers()
 -> waltr_agent::Result<()> {
-    let provider =
-        CapturingProvider::new(scripted_question_provider(structured_question_arguments()));
-    let agent = Agent::builder(test_model())
+    let provider = Arc::new(CapturingProvider::new(scripted_question_provider(
+        structured_question_arguments(),
+    )));
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
         .with_question_tool(QuestionConfig::new())
         .build();
 
@@ -59,17 +62,18 @@ async fn question_agent_loop_surfaces_tool_and_suspends_for_external_answers()
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn question_external_request_resumes_from_durable_session() -> waltr_agent::Result<()> {
-    let provider =
-        CapturingProvider::new(scripted_question_provider(structured_question_arguments()));
-    let agent = Agent::builder(test_model())
+    let provider = Arc::new(CapturingProvider::new(scripted_question_provider(
+        structured_question_arguments(),
+    )));
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
         .with_question_tool(QuestionConfig::new())
         .build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions
-        .prompt(&provider, session_id.clone(), "ask structured questions")
+        .prompt(&agent, session_id.clone(), "ask structured questions")
         .stream();
     let mut request_id = None;
     while let Some(event) = stream.next().await {
@@ -117,7 +121,7 @@ async fn question_external_request_resumes_from_durable_session() -> waltr_agent
 
     let mut resumed = sessions
         .resume(
-            &provider,
+            &agent,
             session_id.clone(),
             ResumeInput::ExternalResponse {
                 request_id: ExternalRequestId::new(request_id.clone()),
@@ -166,7 +170,7 @@ async fn question_external_request_resumes_from_durable_session() -> waltr_agent
 #[tokio::test]
 async fn question_tool_rejects_unanswerable_prompt_without_options_or_custom()
 -> waltr_agent::Result<()> {
-    let provider = CapturingProvider::new(scripted_question_provider(json!({
+    let provider = Arc::new(CapturingProvider::new(scripted_question_provider(json!({
         "questions": [{
             "question": "How should this be answered?",
             "header": "Blocked",
@@ -174,8 +178,8 @@ async fn question_tool_rejects_unanswerable_prompt_without_options_or_custom()
             "multiple": false,
             "custom": false
         }]
-    })));
-    let agent = Agent::builder(test_model())
+    }))));
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
         .with_question_tool(QuestionConfig::new())
         .build();
 

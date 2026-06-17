@@ -2,8 +2,9 @@
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, LlmError, LlmStream, MemorySessionStore,
-    ModelApi, ModelRef, SessionStore, TimelineContent, TimelineEventKind, TimelineStatus,
+    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, LlmError, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, SessionStore, TimelineContent, TimelineEventKind,
+    TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
         OpenAiReasoningEffort, OpenAiReasoningSummary,
@@ -74,18 +75,17 @@ async fn openai_chat_completions_is_no_thinking_baseline() -> waltr_agent::Resul
 }
 
 async fn assert_provider_thinking(
-    provider: impl LlmStream,
+    provider: impl LlmStream + 'static,
     model: ModelRef,
     expect_thinking: bool,
 ) -> waltr_agent::Result<()> {
-    let agent = Agent::builder(model).build();
+    let provider_name = provider.name();
+    let agent = AgentRuntime::builder(model, std::sync::Arc::new(provider)).build();
     let store = MemorySessionStore::new();
-    let sessions = agent.sessions(store.clone());
+    let sessions = AgentSessions::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let mut stream = sessions
-        .prompt(
-            &provider,
-            session_id.clone(),
+        .prompt(&agent, session_id.clone(),
             format!("Think briefly if supported, then answer exactly: {EXPECTED_TEXT}"),
         )
         .with_system_prompt_fragment(
@@ -128,17 +128,17 @@ async fn assert_provider_thinking(
 
     if !finished {
         return Err(LlmError::Protocol {
-            provider: provider.name(),
+            provider: provider_name,
             message: "agent stream ended without finished status".to_owned(),
         });
     }
-    assert!(text.contains(EXPECTED_TEXT), "{}: {text}", provider.name());
+    assert!(text.contains(EXPECTED_TEXT), "{}: {text}", provider_name);
 
     let stored = store
         .load(&session_id)
         .await
         .map_err(|error| LlmError::Protocol {
-            provider: provider.name(),
+            provider: provider_name,
             message: error.to_string(),
         })?;
     let saw_stored_thinking = stored.timeline_events().any(|event| {
@@ -146,7 +146,7 @@ async fn assert_provider_thinking(
             && matches!(&event.content, TimelineContent::TextDelta { .. })
     }) || stored.snapshot().thinking_blocks().next().is_some();
     let saw_thinking = thinking_delta_count > 0 || saw_stored_thinking;
-    assert_eq!(saw_thinking, expect_thinking, "{}", provider.name());
+    assert_eq!(saw_thinking, expect_thinking, "{}", provider_name);
 
     Ok(())
 }

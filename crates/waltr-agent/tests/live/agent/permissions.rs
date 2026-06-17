@@ -1,9 +1,9 @@
 //! Live provider agent permission integration tests.
 
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, sync::Arc};
 
 use waltr_agent::{
-    Agent, ExternalRequestKind, LlmStream, ModelRef, PermissionEffect, PermissionPolicy,
+    AgentRuntime, ExternalRequestKind, LlmStream, ModelRef, PermissionEffect, PermissionPolicy,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -25,7 +25,11 @@ async fn live_permissions_agent_loop() -> waltr_agent::Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_live_permissions(provider: impl LlmStream, model: ModelRef) -> waltr_agent::Result<()> {
+async fn run_live_permissions(
+    provider: impl LlmStream + 'static,
+    model: ModelRef,
+) -> waltr_agent::Result<()> {
+    let provider = Arc::new(provider);
     let fixture = PermissionFixture::new()?;
     let policy =
         PermissionPolicy::filesystem_external(fixture.root.path(), PermissionEffect::ask());
@@ -41,7 +45,7 @@ async fn run_live_permissions(provider: impl LlmStream, model: ModelRef) -> walt
             PermissionCommandPattern::Name("git".to_owned()),
             PermissionEffect::deny_with_message("do not interact with git"),
         );
-    let agent = Agent::builder(model)
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
         .with_permission_policy(policy)
         .with_filesystem_tools(
             FilesystemConfig::new(fixture.root.path())

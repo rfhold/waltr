@@ -1,9 +1,11 @@
 //! Live provider agent shell integration tests.
 
+use std::sync::Arc;
+
 use waltr_agent::{
-    Agent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef, PermissionCommandPattern,
-    PermissionEffect, PermissionPolicy, PermissionToolSelector, TimelineContent,
-    tools::shell::ShellConfig,
+    AgentRuntime, AgentSessions, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef,
+    PermissionCommandPattern, PermissionEffect, PermissionPolicy, PermissionToolSelector,
+    TimelineContent, tools::shell::ShellConfig,
 };
 
 use crate::{live_provider, session::AgentTestSession};
@@ -51,11 +53,12 @@ async fn openai_responses_websocket_runs_shell_agent_loop() -> waltr_agent::Resu
 }
 
 async fn assert_provider_runs_shell_agent(
-    provider: impl LlmStream,
+    provider: impl LlmStream + 'static,
     model: ModelRef,
 ) -> waltr_agent::Result<()> {
+    let provider = Arc::new(provider);
     let root = std::env::current_dir()?;
-    let agent = Agent::builder(model)
+    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
         .with_permission_policy(
             PermissionPolicy::filesystem_default(&root).with_command_rule(
                 PermissionToolSelector::exact("shell"),
