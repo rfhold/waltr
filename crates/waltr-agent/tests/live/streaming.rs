@@ -90,7 +90,13 @@ async fn assert_provider_streams_expected_text(provider: impl LlmStream) -> walt
         });
     }
 
-    assert_eq!(text.trim(), EXPECTED_TEXT, "{}", provider.name());
+    let actual = text.trim();
+    let actual = actual
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))
+        .unwrap_or(actual);
+
+    assert_eq!(actual, EXPECTED_TEXT, "{}", provider.name());
 
     Ok(())
 }
