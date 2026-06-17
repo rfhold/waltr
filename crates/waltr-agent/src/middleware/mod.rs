@@ -26,8 +26,6 @@ pub enum ExternalRequestKind {
     Permission,
     /// Structured user question request.
     Question,
-    /// User confirmation request.
-    Confirmation,
     /// Middleware-defined request kind.
     Custom(String),
 }

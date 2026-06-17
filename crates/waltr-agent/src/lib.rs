@@ -26,9 +26,10 @@ pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
 pub use permission::{
     PermissionClaim, PermissionClassRule, PermissionCommandPattern, PermissionCommandRule,
-    PermissionDirectoryRule, PermissionEffect, PermissionEngine, PermissionLevel,
-    PermissionOperation, PermissionPathPattern, PermissionPattern, PermissionPolicy,
-    PermissionResource, PermissionResourcePattern, PermissionToolRule, PermissionToolSelector,
+    PermissionDenyMode, PermissionDirectoryRule, PermissionEffect, PermissionEngine,
+    PermissionLevel, PermissionOperation, PermissionPathPattern, PermissionPattern,
+    PermissionPolicy, PermissionResource, PermissionResourcePattern, PermissionResponse,
+    PermissionToolRule, PermissionToolSelector,
 };
 #[cfg(feature = "shell")]
 pub use prompt::ShellPromptConfig;

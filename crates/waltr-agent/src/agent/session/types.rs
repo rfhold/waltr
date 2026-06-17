@@ -682,8 +682,6 @@ pub enum ExternalRequestKind {
     Question,
     /// Tool input request.
     ToolInput,
-    /// Confirmation request.
-    Confirmation,
     /// Host-defined request kind.
     Custom(String),
 }

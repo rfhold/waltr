@@ -2,10 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use super::{PermissionClaim, PermissionOperation, PermissionResource};
 
 /// Path pattern used by permission policy rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionPathPattern {
     /// Match any path.
     Any,
@@ -44,7 +46,7 @@ impl PermissionPathPattern {
 }
 
 /// Command pattern used by permission policy rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionCommandPattern {
     /// Match any command.
     Any,
@@ -72,7 +74,7 @@ impl PermissionCommandPattern {
 }
 
 /// Reusable permission approval pattern.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionPattern {
     /// Operation matched by this pattern. `None` matches any operation.
     pub operation: Option<PermissionOperation>,
@@ -103,7 +105,7 @@ impl PermissionPattern {
 }
 
 /// Resource matcher for reusable permission approvals.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionResourcePattern {
     /// Exact filesystem path.
     FilesystemPath(PathBuf),

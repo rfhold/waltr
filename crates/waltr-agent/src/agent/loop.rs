@@ -8,11 +8,13 @@ use std::{
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+use crate::permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState};
 use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
-    ModelRef, PendingTimelineEvent, PermissionClaim, PermissionLevel, PermissionPolicy, Result,
-    TimelineChannel, TimelineContent, TimelineEventKind, TimelineItemId, ToolCall, ToolDefinition,
-    ToolExecutionContext, ToolProgressSink, ToolResult, TurnItem,
+    ModelRef, PendingTimelineEvent, PermissionClaim, PermissionLevel, PermissionPolicy,
+    PermissionResponse, Result, TimelineChannel, TimelineContent, TimelineEventKind,
+    TimelineItemId, ToolCall, ToolDefinition, ToolExecutionContext, ToolProgressSink, ToolResult,
+    TurnItem,
     middleware::{
         self as middleware, HookOutcome,
         chain::MiddlewareChain,
@@ -31,9 +33,9 @@ use super::{
     AgentTool,
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
-        ExternalRequestKind, ExternalRequestStatus, RequestId, RequestRecord, ResumeInput,
-        Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent, SessionRecord, SessionStore,
-        SessionStoreError, Suspension as SessionSuspension,
+        ExternalRequestKind, ExternalRequestStatus, ExternalResponse, RequestId, RequestRecord,
+        ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent, SessionRecord,
+        SessionSnapshot, SessionStore, SessionStoreError, Suspension as SessionSuspension,
     },
 };
 
@@ -132,8 +134,10 @@ where
 
             match std::mem::replace(&mut self.phase, AgentLoopPhase::Done) {
                 AgentLoopPhase::StartTurn => {
-                    if let Err(error) = self.initialize_session().await {
-                        return Some((Err(error), self));
+                    match self.initialize_session().await {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => return Some((Err(error), self)),
                     }
                     // Crash recovery is retry-the-turn: the request is journaled before
                     // dispatch and parser progress is intentionally not persisted.
@@ -410,8 +414,10 @@ where
         };
 
         match self.permission_outcome(&call, &claims) {
-            PermissionOutcome::Allow => {}
-            PermissionOutcome::Deny(message) => {
+            Ok(PermissionOutcome::Allow) => {
+                self.flush_middleware_state().await?;
+            }
+            Ok(PermissionOutcome::Deny(message)) => {
                 return Ok(ToolExecution::Finished(Some(error_tool_result(
                     &call,
                     &LlmError::Protocol {
@@ -420,7 +426,7 @@ where
                     },
                 ))));
             }
-            PermissionOutcome::Ask(claims) => {
+            Ok(PermissionOutcome::Ask(claims)) => {
                 let outcome = HookOutcome::Suspend(permission_suspension(
                     &self.session_id,
                     self.turn as u64,
@@ -431,6 +437,11 @@ where
                     .tool_result_from_hook_outcome(&call, outcome)
                     .await
                     .map(ToolExecution::Finished);
+            }
+            Err(error) => {
+                return Ok(ToolExecution::Finished(Some(error_tool_result(
+                    &call, &error,
+                ))));
             }
         }
 
@@ -556,10 +567,10 @@ where
     }
 
     fn permission_outcome(
-        &self,
+        &mut self,
         tool_call: &ToolCall,
         claims: &[PermissionClaim],
-    ) -> PermissionOutcome {
+    ) -> Result<PermissionOutcome> {
         let denied = claims
             .iter()
             .filter(|claim| {
@@ -571,10 +582,28 @@ where
             .cloned()
             .collect::<Vec<_>>();
         if !denied.is_empty() {
-            return PermissionOutcome::Deny(permission_claim_message("permission denied", &denied));
+            return Ok(PermissionOutcome::Deny(permission_claim_message(
+                "permission denied",
+                &denied,
+            )));
         }
 
-        let ask = claims
+        let mut state = self.permission_runtime_state()?;
+        let unmatched = claims
+            .iter()
+            .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unmatched.is_empty() {
+            return Ok(PermissionOutcome::Allow);
+        }
+
+        if state.consume_one_shot(&tool_call.id) {
+            self.set_permission_runtime_state(&state)?;
+            return Ok(PermissionOutcome::Allow);
+        }
+
+        let ask = unmatched
             .iter()
             .filter(|claim| {
                 self.permission_policy
@@ -585,22 +614,39 @@ where
             .cloned()
             .collect::<Vec<_>>();
         if ask.is_empty() {
-            PermissionOutcome::Allow
+            Ok(PermissionOutcome::Allow)
         } else {
-            PermissionOutcome::Ask(ask)
+            Ok(PermissionOutcome::Ask(ask))
         }
     }
 
-    async fn initialize_session(&mut self) -> Result<()> {
+    fn permission_runtime_state(&self) -> Result<PermissionRuntimeState> {
+        self.middleware_state
+            .get(PERMISSION_STATE_NAMESPACE)
+            .map(|state| serde_json::from_value(state.clone()))
+            .transpose()
+            .map_err(|error| session_store_error(error.to_string()))
+            .map(Option::unwrap_or_default)
+    }
+
+    fn set_permission_runtime_state(&mut self, state: &PermissionRuntimeState) -> Result<()> {
+        self.middleware_state.set(
+            PERMISSION_STATE_NAMESPACE,
+            serde_json::to_value(state).map_err(|error| session_store_error(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    async fn initialize_session(&mut self) -> Result<bool> {
         if self.session_initialized {
-            return Ok(());
+            return Ok(true);
         }
 
         match self.session_store.load(&self.session_id).await {
             Ok(record) => {
-                self.apply_resume_input(record).await?;
+                let continue_start_turn = self.apply_resume_input(record).await?;
                 self.session_initialized = true;
-                return Ok(());
+                return Ok(continue_start_turn);
             }
             Err(SessionStoreError::NotFound { .. }) => {}
             Err(error) => return Err(session_store_error(error)),
@@ -622,15 +668,16 @@ where
         self.append_journal_event(SessionJournalEvent::PromptAppended { prompt })
             .await?;
         self.session_initialized = true;
-        Ok(())
+        Ok(true)
     }
 
-    async fn apply_resume_input(&mut self, record: SessionRecord) -> Result<()> {
+    async fn apply_resume_input(&mut self, record: SessionRecord) -> Result<bool> {
         let Some(input) = self.input.take() else {
             self.hydrate_from_record(record);
-            return Ok(());
+            return Ok(true);
         };
 
+        let mut continue_start_turn = true;
         let record = match input {
             ResumeInput::Prompt(prompt) => {
                 let snapshot = record.snapshot();
@@ -652,19 +699,32 @@ where
             ResumeInput::ExternalResponse {
                 request_id,
                 response,
-            } => match AgentSessionRuntime::new(&self.session_store)
-                .resume(
-                    &self.session_id,
-                    ResumeInput::ExternalResponse {
-                        request_id,
-                        response,
-                    },
-                )
-                .await?
-            {
-                RuntimeResumeOutput::Resumed { record }
-                | RuntimeResumeOutput::Suspended { record, .. } => record,
-            },
+            } => {
+                let retry = permission_retry_tool_call(&record.snapshot(), &request_id, &response)?;
+                let cancel =
+                    permission_cancel_response(&record.snapshot(), &request_id, &response)?;
+                let record = match AgentSessionRuntime::new(&self.session_store)
+                    .resume(
+                        &self.session_id,
+                        ResumeInput::ExternalResponse {
+                            request_id,
+                            response,
+                        },
+                    )
+                    .await?
+                {
+                    RuntimeResumeOutput::Resumed { record }
+                    | RuntimeResumeOutput::Suspended { record, .. } => record,
+                };
+                if let Some(call) = retry {
+                    self.phase = AgentLoopPhase::ExecuteTool(call);
+                    continue_start_turn = false;
+                } else if cancel {
+                    self.phase = AgentLoopPhase::Done;
+                    continue_start_turn = false;
+                }
+                record
+            }
             ResumeInput::ToolResults(results) => {
                 match AgentSessionRuntime::new(&self.session_store)
                     .resume(&self.session_id, ResumeInput::ToolResults(results))
@@ -674,17 +734,21 @@ where
                     | RuntimeResumeOutput::Suspended { record, .. } => record,
                 }
             }
-            ResumeInput::Interrupt => match AgentSessionRuntime::new(&self.session_store)
-                .resume(&self.session_id, ResumeInput::Interrupt)
-                .await?
-            {
-                RuntimeResumeOutput::Resumed { record }
-                | RuntimeResumeOutput::Suspended { record, .. } => record,
-            },
+            ResumeInput::Interrupt => {
+                continue_start_turn = false;
+                self.phase = AgentLoopPhase::Done;
+                match AgentSessionRuntime::new(&self.session_store)
+                    .resume(&self.session_id, ResumeInput::Interrupt)
+                    .await?
+                {
+                    RuntimeResumeOutput::Resumed { record }
+                    | RuntimeResumeOutput::Suspended { record, .. } => record,
+                }
+            }
         };
 
         self.hydrate_from_record(record);
-        Ok(())
+        Ok(continue_start_turn)
     }
 
     fn hydrate_from_record(&mut self, record: SessionRecord) {
@@ -710,6 +774,11 @@ where
             .await
             .map_err(session_store_error)?;
         Ok(())
+    }
+
+    async fn flush_middleware_state(&mut self) -> Result<()> {
+        let events = self.middleware_state.drain_pending();
+        self.append_journal_events(events).await
     }
 
     async fn append_timeline_event(
@@ -990,7 +1059,6 @@ fn session_external_request_kind(kind: &middleware::ExternalRequestKind) -> Exte
     match kind {
         middleware::ExternalRequestKind::Permission => ExternalRequestKind::Permission,
         middleware::ExternalRequestKind::Question => ExternalRequestKind::Question,
-        middleware::ExternalRequestKind::Confirmation => ExternalRequestKind::Confirmation,
         middleware::ExternalRequestKind::Custom(value) => {
             ExternalRequestKind::Custom(value.clone())
         }
@@ -1048,6 +1116,62 @@ fn permission_suspension(
             status: middleware::ExternalRequestStatus::Pending,
         },
     )
+}
+
+fn permission_retry_tool_call(
+    snapshot: &SessionSnapshot,
+    request_id: &ExternalRequestId,
+    response: &ExternalResponse,
+) -> Result<Option<ToolCall>> {
+    let Some(request) = snapshot
+        .external_requests
+        .iter()
+        .rev()
+        .find(|request| request.id == *request_id)
+    else {
+        return Ok(None);
+    };
+    if request.kind != ExternalRequestKind::Permission {
+        return Ok(None);
+    }
+    let response = PermissionResponse::from_value(response.payload.clone())?;
+    if !matches!(
+        response,
+        PermissionResponse::AllowOnce | PermissionResponse::AllowAlways { .. }
+    ) {
+        return Ok(None);
+    }
+    let Some(tool_call_id) = request.tool_call_id.as_deref() else {
+        return Err(session_store_error(
+            "permission request missing tool call id",
+        ));
+    };
+    snapshot
+        .pending_work
+        .iter()
+        .rev()
+        .find(|work| work.id == tool_call_id)
+        .and_then(|work| work.tool_call.clone())
+        .map(Some)
+        .ok_or_else(|| {
+            session_store_error(format!(
+                "pending permission work not found for tool call: {tool_call_id}"
+            ))
+        })
+}
+
+fn permission_cancel_response(
+    _snapshot: &SessionSnapshot,
+    _request_id: &ExternalRequestId,
+    response: &ExternalResponse,
+) -> Result<bool> {
+    match PermissionResponse::from_value(response.payload.clone()) {
+        Ok(PermissionResponse::Deny {
+            mode: crate::PermissionDenyMode::CancelWork,
+            ..
+        }) => Ok(true),
+        Ok(_) | Err(_) => Ok(false),
+    }
 }
 
 fn permission_claim_message(prefix: &str, claims: &[PermissionClaim]) -> String {

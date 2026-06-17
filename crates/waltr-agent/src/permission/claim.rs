@@ -2,8 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// Abstract operation requested by a tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionOperation {
     /// Read a resource.
     Read,
@@ -18,7 +20,7 @@ pub enum PermissionOperation {
 }
 
 /// Abstract resource requested by a tool.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionResource {
     /// Concrete filesystem path.
     FilesystemPath(PathBuf),
@@ -31,7 +33,7 @@ pub enum PermissionResource {
 }
 
 /// One permission claim extracted from a tool call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionClaim {
     /// Requested operation.
     pub operation: PermissionOperation,

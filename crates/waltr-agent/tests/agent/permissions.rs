@@ -2,14 +2,15 @@
 
 use std::{env, fs, path::PathBuf};
 
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use waltr_agent::{
-    Agent, AgentSessionRuntime, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
-    CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, CancelReason, CompletionEvent,
-    CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus,
-    PermissionEffect, PermissionPolicy, PermissionToolSelector, ProviderId, ResumeInput,
-    RuntimeResumeOutput, SessionStatus, SessionStore, TimelineContent, ToolCall,
+    Agent, AgentSessionRuntime, AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture,
+    CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, CancelReason,
+    CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
+    ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
+    PendingWorkStatus, PermissionEffect, PermissionOperation, PermissionPattern, PermissionPolicy,
+    PermissionResponse, PermissionToolSelector, ProviderId, ResumeInput, RuntimeResumeOutput,
+    SessionStatus, SessionStore, TimelineContent, ToolCall,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -131,10 +132,9 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         )
         .build();
     let provider = ScriptedProvider::new("permission_resume_provider", |request| {
-        if request
-            .tool_results()
-            .any(|result| result.call_id == "call_resume")
-        {
+        if request.tool_results().any(|result| {
+            result.call_id == "call_resume" && result.content.contains("external-once-202")
+        }) {
             vec![
                 Ok(CompletionEvent::Delta(
                     "permission-flow-complete".to_owned(),
@@ -196,6 +196,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         )
         .stream();
     let mut text = String::new();
+    let mut tool_results = Vec::new();
     while let Some(event) = resumed.next().await {
         let event = event?;
         if let TimelineContent::TextDelta { delta } = &event.content
@@ -203,7 +204,18 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         {
             text.push_str(&delta);
         }
+        if let TimelineContent::ToolResult { result } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)
+        {
+            tool_results.push(result.clone());
+        }
     }
+    assert!(
+        tool_results.iter().any(|result| {
+            result.call_id == "call_resume" && result.content.contains("external-once-202")
+        }),
+        "permission approval must run the original tool call, got {tool_results:#?}"
+    );
     assert_eq!(text, "permission-flow-complete");
 
     let completed = store.load(&session_id).await.expect("stored session");
@@ -219,6 +231,361 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
     ));
     assert!(completed_snapshot.pending_work.iter().any(|work| {
         work.id == "call_resume" && matches!(work.status, PendingWorkStatus::Finished(_))
+    }));
+
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> waltr_agent::Result<()>
+{
+    let fixture = PermissionFixture::new()?;
+    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            fixture.root.path(),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(
+            FilesystemConfig::new(fixture.root.path())
+                .with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let provider = ScriptedProvider::new("permission_allow_always_provider", |request| {
+        let has_first = request.tool_results().any(|result| {
+            result.call_id == "call_first" && result.content.contains("external-once-202")
+        });
+        let has_second = request.tool_results().any(|result| {
+            result.call_id == "call_second" && result.content.contains("external-another-404")
+        });
+        if has_second {
+            vec![
+                Ok(CompletionEvent::Delta("allow-always-complete".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ]
+        } else if has_first {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_second",
+                "../outside/nested/another.txt",
+            )))]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_first",
+                "../outside/external.txt",
+            )))]
+        }
+    });
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "read two external files")
+        .stream();
+    let mut request_id = None;
+    while let Some(event) = stream.next().await {
+        let event = event?;
+        if let TimelineContent::ExternalRequest { request } = &event.content {
+            request_id = Some(request.id.as_str().to_owned());
+        }
+    }
+    let request_id = request_id.expect("permission request");
+
+    let mut resumed = sessions
+        .resume(
+            &provider,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id: ExternalRequestId::new(request_id),
+                response: ExternalResponse::new(json!(PermissionResponse::AllowAlways {
+                    patterns: vec![PermissionPattern::filesystem_prefix(
+                        PermissionOperation::Read,
+                        fixture.outside.path(),
+                    )],
+                })),
+            },
+        )
+        .stream();
+    let mut text = String::new();
+    let mut external_requests = Vec::new();
+    let mut tool_results = Vec::new();
+    while let Some(event) = resumed.next().await {
+        let event = event?;
+        match &event.content {
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                text.push_str(delta);
+            }
+            TimelineContent::ExternalRequest { request }
+                if crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST) =>
+            {
+                external_requests.push(request.clone());
+            }
+            TimelineContent::ToolResult { result }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) =>
+            {
+                tool_results.push(result.clone());
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
+        }
+    }
+
+    assert!(
+        external_requests.is_empty(),
+        "allow-always pattern should avoid a second permission prompt: {external_requests:#?}"
+    );
+    assert!(
+        tool_results.iter().any(|result| {
+            result.call_id == "call_second" && result.content.contains("external-another-404")
+        }),
+        "second matching call should execute normally, got {tool_results:#?}"
+    );
+    assert_eq!(text, "allow-always-complete");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            fixture.root.path(),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(
+            FilesystemConfig::new(fixture.root.path())
+                .with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let provider = ScriptedProvider::new("permission_allow_once_provider", |request| {
+        if request.tool_results().any(|result| {
+            result.call_id == "call_once" && result.content.contains("external-once-202")
+        }) {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_later",
+                "../outside/nested/another.txt",
+            )))]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_once",
+                "../outside/external.txt",
+            )))]
+        }
+    });
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "read external files once")
+        .stream();
+    let mut request_id = None;
+    while let Some(event) = stream.next().await {
+        let event = event?;
+        if let TimelineContent::ExternalRequest { request } = &event.content {
+            request_id = Some(request.id.as_str().to_owned());
+        }
+    }
+    let request_id = request_id.expect("permission request");
+
+    let mut resumed = sessions
+        .resume(
+            &provider,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id: ExternalRequestId::new(request_id),
+                response: ExternalResponse::new(json!(PermissionResponse::AllowOnce)),
+            },
+        )
+        .stream();
+    let mut external_requests = Vec::new();
+    let mut tool_results = Vec::new();
+    while let Some(event) = resumed.next().await {
+        let event = event?;
+        match &event.content {
+            TimelineContent::ExternalRequest { request }
+                if crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST) =>
+            {
+                external_requests.push(request.clone());
+            }
+            TimelineContent::ToolResult { result }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) =>
+            {
+                tool_results.push(result.clone());
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
+        }
+    }
+
+    assert!(
+        tool_results.iter().any(|result| {
+            result.call_id == "call_once" && result.content.contains("external-once-202")
+        }),
+        "allow-once should execute the approved call, got {tool_results:#?}"
+    );
+    let [request] = external_requests.as_slice() else {
+        panic!("later matching call should ask again: {external_requests:#?}");
+    };
+    assert_eq!(request.tool_call_id.as_deref(), Some("call_later"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            fixture.root.path(),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(
+            FilesystemConfig::new(fixture.root.path())
+                .with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let provider = ScriptedProvider::new("permission_deny_result_provider", |request| {
+        if request
+            .tool_results()
+            .any(|result| result.call_id == "call_deny" && result.content.contains("not this time"))
+        {
+            vec![
+                Ok(CompletionEvent::Delta("denial-observed".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_deny",
+                "../outside/external.txt",
+            )))]
+        }
+    });
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let request_id = first_permission_request_id(
+        sessions
+            .prompt(&provider, session_id.clone(), "read denied external file")
+            .stream(),
+    )
+    .await?;
+
+    let mut resumed = sessions
+        .resume(
+            &provider,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id,
+                response: ExternalResponse::new(json!({
+                    "decision": "deny",
+                    "message": "not this time",
+                    "mode": "return_tool_result",
+                })),
+            },
+        )
+        .stream();
+    let mut text = String::new();
+    while let Some(event) = resumed.next().await {
+        let event = event?;
+        if let TimelineContent::TextDelta { delta } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
+        {
+            text.push_str(delta);
+        }
+    }
+
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert!(
+        snapshot
+            .tool_results()
+            .any(|result| { result.call_id == "call_deny" && result.content == "not this time" }),
+        "deny should return a stored denial tool result: {snapshot:#?}"
+    );
+    assert_eq!(text, "denial-observed");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            fixture.root.path(),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(
+            FilesystemConfig::new(fixture.root.path())
+                .with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let provider = ScriptedProvider::new("permission_deny_cancel_provider", |_| {
+        vec![Ok(CompletionEvent::ToolCall(read_call(
+            "call_cancel",
+            "../outside/external.txt",
+        )))]
+    });
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let request_id = first_permission_request_id(
+        sessions
+            .prompt(&provider, session_id.clone(), "read canceled external file")
+            .stream(),
+    )
+    .await?;
+
+    let mut resumed = sessions
+        .resume(
+            &provider,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id,
+                response: ExternalResponse::new(json!({
+                    "decision": "deny",
+                    "message": "stop",
+                    "mode": "cancel_work",
+                })),
+            },
+        )
+        .stream();
+    let mut emitted = Vec::new();
+    while let Some(event) = resumed.next().await {
+        emitted.push(event?);
+    }
+    assert!(
+        emitted.is_empty(),
+        "cancel should not continue: {emitted:#?}"
+    );
+
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert!(snapshot.pending_work.iter().any(|work| {
+        work.id == "call_cancel" && matches!(work.status, PendingWorkStatus::Canceled(_))
     }));
 
     Ok(())
@@ -514,6 +881,20 @@ impl LlmStream for PatchDeniedProvider {
 
 fn read_call(id: &str, file_path: &str) -> ToolCall {
     ToolCall::new(id, "read", json!({ "filePath": file_path }))
+}
+
+async fn first_permission_request_id<S>(mut stream: S) -> waltr_agent::Result<ExternalRequestId>
+where
+    S: Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
+{
+    while let Some(event) = stream.next().await {
+        let event = event?;
+        if let TimelineContent::ExternalRequest { request } = &event.content {
+            assert_eq!(request.kind, ExternalRequestKind::Permission);
+            return Ok(request.id.clone());
+        }
+    }
+    panic!("expected permission request");
 }
 
 #[cfg(feature = "shell")]
