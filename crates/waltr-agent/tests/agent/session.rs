@@ -4,8 +4,9 @@ use std::{env, fmt::Write};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentEvent, LlmError, LlmStream, SessionSnapshot, ToolResult,
-    middleware::ExternalRequestDraft,
+    Agent, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT,
+    ExternalRequest, LlmError, LlmStream, TimelineContent, TimelineEventKind, TimelineStatus,
+    ToolCall, ToolResult,
 };
 
 #[allow(dead_code)]
@@ -15,12 +16,13 @@ pub const TEST_HARNESS_SYSTEM_PROMPT: &str = "You are running inside an automate
 #[derive(Debug, Default)]
 pub struct AgentTestSession {
     pub text: String,
-    pub final_snapshot: Option<SessionSnapshot>,
+    pub timeline: Vec<AgentTimelineEvent>,
+    pub finished: bool,
     pub saw_text_after_tool_result: bool,
-    pub external_requests: Vec<ExternalRequestDraft>,
-    tool_calls: usize,
-    tool_results: usize,
-    tool_errors: Vec<ToolResult>,
+    pub external_requests: Vec<ExternalRequest>,
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_results: Vec<ToolResult>,
+    pub tool_errors: Vec<ToolResult>,
 }
 
 #[allow(dead_code)]
@@ -51,34 +53,53 @@ impl AgentTestSession {
         let mut saw_tool_result = false;
 
         while let Some(event) = stream.next().await {
-            match event? {
-                AgentEvent::TextDelta { delta, .. } => {
+            let event = event?;
+            match &event.content {
+                TimelineContent::TextDelta { delta }
+                    if channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+                {
                     if saw_tool_result && !delta.is_empty() {
                         session.saw_text_after_tool_result = true;
                     }
                     session.text.push_str(&delta);
                 }
-                AgentEvent::ToolCall { .. } => session.tool_calls += 1,
-                AgentEvent::ToolResult { result, .. } => {
-                    session.tool_results += 1;
+                TimelineContent::ToolCall { call } if channel_is(&event, CHANNEL_TOOL_CALL) => {
+                    session.tool_calls.push(call.clone());
+                }
+                TimelineContent::ToolResult { result }
+                    if channel_is(&event, CHANNEL_TOOL_RESULT) =>
+                {
+                    session.tool_results.push(result.clone());
                     saw_tool_result = true;
                     if result.content.starts_with("Tool error:") {
-                        session.tool_errors.push(result);
+                        session.tool_errors.push(result.clone());
                     }
                 }
-                AgentEvent::ExternalRequest { request, .. } => {
-                    session.external_requests.push(request);
+                TimelineContent::ExternalRequest { request } => {
+                    session.external_requests.push(request.clone());
                 }
-                AgentEvent::ThinkingDelta { .. } | AgentEvent::TurnFinished { .. } => {}
-                AgentEvent::Finished { snapshot } => session.final_snapshot = Some(snapshot),
+                TimelineContent::Empty
+                    if event.kind == TimelineEventKind::SessionStatusChanged
+                        && event.status == Some(TimelineStatus::Finished) =>
+                {
+                    session.finished = true;
+                }
+                TimelineContent::Empty
+                | TimelineContent::TextDelta { .. }
+                | TimelineContent::TextSnapshot { .. }
+                | TimelineContent::ContentRef { .. }
+                | TimelineContent::Json { .. }
+                | TimelineContent::ToolCall { .. }
+                | TimelineContent::ToolResult { .. } => {}
             }
+            session.timeline.push(event);
         }
 
         Ok(session)
     }
 
     pub fn require_tool_execution(&self, provider: &'static str) -> waltr_agent::Result<()> {
-        if self.tool_calls == 0 || self.tool_results == 0 {
+        if self.tool_calls.is_empty() || self.tool_results.is_empty() {
             return Err(LlmError::Protocol {
                 provider,
                 message: "agent prompt did not execute a tool".to_owned(),
@@ -119,6 +140,13 @@ impl AgentTestSession {
     }
 }
 
+pub fn channel_is(event: &AgentTimelineEvent, channel: &str) -> bool {
+    event
+        .channel
+        .as_ref()
+        .is_some_and(|candidate| candidate.as_str() == channel)
+}
+
 #[allow(dead_code)]
 fn report_tool_errors_enabled() -> bool {
     env::var(REPORT_TOOL_ERRORS_ENV)
@@ -129,8 +157,9 @@ fn report_tool_errors_enabled() -> bool {
 mod completion {
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi, ModelRef,
-        ProviderId, SessionSnapshot, SessionStatus, SessionStore, ToolCall, ToolDefinition,
+        Agent, AgentTimelineEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi,
+        ModelRef, ProviderId, SessionId, SessionStatus, SessionStore, TimelineContent,
+        TimelineEventKind, TimelineStatus, ToolCall, ToolDefinition,
     };
     use serde_json::json;
 
@@ -151,7 +180,7 @@ mod completion {
                 "Echoes a marker.",
                 json!({ "type": "object", "additionalProperties": false }),
             ),
-            |_call| Ok("echo output".to_owned()),
+            |call| Ok(call.result("echo output")),
         )
     }
 
@@ -169,14 +198,18 @@ mod completion {
         ]
     }
 
-    async fn collect_finished_snapshot<S>(mut stream: S) -> Option<SessionSnapshot>
+    async fn saw_finished_status<S>(mut stream: S) -> bool
     where
-        S: futures_util::Stream<Item = waltr_agent::Result<AgentEvent>> + Unpin,
+        S: futures_util::Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
     {
-        let mut finished = None;
+        let mut finished = false;
         while let Some(event) = stream.next().await {
-            if let AgentEvent::Finished { snapshot } = event.expect("agent event") {
-                finished = Some(snapshot);
+            let event = event.expect("agent event");
+            if event.kind == TimelineEventKind::SessionStatusChanged
+                && event.status == Some(TimelineStatus::Finished)
+                && event.content == TimelineContent::Empty
+            {
+                finished = true;
             }
         }
         finished
@@ -195,32 +228,59 @@ mod completion {
             .id()
             .clone();
 
-        let finished = collect_finished_snapshot(
+        let finished = saw_finished_status(
             sessions
                 .prompt(&provider, session_id.clone(), "run the tool")
                 .stream(),
         )
-        .await
-        .expect("finished snapshot");
+        .await;
 
         let record = store.load(&session_id).await.expect("stored record");
-        assert_eq!(finished.revision, record.revision);
-        assert_eq!(finished, record.snapshot);
-        assert_eq!(finished.status, SessionStatus::Finished);
+        assert!(
+            finished,
+            "stream should emit finished status timeline event"
+        );
+        let snapshot = record.snapshot();
+        assert_eq!(snapshot.revision, record.revision);
+        assert_eq!(snapshot.status, SessionStatus::Finished);
     }
 
     #[tokio::test]
-    async fn ephemeral_run_emits_complete_snapshot() {
+    async fn ephemeral_run_persists_complete_snapshot_to_supplied_store() {
+        let store = MemorySessionStore::new();
+        let session_id = SessionId::new("ephemeral-completion");
         let provider = scripted_provider(tool_then_text_script());
         let agent = Agent::builder(test_model())
             .with_system_prompt("ephemeral marker-prompt")
             .with_tool(echo_tool())
             .build();
 
-        let snapshot = collect_finished_snapshot(agent.prompt(&provider, "run the tool").stream())
-            .await
-            .expect("finished snapshot");
+        let finished = saw_finished_status(
+            agent
+                .prompt(&provider, "run the tool")
+                .with_session_store(store.clone(), session_id.clone())
+                .stream(),
+        )
+        .await;
+        let record = store.load(&session_id).await.expect("stored session");
+        let assistant_text = record
+            .timeline_events()
+            .filter_map(|event| match &event.content {
+                TimelineContent::TextDelta { delta }
+                    if crate::session::channel_is(event, waltr_agent::CHANNEL_ASSISTANT_TEXT) =>
+                {
+                    Some(delta.as_str())
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        let snapshot = record.snapshot();
 
+        assert!(
+            finished,
+            "stream should emit finished status timeline event"
+        );
+        assert_eq!(assistant_text, "done");
         assert_eq!(snapshot.prompts, ["run the tool"]);
         assert_eq!(snapshot.current_prompt.as_deref(), Some("run the tool"));
         assert_eq!(snapshot.status, SessionStatus::Finished);
@@ -231,7 +291,6 @@ mod completion {
                 .tool_results()
                 .any(|result| result.content == "echo output")
         );
-        assert_eq!(snapshot.state.last_assistant_text(), "done");
         let prompt_state = snapshot
             .middleware_state
             .get("system_prompt")
@@ -243,8 +302,7 @@ mod completion {
 #[cfg(test)]
 mod middleware_state {
     use waltr_agent::{
-        MemorySessionStore, Revision, SessionEvent, SessionId, SessionRecord, SessionSnapshot,
-        SessionStore,
+        MemorySessionStore, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionStore,
     };
     use serde_json::json;
 
@@ -252,40 +310,30 @@ mod middleware_state {
     async fn middleware_state_round_trips_through_memory_store() {
         let store = MemorySessionStore::new();
         let id = SessionId::new("middleware-state-session");
-        store
-            .create(SessionRecord::new(id.clone()))
-            .await
-            .expect("created session");
+        store.create(id.clone()).await.expect("created session");
 
-        let revision = store
-            .append(
+        store
+            .append_journal(
                 &id,
+                Revision::ZERO,
                 vec![
-                    SessionEvent::MiddlewareStateUpdated {
+                    SessionJournalEvent::MiddlewareStateUpdated {
                         namespace: "agents".to_owned(),
                         state: json!({ "loaded": ["a"] }),
                     },
-                    SessionEvent::MiddlewareStateUpdated {
+                    SessionJournalEvent::MiddlewareStateUpdated {
                         namespace: "agents".to_owned(),
                         state: json!({ "loaded": ["a", "b"] }),
                     },
                 ],
-                Revision::ZERO,
             )
             .await
             .expect("appended events");
 
         let record = store.load(&id).await.expect("loaded record");
-        let mut snapshot = SessionSnapshot::new(id.clone());
-        snapshot.apply_events(&record.events);
-        store
-            .save_snapshot(&id, snapshot, revision)
-            .await
-            .expect("saved snapshot");
-
-        let record = store.load(&id).await.expect("loaded record");
+        let snapshot = record.snapshot();
         assert_eq!(
-            record.snapshot.middleware_state.get("agents"),
+            snapshot.middleware_state.get("agents"),
             Some(&json!({ "loaded": ["a", "b"] })),
             "last write per namespace must win after rebuild"
         );
@@ -296,18 +344,14 @@ mod middleware_state {
     }
 
     #[test]
-    fn record_without_middleware_state_field_deserializes_to_empty_map() {
+    fn journal_only_record_serializes_without_snapshot() {
         let record = SessionRecord::new("legacy-session");
-        let mut value = serde_json::to_value(&record).expect("serialized record");
-        value["snapshot"]
-            .as_object_mut()
-            .expect("snapshot object")
-            .remove("middleware_state")
-            .expect("field present in current schema");
+        let value = serde_json::to_value(&record).expect("serialized record");
 
-        let restored: SessionRecord = serde_json::from_value(value).expect("legacy record");
+        assert!(value.get("snapshot").is_none());
+        let restored: SessionRecord = serde_json::from_value(value).expect("restored record");
 
-        assert!(restored.snapshot.middleware_state.is_empty());
+        assert!(restored.snapshot().middleware_state.is_empty());
     }
 }
 
@@ -321,9 +365,9 @@ mod tool_projection {
 
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, CompletionEvent, ExternalRequestId, ExternalResponse,
-        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, ToolCall,
-        question::QuestionConfig, tools::filesystem::FilesystemConfig,
+        Agent, CompletionEvent, ExternalRequestId, ExternalResponse, MemorySessionStore, ModelApi,
+        ModelRef, ProviderId, ResumeInput, TimelineContent, ToolCall, question::QuestionConfig,
+        tools::filesystem::FilesystemConfig,
     };
     use serde_json::json;
 
@@ -401,8 +445,10 @@ mod tool_projection {
             .prompt(&provider, session_id.clone(), "hello")
             .stream();
         while let Some(event) = stream.next().await {
-            if let AgentEvent::ExternalRequest { request, .. } = event.expect("agent event") {
-                request_id = Some(request.id);
+            if let TimelineContent::ExternalRequest { request } =
+                event.expect("agent event").content
+            {
+                request_id = Some(request.id.as_str().to_owned());
             }
         }
         drop(stream);
@@ -471,10 +517,10 @@ mod tool_projection {
 mod system_prompt_state {
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, AgentTool, CompletionEvent, ExternalRequestId, ExternalResponse,
+        Agent, AgentTimelineEvent, AgentTool, CompletionEvent, ExternalRequestId, ExternalResponse,
         MemorySessionStore, ModelApi, ModelRef, PermissionEffect, PermissionPolicy,
-        PermissionToolSelector, ProviderId, ResumeInput, SessionEvent, SessionId, SessionRecord,
-        SessionStore, ToolCall, ToolDefinition,
+        PermissionToolSelector, ProviderId, ResumeInput, SessionId, SessionJournalEvent,
+        SessionRecord, SessionStore, TimelineContent, ToolCall, ToolDefinition,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
     };
     use serde_json::json;
@@ -522,17 +568,17 @@ mod system_prompt_state {
 
     async fn drain_run<S>(mut stream: S) -> RunOutput
     where
-        S: futures_util::Stream<Item = waltr_agent::Result<AgentEvent>> + Unpin,
+        S: futures_util::Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
     {
         let mut output = RunOutput {
             tool_results: Vec::new(),
             external_request_id: None,
         };
         while let Some(event) = stream.next().await {
-            match event.expect("agent event") {
-                AgentEvent::ToolResult { result, .. } => output.tool_results.push(result.content),
-                AgentEvent::ExternalRequest { request, .. } => {
-                    output.external_request_id = Some(request.id);
+            match event.expect("agent event").content {
+                TimelineContent::ToolResult { result } => output.tool_results.push(result.content),
+                TimelineContent::ExternalRequest { request } => {
+                    output.external_request_id = Some(request.id.as_str().to_owned());
                 }
                 _ => {}
             }
@@ -542,13 +588,13 @@ mod system_prompt_state {
 
     fn system_prompt_state_indices(record: &SessionRecord) -> Vec<usize> {
         record
-            .events
+            .journal
             .iter()
             .enumerate()
             .filter_map(|(index, event)| {
                 matches!(
                     event,
-                    SessionEvent::MiddlewareStateUpdated { namespace, .. }
+                    SessionJournalEvent::MiddlewareStateUpdated { namespace, .. }
                         if namespace == "system_prompt"
                 )
                 .then_some(index)
@@ -558,11 +604,12 @@ mod system_prompt_state {
 
     fn request_record_indices(record: &SessionRecord) -> Vec<usize> {
         record
-            .events
+            .journal
             .iter()
             .enumerate()
             .filter_map(|(index, event)| {
-                matches!(event, SessionEvent::ProviderRequestRecorded { .. }).then_some(index)
+                matches!(event, SessionJournalEvent::ProviderRequestRecorded { .. })
+                    .then_some(index)
             })
             .collect()
     }
@@ -627,7 +674,10 @@ mod system_prompt_state {
         );
 
         let record = store.load(&session_id).await.expect("stored session");
-        let persisted = record.requests.last().expect("persisted request record");
+        let persisted = record
+            .provider_requests()
+            .last()
+            .expect("persisted request record");
         let persisted_prompt = persisted.canonical_request["system_prompt"]
             .as_str()
             .expect("persisted system prompt");
@@ -675,8 +725,9 @@ mod system_prompt_state {
         );
         let request_indices = request_record_indices(&record);
         assert!(state_indices[0] < request_indices[0]);
+        let snapshot = record.snapshot();
         assert_eq!(
-            record.snapshot.middleware_state.get("system_prompt"),
+            snapshot.middleware_state.get("system_prompt"),
             Some(&json!({ "prompt": "override marker-override" }))
         );
     }
@@ -754,8 +805,9 @@ mod system_prompt_state {
             request_indices[0] < state_indices[1] && state_indices[1] < request_indices[1],
             "override update must be journaled before the request it influenced"
         );
+        let snapshot = record.snapshot();
         assert_eq!(
-            record.snapshot.middleware_state.get("system_prompt"),
+            snapshot.middleware_state.get("system_prompt"),
             Some(&json!({ "prompt": "override marker-override" }))
         );
     }
@@ -797,11 +849,11 @@ mod system_prompt_state {
         let schema = json!({ "type": "object", "additionalProperties": false });
         let extra_tool = AgentTool::new(
             ToolDefinition::new("extra_tool", "Extra run tool.", schema.clone()),
-            |_call| Ok("extra output".to_owned()),
+            |call| Ok(call.result("extra output")),
         );
         let blocked_tool = AgentTool::new(
             ToolDefinition::new("blocked_tool", "Blocked run tool.", schema),
-            |_call| Ok("blocked output".to_owned()),
+            |call| Ok(call.result("blocked output")),
         );
         let policy = PermissionPolicy::default().with_tool_rule(
             PermissionToolSelector::exact("blocked_tool"),
@@ -835,9 +887,9 @@ mod system_prompt_state {
 
         let record = store.load(&session_id).await.expect("stored session");
         let state_events = record
-            .events
+            .journal
             .iter()
-            .filter(|event| matches!(event, SessionEvent::MiddlewareStateUpdated { .. }))
+            .filter(|event| matches!(event, SessionJournalEvent::MiddlewareStateUpdated { .. }))
             .count();
         assert_eq!(
             state_events, 1,
@@ -856,9 +908,9 @@ mod agents_skills_state {
 
     use futures_util::StreamExt;
     use waltr_agent::{
-        Agent, AgentEvent, AgentsPromptConfig, CompletionEvent, ExternalRequestId,
+        Agent, AgentTimelineEvent, AgentsPromptConfig, CompletionEvent, ExternalRequestId,
         ExternalResponse, MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput,
-        SessionId, SkillsConfig, ToolCall,
+        SessionId, SkillsConfig, TimelineContent, ToolCall,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
         tools::filesystem::FilesystemConfig,
     };
@@ -900,17 +952,17 @@ mod agents_skills_state {
 
     async fn drain_run<S>(mut stream: S) -> RunOutput
     where
-        S: futures_util::Stream<Item = waltr_agent::Result<AgentEvent>> + Unpin,
+        S: futures_util::Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
     {
         let mut output = RunOutput {
             tool_results: Vec::new(),
             external_request_id: None,
         };
         while let Some(event) = stream.next().await {
-            match event.expect("agent event") {
-                AgentEvent::ToolResult { result, .. } => output.tool_results.push(result.content),
-                AgentEvent::ExternalRequest { request, .. } => {
-                    output.external_request_id = Some(request.id);
+            match event.expect("agent event").content {
+                TimelineContent::ToolResult { result } => output.tool_results.push(result.content),
+                TimelineContent::ExternalRequest { request } => {
+                    output.external_request_id = Some(request.id.as_str().to_owned());
                 }
                 _ => {}
             }
@@ -1159,8 +1211,8 @@ mod agents_skills_state {
         let record = waltr_agent::SessionStore::load(&store, &SessionId::new("ephemeral-agents"))
             .await
             .expect("stored session");
-        let state = record
-            .snapshot
+        let snapshot = record.snapshot();
+        let state = snapshot
             .middleware_state
             .get("agents")
             .expect("captured agents state");

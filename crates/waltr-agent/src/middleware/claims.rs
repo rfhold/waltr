@@ -84,7 +84,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        AgentState, ModelApi, PermissionClaim, PermissionResource, ProviderId, ToolCall,
+        ModelApi, PermissionClaim, PermissionResource, ProviderId, ToolCall,
         middleware::{chain::MiddlewareChain, context::MiddlewareStateLog},
     };
 
@@ -120,17 +120,13 @@ mod tests {
                 observed: Arc::clone(&observed),
             });
 
-        let session = AgentState::default();
         let mut call = ToolCall::new("call-1", "read", json!({ "filePath": "notes.txt" }));
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let mut ctx = ToolCallContext {
             session_id: "session-1",
-            revision: 0,
             turn: 0,
-            session: &session,
             call: &mut call,
-            tool_definition: None,
             permission_claims: &mut claims,
             middleware_state: &mut middleware_state,
         };

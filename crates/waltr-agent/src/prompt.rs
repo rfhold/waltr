@@ -111,7 +111,7 @@ impl AgentsPromptConfig {
     /// Render this configuration as a system prompt fragment.
     #[must_use]
     pub fn system_prompt(&self) -> Option<String> {
-        // Compatibility renderer; `AgentsSystemPromptMiddleware` provides the request boundary.
+        // Compatibility renderer for callers that need a prompt fragment directly.
         let instructions = self.instructions();
         if instructions.is_empty() {
             None
@@ -185,7 +185,7 @@ impl FilesystemPromptConfig {
     /// Render this configuration as a system prompt fragment.
     #[must_use]
     pub fn system_prompt(&self) -> String {
-        // Compatibility renderer; `FilesystemSystemPromptMiddleware` provides the request boundary.
+        // Compatibility renderer for callers that need a prompt fragment directly.
         let root = display_path(&self.root);
         let mut prompt = format!(
             "Filesystem tools are available when exposed in the tool list. Paths are scoped to this filesystem root: {root}. Prefer relative paths under the root unless the user gives an absolute path inside the root."
@@ -267,7 +267,7 @@ impl ShellPromptConfig {
     /// Render this configuration as a system prompt fragment.
     #[must_use]
     pub fn system_prompt(&self) -> String {
-        // Compatibility renderer; `ShellSystemPromptMiddleware` provides the request boundary.
+        // Compatibility renderer for callers that need a prompt fragment directly.
         format!(
             "The shell tool executes commands on {} using {}. The shell program is {}. The default working directory is {}. Relative workdirs and path-like command arguments resolve under root {}. Use Bash/POSIX shell syntax.",
             self.os,

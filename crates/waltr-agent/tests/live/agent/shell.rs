@@ -1,8 +1,9 @@
 //! Live provider agent shell integration tests.
 
 use waltr_agent::{
-    Agent, AgentTranscriptEvent, LlmStream, ModelRef, PermissionCommandPattern, PermissionEffect,
-    PermissionPolicy, PermissionToolSelector, tools::shell::ShellConfig,
+    Agent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef, PermissionCommandPattern,
+    PermissionEffect, PermissionPolicy, PermissionToolSelector, TimelineContent,
+    tools::shell::ShellConfig,
 };
 
 use crate::{live_provider, session::AgentTestSession};
@@ -75,22 +76,20 @@ async fn assert_provider_runs_shell_agent(
     crate::session::report_tool_errors(&provider, &session, "shell live test");
     let context = crate::session::session_context(&provider, &session);
 
-    let events = session
-        .final_snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.state.events.as_slice())
-        .unwrap_or_default();
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AgentTranscriptEvent::ToolCall { call, .. } if call.name == "shell"
-        )),
+        session.timeline.iter().any(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_CALL)
+                && matches!(&event.content, TimelineContent::ToolCall { call } if call.name == "shell")
+        }),
         "{context}"
     );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentTranscriptEvent::ToolResult { result, .. } if result.content.contains("waltr-shell-ok")
-    )), "{context}");
+    assert!(
+        session.timeline.iter().any(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_RESULT)
+                && matches!(&event.content, TimelineContent::ToolResult { result } if result.content.contains("waltr-shell-ok"))
+        }),
+        "{context}"
+    );
     assert!(session.text.contains("waltr-shell-ok"), "{context}");
 
     Ok(())

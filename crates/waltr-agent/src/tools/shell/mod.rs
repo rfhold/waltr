@@ -36,12 +36,15 @@ fn shell_error(message: impl Into<String>) -> LlmError {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::Path};
+    use std::{env, fs, path::Path, sync::Arc};
 
     use crate::{
-        PermissionOperation, PermissionResource, PermissionResourcePattern,
+        CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO, PendingTimelineEvent,
+        PermissionOperation, PermissionResource, PermissionResourcePattern, SessionId,
+        TimelineChannel, TimelineContent, TimelineItemId, ToolProgressSink,
         tools::shell::{ShellConfig, ShellInput},
     };
+    use std::sync::Mutex;
 
     #[test]
     fn parser_extracts_single_command_claim() {
@@ -181,6 +184,45 @@ mod tests {
     }
 
     #[test]
+    fn execution_streams_generic_progress() {
+        let root = temp_root("progress");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = ToolProgressSink::timeline(
+            SessionId::new("session-1"),
+            1,
+            TimelineItemId::new("tool-call-1"),
+            {
+                let events = Arc::clone(&events);
+                move |event: PendingTimelineEvent| {
+                    events.lock().expect("events lock").push(event);
+                    Ok(())
+                }
+            },
+        );
+        let output = ShellConfig::new(&root)
+            .execute_with_progress(
+                &ShellInput::new("printf out; printf err >&2", "test"),
+                &sink,
+            )
+            .expect("execute");
+
+        assert!(output.contains("Exit code: 0"));
+        let events = events.lock().expect("events lock");
+        assert!(events.iter().any(|event| is_progress_delta(
+            event,
+            CHANNEL_TOOL_PROGRESS_INFO,
+            "out"
+        )));
+        assert!(events.iter().any(|event| is_progress_delta(
+            event,
+            CHANNEL_TOOL_PROGRESS_ERROR,
+            "err"
+        )));
+        drop(events);
+        drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
     fn execution_uses_workdir() {
         let root = temp_root("workdir");
         fs::create_dir_all(root.join("subdir")).expect("subdir");
@@ -252,5 +294,11 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp root");
         path
+    }
+
+    fn is_progress_delta(event: &PendingTimelineEvent, channel: &str, delta: &str) -> bool {
+        event.parent_id == Some(TimelineItemId::new("tool-call-1"))
+            && event.channel == Some(TimelineChannel::from(channel))
+            && matches!(&event.content, TimelineContent::TextDelta { delta: event_delta } if event_delta == delta)
     }
 }

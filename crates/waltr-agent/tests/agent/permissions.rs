@@ -4,12 +4,12 @@ use std::{env, fs, path::PathBuf};
 
 use futures_util::{StreamExt, stream};
 use waltr_agent::{
-    Agent, AgentEvent, AgentSessionRuntime, BoxCompletionStream, BoxStreamFuture, CancelReason,
-    CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
-    ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
-    PendingWorkStatus, PermissionEffect, PermissionPolicy, PermissionToolSelector, ProviderId,
-    ResumeInput, RuntimeResumeOutput, SessionStatus, SessionStore, ToolCall,
-    middleware::ExternalRequestKind as MiddlewareExternalRequestKind,
+    Agent, AgentSessionRuntime, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
+    CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, CancelReason, CompletionEvent,
+    CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
+    ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus,
+    PermissionEffect, PermissionPolicy, PermissionToolSelector, ProviderId, ResumeInput,
+    RuntimeResumeOutput, SessionStatus, SessionStore, TimelineContent, ToolCall,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -71,14 +71,26 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
     let mut external_requests = Vec::new();
 
     while let Some(event) = stream.next().await {
-        match event? {
-            AgentEvent::ToolResult { result, .. } => results.push(result.content),
-            AgentEvent::ExternalRequest { request, .. } => external_requests.push(request),
-            AgentEvent::ThinkingDelta { .. }
-            | AgentEvent::TextDelta { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::TurnFinished { .. }
-            | AgentEvent::Finished { .. } => {}
+        let event = event?;
+        match &event.content {
+            TimelineContent::ToolResult { result }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) =>
+            {
+                results.push(result.content.clone());
+            }
+            TimelineContent::ExternalRequest { request }
+                if crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST) =>
+            {
+                external_requests.push(request.clone());
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
         }
     }
 
@@ -91,10 +103,15 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
     let [request] = external_requests.as_slice() else {
         panic!("expected one permission external request: {external_requests:#?}");
     };
-    assert_eq!(request.kind, MiddlewareExternalRequestKind::Permission);
+    assert_eq!(request.kind, ExternalRequestKind::Permission);
     assert_eq!(request.tool_call_id.as_deref(), Some("call_2"));
     assert!(request.prompt.contains("external.txt"), "{request:#?}");
-    assert!(request.id.starts_with("permission:ephemeral:1:call_2"));
+    assert!(
+        request
+            .id
+            .as_str()
+            .starts_with("permission:ephemeral:1:call_2")
+    );
 
     Ok(())
 }
@@ -140,18 +157,20 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         .stream();
     let mut request_id = None;
     while let Some(event) = stream.next().await {
-        if let AgentEvent::ExternalRequest { request, .. } = event? {
-            assert_eq!(request.kind, MiddlewareExternalRequestKind::Permission);
+        let event = event?;
+        if let TimelineContent::ExternalRequest { request } = &event.content {
+            assert!(crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST));
+            assert_eq!(request.kind, ExternalRequestKind::Permission);
             assert_eq!(request.tool_call_id.as_deref(), Some("call_resume"));
             assert!(request.prompt.contains("external.txt"), "{request:#?}");
-            request_id = Some(request.id);
+            request_id = Some(request.id.as_str().to_owned());
         }
     }
     let request_id = request_id.expect("permission request");
 
     let suspended = store.load(&session_id).await.expect("stored session");
-    let persisted_request = suspended
-        .snapshot
+    let suspended_snapshot = suspended.snapshot();
+    let persisted_request = suspended_snapshot
         .external_requests
         .iter()
         .find(|request| request.id.as_str() == request_id)
@@ -159,10 +178,10 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
     assert_eq!(persisted_request.kind, ExternalRequestKind::Permission);
     assert_eq!(persisted_request.status, ExternalRequestStatus::Pending);
     assert!(matches!(
-        suspended.snapshot.status,
+        suspended_snapshot.status,
         SessionStatus::Suspended(_)
     ));
-    assert!(suspended.snapshot.pending_work.iter().any(|work| {
+    assert!(suspended_snapshot.pending_work.iter().any(|work| {
         work.id == "call_resume" && matches!(work.status, PendingWorkStatus::Pending)
     }));
 
@@ -178,15 +197,18 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         .stream();
     let mut text = String::new();
     while let Some(event) = resumed.next().await {
-        if let AgentEvent::TextDelta { delta, .. } = event? {
+        let event = event?;
+        if let TimelineContent::TextDelta { delta } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
+        {
             text.push_str(&delta);
         }
     }
     assert_eq!(text, "permission-flow-complete");
 
     let completed = store.load(&session_id).await.expect("stored session");
-    let responded_request = completed
-        .snapshot
+    let completed_snapshot = completed.snapshot();
+    let responded_request = completed_snapshot
         .external_requests
         .iter()
         .find(|request| request.id.as_str() == request_id)
@@ -195,7 +217,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         responded_request.status,
         ExternalRequestStatus::Responded(_)
     ));
-    assert!(completed.snapshot.pending_work.iter().any(|work| {
+    assert!(completed_snapshot.pending_work.iter().any(|work| {
         work.id == "call_resume" && matches!(work.status, PendingWorkStatus::Finished(_))
     }));
 
@@ -293,15 +315,17 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
         .stream();
     let mut external_requests = Vec::new();
     while let Some(event) = stream.next().await {
-        if let AgentEvent::ExternalRequest { request, .. } = event? {
-            external_requests.push(request);
+        let event = event?;
+        if let TimelineContent::ExternalRequest { request } = &event.content {
+            assert!(crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST));
+            external_requests.push(request.clone());
         }
     }
 
     let [request] = external_requests.as_slice() else {
         panic!("expected one permission external request: {external_requests:#?}");
     };
-    assert_eq!(request.kind, MiddlewareExternalRequestKind::Permission);
+    assert_eq!(request.kind, ExternalRequestKind::Permission);
     assert_eq!(request.tool_call_id.as_deref(), Some("call_1"));
     assert!(
         request.prompt.contains("Write filesystem path"),
@@ -313,8 +337,9 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     assert!(!shell_denied.exists());
 
     let suspended = store.load(&session_id).await.expect("stored session");
+    let suspended_snapshot = suspended.snapshot();
     assert!(
-        suspended.snapshot.pending_work.iter().any(|work| {
+        suspended_snapshot.pending_work.iter().any(|work| {
             work.id == "call_1" && matches!(work.status, PendingWorkStatus::Pending)
         })
     );
@@ -331,18 +356,17 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     }
 
     let canceled = store.load(&session_id).await.expect("stored session");
-    let persisted_request = canceled
-        .snapshot
+    let canceled_snapshot = canceled.snapshot();
+    let persisted_request = canceled_snapshot
         .external_requests
         .iter()
-        .find(|request| request.id.as_str() == external_request_id)
+        .find(|request| request.id.as_str() == external_request_id.as_str())
         .expect("persisted permission request");
     assert!(matches!(
         persisted_request.status,
         ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt)
     ));
-    let work = canceled
-        .snapshot
+    let work = canceled_snapshot
         .pending_work
         .iter()
         .find(|work| work.id == "call_1")

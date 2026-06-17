@@ -5,21 +5,21 @@ mod error;
 pub mod mcp;
 pub mod middleware;
 mod model;
-pub mod models;
 mod permission;
 pub mod prompt;
 pub mod provider;
 mod stream;
+pub mod timeline;
 pub mod tools;
 
 pub use agent::{
-    Agent, AgentBuilder, AgentEvent, AgentRunBuilder, AgentSession, AgentSessionRuntime,
-    AgentSessions, AgentState, AgentTool, AgentTranscriptEvent, BoxAgentEventStream, CancelReason,
-    ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
-    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
-    S3SessionStore, ScyllaSessionStore, SessionEvent, SessionId, SessionRecord, SessionSnapshot,
-    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, Suspension,
+    Agent, AgentBuilder, AgentRunBuilder, AgentSession, AgentSessionRuntime, AgentSessions,
+    AgentTool, BoxAgentTimelineStream, CancelReason, ExternalRequest, ExternalRequestId,
+    ExternalRequestKind, ExternalRequestStatus, ExternalResponse, FilesystemSessionStore,
+    MemorySessionStore, OpenDalSessionStore, PendingWork, PendingWorkStatus, RequestId,
+    RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, S3SessionStore, ScyllaSessionStore,
+    SessionId, SessionJournalEvent, SessionRecord, SessionSnapshot, SessionStatus, SessionStore,
+    SessionStoreError, SessionStoreResult, Suspension, ToolExecutionContext, ToolProgressSink,
     opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use error::{LlmError, Result};
@@ -40,6 +40,12 @@ pub use stream::{
     BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
     CompletionRequestBuilder, CompletionTurn, LlmStream, ProviderTurnMetadata, ThinkingBlock,
     ThinkingBlockKind, ThinkingDelta, TokenUsage, ToolCall, ToolDefinition, ToolResult, TurnItem,
+};
+pub use timeline::{
+    AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO,
+    CHANNEL_TOOL_RESULT, PendingTimelineEvent, TimelineChannel, TimelineContent, TimelineContentId,
+    TimelineCursor, TimelineEventKind, TimelineItemId, TimelineStatus,
 };
 pub use tools::filesystem;
 pub use tools::question;

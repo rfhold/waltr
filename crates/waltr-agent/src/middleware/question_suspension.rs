@@ -61,7 +61,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        AgentState, ToolCall, ToolDefinition,
+        ToolCall,
         middleware::context::{MiddlewareStateLog, ToolCallContext},
     };
 
@@ -69,8 +69,6 @@ mod tests {
 
     #[test]
     fn question_call_suspends_with_external_request() {
-        let session = AgentState::default();
-        let definition = ToolDefinition::new(QUESTION_TOOL_NAME, "Ask", json!({}));
         let mut call = ToolCall::new(
             "call-1",
             QUESTION_TOOL_NAME,
@@ -87,11 +85,8 @@ mod tests {
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
             session_id: "session-1",
-            revision: 0,
             turn: 2,
-            session: &session,
             call: &mut call,
-            tool_definition: Some(&definition),
             permission_claims: &mut claims,
             middleware_state: &mut middleware_state,
         };
@@ -115,17 +110,13 @@ mod tests {
 
     #[test]
     fn non_question_call_continues() {
-        let session = AgentState::default();
         let mut call = ToolCall::new("call-1", "lookup", json!({}));
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
             session_id: "session-1",
-            revision: 0,
             turn: 0,
-            session: &session,
             call: &mut call,
-            tool_definition: None,
             permission_claims: &mut claims,
             middleware_state: &mut middleware_state,
         };
@@ -139,17 +130,13 @@ mod tests {
 
     #[test]
     fn invalid_question_call_errors() {
-        let session = AgentState::default();
         let mut call = ToolCall::new("call-1", QUESTION_TOOL_NAME, json!({ "questions": [] }));
         let mut claims = Vec::new();
         let mut middleware_state = MiddlewareStateLog::default();
         let ctx = ToolCallContext {
             session_id: "session-1",
-            revision: 0,
             turn: 0,
-            session: &session,
             call: &mut call,
-            tool_definition: None,
             permission_claims: &mut claims,
             middleware_state: &mut middleware_state,
         };

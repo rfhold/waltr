@@ -1,8 +1,7 @@
 //! Agent question tool integration tests.
 
 use waltr_agent::{
-    Agent, LlmStream, ModelRef,
-    middleware::ExternalRequestKind,
+    Agent, ExternalRequestKind, LlmStream, ModelRef,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 
@@ -33,7 +32,7 @@ async fn run_live_question(provider: impl LlmStream, model: ModelRef) -> waltr_a
     let context = test_context(&provider, &session);
 
     assert_tool_was_surfaced(&provider, QUESTION_TOOL_NAME);
-    assert!(session.final_snapshot.is_none(), "{context}");
+    assert!(!session.finished, "{context}");
     assert!(
         session
             .external_requests

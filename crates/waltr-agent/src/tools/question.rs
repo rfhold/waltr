@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 
-use crate::{AgentTool, LlmError, Result, ToolCall, ToolDefinition};
+use crate::{AgentTool, LlmError, Result, ToolCall, ToolDefinition, ToolExecutionContext};
 
 /// Provider-facing question tool name.
 pub const QUESTION_TOOL_NAME: &str = "question";
@@ -24,14 +24,17 @@ impl QuestionConfig {
     /// Convert this configuration into the `question` agent tool.
     #[must_use]
     pub fn into_agent_tool(self) -> AgentTool {
-        AgentTool::new(question_definition(), move |call| {
-            let input = tool_input::<QuestionInput>(call)?;
-            input.validate()?;
-            Err(question_error(format!(
-                "question tool call {} must suspend for external response",
-                call.id
-            )))
-        })
+        AgentTool::new(
+            question_definition(),
+            move |context: ToolExecutionContext| {
+                let input = tool_input::<QuestionInput>(context.call())?;
+                input.validate()?;
+                Err(question_error(format!(
+                    "question tool call {} must suspend for external response",
+                    context.call().id
+                )))
+            },
+        )
     }
 }
 

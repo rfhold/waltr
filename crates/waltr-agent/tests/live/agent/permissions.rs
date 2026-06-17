@@ -3,8 +3,7 @@
 use std::{env, fs, path::PathBuf};
 
 use waltr_agent::{
-    Agent, LlmStream, ModelRef, PermissionEffect, PermissionPolicy,
-    middleware::ExternalRequestKind,
+    Agent, ExternalRequestKind, LlmStream, ModelRef, PermissionEffect, PermissionPolicy,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]

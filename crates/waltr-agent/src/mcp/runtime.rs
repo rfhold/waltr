@@ -40,14 +40,16 @@ impl McpRuntime {
                     ),
                     tool.input_schema.clone(),
                 );
-                tools.push(AgentTool::new_async(definition, move |call| {
+                tools.push(AgentTool::new_async(definition, move |context| {
                     let runtime = Arc::clone(&runtime);
                     let server_name = server_name.clone();
                     let tool_name = tool_name.clone();
+                    let arguments = context.call().arguments.clone();
                     Box::pin(async move {
-                        runtime
-                            .call_tool(&server_name, &tool_name, call.arguments.clone())
-                            .await
+                        let content = runtime
+                            .call_tool(&server_name, &tool_name, arguments)
+                            .await?;
+                        Ok(context.result(content))
                     })
                 }));
             }

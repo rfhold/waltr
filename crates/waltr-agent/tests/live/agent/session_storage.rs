@@ -8,8 +8,9 @@ use std::{
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentEvent, ExternalRequestId, ExternalResponse, FilesystemSessionStore,
-    OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore, SessionStore,
+    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, ExternalRequestId, ExternalResponse,
+    FilesystemSessionStore, OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore,
+    SessionStore, TimelineContent, TimelineEventKind, TimelineStatus,
     opendal_postgresql_session_store,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
@@ -138,7 +139,7 @@ where
                 &provider,
                 session_id.clone(),
                 ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new(request),
+                    request_id: request,
                     response: ExternalResponse::new(json!("resume confirmed")),
                 },
             )
@@ -153,9 +154,9 @@ where
     );
 
     let stored = store.load(&session_id).await.map_err(store_error)?;
+    let snapshot = stored.snapshot();
     assert!(
-        stored
-            .snapshot
+        snapshot
             .tool_results()
             .any(|result| result.name == QUESTION_TOOL_NAME
                 && result.content.contains("resume confirmed")),
@@ -168,24 +169,40 @@ where
 struct CollectedSession {
     text: String,
     finished: bool,
-    external_request_ids: Vec<String>,
+    external_request_ids: Vec<ExternalRequestId>,
 }
 
 async fn collect(
-    mut events: waltr_agent::BoxAgentEventStream<'_>,
+    mut events: waltr_agent::BoxAgentTimelineStream<'_>,
 ) -> waltr_agent::Result<CollectedSession> {
     let mut collected = CollectedSession::default();
     while let Some(event) = events.next().await {
-        match event? {
-            AgentEvent::TextDelta { delta, .. } => collected.text.push_str(&delta),
-            AgentEvent::ExternalRequest { request, .. } => {
-                collected.external_request_ids.push(request.id);
+        let event = event?;
+        match &event.content {
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                collected.text.push_str(delta);
             }
-            AgentEvent::Finished { .. } => collected.finished = true,
-            AgentEvent::ThinkingDelta { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::ToolResult { .. }
-            | AgentEvent::TurnFinished { .. } => {}
+            TimelineContent::ExternalRequest { request }
+                if crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST) =>
+            {
+                collected.external_request_ids.push(request.id.clone());
+            }
+            TimelineContent::Empty
+                if event.kind == TimelineEventKind::SessionStatusChanged
+                    && event.status == Some(TimelineStatus::Finished) =>
+            {
+                collected.finished = true;
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
         }
     }
     Ok(collected)

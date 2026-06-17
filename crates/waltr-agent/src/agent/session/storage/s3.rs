@@ -2,10 +2,13 @@
 
 use aws_sdk_s3::{Client, error::DisplayErrorContext, primitives::ByteStream};
 
-use super::{SessionStore, SessionStoreError, SessionStoreResult};
-use crate::agent::session::{
-    ExternalRequest, RequestRecord, Revision, SessionEvent, SessionId, SessionRecord,
-    SessionSnapshot,
+use super::{
+    SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
+    timeline_after_slice, timeline_before_slice,
+};
+use crate::{
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    timeline::{AgentTimelineEvent, PendingTimelineEvent, TimelineCursor},
 };
 
 /// S3 JSON-object implementation of [`SessionStore`].
@@ -68,12 +71,12 @@ impl S3SessionStore {
         Ok(())
     }
 
-    async fn update_record(
+    async fn update_record<T: Send>(
         &self,
         id: &SessionId,
         expected_revision: Revision,
-        update: impl FnOnce(&mut SessionRecord, Revision),
-    ) -> SessionStoreResult<Revision> {
+        update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
+    ) -> SessionStoreResult<(Revision, T)> {
         let mut record = self.load_record(id).await?;
         if record.revision != expected_revision {
             return Err(SessionStoreError::StaleRevision {
@@ -83,23 +86,27 @@ impl S3SessionStore {
             });
         }
         let revision = record.revision.next();
-        update(&mut record, revision);
+        let value = update(&mut record, revision)?;
         record.revision = revision;
         self.save_record(&record).await?;
-        Ok(revision)
+        Ok((revision, value))
     }
 }
 
 impl SessionStore for S3SessionStore {
     fn create(
         &self,
-        record: SessionRecord,
-    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        id: SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
+            let record = SessionRecord::new(id);
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
-                Err(SessionStoreError::NotFound { .. }) => store.save_record(&record).await,
+                Err(SessionStoreError::NotFound { .. }) => {
+                    store.save_record(&record).await?;
+                    Ok(record)
+                }
                 Err(error) => Err(error),
             }
         }
@@ -114,79 +121,68 @@ impl SessionStore for S3SessionStore {
         async move { store.load_record(&id).await }
     }
 
-    fn append(
+    fn append_timeline(
         &self,
         id: &SessionId,
-        events: Vec<SessionEvent>,
         expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        events: Vec<PendingTimelineEvent>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store
+            let (_, assigned) = store
                 .update_record(&id, expected_revision, |record, _| {
-                    record.events.extend(events);
+                    append_timeline_to_record(record, &id, events)
                 })
-                .await
+                .await?;
+            Ok(assigned)
         }
     }
 
-    fn save_snapshot(
+    fn append_journal(
         &self,
         id: &SessionId,
-        mut snapshot: SessionSnapshot,
         expected_revision: Revision,
+        events: Vec<SessionJournalEvent>,
     ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            if snapshot.id != id {
-                return Err(SessionStoreError::SessionIdMismatch {
-                    expected: id,
-                    actual: snapshot.id,
-                });
-            }
-            store
-                .update_record(&id, expected_revision, |record, revision| {
-                    snapshot.revision = revision;
-                    record.snapshot = snapshot;
-                })
-                .await
-        }
-    }
-
-    fn record_request(
-        &self,
-        id: &SessionId,
-        request: RequestRecord,
-        expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
-        let store = self.clone();
-        let id = id.clone();
-        async move {
-            store
+            let (revision, ()) = store
                 .update_record(&id, expected_revision, |record, _| {
-                    record.requests.push(request);
+                    record.append_journal_events(events);
+                    Ok(())
                 })
-                .await
+                .await?;
+            Ok(revision)
         }
     }
 
-    fn record_external_request(
+    fn timeline_after(
         &self,
         id: &SessionId,
-        request: ExternalRequest,
-        expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store
-                .update_record(&id, expected_revision, |record, revision| {
-                    record.snapshot.external_requests.push(request);
-                    record.snapshot.revision = revision;
-                })
-                .await
+            let record = store.load_record(&id).await?;
+            Ok(timeline_after_slice(&record, cursor, limit))
+        }
+    }
+
+    fn timeline_before(
+        &self,
+        id: &SessionId,
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let record = store.load_record(&id).await?;
+            Ok(timeline_before_slice(&record, cursor, limit))
         }
     }
 }

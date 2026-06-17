@@ -46,6 +46,7 @@ pub(super) fn responses_input(request: &CompletionRequest<'_>) -> Value {
 
     for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
         match item {
+            TurnItem::AssistantText(text) => input.push(responses_assistant_text(text)),
             TurnItem::Thinking(block)
                 if block.kind == ThinkingBlockKind::OpenAiResponses
                     && has_encrypted_content(&block.payload) =>
@@ -58,6 +59,14 @@ pub(super) fn responses_input(request: &CompletionRequest<'_>) -> Value {
         }
     }
     Value::Array(input)
+}
+
+fn responses_assistant_text(text: &str) -> Value {
+    json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": text }]
+    })
 }
 
 /// With store:false the API rejects reasoning items replayed by id alone, so a
@@ -152,6 +161,24 @@ mod tests {
 
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn responses_input_replays_assistant_text_as_output_message() {
+        let mut request = CompletionRequest::new("hello");
+        request.turns = vec![CompletionTurn {
+            turn: 0,
+            metadata: None,
+            items: vec![TurnItem::AssistantText("prior answer".to_owned())],
+        }];
+
+        let input = responses_input(&request);
+
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[1]["content"][0]["text"], "prior answer");
+        assert_eq!(input.as_array().expect("input array").len(), 2);
     }
 
     #[test]

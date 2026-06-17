@@ -5,10 +5,10 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use crate::Result;
 
 use super::{
-    AgentMiddleware, HookOutcome, ModelEvent, ResumeInput, Suspension,
+    AgentMiddleware, HookOutcome, Suspension,
     context::{
-        ModelRequestDraft, RequestContext, RunContext, StreamContext, SystemPromptParts,
-        ToolCallContext, ToolDraft, ToolResultContext,
+        ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, ToolCallContext,
+        ToolDraft, ToolResultContext,
     },
 };
 
@@ -39,12 +39,6 @@ trait ChainMiddleware: Send + Sync {
         request: &'a mut ModelRequestDraft,
     ) -> BoxHookFuture<'a, HookOutcome>;
 
-    fn on_provider_event<'a>(
-        &'a self,
-        ctx: &'a mut StreamContext<'_>,
-        event: &'a mut ModelEvent,
-    ) -> BoxHookFuture<'a, HookOutcome>;
-
     fn before_tool_call<'a>(
         &'a self,
         ctx: &'a mut ToolCallContext<'_>,
@@ -59,12 +53,6 @@ trait ChainMiddleware: Send + Sync {
         &'a self,
         ctx: &'a mut RunContext<'_>,
         suspension: &'a mut Suspension,
-    ) -> BoxHookFuture<'a, ()>;
-
-    fn on_resume<'a>(
-        &'a self,
-        ctx: &'a mut RunContext<'_>,
-        input: &'a mut ResumeInput,
     ) -> BoxHookFuture<'a, ()>;
 }
 
@@ -104,14 +92,6 @@ where
         Box::pin(AgentMiddleware::before_provider_request(self, ctx, request))
     }
 
-    fn on_provider_event<'a>(
-        &'a self,
-        ctx: &'a mut StreamContext<'_>,
-        event: &'a mut ModelEvent,
-    ) -> BoxHookFuture<'a, HookOutcome> {
-        Box::pin(AgentMiddleware::on_provider_event(self, ctx, event))
-    }
-
     fn before_tool_call<'a>(
         &'a self,
         ctx: &'a mut ToolCallContext<'_>,
@@ -133,14 +113,6 @@ where
     ) -> BoxHookFuture<'a, ()> {
         Box::pin(AgentMiddleware::on_suspend(self, ctx, suspension))
     }
-
-    fn on_resume<'a>(
-        &'a self,
-        ctx: &'a mut RunContext<'_>,
-        input: &'a mut ResumeInput,
-    ) -> BoxHookFuture<'a, ()> {
-        Box::pin(AgentMiddleware::on_resume(self, ctx, input))
-    }
 }
 
 /// Ordered middleware collection for deterministic hook execution.
@@ -156,12 +128,6 @@ impl MiddlewareChain {
         Self::default()
     }
 
-    /// Return true when the chain contains no middleware.
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.middleware.is_empty()
-    }
-
     /// Return the number of middleware entries in insertion order.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
@@ -174,15 +140,6 @@ impl MiddlewareChain {
         M: AgentMiddleware + 'static,
     {
         self.middleware.push(Arc::new(middleware));
-        self
-    }
-
-    /// Add shared middleware to the end of the chain.
-    pub(crate) fn push_arc<M>(&mut self, middleware: Arc<M>) -> &mut Self
-    where
-        M: AgentMiddleware + 'static,
-    {
-        self.middleware.push(middleware);
         self
     }
 
@@ -247,22 +204,6 @@ impl MiddlewareChain {
         Ok(HookOutcome::Continue)
     }
 
-    /// Run provider event middleware until the first non-continue outcome.
-    pub(crate) async fn on_provider_event(
-        &self,
-        ctx: &mut StreamContext<'_>,
-        event: &mut ModelEvent,
-    ) -> Result<HookOutcome> {
-        for middleware in &self.middleware {
-            let outcome = middleware.on_provider_event(ctx, event).await?;
-            if !matches!(outcome, HookOutcome::Continue) {
-                return Ok(outcome);
-            }
-        }
-
-        Ok(HookOutcome::Continue)
-    }
-
     /// Run pre-tool-call middleware until the first non-continue outcome.
     pub(crate) async fn before_tool_call(
         &self,
@@ -305,26 +246,13 @@ impl MiddlewareChain {
 
         Ok(())
     }
-
-    /// Run resume middleware in insertion order.
-    pub(crate) async fn on_resume(
-        &self,
-        ctx: &mut RunContext<'_>,
-        input: &mut ResumeInput,
-    ) -> Result<()> {
-        for middleware in &self.middleware {
-            middleware.on_resume(ctx, input).await?;
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::{AgentState, ModelId, Result};
+    use crate::{Result, ToolResult};
 
     use super::*;
 
@@ -356,7 +284,7 @@ mod tests {
 
     enum ProviderRequestOutcome {
         Continue,
-        Suppress,
+        Replace,
     }
 
     impl AgentMiddleware for ProviderRequestMiddleware {
@@ -371,24 +299,18 @@ mod tests {
                 .push(self.name);
             Ok(match self.outcome {
                 ProviderRequestOutcome::Continue => HookOutcome::Continue,
-                ProviderRequestOutcome::Suppress => HookOutcome::Suppress,
+                ProviderRequestOutcome::Replace => {
+                    HookOutcome::ReplaceToolResult(ToolResult::new("call-1", "test", "replace"))
+                }
             })
         }
     }
 
     fn request_context<'a>(
-        model_id: &'a ModelId,
-        session: &'a AgentState,
         middleware_state: &'a mut crate::middleware::context::MiddlewareStateLog,
         system_prompt_override: &'a mut Option<crate::middleware::prompt::SystemPromptOverride>,
     ) -> RequestContext<'a> {
         RequestContext {
-            session_id: "session-1",
-            revision: 0,
-            model_id,
-            provider_id: None,
-            turn: 0,
-            session,
             middleware_state,
             system_prompt_override,
         }
@@ -408,16 +330,9 @@ mod tests {
                 calls: Arc::clone(&calls),
             });
 
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = crate::middleware::context::MiddlewareStateLog::default();
         let mut system_prompt_override = None;
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut system_prompt_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut system_prompt_override);
         let mut prompt = SystemPromptParts::default();
 
         chain
@@ -445,7 +360,7 @@ mod tests {
             .push(ProviderRequestMiddleware {
                 name: "second",
                 calls: Arc::clone(&calls),
-                outcome: ProviderRequestOutcome::Suppress,
+                outcome: ProviderRequestOutcome::Replace,
             })
             .push(ProviderRequestMiddleware {
                 name: "third",
@@ -453,16 +368,9 @@ mod tests {
                 outcome: ProviderRequestOutcome::Continue,
             });
 
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = crate::middleware::context::MiddlewareStateLog::default();
         let mut system_prompt_override = None;
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut system_prompt_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut system_prompt_override);
         let mut request = ModelRequestDraft::default();
 
         let outcome = chain
@@ -470,7 +378,7 @@ mod tests {
             .await
             .expect("provider request middleware should run");
 
-        assert!(matches!(outcome, HookOutcome::Suppress));
+        assert!(matches!(outcome, HookOutcome::ReplaceToolResult(_)));
         assert_eq!(
             *calls.lock().expect("call log poisoned"),
             vec!["first", "second"]

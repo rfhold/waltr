@@ -2,13 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Result,
-    prompt::{AgentsPromptConfig, BASE_SYSTEM_PROMPT, FilesystemPromptConfig},
-};
-
-#[cfg(feature = "shell")]
-use crate::prompt::ShellPromptConfig;
+use crate::Result;
 
 use super::{
     AgentMiddleware,
@@ -17,21 +11,6 @@ use super::{
 
 /// Durable state namespace owned by [`SystemPromptMiddleware`].
 const SYSTEM_PROMPT_STATE_NAMESPACE: &str = "system_prompt";
-
-/// Middleware that appends the reusable base system prompt.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BaseSystemPromptMiddleware;
-
-impl AgentMiddleware for BaseSystemPromptMiddleware {
-    async fn build_system_prompt(
-        &self,
-        _ctx: &mut RequestContext<'_>,
-        prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
-        prompt.push(BASE_SYSTEM_PROMPT);
-        Ok(())
-    }
-}
 
 /// Captured system prompt persisted in the `"system_prompt"` namespace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,108 +117,19 @@ impl AgentMiddleware for SystemPromptMiddleware {
     }
 }
 
-/// Middleware that renders configured `AGENTS.md` instruction context per request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentsSystemPromptMiddleware {
-    config: AgentsPromptConfig,
-}
-
-impl AgentsSystemPromptMiddleware {
-    /// Create middleware from an `AGENTS.md` prompt configuration.
-    pub const fn new(config: AgentsPromptConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl AgentMiddleware for AgentsSystemPromptMiddleware {
-    async fn build_system_prompt(
-        &self,
-        _ctx: &mut RequestContext<'_>,
-        prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
-        for instruction in self.config.instructions() {
-            prompt.push(instruction.content);
-        }
-
-        Ok(())
-    }
-}
-
-/// Middleware that renders filesystem prompt context per request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilesystemSystemPromptMiddleware {
-    config: FilesystemPromptConfig,
-}
-
-impl FilesystemSystemPromptMiddleware {
-    /// Create middleware from filesystem prompt configuration.
-    pub const fn new(config: FilesystemPromptConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl AgentMiddleware for FilesystemSystemPromptMiddleware {
-    async fn build_system_prompt(
-        &self,
-        _ctx: &mut RequestContext<'_>,
-        prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
-        prompt.push(self.config.system_prompt());
-        Ok(())
-    }
-}
-
-/// Middleware that renders shell prompt context per request.
-#[cfg(feature = "shell")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShellSystemPromptMiddleware {
-    config: ShellPromptConfig,
-}
-
-#[cfg(feature = "shell")]
-impl ShellSystemPromptMiddleware {
-    /// Create middleware from shell prompt configuration.
-    pub const fn new(config: ShellPromptConfig) -> Self {
-        Self { config }
-    }
-}
-
-#[cfg(feature = "shell")]
-impl AgentMiddleware for ShellSystemPromptMiddleware {
-    async fn build_system_prompt(
-        &self,
-        _ctx: &mut RequestContext<'_>,
-        prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
-        prompt.push(self.config.system_prompt());
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use crate::{
-        AgentState, ModelId,
-        middleware::context::{MiddlewareStateLog, RequestContext},
-    };
+    use crate::middleware::context::{MiddlewareStateLog, RequestContext};
 
     use super::*;
 
     fn request_context<'a>(
-        model_id: &'a ModelId,
-        session: &'a AgentState,
         middleware_state: &'a mut MiddlewareStateLog,
         system_prompt_override: &'a mut Option<SystemPromptOverride>,
     ) -> RequestContext<'a> {
         RequestContext {
-            session_id: "session-1",
-            revision: 0,
-            model_id,
-            provider_id: None,
-            turn: 0,
-            session,
             middleware_state,
             system_prompt_override,
         }
@@ -248,16 +138,9 @@ mod tests {
     #[tokio::test]
     async fn captures_configured_prompt_into_state_on_first_turn() {
         let middleware = SystemPromptMiddleware::new(Some("configured prompt".to_owned()));
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = MiddlewareStateLog::default();
         let mut run_override = None;
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut run_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
         let mut prompt = SystemPromptParts::default();
 
         middleware
@@ -275,18 +158,11 @@ mod tests {
     #[tokio::test]
     async fn stored_state_wins_over_configured_prompt() {
         let middleware = SystemPromptMiddleware::new(Some("configured prompt".to_owned()));
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = MiddlewareStateLog::default();
         middleware_state.set("system_prompt", json!({ "prompt": "stored prompt" }));
         drop(middleware_state.drain_pending());
         let mut run_override = None;
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut run_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
         let mut prompt = SystemPromptParts::default();
 
         middleware
@@ -304,8 +180,6 @@ mod tests {
     #[tokio::test]
     async fn run_override_folds_into_first_turn_capture() {
         let middleware = SystemPromptMiddleware::new(Some("configured prompt".to_owned()));
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = MiddlewareStateLog::default();
         let mut run_override = Some({
             let mut value = SystemPromptOverride::default();
@@ -313,12 +187,7 @@ mod tests {
             value.push_fragment("extra fragment");
             value
         });
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut run_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
         let mut prompt = SystemPromptParts::default();
 
         middleware
@@ -337,20 +206,13 @@ mod tests {
     #[tokio::test]
     async fn run_fragment_appends_to_configured_prompt() {
         let middleware = SystemPromptMiddleware::new(Some("configured prompt".to_owned()));
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = MiddlewareStateLog::default();
         let mut run_override = Some({
             let mut value = SystemPromptOverride::default();
             value.push_fragment("run fragment");
             value
         });
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut run_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
         let mut prompt = SystemPromptParts::default();
 
         middleware
@@ -364,8 +226,6 @@ mod tests {
     #[tokio::test]
     async fn run_override_on_stored_state_journals_replacement() {
         let middleware = SystemPromptMiddleware::new(Some("configured prompt".to_owned()));
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = MiddlewareStateLog::default();
         middleware_state.set("system_prompt", json!({ "prompt": "stored prompt" }));
         drop(middleware_state.drain_pending());
@@ -374,12 +234,7 @@ mod tests {
             value.replace("override prompt");
             value
         });
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut run_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
         let mut prompt = SystemPromptParts::default();
 
         middleware
@@ -398,20 +253,13 @@ mod tests {
     #[tokio::test]
     async fn empty_replacement_clears_captured_prompt() {
         let middleware = SystemPromptMiddleware::new(Some("configured prompt".to_owned()));
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = MiddlewareStateLog::default();
         let mut run_override = Some({
             let mut value = SystemPromptOverride::default();
             value.replace("");
             value
         });
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut run_override,
-        );
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
         let mut prompt = SystemPromptParts::default();
 
         middleware
@@ -424,28 +272,5 @@ mod tests {
             middleware_state.get("system_prompt"),
             Some(&json!({ "prompt": null }))
         );
-    }
-
-    #[tokio::test]
-    async fn appends_base_system_prompt_fragment() {
-        let middleware = BaseSystemPromptMiddleware;
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
-        let mut middleware_state = MiddlewareStateLog::default();
-        let mut run_override = None;
-        let mut ctx = request_context(
-            &model_id,
-            &session,
-            &mut middleware_state,
-            &mut run_override,
-        );
-        let mut prompt = SystemPromptParts::default();
-
-        middleware
-            .build_system_prompt(&mut ctx, &mut prompt)
-            .await
-            .expect("base prompt middleware should run");
-
-        assert_eq!(prompt.parts, vec![BASE_SYSTEM_PROMPT]);
     }
 }

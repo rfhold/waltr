@@ -9,7 +9,7 @@ use crate::{LlmStream, ModelRef, PermissionPolicy};
 use super::session::{
     EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId, SessionStore,
 };
-use super::{Agent, AgentTool, BoxAgentEventStream, r#loop::AgentLoopState};
+use super::{Agent, AgentTool, BoxAgentTimelineStream, r#loop::AgentLoopState};
 use crate::middleware::{
     chain::MiddlewareChain, prompt::SystemPromptOverride,
     tools::PermissionFilteredToolRegistryMiddleware,
@@ -166,7 +166,7 @@ where
 
     /// Stream the full ordered agent timeline.
     #[must_use]
-    pub fn stream(self) -> BoxAgentEventStream<'a> {
+    pub fn stream(self) -> BoxAgentTimelineStream<'a> {
         let run = self.into_ephemeral_session_run();
         Box::pin(stream::unfold(
             AgentLoopState::from_ephemeral_session(run),

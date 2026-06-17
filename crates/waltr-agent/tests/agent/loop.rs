@@ -4,22 +4,25 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{StreamExt, stream};
-use waltr_agent::middleware::ExternalRequestKind as MiddlewareExternalRequestKind;
 use waltr_agent::{
-    AGENTS_INSTRUCTION_FILE, Agent, AgentEvent, AgentTool, AgentTranscriptEvent,
-    AgentsPromptConfig, BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-    CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
-    FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef,
-    ProviderId, ProviderTurnMetadata, ResumeInput, SessionStatus, SessionStore, SkillsConfig,
-    ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TokenUsage, ToolCall, ToolDefinition,
+    AGENTS_INSTRUCTION_FILE, Agent, AgentTimelineEvent, AgentTool, AgentsPromptConfig,
+    BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
+    CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO,
+    CHANNEL_TOOL_RESULT, CompletionEvent, CompletionRequest, ExternalRequestId,
+    ExternalRequestKind, ExternalResponse, FilesystemPromptConfig, LlmError, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, ProviderId, ProviderTurnMetadata, ResumeInput,
+    SessionStore, SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent,
+    TimelineEventKind, TimelineStatus, TokenUsage, ToolCall, ToolDefinition,
     tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
 use serde_json::json;
+
+use crate::scripted_provider::ScriptedProvider;
 
 #[tokio::test]
 async fn durable_session_resume_continues_same_agent_loop() {
@@ -41,18 +44,21 @@ async fn durable_session_resume_continues_same_agent_loop() {
         .stream();
     let mut request_id = None;
     while let Some(event) = stream.next().await {
-        if let AgentEvent::ExternalRequest { request, .. } = event.expect("agent event") {
-            assert_eq!(request.kind, MiddlewareExternalRequestKind::Question);
-            request_id = Some(request.id);
+        let event = event.expect("agent event");
+        if let TimelineContent::ExternalRequest { request } = &event.content {
+            assert_eq!(request.kind, ExternalRequestKind::Question);
+            assert!(crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST));
+            request_id = Some(request.id.as_str().to_owned());
         }
     }
     let request_id = request_id.expect("question request");
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
     assert!(
-        store
-            .load(&session_id)
-            .await
-            .expect("stored session")
-            .snapshot
+        snapshot
             .external_requests
             .iter()
             .any(|request| request.kind == ExternalRequestKind::Question)
@@ -70,24 +76,24 @@ async fn durable_session_resume_continues_same_agent_loop() {
         .stream();
     let mut text = String::new();
     while let Some(event) = resumed.next().await {
-        if let AgentEvent::TextDelta { delta, .. } = event.expect("agent event") {
+        let event = event.expect("agent event");
+        if let TimelineContent::TextDelta { delta } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
+        {
             text.push_str(&delta);
         }
     }
 
     assert_eq!(text, "resumed-with-answer");
     assert!(provider.saw_resumed_tool_result());
-    assert!(
-        store
-            .load(&session_id)
-            .await
-            .expect("stored session")
-            .snapshot
-            .tool_results()
-            .any(
-                |result| result.name == QUESTION_TOOL_NAME && result.content == "resume-answer-123"
-            )
-    );
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert!(snapshot.tool_results().any(|result| {
+        result.name == QUESTION_TOOL_NAME && result.content == "resume-answer-123"
+    }));
 }
 
 #[tokio::test]
@@ -106,7 +112,10 @@ async fn provider_projection_and_turn_metadata_are_journaled() {
     .await;
 
     let record = store.load(&session_id).await.expect("stored session");
-    let request = record.requests.first().expect("journaled request record");
+    let request = record
+        .provider_requests()
+        .next()
+        .expect("journaled request record");
     assert_eq!(
         request.projected_request,
         json!({ "wire": "projected", "prompt": "hello" }),
@@ -115,7 +124,7 @@ async fn provider_projection_and_turn_metadata_are_journaled() {
     assert_ne!(request.projected_request, request.canonical_request);
     assert_eq!(
         record
-            .snapshot
+            .snapshot()
             .turns
             .first()
             .and_then(|turn| turn.metadata.clone()),
@@ -152,6 +161,133 @@ async fn provider_turn_metadata_is_forwarded_without_agent_filtering() {
 }
 
 #[tokio::test]
+async fn durable_session_timeline_ranges_preserve_cursor_order() {
+    let provider = MetadataEmittingProvider::default();
+    let agent = Agent::builder(test_model()).build();
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    drain(
+        sessions
+            .prompt(&provider, session_id.clone(), "range prompt")
+            .stream(),
+    )
+    .await;
+
+    let all = store
+        .timeline_after(&session_id, None, 10)
+        .await
+        .expect("timeline events");
+    assert!(
+        all.len() >= 2,
+        "expected content and finished status events"
+    );
+    assert!(
+        all.windows(2)
+            .all(|events| events[0].cursor < events[1].cursor)
+    );
+    assert!(matches!(
+        &all[0].content,
+        TimelineContent::TextDelta { delta } if delta == "first"
+    ));
+    assert!(crate::session::channel_is(&all[0], CHANNEL_ASSISTANT_TEXT));
+    assert_eq!(
+        all.last().map(|event| (event.kind, event.status)),
+        Some((
+            TimelineEventKind::SessionStatusChanged,
+            Some(TimelineStatus::Finished)
+        ))
+    );
+
+    let after_first = store
+        .timeline_after(&session_id, Some(all[0].cursor), 10)
+        .await
+        .expect("timeline after first cursor");
+    assert_eq!(after_first, all[1..].to_vec());
+
+    let before_last = store
+        .timeline_before(&session_id, all.last().map(|event| event.cursor), 10)
+        .await
+        .expect("timeline before last cursor");
+    assert_eq!(before_last, all[..all.len() - 1].to_vec());
+
+    let limited = store
+        .timeline_after(&session_id, None, 1)
+        .await
+        .expect("limited timeline range");
+    assert_eq!(limited, vec![all[0].clone()]);
+}
+
+#[tokio::test]
+async fn tool_progress_streams_between_call_preview_and_result() {
+    let provider = ScriptedProvider::from_turns(
+        "progress_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "progress-call",
+                "progress_tool",
+                json!({}),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    );
+    let tool = AgentTool::new_async(
+        ToolDefinition::new(
+            "progress_tool",
+            "Emit progress before finishing.",
+            json!({}),
+        ),
+        |context| {
+            Box::pin(async move {
+                context.progress().info("progress-started")?;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok(context.result("progress-finished"))
+            })
+        },
+    );
+    let agent = Agent::builder(test_model()).with_tool(tool).build();
+
+    let events = agent
+        .prompt(&provider, "run progress tool")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("agent event"))
+        .collect::<Vec<_>>();
+
+    let call_index = events
+        .iter()
+        .position(|event| crate::session::channel_is(event, CHANNEL_TOOL_CALL))
+        .expect("tool-call preview");
+    let progress_index = events
+        .iter()
+        .position(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_PROGRESS_INFO)
+                && matches!(&event.content, TimelineContent::TextDelta { delta } if delta == "progress-started")
+        })
+        .expect("tool progress");
+    let result_index = events
+        .iter()
+        .position(|event| crate::session::channel_is(event, CHANNEL_TOOL_RESULT))
+        .expect("tool result");
+
+    assert!(call_index < progress_index);
+    assert!(progress_index < result_index);
+    assert_eq!(
+        events[progress_index].parent_id,
+        Some(events[call_index].item_id.clone())
+    );
+    assert_eq!(
+        events[result_index].parent_id,
+        Some(events[call_index].item_id.clone())
+    );
+    assert!(events[call_index].cursor < events[progress_index].cursor);
+    assert!(events[progress_index].cursor < events[result_index].cursor);
+}
+
+#[tokio::test]
 async fn agents_system_prompt_is_sent_to_provider() {
     let temp = TempRoot::new("waltr-agent-static-agents-test");
     temp.write(AGENTS_INSTRUCTION_FILE, "Prefer concise answers.\n");
@@ -165,7 +301,10 @@ async fn agents_system_prompt_is_sent_to_provider() {
     let mut events = agent.prompt(&provider, "hello").stream();
     let mut text = String::new();
     while let Some(event) = events.next().await {
-        if let AgentEvent::TextDelta { delta, .. } = event.expect("agent event") {
+        let event = event.expect("agent event");
+        if let TimelineContent::TextDelta { delta } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
+        {
             text.push_str(&delta);
         }
     }
@@ -187,8 +326,11 @@ async fn filesystem_read_agents_context_is_opt_in_and_loaded_once() {
     let mut events = agent.prompt(&provider, "read twice").stream();
     let mut tool_results = Vec::new();
     while let Some(event) = events.next().await {
-        if let AgentEvent::ToolResult { result, .. } = event.expect("agent event") {
-            tool_results.push(result.content);
+        let event = event.expect("agent event");
+        if let TimelineContent::ToolResult { result } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)
+        {
+            tool_results.push(result.content.clone());
         }
     }
 
@@ -406,7 +548,10 @@ async fn agent_system_prompt_fragments_are_sent_in_order() {
         .stream();
     let mut text = String::new();
     while let Some(event) = events.next().await {
-        if let AgentEvent::TextDelta { delta, .. } = event.expect("agent event") {
+        let event = event.expect("agent event");
+        if let TimelineContent::TextDelta { delta } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
+        {
             text.push_str(&delta);
         }
     }
@@ -434,24 +579,37 @@ async fn tool_errors_are_reported_to_agent_for_recovery() {
     let mut events = agent.prompt(&RecoveringProvider, "recover").stream();
     let mut saw_error_result = false;
     let mut final_text = String::new();
+    let mut timeline = Vec::new();
 
     while let Some(event) = events.next().await {
-        match event.expect("agent event") {
-            AgentEvent::ToolResult { result, .. } => {
+        let event = event.expect("agent event");
+        match &event.content {
+            TimelineContent::ToolResult { result }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) =>
+            {
                 saw_error_result = result.content.contains("Tool error:")
                     && result.content.contains("validation failed");
             }
-            AgentEvent::TextDelta { delta, .. } => final_text.push_str(&delta),
-            AgentEvent::ThinkingDelta { .. }
-            | AgentEvent::ExternalRequest { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::TurnFinished { .. }
-            | AgentEvent::Finished { .. } => {}
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                final_text.push_str(delta);
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
         }
+        timeline.push(event);
     }
 
     assert!(saw_error_result);
     assert_eq!(final_text, "recovered");
+    assert_tool_call_precedes_parented_result(&timeline, "call_1");
 }
 
 #[tokio::test]
@@ -459,30 +617,45 @@ async fn agent_surfaces_and_stores_thinking_without_final_text_pollution() {
     let agent = Agent::builder(test_model()).build();
     let mut events = agent.prompt(&ThinkingProvider, "think").stream();
     let mut saw_thinking_delta = false;
-    let mut final_snapshot = None;
+    let mut final_text = String::new();
+    let mut saw_finished = false;
 
     while let Some(event) = events.next().await {
-        match event.expect("agent event") {
-            AgentEvent::ThinkingDelta { delta, .. } => {
+        let event = event.expect("agent event");
+        match &event.content {
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_THINKING) =>
+            {
                 saw_thinking_delta = delta == "hidden thought";
             }
-            AgentEvent::Finished { snapshot } => final_snapshot = Some(snapshot),
-            AgentEvent::TextDelta { .. }
-            | AgentEvent::ExternalRequest { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::ToolResult { .. }
-            | AgentEvent::TurnFinished { .. } => {}
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                final_text.push_str(delta);
+            }
+            TimelineContent::Empty
+                if event.kind == TimelineEventKind::SessionStatusChanged
+                    && event.status == Some(TimelineStatus::Finished) =>
+            {
+                saw_finished = true;
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
         }
     }
 
-    let snapshot = final_snapshot.expect("final snapshot");
     assert!(saw_thinking_delta);
-    assert_eq!(snapshot.status, SessionStatus::Finished);
-    assert_eq!(snapshot.state.last_assistant_text(), "final answer");
-    assert!(matches!(
-        snapshot.state.events[0],
-        AgentTranscriptEvent::Thinking { ref text, .. } if text == "hidden thought"
-    ));
+    assert_eq!(final_text, "final answer");
+    assert!(
+        saw_finished,
+        "stream should emit finished status timeline event"
+    );
 }
 
 #[tokio::test]
@@ -494,13 +667,31 @@ async fn agent_replays_thinking_blocks_on_tool_continuation() {
             "Look up test data.",
             json!({ "type": "object", "additionalProperties": false }),
         ),
-        |_call| Ok("tool output".to_owned()),
+        |call| Ok(call.result("tool output")),
     );
     let agent = Agent::builder(test_model()).with_tool(tool).build();
 
     drain(agent.prompt(&provider, "use tool").stream()).await;
 
     assert!(provider.saw_replayed_thinking());
+}
+
+#[tokio::test]
+async fn agent_replays_assistant_text_on_tool_continuation() {
+    let provider = ReplayAssistantTextProvider::default();
+    let tool = AgentTool::new(
+        ToolDefinition::new(
+            "lookup",
+            "Look up test data.",
+            json!({ "type": "object", "additionalProperties": false }),
+        ),
+        |call| Ok(call.result("tool output")),
+    );
+    let agent = Agent::builder(test_model()).with_tool(tool).build();
+
+    drain(agent.prompt(&provider, "use tool").stream()).await;
+
+    assert!(provider.saw_replayed_assistant_text());
 }
 
 fn test_model() -> ModelRef {
@@ -521,7 +712,7 @@ where
 
 async fn drain<S>(mut stream: S)
 where
-    S: futures_util::Stream<Item = waltr_agent::Result<AgentEvent>> + Unpin,
+    S: futures_util::Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
 {
     while let Some(event) = stream.next().await {
         event.expect("agent event");
@@ -530,12 +721,15 @@ where
 
 async fn tool_results<S>(mut stream: S) -> Vec<String>
 where
-    S: futures_util::Stream<Item = waltr_agent::Result<AgentEvent>> + Unpin,
+    S: futures_util::Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
 {
     let mut results = Vec::new();
     while let Some(event) = stream.next().await {
-        if let AgentEvent::ToolResult { result, .. } = event.expect("agent event") {
-            results.push(result.content);
+        let event = event.expect("agent event");
+        if let TimelineContent::ToolResult { result } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)
+        {
+            results.push(result.content.clone());
         }
     }
     results
@@ -543,9 +737,37 @@ where
 
 async fn single_tool_result<S>(stream: S) -> String
 where
-    S: futures_util::Stream<Item = waltr_agent::Result<AgentEvent>> + Unpin,
+    S: futures_util::Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
 {
     tool_results(stream).await.pop().expect("tool result")
+}
+
+fn assert_tool_call_precedes_parented_result(events: &[AgentTimelineEvent], call_id: &str) {
+    let call_index = events
+        .iter()
+        .position(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_CALL)
+                && matches!(&event.content, TimelineContent::ToolCall { call } if call.id == call_id)
+        })
+        .expect("tool-call preview event");
+    let result_index = events
+        .iter()
+        .position(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_RESULT)
+                && matches!(&event.content, TimelineContent::ToolResult { result } if result.call_id == call_id)
+        })
+        .expect("tool-result event");
+
+    let call = &events[call_index];
+    let result = &events[result_index];
+    assert!(
+        call_index < result_index,
+        "tool call must stream before result"
+    );
+    assert_eq!(call.kind, TimelineEventKind::ItemStarted);
+    assert_eq!(result.kind, TimelineEventKind::ItemFinished);
+    assert_eq!(result.parent_id.as_ref(), Some(&call.item_id));
+    assert!(call.cursor < result.cursor);
 }
 
 #[derive(Default)]
@@ -1066,6 +1288,47 @@ impl LlmStream for ReplayThinkingProvider {
                     Ok(CompletionEvent::Delta("done".to_owned())),
                     Ok(CompletionEvent::Finished),
                 ])) as BoxCompletionStream)
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct ReplayAssistantTextProvider {
+    calls: Mutex<usize>,
+    saw_replayed_assistant_text: Mutex<bool>,
+}
+
+impl ReplayAssistantTextProvider {
+    fn saw_replayed_assistant_text(&self) -> bool {
+        *self.saw_replayed_assistant_text.lock().expect("lock")
+    }
+}
+
+impl LlmStream for ReplayAssistantTextProvider {
+    fn name(&self) -> &'static str {
+        "replay_assistant_text_provider"
+    }
+
+    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        Box::pin(async move {
+            let mut calls = self.calls.lock().expect("lock");
+            *calls += 1;
+            if *calls == 1 {
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(CompletionEvent::Delta("partial ".to_owned())),
+                    Ok(CompletionEvent::Delta("answer".to_owned())),
+                    Ok(CompletionEvent::ToolCall(ToolCall::new(
+                        "call_1",
+                        "lookup",
+                        json!({}),
+                    ))),
+                ])) as BoxCompletionStream)
+            } else {
+                *self.saw_replayed_assistant_text.lock().expect("lock") =
+                    request.assistant_texts().collect::<Vec<_>>() == ["partial answer"];
+                Ok(Box::pin(stream::iter(vec![Ok(CompletionEvent::Finished)]))
+                    as BoxCompletionStream)
             }
         })
     }

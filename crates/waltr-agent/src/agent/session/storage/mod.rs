@@ -18,10 +18,9 @@ pub use postgresql::{opendal_postgresql_session_store, run_postgresql_migrations
 pub use s3::S3SessionStore;
 pub use scylla::ScyllaSessionStore;
 
-use super::types::{
-    ExternalRequest, RequestRecord, Revision, SessionEvent, SessionId, SessionRecord,
-    SessionSnapshot,
-};
+use crate::timeline::{AgentTimelineEvent, PendingTimelineEvent, TimelineCursor};
+
+use super::types::{Revision, SessionId, SessionJournalEvent, SessionRecord};
 
 /// Result type returned by session stores.
 pub type SessionStoreResult<T> = Result<T, SessionStoreError>;
@@ -86,8 +85,11 @@ impl Error for SessionStoreError {}
 
 /// Durable agent session storage contract.
 pub trait SessionStore: Send + Sync {
-    /// Create a new session record.
-    fn create(&self, record: SessionRecord) -> impl Future<Output = SessionStoreResult<()>> + Send;
+    /// Create a new empty session record.
+    fn create(
+        &self,
+        id: SessionId,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
     /// Load a session record.
     fn load(
@@ -95,35 +97,91 @@ pub trait SessionStore: Send + Sync {
         id: &SessionId,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
-    /// Append journal events if the current revision matches the caller's expectation.
-    fn append(
+    /// Append pending timeline events and return them with assigned cursors.
+    fn append_timeline(
         &self,
         id: &SessionId,
-        events: Vec<SessionEvent>,
         expected_revision: Revision,
+        events: Vec<PendingTimelineEvent>,
+    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send;
+
+    /// Append internal journal events if the revision matches.
+    fn append_journal(
+        &self,
+        id: &SessionId,
+        expected_revision: Revision,
+        events: Vec<SessionJournalEvent>,
     ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
 
-    /// Save a compact snapshot if the current revision matches the caller's expectation.
-    fn save_snapshot(
+    /// Read timeline events after `cursor`, or from the start when no cursor is supplied.
+    fn timeline_after(
         &self,
         id: &SessionId,
-        snapshot: SessionSnapshot,
-        expected_revision: Revision,
-    ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send;
 
-    /// Record a provider request before dispatch.
-    fn record_request(
+    /// Read timeline events before `cursor`, preserving persisted order.
+    fn timeline_before(
         &self,
         id: &SessionId,
-        request: RequestRecord,
-        expected_revision: Revision,
-    ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send;
+}
 
-    /// Record an external request before the runtime emits a suspension.
-    fn record_external_request(
-        &self,
-        id: &SessionId,
-        request: ExternalRequest,
-        expected_revision: Revision,
-    ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
+pub(super) fn append_timeline_to_record(
+    record: &mut SessionRecord,
+    id: &SessionId,
+    events: Vec<PendingTimelineEvent>,
+) -> SessionStoreResult<Vec<AgentTimelineEvent>> {
+    let mut cursor = record
+        .last_timeline_cursor()
+        .unwrap_or(TimelineCursor::ZERO);
+    let mut assigned = Vec::with_capacity(events.len());
+    for event in events {
+        if event.session_id != *id {
+            return Err(SessionStoreError::SessionIdMismatch {
+                expected: id.clone(),
+                actual: event.session_id,
+            });
+        }
+        cursor = cursor.next();
+        assigned.push(event.with_cursor(cursor));
+    }
+    record.append_journal_events(assigned.iter().cloned().map(SessionJournalEvent::Timeline));
+    Ok(assigned)
+}
+
+pub(super) fn timeline_after_slice(
+    record: &SessionRecord,
+    cursor: Option<TimelineCursor>,
+    limit: usize,
+) -> Vec<AgentTimelineEvent> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    record
+        .timeline_events()
+        .filter(|event| cursor.map_or(true, |cursor| event.cursor > cursor))
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+pub(super) fn timeline_before_slice(
+    record: &SessionRecord,
+    cursor: Option<TimelineCursor>,
+    limit: usize,
+) -> Vec<AgentTimelineEvent> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let events = record
+        .timeline_events()
+        .filter(|event| cursor.map_or(true, |cursor| event.cursor < cursor))
+        .cloned()
+        .collect::<Vec<_>>();
+    let start = events.len().saturating_sub(limit);
+    events[start..].to_vec()
 }

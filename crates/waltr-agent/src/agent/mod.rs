@@ -9,23 +9,21 @@ mod event;
 mod r#loop;
 mod run;
 pub mod session;
-mod state;
 mod tool;
 
 pub use builder::AgentBuilder;
-pub use event::{AgentEvent, BoxAgentEventStream};
+pub use event::BoxAgentTimelineStream;
 pub use run::AgentRunBuilder;
 pub use session::{
     AgentSession, AgentSessionRuntime, AgentSessions, CancelReason, ExternalRequest,
     ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse,
     FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
-    S3SessionStore, ScyllaSessionStore, SessionEvent, SessionId, SessionRecord, SessionSnapshot,
-    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, Suspension,
-    opendal_postgresql_session_store, run_postgresql_migrations,
+    S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionRecord,
+    SessionSnapshot, SessionStatus, SessionStore, SessionStoreError, SessionStoreResult,
+    Suspension, opendal_postgresql_session_store, run_postgresql_migrations,
 };
-pub use state::{AgentState, AgentTranscriptEvent};
-pub use tool::AgentTool;
+pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 
 /// Agent configuration and enabled capabilities.
 #[derive(Clone)]
@@ -93,9 +91,10 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
-        ExternalRequestId, ExternalResponse, MemorySessionStore, ModelApi, ModelRef, ProviderId,
-        ResumeInput, SessionEvent, SessionStore, ToolCall,
+        AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
+        CompletionRequest, ExternalRequestId, ExternalResponse, MemorySessionStore, ModelApi,
+        ModelRef, ProviderId, ResumeInput, SessionJournalEvent, SessionStore, TimelineContent,
+        ToolCall,
         middleware::{
             AgentMiddleware, HookOutcome,
             chain::MiddlewareChain,
@@ -109,7 +108,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use std::sync::{Arc, Mutex};
 
-    use super::{Agent, AgentEvent};
+    use super::Agent;
 
     struct NoopMiddleware;
 
@@ -224,14 +223,15 @@ mod tests {
             ctx: &mut RequestContext<'_>,
             _request: &mut ModelRequestDraft,
         ) -> crate::Result<HookOutcome> {
+            let current = ctx.state_as::<serde_json::Value>(self.namespace)?;
             self.observed
                 .lock()
                 .expect("observed state lock")
-                .push(ctx.state(self.namespace).cloned());
+                .push(current.clone());
             if let Some(state) = &self.write
-                && ctx.state(self.namespace).is_none()
+                && current.is_none()
             {
-                ctx.set_state(self.namespace, state.clone());
+                ctx.set_state_as(self.namespace, state)?;
             }
             Ok(HookOutcome::Continue)
         }
@@ -284,27 +284,28 @@ mod tests {
 
         let record = store.load(&session_id).await.expect("stored session");
         let state_index = record
-            .events
+            .journal
             .iter()
             .position(|event| {
                 matches!(
                     event,
-                    SessionEvent::MiddlewareStateUpdated { namespace, .. }
+                    SessionJournalEvent::MiddlewareStateUpdated { namespace, .. }
                         if namespace == "test-state"
                 )
             })
             .expect("state event journaled");
         let request_index = record
-            .events
+            .journal
             .iter()
-            .position(|event| matches!(event, SessionEvent::ProviderRequestRecorded { .. }))
+            .position(|event| matches!(event, SessionJournalEvent::ProviderRequestRecorded { .. }))
             .expect("request record journaled");
         assert!(
             state_index < request_index,
             "state event must precede the provider request record it influenced"
         );
+        let snapshot = record.snapshot();
         assert_eq!(
-            record.snapshot.middleware_state.get("test-state"),
+            snapshot.middleware_state.get("test-state"),
             Some(&json!({ "writes": 1 }))
         );
         assert_eq!(*observed.lock().expect("observed state lock"), vec![None]);
@@ -339,8 +340,10 @@ mod tests {
             .stream();
         let mut request_id = None;
         while let Some(event) = events.next().await {
-            if let AgentEvent::ExternalRequest { request, .. } = event.expect("agent event") {
-                request_id = Some(request.id);
+            if let TimelineContent::ExternalRequest { request } =
+                event.expect("agent event").content
+            {
+                request_id = Some(request.id.as_str().to_owned());
             }
         }
         drop(events);
@@ -383,7 +386,7 @@ mod tests {
 
     async fn drain<S>(mut stream: S)
     where
-        S: futures_util::Stream<Item = crate::Result<AgentEvent>> + Unpin,
+        S: futures_util::Stream<Item = crate::Result<AgentTimelineEvent>> + Unpin,
     {
         while let Some(event) = stream.next().await {
             event.expect("agent event");

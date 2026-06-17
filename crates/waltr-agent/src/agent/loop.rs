@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 
 use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
-    ModelRef, PermissionClaim, PermissionLevel, PermissionPolicy, Result, ToolCall, ToolDefinition,
-    ToolResult, TurnItem,
+    ModelRef, PendingTimelineEvent, PermissionClaim, PermissionLevel, PermissionPolicy, Result,
+    TimelineChannel, TimelineContent, TimelineEventKind, TimelineItemId, ToolCall, ToolDefinition,
+    ToolExecutionContext, ToolProgressSink, ToolResult, TurnItem,
     middleware::{
         self as middleware, HookOutcome,
         chain::MiddlewareChain,
@@ -21,15 +22,18 @@ use crate::{
         },
         tools::tool_is_visible,
     },
+    timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, TimelineStatus},
 };
+use tokio::sync::mpsc;
 
+use super::tool::ToolFuture;
 use super::{
-    AgentEvent, AgentState, AgentTool, AgentTranscriptEvent,
+    AgentTool,
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, RequestId, RequestRecord, ResumeInput,
-        Revision, RuntimeResumeOutput, SessionEvent, SessionId, SessionRecord, SessionSnapshot,
-        SessionStore, SessionStoreError, Suspension as SessionSuspension,
+        Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent, SessionRecord, SessionStore,
+        SessionStoreError, Suspension as SessionSuspension,
     },
 };
 
@@ -45,10 +49,9 @@ where
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
     turns: Vec<CompletionTurn>,
-    state: AgentState,
     turn: usize,
     phase: AgentLoopPhase,
-    pending: VecDeque<Result<AgentEvent>>,
+    pending: VecDeque<Result<AgentTimelineEvent>>,
     permission_policy: PermissionPolicy,
     session_id: SessionId,
     session_revision: Revision,
@@ -61,7 +64,15 @@ where
 enum AgentLoopPhase {
     StartTurn,
     Streaming(BoxCompletionStream),
+    ExecuteTool(ToolCall),
+    RunningTool(RunningTool),
     Done,
+}
+
+struct RunningTool {
+    call: ToolCall,
+    result: ToolFuture,
+    progress_rx: Option<mpsc::UnboundedReceiver<PendingTimelineEvent>>,
 }
 
 type ResolvedToolCall = std::result::Result<(usize, ToolDefinition), ToolResult>;
@@ -70,6 +81,11 @@ enum PermissionOutcome {
     Allow,
     Ask(Vec<PermissionClaim>),
     Deny(String),
+}
+
+enum ToolExecution {
+    Running(RunningTool),
+    Finished(Option<ToolResult>),
 }
 
 impl<'a, P, S> AgentLoopState<'a, P, S>
@@ -94,7 +110,6 @@ where
             tools: run.tools,
             middleware_chain: run.middleware_chain,
             turns: Vec::new(),
-            state: AgentState::default(),
             turn: 0,
             phase: AgentLoopPhase::StartTurn,
             pending: VecDeque::new(),
@@ -109,7 +124,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(super) async fn next(mut self) -> Option<(Result<AgentEvent>, Self)> {
+    pub(super) async fn next(mut self) -> Option<(Result<AgentTimelineEvent>, Self)> {
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some((event, self));
@@ -132,9 +147,6 @@ where
                     if let Err(error) = self.persist_provider_request(&draft, projected).await {
                         return Some((Err(error), self));
                     }
-                    if let Err(error) = self.save_session_snapshot().await {
-                        return Some((Err(error), self));
-                    }
                     match self.provider.stream_request(request).await {
                         Ok(stream) => self.phase = AgentLoopPhase::Streaming(stream),
                         Err(error) => {
@@ -145,60 +157,34 @@ where
                 }
                 AgentLoopPhase::Streaming(mut stream) => match stream.next().await {
                     Some(Ok(CompletionEvent::Delta(delta))) => {
-                        self.state.events.push(AgentTranscriptEvent::Text {
-                            turn: self.turn,
-                            text: delta.clone(),
-                        });
-                        if let Err(error) = self
-                            .append_session_event(SessionEvent::ProviderTextDelta {
-                                turn: self.turn as u64,
-                                delta: delta.clone(),
-                            })
-                            .await
-                        {
-                            return Some((Err(error), self));
-                        }
+                        let event = match self.append_assistant_delta(delta.clone()).await {
+                            Ok(event) => event,
+                            Err(error) => return Some((Err(error), self)),
+                        };
+                        CompletionTurn::entry(&mut self.turns, self.turn as u64)
+                            .append_assistant_text(&delta);
                         self.phase = AgentLoopPhase::Streaming(stream);
-                        return Some((
-                            Ok(AgentEvent::TextDelta {
-                                turn: self.turn,
-                                delta,
-                            }),
-                            self,
-                        ));
+                        return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::ThinkingDelta(delta))) => {
-                        self.state.events.push(AgentTranscriptEvent::Thinking {
-                            turn: self.turn,
-                            text: delta.text.clone(),
-                        });
-                        if let Err(error) = self
-                            .append_session_event(SessionEvent::ProviderThinkingDelta {
-                                turn: self.turn as u64,
-                                delta: delta.text.clone(),
-                            })
-                            .await
-                        {
-                            return Some((Err(error), self));
-                        }
+                        let event = match self.append_thinking_delta(delta.text.clone()).await {
+                            Ok(event) => event,
+                            Err(error) => return Some((Err(error), self)),
+                        };
                         self.phase = AgentLoopPhase::Streaming(stream);
-                        return Some((
-                            Ok(AgentEvent::ThinkingDelta {
-                                turn: self.turn,
-                                delta: delta.text,
-                            }),
-                            self,
-                        ));
+                        return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::ThinkingBlock(block))) => {
                         CompletionTurn::entry(&mut self.turns, self.turn as u64)
                             .items
                             .push(TurnItem::Thinking(block.clone()));
                         if let Err(error) = self
-                            .append_session_event(SessionEvent::ThinkingBlockRecorded {
-                                turn: self.turn as u64,
-                                block,
-                            })
+                            .append_journal_event(
+                                SessionJournalEvent::ProviderThinkingBlockRecorded {
+                                    turn: self.turn as u64,
+                                    block,
+                                },
+                            )
                             .await
                         {
                             return Some((Err(error), self));
@@ -209,10 +195,12 @@ where
                         CompletionTurn::entry(&mut self.turns, self.turn as u64).metadata =
                             Some(metadata.clone());
                         if let Err(error) = self
-                            .append_session_event(SessionEvent::ProviderTurnMetadataRecorded {
-                                turn: self.turn as u64,
-                                metadata,
-                            })
+                            .append_journal_event(
+                                SessionJournalEvent::ProviderTurnMetadataRecorded {
+                                    turn: self.turn as u64,
+                                    metadata,
+                                },
+                            )
                             .await
                         {
                             return Some((Err(error), self));
@@ -220,83 +208,37 @@ where
                         self.phase = AgentLoopPhase::Streaming(stream);
                     }
                     Some(Ok(CompletionEvent::ToolCall(call))) => {
-                        self.state.events.push(AgentTranscriptEvent::ToolCall {
-                            turn: self.turn,
-                            call: call.clone(),
-                        });
                         CompletionTurn::entry(&mut self.turns, self.turn as u64)
                             .items
                             .push(TurnItem::ToolCall(call.clone()));
-                        if let Err(error) = self
-                            .append_session_event(SessionEvent::ToolCallRecorded {
-                                turn: self.turn as u64,
-                                call: call.clone(),
-                            })
+                        let event = match self
+                            .append_timeline_event(tool_call_timeline_event(
+                                &self.session_id,
+                                self.turn as u64,
+                                call.clone(),
+                            ))
                             .await
                         {
-                            return Some((Err(error), self));
-                        }
-                        let event = AgentEvent::ToolCall {
-                            turn: self.turn,
-                            call: call.clone(),
+                            Ok(event) => event,
+                            Err(error) => return Some((Err(error), self)),
                         };
-                        let Some(result) = self.execute_tool(&call).await else {
-                            self.phase = AgentLoopPhase::Done;
-                            return Some((Ok(event), self));
-                        };
-                        CompletionTurn::entry(&mut self.turns, self.turn as u64)
-                            .items
-                            .push(TurnItem::ToolResult(result.clone()));
-                        self.state.events.push(AgentTranscriptEvent::ToolResult {
-                            turn: self.turn,
-                            result: result.clone(),
-                        });
-                        let mut events = self.middleware_state.drain_pending();
-                        events.push(SessionEvent::ToolResultRecorded {
-                            turn: self.turn as u64,
-                            result: result.clone(),
-                        });
-                        if let Err(error) = self.append_session_events(events).await {
-                            return Some((Err(error), self));
-                        }
-                        self.pending.push_back(Ok(AgentEvent::ToolResult {
-                            turn: self.turn,
-                            result,
-                        }));
-                        if let Err(error) = self
-                            .append_session_event(SessionEvent::TurnFinished {
-                                turn: self.turn as u64,
-                            })
-                            .await
-                        {
-                            return Some((Err(error), self));
-                        }
-                        self.pending
-                            .push_back(Ok(AgentEvent::TurnFinished { turn: self.turn }));
-                        if let Err(error) = self.save_session_snapshot().await {
-                            return Some((Err(error), self));
-                        }
-                        self.turn += 1;
-                        self.phase = AgentLoopPhase::StartTurn;
+                        self.phase = AgentLoopPhase::ExecuteTool(call);
                         return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::Finished)) | None => {
                         let mut events = self.middleware_state.drain_pending();
-                        events.push(SessionEvent::TurnFinished {
+                        events.push(SessionJournalEvent::TurnFinished {
                             turn: self.turn as u64,
                         });
-                        events.push(SessionEvent::Finished);
-                        if let Err(error) = self.append_session_events(events).await {
+                        events.push(SessionJournalEvent::Finished);
+                        if let Err(error) = self.append_journal_events(events).await {
                             return Some((Err(error), self));
                         }
-                        self.pending
-                            .push_back(Ok(AgentEvent::TurnFinished { turn: self.turn }));
-                        let snapshot = match self.save_session_snapshot().await {
-                            Ok(snapshot) => snapshot,
+                        let status = match self.append_finished_status_event().await {
+                            Ok(event) => event,
                             Err(error) => return Some((Err(error), self)),
                         };
-                        self.pending
-                            .push_back(Ok(AgentEvent::Finished { snapshot }));
+                        self.pending.push_back(Ok(status));
                         self.phase = AgentLoopPhase::Done;
                     }
                     Some(Err(error)) => {
@@ -304,6 +246,63 @@ where
                         return Some((Err(error), self));
                     }
                 },
+                AgentLoopPhase::ExecuteTool(call) => match self.start_tool(call).await {
+                    Ok(ToolExecution::Running(running)) => {
+                        self.phase = AgentLoopPhase::RunningTool(running);
+                        continue;
+                    }
+                    Ok(ToolExecution::Finished(Some(result))) => {
+                        if let Err(error) = self.finish_tool_turn(result).await {
+                            return Some((Err(error), self));
+                        }
+                        continue;
+                    }
+                    Ok(ToolExecution::Finished(None)) => continue,
+                    Err(error) => return Some((Err(error), self)),
+                },
+                AgentLoopPhase::RunningTool(mut running) => {
+                    if let Some(rx) = running.progress_rx.as_mut() {
+                        tokio::select! {
+                            biased;
+
+                            progress = rx.recv() => {
+                                match progress {
+                                    Some(progress) => {
+                                        let event = match self.append_timeline_event(progress).await {
+                                            Ok(event) => event,
+                                            Err(error) => return Some((Err(error), self)),
+                                        };
+                                        self.phase = AgentLoopPhase::RunningTool(running);
+                                        return Some((Ok(event), self));
+                                    }
+                                    None => {
+                                        running.progress_rx = None;
+                                        self.phase = AgentLoopPhase::RunningTool(running);
+                                        continue;
+                                    }
+                                }
+                            }
+                            result = &mut running.result => {
+                                if let Some(progress_rx) = running.progress_rx.as_mut() {
+                                    match self.append_timeline_events(drain_progress_events(progress_rx)).await {
+                                        Ok(events) => self.pending.extend(events.into_iter().map(Ok)),
+                                        Err(error) => return Some((Err(error), self)),
+                                    }
+                                }
+                                if let Err(error) = self.finish_running_tool(running.call, result).await {
+                                    return Some((Err(error), self));
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        let result = running.result.await;
+                        if let Err(error) = self.finish_running_tool(running.call, result).await {
+                            return Some((Err(error), self));
+                        }
+                        continue;
+                    }
+                }
                 AgentLoopPhase::Done => return None,
             }
         }
@@ -311,12 +310,6 @@ where
 
     async fn build_provider_request(&mut self) -> Result<ModelRequestDraft> {
         let mut ctx = RequestContext {
-            session_id: self.session_id.as_str(),
-            revision: self.session_revision.get(),
-            model_id: &self.model.model,
-            provider_id: Some(self.model.provider),
-            turn: self.turn as u64,
-            session: &self.state,
             middleware_state: &mut self.middleware_state,
             system_prompt_override: &mut self.system_prompt_override,
         };
@@ -347,7 +340,6 @@ where
             .await?
         {
             HookOutcome::Continue => Ok(request),
-            HookOutcome::Abort(error) => Err(error),
             outcome => Err(unsupported_before_provider_request_outcome(&outcome)),
         }
     }
@@ -372,11 +364,10 @@ where
         Some(Ok((tool_index, tool_definition)))
     }
 
-    async fn execute_tool(&mut self, call: &ToolCall) -> Option<ToolResult> {
-        let mut call = call.clone();
+    async fn start_tool(&mut self, mut call: ToolCall) -> Result<ToolExecution> {
         let resolved = match self.resolve_tool_call(&call) {
             Some(Ok(resolved)) => Some(resolved),
-            Some(Err(result)) => return Some(result),
+            Some(Err(result)) => return Ok(ToolExecution::Finished(Some(result))),
             None => None,
         };
 
@@ -386,11 +377,8 @@ where
         let before_outcome = {
             let mut ctx = ToolCallContext {
                 session_id: self.session_id.as_str(),
-                revision: self.session_revision.get(),
                 turn: self.turn as u64,
-                session: &self.state,
                 call: &mut call,
-                tool_definition: resolved.as_ref().map(|(_, definition)| definition),
                 permission_claims: &mut claims,
                 middleware_state: &mut self.middleware_state,
             };
@@ -398,30 +386,39 @@ where
         };
         match before_outcome {
             Ok(HookOutcome::Continue) => {}
-            Ok(outcome) => return self.tool_result_from_hook_outcome(&call, outcome).await,
-            Err(error) => return Some(error_tool_result(&call, &error)),
+            Ok(outcome) => {
+                return self
+                    .tool_result_from_hook_outcome(&call, outcome)
+                    .await
+                    .map(ToolExecution::Finished);
+            }
+            Err(error) => {
+                return Ok(ToolExecution::Finished(Some(error_tool_result(
+                    &call, &error,
+                ))));
+            }
         }
 
         let Some((tool_index, _)) = resolved else {
-            return Some(error_tool_result(
+            return Ok(ToolExecution::Finished(Some(error_tool_result(
                 &call,
                 &LlmError::Protocol {
                     provider: "agent",
                     message: format!("unknown tool: {}", call.name),
                 },
-            ));
+            ))));
         };
 
         match self.permission_outcome(&call, &claims) {
             PermissionOutcome::Allow => {}
             PermissionOutcome::Deny(message) => {
-                return Some(error_tool_result(
+                return Ok(ToolExecution::Finished(Some(error_tool_result(
                     &call,
                     &LlmError::Protocol {
                         provider: "permission",
                         message,
                     },
-                ));
+                ))));
             }
             PermissionOutcome::Ask(claims) => {
                 let outcome = HookOutcome::Suspend(permission_suspension(
@@ -430,21 +427,44 @@ where
                     &call,
                     &claims,
                 ));
-                return self.tool_result_from_hook_outcome(&call, outcome).await;
+                return self
+                    .tool_result_from_hook_outcome(&call, outcome)
+                    .await
+                    .map(ToolExecution::Finished);
             }
         }
 
-        let mut result = match self.tools[tool_index].call(&call).await {
-            Ok(content) => ToolResult::new(call.id.clone(), call.name.clone(), content),
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let progress = ToolProgressSink::timeline(
+            self.session_id.clone(),
+            self.turn as u64,
+            tool_call_item_id(&call.id),
+            move |event| {
+                drop(progress_tx.send(event));
+                Ok(())
+            },
+        );
+        let result = self.tools[tool_index]
+            .call(ToolExecutionContext::with_progress(call.clone(), progress));
+        Ok(ToolExecution::Running(RunningTool {
+            call,
+            result,
+            progress_rx: Some(progress_rx),
+        }))
+    }
+
+    async fn finish_running_tool(
+        &mut self,
+        call: ToolCall,
+        result: Result<ToolResult>,
+    ) -> Result<()> {
+        let mut result = match result {
+            Ok(result) => result,
             Err(error) => error_tool_result(&call, &error),
         };
 
         let after_outcome = {
             let mut ctx = ToolResultContext {
-                session_id: self.session_id.as_str(),
-                revision: self.session_revision.get(),
-                turn: self.turn as u64,
-                session: &self.state,
                 call: Some(&call),
                 result: &mut result,
                 middleware_state: &mut self.middleware_state,
@@ -452,32 +472,57 @@ where
             self.middleware_chain.after_tool_call(&mut ctx).await
         };
         match after_outcome {
-            Ok(HookOutcome::Continue) => Some(result),
-            Ok(outcome) => self.tool_result_from_hook_outcome(&call, outcome).await,
-            Err(error) => Some(error_tool_result(&call, &error)),
+            Ok(HookOutcome::Continue) => self.finish_tool_turn(result).await,
+            Ok(outcome) => {
+                if let Some(result) = self.tool_result_from_hook_outcome(&call, outcome).await? {
+                    self.finish_tool_turn(result).await?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.finish_tool_turn(error_tool_result(&call, &error))
+                    .await
+            }
         }
+    }
+
+    async fn finish_tool_turn(&mut self, result: ToolResult) -> Result<()> {
+        CompletionTurn::entry(&mut self.turns, self.turn as u64)
+            .items
+            .push(TurnItem::ToolResult(result.clone()));
+        let events = self.middleware_state.drain_pending();
+        self.append_journal_events(events).await?;
+        let event = self
+            .append_timeline_event(tool_result_timeline_event(
+                &self.session_id,
+                self.turn as u64,
+                result,
+            ))
+            .await?;
+        self.append_journal_event(SessionJournalEvent::TurnFinished {
+            turn: self.turn as u64,
+        })
+        .await?;
+        self.turn += 1;
+        self.phase = AgentLoopPhase::StartTurn;
+        self.pending.push_back(Ok(event));
+        Ok(())
     }
 
     async fn tool_result_from_hook_outcome(
         &mut self,
         call: &ToolCall,
         outcome: HookOutcome,
-    ) -> Option<ToolResult> {
+    ) -> Result<Option<ToolResult>> {
         match outcome {
-            HookOutcome::Continue => Some(ToolResult::new(call.id.clone(), call.name.clone(), "")),
-            HookOutcome::ReplaceToolResult(result) => Some(result),
-            HookOutcome::Abort(error) => Some(error_tool_result(call, &error)),
-            HookOutcome::Suppress => Some(ToolResult::new(
+            HookOutcome::Continue => Ok(Some(ToolResult::new(
                 call.id.clone(),
                 call.name.clone(),
-                "Tool call suppressed by middleware.",
-            )),
+                "",
+            ))),
+            HookOutcome::ReplaceToolResult(result) => Ok(Some(result)),
             HookOutcome::Suspend(mut suspension) => {
                 let mut ctx = RunContext {
-                    session_id: self.session_id.as_str(),
-                    revision: self.session_revision.get(),
-                    turn: self.turn as u64,
-                    session: &self.state,
                     middleware_state: &mut self.middleware_state,
                 };
                 if let Err(error) = self
@@ -485,32 +530,27 @@ where
                     .on_suspend(&mut ctx, &mut suspension)
                     .await
                 {
-                    return Some(error_tool_result(call, &error));
+                    return Ok(Some(error_tool_result(call, &error)));
                 }
                 if let Some(request) = suspension.external_request.clone() {
-                    if let Err(error) = self.persist_external_request(&request).await {
-                        return Some(error_tool_result(call, &error));
-                    }
+                    let event = match self.persist_external_request(&request).await {
+                        Ok(event) => event,
+                        Err(error) => return Ok(Some(error_tool_result(call, &error))),
+                    };
                     let session_request = external_request_from_draft(&request);
                     let mut events = self.middleware_state.drain_pending();
-                    events.push(SessionEvent::Suspended {
+                    events.push(SessionJournalEvent::Suspended {
                         suspension: SessionSuspension::AwaitingExternalInput {
                             request: Box::new(session_request),
                         },
                     });
-                    if let Err(error) = self.append_session_events(events).await {
-                        return Some(error_tool_result(call, &error));
+                    if let Err(error) = self.append_journal_events(events).await {
+                        return Ok(Some(error_tool_result(call, &error)));
                     }
-                    if let Err(error) = self.save_session_snapshot().await {
-                        return Some(error_tool_result(call, &error));
-                    }
-                    self.pending.push_back(Ok(AgentEvent::ExternalRequest {
-                        turn: self.turn,
-                        request,
-                    }));
+                    self.pending.push_back(Ok(event));
                 }
                 self.phase = AgentLoopPhase::Done;
-                None
+                Ok(None)
             }
         }
     }
@@ -576,18 +616,11 @@ where
         };
         self.prompt.clone_from(&prompt);
         self.session_store
-            .create(SessionRecord::new(self.session_id.clone()))
+            .create(self.session_id.clone())
             .await
             .map_err(session_store_error)?;
-        self.session_revision = self
-            .session_store
-            .append(
-                &self.session_id,
-                vec![SessionEvent::PromptAppended { prompt }],
-                self.session_revision,
-            )
-            .await
-            .map_err(session_store_error)?;
+        self.append_journal_event(SessionJournalEvent::PromptAppended { prompt })
+            .await?;
         self.session_initialized = true;
         Ok(())
     }
@@ -600,9 +633,10 @@ where
 
         let record = match input {
             ResumeInput::Prompt(prompt) => {
-                if record.snapshot.current_prompt.as_deref() == Some(prompt.as_str())
-                    && record.snapshot.prompts.len() == 1
-                    && record.snapshot.turns.is_empty()
+                let snapshot = record.snapshot();
+                if snapshot.current_prompt.as_deref() == Some(prompt.as_str())
+                    && snapshot.prompts.len() == 1
+                    && snapshot.turns.is_empty()
                 {
                     record
                 } else {
@@ -654,56 +688,97 @@ where
     }
 
     fn hydrate_from_record(&mut self, record: SessionRecord) {
-        let snapshot = record.snapshot;
+        let snapshot = record.snapshot();
         self.middleware_state = MiddlewareStateLog::from_snapshot(&snapshot);
         self.prompt = snapshot.current_prompt.unwrap_or_default();
         self.turns = snapshot.turns;
-        self.state = snapshot.state;
         self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
     }
 
-    async fn append_session_event(&mut self, event: SessionEvent) -> Result<()> {
-        self.append_session_events(vec![event]).await
+    async fn append_journal_event(&mut self, event: SessionJournalEvent) -> Result<()> {
+        self.append_journal_events(vec![event]).await
     }
 
-    async fn append_session_events(&mut self, events: Vec<SessionEvent>) -> Result<()> {
+    async fn append_journal_events(&mut self, events: Vec<SessionJournalEvent>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
         self.session_revision = self
             .session_store
-            .append(&self.session_id, events, self.session_revision)
+            .append_journal(&self.session_id, self.session_revision, events)
             .await
             .map_err(session_store_error)?;
         Ok(())
     }
 
-    // Returns the snapshot exactly as persisted: stores stamp the new revision on save.
-    async fn save_session_snapshot(&mut self) -> Result<SessionSnapshot> {
-        let record = self
+    async fn append_timeline_event(
+        &mut self,
+        event: PendingTimelineEvent,
+    ) -> Result<AgentTimelineEvent> {
+        let mut events = self.append_timeline_events(vec![event]).await?;
+        events
+            .pop()
+            .ok_or_else(|| session_store_error("timeline append returned no assigned event"))
+    }
+
+    async fn append_timeline_events(
+        &mut self,
+        events: Vec<PendingTimelineEvent>,
+    ) -> Result<Vec<AgentTimelineEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let assigned = self
             .session_store
-            .load(&self.session_id)
+            .append_timeline(&self.session_id, self.session_revision, events)
             .await
             .map_err(session_store_error)?;
-        let mut snapshot = SessionSnapshot::new(record.id.clone());
-        snapshot.apply_events(&record.events);
-        self.session_revision = self
-            .session_store
-            .save_snapshot(&self.session_id, snapshot.clone(), self.session_revision)
-            .await
-            .map_err(session_store_error)?;
-        snapshot.revision = self.session_revision;
-        Ok(snapshot)
+        self.session_revision = self.session_revision.next();
+        Ok(assigned)
+    }
+
+    async fn append_assistant_delta(&mut self, delta: String) -> Result<AgentTimelineEvent> {
+        self.append_timeline_event(PendingTimelineEvent::assistant_text_delta(
+            self.session_id.clone(),
+            self.turn as u64,
+            assistant_text_item_id(self.turn as u64),
+            delta,
+        ))
+        .await
+    }
+
+    async fn append_thinking_delta(&mut self, delta: String) -> Result<AgentTimelineEvent> {
+        self.append_timeline_event(PendingTimelineEvent::thinking_delta(
+            self.session_id.clone(),
+            self.turn as u64,
+            thinking_item_id(self.turn as u64),
+            delta,
+        ))
+        .await
+    }
+
+    async fn append_finished_status_event(&mut self) -> Result<AgentTimelineEvent> {
+        let mut event = PendingTimelineEvent::new(
+            self.session_id.clone(),
+            self.turn as u64,
+            session_status_item_id(),
+            TimelineEventKind::SessionStatusChanged,
+            None,
+            TimelineContent::Empty,
+        );
+        event.status = Some(TimelineStatus::Finished);
+        self.append_timeline_event(event).await
     }
 
     async fn pending_failed_session_event(&mut self, error: &LlmError) {
-        if self.session_initialized
-            && self
-                .append_session_event(SessionEvent::Failed {
+        if self.session_initialized {
+            drop(
+                self.append_journal_event(SessionJournalEvent::Failed {
                     message: error.to_string(),
                 })
-                .await
-                .is_ok()
-        {
-            drop(self.save_session_snapshot().await);
+                .await,
+            );
         }
     }
 
@@ -729,21 +804,16 @@ where
         // State writes that shaped this request must be durable before the request record.
         let events = self.middleware_state.drain_pending();
         if !events.is_empty() {
-            self.append_session_events(events).await?;
+            self.append_journal_events(events).await?;
         }
-        self.session_revision = self
-            .session_store
-            .record_request(&self.session_id, request.clone(), self.session_revision)
-            .await
-            .map_err(session_store_error)?;
-        self.append_session_event(SessionEvent::ProviderRequestRecorded { request })
+        self.append_journal_event(SessionJournalEvent::ProviderRequestRecorded { request })
             .await
     }
 
     async fn persist_external_request(
         &mut self,
         request: &middleware::ExternalRequestDraft,
-    ) -> Result<()> {
+    ) -> Result<AgentTimelineEvent> {
         let request = ExternalRequest {
             id: ExternalRequestId::new(request.id.clone()),
             kind: session_external_request_kind(&request.kind),
@@ -755,17 +825,89 @@ where
 
         let events = self.middleware_state.drain_pending();
         if !events.is_empty() {
-            self.append_session_events(events).await?;
+            self.append_journal_events(events).await?;
         }
-        self.session_revision = self
-            .session_store
-            .record_external_request(&self.session_id, request.clone(), self.session_revision)
-            .await
-            .map_err(session_store_error)?;
-        self.append_session_event(SessionEvent::ExternalRequestCreated { request })
-            .await?;
-        Ok(())
+        self.append_timeline_event(external_request_timeline_event(
+            &self.session_id,
+            self.turn as u64,
+            request,
+            TimelineEventKind::ExternalRequestOpened,
+        ))
+        .await
     }
+}
+
+fn assistant_text_item_id(turn: u64) -> TimelineItemId {
+    TimelineItemId::new(format!("assistant-turn-{turn}"))
+}
+
+fn thinking_item_id(turn: u64) -> TimelineItemId {
+    TimelineItemId::new(format!("thinking-turn-{turn}"))
+}
+
+fn tool_call_item_id(call_id: &str) -> TimelineItemId {
+    TimelineItemId::new(format!("tool-call:{call_id}"))
+}
+
+fn tool_result_item_id(call_id: &str) -> TimelineItemId {
+    TimelineItemId::new(format!("tool-result:{call_id}"))
+}
+
+fn external_request_item_id(request_id: &ExternalRequestId) -> TimelineItemId {
+    TimelineItemId::new(format!("external-request:{}", request_id.as_str()))
+}
+
+fn drain_progress_events(
+    progress_rx: &mut mpsc::UnboundedReceiver<PendingTimelineEvent>,
+) -> Vec<PendingTimelineEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = progress_rx.try_recv() {
+        events.push(event);
+    }
+    events
+}
+
+fn session_status_item_id() -> TimelineItemId {
+    TimelineItemId::new("session-status")
+}
+
+fn tool_call_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    call: ToolCall,
+) -> PendingTimelineEvent {
+    PendingTimelineEvent::tool_call(session_id.clone(), turn, tool_call_item_id(&call.id), call)
+}
+
+fn tool_result_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    result: ToolResult,
+) -> PendingTimelineEvent {
+    let call_id = result.call_id.clone();
+    PendingTimelineEvent::tool_result(
+        session_id.clone(),
+        turn,
+        tool_result_item_id(&call_id),
+        tool_call_item_id(&call_id),
+        result,
+    )
+}
+
+fn external_request_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    request: ExternalRequest,
+    kind: TimelineEventKind,
+) -> PendingTimelineEvent {
+    PendingTimelineEvent::new(
+        session_id.clone(),
+        turn,
+        external_request_item_id(&request.id),
+        kind,
+        Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
+        TimelineContent::ExternalRequest { request },
+    )
 }
 
 fn external_request_from_draft(request: &middleware::ExternalRequestDraft) -> ExternalRequest {
@@ -801,6 +943,7 @@ fn turn_json(turn: &CompletionTurn) -> Value {
 
 fn turn_item_json(item: &TurnItem) -> Value {
     match item {
+        TurnItem::AssistantText(text) => json!({ "assistant_text": text }),
         TurnItem::Thinking(block) => json!({
             "thinking": {
                 "kind": format!("{:?}", block.kind),

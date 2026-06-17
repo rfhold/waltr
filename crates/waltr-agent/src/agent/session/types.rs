@@ -9,9 +9,11 @@ use serde_json::Value;
 
 use crate::{
     CompletionTurn, ModelRef, ProviderTurnMetadata, ThinkingBlock, ToolCall, ToolResult, TurnItem,
+    timeline::{
+        AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, TimelineContent,
+        TimelineEventKind, TimelineStatus,
+    },
 };
-
-use super::super::{AgentState, AgentTranscriptEvent};
 
 /// Durable session identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,41 +171,81 @@ pub struct SessionRecord {
     pub id: SessionId,
     /// Current optimistic revision.
     pub revision: Revision,
-    /// Latest compact session snapshot.
-    pub snapshot: SessionSnapshot,
-    /// Ordered event journal entries not necessarily compacted into the snapshot.
-    pub events: Vec<SessionEvent>,
-    /// Provider requests recorded before dispatch.
-    pub requests: Vec<RequestRecord>,
+    /// Ordered durable journal, including cursor-assigned timeline events.
+    pub journal: Vec<SessionJournalEvent>,
 }
 
 impl SessionRecord {
     /// Create a session record with an empty journal.
     pub fn new(id: impl Into<SessionId>) -> Self {
-        let id = id.into();
         Self {
-            snapshot: SessionSnapshot::new(id.clone()),
-            id,
+            id: id.into(),
             revision: Revision::ZERO,
-            events: Vec::new(),
-            requests: Vec::new(),
+            journal: Vec::new(),
         }
     }
 
-    /// Apply and append one durable event to this record.
-    pub fn apply_event(&mut self, event: SessionEvent) {
-        if let SessionEvent::ProviderRequestRecorded { request } = &event {
-            self.requests.push(request.clone());
-        }
-        self.snapshot.apply_event(&event);
-        self.events.push(event);
+    /// Derive the current compact session projection from the journal.
+    #[must_use]
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let mut snapshot = SessionSnapshot::from_journal(self.id.clone(), &self.journal);
+        snapshot.revision = self.revision;
+        snapshot
     }
 
-    /// Apply and append durable events to this record in order.
-    pub fn apply_events(&mut self, events: impl IntoIterator<Item = SessionEvent>) {
-        for event in events {
-            self.apply_event(event);
-        }
+    /// Append one durable journal event to this record.
+    pub fn append_journal_event(&mut self, event: SessionJournalEvent) {
+        self.journal.push(event);
+    }
+
+    /// Append durable journal events to this record in order.
+    pub fn append_journal_events(&mut self, events: impl IntoIterator<Item = SessionJournalEvent>) {
+        self.journal.extend(events);
+    }
+
+    /// Timeline events stored in journal order.
+    pub fn timeline_events(&self) -> impl Iterator<Item = &AgentTimelineEvent> {
+        self.journal.iter().filter_map(|event| match event {
+            SessionJournalEvent::Timeline(event) => Some(event),
+            SessionJournalEvent::PromptAppended { .. }
+            | SessionJournalEvent::ProviderRequestRecorded { .. }
+            | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
+            | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
+            | SessionJournalEvent::MiddlewareStateUpdated { .. }
+            | SessionJournalEvent::ExternalRequestResponded { .. }
+            | SessionJournalEvent::ExternalRequestCanceled { .. }
+            | SessionJournalEvent::Suspended { .. }
+            | SessionJournalEvent::WorkCanceled { .. }
+            | SessionJournalEvent::Interrupted
+            | SessionJournalEvent::TurnFinished { .. }
+            | SessionJournalEvent::Finished
+            | SessionJournalEvent::Failed { .. } => None,
+        })
+    }
+
+    /// Last assigned timeline cursor, if any.
+    pub fn last_timeline_cursor(&self) -> Option<crate::timeline::TimelineCursor> {
+        self.timeline_events().last().map(|event| event.cursor)
+    }
+
+    /// Provider request records stored in journal order.
+    pub fn provider_requests(&self) -> impl Iterator<Item = &RequestRecord> {
+        self.journal.iter().filter_map(|event| match event {
+            SessionJournalEvent::ProviderRequestRecorded { request } => Some(request),
+            SessionJournalEvent::Timeline(_)
+            | SessionJournalEvent::PromptAppended { .. }
+            | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
+            | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
+            | SessionJournalEvent::MiddlewareStateUpdated { .. }
+            | SessionJournalEvent::ExternalRequestResponded { .. }
+            | SessionJournalEvent::ExternalRequestCanceled { .. }
+            | SessionJournalEvent::Suspended { .. }
+            | SessionJournalEvent::WorkCanceled { .. }
+            | SessionJournalEvent::Interrupted
+            | SessionJournalEvent::TurnFinished { .. }
+            | SessionJournalEvent::Finished
+            | SessionJournalEvent::Failed { .. } => None,
+        })
     }
 }
 
@@ -220,8 +262,6 @@ pub struct SessionSnapshot {
     pub current_prompt: Option<String>,
     /// Next provider turn number.
     pub turn: u64,
-    /// Provider-neutral transcript state.
-    pub state: AgentState,
     /// Completed turns accumulated for provider request replay, in turn order.
     pub turns: Vec<CompletionTurn>,
     /// Runtime status captured at the checkpoint.
@@ -245,7 +285,6 @@ impl SessionSnapshot {
             prompts: Vec::new(),
             current_prompt: None,
             turn: 0,
-            state: AgentState::default(),
             turns: Vec::new(),
             status: SessionStatus::Idle,
             pending_work: Vec::new(),
@@ -254,9 +293,22 @@ impl SessionSnapshot {
         }
     }
 
+    /// Rebuild a snapshot projection from durable journal records.
+    #[must_use]
+    pub fn from_journal(id: SessionId, journal: &[SessionJournalEvent]) -> Self {
+        let mut snapshot = Self::new(id);
+        snapshot.apply_events(journal);
+        snapshot
+    }
+
     /// Tool calls accumulated across all turns, in emission order.
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
         self.turns.iter().flat_map(CompletionTurn::tool_calls)
+    }
+
+    /// Assistant text accumulated across all turns, in emission order.
+    pub fn assistant_texts(&self) -> impl Iterator<Item = &str> {
+        self.turns.iter().flat_map(CompletionTurn::assistant_texts)
     }
 
     /// Tool results accumulated across all turns, in emission order.
@@ -269,81 +321,58 @@ impl SessionSnapshot {
         self.turns.iter().flat_map(CompletionTurn::thinking_blocks)
     }
 
-    /// Apply one durable event to this snapshot.
-    pub fn apply_event(&mut self, event: &SessionEvent) {
+    /// Apply one durable journal event to this snapshot.
+    pub fn apply_event(&mut self, event: &SessionJournalEvent) {
         match event {
-            SessionEvent::PromptAppended { prompt } => {
+            SessionJournalEvent::Timeline(event) => self.apply_timeline_event(event),
+            SessionJournalEvent::PromptAppended { prompt } => {
                 self.prompts.push(prompt.clone());
                 self.current_prompt = Some(prompt.clone());
                 self.status = SessionStatus::BuildingRequest;
             }
-            SessionEvent::ProviderRequestRecorded { .. } => {
+            SessionJournalEvent::ProviderRequestRecorded { .. } => {
                 self.status = SessionStatus::StreamingProvider;
             }
-            SessionEvent::ProviderTextDelta { turn, delta }
-            | SessionEvent::TextDelta { turn, delta } => {
-                self.state.events.push(AgentTranscriptEvent::Text {
-                    turn: turn_index(*turn),
-                    text: delta.clone(),
-                });
-                self.status = SessionStatus::StreamingProvider;
-            }
-            SessionEvent::ProviderThinkingDelta { turn, delta }
-            | SessionEvent::ThinkingDelta { turn, delta } => {
-                self.state.events.push(AgentTranscriptEvent::Thinking {
-                    turn: turn_index(*turn),
-                    text: delta.clone(),
-                });
-                self.status = SessionStatus::StreamingProvider;
-            }
-            SessionEvent::ThinkingBlockRecorded { turn, block } => {
+            SessionJournalEvent::ProviderThinkingBlockRecorded { turn, block } => {
                 CompletionTurn::entry(&mut self.turns, *turn)
                     .items
                     .push(TurnItem::Thinking(block.clone()));
                 self.status = SessionStatus::StreamingProvider;
             }
-            SessionEvent::ProviderTurnMetadataRecorded { turn, metadata } => {
+            SessionJournalEvent::ProviderTurnMetadataRecorded { turn, metadata } => {
                 CompletionTurn::entry(&mut self.turns, *turn).metadata = Some(metadata.clone());
                 self.status = SessionStatus::StreamingProvider;
             }
-            SessionEvent::ToolCallRecorded { turn, call }
-            | SessionEvent::ToolCall { turn, call } => self.record_tool_call(*turn, call),
-            SessionEvent::ToolResultRecorded { turn, result }
-            | SessionEvent::ToolResult { turn, result } => self.record_tool_result(*turn, result),
-            SessionEvent::MiddlewareStateUpdated { namespace, state } => {
+            SessionJournalEvent::MiddlewareStateUpdated { namespace, state } => {
                 self.middleware_state
                     .insert(namespace.clone(), state.clone());
             }
-            SessionEvent::ExternalRequestCreated { request } => {
-                upsert_external_request(&mut self.external_requests, request.clone());
-                self.status = SessionStatus::Suspended(Suspension::AwaitingExternalInput {
-                    request: Box::new(request.clone()),
-                });
-            }
-            SessionEvent::ExternalRequestResponded {
+            SessionJournalEvent::ExternalRequestResponded {
                 request_id,
                 response,
             } => self.respond_external_request(request_id, response),
-            SessionEvent::ExternalRequestCanceled { request_id, reason } => {
+            SessionJournalEvent::ExternalRequestCanceled { request_id, reason } => {
                 self.cancel_external_request(request_id, reason);
             }
-            SessionEvent::Suspended { suspension } => {
+            SessionJournalEvent::Suspended { suspension } => {
                 self.status = SessionStatus::Suspended(suspension.clone());
             }
-            SessionEvent::WorkCanceled { work_id, reason } => self.cancel_work(work_id, reason),
-            SessionEvent::Interrupted => {
+            SessionJournalEvent::WorkCanceled { work_id, reason } => {
+                self.cancel_work(work_id, reason);
+            }
+            SessionJournalEvent::Interrupted => {
                 self.status = SessionStatus::Suspended(Suspension::Interrupted {
                     work: self.pending_work.clone(),
                 });
             }
-            SessionEvent::TurnFinished { turn } => {
+            SessionJournalEvent::TurnFinished { turn } => {
                 self.turn = self.turn.max(turn + 1);
                 self.status = SessionStatus::Idle;
             }
-            SessionEvent::Finished => {
+            SessionJournalEvent::Finished => {
                 self.status = SessionStatus::Finished;
             }
-            SessionEvent::Failed { message } => {
+            SessionJournalEvent::Failed { message } => {
                 self.status = SessionStatus::Failed {
                     message: message.clone(),
                 };
@@ -351,31 +380,113 @@ impl SessionSnapshot {
         }
     }
 
+    fn apply_timeline_event(&mut self, event: &AgentTimelineEvent) {
+        if event.kind == TimelineEventKind::SessionStatusChanged {
+            if let Some(status) = event.status {
+                self.apply_timeline_status(status, event);
+            }
+            return;
+        }
+
+        match &event.content {
+            TimelineContent::ToolCall { call } => self.record_tool_call(event.turn, call),
+            TimelineContent::ToolResult { result } => self.record_tool_result(event.turn, result),
+            TimelineContent::ExternalRequest { request } => self.record_external_request(request),
+            TimelineContent::TextDelta { delta } if channel_is(event, CHANNEL_ASSISTANT_TEXT) => {
+                self.record_assistant_text_delta(event.turn, delta);
+                self.status = SessionStatus::StreamingProvider;
+            }
+            TimelineContent::TextSnapshot { text } if channel_is(event, CHANNEL_ASSISTANT_TEXT) => {
+                self.record_assistant_text_snapshot(event.turn, text);
+                self.status = SessionStatus::StreamingProvider;
+            }
+            TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. }
+                if channel_is(event, CHANNEL_THINKING) =>
+            {
+                self.status = SessionStatus::StreamingProvider;
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
+        }
+    }
+
+    fn apply_timeline_status(&mut self, status: TimelineStatus, event: &AgentTimelineEvent) {
+        self.status = match status {
+            TimelineStatus::Idle => SessionStatus::Idle,
+            TimelineStatus::BuildingRequest => SessionStatus::BuildingRequest,
+            TimelineStatus::StreamingProvider => SessionStatus::StreamingProvider,
+            TimelineStatus::EvaluatingToolCall => SessionStatus::EvaluatingToolCall,
+            TimelineStatus::RunningTool => SessionStatus::RunningTool,
+            TimelineStatus::AwaitingToolResults => {
+                SessionStatus::Suspended(Suspension::AwaitingToolResults {
+                    work: self.pending_work.clone(),
+                })
+            }
+            TimelineStatus::AwaitingExternalInput => {
+                let request = self
+                    .external_requests
+                    .iter()
+                    .rev()
+                    .find(|request| matches!(request.status, ExternalRequestStatus::Pending))
+                    .cloned();
+                match request {
+                    Some(request) => SessionStatus::Suspended(Suspension::AwaitingExternalInput {
+                        request: Box::new(request),
+                    }),
+                    None => SessionStatus::RunningTool,
+                }
+            }
+            TimelineStatus::Interrupted => SessionStatus::Suspended(Suspension::Interrupted {
+                work: self.pending_work.clone(),
+            }),
+            TimelineStatus::Finished => SessionStatus::Finished,
+            TimelineStatus::Failed => SessionStatus::Failed {
+                message: timeline_failure_message(event),
+            },
+            TimelineStatus::Pending | TimelineStatus::Resolved | TimelineStatus::Canceled => {
+                self.status.clone()
+            }
+        };
+    }
+
+    fn record_assistant_text_delta(&mut self, turn: u64, delta: &str) {
+        CompletionTurn::entry(&mut self.turns, turn).append_assistant_text(delta);
+    }
+
+    fn record_assistant_text_snapshot(&mut self, turn: u64, text: &str) {
+        CompletionTurn::entry(&mut self.turns, turn).set_assistant_text_snapshot(text);
+    }
+
     fn record_tool_call(&mut self, turn: u64, call: &ToolCall) {
-        self.state.events.push(AgentTranscriptEvent::ToolCall {
-            turn: turn_index(turn),
-            call: call.clone(),
-        });
-        CompletionTurn::entry(&mut self.turns, turn)
+        let turn_record = CompletionTurn::entry(&mut self.turns, turn);
+        if !turn_record
             .items
-            .push(TurnItem::ToolCall(call.clone()));
-        self.pending_work.push(PendingWork {
-            id: call.id.clone(),
-            turn,
-            tool_call: Some(call.clone()),
-            status: PendingWorkStatus::Pending,
-        });
+            .iter()
+            .any(|item| matches!(item, TurnItem::ToolCall(existing) if existing.id == call.id))
+        {
+            turn_record.items.push(TurnItem::ToolCall(call.clone()));
+        }
+        if !self.pending_work.iter().any(|work| work.id == call.id) {
+            self.pending_work.push(PendingWork {
+                id: call.id.clone(),
+                turn,
+                tool_call: Some(call.clone()),
+                status: PendingWorkStatus::Pending,
+            });
+        }
         self.status = SessionStatus::EvaluatingToolCall;
     }
 
     fn record_tool_result(&mut self, turn: u64, result: &ToolResult) {
-        self.state.events.push(AgentTranscriptEvent::ToolResult {
-            turn: turn_index(turn),
-            result: result.clone(),
-        });
-        CompletionTurn::entry(&mut self.turns, turn)
-            .items
-            .push(TurnItem::ToolResult(result.clone()));
+        let turn_record = CompletionTurn::entry(&mut self.turns, turn);
+        if !turn_record.items.iter().any(|item| {
+            matches!(item, TurnItem::ToolResult(existing) if existing.call_id == result.call_id)
+        }) {
+            turn_record.items.push(TurnItem::ToolResult(result.clone()));
+        }
         if let Some(work) = self
             .pending_work
             .iter_mut()
@@ -383,8 +494,28 @@ impl SessionSnapshot {
             .find(|work| work.id == result.call_id)
         {
             work.status = PendingWorkStatus::Finished(result.clone());
+        } else {
+            self.pending_work.push(PendingWork {
+                id: result.call_id.clone(),
+                turn,
+                tool_call: None,
+                status: PendingWorkStatus::Finished(result.clone()),
+            });
         }
         self.status = SessionStatus::RunningTool;
+    }
+
+    fn record_external_request(&mut self, request: &ExternalRequest) {
+        upsert_external_request(&mut self.external_requests, request.clone());
+        match &request.status {
+            ExternalRequestStatus::Pending => {
+                self.status = SessionStatus::Suspended(Suspension::AwaitingExternalInput {
+                    request: Box::new(request.clone()),
+                });
+            }
+            ExternalRequestStatus::Responded(_) => self.status = SessionStatus::RunningTool,
+            ExternalRequestStatus::Canceled(_) => {}
+        }
     }
 
     fn respond_external_request(
@@ -424,8 +555,8 @@ impl SessionSnapshot {
         }
     }
 
-    /// Apply durable events to this snapshot in order.
-    pub fn apply_events<'a>(&mut self, events: impl IntoIterator<Item = &'a SessionEvent>) {
+    /// Apply durable journal events to this snapshot in order.
+    pub fn apply_events<'a>(&mut self, events: impl IntoIterator<Item = &'a SessionJournalEvent>) {
         for event in events {
             self.apply_event(event);
         }
@@ -455,40 +586,22 @@ pub enum SessionStatus {
 
 /// Ordered durable session journal event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionEvent {
+pub enum SessionJournalEvent {
+    /// Cursor-assigned timeline event.
+    Timeline(AgentTimelineEvent),
     /// User prompt was appended to the conversation.
     PromptAppended { prompt: String },
     /// Provider request was recorded before dispatch.
     ProviderRequestRecorded { request: RequestRecord },
-    /// Provider emitted assistant text.
-    ProviderTextDelta { turn: u64, delta: String },
-    /// Provider emitted thinking text.
-    ProviderThinkingDelta { turn: u64, delta: String },
     /// Provider emitted a replayable thinking block.
-    ThinkingBlockRecorded { turn: u64, block: ThinkingBlock },
+    ProviderThinkingBlockRecorded { turn: u64, block: ThinkingBlock },
     /// Provider surfaced response metadata for the turn.
     ProviderTurnMetadataRecorded {
         turn: u64,
         metadata: ProviderTurnMetadata,
     },
-    /// Provider requested a tool call.
-    ToolCallRecorded { turn: u64, call: ToolCall },
-    /// Tool result was appended.
-    ToolResultRecorded { turn: u64, result: ToolResult },
-    /// Provider turn finished.
-    TurnFinished { turn: u64 },
-    /// Provider emitted assistant text.
-    TextDelta { turn: u64, delta: String },
-    /// Provider emitted thinking text.
-    ThinkingDelta { turn: u64, delta: String },
-    /// Provider requested a tool call.
-    ToolCall { turn: u64, call: ToolCall },
-    /// Tool result was appended.
-    ToolResult { turn: u64, result: ToolResult },
     /// Middleware namespace state was replaced wholesale.
     MiddlewareStateUpdated { namespace: String, state: Value },
-    /// External request was recorded before suspension was emitted.
-    ExternalRequestCreated { request: ExternalRequest },
     /// External request received a durable response.
     ExternalRequestResponded {
         request_id: ExternalRequestId,
@@ -508,6 +621,8 @@ pub enum SessionEvent {
     },
     /// Runtime was interrupted.
     Interrupted,
+    /// Provider turn finished.
+    TurnFinished { turn: u64 },
     /// Session completed normally.
     Finished,
     /// Session failed.
@@ -653,8 +768,24 @@ pub struct RequestRecord {
     pub projected_request: Value,
 }
 
-fn turn_index(turn: u64) -> usize {
-    usize::try_from(turn).unwrap_or(usize::MAX)
+fn channel_is(event: &AgentTimelineEvent, channel: &str) -> bool {
+    event
+        .channel
+        .as_ref()
+        .is_some_and(|candidate| candidate.as_str() == channel)
+}
+
+fn timeline_failure_message(event: &AgentTimelineEvent) -> String {
+    match &event.content {
+        TimelineContent::TextDelta { delta } => delta.clone(),
+        TimelineContent::TextSnapshot { text } => text.clone(),
+        TimelineContent::Json { value } => value.to_string(),
+        TimelineContent::Empty
+        | TimelineContent::ToolCall { .. }
+        | TimelineContent::ToolResult { .. }
+        | TimelineContent::ExternalRequest { .. }
+        | TimelineContent::ContentRef { .. } => "timeline status failed".to_owned(),
+    }
 }
 
 fn upsert_external_request(requests: &mut Vec<ExternalRequest>, request: ExternalRequest) {
@@ -674,7 +805,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{AgentTranscriptEvent, ThinkingBlockKind};
+    use crate::{
+        ThinkingBlockKind,
+        timeline::{
+            CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
+            TimelineCursor, TimelineEventKind,
+        },
+    };
 
     fn sample_thinking_block() -> ThinkingBlock {
         ThinkingBlock {
@@ -697,48 +834,72 @@ mod tests {
         }
     }
 
-    fn provider_fact_events(call: &ToolCall, result: &ToolResult) -> Vec<SessionEvent> {
+    fn assigned(cursor: u64, pending: PendingTimelineEvent) -> SessionJournalEvent {
+        SessionJournalEvent::Timeline(pending.with_cursor(TimelineCursor::new(cursor)))
+    }
+
+    fn provider_fact_events(
+        session_id: &SessionId,
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> Vec<SessionJournalEvent> {
         vec![
-            SessionEvent::PromptAppended {
+            SessionJournalEvent::PromptAppended {
                 prompt: "summarize".to_owned(),
             },
-            SessionEvent::ProviderTextDelta {
-                turn: 0,
-                delta: "hello".to_owned(),
-            },
-            SessionEvent::ProviderThinkingDelta {
-                turn: 0,
-                delta: "think".to_owned(),
-            },
-            SessionEvent::ThinkingBlockRecorded {
+            assigned(
+                1,
+                PendingTimelineEvent::assistant_text_delta(
+                    session_id.clone(),
+                    0,
+                    "assistant-turn-0",
+                    "hello",
+                ),
+            ),
+            assigned(
+                2,
+                PendingTimelineEvent::thinking_delta(session_id.clone(), 0, "thinking-0", "think"),
+            ),
+            SessionJournalEvent::ProviderThinkingBlockRecorded {
                 turn: 0,
                 block: sample_thinking_block(),
             },
-            SessionEvent::ToolCallRecorded {
-                turn: 0,
-                call: call.clone(),
-            },
-            SessionEvent::ToolResultRecorded {
-                turn: 0,
-                result: result.clone(),
-            },
-            SessionEvent::ProviderTurnMetadataRecorded {
+            assigned(
+                3,
+                PendingTimelineEvent::tool_call(
+                    session_id.clone(),
+                    0,
+                    "tool-call:call-1",
+                    call.clone(),
+                ),
+            ),
+            assigned(
+                4,
+                PendingTimelineEvent::tool_result(
+                    session_id.clone(),
+                    0,
+                    "tool-result:call-1",
+                    "tool-call:call-1",
+                    result.clone(),
+                ),
+            ),
+            SessionJournalEvent::ProviderTurnMetadataRecorded {
                 turn: 0,
                 metadata: sample_turn_metadata(),
             },
-            SessionEvent::TurnFinished { turn: 0 },
-            SessionEvent::Finished,
+            SessionJournalEvent::TurnFinished { turn: 0 },
+            SessionJournalEvent::Finished,
         ]
     }
 
     #[test]
-    fn snapshot_rebuilds_provider_facts_from_events() {
+    fn snapshot_rebuilds_provider_facts_from_journal() {
         let id = SessionId::new("session-1");
         let call = ToolCall::new("call-1", "read", json!({ "path": "README.md" }));
         let result = ToolResult::new("call-1", "read", "contents");
 
-        let mut snapshot = SessionSnapshot::new(id);
-        snapshot.apply_events(&provider_fact_events(&call, &result));
+        let snapshot =
+            SessionSnapshot::from_journal(id.clone(), &provider_fact_events(&id, &call, &result));
 
         assert_eq!(snapshot.current_prompt.as_deref(), Some("summarize"));
         assert_eq!(snapshot.prompts, ["summarize"]);
@@ -748,12 +909,14 @@ mod tests {
                 turn: 0,
                 metadata: Some(sample_turn_metadata()),
                 items: vec![
+                    TurnItem::AssistantText("hello".to_owned()),
                     TurnItem::Thinking(sample_thinking_block()),
                     TurnItem::ToolCall(call.clone()),
                     TurnItem::ToolResult(result.clone()),
                 ],
             }]
         );
+        assert_eq!(snapshot.assistant_texts().collect::<Vec<_>>(), ["hello"]);
         assert_eq!(snapshot.tool_calls().collect::<Vec<_>>(), [&call]);
         assert_eq!(snapshot.tool_results().collect::<Vec<_>>(), [&result]);
         assert_eq!(snapshot.turn, 1);
@@ -767,36 +930,59 @@ mod tests {
                 status: PendingWorkStatus::Finished(result),
             }]
         );
-        assert!(matches!(
-            &snapshot.state.events[..],
-            [
-                AgentTranscriptEvent::Text { .. },
-                AgentTranscriptEvent::Thinking { .. },
-                AgentTranscriptEvent::ToolCall { .. },
-                AgentTranscriptEvent::ToolResult { .. },
-            ]
-        ));
+    }
+
+    #[test]
+    fn timeline_external_request_projects_lifecycle_state() {
+        let id = SessionId::new("session-1");
+        let request = ExternalRequest {
+            id: ExternalRequestId::new("request-1"),
+            kind: ExternalRequestKind::Permission,
+            tool_call_id: Some("call-1".to_owned()),
+            prompt: "Allow?".to_owned(),
+            payload: json!({ "allow": true }),
+            status: ExternalRequestStatus::Pending,
+        };
+        let pending = PendingTimelineEvent::new(
+            id.clone(),
+            0,
+            "external-request:request-1",
+            TimelineEventKind::ExternalRequestOpened,
+            Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
+            TimelineContent::ExternalRequest {
+                request: request.clone(),
+            },
+        );
+
+        let snapshot = SessionSnapshot::from_journal(id, &[assigned(1, pending)]);
+
+        assert_eq!(snapshot.external_requests, [request.clone()]);
+        assert_eq!(
+            snapshot.status,
+            SessionStatus::Suspended(Suspension::AwaitingExternalInput {
+                request: Box::new(request),
+            })
+        );
     }
 
     #[test]
     fn middleware_state_fold_replaces_namespace_wholesale() {
         let events = vec![
-            SessionEvent::MiddlewareStateUpdated {
+            SessionJournalEvent::MiddlewareStateUpdated {
                 namespace: "agents".to_owned(),
                 state: json!({ "loaded": ["a"], "stale": true }),
             },
-            SessionEvent::MiddlewareStateUpdated {
+            SessionJournalEvent::MiddlewareStateUpdated {
                 namespace: "cost".to_owned(),
                 state: json!({ "tokens": 10 }),
             },
-            SessionEvent::MiddlewareStateUpdated {
+            SessionJournalEvent::MiddlewareStateUpdated {
                 namespace: "agents".to_owned(),
                 state: json!({ "loaded": ["a", "b"] }),
             },
         ];
 
-        let mut snapshot = SessionSnapshot::new(SessionId::new("session-1"));
-        snapshot.apply_events(&events);
+        let snapshot = SessionSnapshot::from_journal(SessionId::new("session-1"), &events);
 
         assert_eq!(
             snapshot.middleware_state.get("agents"),
@@ -810,7 +996,7 @@ mod tests {
 
         let mut incremental = std::collections::BTreeMap::new();
         for event in &events {
-            if let SessionEvent::MiddlewareStateUpdated { namespace, state } = event {
+            if let SessionJournalEvent::MiddlewareStateUpdated { namespace, state } = event {
                 incremental.insert(namespace.clone(), state.clone());
             }
         }
@@ -820,7 +1006,7 @@ mod tests {
     #[test]
     fn middleware_state_fold_does_not_change_status() {
         let mut snapshot = SessionSnapshot::new(SessionId::new("session-1"));
-        snapshot.apply_event(&SessionEvent::MiddlewareStateUpdated {
+        snapshot.apply_event(&SessionJournalEvent::MiddlewareStateUpdated {
             namespace: "agents".to_owned(),
             state: json!({}),
         });
@@ -846,7 +1032,7 @@ mod tests {
     #[test]
     fn middleware_state_round_trips_through_serde() {
         let mut snapshot = SessionSnapshot::new(SessionId::new("session-1"));
-        snapshot.apply_event(&SessionEvent::MiddlewareStateUpdated {
+        snapshot.apply_event(&SessionJournalEvent::MiddlewareStateUpdated {
             namespace: "permissions".to_owned(),
             state: json!({ "grants": ["shell"] }),
         });
