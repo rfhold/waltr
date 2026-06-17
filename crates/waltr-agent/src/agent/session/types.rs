@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,7 +16,7 @@ use crate::{
 };
 
 /// Durable session identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(String);
 
 impl SessionId {
@@ -171,8 +171,54 @@ pub struct SessionRecord {
     pub id: SessionId,
     /// Current optimistic revision.
     pub revision: Revision,
+    /// Durable metadata used by hosts to list and order sessions.
+    #[serde(default = "SessionMetadata::now")]
+    pub metadata: SessionMetadata,
     /// Ordered durable journal, including cursor-assigned timeline events.
     pub journal: Vec<SessionJournalEvent>,
+}
+
+/// Durable session metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    /// Time the session record was created.
+    pub created_at: SystemTime,
+    /// Time the session record was last written.
+    pub updated_at: SystemTime,
+    /// Time the session last had user-visible activity.
+    pub last_activity_at: SystemTime,
+}
+
+impl SessionMetadata {
+    /// Create metadata with all timestamps set to now.
+    #[must_use]
+    pub fn now() -> Self {
+        let now = SystemTime::now();
+        Self {
+            created_at: now,
+            updated_at: now,
+            last_activity_at: now,
+        }
+    }
+}
+
+/// Compact session row for listing durable sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    /// Session identity.
+    pub id: SessionId,
+    /// Current optimistic revision.
+    pub revision: Revision,
+    /// Current status derived from the journal.
+    pub status: SessionStatus,
+    /// Most recent user prompt or conversation input.
+    pub current_prompt: Option<String>,
+    /// Time the session record was created.
+    pub created_at: SystemTime,
+    /// Time the session record was last written.
+    pub updated_at: SystemTime,
+    /// Time the session last had user-visible activity.
+    pub last_activity_at: SystemTime,
 }
 
 impl SessionRecord {
@@ -181,6 +227,7 @@ impl SessionRecord {
         Self {
             id: id.into(),
             revision: Revision::ZERO,
+            metadata: SessionMetadata::now(),
             journal: Vec::new(),
         }
     }
@@ -191,6 +238,32 @@ impl SessionRecord {
         let mut snapshot = SessionSnapshot::from_journal(self.id.clone(), &self.journal);
         snapshot.revision = self.revision;
         snapshot
+    }
+
+    /// Derive the compact listing row for this record.
+    #[must_use]
+    pub fn summary(&self) -> SessionSummary {
+        let snapshot = self.snapshot();
+        SessionSummary {
+            id: self.id.clone(),
+            revision: self.revision,
+            status: snapshot.status,
+            current_prompt: snapshot.current_prompt,
+            created_at: self.metadata.created_at,
+            updated_at: self.metadata.updated_at,
+            last_activity_at: self.metadata.last_activity_at,
+        }
+    }
+
+    /// Mark this record as having user-visible activity now.
+    pub fn touch_activity(&mut self) {
+        self.touch_activity_at(SystemTime::now());
+    }
+
+    /// Mark this record as having user-visible activity at a specific time.
+    pub fn touch_activity_at(&mut self, time: SystemTime) {
+        self.metadata.updated_at = time;
+        self.metadata.last_activity_at = time;
     }
 
     /// Append one durable journal event to this record.

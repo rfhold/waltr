@@ -2,7 +2,7 @@
 
 use crate::{LlmStream, Result};
 
-use super::{AgentSessionRuntime, ResumeInput, SessionId, SessionStore};
+use super::{AgentSessionRuntime, ResumeInput, SessionId, SessionStore, SessionSummary};
 use crate::agent::{Agent, AgentRunBuilder, AgentSession};
 
 /// Durable session factory bound to an agent configuration and store.
@@ -43,6 +43,25 @@ where
     pub async fn load(&self, id: &SessionId) -> Result<AgentSession> {
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime.load_session(id).await?;
+        Ok(AgentSession::new(record))
+    }
+
+    /// List durable sessions, newest activity first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session store cannot list sessions.
+    pub async fn list(&self) -> Result<Vec<SessionSummary>> {
+        AgentSessionRuntime::new(&self.store).list_sessions().await
+    }
+
+    /// Persist an interruption for an existing durable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
+    pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
+        let record = AgentSessionRuntime::new(&self.store).interrupt(id).await?;
         Ok(AgentSession::new(record))
     }
 

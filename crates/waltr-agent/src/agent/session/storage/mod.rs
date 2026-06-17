@@ -23,7 +23,7 @@ use crate::timeline::{
     TimelineItemId, TimelineItemText, TimelineQuery,
 };
 
-use super::types::{Revision, SessionId, SessionJournalEvent, SessionRecord};
+use super::types::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary};
 
 /// Result type returned by session stores.
 pub type SessionStoreResult<T> = Result<T, SessionStoreError>;
@@ -132,6 +132,9 @@ pub trait SessionStore: Send + Sync {
         id: &SessionId,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
+    /// List known sessions, newest activity first.
+    fn list(&self) -> impl Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send;
+
     /// Append pending timeline events and return them with assigned cursors.
     fn append_timeline(
         &self,
@@ -203,7 +206,24 @@ pub(super) fn append_timeline_to_record(
         assigned.push(event.with_cursor(cursor));
     }
     record.append_journal_events(assigned.iter().cloned().map(SessionJournalEvent::Timeline));
+    record.touch_activity();
     Ok(assigned)
+}
+
+pub(super) fn sorted_session_summaries(
+    records: impl IntoIterator<Item = SessionRecord>,
+) -> Vec<SessionSummary> {
+    let mut summaries = records
+        .into_iter()
+        .map(|record| record.summary())
+        .collect::<Vec<_>>();
+    summaries.sort_by(|left, right| {
+        right
+            .last_activity_at
+            .cmp(&left.last_activity_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    summaries
 }
 
 pub(super) fn timeline_query_slice(

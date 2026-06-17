@@ -164,8 +164,17 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
     let record = store.load(&session_id).await.expect("stored session");
     assert!(record.snapshot().pending_work.iter().any(|work| {
         work.id == "mcp-cancel-call"
-            && matches!(work.status, waltr_agent::PendingWorkStatus::Pending)
+            && matches!(
+                work.status,
+                waltr_agent::PendingWorkStatus::Canceled(
+                    waltr_agent::CancelReason::SessionInterrupted
+                )
+            )
     }));
+    assert!(matches!(
+        record.snapshot().status,
+        waltr_agent::SessionStatus::Suspended(waltr_agent::Suspension::Interrupted { .. })
+    ));
 
     let recovery_provider = ScriptedProvider::from_turns(
         "mcp_recovery_provider",

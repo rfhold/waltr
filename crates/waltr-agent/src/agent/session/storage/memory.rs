@@ -7,10 +7,10 @@ use std::{
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    timeline_item_text_from_record, timeline_query_slice,
+    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
-    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -102,6 +102,19 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    fn list(
+        &self,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
+        let store = self.clone();
+        async move {
+            let records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            Ok(sorted_session_summaries(records.values().cloned()))
+        }
+    }
+
     fn append_timeline(
         &self,
         id: &SessionId,
@@ -130,6 +143,7 @@ impl SessionStore for MemorySessionStore {
         async move {
             let (revision, ()) = store.with_record_mut(&id, expected_revision, |record, _| {
                 record.append_journal_events(events);
+                record.touch_activity();
                 Ok(())
             })?;
 
@@ -278,6 +292,52 @@ mod tests {
         assert_eq!(loaded_again.id, id);
         assert_eq!(loaded_again.revision, Revision::ZERO);
         assert!(loaded_again.journal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_returns_session_summaries_newest_activity_first() {
+        let store = MemorySessionStore::new();
+        let first = SessionId::new("session-first");
+        let second = SessionId::new("session-second");
+        store.create(first.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        store.create(second.clone()).await.unwrap();
+
+        let summaries = store.list().await.unwrap();
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, second);
+        assert_eq!(summaries[1].id, first);
+        assert_eq!(summaries[0].revision, Revision::ZERO);
+        assert_eq!(summaries[0].status, SessionStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn list_summary_reflects_latest_activity_and_status() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        let created = store.create(id.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        store
+            .append_journal(
+                &id,
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "hello".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let summaries = store.list().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, id);
+        assert_eq!(summaries[0].revision, Revision::new(1));
+        assert_eq!(summaries[0].status, SessionStatus::BuildingRequest);
+        assert_eq!(summaries[0].current_prompt.as_deref(), Some("hello"));
+        assert_eq!(summaries[0].created_at, created.metadata.created_at);
+        assert!(summaries[0].last_activity_at > created.metadata.last_activity_at);
     }
 
     #[tokio::test]

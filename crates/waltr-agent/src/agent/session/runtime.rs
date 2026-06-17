@@ -14,7 +14,7 @@ use crate::{
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
     ExternalResponse, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
-    SessionRecord, SessionSnapshot, SessionStore, Suspension,
+    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionSummary, Suspension,
 };
 
 /// Runtime facade for durable session resume operations.
@@ -53,6 +53,15 @@ where
         self.store.load(id).await.map_err(session_store_error)
     }
 
+    /// List durable sessions, newest activity first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot list sessions.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        self.store.list().await.map_err(session_store_error)
+    }
+
     /// Apply resume input to a persisted session and return the durable checkpoint reached.
     ///
     /// # Errors
@@ -71,6 +80,59 @@ where
             }
             ResumeInput::ToolResults(results) => self.resume_tool_results(record, results).await,
         }
+    }
+
+    /// Persist an interruption for a durable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or interruption state cannot be saved.
+    pub async fn interrupt(&self, id: &SessionId) -> Result<SessionRecord> {
+        let record = self.load_session(id).await?;
+        self.interrupt_record(record).await
+    }
+
+    async fn interrupt_record(&self, record: SessionRecord) -> Result<SessionRecord> {
+        let snapshot = record.snapshot();
+        if matches!(
+            snapshot.status,
+            SessionStatus::Idle
+                | SessionStatus::Finished
+                | SessionStatus::Failed { .. }
+                | SessionStatus::Suspended(Suspension::Interrupted { .. })
+        ) {
+            return Ok(record);
+        }
+
+        let mut journal = Vec::new();
+        let mut timeline = Vec::new();
+        for request in pending_external_requests(&snapshot) {
+            let reason = CancelReason::SessionInterrupted;
+            journal.push(SessionJournalEvent::ExternalRequestCanceled {
+                request_id: request.id.clone(),
+                reason: reason.clone(),
+            });
+            let mut request = request.clone();
+            request.status = ExternalRequestStatus::Canceled(reason);
+            timeline.push(external_request_timeline_event(
+                &record.id,
+                snapshot.turn,
+                request,
+                TimelineEventKind::ExternalRequestResolved,
+            ));
+        }
+        for work_id in pending_work_ids(&snapshot) {
+            journal.push(SessionJournalEvent::WorkCanceled {
+                work_id,
+                reason: CancelReason::SessionInterrupted,
+            });
+        }
+        journal.push(SessionJournalEvent::Interrupted);
+        timeline.push(interrupted_status_timeline_event(&record.id, snapshot.turn));
+
+        let mut record = self.append_journal_and_reload(record, journal).await?;
+        record = self.append_timeline_and_reload(record, timeline).await?;
+        Ok(record)
     }
 
     async fn resume_prompt(
@@ -395,6 +457,19 @@ fn external_request_timeline_event(
     )
 }
 
+fn interrupted_status_timeline_event(session_id: &SessionId, turn: u64) -> PendingTimelineEvent {
+    let mut event = PendingTimelineEvent::new(
+        session_id.clone(),
+        turn,
+        "session-status",
+        TimelineEventKind::SessionStatusChanged,
+        None,
+        TimelineContent::Empty,
+    );
+    event.status = Some(crate::timeline::TimelineStatus::Interrupted);
+    event
+}
+
 const fn request_tool_name(kind: &super::ExternalRequestKind) -> &'static str {
     match kind {
         super::ExternalRequestKind::Question => "question",
@@ -607,6 +682,78 @@ mod tests {
             snapshot.pending_work[0].status,
             PendingWorkStatus::Canceled(CancelReason::SupersededByUserPrompt)
         );
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_pending_external_request_and_work() {
+        let store = MemorySessionStore::new();
+        let id = suspended_question_session(&store).await;
+        let runtime = AgentSessionRuntime::new(&store);
+
+        let record = runtime.interrupt(&id).await.unwrap();
+
+        let snapshot = record.snapshot();
+        assert!(matches!(
+            snapshot.status,
+            SessionStatus::Suspended(Suspension::Interrupted { .. })
+        ));
+        assert_eq!(
+            snapshot.external_requests[0].status,
+            ExternalRequestStatus::Canceled(CancelReason::SessionInterrupted)
+        );
+        assert_eq!(
+            snapshot.pending_work[0].status,
+            PendingWorkStatus::Canceled(CancelReason::SessionInterrupted)
+        );
+        assert!(
+            record
+                .journal
+                .iter()
+                .any(|event| matches!(event, SessionJournalEvent::Interrupted))
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_is_idempotent() {
+        let store = MemorySessionStore::new();
+        let id = suspended_question_session(&store).await;
+        let runtime = AgentSessionRuntime::new(&store);
+
+        let first = runtime.interrupt(&id).await.unwrap();
+        let second = runtime.interrupt(&id).await.unwrap();
+
+        assert_eq!(second.revision, first.revision);
+        assert_eq!(
+            second
+                .journal
+                .iter()
+                .filter(|event| matches!(event, SessionJournalEvent::Interrupted))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_external_response_is_rejected_deterministically() {
+        let store = MemorySessionStore::new();
+        let id = suspended_question_session(&store).await;
+        let runtime = AgentSessionRuntime::new(&store);
+        runtime.interrupt(&id).await.unwrap();
+
+        let error = runtime
+            .resume(
+                &id,
+                ResumeInput::ExternalResponse {
+                    request_id: ExternalRequestId::new("question-1"),
+                    response: ExternalResponse {
+                        payload: json!("late"),
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("canceled"));
     }
 
     #[tokio::test]

@@ -4,10 +4,10 @@ use aws_sdk_s3::{Client, error::DisplayErrorContext, primitives::ByteStream};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    timeline_item_text_from_record, timeline_query_slice,
+    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
-    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -73,6 +73,49 @@ impl S3SessionStore {
         Ok(())
     }
 
+    async fn list_records(&self) -> SessionStoreResult<Vec<SessionSummary>> {
+        let mut continuation_token = None;
+        let mut records = Vec::new();
+        loop {
+            let output = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&self.prefix)
+                .set_continuation_token(continuation_token)
+                .send()
+                .await
+                .map_err(backend_error)?;
+            for object in output.contents() {
+                let Some(key) = object.key() else { continue };
+                if !key.ends_with(".json") {
+                    continue;
+                }
+                let output = self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .map_err(backend_error)?;
+                let bytes = output
+                    .body
+                    .collect()
+                    .await
+                    .map_err(backend_error)?
+                    .into_bytes();
+                records.push(serde_json::from_slice(bytes.as_ref()).map_err(backend_error)?);
+            }
+            if output.is_truncated().unwrap_or(false) {
+                continuation_token = output.next_continuation_token().map(str::to_owned);
+            } else {
+                break;
+            }
+        }
+        Ok(sorted_session_summaries(records))
+    }
+
     async fn update_record<T: Send>(
         &self,
         id: &SessionId,
@@ -123,6 +166,13 @@ impl SessionStore for S3SessionStore {
         async move { store.load_record(&id).await }
     }
 
+    fn list(
+        &self,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
+        let store = self.clone();
+        async move { store.list_records().await }
+    }
+
     fn append_timeline(
         &self,
         id: &SessionId,
@@ -153,6 +203,7 @@ impl SessionStore for S3SessionStore {
             let (revision, ()) = store
                 .update_record(&id, expected_revision, |record, _| {
                     record.append_journal_events(events);
+                    record.touch_activity();
                     Ok(())
                 })
                 .await?;
