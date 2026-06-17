@@ -16,7 +16,7 @@ use waltr_agent::{
     ExternalRequestKind, ExternalResponse, FilesystemPromptConfig, LlmError, LlmStream,
     MemorySessionStore, ModelApi, ModelRef, ProviderId, ProviderTurnMetadata, ResumeInput,
     SessionStore, SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent,
-    TimelineEventKind, TimelineStatus, TokenUsage, ToolCall, ToolDefinition,
+    TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition,
     tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
@@ -176,7 +176,7 @@ async fn durable_session_timeline_ranges_preserve_cursor_order() {
     .await;
 
     let all = store
-        .timeline_after(&session_id, None, 10)
+        .timeline(&session_id, TimelineQuery::forward(None, 10))
         .await
         .expect("timeline events");
     assert!(
@@ -201,22 +201,100 @@ async fn durable_session_timeline_ranges_preserve_cursor_order() {
     );
 
     let after_first = store
-        .timeline_after(&session_id, Some(all[0].cursor), 10)
+        .timeline(&session_id, TimelineQuery::forward(Some(all[0].cursor), 10))
         .await
         .expect("timeline after first cursor");
     assert_eq!(after_first, all[1..].to_vec());
 
     let before_last = store
-        .timeline_before(&session_id, all.last().map(|event| event.cursor), 10)
+        .timeline(
+            &session_id,
+            TimelineQuery::backward(all.last().map(|event| event.cursor), 10),
+        )
         .await
         .expect("timeline before last cursor");
     assert_eq!(before_last, all[..all.len() - 1].to_vec());
 
     let limited = store
-        .timeline_after(&session_id, None, 1)
+        .timeline(&session_id, TimelineQuery::forward(None, 1))
         .await
         .expect("limited timeline range");
     assert_eq!(limited, vec![all[0].clone()]);
+}
+
+#[tokio::test]
+async fn assistant_and_thinking_deltas_use_stable_items_and_reconstruct_text() {
+    let provider = ScriptedProvider::from_turns(
+        "streaming_text_provider",
+        vec![vec![
+            CompletionEvent::ThinkingDelta(ThinkingDelta {
+                text: "think-1 ".to_owned(),
+            }),
+            CompletionEvent::ThinkingDelta(ThinkingDelta {
+                text: "think-2".to_owned(),
+            }),
+            CompletionEvent::Delta("answer-1 ".to_owned()),
+            CompletionEvent::Delta("answer-2".to_owned()),
+            CompletionEvent::Finished,
+        ]],
+    );
+    let agent = Agent::builder(test_model()).build();
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    let events = sessions
+        .prompt(&provider, session_id.clone(), "stream text")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("agent event"))
+        .collect::<Vec<_>>();
+
+    let assistant_events = events
+        .iter()
+        .filter(|event| crate::session::channel_is(event, CHANNEL_ASSISTANT_TEXT))
+        .collect::<Vec<_>>();
+    let thinking_events = events
+        .iter()
+        .filter(|event| crate::session::channel_is(event, CHANNEL_THINKING))
+        .collect::<Vec<_>>();
+
+    assert_eq!(assistant_events.len(), 2);
+    assert_eq!(thinking_events.len(), 2);
+    assert!(
+        assistant_events
+            .iter()
+            .all(|event| event.item_id == assistant_events[0].item_id)
+    );
+    assert!(
+        thinking_events
+            .iter()
+            .all(|event| event.item_id == thinking_events[0].item_id)
+    );
+    assert!(
+        assistant_events
+            .iter()
+            .all(|event| event.kind == TimelineEventKind::ContentDelta)
+    );
+    assert!(
+        thinking_events
+            .iter()
+            .all(|event| event.kind == TimelineEventKind::ContentDelta)
+    );
+
+    let assistant_text = store
+        .timeline_item_text(&session_id, &assistant_events[0].item_id)
+        .await
+        .expect("assistant item text");
+    let thinking_text = store
+        .timeline_item_text(&session_id, &thinking_events[0].item_id)
+        .await
+        .expect("thinking item text");
+
+    assert_eq!(assistant_text.text, "answer-1 answer-2");
+    assert_eq!(thinking_text.text, "think-1 think-2");
 }
 
 #[tokio::test]

@@ -7,11 +7,13 @@ use std::{
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    timeline_after_slice, timeline_before_slice,
+    timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
     agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
-    timeline::{AgentTimelineEvent, PendingTimelineEvent, TimelineCursor},
+    timeline::{
+        AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
+    },
 };
 
 /// Process-memory implementation of [`SessionStore`].
@@ -135,31 +137,30 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
-    fn timeline_after(
+    fn timeline(
         &self,
         id: &SessionId,
-        cursor: Option<TimelineCursor>,
-        limit: usize,
+        query: TimelineQuery,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             let record = store.load(&id).await?;
-            Ok(timeline_after_slice(&record, cursor, limit))
+            Ok(timeline_query_slice(&record, &query))
         }
     }
 
-    fn timeline_before(
+    fn timeline_item_text(
         &self,
         id: &SessionId,
-        cursor: Option<TimelineCursor>,
-        limit: usize,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+        item_id: &TimelineItemId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<TimelineItemText>> + Send {
         let store = self.clone();
         let id = id.clone();
+        let item_id = item_id.clone();
         async move {
             let record = store.load(&id).await?;
-            Ok(timeline_before_slice(&record, cursor, limit))
+            timeline_item_text_from_record(&record, &item_id)
         }
     }
 }
@@ -175,7 +176,11 @@ mod tests {
     };
     use crate::{
         ModelApi, ModelRef, ProviderId, ToolCall, ToolResult,
-        timeline::{CHANNEL_EXTERNAL_REQUEST, TimelineChannel, TimelineContent, TimelineEventKind},
+        timeline::{
+            CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL,
+            TimelineChannel, TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
+            TimelineQuery, TimelineStatus,
+        },
     };
 
     fn session_id() -> SessionId {
@@ -219,6 +224,28 @@ mod tests {
             format!("assistant-{index}"),
             format!("delta-{index}"),
         )
+    }
+
+    fn pending_thinking_delta(id: &SessionId, index: usize) -> PendingTimelineEvent {
+        PendingTimelineEvent::thinking_delta(
+            id.clone(),
+            0,
+            format!("thinking-{index}"),
+            format!("thought-{index}"),
+        )
+    }
+
+    fn pending_status(id: &SessionId, index: usize) -> PendingTimelineEvent {
+        let mut event = PendingTimelineEvent::new(
+            id.clone(),
+            0,
+            format!("status-{index}"),
+            TimelineEventKind::SessionStatusChanged,
+            None,
+            TimelineContent::Empty,
+        );
+        event.status = Some(TimelineStatus::Idle);
+        event
     }
 
     fn external_request_event(
@@ -576,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeline_after_and_before_slice_by_cursor() {
+    async fn timeline_query_slices_by_direction_cursor_limit_and_channel() {
         let store = MemorySessionStore::new();
         let id = session_id();
         store.create(id.clone()).await.unwrap();
@@ -584,19 +611,56 @@ mod tests {
             .append_timeline(
                 &id,
                 Revision::ZERO,
-                (1..=5).map(|index| pending_delta(&id, index)).collect(),
+                vec![
+                    pending_delta(&id, 1),
+                    pending_thinking_delta(&id, 2),
+                    pending_status(&id, 3),
+                    pending_delta(&id, 4),
+                    PendingTimelineEvent::tool_call(id.clone(), 0, "tool-call:5", tool_call("5")),
+                ],
             )
             .await
             .unwrap();
 
-        let after_start = store.timeline_after(&id, None, 2).await.unwrap();
-        let after_two = store
-            .timeline_after(&id, Some(TimelineCursor::new(2)), 2)
+        let after_start = store
+            .timeline(&id, TimelineQuery::forward(None, 2))
             .await
             .unwrap();
-        let before_end = store.timeline_before(&id, None, 2).await.unwrap();
+        let after_two = store
+            .timeline(&id, TimelineQuery::forward(Some(TimelineCursor::new(2)), 2))
+            .await
+            .unwrap();
+        let before_end = store
+            .timeline(&id, TimelineQuery::backward(None, 2))
+            .await
+            .unwrap();
         let before_four = store
-            .timeline_before(&id, Some(TimelineCursor::new(4)), 2)
+            .timeline(
+                &id,
+                TimelineQuery::backward(Some(TimelineCursor::new(4)), 2),
+            )
+            .await
+            .unwrap();
+        let assistant_only = store
+            .timeline(
+                &id,
+                TimelineQuery::forward(None, 10)
+                    .with_channels([TimelineChannel::from(CHANNEL_ASSISTANT_TEXT)]),
+            )
+            .await
+            .unwrap();
+        let assistant_or_tool = store
+            .timeline(
+                &id,
+                TimelineQuery::forward(None, 10).with_channels([
+                    TimelineChannel::from(CHANNEL_ASSISTANT_TEXT),
+                    TimelineChannel::from(CHANNEL_TOOL_CALL),
+                ]),
+            )
+            .await
+            .unwrap();
+        let zero_limit = store
+            .timeline(&id, TimelineQuery::forward(None, 0))
             .await
             .unwrap();
 
@@ -628,5 +692,123 @@ mod tests {
                 .collect::<Vec<_>>(),
             [TimelineCursor::new(2), TimelineCursor::new(3)]
         );
+        assert_eq!(
+            assistant_only
+                .iter()
+                .map(|event| event.cursor)
+                .collect::<Vec<_>>(),
+            [TimelineCursor::new(1), TimelineCursor::new(4)]
+        );
+        assert_eq!(
+            assistant_or_tool
+                .iter()
+                .map(|event| event.cursor)
+                .collect::<Vec<_>>(),
+            [
+                TimelineCursor::new(1),
+                TimelineCursor::new(4),
+                TimelineCursor::new(5)
+            ]
+        );
+        assert!(zero_limit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeline_item_text_reconstructs_text_like_content() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+        let item_id = TimelineItemId::new("assistant-shared");
+        let mut snapshot = PendingTimelineEvent::new(
+            id.clone(),
+            0,
+            item_id.clone(),
+            TimelineEventKind::ItemUpdated,
+            Some(TimelineChannel::from(CHANNEL_ASSISTANT_TEXT)),
+            TimelineContent::TextSnapshot {
+                text: "reset".to_owned(),
+            },
+        );
+        snapshot.status = Some(TimelineStatus::StreamingProvider);
+        store
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                vec![
+                    PendingTimelineEvent::assistant_text_delta(
+                        id.clone(),
+                        0,
+                        item_id.clone(),
+                        "hello ",
+                    ),
+                    pending_thinking_delta(&id, 1),
+                    snapshot,
+                    PendingTimelineEvent::assistant_text_delta(
+                        id.clone(),
+                        0,
+                        item_id.clone(),
+                        " world",
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let text = store.timeline_item_text(&id, &item_id).await.unwrap();
+
+        assert_eq!(text.item_id, item_id);
+        assert_eq!(text.text, "reset world");
+        assert_eq!(text.bytes, "reset world".len() as u64);
+        assert_eq!(text.last_cursor, Some(TimelineCursor::new(4)));
+    }
+
+    #[tokio::test]
+    async fn timeline_item_text_distinguishes_missing_non_text_and_refs() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        let tool_item = TimelineItemId::new("tool-call:non-text");
+        let ref_item = TimelineItemId::new("content-ref");
+        store.create(id.clone()).await.unwrap();
+        store
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                vec![
+                    PendingTimelineEvent::tool_call(
+                        id.clone(),
+                        0,
+                        tool_item.clone(),
+                        tool_call("non-text"),
+                    ),
+                    PendingTimelineEvent::new(
+                        id.clone(),
+                        0,
+                        ref_item.clone(),
+                        TimelineEventKind::ItemUpdated,
+                        Some(TimelineChannel::from(CHANNEL_THINKING)),
+                        TimelineContent::content_ref("content-1", 100),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let tool_text = store.timeline_item_text(&id, &tool_item).await.unwrap();
+        let missing = store
+            .timeline_item_text(&id, &TimelineItemId::new("missing"))
+            .await
+            .unwrap_err();
+        let unavailable = store.timeline_item_text(&id, &ref_item).await.unwrap_err();
+
+        assert_eq!(tool_text.text, "");
+        assert_eq!(tool_text.bytes, 0);
+        assert!(matches!(
+            missing,
+            SessionStoreError::TimelineItemNotFound { .. }
+        ));
+        assert!(matches!(
+            unavailable,
+            SessionStoreError::TimelineContentUnavailable { .. }
+        ));
     }
 }
