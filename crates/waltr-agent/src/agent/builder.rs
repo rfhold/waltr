@@ -2,6 +2,8 @@
 
 use std::{fmt, path::PathBuf};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
     mcp::McpConfig,
@@ -135,6 +137,25 @@ impl AgentBuilder {
     #[allow(clippy::needless_pass_by_value)]
     pub async fn with_mcp_servers(mut self, config: McpConfig) -> Result<Self> {
         self.tools.extend(config.into_agent_tools().await?);
+        Ok(self)
+    }
+
+    /// Opt into configured MCP servers as host tools with caller-controlled cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any MCP server cannot be initialized or its tools cannot be listed.
+    #[allow(clippy::needless_pass_by_value)]
+    pub async fn with_mcp_servers_with_cancellation(
+        mut self,
+        config: McpConfig,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
+        self.tools.extend(
+            config
+                .into_agent_tools_with_cancellation(cancellation_token)
+                .await?,
+        );
         Ok(self)
     }
 

@@ -1,10 +1,12 @@
 //! MCP agent integration tests.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{fs, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::Router;
+use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CompletionEvent, LlmStream, ModelApi, ModelRef, ProviderId, ToolCall,
+    Agent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, LlmError, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionStore, ToolCall,
     mcp::{McpConfig, McpServerConfig},
 };
 use rmcp::{
@@ -18,6 +20,7 @@ use rmcp::{
 };
 use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
@@ -67,6 +70,120 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
         "{context}"
     );
     assert!(session.text.contains("mcp-flow-complete"), "{context}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_tool_discovery_observes_cancellation() -> waltr_agent::Result<()> {
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = Agent::builder(test_model())
+        .with_mcp_servers_with_cancellation(
+            McpConfig::new().with_server(stdio_server("command-that-should-not-run")),
+            cancellation,
+        )
+        .await
+        .expect_err("canceled MCP discovery should fail");
+
+    assert!(matches!(
+        error,
+        LlmError::Protocol {
+            provider: "mcp",
+            message
+        } if message == "MCP request canceled"
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("mcp-cancel-marker.txt");
+    let stdio_command = test_stdio_server_command();
+    let provider = ScriptedProvider::from_turns(
+        "mcp_cancel_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "mcp-cancel-call",
+                "mcp_stdio_test_delayed_write_marker",
+                json!({
+                    "path": marker.display().to_string(),
+                    "value": "foo",
+                    "delay_ms": 5000_u64,
+                }),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    );
+    let agent = Agent::builder(test_model())
+        .with_mcp_servers(McpConfig::new().with_server(stdio_server(&stdio_command)))
+        .await?
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = agent.clone().sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let cancellation = CancellationToken::new();
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "run delayed MCP write")
+        .with_cancellation_token(cancellation.clone())
+        .stream();
+
+    let first = stream
+        .next()
+        .await
+        .expect("tool call event")
+        .expect("tool call event");
+    assert!(crate::session::channel_is(&first, CHANNEL_TOOL_CALL));
+
+    tokio::select! {
+        event = stream.next() => panic!("MCP tool finished before cancellation: {event:#?}"),
+        () = tokio::time::sleep(Duration::from_secs(1)) => cancellation.cancel(),
+    }
+
+    let remaining = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("agent event"))
+        .collect::<Vec<_>>();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    assert!(
+        remaining
+            .iter()
+            .all(|event| !crate::session::channel_is(event, CHANNEL_TOOL_RESULT)),
+        "canceled run should not finish the MCP tool: {remaining:#?}"
+    );
+    assert!(
+        !marker.exists() || fs::read_to_string(&marker)?.is_empty(),
+        "canceled MCP tool should not write marker"
+    );
+    let record = store.load(&session_id).await.expect("stored session");
+    assert!(record.snapshot().pending_work.iter().any(|work| {
+        work.id == "mcp-cancel-call"
+            && matches!(work.status, waltr_agent::PendingWorkStatus::Pending)
+    }));
+
+    let recovery_provider = ScriptedProvider::from_turns(
+        "mcp_recovery_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "mcp-recovery-call",
+                "mcp_stdio_test_echo_marker",
+                json!({ "value": "stdio-after-cancel-909" }),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    );
+    let recovery = AgentTestSession::run(&agent, &recovery_provider, "recover MCP stdio").await?;
+    assert!(
+        tool_result_text(&recovery).contains("stdio-after-cancel-909"),
+        "{}",
+        crate::session::session_context(&recovery_provider, &recovery)
+    );
 
     Ok(())
 }

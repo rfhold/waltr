@@ -1,5 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{AgentTool, Result};
 
 use super::runtime::McpRuntime;
@@ -43,8 +45,21 @@ impl McpConfig {
     ///
     /// Returns an error if any configured MCP server cannot be initialized or listed.
     pub async fn into_agent_tools(self) -> Result<Vec<AgentTool>> {
+        self.into_agent_tools_with_cancellation(CancellationToken::new())
+            .await
+    }
+
+    /// Convert this MCP configuration into host tools with caller-controlled cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any configured MCP server cannot be initialized or listed.
+    pub async fn into_agent_tools_with_cancellation(
+        self,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<AgentTool>> {
         let runtime = Arc::new(McpRuntime::new(self.servers, self.timeout));
-        runtime.direct_agent_tools().await
+        runtime.direct_agent_tools(cancellation_token).await
     }
 }
 

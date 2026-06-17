@@ -629,7 +629,7 @@ pub enum SessionJournalEvent {
     Failed { message: String },
 }
 
-/// Input used to resume or interrupt a session.
+/// Input used to resume a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumeInput {
     /// Resume with a new user prompt.
@@ -641,8 +641,6 @@ pub enum ResumeInput {
         request_id: ExternalRequestId,
         response: ExternalResponse,
     },
-    /// Request interruption of active work.
-    Interrupt,
 }
 
 /// Durable runtime suspension.

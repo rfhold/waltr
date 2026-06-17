@@ -12,6 +12,13 @@ struct EchoMarkerRequest {
     value: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DelayedWriteRequest {
+    path: String,
+    value: String,
+    delay_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 struct EchoMarkerServer {
     tool_router: ToolRouter<Self>,
@@ -33,6 +40,24 @@ impl EchoMarkerServer {
         Parameters(EchoMarkerRequest { value }): Parameters<EchoMarkerRequest>,
     ) -> String {
         let _ = &self.tool_router;
+        value
+    }
+
+    #[tool(
+        name = "delayed_write_marker",
+        description = "Write a marker after a delay."
+    )]
+    fn delayed_write_marker(
+        &self,
+        Parameters(DelayedWriteRequest {
+            path,
+            value,
+            delay_ms,
+        }): Parameters<DelayedWriteRequest>,
+    ) -> String {
+        let _ = &self.tool_router;
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        std::fs::write(path, &value).expect("delayed marker write should succeed");
         value
     }
 }

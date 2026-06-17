@@ -27,6 +27,7 @@ use crate::{
     timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, TimelineStatus},
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::tool::ToolFuture;
 use super::{
@@ -61,6 +62,7 @@ where
     session_initialized: bool,
     middleware_state: MiddlewareStateLog,
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
+    cancellation_token: CancellationToken,
 }
 
 enum AgentLoopPhase {
@@ -98,9 +100,7 @@ where
     pub(super) fn from_ephemeral_session(run: EphemeralSessionRun<'a, P, S>) -> Self {
         let prompt = match &run.input {
             ResumeInput::Prompt(prompt) => prompt,
-            ResumeInput::ToolResults(_)
-            | ResumeInput::ExternalResponse { .. }
-            | ResumeInput::Interrupt => "",
+            ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => "",
         }
         .to_owned();
         let permission_policy = run.permission_policy;
@@ -122,12 +122,18 @@ where
             session_initialized: false,
             middleware_state: MiddlewareStateLog::default(),
             system_prompt_override: run.system_prompt_override,
+            cancellation_token: run.cancellation_token,
         }
     }
 
     #[allow(clippy::too_many_lines)]
     pub(super) async fn next(mut self) -> Option<(Result<AgentTimelineEvent>, Self)> {
         loop {
+            if self.cancellation_token.is_cancelled() {
+                self.phase = AgentLoopPhase::Done;
+                return None;
+            }
+
             if let Some(event) = self.pending.pop_front() {
                 return Some((event, self));
             }
@@ -151,7 +157,16 @@ where
                     if let Err(error) = self.persist_provider_request(&draft, projected).await {
                         return Some((Err(error), self));
                     }
-                    match self.provider.stream_request(request).await {
+                    let stream_result = tokio::select! {
+                        biased;
+
+                        () = self.cancellation_token.cancelled() => {
+                            self.phase = AgentLoopPhase::Done;
+                            return None;
+                        }
+                        result = self.provider.stream_request(request) => result,
+                    };
+                    match stream_result {
                         Ok(stream) => self.phase = AgentLoopPhase::Streaming(stream),
                         Err(error) => {
                             self.pending_failed_session_event(&error).await;
@@ -159,7 +174,15 @@ where
                         }
                     }
                 }
-                AgentLoopPhase::Streaming(mut stream) => match stream.next().await {
+                AgentLoopPhase::Streaming(mut stream) => match tokio::select! {
+                    biased;
+
+                    () = self.cancellation_token.cancelled() => {
+                        self.phase = AgentLoopPhase::Done;
+                        return None;
+                    }
+                    event = stream.next() => event,
+                } {
                     Some(Ok(CompletionEvent::Delta(delta))) => {
                         let event = match self.append_assistant_delta(delta.clone()).await {
                             Ok(event) => event,
@@ -298,9 +321,21 @@ where
                                 }
                                 continue;
                             }
+                            () = self.cancellation_token.cancelled() => {
+                                self.phase = AgentLoopPhase::Done;
+                                return None;
+                            }
                         }
                     } else {
-                        let result = running.result.await;
+                        let result = tokio::select! {
+                            biased;
+
+                            () = self.cancellation_token.cancelled() => {
+                                self.phase = AgentLoopPhase::Done;
+                                return None;
+                            }
+                            result = running.result => result,
+                        };
                         if let Err(error) = self.finish_running_tool(running.call, result).await {
                             return Some((Err(error), self));
                         }
@@ -455,8 +490,12 @@ where
                 Ok(())
             },
         );
-        let result = self.tools[tool_index]
-            .call(ToolExecutionContext::with_progress(call.clone(), progress));
+        let result =
+            self.tools[tool_index].call(ToolExecutionContext::with_progress_and_cancellation(
+                call.clone(),
+                progress,
+                self.cancellation_token.clone(),
+            ));
         Ok(ToolExecution::Running(RunningTool {
             call,
             result,
@@ -728,17 +767,6 @@ where
             ResumeInput::ToolResults(results) => {
                 match AgentSessionRuntime::new(&self.session_store)
                     .resume(&self.session_id, ResumeInput::ToolResults(results))
-                    .await?
-                {
-                    RuntimeResumeOutput::Resumed { record }
-                    | RuntimeResumeOutput::Suspended { record, .. } => record,
-                }
-            }
-            ResumeInput::Interrupt => {
-                continue_start_turn = false;
-                self.phase = AgentLoopPhase::Done;
-                match AgentSessionRuntime::new(&self.session_store)
-                    .resume(&self.session_id, ResumeInput::Interrupt)
                     .await?
                 {
                     RuntimeResumeOutput::Resumed { record }

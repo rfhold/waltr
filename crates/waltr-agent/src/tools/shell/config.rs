@@ -4,10 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{ShellCommandParser, ShellScan, tool_input};
-use crate::{
-    AgentTool, Result, ToolDefinition, ToolExecutionContext, ToolResult,
-    middleware::tool_metadata::RootHintsMiddleware,
-};
+use crate::{AgentTool, Result, ToolDefinition, middleware::tool_metadata::RootHintsMiddleware};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 20 * 1024;
@@ -108,12 +105,14 @@ impl ShellConfig {
         AgentTool::new_async(definition, move |context| {
             let config = self.clone();
             Box::pin(async move {
-                tokio::task::spawn_blocking(move || config.call_agent_tool(context))
-                    .await
-                    .map_err(|error| crate::LlmError::Protocol {
-                        provider: "shell",
-                        message: format!("shell executor task failed: {error}"),
-                    })?
+                let content = config
+                    .execute_with_progress_and_cancellation(
+                        &tool_input(context.call())?,
+                        context.progress().clone(),
+                        context.cancellation_token().clone(),
+                    )
+                    .await?;
+                Ok(context.result(content))
             })
         })
     }
@@ -127,12 +126,6 @@ impl ShellConfig {
     pub fn scan(&self, input: &ShellInput) -> Result<ShellScan> {
         let workdir = self.resolved_workdir(input.workdir.as_deref());
         ShellCommandParser::new()?.scan(&input.command, &self.root_path(), &workdir)
-    }
-
-    fn call_agent_tool(&self, context: ToolExecutionContext) -> Result<ToolResult> {
-        let content =
-            self.execute_with_progress(&tool_input(context.call())?, context.progress())?;
-        Ok(context.result(content))
     }
 }
 

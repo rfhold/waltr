@@ -8,6 +8,10 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream};
+#[cfg(feature = "shell")]
+use waltr_agent::PermissionPolicy;
+#[cfg(feature = "shell")]
+use waltr_agent::tools::shell::ShellConfig;
 use waltr_agent::{
     AGENTS_INSTRUCTION_FILE, Agent, AgentTimelineEvent, AgentTool, AgentsPromptConfig,
     BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
@@ -21,6 +25,7 @@ use waltr_agent::{
     tools::question::QuestionConfig,
 };
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use crate::scripted_provider::ScriptedProvider;
 
@@ -363,6 +368,146 @@ async fn tool_progress_streams_between_call_preview_and_result() {
     );
     assert!(events[call_index].cursor < events[progress_index].cursor);
     assert!(events[progress_index].cursor < events[result_index].cursor);
+}
+
+#[tokio::test]
+async fn cancellation_token_stops_running_tool_without_finishing_result() {
+    let provider = ScriptedProvider::from_turns(
+        "cancel_tool_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "cancel-call",
+                "cancel_tool",
+                json!({}),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    );
+    let tool = AgentTool::new_async(
+        ToolDefinition::new("cancel_tool", "Wait for cancellation.", json!({})),
+        |context| {
+            Box::pin(async move {
+                context.cancellation_token().cancelled().await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok(context.result("should-not-finish"))
+            })
+        },
+    );
+    let agent = Agent::builder(test_model()).with_tool(tool).build();
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions
+        .create()
+        .await
+        .expect("created session")
+        .id()
+        .clone();
+    let cancellation = CancellationToken::new();
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "run cancel tool")
+        .with_cancellation_token(cancellation.clone())
+        .stream();
+
+    let first = stream
+        .next()
+        .await
+        .expect("tool call event")
+        .expect("tool call event");
+    assert!(crate::session::channel_is(&first, CHANNEL_TOOL_CALL));
+    cancellation.cancel();
+    let remaining = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("agent event"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        remaining
+            .iter()
+            .all(|event| !crate::session::channel_is(event, CHANNEL_TOOL_RESULT)),
+        "canceled run should not finish the running tool: {remaining:#?}"
+    );
+    let record = store.load(&session_id).await.expect("stored session");
+    assert!(record.snapshot().pending_work.iter().any(|work| {
+        work.id == "cancel-call" && matches!(work.status, waltr_agent::PendingWorkStatus::Pending)
+    }));
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn shell_cancellation_kills_running_command() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("shell-cancel-marker.txt");
+    let command = format!("(sleep 5; printf foo > {}) & wait", marker.display());
+    let provider = ScriptedProvider::from_turns(
+        "shell_cancel_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "shell-cancel-call",
+                "shell",
+                json!({
+                    "command": command,
+                    "description": "delayed marker write",
+                    "workdir": temp.path().display().to_string(),
+                }),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    );
+    let agent = Agent::builder(test_model())
+        .with_permission_policy(PermissionPolicy::default())
+        .with_shell_tool(ShellConfig::new(temp.path()))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions
+        .create()
+        .await
+        .expect("created session")
+        .id()
+        .clone();
+    let cancellation = CancellationToken::new();
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "run shell cancel command")
+        .with_cancellation_token(cancellation.clone())
+        .stream();
+
+    let first = stream
+        .next()
+        .await
+        .expect("tool call event")
+        .expect("tool call event");
+    assert!(crate::session::channel_is(&first, CHANNEL_TOOL_CALL));
+
+    tokio::select! {
+        event = stream.next() => panic!("shell command finished before cancellation: {event:#?}"),
+        () = tokio::time::sleep(Duration::from_secs(1)) => cancellation.cancel(),
+    }
+
+    let remaining = stream
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("agent event"))
+        .collect::<Vec<_>>();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    assert!(
+        remaining
+            .iter()
+            .all(|event| !crate::session::channel_is(event, CHANNEL_TOOL_RESULT)),
+        "canceled run should not finish the shell tool: {remaining:#?}"
+    );
+    assert!(
+        !marker.exists() || fs::read_to_string(&marker).expect("marker read").is_empty(),
+        "canceled shell command should not write marker"
+    );
+    let record = store.load(&session_id).await.expect("stored session");
+    assert!(record.snapshot().pending_work.iter().any(|work| {
+        work.id == "shell-cancel-call"
+            && matches!(work.status, waltr_agent::PendingWorkStatus::Pending)
+    }));
 }
 
 #[tokio::test]

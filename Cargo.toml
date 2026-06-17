@@ -50,6 +50,7 @@ tokio = "1.52.3"
 tokio-postgres = "0.7.15"
 tokio-stream = "0.1.18"
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7.17"
 toml = "1.1.2"
 tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router"] }
 tonic-otel-layer = "0.2.0"
