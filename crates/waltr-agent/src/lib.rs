@@ -45,7 +45,8 @@ pub use timeline::{
     AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING,
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO,
     CHANNEL_TOOL_RESULT, PendingTimelineEvent, TimelineChannel, TimelineContent, TimelineContentId,
-    TimelineCursor, TimelineEventKind, TimelineItemId, TimelineStatus,
+    TimelineCursor, TimelineDirection, TimelineEventKind, TimelineItemId, TimelineItemText,
+    TimelineQuery, TimelineStatus,
 };
 pub use tools::filesystem;
 pub use tools::question;

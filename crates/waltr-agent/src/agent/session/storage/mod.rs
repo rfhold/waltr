@@ -18,7 +18,10 @@ pub use postgresql::{opendal_postgresql_session_store, run_postgresql_migrations
 pub use s3::S3SessionStore;
 pub use scylla::ScyllaSessionStore;
 
-use crate::timeline::{AgentTimelineEvent, PendingTimelineEvent, TimelineCursor};
+use crate::timeline::{
+    AgentTimelineEvent, PendingTimelineEvent, TimelineContent, TimelineCursor, TimelineDirection,
+    TimelineItemId, TimelineItemText, TimelineQuery,
+};
 
 use super::types::{Revision, SessionId, SessionJournalEvent, SessionRecord};
 
@@ -47,6 +50,22 @@ pub enum SessionStoreError {
     LockPoisoned,
     /// The backend returned an implementation-specific error.
     Backend { message: String },
+    /// The requested timeline item does not exist in the session timeline.
+    TimelineItemNotFound {
+        /// Session containing the timeline.
+        id: SessionId,
+        /// Missing item identity.
+        item_id: TimelineItemId,
+    },
+    /// The requested timeline content cannot be reconstructed by this store contract.
+    TimelineContentUnavailable {
+        /// Session containing the timeline.
+        id: SessionId,
+        /// Timeline item identity.
+        item_id: TimelineItemId,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl fmt::Display for SessionStoreError {
@@ -77,6 +96,22 @@ impl fmt::Display for SessionStoreError {
             Self::Backend { message } => {
                 write!(formatter, "session store backend error: {message}")
             }
+            Self::TimelineItemNotFound { id, item_id } => write!(
+                formatter,
+                "timeline item not found in {}: {}",
+                id.as_str(),
+                item_id.as_str()
+            ),
+            Self::TimelineContentUnavailable {
+                id,
+                item_id,
+                reason,
+            } => write!(
+                formatter,
+                "timeline content unavailable in {} for {}: {reason}",
+                id.as_str(),
+                item_id.as_str()
+            ),
         }
     }
 }
@@ -113,13 +148,29 @@ pub trait SessionStore: Send + Sync {
         events: Vec<SessionJournalEvent>,
     ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
 
+    /// Read timeline events using a bounded store-neutral query.
+    fn timeline(
+        &self,
+        id: &SessionId,
+        query: TimelineQuery,
+    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send;
+
+    /// Reconstruct text-like content for one timeline item.
+    fn timeline_item_text(
+        &self,
+        id: &SessionId,
+        item_id: &TimelineItemId,
+    ) -> impl Future<Output = SessionStoreResult<TimelineItemText>> + Send;
+
     /// Read timeline events after `cursor`, or from the start when no cursor is supplied.
     fn timeline_after(
         &self,
         id: &SessionId,
         cursor: Option<TimelineCursor>,
         limit: usize,
-    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send;
+    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+        self.timeline(id, TimelineQuery::forward(cursor, limit))
+    }
 
     /// Read timeline events before `cursor`, preserving persisted order.
     fn timeline_before(
@@ -127,7 +178,9 @@ pub trait SessionStore: Send + Sync {
         id: &SessionId,
         cursor: Option<TimelineCursor>,
         limit: usize,
-    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send;
+    ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+        self.timeline(id, TimelineQuery::backward(cursor, limit))
+    }
 }
 
 pub(super) fn append_timeline_to_record(
@@ -153,35 +206,95 @@ pub(super) fn append_timeline_to_record(
     Ok(assigned)
 }
 
-pub(super) fn timeline_after_slice(
+pub(super) fn timeline_query_slice(
     record: &SessionRecord,
-    cursor: Option<TimelineCursor>,
-    limit: usize,
+    query: &TimelineQuery,
 ) -> Vec<AgentTimelineEvent> {
+    let limit = query.limit;
     if limit == 0 {
         return Vec::new();
     }
-    record
-        .timeline_events()
-        .filter(|event| cursor.map_or(true, |cursor| event.cursor > cursor))
-        .take(limit)
-        .cloned()
-        .collect()
+
+    match query.direction {
+        TimelineDirection::Forward => record
+            .timeline_events()
+            .filter(|event| query.cursor.map_or(true, |cursor| event.cursor > cursor))
+            .filter(|event| channel_matches(event, query.channels.as_deref()))
+            .take(limit)
+            .cloned()
+            .collect(),
+        TimelineDirection::Backward => {
+            let events = record
+                .timeline_events()
+                .filter(|event| query.cursor.map_or(true, |cursor| event.cursor < cursor))
+                .filter(|event| channel_matches(event, query.channels.as_deref()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let start = events.len().saturating_sub(limit);
+            events[start..].to_vec()
+        }
+    }
 }
 
-pub(super) fn timeline_before_slice(
+pub(super) fn timeline_item_text_from_record(
     record: &SessionRecord,
-    cursor: Option<TimelineCursor>,
-    limit: usize,
-) -> Vec<AgentTimelineEvent> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    let events = record
+    item_id: &TimelineItemId,
+) -> SessionStoreResult<TimelineItemText> {
+    let mut found = false;
+    let mut text = String::new();
+    let mut last_cursor = None;
+
+    for event in record
         .timeline_events()
-        .filter(|event| cursor.map_or(true, |cursor| event.cursor < cursor))
-        .cloned()
-        .collect::<Vec<_>>();
-    let start = events.len().saturating_sub(limit);
-    events[start..].to_vec()
+        .filter(|event| event.item_id == *item_id)
+    {
+        found = true;
+        last_cursor = Some(event.cursor);
+        match &event.content {
+            TimelineContent::TextDelta { delta } => text.push_str(delta),
+            TimelineContent::TextSnapshot { text: snapshot } => text.clone_from(snapshot),
+            TimelineContent::ContentRef { content_id, .. } => {
+                return Err(SessionStoreError::TimelineContentUnavailable {
+                    id: record.id.clone(),
+                    item_id: item_id.clone(),
+                    reason: format!(
+                        "content references are not implemented: {}",
+                        content_id.as_str()
+                    ),
+                });
+            }
+            TimelineContent::Empty
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::Json { .. } => {}
+        }
+    }
+
+    if !found {
+        return Err(SessionStoreError::TimelineItemNotFound {
+            id: record.id.clone(),
+            item_id: item_id.clone(),
+        });
+    }
+
+    Ok(TimelineItemText {
+        item_id: item_id.clone(),
+        bytes: text.len() as u64,
+        text,
+        last_cursor,
+    })
+}
+
+fn channel_matches(
+    event: &AgentTimelineEvent,
+    channels: Option<&[crate::timeline::TimelineChannel]>,
+) -> bool {
+    match channels {
+        None => true,
+        Some(channels) => event
+            .channel
+            .as_ref()
+            .is_some_and(|channel| channels.contains(channel)),
+    }
 }

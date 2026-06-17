@@ -4,11 +4,13 @@ use std::{fs, path::PathBuf};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    timeline_after_slice, timeline_before_slice,
+    timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
     agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
-    timeline::{AgentTimelineEvent, PendingTimelineEvent, TimelineCursor},
+    timeline::{
+        AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
+    },
 };
 
 /// Local JSON-file implementation of [`SessionStore`].
@@ -130,31 +132,30 @@ impl SessionStore for FilesystemSessionStore {
         }
     }
 
-    fn timeline_after(
+    fn timeline(
         &self,
         id: &SessionId,
-        cursor: Option<TimelineCursor>,
-        limit: usize,
+        query: TimelineQuery,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             let record = store.load_sync(&id)?;
-            Ok(timeline_after_slice(&record, cursor, limit))
+            Ok(timeline_query_slice(&record, &query))
         }
     }
 
-    fn timeline_before(
+    fn timeline_item_text(
         &self,
         id: &SessionId,
-        cursor: Option<TimelineCursor>,
-        limit: usize,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+        item_id: &TimelineItemId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<TimelineItemText>> + Send {
         let store = self.clone();
         let id = id.clone();
+        let item_id = item_id.clone();
         async move {
             let record = store.load_sync(&id)?;
-            Ok(timeline_before_slice(&record, cursor, limit))
+            timeline_item_text_from_record(&record, &item_id)
         }
     }
 }

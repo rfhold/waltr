@@ -1,6 +1,7 @@
 //! Ignored durable session storage resume tests.
 
 use std::{
+    collections::BTreeMap,
     fs,
     net::TcpListener,
     sync::{Arc, Once},
@@ -8,9 +9,10 @@ use std::{
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, ExternalRequestId, ExternalResponse,
-    FilesystemSessionStore, OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore,
-    SessionStore, TimelineContent, TimelineEventKind, TimelineStatus,
+    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_CALL,
+    CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse, FilesystemSessionStore,
+    OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore, SessionStore,
+    TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
     opendal_postgresql_session_store,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
@@ -162,6 +164,141 @@ where
                 && result.content.contains("resume confirmed")),
         "{label}: stored session did not persist the resumed question result: {stored:?}"
     );
+
+    assert_timeline_surface(&store, &session_id, label).await?;
+    Ok(())
+}
+
+async fn assert_timeline_surface<S>(
+    store: &S,
+    session_id: &waltr_agent::SessionId,
+    label: &str,
+) -> waltr_agent::Result<()>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    let all = store
+        .timeline(session_id, TimelineQuery::forward(None, 512))
+        .await
+        .map_err(store_error)?;
+    assert!(
+        !all.is_empty(),
+        "{label}: timeline query returned no events"
+    );
+    assert!(
+        all.windows(2)
+            .all(|window| window[0].cursor < window[1].cursor),
+        "{label}: timeline cursors are not strictly increasing: {all:?}"
+    );
+
+    let last_cursor = all.last().expect("non-empty timeline").cursor;
+    let before_last = store
+        .timeline(
+            session_id,
+            TimelineQuery::backward(Some(last_cursor), all.len()),
+        )
+        .await
+        .map_err(store_error)?;
+    assert_eq!(
+        before_last,
+        all[..all.len() - 1],
+        "{label}: backward timeline query did not preserve chronological order"
+    );
+
+    let assistant_events = store
+        .timeline(
+            session_id,
+            TimelineQuery::forward(None, 512)
+                .with_channels([TimelineChannel::from(CHANNEL_ASSISTANT_TEXT)]),
+        )
+        .await
+        .map_err(store_error)?;
+    assert!(
+        !assistant_events.is_empty(),
+        "{label}: assistant channel query returned no events"
+    );
+    assert!(
+        assistant_events
+            .iter()
+            .all(|event| crate::session::channel_is(event, CHANNEL_ASSISTANT_TEXT)),
+        "{label}: assistant channel query returned a non-assistant event"
+    );
+
+    let tool_and_external_events = store
+        .timeline(
+            session_id,
+            TimelineQuery::forward(None, 512).with_channels([
+                TimelineChannel::from(CHANNEL_TOOL_CALL),
+                TimelineChannel::from(CHANNEL_TOOL_RESULT),
+                TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST),
+            ]),
+        )
+        .await
+        .map_err(store_error)?;
+    assert!(
+        tool_and_external_events
+            .iter()
+            .any(|event| crate::session::channel_is(event, CHANNEL_TOOL_CALL)),
+        "{label}: tool call channel was not present in storage timeline"
+    );
+    assert!(
+        tool_and_external_events
+            .iter()
+            .any(|event| crate::session::channel_is(event, CHANNEL_TOOL_RESULT)),
+        "{label}: tool result channel was not present in storage timeline"
+    );
+    assert!(
+        tool_and_external_events
+            .iter()
+            .any(|event| crate::session::channel_is(event, CHANNEL_EXTERNAL_REQUEST)),
+        "{label}: external request channel was not present in storage timeline"
+    );
+
+    let mut assistant_text_by_item = BTreeMap::new();
+    for event in &assistant_events {
+        match &event.content {
+            TimelineContent::TextDelta { delta } => {
+                assistant_text_by_item
+                    .entry(event.item_id.clone())
+                    .or_insert_with(String::new)
+                    .push_str(delta);
+            }
+            TimelineContent::TextSnapshot { text } => {
+                assistant_text_by_item.insert(event.item_id.clone(), text.clone());
+            }
+            TimelineContent::Empty
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
+        }
+    }
+    let (final_assistant_item, final_assistant_text) = assistant_text_by_item
+        .iter()
+        .find(|(_, text)| text.contains("storage resume complete"))
+        .unwrap_or_else(|| {
+            panic!("{label}: no assistant timeline item contained final resume text: {assistant_text_by_item:?}")
+        });
+    let reconstructed = store
+        .timeline_item_text(session_id, final_assistant_item)
+        .await
+        .map_err(store_error)?;
+
+    assert_eq!(
+        reconstructed.text, *final_assistant_text,
+        "{label}: reconstructed assistant item text did not match timeline deltas"
+    );
+    assert_eq!(
+        reconstructed.bytes,
+        final_assistant_text.len() as u64,
+        "{label}: reconstructed assistant item byte count was wrong"
+    );
+    assert!(
+        reconstructed.last_cursor.is_some(),
+        "{label}: reconstructed assistant item did not report a last cursor"
+    );
+
     Ok(())
 }
 

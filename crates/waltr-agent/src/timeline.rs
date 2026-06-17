@@ -167,6 +167,72 @@ pub enum TimelineEventKind {
     SessionStatusChanged,
 }
 
+/// Direction for bounded timeline history reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TimelineDirection {
+    /// Read events after a cursor, or from the start when no cursor is supplied.
+    Forward,
+    /// Read events before a cursor, or from the end when no cursor is supplied.
+    Backward,
+}
+
+/// Store-neutral timeline range query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineQuery {
+    /// Read direction.
+    pub direction: TimelineDirection,
+    /// Exclusive cursor boundary.
+    pub cursor: Option<TimelineCursor>,
+    /// Maximum number of events to return.
+    pub limit: usize,
+    /// Optional display-channel filter.
+    pub channels: Option<Vec<TimelineChannel>>,
+}
+
+impl TimelineQuery {
+    /// Create a forward query after `cursor`, or from the start when no cursor is supplied.
+    #[must_use]
+    pub const fn forward(cursor: Option<TimelineCursor>, limit: usize) -> Self {
+        Self {
+            direction: TimelineDirection::Forward,
+            cursor,
+            limit,
+            channels: None,
+        }
+    }
+
+    /// Create a backward query before `cursor`, or from the end when no cursor is supplied.
+    #[must_use]
+    pub const fn backward(cursor: Option<TimelineCursor>, limit: usize) -> Self {
+        Self {
+            direction: TimelineDirection::Backward,
+            cursor,
+            limit,
+            channels: None,
+        }
+    }
+
+    /// Limit the query to the supplied display channels.
+    #[must_use]
+    pub fn with_channels(mut self, channels: impl IntoIterator<Item = TimelineChannel>) -> Self {
+        self.channels = Some(channels.into_iter().collect());
+        self
+    }
+}
+
+/// Reconstructed text content for one timeline item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineItemText {
+    /// Timeline item identity.
+    pub item_id: TimelineItemId,
+    /// Reconstructed UTF-8 text.
+    pub text: String,
+    /// Reconstructed text size in bytes.
+    pub bytes: u64,
+    /// Last cursor observed for this item.
+    pub last_cursor: Option<TimelineCursor>,
+}
+
 /// Coarse status attached to timeline items or session-status events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimelineStatus {
