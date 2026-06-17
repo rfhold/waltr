@@ -2,8 +2,9 @@
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentEvent, ExternalRequestId, ExternalResponse, FilesystemSessionStore, LlmStream,
-    ModelApi, ModelRef, ProviderId, ResumeInput, SessionStore,
+    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, ExternalRequestId, ExternalResponse,
+    FilesystemSessionStore, LlmStream, ModelApi, ModelRef, ProviderId, ResumeInput, SessionStore,
+    TimelineContent, TimelineEventKind, TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
         OpenAiReasoningEffort, OpenAiReasoningSummary,
@@ -124,7 +125,7 @@ async fn assert_provider_durable_replay(
                 &provider,
                 session_id.clone(),
                 ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new(first_request),
+                    request_id: first_request,
                     response: ExternalResponse::new(json!(FIRST_ANSWER)),
                 },
             )
@@ -143,7 +144,7 @@ async fn assert_provider_durable_replay(
                 &provider,
                 session_id.clone(),
                 ResumeInput::ExternalResponse {
-                    request_id: ExternalRequestId::new(second_request),
+                    request_id: second_request,
                     response: ExternalResponse::new(json!(SECOND_ANSWER)),
                 },
             )
@@ -167,10 +168,10 @@ fn assert_stored_replay_facts(
     label: &str,
     expect_thinking: bool,
 ) {
+    let snapshot = stored.snapshot();
     for answer in [FIRST_ANSWER, SECOND_ANSWER] {
         assert!(
-            stored
-                .snapshot
+            snapshot
                 .tool_results()
                 .any(|result| result.name == QUESTION_TOOL_NAME && result.content.contains(answer)),
             "{label}: stored session is missing the persisted question answer {answer}: {stored:?}"
@@ -183,8 +184,7 @@ fn assert_stored_replay_facts(
         // turn. The later turns still prove replay validity: the provider
         // accepts requests that replay the earlier thinking payloads.
         assert!(
-            stored
-                .snapshot
+            snapshot
                 .turns
                 .iter()
                 .any(|turn| turn.thinking_blocks().next().is_some()),
@@ -197,24 +197,40 @@ fn assert_stored_replay_facts(
 struct CollectedSession {
     text: String,
     finished: bool,
-    external_request_ids: Vec<String>,
+    external_request_ids: Vec<ExternalRequestId>,
 }
 
 async fn collect(
-    mut events: waltr_agent::BoxAgentEventStream<'_>,
+    mut events: waltr_agent::BoxAgentTimelineStream<'_>,
 ) -> waltr_agent::Result<CollectedSession> {
     let mut collected = CollectedSession::default();
     while let Some(event) = events.next().await {
-        match event? {
-            AgentEvent::TextDelta { delta, .. } => collected.text.push_str(&delta),
-            AgentEvent::ExternalRequest { request, .. } => {
-                collected.external_request_ids.push(request.id);
+        let event = event?;
+        match &event.content {
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                collected.text.push_str(delta);
             }
-            AgentEvent::Finished { .. } => collected.finished = true,
-            AgentEvent::ThinkingDelta { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::ToolResult { .. }
-            | AgentEvent::TurnFinished { .. } => {}
+            TimelineContent::ExternalRequest { request }
+                if crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST) =>
+            {
+                collected.external_request_ids.push(request.id.clone());
+            }
+            TimelineContent::Empty
+                if event.kind == TimelineEventKind::SessionStatusChanged
+                    && event.status == Some(TimelineStatus::Finished) =>
+            {
+                collected.finished = true;
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
         }
     }
     Ok(collected)
@@ -224,7 +240,7 @@ fn expect_external_request(
     collected: &CollectedSession,
     label: &str,
     stage: &str,
-) -> waltr_agent::Result<String> {
+) -> waltr_agent::Result<ExternalRequestId> {
     collected
         .external_request_ids
         .first()

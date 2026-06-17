@@ -22,29 +22,36 @@ pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     }
     messages.push(json!({ "role": "user", "content": request.prompt }));
 
+    let mut pending_text = String::new();
     let mut pending_calls: Vec<Value> = Vec::new();
     for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
         match item {
+            TurnItem::AssistantText(text) => pending_text.push_str(text),
             TurnItem::Thinking(_) => {}
             TurnItem::ToolCall(call) => pending_calls.push(chat_tool_call(call)),
             TurnItem::ToolResult(result) => {
-                flush_assistant_tool_calls(&mut messages, &mut pending_calls);
+                flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
                 messages.push(chat_tool_result(result));
             }
         }
     }
-    flush_assistant_tool_calls(&mut messages, &mut pending_calls);
+    flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
     messages
 }
 
-fn flush_assistant_tool_calls(messages: &mut Vec<Value>, calls: &mut Vec<Value>) {
-    if !calls.is_empty() {
-        messages.push(json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": std::mem::take(calls),
-        }));
+fn flush_assistant_message(messages: &mut Vec<Value>, text: &mut String, calls: &mut Vec<Value>) {
+    if text.is_empty() && calls.is_empty() {
+        return;
     }
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(std::mem::take(text)) },
+    });
+    if !calls.is_empty() {
+        message["tool_calls"] = json!(std::mem::take(calls));
+    }
+    messages.push(message);
 }
 
 fn chat_tool_call(call: &ToolCall) -> Value {
@@ -111,6 +118,7 @@ mod tests {
                 turn: 0,
                 metadata: None,
                 items: vec![
+                    TurnItem::AssistantText("first answer".to_owned()),
                     TurnItem::ToolCall(ToolCall::new("call-0", "echo", json!({ "value": "a" }))),
                     TurnItem::ToolResult(ToolResult::new("call-0", "echo", "a")),
                 ],
@@ -119,6 +127,7 @@ mod tests {
                 turn: 1,
                 metadata: None,
                 items: vec![
+                    TurnItem::AssistantText("second answer".to_owned()),
                     TurnItem::ToolCall(ToolCall::new("call-1", "echo", json!({ "value": "b" }))),
                     TurnItem::ToolResult(ToolResult::new("call-1", "echo", "b")),
                 ],
@@ -129,10 +138,12 @@ mod tests {
 
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "first answer");
         assert_eq!(messages[1]["tool_calls"][0]["id"], "call-0");
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_call_id"], "call-0");
         assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"], "second answer");
         assert_eq!(messages[3]["tool_calls"][0]["id"], "call-1");
         assert_eq!(messages[4]["role"], "tool");
         assert_eq!(messages[4]["tool_call_id"], "call-1");

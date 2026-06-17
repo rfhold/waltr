@@ -89,6 +89,11 @@ impl<'a> CompletionRequest<'a> {
         self.turns.iter().flat_map(CompletionTurn::tool_calls)
     }
 
+    /// Assistant text across all replayed turns, in emission order.
+    pub fn assistant_texts(&self) -> impl Iterator<Item = &str> {
+        self.turns.iter().flat_map(CompletionTurn::assistant_texts)
+    }
+
     /// Tool results across all replayed turns, in emission order.
     pub fn tool_results(&self) -> impl Iterator<Item = &ToolResult> {
         self.turns.iter().flat_map(CompletionTurn::tool_results)
@@ -157,6 +162,36 @@ impl CompletionTurn {
         })
     }
 
+    /// Assistant text segments recorded during the turn, in emission order.
+    pub fn assistant_texts(&self) -> impl Iterator<Item = &str> {
+        self.items.iter().filter_map(|item| match item {
+            TurnItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Append assistant text to the latest assistant segment, preserving item order.
+    pub fn append_assistant_text(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        match self.items.last_mut() {
+            Some(TurnItem::AssistantText(text)) => text.push_str(delta),
+            _ => self.items.push(TurnItem::AssistantText(delta.to_owned())),
+        }
+    }
+
+    /// Replace the latest assistant text segment with a snapshot value.
+    pub fn set_assistant_text_snapshot(&mut self, text: &str) {
+        match self.items.last_mut() {
+            Some(TurnItem::AssistantText(existing)) => {
+                existing.clear();
+                existing.push_str(text);
+            }
+            _ => self.items.push(TurnItem::AssistantText(text.to_owned())),
+        }
+    }
+
     /// Tool calls recorded during the turn, in emission order.
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
         self.items.iter().filter_map(|item| match item {
@@ -177,6 +212,8 @@ impl CompletionTurn {
 /// One replayable item produced during a provider turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnItem {
+    /// Assistant text emitted by the provider.
+    AssistantText(String),
     /// Provider thinking/reasoning block.
     Thinking(ThinkingBlock),
     /// Tool call requested by the model.
@@ -427,6 +464,31 @@ mod tests {
         assert_eq!(turns[1].items.len(), 2);
         assert_eq!(turns[1].thinking_blocks().count(), 1);
         assert_eq!(turns[1].tool_results().count(), 1);
+    }
+
+    #[test]
+    fn assistant_text_deltas_merge_until_another_turn_item() {
+        let mut turn = CompletionTurn::new(0);
+
+        turn.append_assistant_text("hello ");
+        turn.append_assistant_text("world");
+        turn.items.push(TurnItem::ToolResult(super::ToolResult::new(
+            "call-1", "echo", "ok",
+        )));
+        turn.append_assistant_text("again");
+
+        assert_eq!(
+            turn.items,
+            [
+                TurnItem::AssistantText("hello world".to_owned()),
+                TurnItem::ToolResult(super::ToolResult::new("call-1", "echo", "ok")),
+                TurnItem::AssistantText("again".to_owned()),
+            ]
+        );
+        assert_eq!(
+            turn.assistant_texts().collect::<Vec<_>>(),
+            ["hello world", "again"]
+        );
     }
 
     #[test]

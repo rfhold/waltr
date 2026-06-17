@@ -2,10 +2,13 @@
 
 use std::{fs, path::PathBuf};
 
-use super::{SessionStore, SessionStoreError, SessionStoreResult};
-use crate::agent::session::{
-    ExternalRequest, RequestRecord, Revision, SessionEvent, SessionId, SessionRecord,
-    SessionSnapshot,
+use super::{
+    SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
+    timeline_after_slice, timeline_before_slice,
+};
+use crate::{
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    timeline::{AgentTimelineEvent, PendingTimelineEvent, TimelineCursor},
 };
 
 /// Local JSON-file implementation of [`SessionStore`].
@@ -47,12 +50,12 @@ impl FilesystemSessionStore {
         Ok(())
     }
 
-    fn update_sync(
+    fn update_sync<T>(
         &self,
         id: &SessionId,
         expected_revision: Revision,
-        update: impl FnOnce(&mut SessionRecord, Revision),
-    ) -> SessionStoreResult<Revision> {
+        update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T>,
+    ) -> SessionStoreResult<(Revision, T)> {
         let mut record = self.load_sync(id)?;
         if record.revision != expected_revision {
             return Err(SessionStoreError::StaleRevision {
@@ -62,24 +65,26 @@ impl FilesystemSessionStore {
             });
         }
         let revision = record.revision.next();
-        update(&mut record, revision);
+        let value = update(&mut record, revision)?;
         record.revision = revision;
         self.save_sync(&record)?;
-        Ok(revision)
+        Ok((revision, value))
     }
 }
 
 impl SessionStore for FilesystemSessionStore {
     fn create(
         &self,
-        record: SessionRecord,
-    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        id: SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
+            let record = SessionRecord::new(id);
             if store.path(&record.id).exists() {
                 return Err(SessionStoreError::AlreadyExists { id: record.id });
             }
-            store.save_sync(&record)
+            store.save_sync(&record)?;
+            Ok(record)
         }
     }
 
@@ -92,71 +97,64 @@ impl SessionStore for FilesystemSessionStore {
         async move { store.load_sync(&id) }
     }
 
-    fn append(
+    fn append_timeline(
         &self,
         id: &SessionId,
-        events: Vec<SessionEvent>,
         expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        events: Vec<PendingTimelineEvent>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store.update_sync(&id, expected_revision, |record, _| {
-                record.events.extend(events);
-            })
+            let (_, assigned) = store.update_sync(&id, expected_revision, |record, _| {
+                append_timeline_to_record(record, &id, events)
+            })?;
+            Ok(assigned)
         }
     }
 
-    fn save_snapshot(
+    fn append_journal(
         &self,
         id: &SessionId,
-        mut snapshot: SessionSnapshot,
         expected_revision: Revision,
+        events: Vec<SessionJournalEvent>,
     ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            if snapshot.id != id {
-                return Err(SessionStoreError::SessionIdMismatch {
-                    expected: id,
-                    actual: snapshot.id,
-                });
-            }
-            store.update_sync(&id, expected_revision, |record, revision| {
-                snapshot.revision = revision;
-                record.snapshot = snapshot;
-            })
+            let (revision, ()) = store.update_sync(&id, expected_revision, |record, _| {
+                record.append_journal_events(events);
+                Ok(())
+            })?;
+            Ok(revision)
         }
     }
 
-    fn record_request(
+    fn timeline_after(
         &self,
         id: &SessionId,
-        request: RequestRecord,
-        expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store.update_sync(&id, expected_revision, |record, _| {
-                record.requests.push(request);
-            })
+            let record = store.load_sync(&id)?;
+            Ok(timeline_after_slice(&record, cursor, limit))
         }
     }
 
-    fn record_external_request(
+    fn timeline_before(
         &self,
         id: &SessionId,
-        request: ExternalRequest,
-        expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store.update_sync(&id, expected_revision, |record, revision| {
-                record.snapshot.external_requests.push(request);
-                record.snapshot.revision = revision;
-            })
+            let record = store.load_sync(&id)?;
+            Ok(timeline_before_slice(&record, cursor, limit))
         }
     }
 }

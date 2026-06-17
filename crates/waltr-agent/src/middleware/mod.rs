@@ -1,44 +1,23 @@
 //! Middleware extension points for agent runs.
 
-#![allow(dead_code)]
-
 use std::future::Future;
 
 pub(crate) mod agents;
 pub mod chain;
 pub(crate) mod claims;
 pub mod context;
-pub mod cost;
-pub mod otel;
-pub mod pricing;
 pub(crate) mod prompt;
 pub(crate) mod question_suspension;
-pub mod secrets;
 pub(crate) mod skills;
 pub(crate) mod tool_metadata;
 pub(crate) mod tools;
-pub mod usage;
 
-use crate::{CompletionEvent, LlmError, Result, ToolResult};
+use crate::{Result, ToolResult};
 
 use self::context::{
-    ModelRequestDraft, RequestContext, RunContext, StreamContext, SystemPromptParts,
-    ToolCallContext, ToolDraft, ToolResultContext,
+    ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, ToolCallContext, ToolDraft,
+    ToolResultContext,
 };
-
-/// Provider-neutral stream event exposed to middleware.
-pub(crate) type ModelEvent = CompletionEvent;
-
-/// Minimal resume input draft for middleware lifecycle hooks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ResumeInput {
-    /// Resume with a new user prompt.
-    Prompt(String),
-    /// Resume with externally completed tool results.
-    ToolResults(Vec<ToolResult>),
-    /// Request interruption of active work.
-    Interrupt,
-}
 
 /// Provider-neutral external request kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,14 +92,10 @@ impl Suspension {
 pub(crate) enum HookOutcome {
     /// Continue normal hook-chain or runtime progression.
     Continue,
-    /// Suppress the current request, event, tool call, or result.
-    Suppress,
     /// Replace the current tool execution with a synthetic result.
     ReplaceToolResult(ToolResult),
     /// Persist a suspension and stop runtime progression.
     Suspend(Suspension),
-    /// Abort runtime progression with an LLM error.
-    Abort(LlmError),
 }
 
 /// Middleware hooks for request construction, streaming, tools, and run lifecycle.
@@ -161,15 +136,6 @@ pub(crate) trait AgentMiddleware: Send + Sync {
         async { Ok(HookOutcome::Continue) }
     }
 
-    /// Observe or alter one provider stream event.
-    fn on_provider_event(
-        &self,
-        _ctx: &mut StreamContext<'_>,
-        _event: &mut ModelEvent,
-    ) -> impl Future<Output = Result<HookOutcome>> + Send {
-        async { Ok(HookOutcome::Continue) }
-    }
-
     /// Observe or alter a tool call before execution.
     fn before_tool_call(
         &self,
@@ -191,15 +157,6 @@ pub(crate) trait AgentMiddleware: Send + Sync {
         &self,
         _ctx: &mut RunContext<'_>,
         _suspension: &mut Suspension,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
-    }
-
-    /// Observe or edit resume input before it is applied.
-    fn on_resume(
-        &self,
-        _ctx: &mut RunContext<'_>,
-        _input: &mut ResumeInput,
     ) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }

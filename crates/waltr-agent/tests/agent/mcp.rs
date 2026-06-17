@@ -4,8 +4,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::Router;
 use waltr_agent::{
-    Agent, AgentTranscriptEvent, CompletionEvent, LlmError, LlmStream, ModelApi, ModelRef,
-    ProviderId, ToolCall,
+    Agent, CompletionEvent, LlmStream, ModelApi, ModelRef, ProviderId, ToolCall,
     mcp::{McpConfig, McpServerConfig},
 };
 use rmcp::{
@@ -57,8 +56,8 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
     assert_tool_was_not_surfaced(&provider, "search_mcp_tools");
     assert_tool_was_not_surfaced(&provider, "get_mcp_tool_details");
     assert_tool_was_not_surfaced(&provider, "call_mcp_tool");
-    assert_tool_call(&session, "mcp_stdio_test_echo_marker", &context)?;
-    assert_tool_call(&session, "mcp_http_test_echo_marker", &context)?;
+    assert_tool_call(&session, "mcp_stdio_test_echo_marker", &context);
+    assert_tool_call(&session, "mcp_http_test_echo_marker", &context);
     assert!(
         direct_results.contains("stdio-mcp-tool-called-707"),
         "{context}"
@@ -172,50 +171,26 @@ impl Drop for HttpMcpTestServer {
 }
 
 fn tool_result_text(session: &AgentTestSession) -> String {
-    let Some(snapshot) = &session.final_snapshot else {
-        return String::new();
-    };
-    snapshot
-        .state
-        .events
+    session
+        .tool_results
         .iter()
-        .filter_map(|event| match event {
-            waltr_agent::AgentTranscriptEvent::ToolResult { result, .. } => {
-                Some(result.content.as_str())
-            }
-            waltr_agent::AgentTranscriptEvent::Thinking { .. }
-            | waltr_agent::AgentTranscriptEvent::Text { .. }
-            | waltr_agent::AgentTranscriptEvent::ToolCall { .. } => None,
-        })
+        .map(|result| result.content.as_str())
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn assert_tool_call(
-    session: &AgentTestSession,
-    name: &str,
-    context: &str,
-) -> waltr_agent::Result<()> {
-    let snapshot = session
-        .final_snapshot
-        .as_ref()
-        .ok_or_else(|| LlmError::Protocol {
-            provider: "mcp",
-            message: "agent stream ended without final snapshot".to_owned(),
-        })?;
+fn assert_tool_call(session: &AgentTestSession, name: &str, context: &str) {
     assert!(
-        snapshot.state.events.iter().any(
-            |event| matches!(event, AgentTranscriptEvent::ToolCall { call, .. } if call.name == name)
-        ),
+        session.tool_calls.iter().any(|call| call.name == name),
         "{context}"
     );
     assert!(
-        snapshot.state.events.iter().any(
-            |event| matches!(event, AgentTranscriptEvent::ToolResult { result, .. } if result.name == name)
-        ),
+        session
+            .tool_results
+            .iter()
+            .any(|result| result.name == name),
         "{context}"
     );
-    Ok(())
 }
 
 fn test_model() -> ModelRef {

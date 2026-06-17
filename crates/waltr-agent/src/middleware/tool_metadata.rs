@@ -47,7 +47,7 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        AgentState, ModelId, ToolDefinition,
+        ToolDefinition,
         middleware::context::{MiddlewareStateLog, RequestContext},
     };
 
@@ -56,17 +56,9 @@ mod tests {
     #[tokio::test]
     async fn appends_hint_only_to_named_tools() {
         let middleware = RootHintsMiddleware::new(vec!["read".to_owned()], " Root: /workspace.");
-        let model_id = ModelId::new("test-model");
-        let session = AgentState::default();
         let mut middleware_state = MiddlewareStateLog::default();
         let mut system_prompt_override = None;
         let mut ctx = RequestContext {
-            session_id: "session-1",
-            revision: 0,
-            model_id: &model_id,
-            provider_id: None,
-            turn: 0,
-            session: &session,
             middleware_state: &mut middleware_state,
             system_prompt_override: &mut system_prompt_override,
         };

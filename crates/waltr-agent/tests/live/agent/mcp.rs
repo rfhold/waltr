@@ -4,7 +4,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::Router;
 use waltr_agent::{
-    Agent, AgentTranscriptEvent, LlmError, LlmStream, ModelRef,
+    Agent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmError, LlmStream, ModelRef, TimelineContent,
     mcp::{McpConfig, McpServerConfig},
 };
 use rmcp::{
@@ -63,7 +63,7 @@ async fn run_live_mcp(provider: impl LlmStream, model: ModelRef) -> waltr_agent:
     assert_tool_was_not_surfaced(&provider, "search_mcp_tools");
     assert_tool_was_not_surfaced(&provider, "get_mcp_tool_details");
     assert_tool_was_not_surfaced(&provider, "call_mcp_tool");
-    require_transcript_tool_execution(provider.name(), &session, &context)?;
+    require_timeline_tool_execution(provider.name(), &session, &context)?;
     assert_tool_call(&session, "mcp_stdio_test_echo_marker", &context)?;
     assert_tool_call(&session, "mcp_http_test_echo_marker", &context)?;
     assert!(
@@ -168,20 +168,17 @@ impl Drop for HttpMcpTestServer {
 }
 
 fn tool_result_text(session: &AgentTestSession) -> String {
-    let Some(snapshot) = &session.final_snapshot else {
-        return String::new();
-    };
-    snapshot
-        .state
-        .events
+    session
+        .timeline
         .iter()
-        .filter_map(|event| match event {
-            waltr_agent::AgentTranscriptEvent::ToolResult { result, .. } => {
+        .filter_map(|event| {
+            if crate::session::channel_is(event, CHANNEL_TOOL_RESULT)
+                && let TimelineContent::ToolResult { result } = &event.content
+            {
                 Some(result.content.as_str())
+            } else {
+                None
             }
-            waltr_agent::AgentTranscriptEvent::Thinking { .. }
-            | waltr_agent::AgentTranscriptEvent::Text { .. }
-            | waltr_agent::AgentTranscriptEvent::ToolCall { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -192,45 +189,37 @@ fn assert_tool_call(
     name: &str,
     context: &str,
 ) -> waltr_agent::Result<()> {
-    let snapshot = session
-        .final_snapshot
-        .as_ref()
-        .ok_or_else(|| LlmError::Protocol {
-            provider: "mcp",
-            message: "agent stream ended without final snapshot".to_owned(),
-        })?;
     assert!(
-        snapshot.state.events.iter().any(
-            |event| matches!(event, AgentTranscriptEvent::ToolCall { call, .. } if call.name == name)
-        ),
+        session.timeline.iter().any(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_CALL)
+                && matches!(&event.content, TimelineContent::ToolCall { call } if call.name == name)
+        }),
         "{context}"
     );
     assert!(
-        snapshot.state.events.iter().any(
-            |event| matches!(event, AgentTranscriptEvent::ToolResult { result, .. } if result.name == name)
-        ),
+        session.timeline.iter().any(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_RESULT)
+                && matches!(&event.content, TimelineContent::ToolResult { result } if result.name == name)
+        }),
         "{context}"
     );
     Ok(())
 }
 
-fn require_transcript_tool_execution(
+fn require_timeline_tool_execution(
     provider: &'static str,
     session: &AgentTestSession,
     context: &str,
 ) -> waltr_agent::Result<()> {
-    let has_tool_call_and_result = session.final_snapshot.as_ref().is_some_and(|snapshot| {
-        snapshot
-            .state
-            .events
-            .iter()
-            .any(|event| matches!(event, AgentTranscriptEvent::ToolCall { .. }))
-            && snapshot
-                .state
-                .events
-                .iter()
-                .any(|event| matches!(event, AgentTranscriptEvent::ToolResult { .. }))
+    let has_tool_call = session.timeline.iter().any(|event| {
+        crate::session::channel_is(event, CHANNEL_TOOL_CALL)
+            && matches!(&event.content, TimelineContent::ToolCall { .. })
     });
+    let has_tool_result = session.timeline.iter().any(|event| {
+        crate::session::channel_is(event, CHANNEL_TOOL_RESULT)
+            && matches!(&event.content, TimelineContent::ToolResult { .. })
+    });
+    let has_tool_call_and_result = has_tool_call && has_tool_result;
     if has_tool_call_and_result {
         return Ok(());
     }

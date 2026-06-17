@@ -5,7 +5,8 @@ use serde_json::json;
 
 use super::{ShellCommandParser, ShellScan, tool_input};
 use crate::{
-    AgentTool, Result, ToolCall, ToolDefinition, middleware::tool_metadata::RootHintsMiddleware,
+    AgentTool, Result, ToolDefinition, ToolExecutionContext, ToolResult,
+    middleware::tool_metadata::RootHintsMiddleware,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -104,7 +105,17 @@ impl ShellConfig {
                 "additionalProperties": false
             }),
         );
-        AgentTool::new(definition, move |call| self.call_agent_tool(call))
+        AgentTool::new_async(definition, move |context| {
+            let config = self.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || config.call_agent_tool(context))
+                    .await
+                    .map_err(|error| crate::LlmError::Protocol {
+                        provider: "shell",
+                        message: format!("shell executor task failed: {error}"),
+                    })?
+            })
+        })
     }
 
     /// Scan a shell command and return parsed commands, claims, and reusable patterns.
@@ -118,8 +129,10 @@ impl ShellConfig {
         ShellCommandParser::new()?.scan(&input.command, &self.root_path(), &workdir)
     }
 
-    fn call_agent_tool(&self, call: &ToolCall) -> Result<String> {
-        self.execute(&tool_input(call)?)
+    fn call_agent_tool(&self, context: ToolExecutionContext) -> Result<ToolResult> {
+        let content =
+            self.execute_with_progress(&tool_input(context.call())?, context.progress())?;
+        Ok(context.result(content))
     }
 }
 

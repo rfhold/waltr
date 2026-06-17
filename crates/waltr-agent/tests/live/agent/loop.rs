@@ -1,7 +1,8 @@
 //! Live provider agent-loop integration tests.
 
 use waltr_agent::{
-    Agent, AgentTool, LlmError, LlmStream, ModelRef, SessionSnapshot, SessionStatus, ToolDefinition,
+    Agent, AgentTool, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef, TimelineContent,
+    ToolDefinition,
 };
 use serde_json::json;
 
@@ -65,15 +66,7 @@ async fn assert_provider_runs_status_agent(
     crate::session::report_tool_errors(&provider, &session, "status loop");
     let context = crate::session::session_context(&provider, &session);
 
-    let final_snapshot = session
-        .final_snapshot
-        .as_ref()
-        .ok_or_else(|| LlmError::Protocol {
-            provider: provider.name(),
-            message: "agent stream ended without final snapshot".to_owned(),
-        })?;
-
-    assert_final_snapshot(final_snapshot, &context);
+    assert_finished_status_session(&session, &context);
     assert!(session.saw_text_after_tool_result, "{context}");
 
     Ok(())
@@ -90,27 +83,25 @@ fn get_status_tool() -> AgentTool {
                 "additionalProperties": false
             }),
         ),
-        |_| Ok(STATUS.to_owned()),
+        |context| Ok(context.result(STATUS)),
     )
 }
 
-fn assert_final_snapshot(snapshot: &SessionSnapshot, context: &str) {
-    assert_eq!(snapshot.status, SessionStatus::Finished, "{context}");
-    assert_eq!(
-        snapshot.state.last_assistant_text().trim(),
-        STATUS,
+fn assert_finished_status_session(session: &AgentTestSession, context: &str) {
+    assert!(session.finished, "{context}");
+    assert_eq!(session.text.trim(), STATUS, "{context}");
+    assert!(
+        session.timeline.iter().any(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_CALL)
+                && matches!(&event.content, TimelineContent::ToolCall { call } if call.name == "get_status")
+        }),
         "{context}"
     );
     assert!(
-        snapshot.state.events.iter().any(
-            |event| matches!(event, waltr_agent::AgentTranscriptEvent::ToolCall { call, .. } if call.name == "get_status")
-        ),
-        "{context}"
-    );
-    assert!(
-        snapshot.state.events.iter().any(
-            |event| matches!(event, waltr_agent::AgentTranscriptEvent::ToolResult { result, .. } if result.name == "get_status" && result.content == STATUS)
-        ),
+        session.timeline.iter().any(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_RESULT)
+                && matches!(&event.content, TimelineContent::ToolResult { result } if result.name == "get_status" && result.content == STATUS)
+        }),
         "{context}"
     );
 }

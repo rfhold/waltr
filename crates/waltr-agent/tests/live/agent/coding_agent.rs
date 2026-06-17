@@ -4,10 +4,10 @@ use std::{env, fmt::Write, fs, path::PathBuf};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentEvent, ExternalRequestId, ExternalResponse, LlmError, LlmStream,
-    MemorySessionStore, ModelRef, PermissionEffect, PermissionPolicy, ResumeInput, SessionId,
-    SessionRecord, SessionStore,
-    middleware::{ExternalRequestDraft, ExternalRequestKind as MiddlewareExternalRequestKind},
+    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, ExternalRequest,
+    ExternalRequestKind, ExternalResponse, LlmError, LlmStream, MemorySessionStore, ModelRef,
+    PermissionEffect, PermissionPolicy, ResumeInput, SessionId, SessionRecord, SessionStore,
+    TimelineContent, TimelineEventKind, TimelineStatus,
     tools::{
         filesystem::{FilesystemConfig, FilesystemToolProfile},
         filesystem_skills::SkillsConfig,
@@ -69,17 +69,17 @@ async fn run_live_coding_agent(
     assert_tool_was_surfaced(&provider, QUESTION_TOOL_NAME);
     assert_tool_was_surfaced(&provider, "read");
     assert_tool_was_surfaced(&provider, "load_skill");
-    assert!(first.final_snapshot_seen.is_none(), "{first_context}");
+    assert!(!first.finished, "{first_context}");
     let question_request = first
         .external_requests
         .iter()
-        .find(|request| request.kind == MiddlewareExternalRequestKind::Question)
+        .find(|request| request.kind == ExternalRequestKind::Question)
         .unwrap_or_else(|| panic!("expected question request\n{first_context}"));
 
     let stored_after_question = load_session(&store, &session_id).await?;
+    let snapshot_after_question = stored_after_question.snapshot();
     assert!(
-        stored_after_question
-            .snapshot
+        snapshot_after_question
             .external_requests
             .iter()
             .any(|request| request.kind == waltr_agent::ExternalRequestKind::Question),
@@ -91,7 +91,7 @@ async fn run_live_coding_agent(
         &provider,
         &session_id,
         ResumeInput::ExternalResponse {
-            request_id: ExternalRequestId::new(question_request.id.clone()),
+            request_id: question_request.id.clone(),
             response: ExternalResponse::new(json!(
                 "Proceed. Read the task, obey AGENTS.md, load coding-style, read required references, then attempt the external read."
             )),
@@ -106,21 +106,20 @@ async fn run_live_coding_agent(
         resumed
             .external_requests
             .iter()
-            .any(|request| request.kind == MiddlewareExternalRequestKind::Permission),
+            .any(|request| request.kind == ExternalRequestKind::Permission),
         "{resumed_context}"
     );
 
     let stored_after_resume = load_session(&store, &session_id).await?;
+    let snapshot_after_resume = stored_after_resume.snapshot();
     assert!(
-        stored_after_resume
-            .snapshot
+        snapshot_after_resume
             .tool_results()
             .any(|result| result.name == QUESTION_TOOL_NAME),
         "question response was not recorded as a durable tool result: {stored_after_resume:?}"
     );
     assert!(
-        stored_after_resume
-            .snapshot
+        snapshot_after_resume
             .external_requests
             .iter()
             .any(|request| request.kind == waltr_agent::ExternalRequestKind::Permission),
@@ -130,8 +129,7 @@ async fn run_live_coding_agent(
     let observed = format!(
         "{}\n{}",
         resumed.text,
-        stored_after_resume
-            .snapshot
+        snapshot_after_resume
             .tool_results()
             .map(|result| result.content.as_str())
             .collect::<Vec<_>>()
@@ -157,8 +155,8 @@ async fn run_live_coding_agent(
 #[derive(Debug, Default)]
 struct DurableLiveSession {
     text: String,
-    final_snapshot_seen: Option<waltr_agent::SessionSnapshot>,
-    external_requests: Vec<ExternalRequestDraft>,
+    finished: bool,
+    external_requests: Vec<ExternalRequest>,
     tool_errors: Vec<waltr_agent::ToolResult>,
 }
 
@@ -195,23 +193,44 @@ impl DurableLiveSession {
         Self::collect(stream).await
     }
 
-    async fn collect(mut stream: waltr_agent::BoxAgentEventStream<'_>) -> waltr_agent::Result<Self> {
+    async fn collect(
+        mut stream: waltr_agent::BoxAgentTimelineStream<'_>,
+    ) -> waltr_agent::Result<Self> {
         let mut session = Self::default();
         while let Some(event) = stream.next().await {
-            match event? {
-                AgentEvent::TextDelta { delta, .. } => session.text.push_str(&delta),
-                AgentEvent::ToolResult { result, .. } => {
+            let event = event?;
+            match &event.content {
+                TimelineContent::TextDelta { delta }
+                    if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+                {
+                    session.text.push_str(delta);
+                }
+                TimelineContent::ToolResult { result }
+                    if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) =>
+                {
                     if result.content.starts_with("Tool error:") {
-                        session.tool_errors.push(result);
+                        session.tool_errors.push(result.clone());
                     }
                 }
-                AgentEvent::ExternalRequest { request, .. } => {
-                    session.external_requests.push(request);
+                TimelineContent::ExternalRequest { request }
+                    if crate::session::channel_is(&event, CHANNEL_EXTERNAL_REQUEST) =>
+                {
+                    session.external_requests.push(request.clone());
                 }
-                AgentEvent::Finished { snapshot } => session.final_snapshot_seen = Some(snapshot),
-                AgentEvent::ToolCall { .. }
-                | AgentEvent::ThinkingDelta { .. }
-                | AgentEvent::TurnFinished { .. } => {}
+                TimelineContent::Empty
+                    if event.kind == TimelineEventKind::SessionStatusChanged
+                        && event.status == Some(TimelineStatus::Finished) =>
+                {
+                    session.finished = true;
+                }
+                TimelineContent::Empty
+                | TimelineContent::TextDelta { .. }
+                | TimelineContent::TextSnapshot { .. }
+                | TimelineContent::ToolCall { .. }
+                | TimelineContent::ToolResult { .. }
+                | TimelineContent::ExternalRequest { .. }
+                | TimelineContent::ContentRef { .. }
+                | TimelineContent::Json { .. } => {}
             }
         }
         Ok(session)
@@ -222,12 +241,11 @@ impl crate::session::AgentTestSession {
     fn from_durable(session: &DurableLiveSession) -> Self {
         let mut converted = Self::default();
         converted.text.clone_from(&session.text);
-        converted
-            .final_snapshot
-            .clone_from(&session.final_snapshot_seen);
+        converted.finished = session.finished;
         converted
             .external_requests
             .clone_from(&session.external_requests);
+        converted.tool_errors.clone_from(&session.tool_errors);
         converted
     }
 }

@@ -14,3 +14,4 @@ Agent docs describe Waltr's isolated agent library features, provider integratio
 | [shell.md](shell.md) | Shell tool behavior, command execution, and safety boundaries. |
 | [skills.md](skills.md) | Skill discovery and prompt/resource loading. |
 | [storage.md](storage.md) | Agent session and storage behavior. |
+| [timeline-rewrite-plan.md](timeline-rewrite-plan.md) | Hard-cutover implementation plan for the durable agent timeline and streaming model. |

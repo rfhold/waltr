@@ -2,7 +2,8 @@
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    Agent, AgentEvent, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef, SessionStore,
+    Agent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, LlmError, LlmStream, MemorySessionStore,
+    ModelApi, ModelRef, SessionStore, TimelineContent, TimelineEventKind, TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
         OpenAiReasoningEffort, OpenAiReasoningSummary,
@@ -93,24 +94,44 @@ async fn assert_provider_thinking(
         .stream();
 
     let mut thinking_delta_count = 0_u16;
-    let mut final_snapshot = None;
+    let mut text = String::new();
+    let mut finished = false;
     while let Some(event) = stream.next().await {
-        match event? {
-            AgentEvent::ThinkingDelta { .. } => thinking_delta_count += 1,
-            AgentEvent::Finished { snapshot } => final_snapshot = Some(snapshot),
-            AgentEvent::TextDelta { .. }
-            | AgentEvent::ExternalRequest { .. }
-            | AgentEvent::ToolCall { .. }
-            | AgentEvent::ToolResult { .. }
-            | AgentEvent::TurnFinished { .. } => {}
+        let event = event?;
+        match &event.content {
+            TimelineContent::TextDelta { .. }
+                if crate::session::channel_is(&event, CHANNEL_THINKING) =>
+            {
+                thinking_delta_count += 1;
+            }
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                text.push_str(delta);
+            }
+            TimelineContent::Empty
+                if event.kind == TimelineEventKind::SessionStatusChanged
+                    && event.status == Some(TimelineStatus::Finished) =>
+            {
+                finished = true;
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. }
+            | TimelineContent::ExternalRequest { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. } => {}
         }
     }
 
-    let snapshot = final_snapshot.ok_or_else(|| LlmError::Protocol {
-        provider: provider.name(),
-        message: "agent stream ended without final snapshot".to_owned(),
-    })?;
-    let text = snapshot.state.last_assistant_text();
+    if !finished {
+        return Err(LlmError::Protocol {
+            provider: provider.name(),
+            message: "agent stream ended without finished status".to_owned(),
+        });
+    }
     assert!(text.contains(EXPECTED_TEXT), "{}: {text}", provider.name());
 
     let stored = store
@@ -120,8 +141,11 @@ async fn assert_provider_thinking(
             provider: provider.name(),
             message: error.to_string(),
         })?;
-    let saw_thinking =
-        thinking_delta_count > 0 || stored.snapshot.thinking_blocks().next().is_some();
+    let saw_stored_thinking = stored.timeline_events().any(|event| {
+        crate::session::channel_is(event, CHANNEL_THINKING)
+            && matches!(&event.content, TimelineContent::TextDelta { .. })
+    }) || stored.snapshot().thinking_blocks().next().is_some();
+    let saw_thinking = thinking_delta_count > 0 || saw_stored_thinking;
     assert_eq!(saw_thinking, expect_thinking, "{}", provider.name());
 
     Ok(())

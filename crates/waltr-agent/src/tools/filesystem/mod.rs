@@ -26,7 +26,8 @@ pub(crate) use path::{model_path, resolve_existing_path};
 use schema::GrepSearch;
 
 use crate::{
-    AgentTool, ModelRef, Result, ToolCall, middleware::tool_metadata::RootHintsMiddleware,
+    AgentTool, ModelRef, Result, ToolCall, ToolExecutionContext, ToolResult,
+    middleware::tool_metadata::RootHintsMiddleware,
 };
 
 impl FilesystemConfig {
@@ -62,21 +63,28 @@ impl FilesystemConfig {
     }
 
     fn into_agent_tool(self, kind: FilesystemToolKind) -> AgentTool {
-        AgentTool::new(kind.definition(), move |call| {
-            self.call_agent_tool(kind, call)
+        AgentTool::new(kind.definition(), move |context| {
+            self.call_agent_tool(kind, context)
         })
     }
 
-    fn call_agent_tool(&self, kind: FilesystemToolKind, call: &ToolCall) -> Result<String> {
-        match kind {
-            FilesystemToolKind::Read => self.read_unscoped(&tool_input(call)?),
-            FilesystemToolKind::Glob => self.glob_unscoped(&tool_input(call)?),
-            FilesystemToolKind::Grep => self.grep_unscoped(&tool_input(call)?),
-            FilesystemToolKind::Edit => self.edit_unscoped(&tool_input(call)?),
-            FilesystemToolKind::Write => self.write_unscoped(&tool_input(call)?),
-            FilesystemToolKind::Delete => self.delete_unscoped(&tool_input(call)?),
-            FilesystemToolKind::ApplyPatch => self.apply_patch_unscoped(&tool_input(call)?),
-        }
+    fn call_agent_tool(
+        &self,
+        kind: FilesystemToolKind,
+        context: ToolExecutionContext,
+    ) -> Result<ToolResult> {
+        let content = match kind {
+            FilesystemToolKind::Read => self.read_unscoped(&tool_input(context.call())?)?,
+            FilesystemToolKind::Glob => self.glob_unscoped(&tool_input(context.call())?)?,
+            FilesystemToolKind::Grep => self.grep_unscoped(&tool_input(context.call())?)?,
+            FilesystemToolKind::Edit => self.edit_unscoped(&tool_input(context.call())?)?,
+            FilesystemToolKind::Write => self.write_unscoped(&tool_input(context.call())?)?,
+            FilesystemToolKind::Delete => self.delete_unscoped(&tool_input(context.call())?)?,
+            FilesystemToolKind::ApplyPatch => {
+                self.apply_patch_unscoped(&tool_input(context.call())?)?
+            }
+        };
+        Ok(context.result(content))
     }
 }
 

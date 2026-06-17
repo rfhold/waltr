@@ -2,11 +2,17 @@
 
 #![allow(missing_docs)]
 
-use crate::{LlmError, Result, ToolResult};
+use crate::{
+    LlmError, Result, ToolResult,
+    timeline::{
+        CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
+        TimelineEventKind,
+    },
+};
 
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestStatus, ExternalResponse,
-    PendingWorkStatus, ResumeInput, SessionEvent, SessionId, SessionRecord, SessionSnapshot,
+    PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent, SessionRecord, SessionSnapshot,
     SessionStore, Suspension,
 };
 
@@ -32,14 +38,9 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when the store rejects the new record or the reload fails.
+    /// Returns an error when the store rejects the new record.
     pub async fn create_session(&self, id: SessionId) -> Result<SessionRecord> {
-        let record = SessionRecord::new(id.clone());
-        self.store
-            .create(record)
-            .await
-            .map_err(session_store_error)?;
-        self.load_session(&id).await
+        self.store.create(id).await.map_err(session_store_error)
     }
 
     /// Load a durable session record.
@@ -77,22 +78,36 @@ where
         record: SessionRecord,
         prompt: String,
     ) -> Result<RuntimeResumeOutput> {
-        let mut events = Vec::new();
-        for request in pending_external_requests(&record.snapshot) {
-            events.push(SessionEvent::ExternalRequestCanceled {
+        let snapshot = record.snapshot();
+        let mut journal = Vec::new();
+        let mut timeline = Vec::new();
+        for request in pending_external_requests(&snapshot) {
+            let reason = CancelReason::SupersededByUserPrompt;
+            journal.push(SessionJournalEvent::ExternalRequestCanceled {
                 request_id: request.id.clone(),
-                reason: CancelReason::SupersededByUserPrompt,
+                reason: reason.clone(),
             });
+            let mut request = request.clone();
+            request.status = ExternalRequestStatus::Canceled(reason);
+            timeline.push(external_request_timeline_event(
+                &record.id,
+                snapshot.turn,
+                request,
+                TimelineEventKind::ExternalRequestResolved,
+            ));
         }
-        for work_id in pending_work_ids(&record.snapshot) {
-            events.push(SessionEvent::WorkCanceled {
+        for work_id in pending_work_ids(&snapshot) {
+            journal.push(SessionJournalEvent::WorkCanceled {
                 work_id,
                 reason: CancelReason::SupersededByUserPrompt,
             });
         }
-        events.push(SessionEvent::PromptAppended { prompt });
+        journal.push(SessionJournalEvent::PromptAppended { prompt });
 
-        let record = self.append_and_snapshot(record, events).await?;
+        let mut record = self.append_journal_and_reload(record, journal).await?;
+        if !timeline.is_empty() {
+            record = self.append_timeline_and_reload(record, timeline).await?;
+        }
         Ok(RuntimeResumeOutput::Resumed { record })
     }
 
@@ -102,28 +117,52 @@ where
         request_id: ExternalRequestId,
         response: ExternalResponse,
     ) -> Result<RuntimeResumeOutput> {
-        let request = validate_pending_external_response(&record.snapshot, &request_id)?;
-        let mut events = vec![SessionEvent::ExternalRequestResponded {
-            request_id: request_id.clone(),
-            response: response.clone(),
-        }];
+        let snapshot = record.snapshot();
+        let request = validate_pending_external_response(&snapshot, &request_id)?;
+        let turn = snapshot.turn;
+        let mut record = self
+            .append_journal_and_reload(
+                record,
+                vec![SessionJournalEvent::ExternalRequestResponded {
+                    request_id: request_id.clone(),
+                    response: response.clone(),
+                }],
+            )
+            .await?;
+
+        let mut resolved_request = request.clone();
+        resolved_request.status = ExternalRequestStatus::Responded(response.clone());
+        let session_id = record.id.clone();
+        record = self
+            .append_timeline_and_reload(
+                record,
+                vec![external_request_timeline_event(
+                    &session_id,
+                    turn,
+                    resolved_request,
+                    TimelineEventKind::ExternalRequestResolved,
+                )],
+            )
+            .await?;
 
         if let Some(tool_call_id) = request.tool_call_id {
-            let turn = record.snapshot.turn;
-            events.push(SessionEvent::ToolResultRecorded {
-                turn,
-                result: ToolResult::new(
-                    tool_call_id,
-                    request_tool_name(&request.kind),
-                    external_response_content(&response),
-                ),
-            });
-            // The external response completes the suspended tool call, so the
-            // turn finishes here just like the inline tool execution path.
-            events.push(SessionEvent::TurnFinished { turn });
+            let result = ToolResult::new(
+                tool_call_id,
+                request_tool_name(&request.kind),
+                external_response_content(&response),
+            );
+            let session_id = record.id.clone();
+            record = self
+                .append_timeline_and_reload(
+                    record,
+                    vec![tool_result_timeline_event(&session_id, turn, result)],
+                )
+                .await?;
+            record = self
+                .append_journal_and_reload(record, vec![SessionJournalEvent::TurnFinished { turn }])
+                .await?;
         }
 
-        let record = self.append_and_snapshot(record, events).await?;
         Ok(RuntimeResumeOutput::Resumed { record })
     }
 
@@ -132,21 +171,24 @@ where
         record: SessionRecord,
         results: Vec<ToolResult>,
     ) -> Result<RuntimeResumeOutput> {
-        let turn = record.snapshot.turn;
-        let mut events: Vec<SessionEvent> = results
-            .into_iter()
-            .map(|result| SessionEvent::ToolResultRecorded { turn, result })
-            .collect();
-        if !events.is_empty() {
-            events.push(SessionEvent::TurnFinished { turn });
+        let turn = record.snapshot().turn;
+        let mut record = record;
+        if !results.is_empty() {
+            let events = results
+                .into_iter()
+                .map(|result| tool_result_timeline_event(&record.id, turn, result))
+                .collect();
+            record = self.append_timeline_and_reload(record, events).await?;
+            record = self
+                .append_journal_and_reload(record, vec![SessionJournalEvent::TurnFinished { turn }])
+                .await?;
         }
-        let record = self.append_and_snapshot(record, events).await?;
         Ok(RuntimeResumeOutput::Resumed { record })
     }
 
     async fn interrupt(&self, record: SessionRecord) -> Result<RuntimeResumeOutput> {
         let record = self
-            .append_and_snapshot(record, vec![SessionEvent::Interrupted])
+            .append_journal_and_reload(record, vec![SessionJournalEvent::Interrupted])
             .await?;
         Ok(RuntimeResumeOutput::Suspended {
             record,
@@ -154,35 +196,30 @@ where
         })
     }
 
-    async fn append_and_snapshot(
+    async fn append_journal_and_reload(
         &self,
         record: SessionRecord,
-        events: Vec<SessionEvent>,
+        events: Vec<SessionJournalEvent>,
     ) -> Result<SessionRecord> {
-        let revision = self
-            .store
-            .append(&record.id, events, record.revision)
+        let id = record.id.clone();
+        self.store
+            .append_journal(&id, record.revision, events)
             .await
             .map_err(session_store_error)?;
-        let mut record = self
-            .store
-            .load(&record.id)
+        self.load_session(&id).await
+    }
+
+    async fn append_timeline_and_reload(
+        &self,
+        record: SessionRecord,
+        events: Vec<PendingTimelineEvent>,
+    ) -> Result<SessionRecord> {
+        let id = record.id.clone();
+        self.store
+            .append_timeline(&id, record.revision, events)
             .await
             .map_err(session_store_error)?;
-        let mut snapshot = SessionSnapshot::new(record.id.clone());
-        snapshot.apply_events(&record.events);
-        let revision = self
-            .store
-            .save_snapshot(&record.id, snapshot, revision)
-            .await
-            .map_err(session_store_error)?;
-        record = self
-            .store
-            .load(&record.id)
-            .await
-            .map_err(session_store_error)?;
-        debug_assert_eq!(record.revision, revision);
-        Ok(record)
+        self.load_session(&id).await
     }
 }
 
@@ -244,6 +281,37 @@ fn pending_work_ids(snapshot: &SessionSnapshot) -> Vec<String> {
         .collect()
 }
 
+fn tool_result_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    result: ToolResult,
+) -> PendingTimelineEvent {
+    let call_id = result.call_id.clone();
+    PendingTimelineEvent::tool_result(
+        session_id.clone(),
+        turn,
+        format!("tool-result:{call_id}"),
+        format!("tool-call:{call_id}"),
+        result,
+    )
+}
+
+fn external_request_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    request: ExternalRequest,
+    kind: TimelineEventKind,
+) -> PendingTimelineEvent {
+    PendingTimelineEvent::new(
+        session_id.clone(),
+        turn,
+        format!("external-request:{}", request.id.as_str()),
+        kind,
+        Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
+        TimelineContent::ExternalRequest { request },
+    )
+}
+
 const fn request_tool_name(kind: &super::ExternalRequestKind) -> &'static str {
     match kind {
         super::ExternalRequestKind::Question => "question",
@@ -297,38 +365,54 @@ mod tests {
 
     async fn suspended_question_session(store: &MemorySessionStore) -> SessionId {
         let id = session_id();
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
-        store
-            .append(
+        store.create(id.clone()).await.unwrap();
+        let revision = store
+            .append_journal(
                 &id,
-                vec![
-                    SessionEvent::PromptAppended {
-                        prompt: "ask".to_owned(),
-                    },
-                    SessionEvent::ToolCallRecorded {
-                        turn: 0,
-                        call: ToolCall::new("call-question", "question", json!({})),
-                    },
-                    SessionEvent::ExternalRequestCreated {
-                        request: external_request("question-1"),
-                    },
-                    SessionEvent::Suspended {
-                        suspension: Suspension::AwaitingExternalInput {
-                            request: Box::new(external_request("question-1")),
-                        },
-                    },
-                ],
                 Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "ask".to_owned(),
+                }],
             )
             .await
             .unwrap();
-        let record = store.load(&id).await.unwrap();
-        let mut snapshot = SessionSnapshot::new(id.clone());
-        snapshot.apply_events(&record.events);
-        store
-            .save_snapshot(&id, snapshot, record.revision)
+        let revision = {
+            store
+                .append_timeline(
+                    &id,
+                    revision,
+                    vec![
+                        PendingTimelineEvent::tool_call(
+                            id.clone(),
+                            0,
+                            "tool-call:call-question",
+                            ToolCall::new("call-question", "question", json!({})),
+                        ),
+                        external_request_timeline_event(
+                            &id,
+                            0,
+                            external_request("question-1"),
+                            TimelineEventKind::ExternalRequestOpened,
+                        ),
+                    ],
+                )
+                .await
+                .unwrap();
+            Revision::new(2)
+        };
+        let revision = store
+            .append_journal(
+                &id,
+                revision,
+                vec![SessionJournalEvent::Suspended {
+                    suspension: Suspension::AwaitingExternalInput {
+                        request: Box::new(external_request("question-1")),
+                    },
+                }],
+            )
             .await
             .unwrap();
+        assert_eq!(revision, Revision::new(3));
         id
     }
 
@@ -341,7 +425,7 @@ mod tests {
 
         assert_eq!(record.id, session_id());
         assert_eq!(record.revision, Revision::ZERO);
-        assert!(record.events.is_empty());
+        assert!(record.journal.is_empty());
     }
 
     #[tokio::test]
@@ -366,17 +450,18 @@ mod tests {
         let RuntimeResumeOutput::Resumed { record } = output else {
             panic!("external response should resume");
         };
+        let snapshot = record.snapshot();
         assert!(matches!(
-            record.snapshot.external_requests[0].status,
+            snapshot.external_requests[0].status,
             ExternalRequestStatus::Responded(_)
         ));
-        let tool_results: Vec<_> = record.snapshot.tool_results().collect();
+        let tool_results: Vec<_> = snapshot.tool_results().collect();
         assert_eq!(tool_results.len(), 1);
         assert_eq!(tool_results[0].call_id, "call-question");
         assert_eq!(tool_results[0].name, "question");
-        assert_eq!(record.snapshot.turns[0].turn, 0);
+        assert_eq!(snapshot.turns[0].turn, 0);
         assert_eq!(
-            record.snapshot.turn, 1,
+            snapshot.turn, 1,
             "answering the suspended call should finish the turn"
         );
     }
@@ -429,16 +514,14 @@ mod tests {
         let RuntimeResumeOutput::Resumed { record } = output else {
             panic!("prompt should resume");
         };
+        let snapshot = record.snapshot();
+        assert_eq!(snapshot.current_prompt.as_deref(), Some("new prompt"));
         assert_eq!(
-            record.snapshot.current_prompt.as_deref(),
-            Some("new prompt")
-        );
-        assert_eq!(
-            record.snapshot.external_requests[0].status,
+            snapshot.external_requests[0].status,
             ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt)
         );
         assert_eq!(
-            record.snapshot.pending_work[0].status,
+            snapshot.pending_work[0].status,
             PendingWorkStatus::Canceled(CancelReason::SupersededByUserPrompt)
         );
     }

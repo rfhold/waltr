@@ -5,10 +5,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::{SessionStore, SessionStoreError, SessionStoreResult};
-use crate::agent::session::{
-    ExternalRequest, RequestRecord, Revision, SessionEvent, SessionId, SessionRecord,
-    SessionSnapshot,
+use super::{
+    SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
+    timeline_after_slice, timeline_before_slice,
+};
+use crate::{
+    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord},
+    timeline::{AgentTimelineEvent, PendingTimelineEvent, TimelineCursor},
 };
 
 /// Process-memory implementation of [`SessionStore`].
@@ -28,7 +31,7 @@ impl MemorySessionStore {
         &self,
         id: &SessionId,
         expected_revision: Revision,
-        update: impl FnOnce(&mut SessionRecord, Revision) -> T,
+        update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T>,
     ) -> SessionStoreResult<(Revision, T)> {
         let mut records = self
             .records
@@ -47,7 +50,7 @@ impl MemorySessionStore {
         }
 
         let next_revision = record.revision.next();
-        let value = update(record, next_revision);
+        let value = update(record, next_revision)?;
         record.revision = next_revision;
         drop(records);
 
@@ -58,10 +61,11 @@ impl MemorySessionStore {
 impl SessionStore for MemorySessionStore {
     fn create(
         &self,
-        record: SessionRecord,
-    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        id: SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
+            let record = SessionRecord::new(id);
             let mut records = store
                 .records
                 .lock()
@@ -71,9 +75,9 @@ impl SessionStore for MemorySessionStore {
                 return Err(SessionStoreError::AlreadyExists { id: record.id });
             }
 
-            records.insert(record.id.clone(), record);
+            records.insert(record.id.clone(), record.clone());
             drop(records);
-            Ok(())
+            Ok(record)
         }
     }
 
@@ -96,82 +100,66 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
-    fn append(
+    fn append_timeline(
         &self,
         id: &SessionId,
-        events: Vec<SessionEvent>,
         expected_revision: Revision,
+        events: Vec<PendingTimelineEvent>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let (_, assigned) = store.with_record_mut(&id, expected_revision, |record, _| {
+                append_timeline_to_record(record, &id, events)
+            })?;
+
+            Ok(assigned)
+        }
+    }
+
+    fn append_journal(
+        &self,
+        id: &SessionId,
+        expected_revision: Revision,
+        events: Vec<SessionJournalEvent>,
     ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             let (revision, ()) = store.with_record_mut(&id, expected_revision, |record, _| {
-                record.events.extend(events);
+                record.append_journal_events(events);
+                Ok(())
             })?;
 
             Ok(revision)
         }
     }
 
-    fn save_snapshot(
+    fn timeline_after(
         &self,
         id: &SessionId,
-        mut snapshot: SessionSnapshot,
-        expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            if snapshot.id != id {
-                return Err(SessionStoreError::SessionIdMismatch {
-                    expected: id,
-                    actual: snapshot.id,
-                });
-            }
-
-            let (revision, ()) =
-                store.with_record_mut(&id, expected_revision, |record, revision| {
-                    snapshot.revision = revision;
-                    record.snapshot = snapshot;
-                })?;
-
-            Ok(revision)
+            let record = store.load(&id).await?;
+            Ok(timeline_after_slice(&record, cursor, limit))
         }
     }
 
-    fn record_request(
+    fn timeline_before(
         &self,
         id: &SessionId,
-        request: RequestRecord,
-        expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+        cursor: Option<TimelineCursor>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (revision, ()) = store.with_record_mut(&id, expected_revision, |record, _| {
-                record.requests.push(request);
-            })?;
-
-            Ok(revision)
-        }
-    }
-
-    fn record_external_request(
-        &self,
-        id: &SessionId,
-        request: ExternalRequest,
-        expected_revision: Revision,
-    ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
-        let store = self.clone();
-        let id = id.clone();
-        async move {
-            let (revision, ()) =
-                store.with_record_mut(&id, expected_revision, |record, revision| {
-                    record.snapshot.external_requests.push(request);
-                    record.snapshot.revision = revision;
-                })?;
-
-            Ok(revision)
+            let record = store.load(&id).await?;
+            Ok(timeline_before_slice(&record, cursor, limit))
         }
     }
 }
@@ -181,12 +169,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::agent::AgentTranscriptEvent;
     use crate::agent::session::{
-        CancelReason, ExternalRequestKind, ExternalRequestStatus, PendingWork, PendingWorkStatus,
-        SessionStatus, Suspension,
+        CancelReason, ExternalRequest, ExternalRequestKind, ExternalRequestStatus, RequestId,
+        RequestRecord, SessionStatus,
     };
-    use crate::{ModelApi, ModelRef, ProviderId, ToolCall, ToolResult};
+    use crate::{
+        ModelApi, ModelRef, ProviderId, ToolCall, ToolResult,
+        timeline::{CHANNEL_EXTERNAL_REQUEST, TimelineChannel, TimelineContent, TimelineEventKind},
+    };
 
     fn session_id() -> SessionId {
         SessionId::new("session-1")
@@ -194,7 +184,7 @@ mod tests {
 
     fn request_record(id: &str) -> RequestRecord {
         RequestRecord {
-            id: id.into(),
+            id: RequestId::new(id),
             turn: 1,
             model: ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
             canonical_request_hash: format!("canonical-{id}"),
@@ -222,25 +212,27 @@ mod tests {
         ToolResult::new(id, "test-tool", format!("result-{id}"))
     }
 
-    fn pending_work(id: &str) -> PendingWork {
-        PendingWork {
-            id: id.to_owned(),
-            turn: 1,
-            tool_call: Some(tool_call(id)),
-            status: PendingWorkStatus::Pending,
-        }
+    fn pending_delta(id: &SessionId, index: usize) -> PendingTimelineEvent {
+        PendingTimelineEvent::assistant_text_delta(
+            id.clone(),
+            0,
+            format!("assistant-{index}"),
+            format!("delta-{index}"),
+        )
     }
 
-    fn snapshot_status(status: SessionStatus) -> SessionSnapshot {
-        let mut snapshot = SessionSnapshot::new(session_id());
-        snapshot.status = status;
-        snapshot
-    }
-
-    fn rebuild_snapshot_from_events(record: &SessionRecord) -> SessionSnapshot {
-        let mut snapshot = SessionSnapshot::new(record.id.clone());
-        snapshot.apply_events(&record.events);
-        snapshot
+    fn external_request_event(
+        session_id: &SessionId,
+        request: ExternalRequest,
+    ) -> PendingTimelineEvent {
+        PendingTimelineEvent::new(
+            session_id.clone(),
+            1,
+            format!("external-request:{}", request.id.as_str()),
+            TimelineEventKind::ExternalRequestOpened,
+            Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
+            TimelineContent::ExternalRequest { request },
+        )
     }
 
     #[tokio::test]
@@ -248,32 +240,32 @@ mod tests {
         let store = MemorySessionStore::new();
         let id = session_id();
 
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
+        store.create(id.clone()).await.unwrap();
 
         let mut loaded = store.load(&id).await.unwrap();
-        loaded.events.push(SessionEvent::PromptAppended {
+        loaded.journal.push(SessionJournalEvent::PromptAppended {
             prompt: "mutated outside store".to_owned(),
         });
 
         let loaded_again = store.load(&id).await.unwrap();
         assert_eq!(loaded_again.id, id);
         assert_eq!(loaded_again.revision, Revision::ZERO);
-        assert!(loaded_again.events.is_empty());
+        assert!(loaded_again.journal.is_empty());
     }
 
     #[tokio::test]
-    async fn append_succeeds_and_increments_revision() {
+    async fn append_journal_succeeds_and_increments_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
+        store.create(id.clone()).await.unwrap();
 
         let revision = store
-            .append(
+            .append_journal(
                 &id,
-                vec![SessionEvent::PromptAppended {
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
                     prompt: "hello".to_owned(),
                 }],
-                Revision::ZERO,
             )
             .await
             .unwrap();
@@ -281,32 +273,32 @@ mod tests {
         let loaded = store.load(&id).await.unwrap();
         assert_eq!(revision, Revision::new(1));
         assert_eq!(loaded.revision, Revision::new(1));
-        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(loaded.journal.len(), 1);
     }
 
     #[tokio::test]
-    async fn append_fails_for_stale_revision() {
+    async fn append_journal_fails_for_stale_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
+        store.create(id.clone()).await.unwrap();
         store
-            .append(
+            .append_journal(
                 &id,
-                vec![SessionEvent::PromptAppended {
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
                     prompt: "first".to_owned(),
                 }],
-                Revision::ZERO,
             )
             .await
             .unwrap();
 
         let error = store
-            .append(
+            .append_journal(
                 &id,
-                vec![SessionEvent::PromptAppended {
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
                     prompt: "stale".to_owned(),
                 }],
-                Revision::ZERO,
             )
             .await
             .unwrap_err();
@@ -319,152 +311,131 @@ mod tests {
                 actual: Revision::new(1),
             }
         );
-        assert_eq!(store.load(&id).await.unwrap().events.len(), 1);
+        assert_eq!(store.load(&id).await.unwrap().journal.len(), 1);
     }
 
     #[tokio::test]
-    async fn save_snapshot_fails_for_stale_revision() {
+    async fn append_timeline_fails_for_stale_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
-        let revision = store
-            .append(
-                &id,
-                vec![SessionEvent::PromptAppended {
-                    prompt: "first".to_owned(),
-                }],
-                Revision::ZERO,
-            )
+        store.create(id.clone()).await.unwrap();
+        store
+            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
             .await
             .unwrap();
-        assert_eq!(revision, Revision::new(1));
-
-        let mut snapshot = SessionSnapshot::new(id.clone());
-        snapshot.status = SessionStatus::Finished;
 
         let error = store
-            .save_snapshot(&id, snapshot, Revision::ZERO)
+            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 2)])
             .await
             .unwrap_err();
 
         assert!(matches!(error, SessionStoreError::StaleRevision { .. }));
-        assert_eq!(
-            store.load(&id).await.unwrap().snapshot.status,
-            SessionStatus::Idle
-        );
+        assert_eq!(store.load(&id).await.unwrap().timeline_events().count(), 1);
     }
 
     #[tokio::test]
-    async fn appended_events_can_be_rebuilt_saved_and_loaded_as_snapshot() {
+    async fn snapshot_is_derived_from_journal() {
         let store = MemorySessionStore::new();
         let id = session_id();
         let call = tool_call("call-1");
         let result = tool_result("call-1");
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
+        store.create(id.clone()).await.unwrap();
 
         let append_revision = store
-            .append(
+            .append_journal(
                 &id,
-                vec![
-                    SessionEvent::PromptAppended {
-                        prompt: "hello".to_owned(),
-                    },
-                    SessionEvent::ProviderTextDelta {
-                        turn: 1,
-                        delta: "answer".to_owned(),
-                    },
-                    SessionEvent::ProviderThinkingDelta {
-                        turn: 1,
-                        delta: "reasoning".to_owned(),
-                    },
-                    SessionEvent::ToolCallRecorded {
-                        turn: 1,
-                        call: call.clone(),
-                    },
-                    SessionEvent::ToolResultRecorded {
-                        turn: 1,
-                        result: result.clone(),
-                    },
-                    SessionEvent::TurnFinished { turn: 1 },
-                    SessionEvent::Finished,
-                ],
                 Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "hello".to_owned(),
+                }],
             )
             .await
             .unwrap();
-
-        let rebuilt = rebuild_snapshot_from_events(&store.load(&id).await.unwrap());
-        let snapshot_revision = store
-            .save_snapshot(&id, rebuilt, append_revision)
+        let _assigned = store
+            .append_timeline(
+                &id,
+                append_revision,
+                vec![
+                    PendingTimelineEvent::tool_call(
+                        id.clone(),
+                        1,
+                        "tool-call:call-1",
+                        call.clone(),
+                    ),
+                    PendingTimelineEvent::tool_result(
+                        id.clone(),
+                        1,
+                        "tool-result:call-1",
+                        "tool-call:call-1",
+                        result.clone(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let turn_revision = store
+            .append_journal(
+                &id,
+                Revision::new(2),
+                vec![
+                    SessionJournalEvent::TurnFinished { turn: 1 },
+                    SessionJournalEvent::Finished,
+                ],
+            )
             .await
             .unwrap();
 
         let loaded = store.load(&id).await.unwrap();
-        assert_eq!(append_revision, Revision::new(1));
-        assert_eq!(snapshot_revision, Revision::new(2));
-        assert_eq!(loaded.revision, Revision::new(2));
-        assert_eq!(loaded.snapshot.revision, Revision::new(2));
-        assert_eq!(loaded.snapshot.status, SessionStatus::Finished);
-        assert_eq!(loaded.snapshot.turn, 2);
-        assert_eq!(loaded.events.len(), 7);
-        assert_eq!(
-            loaded.snapshot.state.events,
-            vec![
-                AgentTranscriptEvent::Text {
-                    turn: 1,
-                    text: "answer".to_owned(),
-                },
-                AgentTranscriptEvent::Thinking {
-                    turn: 1,
-                    text: "reasoning".to_owned(),
-                },
-                AgentTranscriptEvent::ToolCall { turn: 1, call },
-                AgentTranscriptEvent::ToolResult { turn: 1, result },
-            ]
-        );
+        let snapshot = loaded.snapshot();
+        assert_eq!(turn_revision, Revision::new(3));
+        assert_eq!(loaded.revision, Revision::new(3));
+        assert_eq!(snapshot.revision, Revision::new(3));
+        assert_eq!(snapshot.status, SessionStatus::Finished);
+        assert_eq!(snapshot.turn, 2);
+        assert_eq!(loaded.journal.len(), 5);
+        assert_eq!(snapshot.tool_calls().collect::<Vec<_>>(), [&call]);
+        assert_eq!(snapshot.tool_results().collect::<Vec<_>>(), [&result]);
     }
 
     #[tokio::test]
-    async fn optimistic_revisions_advance_across_append_and_snapshot_save() {
+    async fn optimistic_revisions_advance_across_appends() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
+        store.create(id.clone()).await.unwrap();
 
         let append_revision = store
-            .append(
+            .append_journal(
                 &id,
-                vec![SessionEvent::TextDelta {
-                    turn: 0,
-                    delta: "first".to_owned(),
-                }],
                 Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "first".to_owned(),
+                }],
             )
             .await
             .unwrap();
         let stale_append = store
-            .append(
+            .append_journal(
                 &id,
-                vec![SessionEvent::TextDelta {
-                    turn: 0,
-                    delta: "stale".to_owned(),
-                }],
                 Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "stale".to_owned(),
+                }],
             )
             .await
             .unwrap_err();
 
-        let rebuilt = rebuild_snapshot_from_events(&store.load(&id).await.unwrap());
-        let snapshot_revision = store
-            .save_snapshot(&id, rebuilt, append_revision)
+        let timeline_revision = store
+            .append_timeline(&id, append_revision, vec![pending_delta(&id, 1)])
             .await
             .unwrap();
-        let stale_snapshot = store
-            .save_snapshot(&id, SessionSnapshot::new(id.clone()), append_revision)
+        let stale_timeline = store
+            .append_timeline(&id, append_revision, vec![pending_delta(&id, 2)])
             .await
             .unwrap_err();
 
         assert_eq!(append_revision, Revision::new(1));
-        assert_eq!(snapshot_revision, Revision::new(2));
+        assert_eq!(timeline_revision[0].cursor, TimelineCursor::new(1));
+        assert_eq!(store.load(&id).await.unwrap().revision, Revision::new(2));
         assert_eq!(
             stale_append,
             SessionStoreError::StaleRevision {
@@ -474,7 +445,7 @@ mod tests {
             }
         );
         assert_eq!(
-            stale_snapshot,
+            stale_timeline,
             SessionStoreError::StaleRevision {
                 id: id.clone(),
                 expected: Revision::new(1),
@@ -484,101 +455,178 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_snapshot_persists_status_transitions() {
-        let statuses = vec![
-            SessionStatus::BuildingRequest,
-            SessionStatus::StreamingProvider,
-            SessionStatus::EvaluatingToolCall,
-            SessionStatus::RunningTool,
-            SessionStatus::Suspended(Suspension::AwaitingToolResults {
-                work: vec![pending_work("call-1")],
-            }),
-            SessionStatus::Finished,
-            SessionStatus::Failed {
-                message: "provider failed".to_owned(),
-            },
-        ];
+    async fn derived_snapshot_revision_matches_record_revision() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
 
-        for (index, status) in statuses.into_iter().enumerate() {
-            let store = MemorySessionStore::new();
-            let id = session_id();
-            store.create(SessionRecord::new(id.clone())).await.unwrap();
+        let revision = store
+            .append_journal(
+                &id,
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "hello".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        let loaded = store.load(&id).await.unwrap();
 
-            let revision = store
-                .save_snapshot(&id, snapshot_status(status.clone()), Revision::ZERO)
-                .await
-                .unwrap();
-            let loaded = store.load(&id).await.unwrap();
-
-            assert_eq!(revision, Revision::new(1), "status index {index}");
-            assert_eq!(loaded.revision, Revision::new(1), "status index {index}");
-            assert_eq!(
-                loaded.snapshot.revision,
-                Revision::new(1),
-                "status index {index}"
-            );
-            assert_eq!(loaded.snapshot.status, status, "status index {index}");
-        }
+        assert_eq!(revision, Revision::new(1));
+        assert_eq!(loaded.snapshot().revision, loaded.revision);
     }
 
     #[tokio::test]
     async fn request_records_preserve_insertion_order() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
+        store.create(id.clone()).await.unwrap();
 
         let revision = store
-            .record_request(&id, request_record("first"), Revision::ZERO)
+            .append_journal(
+                &id,
+                Revision::ZERO,
+                vec![SessionJournalEvent::ProviderRequestRecorded {
+                    request: request_record("first"),
+                }],
+            )
             .await
             .unwrap();
         store
-            .record_request(&id, request_record("second"), revision)
+            .append_journal(
+                &id,
+                revision,
+                vec![SessionJournalEvent::ProviderRequestRecorded {
+                    request: request_record("second"),
+                }],
+            )
             .await
             .unwrap();
 
         let loaded = store.load(&id).await.unwrap();
         let request_ids: Vec<&str> = loaded
-            .requests
-            .iter()
+            .provider_requests()
             .map(|request| request.id.as_str())
             .collect();
         assert_eq!(request_ids, ["first", "second"]);
     }
 
     #[tokio::test]
-    async fn external_requests_preserve_insertion_order_and_cancellation_markers() {
+    async fn external_requests_project_insertion_order_and_cancellation_markers() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(SessionRecord::new(id.clone())).await.unwrap();
+        store.create(id.clone()).await.unwrap();
 
-        let revision = store
-            .record_external_request(
+        let _assigned = store
+            .append_timeline(
                 &id,
-                external_request("first", ExternalRequestStatus::Pending),
                 Revision::ZERO,
+                vec![
+                    external_request_event(
+                        &id,
+                        external_request("first", ExternalRequestStatus::Pending),
+                    ),
+                    external_request_event(
+                        &id,
+                        external_request(
+                            "second",
+                            ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt),
+                        ),
+                    ),
+                ],
             )
             .await
             .unwrap();
-        store
-            .record_external_request(
-                &id,
-                external_request(
-                    "second",
-                    ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt),
-                ),
-                revision,
-            )
-            .await
-            .unwrap();
-
         let loaded = store.load(&id).await.unwrap();
-        let requests = loaded.snapshot.external_requests;
+        let requests = loaded.snapshot().external_requests;
         assert_eq!(requests[0].id.as_str(), "first");
         assert_eq!(requests[0].status, ExternalRequestStatus::Pending);
         assert_eq!(requests[1].id.as_str(), "second");
         assert_eq!(
             requests[1].status,
             ExternalRequestStatus::Canceled(CancelReason::SupersededByUserPrompt)
+        );
+    }
+
+    #[tokio::test]
+    async fn append_timeline_assigns_stable_monotonic_cursors() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+
+        let assigned = store
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                vec![pending_delta(&id, 1), pending_delta(&id, 2)],
+            )
+            .await
+            .unwrap();
+        let next = store
+            .append_timeline(&id, Revision::new(1), vec![pending_delta(&id, 3)])
+            .await
+            .unwrap();
+
+        assert_eq!(assigned[0].cursor, TimelineCursor::new(1));
+        assert_eq!(assigned[1].cursor, TimelineCursor::new(2));
+        assert_eq!(next[0].cursor, TimelineCursor::new(3));
+        let loaded = store.load(&id).await.unwrap();
+        assert_eq!(loaded.revision, Revision::new(2));
+        assert_eq!(loaded.timeline_events().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn timeline_after_and_before_slice_by_cursor() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+        store
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                (1..=5).map(|index| pending_delta(&id, index)).collect(),
+            )
+            .await
+            .unwrap();
+
+        let after_start = store.timeline_after(&id, None, 2).await.unwrap();
+        let after_two = store
+            .timeline_after(&id, Some(TimelineCursor::new(2)), 2)
+            .await
+            .unwrap();
+        let before_end = store.timeline_before(&id, None, 2).await.unwrap();
+        let before_four = store
+            .timeline_before(&id, Some(TimelineCursor::new(4)), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            after_start
+                .iter()
+                .map(|event| event.cursor)
+                .collect::<Vec<_>>(),
+            [TimelineCursor::new(1), TimelineCursor::new(2)]
+        );
+        assert_eq!(
+            after_two
+                .iter()
+                .map(|event| event.cursor)
+                .collect::<Vec<_>>(),
+            [TimelineCursor::new(3), TimelineCursor::new(4)]
+        );
+        assert_eq!(
+            before_end
+                .iter()
+                .map(|event| event.cursor)
+                .collect::<Vec<_>>(),
+            [TimelineCursor::new(4), TimelineCursor::new(5)]
+        );
+        assert_eq!(
+            before_four
+                .iter()
+                .map(|event| event.cursor)
+                .collect::<Vec<_>>(),
+            [TimelineCursor::new(2), TimelineCursor::new(3)]
         );
     }
 }

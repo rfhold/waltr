@@ -32,6 +32,10 @@ fn anthropic_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     let mut tool_results: Vec<Value> = Vec::new();
     for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
         match item {
+            TurnItem::AssistantText(text) => {
+                flush_tool_results(&mut messages, &mut tool_results);
+                assistant_content.push(json!({ "type": "text", "text": text }));
+            }
             TurnItem::Thinking(block) if block.kind == ThinkingBlockKind::Anthropic => {
                 flush_tool_results(&mut messages, &mut tool_results);
                 assistant_content.push(block.payload.clone());
@@ -146,6 +150,7 @@ mod tests {
                             "signature": "sig-0",
                         }),
                     }),
+                    TurnItem::AssistantText("first answer".to_owned()),
                     TurnItem::ToolCall(ToolCall::new("call-0", "echo", json!({ "value": "a" }))),
                     TurnItem::ToolResult(ToolResult::new("call-0", "echo", "a")),
                 ],
@@ -168,6 +173,7 @@ mod tests {
                             "signature": "sig-1",
                         }),
                     }),
+                    TurnItem::AssistantText("second answer".to_owned()),
                     TurnItem::ToolCall(ToolCall::new("call-1", "echo", json!({ "value": "b" }))),
                     TurnItem::ToolResult(ToolResult::new("call-1", "echo", "b")),
                 ],
@@ -183,14 +189,17 @@ mod tests {
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"][0]["type"], "thinking");
         assert_eq!(messages[1]["content"][0]["signature"], "sig-0");
-        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
-        assert_eq!(messages[1]["content"][1]["id"], "call-0");
+        assert_eq!(messages[1]["content"][1]["type"], "text");
+        assert_eq!(messages[1]["content"][1]["text"], "first answer");
+        assert_eq!(messages[1]["content"][2]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][2]["id"], "call-0");
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"][0]["type"], "tool_result");
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "call-0");
         assert_eq!(messages[3]["role"], "assistant");
         assert_eq!(messages[3]["content"][0]["signature"], "sig-1");
-        assert_eq!(messages[3]["content"][1]["id"], "call-1");
+        assert_eq!(messages[3]["content"][1]["text"], "second answer");
+        assert_eq!(messages[3]["content"][2]["id"], "call-1");
         assert_eq!(messages[4]["role"], "user");
         assert_eq!(messages[4]["content"][0]["tool_use_id"], "call-1");
     }
