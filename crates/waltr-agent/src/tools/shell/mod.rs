@@ -45,6 +45,7 @@ mod tests {
         tools::shell::{ShellConfig, ShellInput},
     };
     use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn parser_extracts_single_command_claim() {
@@ -171,11 +172,16 @@ mod tests {
         drop(fs::remove_dir_all(root));
     }
 
-    #[test]
-    fn execution_returns_stdout() {
+    #[tokio::test]
+    async fn execution_returns_stdout() {
         let root = temp_root("exec");
         let output = ShellConfig::new(&root)
-            .execute(&ShellInput::new("printf waltr-shell-ok", "test"))
+            .execute_with_progress_and_cancellation(
+                &ShellInput::new("printf waltr-shell-ok", "test"),
+                ToolProgressSink::noop(),
+                CancellationToken::new(),
+            )
+            .await
             .expect("execute");
 
         assert!(output.contains("Exit code: 0"));
@@ -183,8 +189,8 @@ mod tests {
         drop(fs::remove_dir_all(root));
     }
 
-    #[test]
-    fn execution_streams_generic_progress() {
+    #[tokio::test]
+    async fn execution_streams_generic_progress() {
         let root = temp_root("progress");
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = ToolProgressSink::timeline(
@@ -200,10 +206,12 @@ mod tests {
             },
         );
         let output = ShellConfig::new(&root)
-            .execute_with_progress(
+            .execute_with_progress_and_cancellation(
                 &ShellInput::new("printf out; printf err >&2", "test"),
-                &sink,
+                sink,
+                CancellationToken::new(),
             )
+            .await
             .expect("execute");
 
         assert!(output.contains("Exit code: 0"));
@@ -222,46 +230,66 @@ mod tests {
         drop(fs::remove_dir_all(root));
     }
 
-    #[test]
-    fn execution_uses_workdir() {
+    #[tokio::test]
+    async fn execution_uses_workdir() {
         let root = temp_root("workdir");
         fs::create_dir_all(root.join("subdir")).expect("subdir");
         let output = ShellConfig::new(&root)
-            .execute(&ShellInput::new("pwd", "test").with_workdir("subdir"))
+            .execute_with_progress_and_cancellation(
+                &ShellInput::new("pwd", "test").with_workdir("subdir"),
+                ToolProgressSink::noop(),
+                CancellationToken::new(),
+            )
+            .await
             .expect("execute");
 
         assert!(output.contains(&root.join("subdir").display().to_string()));
         drop(fs::remove_dir_all(root));
     }
 
-    #[test]
-    fn execution_times_out() {
+    #[tokio::test]
+    async fn execution_times_out() {
         let root = temp_root("timeout");
         let output = ShellConfig::new(&root)
-            .execute(&ShellInput::new("sleep 5", "test").with_timeout(1))
+            .execute_with_progress_and_cancellation(
+                &ShellInput::new("sleep 5", "test").with_timeout(1),
+                ToolProgressSink::noop(),
+                CancellationToken::new(),
+            )
+            .await
             .expect("execute");
 
         assert!(output.contains("Timed out: true"));
         drop(fs::remove_dir_all(root));
     }
 
-    #[test]
-    fn execution_truncates_output() {
+    #[tokio::test]
+    async fn execution_truncates_output() {
         let root = temp_root("truncate");
         let output = ShellConfig::new(&root)
             .with_max_output_bytes(20)
-            .execute(&ShellInput::new("printf 1234567890123456789012345", "test"))
+            .execute_with_progress_and_cancellation(
+                &ShellInput::new("printf 1234567890123456789012345", "test"),
+                ToolProgressSink::noop(),
+                CancellationToken::new(),
+            )
+            .await
             .expect("execute");
 
         assert!(output.contains("[output truncated]"));
         drop(fs::remove_dir_all(root));
     }
 
-    #[test]
-    fn execution_reports_nonzero_as_output() {
+    #[tokio::test]
+    async fn execution_reports_nonzero_as_output() {
         let root = temp_root("nonzero");
         let output = ShellConfig::new(&root)
-            .execute(&ShellInput::new("exit 7", "test"))
+            .execute_with_progress_and_cancellation(
+                &ShellInput::new("exit 7", "test"),
+                ToolProgressSink::noop(),
+                CancellationToken::new(),
+            )
+            .await
             .expect("execute");
 
         assert!(output.contains("Exit code: 7"));

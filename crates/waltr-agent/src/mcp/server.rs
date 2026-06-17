@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, time::timeout};
+use tokio_util::sync::CancellationToken;
 
 use crate::Result;
 
@@ -41,20 +42,28 @@ impl McpServer {
         &self.name
     }
 
-    pub(in crate::mcp) async fn list_tools(&self) -> Result<Vec<McpToolDefinition>> {
-        self.ensure_initialized().await?;
+    pub(in crate::mcp) async fn list_tools(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<McpToolDefinition>> {
+        self.ensure_initialized(cancellation_token.clone()).await?;
         let mut state = self.state.lock().await;
         if let Some(tools) = &state.tools {
             return Ok(tools.clone());
         }
-        let tools = self.fetch_tools().await?;
+        let tools = self.fetch_tools(cancellation_token).await?;
         state.tools = Some(tools.clone());
         drop(state);
         Ok(tools)
     }
 
-    pub(in crate::mcp) async fn call_tool(&self, tool: &str, arguments: Value) -> Result<String> {
-        self.ensure_initialized().await?;
+    pub(in crate::mcp) async fn call_tool(
+        &self,
+        tool: &str,
+        arguments: Value,
+        cancellation_token: CancellationToken,
+    ) -> Result<String> {
+        self.ensure_initialized(cancellation_token.clone()).await?;
         let response = self
             .request(
                 "tools/call",
@@ -62,12 +71,16 @@ impl McpServer {
                     "name": tool,
                     "arguments": arguments,
                 })),
+                cancellation_token,
             )
             .await?;
         Ok(format_tool_result(&response))
     }
 
-    async fn ensure_initialized(&self) -> Result<()> {
+    async fn ensure_initialized(&self, cancellation_token: CancellationToken) -> Result<()> {
+        if cancellation_token.is_cancelled() {
+            return Err(protocol_error("MCP request canceled"));
+        }
         if self.state.lock().await.initialized {
             return Ok(());
         }
@@ -83,6 +96,7 @@ impl McpServer {
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 })),
+                cancellation_token.clone(),
             )
             .await?;
         let protocol = response
@@ -94,17 +108,26 @@ impl McpServer {
                 "unsupported MCP protocol version `{protocol}`"
             )));
         }
-        self.notify("notifications/initialized", None).await?;
+        self.notify("notifications/initialized", None, cancellation_token)
+            .await?;
         self.state.lock().await.initialized = true;
         Ok(())
     }
 
-    async fn fetch_tools(&self) -> Result<Vec<McpToolDefinition>> {
+    async fn fetch_tools(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<McpToolDefinition>> {
         let mut cursor = None;
         let mut tools = Vec::new();
         loop {
+            if cancellation_token.is_cancelled() {
+                return Err(protocol_error("MCP request canceled"));
+            }
             let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
-            let response = self.request("tools/list", params).await?;
+            let response = self
+                .request("tools/list", params, cancellation_token.clone())
+                .await?;
             for tool in response
                 .get("tools")
                 .and_then(Value::as_array)
@@ -126,23 +149,46 @@ impl McpServer {
         Ok(tools)
     }
 
-    async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+    async fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Value> {
         let id = next_id();
         let request = json_rpc_request(id, method, params);
-        let response = timeout(self.timeout, self.transport.request(request, Some(id))).await;
-        response.unwrap_or_else(|_| {
-            Err(protocol_error(format!(
-                "MCP request `{method}` timed out after {:?}",
-                self.timeout
-            )))
-        })
+        self.transport
+            .request(request, Some(id), self.timeout, cancellation_token)
+            .await
+            .map_err(|error| match error {
+                crate::LlmError::Protocol {
+                    provider: _,
+                    message,
+                } if message == "MCP request timed out" => protocol_error(format!(
+                    "MCP request `{method}` timed out after {:?}",
+                    self.timeout
+                )),
+                other => other,
+            })
     }
 
-    async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
+    async fn notify(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        cancellation_token: CancellationToken,
+    ) -> Result<()> {
+        if cancellation_token.is_cancelled() {
+            return Err(protocol_error("MCP request canceled"));
+        }
         let request = json_rpc_notification(method, params);
-        timeout(self.timeout, self.transport.request(request, None))
-            .await
-            .map_err(|_| protocol_error(format!("MCP notification `{method}` timed out")))??;
+        timeout(
+            self.timeout,
+            self.transport
+                .request(request, None, self.timeout, cancellation_token),
+        )
+        .await
+        .map_err(|_| protocol_error(format!("MCP notification `{method}` timed out")))??;
         Ok(())
     }
 }

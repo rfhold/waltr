@@ -16,6 +16,7 @@ use waltr_agent::{
 #[cfg(feature = "shell")]
 use waltr_agent::{PermissionCommandPattern, tools::shell::ShellConfig};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
@@ -232,6 +233,96 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
     assert!(completed_snapshot.pending_work.iter().any(|work| {
         work.id == "call_resume" && matches!(work.status, PendingWorkStatus::Finished(_))
     }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_after_permission_request_preserves_resume_path() -> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let agent = Agent::builder(test_model(ModelApi::OpenAiResponses))
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            fixture.root.path(),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(
+            FilesystemConfig::new(fixture.root.path())
+                .with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let provider = ScriptedProvider::new("permission_cancel_resume_provider", |request| {
+        if request.tool_results().any(|result| {
+            result.call_id == "call_cancel_resume" && result.content.contains("external-once-202")
+        }) {
+            vec![
+                Ok(CompletionEvent::Delta("resumed-after-cancel".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "call_cancel_resume",
+                "../outside/external.txt",
+            )))]
+        }
+    });
+    let store = MemorySessionStore::new();
+    let sessions = agent.sessions(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let cancellation = CancellationToken::new();
+
+    let mut stream = sessions
+        .prompt(&provider, session_id.clone(), "read external file")
+        .with_cancellation_token(cancellation.clone())
+        .stream();
+    let request_id = first_permission_request_id(&mut stream).await?;
+    cancellation.cancel();
+    assert!(stream.next().await.is_none());
+
+    let suspended = store.load(&session_id).await.expect("stored session");
+    let suspended_snapshot = suspended.snapshot();
+    assert!(matches!(
+        suspended_snapshot.status,
+        SessionStatus::Suspended(_)
+    ));
+    assert!(suspended_snapshot.pending_work.iter().any(|work| {
+        work.id == "call_cancel_resume" && matches!(work.status, PendingWorkStatus::Pending)
+    }));
+
+    let mut resumed = sessions
+        .resume(
+            &provider,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id: request_id.clone(),
+                response: ExternalResponse::new(json!("allow-once")),
+            },
+        )
+        .stream();
+    let mut text = String::new();
+    let mut saw_tool_result = false;
+    while let Some(event) = resumed.next().await {
+        let event = event?;
+        if let TimelineContent::TextDelta { delta } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
+        {
+            text.push_str(delta);
+        }
+        if let TimelineContent::ToolResult { result } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)
+            && result.call_id == "call_cancel_resume"
+        {
+            saw_tool_result = true;
+            assert!(result.content.contains("external-once-202"));
+        }
+    }
+
+    assert!(saw_tool_result, "approved original tool call should run");
+    assert_eq!(text, "resumed-after-cancel");
+    let completed = store.load(&session_id).await.expect("stored session");
+    assert!(matches!(
+        completed.snapshot().status,
+        SessionStatus::Finished
+    ));
 
     Ok(())
 }
@@ -792,38 +883,38 @@ impl LlmStream for ScriptedPermissionProvider {
     }
 }
 
-fn scripted_shell_or_finished(completed: &[&str]) -> Vec<waltr_agent::Result<CompletionEvent>> {
+fn scripted_shell_or_finished(_completed: &[&str]) -> Vec<waltr_agent::Result<CompletionEvent>> {
     #[cfg(feature = "shell")]
     {
-        if !completed.contains(&"call_6") {
+        if !_completed.contains(&"call_6") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_6",
                 "printf shell-one",
                 "first shell command",
             )))];
         }
-        if !completed.contains(&"call_7") {
+        if !_completed.contains(&"call_7") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_7",
                 "printf shell-two",
                 "second shell command",
             )))];
         }
-        if !completed.contains(&"call_8") {
+        if !_completed.contains(&"call_8") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_8",
                 "cat ../outside/nested/shell-walk.txt",
                 "read a shell path covered by the approved nested directory",
             )))];
         }
-        if !completed.contains(&"call_9") {
+        if !_completed.contains(&"call_9") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_9",
                 "cat ../outside/denied.txt",
                 "read a shell path denied by external filesystem policy",
             )))];
         }
-        if !completed.contains(&"call_10") {
+        if !_completed.contains(&"call_10") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_10",
                 "git status",

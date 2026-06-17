@@ -14,6 +14,7 @@ use crate::{
     PendingTimelineEvent, Result, TimelineChannel, TimelineContent, TimelineEventKind,
     TimelineItemId, ToolCall, ToolDefinition, ToolResult,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::session::SessionId;
 
@@ -33,6 +34,7 @@ type ToolHandler = dyn Fn(ToolExecutionContext) -> ToolFuture + Send + Sync;
 pub struct ToolExecutionContext {
     call: ToolCall,
     progress: ToolProgressSink,
+    cancellation_token: CancellationToken,
 }
 
 impl ToolExecutionContext {
@@ -44,8 +46,22 @@ impl ToolExecutionContext {
 
     /// Create a context with a progress receiver.
     #[must_use]
-    pub const fn with_progress(call: ToolCall, progress: ToolProgressSink) -> Self {
-        Self { call, progress }
+    pub fn with_progress(call: ToolCall, progress: ToolProgressSink) -> Self {
+        Self::with_progress_and_cancellation(call, progress, CancellationToken::new())
+    }
+
+    /// Create a context with progress and cancellation receivers.
+    #[must_use]
+    pub const fn with_progress_and_cancellation(
+        call: ToolCall,
+        progress: ToolProgressSink,
+        cancellation_token: CancellationToken,
+    ) -> Self {
+        Self {
+            call,
+            progress,
+            cancellation_token,
+        }
     }
 
     /// Return the provider tool call.
@@ -58,6 +74,18 @@ impl ToolExecutionContext {
     #[must_use]
     pub const fn progress(&self) -> &ToolProgressSink {
         &self.progress
+    }
+
+    /// Return the cancellation token for this invocation.
+    #[must_use]
+    pub const fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
+    }
+
+    /// Return whether this invocation has been canceled.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
     }
 
     /// Create the provider-facing final result for this call.

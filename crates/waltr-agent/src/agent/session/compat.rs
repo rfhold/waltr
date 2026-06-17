@@ -1,6 +1,7 @@
 //! Compatibility input for ephemeral session-backed runs.
 
 use crate::{LlmStream, ModelRef, PermissionPolicy};
+use tokio_util::sync::CancellationToken;
 
 use super::{ResumeInput, SessionId, SessionStore};
 use crate::middleware::{chain::MiddlewareChain, prompt::SystemPromptOverride};
@@ -21,4 +22,5 @@ where
     pub permission_policy: PermissionPolicy,
     pub session_id: SessionId,
     pub session_store: S,
+    pub cancellation_token: CancellationToken,
 }

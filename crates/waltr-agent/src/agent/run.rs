@@ -3,6 +3,7 @@
 use std::fmt;
 
 use futures_util::stream;
+use tokio_util::sync::CancellationToken;
 
 use crate::{LlmStream, ModelRef, PermissionPolicy};
 
@@ -39,6 +40,7 @@ struct RunOverrides {
     tools: Vec<AgentTool>,
     system_prompt: SystemPromptOverride,
     permission_policy: Option<PermissionPolicy>,
+    cancellation_token: Option<CancellationToken>,
 }
 
 /// Builder for an agent loop request.
@@ -86,9 +88,7 @@ where
     {
         let prompt = match &input {
             ResumeInput::Prompt(prompt) => prompt.clone(),
-            ResumeInput::ToolResults(_)
-            | ResumeInput::ExternalResponse { .. }
-            | ResumeInput::Interrupt => String::new(),
+            ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => String::new(),
         };
         AgentRunBuilder {
             provider,
@@ -133,6 +133,13 @@ where
     #[must_use]
     pub fn with_permission_policy(mut self, policy: PermissionPolicy) -> Self {
         self.overrides.permission_policy = Some(policy);
+        self
+    }
+
+    /// Stop this run when the supplied cancellation token is canceled.
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.overrides.cancellation_token = Some(token);
         self
     }
 
@@ -184,6 +191,7 @@ where
             tools: extra_tools,
             system_prompt,
             permission_policy: policy_override,
+            cancellation_token,
         } = self.overrides;
         tools.extend(extra_tools);
         let permission_policy = policy_override.unwrap_or(permission_policy);
@@ -207,6 +215,7 @@ where
             permission_policy,
             session_id: self.session_id,
             session_store: self.session_store,
+            cancellation_token: cancellation_token.unwrap_or_default(),
         }
     }
 }

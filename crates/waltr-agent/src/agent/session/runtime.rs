@@ -70,7 +70,6 @@ where
                     .await
             }
             ResumeInput::ToolResults(results) => self.resume_tool_results(record, results).await,
-            ResumeInput::Interrupt => self.interrupt(record).await,
         }
     }
 
@@ -261,16 +260,6 @@ where
                 .await?;
         }
         Ok(RuntimeResumeOutput::Resumed { record })
-    }
-
-    async fn interrupt(&self, record: SessionRecord) -> Result<RuntimeResumeOutput> {
-        let record = self
-            .append_journal_and_reload(record, vec![SessionJournalEvent::Interrupted])
-            .await?;
-        Ok(RuntimeResumeOutput::Suspended {
-            record,
-            suspension: Suspension::Interrupted { work: Vec::new() },
-        })
     }
 
     async fn append_journal_and_reload(

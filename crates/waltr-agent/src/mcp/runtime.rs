@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::{AgentTool, Result, ToolDefinition};
 
@@ -25,10 +26,16 @@ impl McpRuntime {
         }
     }
 
-    pub(in crate::mcp) async fn direct_agent_tools(self: &Arc<Self>) -> Result<Vec<AgentTool>> {
+    pub(in crate::mcp) async fn direct_agent_tools(
+        self: &Arc<Self>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Vec<AgentTool>> {
         let mut tools = Vec::new();
         for server in self.servers.values() {
-            for tool in server.list_tools().await? {
+            if cancellation_token.is_cancelled() {
+                return Err(protocol_error("MCP request canceled"));
+            }
+            for tool in server.list_tools(cancellation_token.clone()).await? {
                 let runtime = Arc::clone(self);
                 let server_name = server.name().to_owned();
                 let tool_name = tool.name.clone();
@@ -47,7 +54,12 @@ impl McpRuntime {
                     let arguments = context.call().arguments.clone();
                     Box::pin(async move {
                         let content = runtime
-                            .call_tool(&server_name, &tool_name, arguments)
+                            .call_tool(
+                                &server_name,
+                                &tool_name,
+                                arguments,
+                                context.cancellation_token().clone(),
+                            )
                             .await?;
                         Ok(context.result(content))
                     })
@@ -62,9 +74,10 @@ impl McpRuntime {
         server_name: &str,
         tool_name: &str,
         arguments: Value,
+        cancellation_token: CancellationToken,
     ) -> Result<String> {
         self.server(server_name)?
-            .call_tool(tool_name, arguments)
+            .call_tool(tool_name, arguments, cancellation_token)
             .await
     }
 

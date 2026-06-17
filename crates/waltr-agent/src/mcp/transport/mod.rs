@@ -2,7 +2,10 @@ mod http;
 mod sse;
 mod stdio;
 
+use std::time::Duration;
+
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::Result;
 
@@ -27,10 +30,24 @@ impl McpTransport {
         }
     }
 
-    pub(in crate::mcp) async fn request(&self, request: Value, id: Option<u64>) -> Result<Value> {
+    pub(in crate::mcp) async fn request(
+        &self,
+        request: Value,
+        id: Option<u64>,
+        timeout: Duration,
+        cancellation_token: CancellationToken,
+    ) -> Result<Value> {
         match self {
-            Self::Stdio(transport) => transport.request(request, id).await,
-            Self::StreamableHttp(transport) => transport.request(request, id).await,
+            Self::Stdio(transport) => {
+                transport
+                    .request(request, id, timeout, cancellation_token)
+                    .await
+            }
+            Self::StreamableHttp(transport) => {
+                transport
+                    .request(request, id, timeout, cancellation_token)
+                    .await
+            }
         }
     }
 }

@@ -1,48 +1,47 @@
-use std::{
-    io::Read,
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{process::Stdio, time::Duration};
 
 use super::{ShellConfig, ShellInput, format_process_output, shell_error};
 use crate::{Result, ToolProgressSink};
+use tokio::{io::AsyncReadExt, process::Command as TokioCommand, time};
+use tokio_util::sync::CancellationToken;
 
 const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 
 impl ShellConfig {
-    /// Execute a shell command using the configured root and limits.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if command input is invalid or the process cannot be spawned.
-    pub fn execute(&self, input: &ShellInput) -> Result<String> {
-        self.execute_with_progress(input, &ToolProgressSink::noop())
-    }
-
-    /// Execute a shell command and stream stdout/stderr as generic progress.
+    /// Execute a shell command with progress and cancellation.
     ///
     /// # Errors
     ///
     /// Returns an error if command input is invalid, the process cannot be spawned, output cannot
     /// be read, or progress cannot be emitted.
-    pub fn execute_with_progress(
+    pub async fn execute_with_progress_and_cancellation(
         &self,
         input: &ShellInput,
-        progress: &ToolProgressSink,
+        progress: ToolProgressSink,
+        cancellation_token: CancellationToken,
     ) -> Result<String> {
+        if cancellation_token.is_cancelled() {
+            return Err(shell_error("shell command canceled"));
+        }
         let workdir = self.resolved_workdir(input.workdir.as_deref());
         let timeout = input
             .timeout
             .map_or(self.default_timeout, Duration::from_secs);
-        let mut child = Command::new("/bin/bash")
+        let command = cancellation_wrapped_command(&input.command);
+        if cancellation_token.is_cancelled() {
+            return Err(shell_error("shell command canceled"));
+        }
+        let mut child = TokioCommand::new("/bin/bash")
             .arg("-lc")
-            .arg(&input.command)
+            .arg(command)
             .current_dir(workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        let child_id = child
+            .id()
+            .ok_or_else(|| shell_error("failed to identify shell process"))?;
         let stdout = child
             .stdout
             .take()
@@ -51,27 +50,28 @@ impl ShellConfig {
             .stderr
             .take()
             .ok_or_else(|| shell_error("failed to capture shell stderr"))?;
-        let stdout_progress = progress.clone();
-        let stderr_progress = progress.clone();
-        let stdout_reader = thread::spawn(move || read_output(stdout, stdout_progress, false));
-        let stderr_reader = thread::spawn(move || read_output(stderr, stderr_progress, true));
+        let stdout_reader = tokio::spawn(read_output_async(stdout, progress.clone(), false));
+        let stderr_reader = tokio::spawn(read_output_async(stderr, progress, true));
 
-        let start = Instant::now();
-        let (exit_code, timed_out) = loop {
-            if let Some(status) = child.try_wait()? {
-                break (status.code(), false);
+        let (exit_code, timed_out) = tokio::select! {
+            biased;
+
+            () = cancellation_token.cancelled() => {
+                terminate_shell(child_id).await;
+                let status = child.wait().await?;
+                (status.code(), false)
             }
-
-            if start.elapsed() >= timeout {
-                drop(child.kill());
-                let status = child.wait()?;
-                break (status.code(), true);
+            () = time::sleep(timeout) => {
+                terminate_shell(child_id).await;
+                let status = child.wait().await?;
+                (status.code(), true)
             }
-
-            thread::sleep(Duration::from_millis(10));
+            status = child.wait() => {
+                (status?.code(), false)
+            }
         };
-        let stdout = join_output(stdout_reader)?;
-        let stderr = join_output(stderr_reader)?;
+        let stdout = join_output_async(stdout_reader).await?;
+        let stderr = join_output_async(stderr_reader).await?;
 
         Ok(format_process_output(
             exit_code,
@@ -83,8 +83,31 @@ impl ShellConfig {
     }
 }
 
-fn read_output(
-    mut reader: impl Read,
+fn cancellation_wrapped_command(command: &str) -> String {
+    format!("trap 'jobs -pr | xargs -r kill -TERM; exit 143' TERM INT; {command}")
+}
+
+async fn terminate_shell(pid: u32) {
+    let pid = pid.to_string();
+    drop(
+        TokioCommand::new("kill")
+            .arg("-TERM")
+            .arg(&pid)
+            .status()
+            .await,
+    );
+    time::sleep(Duration::from_millis(100)).await;
+    drop(
+        TokioCommand::new("kill")
+            .arg("-KILL")
+            .arg(&pid)
+            .status()
+            .await,
+    );
+}
+
+async fn read_output_async(
+    mut reader: impl AsyncReadExt + Unpin,
     progress: ToolProgressSink,
     is_error: bool,
 ) -> Result<Vec<u8>> {
@@ -92,7 +115,7 @@ fn read_output(
     let mut buffer = [0; OUTPUT_READ_BUFFER_BYTES];
     let mut progress_error = None;
     loop {
-        let bytes = reader.read(&mut buffer)?;
+        let bytes = reader.read(&mut buffer).await?;
         if bytes == 0 {
             break;
         }
@@ -117,8 +140,8 @@ fn read_output(
     }
 }
 
-fn join_output(handle: thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
+async fn join_output_async(handle: tokio::task::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
     handle
-        .join()
-        .map_err(|_| shell_error("shell output reader panicked"))?
+        .await
+        .map_err(|error| shell_error(format!("shell output reader task failed: {error}")))?
 }

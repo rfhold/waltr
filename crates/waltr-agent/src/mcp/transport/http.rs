@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time};
+use tokio_util::sync::CancellationToken;
 
 use crate::Result;
 
@@ -23,8 +26,20 @@ impl StreamableHttpTransport {
         }
     }
 
-    pub(in crate::mcp) async fn request(&self, request: Value, id: Option<u64>) -> Result<Value> {
+    pub(in crate::mcp) async fn request(
+        &self,
+        request: Value,
+        id: Option<u64>,
+        timeout: Duration,
+        cancellation_token: CancellationToken,
+    ) -> Result<Value> {
+        if cancellation_token.is_cancelled() {
+            return Err(protocol_error("MCP request canceled"));
+        }
         let session_id = self.session_id.lock().await.clone();
+        if cancellation_token.is_cancelled() {
+            return Err(protocol_error("MCP request canceled"));
+        }
         let mut builder = self
             .client
             .post(&self.endpoint)
@@ -36,7 +51,17 @@ impl StreamableHttpTransport {
                 .header("mcp-session-id", session_id)
                 .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
         }
-        let response = builder.send().await?;
+        let response = tokio::select! {
+            biased;
+
+            () = cancellation_token.cancelled() => {
+                return Err(protocol_error("MCP request canceled"));
+            }
+            () = time::sleep(timeout) => {
+                return Err(protocol_error("MCP request timed out"));
+            }
+            response = builder.send() => response?,
+        };
         if response.status() == reqwest::StatusCode::NOT_FOUND && session_id.is_some() {
             *self.session_id.lock().await = None;
             return Err(protocol_error("MCP HTTP session expired"));
@@ -61,11 +86,22 @@ impl StreamableHttpTransport {
             .unwrap_or_default()
             .to_owned();
         if content_type.contains("text/event-stream") {
-            parse_sse_response(response, id).await
+            parse_sse_response(response, id, timeout, cancellation_token).await
         } else if id.is_none() {
             Ok(json!(null))
         } else {
-            json_rpc_result(response.json::<JsonRpcMessage>().await?)
+            let message = tokio::select! {
+                biased;
+
+                () = cancellation_token.cancelled() => {
+                    return Err(protocol_error("MCP request canceled"));
+                }
+                () = time::sleep(timeout) => {
+                    return Err(protocol_error("MCP request timed out"));
+                }
+                message = response.json::<JsonRpcMessage>() => message?,
+            };
+            json_rpc_result(message)
         }
     }
 }
