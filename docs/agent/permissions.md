@@ -13,6 +13,7 @@ Agent permissions decide whether host-affecting tool operations are allowed, den
 | `PermissionEffect` | Resulting behavior: allow, ask, or deny. |
 | `ToolSelector` | Rule target for an exact or patterned tool name. |
 | Path and command patterns | Resource matchers used by filesystem and shell policies. |
+| `PermissionResponse` | Typed host decision for permission asks: allow once, allow always, or deny. |
 
 ## Policy Evaluation
 
@@ -45,7 +46,13 @@ Filesystem and shell tools generate detailed claims for the operations they infe
 | Ask | The run suspends with an external permission request for the host. |
 | Deny | The tool is not executed; the agent receives a permission error as the tool result. |
 
-An ask outcome persists an external request in the session. Resuming with an external response records the response and a synthetic permission tool result; it does not automatically re-run the originally suspended tool call.
+An ask outcome persists an external request in the session. Resuming with a permission response records the response, primes durable permission runtime state, and retries the originally suspended tool call through the normal permission and tool-execution path.
+
+Permission responses support:
+
+- `allow_once`: allow the suspended tool call once, then consume the approval.
+- `allow_always`: persist reusable approval patterns and allow the suspended tool call.
+- `deny`: either return a denial tool result to the model or cancel pending work, depending on the response mode.
 
 ## Defaults
 
@@ -61,7 +68,7 @@ Hosts that need safe-by-default user approvals should provide an explicit policy
 
 Permission asks are part of the session model. The agent stores pending external requests, associated tool calls, responses, timeline events, and internal journal records through the configured `SessionStore`.
 
-The current implementation does not have a persisted allow-once or allow-always grant store. Reusable command or path patterns may be suggested by lower-level permission helpers, but the agent loop does not yet consume durable approval patterns.
+Allow-once approvals and allow-always patterns are persisted in the session middleware state under the `permissions` namespace. The agent loop consumes one-shot approvals when the original tool call is retried, and reusable patterns apply to later matching permission claims in the same session.
 
 ## Boundaries
 

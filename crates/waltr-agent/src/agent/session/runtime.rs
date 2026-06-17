@@ -3,7 +3,8 @@
 #![allow(missing_docs)]
 
 use crate::{
-    LlmError, Result, ToolResult,
+    LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
+    permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
     timeline::{
         CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
         TimelineEventKind,
@@ -11,9 +12,9 @@ use crate::{
 };
 
 use super::{
-    CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestStatus, ExternalResponse,
-    PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent, SessionRecord, SessionSnapshot,
-    SessionStore, Suspension,
+    CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
+    ExternalResponse, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
+    SessionRecord, SessionSnapshot, SessionStore, Suspension,
 };
 
 /// Runtime facade for durable session resume operations.
@@ -145,25 +146,101 @@ where
             )
             .await?;
 
-        if let Some(tool_call_id) = request.tool_call_id {
-            let result = ToolResult::new(
-                tool_call_id,
-                request_tool_name(&request.kind),
-                external_response_content(&response),
-            );
-            let session_id = record.id.clone();
-            record = self
-                .append_timeline_and_reload(
-                    record,
-                    vec![tool_result_timeline_event(&session_id, turn, result)],
-                )
-                .await?;
-            record = self
-                .append_journal_and_reload(record, vec![SessionJournalEvent::TurnFinished { turn }])
-                .await?;
+        match &request.kind {
+            ExternalRequestKind::Permission => {
+                record = self
+                    .apply_permission_response(record, &snapshot, &request, &request_id, response)
+                    .await?;
+            }
+            ExternalRequestKind::Question
+            | ExternalRequestKind::ToolInput
+            | ExternalRequestKind::Custom(_) => {
+                if let Some(tool_call_id) = request.tool_call_id {
+                    let result = ToolResult::new(
+                        tool_call_id,
+                        request_tool_name(&request.kind),
+                        external_response_content(&response),
+                    );
+                    let session_id = record.id.clone();
+                    record = self
+                        .append_timeline_and_reload(
+                            record,
+                            vec![tool_result_timeline_event(&session_id, turn, result)],
+                        )
+                        .await?;
+                    record = self
+                        .append_journal_and_reload(
+                            record,
+                            vec![SessionJournalEvent::TurnFinished { turn }],
+                        )
+                        .await?;
+                }
+            }
         }
 
         Ok(RuntimeResumeOutput::Resumed { record })
+    }
+
+    async fn apply_permission_response(
+        &self,
+        record: SessionRecord,
+        snapshot: &SessionSnapshot,
+        request: &ExternalRequest,
+        request_id: &ExternalRequestId,
+        response: ExternalResponse,
+    ) -> Result<SessionRecord> {
+        let response = PermissionResponse::from_value(response.payload)?;
+        let Some(tool_call_id) = request.tool_call_id.as_deref() else {
+            return Err(runtime_error("permission request missing tool call id"));
+        };
+        let turn = snapshot.turn;
+
+        match response {
+            PermissionResponse::AllowOnce => {
+                let mut state = permission_state(snapshot)?;
+                state.allow_once(request_id, tool_call_id);
+                self.append_journal_and_reload(record, vec![permission_state_event(&state)])
+                    .await
+            }
+            PermissionResponse::AllowAlways { patterns } => {
+                let mut state = permission_state(snapshot)?;
+                state.allow_patterns(patterns);
+                state.allow_once(request_id, tool_call_id);
+                self.append_journal_and_reload(record, vec![permission_state_event(&state)])
+                    .await
+            }
+            PermissionResponse::Deny { message, mode } => match mode {
+                PermissionDenyMode::ReturnToolResult => {
+                    let result = ToolResult::new(
+                        tool_call_id.to_owned(),
+                        "permission",
+                        message.unwrap_or_else(|| "permission denied".to_owned()),
+                    );
+                    let session_id = record.id.clone();
+                    let record = self
+                        .append_timeline_and_reload(
+                            record,
+                            vec![tool_result_timeline_event(&session_id, turn, result)],
+                        )
+                        .await?;
+                    self.append_journal_and_reload(
+                        record,
+                        vec![SessionJournalEvent::TurnFinished { turn }],
+                    )
+                    .await
+                }
+                PermissionDenyMode::CancelWork => {
+                    self.append_journal_and_reload(
+                        record,
+                        vec![SessionJournalEvent::WorkCanceled {
+                            work_id: tool_call_id.to_owned(),
+                            reason: CancelReason::ToolUnavailable,
+                        }],
+                    )
+                    .await
+                }
+            },
+        }
     }
 
     async fn resume_tool_results(
@@ -281,6 +358,23 @@ fn pending_work_ids(snapshot: &SessionSnapshot) -> Vec<String> {
         .collect()
 }
 
+fn permission_state(snapshot: &SessionSnapshot) -> Result<PermissionRuntimeState> {
+    snapshot
+        .middleware_state
+        .get(PERMISSION_STATE_NAMESPACE)
+        .map(|state| serde_json::from_value(state.clone()))
+        .transpose()
+        .map_err(|error| runtime_error(error.to_string()))
+        .map(Option::unwrap_or_default)
+}
+
+fn permission_state_event(state: &PermissionRuntimeState) -> SessionJournalEvent {
+    SessionJournalEvent::MiddlewareStateUpdated {
+        namespace: PERMISSION_STATE_NAMESPACE.to_owned(),
+        state: serde_json::to_value(state).expect("permission runtime state serializes"),
+    }
+}
+
 fn tool_result_timeline_event(
     session_id: &SessionId,
     turn: u64,
@@ -316,9 +410,9 @@ const fn request_tool_name(kind: &super::ExternalRequestKind) -> &'static str {
     match kind {
         super::ExternalRequestKind::Question => "question",
         super::ExternalRequestKind::Permission => "permission",
-        super::ExternalRequestKind::ToolInput
-        | super::ExternalRequestKind::Confirmation
-        | super::ExternalRequestKind::Custom(_) => "external_request",
+        super::ExternalRequestKind::ToolInput | super::ExternalRequestKind::Custom(_) => {
+            "external_request"
+        }
     }
 }
 

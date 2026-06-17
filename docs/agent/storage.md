@@ -76,7 +76,7 @@ Loaded sessions resume with `ResumeInput`:
 | `ToolResults` | Records externally supplied tool results. |
 | `Interrupt` | Records interruption and keeps the session suspended. |
 
-External responses record the response and a synthetic tool result when linked. They do not automatically re-run the original suspended tool call.
+Question responses record the response as the linked tool result. Permission responses are typed: allow decisions prime durable permission state and retry the original suspended tool call, while deny decisions either return a denial result or cancel the pending work.
 
 ## Boundaries
 

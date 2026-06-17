@@ -31,6 +31,20 @@ impl PermissionEngine {
         &self.patterns
     }
 
+    /// Add one reusable approval pattern.
+    pub fn allow_pattern(&mut self, pattern: PermissionPattern) {
+        if !self.patterns.contains(&pattern) {
+            self.patterns.push(pattern);
+        }
+    }
+
+    /// Add reusable approval patterns.
+    pub fn allow_patterns(&mut self, patterns: impl IntoIterator<Item = PermissionPattern>) {
+        for pattern in patterns {
+            self.allow_pattern(pattern);
+        }
+    }
+
     /// Check claims for a tool call.
     ///
     /// # Errors
