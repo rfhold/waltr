@@ -2772,6 +2772,7 @@ name = "waltr"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "prost-types",
  "serde",
  "tonic",
  "tonic-prost",
@@ -2832,14 +2833,17 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "waltr",
+ "waltr-agent",
  "notify",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "prost-types",
  "pyroscope",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tokio",
  "tokio-stream",

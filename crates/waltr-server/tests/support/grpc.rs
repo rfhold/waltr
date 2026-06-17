@@ -2,6 +2,7 @@ use waltr::grpc::waltr::config::v1::{
     Configuration, GetConfigRequest, Provider, ProviderType,
     config_service_client::ConfigServiceClient,
 };
+use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use waltr_server::test_support::TestServer;
 use tonic::transport::{Channel, Endpoint};
@@ -23,6 +24,13 @@ pub(crate) async fn status_client(
 ) -> Result<StatusServiceClient<Channel>, Box<dyn std::error::Error>> {
     let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
     Ok(StatusServiceClient::new(channel))
+}
+
+pub(crate) async fn session_client(
+    server: &TestServer,
+) -> Result<SessionServiceClient<Channel>, Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
+    Ok(SessionServiceClient::new(channel))
 }
 
 pub(crate) async fn get_config(
