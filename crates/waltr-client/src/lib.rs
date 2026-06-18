@@ -15,25 +15,33 @@ mod wasm;
 pub use client::{Client, ClientUpdate};
 pub use coordination::event::{
     ClientEffect, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch, ProviderEditBaseline,
-    StatusEffect, StatusEvent, StreamEvent, StreamId,
+    SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
     ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot, ClientStateStream,
-    ClientStateStreamEvent, ConfigSnapshot, OperationSnapshot, StatusSnapshot,
+    ClientStateStreamEvent, ConfigSnapshot, OperationSnapshot, SessionSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
-    ClientState, ConfigClientState, OperationState, OperationStatus, StatusClientState,
-    StreamClientState, StreamState, StreamStatus, WatchState, watch_reconnect_delay_ms,
+    ClientState, ConfigClientState, OperationState, OperationStatus, SessionClientState,
+    StatusClientState, StreamClientState, StreamState, StreamStatus, WatchState,
+    watch_reconnect_delay_ms,
 };
 pub use error::ClientError;
-pub use executor::{ConfigChange, ConfigChangeStream, GrpcEffectExecutor, StatusChangeStream};
+pub use executor::{
+    ConfigChange, ConfigChangeStream, GrpcEffectExecutor, SessionChangeStream, StatusChangeStream,
+};
 pub use waltr::grpc::waltr::config::v1::{
     Configuration, McpServer, McpServerType, Model, ModelCapabilities, ModelLimits, ModelOptions,
     ModelType, Provider, ProviderType,
 };
+pub use waltr::grpc::waltr::session::v1::{
+    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, SessionPhase,
+    SessionStatus, SessionSummary, Suspension, SuspensionKind,
+};
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
-pub use transport::{ConfigWatchUpdate, WaltrTransport};
+pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchUpdate};
 pub use view::{
     ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView,
-    ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
+    ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView, SessionPhaseView,
+    SessionStatusView, SessionView, TimestampView,
 };

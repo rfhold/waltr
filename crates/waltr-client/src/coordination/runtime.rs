@@ -8,11 +8,11 @@ use futures_util::{StreamExt, future::Either, future::select, pin_mut};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::executor::ConfigWatchUpdateStream;
+use crate::executor::{ConfigWatchUpdateStream, SessionWatchUpdateStream};
 use crate::{
     Client, ClientEffect, ClientError, ClientEvent, ClientUpdate, ConfigEffect, ConfigEvent,
-    ConfigView, GrpcEffectExecutor, McpServerView, OperationStatus, ProviderView,
-    StatusChangeStream, StatusEffect, StatusEvent,
+    ConfigView, GrpcEffectExecutor, McpServerView, OperationStatus, ProviderView, SessionEffect,
+    SessionEvent, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -63,6 +63,12 @@ pub enum ClientCommand {
     RegisterConfigWatchInterest,
     /// Release current interest in configuration watch updates.
     ReleaseConfigWatchInterest,
+    /// Create a new server-side session.
+    CreateSession,
+    /// Register current interest in session watch updates.
+    RegisterSessionWatchInterest,
+    /// Release current interest in session watch updates.
+    ReleaseSessionWatchInterest,
     /// Process one status watch update.
     WatchStatus,
     /// Keep watching status until the reducer observes readiness.
@@ -77,6 +83,8 @@ pub struct ClientSnapshot {
     pub config: ConfigSnapshot,
     /// System status coordination snapshot.
     pub status: StatusSnapshot,
+    /// Session coordination snapshot.
+    pub sessions: SessionSnapshot,
 }
 
 /// Stable snapshot of configuration coordination state.
@@ -103,6 +111,20 @@ pub struct StatusSnapshot {
     pub watch: OperationSnapshot,
 }
 
+/// Stable snapshot of session coordination state.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    /// Last known sessions.
+    pub current: Vec<SessionView>,
+    /// Session create operation snapshot.
+    pub create: OperationSnapshot,
+    /// Session list operation snapshot.
+    pub list: OperationSnapshot,
+    /// Session watch operation snapshot.
+    pub watch: OperationSnapshot,
+}
+
 /// Stable snapshot of one operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +141,7 @@ pub struct ClientRuntime {
     executor: GrpcEffectExecutor,
     status_watch: Option<StatusChangeStream>,
     config_watch: Option<ConfigWatchUpdateStream>,
+    session_watch: Option<SessionWatchUpdateStream>,
 }
 
 /// Command sent to a shared client state stream loop.
@@ -168,6 +191,7 @@ impl fmt::Debug for ClientRuntime {
             .field("executor", &self.executor)
             .field("status_watch_active", &self.status_watch.is_some())
             .field("config_watch_active", &self.config_watch.is_some())
+            .field("session_watch_active", &self.session_watch.is_some())
             .finish()
     }
 }
@@ -181,6 +205,7 @@ impl ClientRuntime {
             executor: GrpcEffectExecutor::for_endpoint(endpoint),
             status_watch: None,
             config_watch: None,
+            session_watch: None,
         }
     }
 
@@ -293,6 +318,29 @@ impl ClientRuntime {
                 }
                 self.run_update(update, sleep).await;
             }
+            ClientCommand::CreateSession => {
+                let update = self.reducer.create_session();
+                self.run_update(update, sleep).await;
+
+                if let Some(error) = self.reducer.state().sessions.create.error.as_deref() {
+                    return Err(ClientError::new(error));
+                }
+            }
+            ClientCommand::RegisterSessionWatchInterest => {
+                let update = self.reducer.register_session_watch_interest();
+                self.run_update(update, sleep).await;
+
+                if let Some(error) = self.reducer.state().sessions.watch.error.as_deref() {
+                    return Err(ClientError::new(error));
+                }
+            }
+            ClientCommand::ReleaseSessionWatchInterest => {
+                let update = self.reducer.release_session_watch_interest();
+                if self.reducer.state().sessions.watch.interests == 0 {
+                    self.session_watch = None;
+                }
+                self.run_update(update, sleep).await;
+            }
             ClientCommand::WatchStatus => {
                 let update = self.reducer.request_status_watch();
                 self.run_update(update, sleep).await;
@@ -370,6 +418,15 @@ impl ClientRuntime {
                     Err(error) => vec![ClientEvent::Config(ConfigEvent::WatchFailed(error))],
                 }
             }
+            ClientEffect::Session(SessionEffect::Watch) => {
+                match self.executor.watch_session_updates().await {
+                    Ok(stream) => {
+                        self.session_watch = Some(stream);
+                        vec![ClientEvent::Session(SessionEvent::WatchStarted)]
+                    }
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
+                }
+            }
             effect => self.executor.execute_effect(effect, sleep).await,
         }
     }
@@ -385,6 +442,107 @@ impl ClientRuntime {
     }
 
     async fn next_watch_event(&mut self) -> ClientEvent {
+        if self.reducer.state().sessions.watch.interests > 0 {
+            if let (Some(session), Some(config), Some(status)) = (
+                &mut self.session_watch,
+                &mut self.config_watch,
+                &mut self.status_watch,
+            ) {
+                let session_next = session.next();
+                let config_next = config.next();
+                let status_next = status.next();
+                pin_mut!(session_next);
+                pin_mut!(config_next);
+                pin_mut!(status_next);
+
+                let data_next = select(session_next, config_next);
+                pin_mut!(data_next);
+
+                return match select(data_next, status_next).await {
+                    Either::Left((Either::Left((Some(Ok(update)), _)), _)) => {
+                        ClientEvent::Session(SessionEvent::WatchChanged(update))
+                    }
+                    Either::Left((Either::Left((Some(Err(error)), _)), _)) => {
+                        self.session_watch = None;
+                        ClientEvent::Session(SessionEvent::WatchFailed(error))
+                    }
+                    Either::Left((Either::Left((None, _)), _)) => {
+                        self.session_watch = None;
+                        ClientEvent::Session(SessionEvent::WatchEnded)
+                    }
+                    Either::Left((Either::Right((Some(Ok(update)), _)), _)) => {
+                        ClientEvent::Config(ConfigEvent::WatchChanged(update))
+                    }
+                    Either::Left((Either::Right((Some(Err(error)), _)), _)) => {
+                        self.config_watch = None;
+                        ClientEvent::Config(ConfigEvent::WatchFailed(error))
+                    }
+                    Either::Left((Either::Right((None, _)), _)) => {
+                        self.config_watch = None;
+                        ClientEvent::Config(ConfigEvent::WatchEnded)
+                    }
+                    Either::Right((Some(Ok(status)), _)) => {
+                        ClientEvent::Status(StatusEvent::WatchChanged(status))
+                    }
+                    Either::Right((Some(Err(error)), _)) => {
+                        self.status_watch = None;
+                        ClientEvent::Status(StatusEvent::WatchFailed(error))
+                    }
+                    Either::Right((None, _)) => {
+                        self.status_watch = None;
+                        ClientEvent::Status(StatusEvent::WatchEnded)
+                    }
+                };
+            }
+
+            if let (Some(session), Some(status)) = (&mut self.session_watch, &mut self.status_watch)
+            {
+                let session_next = session.next();
+                let status_next = status.next();
+                pin_mut!(session_next);
+                pin_mut!(status_next);
+
+                return match select(session_next, status_next).await {
+                    Either::Left((Some(Ok(update)), _)) => {
+                        ClientEvent::Session(SessionEvent::WatchChanged(update))
+                    }
+                    Either::Left((Some(Err(error)), _)) => {
+                        self.session_watch = None;
+                        ClientEvent::Session(SessionEvent::WatchFailed(error))
+                    }
+                    Either::Left((None, _)) => {
+                        self.session_watch = None;
+                        ClientEvent::Session(SessionEvent::WatchEnded)
+                    }
+                    Either::Right((Some(Ok(status)), _)) => {
+                        ClientEvent::Status(StatusEvent::WatchChanged(status))
+                    }
+                    Either::Right((Some(Err(error)), _)) => {
+                        self.status_watch = None;
+                        ClientEvent::Status(StatusEvent::WatchFailed(error))
+                    }
+                    Either::Right((None, _)) => {
+                        self.status_watch = None;
+                        ClientEvent::Status(StatusEvent::WatchEnded)
+                    }
+                };
+            }
+
+            if let Some(stream) = &mut self.session_watch {
+                return match stream.next().await {
+                    Some(Ok(update)) => ClientEvent::Session(SessionEvent::WatchChanged(update)),
+                    Some(Err(error)) => {
+                        self.session_watch = None;
+                        ClientEvent::Session(SessionEvent::WatchFailed(error))
+                    }
+                    None => {
+                        self.session_watch = None;
+                        ClientEvent::Session(SessionEvent::WatchEnded)
+                    }
+                };
+            }
+        }
+
         if self.reducer.state().config.watch.interests > 0 {
             if let (Some(config), Some(status)) = (&mut self.config_watch, &mut self.status_watch) {
                 let config_next = config.next();
@@ -514,6 +672,7 @@ impl ClientStateStream {
                 ClientStateStreamPhase::Ready => {
                     if self.runtime.reducer.state().status.watch.status == OperationStatus::Received
                         && self.runtime.reducer.state().config.watch.interests == 0
+                        && self.runtime.reducer.state().sessions.watch.interests == 0
                     {
                         sleep(READY_IDLE_DELAY_MS).await;
                         let update = self.runtime.reducer.maintain_watches();
@@ -521,7 +680,10 @@ impl ClientStateStream {
                         return self.snapshot();
                     }
 
-                    if self.runtime.config_watch.is_some() || self.runtime.status_watch.is_some() {
+                    if self.runtime.config_watch.is_some()
+                        || self.runtime.session_watch.is_some()
+                        || self.runtime.status_watch.is_some()
+                    {
                         self.apply_next_watch_event().await;
                         return self.snapshot();
                     }
@@ -659,6 +821,27 @@ impl ClientSnapshot {
                 watch: OperationSnapshot::from_parts(
                     state.status.watch.status,
                     state.status.watch.error.clone(),
+                ),
+            },
+            sessions: SessionSnapshot {
+                current: state
+                    .sessions
+                    .current
+                    .values()
+                    .cloned()
+                    .map(SessionView::from)
+                    .collect(),
+                create: OperationSnapshot::from_parts(
+                    state.sessions.create.status,
+                    state.sessions.create.error.clone(),
+                ),
+                list: OperationSnapshot::from_parts(
+                    state.sessions.list.status,
+                    state.sessions.list.error.clone(),
+                ),
+                watch: OperationSnapshot::from_parts(
+                    state.sessions.watch.status,
+                    state.sessions.watch.error.clone(),
                 ),
             },
         }

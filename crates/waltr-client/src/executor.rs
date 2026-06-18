@@ -6,10 +6,12 @@ use std::pin::Pin;
 use futures_core::Stream;
 use futures_util::StreamExt;
 
-use crate::transport::{ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, StatusWatchStream};
+use crate::transport::{
+    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, SessionWatchStream, StatusWatchStream,
+};
 use crate::{
     ClientEffect, ClientError, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch, ConfigView,
-    StatusEffect, StatusEvent,
+    SessionEffect, SessionEvent, SessionSummary, StatusEffect, StatusEvent,
 };
 
 /// Stream of configuration changes observed through the gRPC executor.
@@ -20,6 +22,12 @@ pub type ConfigWatchUpdateStream =
 
 /// Stream of system readiness changes observed through the gRPC executor.
 pub type StatusChangeStream = StatusWatchStream;
+
+/// Stream of session changes observed through the gRPC executor.
+pub type SessionChangeStream = SessionWatchStream;
+
+/// Stream of session watch updates observed through the gRPC executor.
+pub type SessionWatchUpdateStream = SessionWatchStream;
 
 /// Stable shell-facing configuration watch change.
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +117,39 @@ impl GrpcEffectExecutor {
         self.transport.watch_status().await
     }
 
+    /// Create a new server-side session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport cannot create the session.
+    pub async fn create_session(&self) -> Result<SessionSummary, ClientError> {
+        self.transport.create_session().await
+    }
+
+    /// List current server-side sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport cannot list sessions.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ClientError> {
+        self.transport.list_sessions().await
+    }
+
+    /// Subscribe to session changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport cannot open the session watch stream.
+    pub async fn watch_sessions(&self) -> Result<SessionChangeStream, ClientError> {
+        self.transport.watch_sessions().await
+    }
+
+    pub(crate) async fn watch_session_updates(
+        &self,
+    ) -> Result<SessionWatchUpdateStream, ClientError> {
+        self.transport.watch_sessions().await
+    }
+
     /// Execute one client side-effect intent and return client events for the reducer.
     pub async fn execute_effect<Sleep, SleepFuture>(
         &self,
@@ -143,6 +184,24 @@ impl GrpcEffectExecutor {
                     Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailed(error))],
                 }
             }
+            ClientEffect::Session(SessionEffect::Create) => {
+                match self.transport.create_session().await {
+                    Ok(session) => vec![ClientEvent::Session(SessionEvent::Created(session))],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::CreateFailed(error))],
+                }
+            }
+            ClientEffect::Session(SessionEffect::List) => {
+                match self.transport.list_sessions().await {
+                    Ok(sessions) => vec![ClientEvent::Session(SessionEvent::Listed(sessions))],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::ListFailed(error))],
+                }
+            }
+            ClientEffect::Session(SessionEffect::Watch) => {
+                match self.transport.watch_sessions().await {
+                    Ok(_) => vec![ClientEvent::Session(SessionEvent::WatchStarted)],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
+                }
+            }
             ClientEffect::Config(ConfigEffect::SleepReconnect { delay_ms }) => {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Config(ConfigEvent::ReconnectReady)]
@@ -150,6 +209,10 @@ impl GrpcEffectExecutor {
             ClientEffect::Status(StatusEffect::SleepReconnect { delay_ms }) => {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Status(StatusEvent::ReconnectReady)]
+            }
+            ClientEffect::Session(SessionEffect::SleepReconnect { delay_ms }) => {
+                sleep(delay_ms).await;
+                vec![ClientEvent::Session(SessionEvent::ReconnectReady)]
             }
         }
     }

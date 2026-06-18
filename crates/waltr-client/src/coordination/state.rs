@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{Configuration, StreamId, SystemStatus};
+use crate::{Configuration, SessionSummary, StreamId, SystemStatus};
 
 /// Return the capped watch reconnect delay for a retry attempt.
 #[must_use]
@@ -19,6 +19,8 @@ pub struct ClientState {
     pub config: ConfigClientState,
     /// System status coordination state.
     pub status: StatusClientState,
+    /// Session coordination state.
+    pub sessions: SessionClientState,
     /// Stream coordination state.
     pub streams: StreamClientState,
 }
@@ -43,6 +45,20 @@ pub struct StatusClientState {
     pub current: Option<SystemStatus>,
     /// Status watch operation state.
     pub watch: WatchState,
+}
+
+/// Session coordination state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionClientState {
+    /// Last known sessions by id.
+    pub current: BTreeMap<String, SessionSummary>,
+    /// Session create operation state.
+    pub create: OperationState,
+    /// Session list operation state.
+    pub list: OperationState,
+    /// Session watch operation state.
+    pub watch: WatchState,
+    pub(crate) last_sequence: u64,
 }
 
 /// Stream coordination state.
@@ -199,6 +215,93 @@ impl ClientState {
         let delay = watch_reconnect_delay_ms(self.status.watch.retry_attempt);
         self.status.watch.retry_attempt = self.status.watch.retry_attempt.saturating_add(1);
         delay
+    }
+
+    pub(crate) fn set_session_create_loading(&mut self) {
+        self.sessions.create.status = OperationStatus::Loading;
+        self.sessions.create.error = None;
+    }
+
+    pub(crate) fn set_session_create_ready(&mut self, session: SessionSummary) {
+        self.upsert_session(session);
+        self.sessions.create.status = OperationStatus::Ready;
+        self.sessions.create.error = None;
+    }
+
+    pub(crate) fn set_session_create_failed(&mut self, message: String) {
+        self.sessions.create.status = OperationStatus::Failed;
+        self.sessions.create.error = Some(message);
+    }
+
+    pub(crate) fn set_session_list_loading(&mut self) {
+        self.sessions.list.status = OperationStatus::Loading;
+        self.sessions.list.error = None;
+    }
+
+    pub(crate) fn set_session_list_ready(&mut self, sessions: Vec<SessionSummary>) {
+        self.sessions.current = sessions
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect();
+        self.sessions.list.status = OperationStatus::Ready;
+        self.sessions.list.error = None;
+    }
+
+    pub(crate) fn set_session_list_failed(&mut self, message: String) {
+        self.sessions.list.status = OperationStatus::Failed;
+        self.sessions.list.error = Some(message);
+    }
+
+    pub(crate) fn set_session_watch_loading(&mut self) {
+        self.sessions.watch.status = OperationStatus::Loading;
+        self.sessions.watch.error = None;
+    }
+
+    pub(crate) fn set_session_watch_opened(&mut self) {
+        self.sessions.watch.status = OperationStatus::Opened;
+        self.sessions.watch.error = None;
+    }
+
+    pub(crate) const fn add_session_watch_interest(&mut self) -> usize {
+        self.sessions.watch.interests = self.sessions.watch.interests.saturating_add(1);
+        self.sessions.watch.interests
+    }
+
+    pub(crate) fn remove_session_watch_interest(&mut self) -> usize {
+        self.sessions.watch.interests = self.sessions.watch.interests.saturating_sub(1);
+
+        if self.sessions.watch.interests == 0 {
+            self.sessions.watch.status = OperationStatus::Idle;
+            self.sessions.watch.error = None;
+            self.sessions.watch.retry_attempt = 0;
+        }
+
+        self.sessions.watch.interests
+    }
+
+    pub(crate) const fn set_session_watch_waiting(&mut self) {
+        self.sessions.watch.status = OperationStatus::Waiting;
+    }
+
+    pub(crate) fn set_session_watch_changed(&mut self, sequence: u64, session: SessionSummary) {
+        self.sessions.last_sequence = sequence;
+        self.upsert_session(session);
+        self.sessions.watch.status = OperationStatus::Received;
+        self.sessions.watch.error = None;
+        self.sessions.watch.retry_attempt = 0;
+    }
+
+    pub(crate) fn set_session_watch_failed(&mut self, message: String) -> u64 {
+        self.sessions.watch.status = OperationStatus::Failed;
+        self.sessions.watch.error = Some(message);
+
+        let delay = watch_reconnect_delay_ms(self.sessions.watch.retry_attempt);
+        self.sessions.watch.retry_attempt = self.sessions.watch.retry_attempt.saturating_add(1);
+        delay
+    }
+
+    fn upsert_session(&mut self, session: SessionSummary) {
+        self.sessions.current.insert(session.id.clone(), session);
     }
 
     pub(crate) fn stream_mut(&mut self, stream_id: StreamId) -> &mut StreamState {

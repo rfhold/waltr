@@ -2817,6 +2817,7 @@ dependencies = [
  "futures-util",
  "waltr",
  "waltr-server",
+ "prost-types",
  "serde",
  "serde_json",
  "tokio",
