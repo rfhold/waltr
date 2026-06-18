@@ -128,6 +128,58 @@ providers: { [key in string]?: ProviderView },
  */
 mcpServers: { [key in string]?: McpServerView }, };
 
+export type TimestampView = { 
+/**
+ * Seconds since the Unix epoch.
+ */
+seconds: bigint, 
+/**
+ * Nanoseconds within the second.
+ */
+nanos: number, };
+
+export type SessionPhaseView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "evaluatingToolCall" | "runningTool" | "suspended" | "finished" | "failed" | "unknown";
+
+export type SessionStatusView = { 
+/**
+ * Session phase as a shell-friendly enum.
+ */
+phase: SessionPhaseView, 
+/**
+ * Failure message, when phase is failed.
+ */
+failedMessage: string, };
+
+export type SessionView = { 
+/**
+ * Server-assigned session id.
+ */
+id: string, 
+/**
+ * Session revision.
+ */
+revision: bigint, 
+/**
+ * Current session status.
+ */
+status: SessionStatusView, 
+/**
+ * Current prompt, when the session has one.
+ */
+currentPrompt: string | null, 
+/**
+ * Creation timestamp, when supplied by the server.
+ */
+createdAt: TimestampView | null, 
+/**
+ * Last update timestamp, when supplied by the server.
+ */
+updatedAt: TimestampView | null, 
+/**
+ * Last activity timestamp, when supplied by the server.
+ */
+lastActivityAt: TimestampView | null, };
+
 export type OperationSnapshot = { 
 /**
  * Stable operation status name.
@@ -166,6 +218,24 @@ ready: boolean,
  */
 watch: OperationSnapshot, };
 
+export type SessionSnapshot = { 
+/**
+ * Last known sessions.
+ */
+current: Array<SessionView>, 
+/**
+ * Session create operation snapshot.
+ */
+create: OperationSnapshot, 
+/**
+ * Session list operation snapshot.
+ */
+list: OperationSnapshot, 
+/**
+ * Session watch operation snapshot.
+ */
+watch: OperationSnapshot, };
+
 export type ClientSnapshot = { 
 /**
  * Configuration coordination snapshot.
@@ -174,7 +244,11 @@ config: ConfigSnapshot,
 /**
  * System status coordination snapshot.
  */
-status: StatusSnapshot, };
+status: StatusSnapshot, 
+/**
+ * Session coordination snapshot.
+ */
+sessions: SessionSnapshot, };
 
 export type ClientCommand = { "type": "requestConfig" } | { "type": "addProvider", 
 /**
@@ -208,4 +282,4 @@ server: McpServerView, } | { "type": "deleteMcpServer",
 /**
  * MCP server key to delete.
  */
-name: string, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };
+name: string, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };

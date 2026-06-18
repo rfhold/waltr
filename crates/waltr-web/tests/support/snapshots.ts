@@ -5,6 +5,7 @@ import type {
   ModelView,
   OperationSnapshot,
   ProviderView,
+  SessionSnapshot,
 } from "../../src/generated/waltr-client";
 
 export function snapshotWithConfig(
@@ -22,6 +23,16 @@ export function snapshotWithConfig(
       ready: options.ready ?? true,
       watch: operationSnapshot("ready"),
     },
+    sessions: emptySessionSnapshot(),
+  };
+}
+
+export function emptySessionSnapshot(): SessionSnapshot {
+  return {
+    current: [],
+    create: operationSnapshot("idle"),
+    list: operationSnapshot("idle"),
+    watch: operationSnapshot("idle"),
   };
 }
 

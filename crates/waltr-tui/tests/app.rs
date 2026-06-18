@@ -8,7 +8,7 @@ use std::{
 use waltr_client::{
     ClientCommand, ClientSnapshot, ConfigSnapshot, ConfigView, McpServerTypeView, McpServerView,
     ModelCapabilitiesView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
-    OperationSnapshot, ProviderKindView, ProviderView, StatusSnapshot,
+    OperationSnapshot, ProviderKindView, ProviderView, SessionSnapshot, StatusSnapshot,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -1190,6 +1190,21 @@ const fn ready_snapshot() -> ClientSnapshot {
             ready: true,
             watch: OperationSnapshot {
                 status: "ready",
+                error: None,
+            },
+        },
+        sessions: SessionSnapshot {
+            current: Vec::new(),
+            create: OperationSnapshot {
+                status: "idle",
+                error: None,
+            },
+            list: OperationSnapshot {
+                status: "idle",
+                error: None,
+            },
+            watch: OperationSnapshot {
+                status: "idle",
                 error: None,
             },
         },

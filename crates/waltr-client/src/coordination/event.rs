@@ -1,7 +1,7 @@
 //! Shell-neutral client events and side-effect intents.
 
-use crate::transport::ConfigWatchUpdate;
-use crate::{ClientError, Configuration, Provider, SystemStatus};
+use crate::transport::{ConfigWatchUpdate, SessionWatchUpdate};
+use crate::{ClientError, Configuration, Provider, SessionSummary, SystemStatus};
 
 /// Runtime-local identifier for a streamed response.
 pub type StreamId = u64;
@@ -13,6 +13,8 @@ pub enum ClientEvent {
     Config(ConfigEvent),
     /// Status coordination event.
     Status(StatusEvent),
+    /// Session coordination event.
+    Session(SessionEvent),
     /// A model or tool stream coordination event.
     Stream(StreamEvent),
 }
@@ -65,6 +67,37 @@ pub enum StatusEvent {
     ReconnectReady,
 }
 
+/// Session coordination event applied to the reducer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionEvent {
+    /// A caller requested a new session.
+    CreateRequested,
+    /// A session was created successfully.
+    Created(SessionSummary),
+    /// Session creation failed.
+    CreateFailed(ClientError),
+    /// A caller requested the current session list.
+    ListRequested,
+    /// The current session list loaded successfully.
+    Listed(Vec<SessionSummary>),
+    /// The current session list failed to load.
+    ListFailed(ClientError),
+    /// A caller registered interest in session watch updates.
+    WatchInterestRegistered,
+    /// A caller released interest in session watch updates.
+    WatchInterestReleased,
+    /// The session watch stream opened.
+    WatchStarted,
+    /// The session watch stream produced an update.
+    WatchChanged(SessionWatchUpdate),
+    /// The session watch stream failed.
+    WatchFailed(ClientError),
+    /// The session watch stream ended.
+    WatchEnded,
+    /// The session watch retry delay elapsed.
+    ReconnectReady,
+}
+
 /// Side-effect intent emitted by the client for shells or runtimes to execute.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClientEffect {
@@ -72,6 +105,8 @@ pub enum ClientEffect {
     Config(ConfigEffect),
     /// Status side-effect intent.
     Status(StatusEffect),
+    /// Session side-effect intent.
+    Session(SessionEffect),
 }
 
 /// Sparse top-level configuration patch emitted by the client.
@@ -110,6 +145,22 @@ pub enum StatusEffect {
     /// Open or continue the status watch stream.
     Watch,
     /// Sleep before attempting a status watch reconnect.
+    SleepReconnect {
+        /// Delay duration in milliseconds.
+        delay_ms: u64,
+    },
+}
+
+/// Session side-effect intent emitted by the client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEffect {
+    /// Create a server-side session.
+    Create,
+    /// Load the current server-side session list.
+    List,
+    /// Open or continue the session watch stream.
+    Watch,
+    /// Sleep before attempting a session watch reconnect.
     SleepReconnect {
         /// Delay duration in milliseconds.
         delay_ms: u64,

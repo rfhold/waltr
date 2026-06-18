@@ -1,9 +1,9 @@
 //! Shell-neutral client reducer.
 
-use crate::coordination::{config, status, stream};
+use crate::coordination::{config, session, status, stream};
 use crate::{
     ClientEffect, ClientError, ClientEvent, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
-    Configuration, McpServer, Provider, ProviderEditBaseline, StatusEvent,
+    Configuration, McpServer, Provider, ProviderEditBaseline, SessionEvent, StatusEvent,
 };
 
 /// Single headless client reducer used by shells.
@@ -30,6 +30,7 @@ impl Client {
         match event {
             ClientEvent::Config(event) => config::reduce(&mut self.state, event),
             ClientEvent::Status(event) => status::reduce(&mut self.state, event),
+            ClientEvent::Session(event) => session::reduce(&mut self.state, event),
             ClientEvent::Stream(event) => {
                 stream::reduce(&mut self.state, event);
                 ClientUpdate::default()
@@ -54,6 +55,28 @@ impl Client {
         self.apply(ClientEvent::Config(ConfigEvent::WatchInterestReleased))
     }
 
+    /// Request that a new server-side session be created.
+    pub fn create_session(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Session(SessionEvent::CreateRequested))
+    }
+
+    /// Request that the current server-side sessions be loaded.
+    pub fn request_sessions(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Session(SessionEvent::ListRequested))
+    }
+
+    /// Request that session changes be watched.
+    #[must_use]
+    pub fn register_session_watch_interest(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Session(SessionEvent::WatchInterestRegistered))
+    }
+
+    /// Release interest in session changes.
+    #[must_use]
+    pub fn release_session_watch_interest(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Session(SessionEvent::WatchInterestReleased))
+    }
+
     /// Request that system status changes be watched.
     pub fn request_status_watch(&mut self) -> ClientUpdate {
         self.apply(ClientEvent::Status(StatusEvent::WatchRequested))
@@ -68,6 +91,13 @@ impl Client {
 
         if self.state.config.watch.interests > 0 {
             let update = config::maintain_watch(&mut self.state);
+            if !update.is_empty() {
+                return update;
+            }
+        }
+
+        if self.state.sessions.watch.interests > 0 {
+            let update = session::maintain_watch(&mut self.state);
             if !update.is_empty() {
                 return update;
             }
@@ -418,6 +448,10 @@ impl ClientUpdate {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.effects.is_empty()
+    }
+
+    pub(crate) fn extend(&mut self, update: Self) {
+        self.effects.extend(update.effects);
     }
 }
 
