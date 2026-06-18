@@ -7,6 +7,7 @@ import "google/protobuf/timestamp.proto";
 service SessionService {
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
   rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
 }
 
@@ -22,11 +23,20 @@ message ListSessionsResponse {
   repeated SessionSummary sessions = 1;
 }
 
+message DeleteSessionRequest {
+  string id = 1;
+}
+
+message DeleteSessionResponse {}
+
 message WatchSessionsRequest {}
 
 message WatchSessionsResponse {
   uint64 sequence = 1;
-  SessionSummary session = 2;
+  oneof event {
+    SessionSummary session = 2;
+    string deleted_id = 3;
+  }
 }
 
 message SessionSummary {
