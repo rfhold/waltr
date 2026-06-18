@@ -44,6 +44,17 @@ async fn session_watch_interest_lists_and_receives_created_sessions() {
         watched.sessions.current[0].status.phase,
         SessionPhaseView::Idle
     );
+    let id = watched.sessions.current[0].id.clone();
+
+    dispatch_stream_command(&mut stream, ClientCommand::DeleteSession { id })
+        .await
+        .expect("session delete should succeed");
+
+    let watched = next_snapshot_until(&mut stream, |snapshot| {
+        snapshot.sessions.watch.status == "received" && snapshot.sessions.current.is_empty()
+    })
+    .await;
+    assert_eq!(watched.sessions.watch.error, None);
 
     let released = dispatch_stream_command(&mut stream, ClientCommand::ReleaseSessionWatchInterest)
         .await

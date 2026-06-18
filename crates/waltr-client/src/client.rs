@@ -64,6 +64,15 @@ impl Client {
         )))
     }
 
+    /// Request that a server-side session be deleted.
+    pub fn delete_session(&mut self, id: impl Into<String>) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(SessionEvent::DeleteRequested {
+            operation_key,
+            id: id.into(),
+        }))
+    }
+
     /// Request that the current server-side sessions be loaded.
     pub fn request_sessions(&mut self) -> ClientUpdate {
         self.apply(ClientEvent::Session(SessionEvent::ListRequested))
@@ -477,7 +486,8 @@ mod tests {
     use super::*;
 
     use crate::{
-        ConfigWatchUpdate, OperationStatus, StatusEffect, StreamEvent, StreamStatus, SystemStatus,
+        ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary, SessionWatchEvent,
+        SessionWatchUpdate, StatusEffect, StreamEvent, StreamStatus, SystemStatus,
         watch_reconnect_delay_ms,
     };
 
@@ -763,6 +773,32 @@ mod tests {
 
         assert!(update.is_empty());
         assert_eq!(client.state().config.watch.status, OperationStatus::Idle);
+    }
+
+    #[test]
+    fn session_watch_deletes_current_session_and_refetches_on_gap() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+
+        let update = client.apply(ClientEvent::Session(SessionEvent::WatchChanged(
+            SessionWatchUpdate {
+                sequence: 2,
+                event: SessionWatchEvent::Deleted("one".to_owned()),
+            },
+        )));
+
+        assert!(!client.state().sessions.current.contains_key("one"));
+        assert_eq!(client.state().sessions.last_sequence, 2);
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Received
+        );
+        assert_eq!(
+            update.effects(),
+            &[ClientEffect::Session(SessionEffect::List)]
+        );
     }
 
     #[test]
@@ -1101,6 +1137,13 @@ mod tests {
         Provider {
             name: name.to_owned(),
             ..Provider::default()
+        }
+    }
+
+    fn session(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.to_owned(),
+            ..SessionSummary::default()
         }
     }
 

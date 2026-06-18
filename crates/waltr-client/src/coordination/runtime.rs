@@ -69,6 +69,11 @@ pub enum ClientCommand {
     ReleaseConfigWatchInterest,
     /// Create a new server-side session.
     CreateSession,
+    /// Delete a server-side session by id.
+    DeleteSession {
+        /// Session id to delete.
+        id: String,
+    },
     /// Register current interest in session watch updates.
     RegisterSessionWatchInterest,
     /// Release current interest in session watch updates.
@@ -123,6 +128,15 @@ pub enum ClientOperationView {
         /// Created session, when the operation completed successfully.
         session: Option<SessionView>,
     },
+    /// Session deletion command result.
+    SessionDelete {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Deleted session id.
+        id: String,
+    },
 }
 
 /// Stable snapshot of configuration coordination state.
@@ -159,6 +173,8 @@ pub struct SessionSnapshot {
     pub create: OperationSnapshot,
     /// Session list operation snapshot.
     pub list: OperationSnapshot,
+    /// Session delete operation snapshot.
+    pub delete: OperationSnapshot,
     /// Session watch operation snapshot.
     pub watch: OperationSnapshot,
 }
@@ -645,6 +661,7 @@ impl ClientStateStream {
                 update
             }
             ClientCommand::CreateSession => self.runtime.reducer.create_session(),
+            ClientCommand::DeleteSession { id } => self.runtime.reducer.delete_session(id),
             ClientCommand::RegisterSessionWatchInterest => {
                 self.runtime.reducer.register_session_watch_interest()
             }
@@ -733,6 +750,7 @@ impl ClientSnapshot {
                     .collect(),
                 create: OperationSnapshot::from_state(&state.sessions.create),
                 list: OperationSnapshot::from_state(&state.sessions.list),
+                delete: OperationSnapshot::from_state(&state.sessions.delete),
                 watch: OperationSnapshot::from_parts(
                     state.sessions.watch.status,
                     state.sessions.watch.error.clone(),
@@ -762,6 +780,11 @@ impl From<ClientOperationState> for ClientOperationView {
                 status: operation_status_name(status),
                 error,
                 session: session.map(SessionView::from),
+            },
+            ClientOperationState::SessionDelete { status, error, id } => Self::SessionDelete {
+                status: operation_status_name(status),
+                error,
+                id,
             },
         }
     }

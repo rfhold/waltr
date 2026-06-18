@@ -135,6 +135,15 @@ impl GrpcEffectExecutor {
         self.transport.list_sessions().await
     }
 
+    /// Delete a server-side session by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport cannot delete the session.
+    pub async fn delete_session(&self, id: impl Into<String>) -> Result<(), ClientError> {
+        self.transport.delete_session(id.into()).await
+    }
+
     /// Subscribe to session changes.
     ///
     /// # Errors
@@ -199,6 +208,19 @@ impl GrpcEffectExecutor {
                     })],
                     Err(error) => vec![ClientEvent::Session(SessionEvent::CreateFailed {
                         operation_key,
+                        error,
+                    })],
+                }
+            }
+            ClientEffect::Session(SessionEffect::Delete { operation_key, id }) => {
+                match self.transport.delete_session(id.clone()).await {
+                    Ok(()) => vec![ClientEvent::Session(SessionEvent::Deleted {
+                        operation_key,
+                        id,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::DeleteFailed {
+                        operation_key,
+                        id,
                         error,
                     })],
                 }

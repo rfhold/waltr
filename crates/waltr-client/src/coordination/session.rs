@@ -1,6 +1,6 @@
 //! Session reducer responsibilities.
 
-use crate::transport::SessionWatchUpdate;
+use crate::transport::{SessionWatchEvent, SessionWatchUpdate};
 use crate::{
     ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect, SessionEvent,
     StatusEffect,
@@ -26,6 +26,25 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             error,
         } => {
             state.set_session_create_failed(operation_key, error.to_string());
+            ClientUpdate::default()
+        }
+        SessionEvent::DeleteRequested { operation_key, id } => {
+            state.set_session_delete_loading(operation_key.clone(), id.clone());
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Delete {
+                operation_key,
+                id,
+            }))
+        }
+        SessionEvent::Deleted { operation_key, id } => {
+            state.set_session_delete_ready(operation_key, id);
+            ClientUpdate::default()
+        }
+        SessionEvent::DeleteFailed {
+            operation_key,
+            id,
+            error,
+        } => {
+            state.set_session_delete_failed(operation_key, id, error.to_string());
             ClientUpdate::default()
         }
         SessionEvent::ListRequested => {
@@ -85,12 +104,21 @@ pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
 
 fn apply_watch_update(state: &mut ClientState, update: SessionWatchUpdate) -> ClientUpdate {
     if update.sequence != state.sessions.last_sequence.saturating_add(1) {
-        state.set_session_watch_changed(update.sequence, update.session);
+        apply_watch_event(state, update);
         return ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::List));
     }
 
-    state.set_session_watch_changed(update.sequence, update.session);
+    apply_watch_event(state, update);
     ClientUpdate::default()
+}
+
+fn apply_watch_event(state: &mut ClientState, update: SessionWatchUpdate) {
+    match update.event {
+        SessionWatchEvent::Upsert(session) => {
+            state.set_session_watch_changed(update.sequence, session)
+        }
+        SessionWatchEvent::Deleted(id) => state.set_session_watch_deleted(update.sequence, &id),
+    }
 }
 
 fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {

@@ -40,7 +40,7 @@ pub use waltr::grpc::waltr::session::v1::{
     SessionStatus, SessionSummary, Suspension, SuspensionKind,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
-pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchUpdate};
+pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchEvent, SessionWatchUpdate};
 pub use view::{
     ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView,
     ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView, SessionPhaseView,
