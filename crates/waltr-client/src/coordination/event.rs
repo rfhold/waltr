@@ -96,6 +96,29 @@ pub enum SessionEvent {
         /// Failure returned by the create effect.
         error: ClientError,
     },
+    /// A caller requested session deletion.
+    DeleteRequested {
+        /// Operation key allocated when session deletion was requested.
+        operation_key: OperationKey,
+        /// Session id to delete.
+        id: String,
+    },
+    /// Session deletion completed successfully.
+    Deleted {
+        /// Operation key allocated when session deletion was requested.
+        operation_key: OperationKey,
+        /// Deleted session id.
+        id: String,
+    },
+    /// Session deletion failed.
+    DeleteFailed {
+        /// Operation key allocated when session deletion was requested.
+        operation_key: OperationKey,
+        /// Session id that failed to delete.
+        id: String,
+        /// Failure returned by the delete effect.
+        error: ClientError,
+    },
     /// A caller requested the current session list.
     ListRequested,
     /// The current session list loaded successfully.
@@ -180,6 +203,13 @@ pub enum SessionEffect {
     Create {
         /// Operation key allocated when session creation was requested.
         operation_key: OperationKey,
+    },
+    /// Delete a server-side session.
+    Delete {
+        /// Operation key allocated when session deletion was requested.
+        operation_key: OperationKey,
+        /// Session id to delete.
+        id: String,
     },
     /// Load the current server-side session list.
     List,

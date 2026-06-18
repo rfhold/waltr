@@ -62,6 +62,8 @@ pub struct SessionClientState {
     pub create: OperationState,
     /// Session list operation state.
     pub list: OperationState,
+    /// Session delete operation state.
+    pub delete: OperationState,
     /// Session watch operation state.
     pub watch: WatchState,
     pub(crate) last_sequence: u64,
@@ -105,6 +107,15 @@ pub enum ClientOperationState {
         error: Option<String>,
         /// Created session, when the operation completed successfully.
         session: Option<SessionSummary>,
+    },
+    /// Session deletion command result.
+    SessionDelete {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Deleted session id.
+        id: String,
     },
 }
 
@@ -324,6 +335,54 @@ impl ClientState {
         );
     }
 
+    pub(crate) fn set_session_delete_loading(&mut self, key: OperationKey, id: String) {
+        self.sessions.delete.status = OperationStatus::Loading;
+        self.sessions.delete.error = None;
+        self.sessions.delete.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionDelete {
+                status: OperationStatus::Loading,
+                error: None,
+                id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_delete_ready(&mut self, key: OperationKey, id: String) {
+        self.remove_session(&id);
+        self.sessions.delete.status = OperationStatus::Ready;
+        self.sessions.delete.error = None;
+        self.sessions.delete.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionDelete {
+                status: OperationStatus::Ready,
+                error: None,
+                id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_delete_failed(
+        &mut self,
+        key: OperationKey,
+        id: String,
+        message: String,
+    ) {
+        self.sessions.delete.status = OperationStatus::Failed;
+        self.sessions.delete.error = Some(message.clone());
+        self.sessions.delete.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionDelete {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                id,
+            },
+        );
+    }
+
     pub(crate) fn set_session_list_loading(&mut self) {
         self.sessions.list.status = OperationStatus::Loading;
         self.sessions.list.error = None;
@@ -382,6 +441,14 @@ impl ClientState {
         self.sessions.watch.retry_attempt = 0;
     }
 
+    pub(crate) fn set_session_watch_deleted(&mut self, sequence: u64, id: &str) {
+        self.sessions.last_sequence = sequence;
+        self.remove_session(id);
+        self.sessions.watch.status = OperationStatus::Received;
+        self.sessions.watch.error = None;
+        self.sessions.watch.retry_attempt = 0;
+    }
+
     pub(crate) fn set_session_watch_failed(&mut self, message: String) -> u64 {
         self.sessions.watch.status = OperationStatus::Failed;
         self.sessions.watch.error = Some(message);
@@ -393,6 +460,10 @@ impl ClientState {
 
     fn upsert_session(&mut self, session: SessionSummary) {
         self.sessions.current.insert(session.id.clone(), session);
+    }
+
+    fn remove_session(&mut self, id: &str) {
+        self.sessions.current.remove(id);
     }
 
     pub(crate) fn stream_mut(&mut self, stream_id: StreamId) -> &mut StreamState {

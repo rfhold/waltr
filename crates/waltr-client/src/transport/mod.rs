@@ -8,7 +8,7 @@ pub use config::{ConfigWatchStream, ConfigWatchUpdate};
 use waltr::grpc::waltr::config::v1::config_service_client::ConfigServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
-pub use session::{SessionWatchStream, SessionWatchUpdate};
+pub use session::{SessionWatchEvent, SessionWatchStream, SessionWatchUpdate};
 pub use status::StatusWatchStream;
 use tonic::Code;
 use tonic::codegen::{Body, Bytes, StdError};
@@ -47,6 +47,9 @@ pub trait WaltrTransport {
 
     /// List current server-side sessions.
     fn list_sessions(&self) -> impl Future<Output = Result<Vec<SessionSummary>, ClientError>>;
+
+    /// Delete a server-side session by id.
+    fn delete_session(&self, id: String) -> impl Future<Output = Result<(), ClientError>>;
 
     /// Subscribe to future session changes.
     fn watch_sessions(&self) -> impl Future<Output = Result<SessionWatchStream, ClientError>>;
@@ -106,6 +109,10 @@ where
 
     async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ClientError> {
         session::list_sessions(self).await
+    }
+
+    async fn delete_session(&self, id: String) -> Result<(), ClientError> {
+        session::delete_session(self, id).await
     }
 
     async fn watch_sessions(&self) -> Result<SessionWatchStream, ClientError> {
