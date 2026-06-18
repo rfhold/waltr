@@ -4,11 +4,11 @@ use std::{pin::Pin, sync::Arc};
 
 use super::{convert::session_summary_to_proto, error::agent_error_to_status};
 use waltr::grpc::waltr::session::v1::{
-    CreateSessionRequest, CreateSessionResponse, ListSessionsRequest, ListSessionsResponse,
-    WatchSessionsRequest, WatchSessionsResponse,
-    session_service_server::SessionService as GeneratedSessionService,
+    CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
+    ListSessionsRequest, ListSessionsResponse, WatchSessionsRequest, WatchSessionsResponse,
+    session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
 };
-use waltr_agent::{AgentSessions, SessionStore};
+use waltr_agent::{AgentSessions, SessionId, SessionListEvent, SessionStore};
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
 
@@ -79,15 +79,43 @@ where
         Ok(Response::new(ListSessionsResponse { sessions }))
     }
 
+    async fn delete_session(
+        &self,
+        request: Request<DeleteSessionRequest>,
+    ) -> Result<Response<DeleteSessionResponse>, Status> {
+        let id = request.into_inner().id;
+        if id.trim().is_empty() {
+            return Err(Status::invalid_argument("session id must not be empty"));
+        }
+
+        tracing::info!(session_id = %id, "delete session requested");
+        let id = SessionId::new(id);
+        self.sessions
+            .delete(&id)
+            .await
+            .map_err(agent_error_to_status)?;
+
+        Ok(Response::new(DeleteSessionResponse {}))
+    }
+
     async fn watch_sessions(
         &self,
         _request: Request<WatchSessionsRequest>,
     ) -> Result<Response<Self::WatchSessionsStream>, Status> {
         tracing::trace!("watch sessions requested");
         let stream = self.sessions.watch_sessions().map(|update| {
+            let event = match update.event {
+                SessionListEvent::Upsert(session) => {
+                    watch_sessions_response::Event::Session(session_summary_to_proto(session))
+                }
+                SessionListEvent::Deleted(id) => {
+                    watch_sessions_response::Event::DeletedId(id.as_str().to_owned())
+                }
+            };
+
             Ok(WatchSessionsResponse {
                 sequence: update.sequence,
-                session: Some(session_summary_to_proto(update.session)),
+                event: Some(event),
             })
         });
 
