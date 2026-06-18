@@ -69,6 +69,8 @@ The reducer is intentionally split from side effects:
 
 Operation state uses shared statuses: `Idle`, `Loading`, `Ready`, `Opened`, `Received`, `Waiting`, and `Failed`. UI clients should render from these statuses instead of deriving separate server-data state.
 
+Command operations that complete asynchronously also receive a runtime-local operation key. The immediate command snapshot records that key on the operation-specific snapshot, such as `snapshot.config.patch.key` or `snapshot.sessions.create.key`, and `snapshot.operations.current[key]` carries the keyed result. Shells that need command completion should keep their UI pending until the matching keyed result reaches `ready` or `failed`; they should not treat the immediate dispatch snapshot or the latest global operation status as completion for a specific command.
+
 ```mermaid
 flowchart TD
     Command[ClientCommand or watch event]
@@ -114,13 +116,14 @@ sequenceDiagram
 
     Shell->>Stream: dispatch ClientCommand
     Stream->>Runtime: reduce command
+    Stream-->>Shell: immediate ClientSnapshot with operation key
     Runtime->>Executor: execute emitted ClientEffect
     Executor->>Server: gRPC or gRPC-web request
     Server-->>Executor: response or stream item
     Executor-->>Runtime: ClientEvent
     Runtime->>Runtime: reduce event and update ClientState
-    Runtime-->>Stream: ClientSnapshot
-    Stream-->>Shell: render snapshot
+    Runtime-->>Stream: ClientSnapshot with keyed result
+    Stream-->>Shell: resolve pending UI by operation key
 ```
 
 ## Client Implementation Contract
@@ -131,6 +134,7 @@ Web and TUI implementations should follow these rules:
 - Keep form drafts, focus, route params, modal state, animation state, and terminal/browser rendering concerns local to the implementation.
 - Dispatch shared commands for server data mutations instead of constructing RPC requests in UI code.
 - Treat snapshots as the source of truth for loaded config, patch/load/watch status, status readiness, and operation errors.
+- For async command completion, capture the operation key from the immediate command snapshot and observe `snapshot.operations.current[key]` until it reaches `ready` or `failed`.
 - Register config watch interest while a UI surface needs live config updates, and release interest when that surface no longer needs them.
 - Preserve feature parity between web and TUI by changing shared reducer behavior in `waltr-client` when behavior is not platform-specific.
 

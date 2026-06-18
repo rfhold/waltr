@@ -201,6 +201,7 @@ flowchart TD
 Client implementations should react to config coordination through `waltr-client` snapshots and commands:
 
 - On ETag patch errors, keep the user's local draft visible if appropriate, show the patch error, and let the shared client receive a watch update or dispatch a config reload before retrying.
+- For config patch commands, keep save/delete UI pending until the keyed `ConfigPatch` result in `snapshot.operations.current` is `ready` or `failed`; the immediate dispatch snapshot only identifies the operation.
 - Do not blindly resubmit a stale patch with the same `expected_etag`.
 - After a stale-edit conflict, rebuild the patch from the latest `state.config.current` before retrying.
 - On watch updates, render from the updated `state.config.current`; do not maintain a second server config cache in web or TUI code.

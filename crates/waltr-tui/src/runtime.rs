@@ -157,14 +157,12 @@ fn spawn_client_events(
     mut commands: mpsc::Receiver<ClientCommand>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let mut client = ClientRuntime::for_endpoint(client_endpoint()).into_state_stream();
+        let mut client =
+            ClientRuntime::for_endpoint(client_endpoint()).into_state_stream(sleep_millis);
 
         loop {
             let event = match client
-                .next_or_dispatch(
-                    async { commands.recv().await.map(ClientCommandRequest::new) },
-                    sleep_millis,
-                )
+                .next_or_dispatch(async { commands.recv().await.map(ClientCommandRequest::new) })
                 .await
             {
                 ClientStateStreamEvent::Snapshot(snapshot) => Ok(AppEvent::Client(snapshot)),

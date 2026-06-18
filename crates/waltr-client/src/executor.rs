@@ -166,11 +166,18 @@ impl GrpcEffectExecutor {
                 Err(error) => vec![ClientEvent::Config(ConfigEvent::LoadFailed(error))],
             },
             ClientEffect::Config(ConfigEffect::Patch {
+                operation_key,
                 patch,
                 expected_etag,
             }) => match self.transport.patch_config(patch, expected_etag).await {
-                Ok(config) => vec![ClientEvent::Config(ConfigEvent::Patched(config))],
-                Err(error) => vec![ClientEvent::Config(ConfigEvent::PatchFailed(error))],
+                Ok(config) => vec![ClientEvent::Config(ConfigEvent::Patched {
+                    operation_key,
+                    config,
+                })],
+                Err(error) => vec![ClientEvent::Config(ConfigEvent::PatchFailed {
+                    operation_key,
+                    error,
+                })],
             },
             ClientEffect::Config(ConfigEffect::Watch) => {
                 match self.transport.watch_config().await {
@@ -184,10 +191,16 @@ impl GrpcEffectExecutor {
                     Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailed(error))],
                 }
             }
-            ClientEffect::Session(SessionEffect::Create) => {
+            ClientEffect::Session(SessionEffect::Create { operation_key }) => {
                 match self.transport.create_session().await {
-                    Ok(session) => vec![ClientEvent::Session(SessionEvent::Created(session))],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::CreateFailed(error))],
+                    Ok(session) => vec![ClientEvent::Session(SessionEvent::Created {
+                        operation_key,
+                        session,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::CreateFailed {
+                        operation_key,
+                        error,
+                    })],
                 }
             }
             ClientEffect::Session(SessionEffect::List) => {

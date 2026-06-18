@@ -7,13 +7,13 @@ use waltr_tui::app::{App, AppAction, AppScreen};
 use crate::support::{
     input::{char_press, ctrl_x_press},
     render::render_app,
-    server::drive_app_to_landing,
+    server::{drive_app_to_landing, no_sleep},
 };
 
 #[tokio::test]
 async fn opening_config_before_watch_data_renders_waiting_state() {
     let server = setup_server();
-    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream();
+    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
 
     drive_app_to_landing(&mut stream, &mut app).await;

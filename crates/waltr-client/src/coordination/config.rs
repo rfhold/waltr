@@ -20,16 +20,22 @@ pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
             state.set_config_load_failed(error.to_string());
             ClientUpdate::default()
         }
-        ConfigEvent::PatchRequested => {
-            state.set_config_patch_loading();
+        ConfigEvent::PatchRequested(operation_key) => {
+            state.set_config_patch_loading(operation_key);
             ClientUpdate::default()
         }
-        ConfigEvent::Patched(config) => {
-            state.set_config_patch_ready(config);
+        ConfigEvent::Patched {
+            operation_key,
+            config,
+        } => {
+            state.set_config_patch_ready(operation_key, config);
             ClientUpdate::default()
         }
-        ConfigEvent::PatchFailed(error) => {
-            state.set_config_patch_failed(error.to_string());
+        ConfigEvent::PatchFailed {
+            operation_key,
+            error,
+        } => {
+            state.set_config_patch_failed(operation_key, error.to_string());
             ClientUpdate::default()
         }
         ConfigEvent::WatchInterestRegistered => {

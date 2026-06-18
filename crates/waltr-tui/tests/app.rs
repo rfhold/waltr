@@ -6,9 +6,10 @@ use std::{
 };
 
 use waltr_client::{
-    ClientCommand, ClientSnapshot, ConfigSnapshot, ConfigView, McpServerTypeView, McpServerView,
-    ModelCapabilitiesView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
-    OperationSnapshot, ProviderKindView, ProviderView, SessionSnapshot, StatusSnapshot,
+    ClientCommand, ClientOperationView, ClientSnapshot, ConfigSnapshot, ConfigView,
+    McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView, ModelOptionsView,
+    ModelTypeView, ModelView, OperationCollectionSnapshot, OperationSnapshot, ProviderKindView,
+    ProviderView, SessionSnapshot, StatusSnapshot,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -449,7 +450,23 @@ fn config_mcp_edit_and_delete_dispatch_mcp_commands() {
     assert!(app.mcp_section().config_form().is_some());
     assert!(render_app(&app).contains("Saving..."));
     assert_eq!(
-        app.handle_event(&AppEvent::Client(Box::new(patched_mcp_snapshot())), now),
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot("op-1", "loading", None))),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert!(app.mcp_section().config_form().is_some());
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot_from(
+                patched_mcp_snapshot(),
+                "op-1",
+                "ready",
+                None,
+            ))),
+            now
+        ),
         AppAction::Continue
     );
     assert!(app.mcp_section().config_form().is_none());
@@ -465,6 +482,122 @@ fn config_mcp_edit_and_delete_dispatch_mcp_commands() {
     );
     assert_eq!(app.mcp_section().delete_server(), Some("files"));
     assert!(render_app(&app).contains("Deleting..."));
+}
+
+#[test]
+fn config_provider_patch_failure_uses_keyed_operation_result() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    let action = app.handle_event(&enter_press(), now);
+    assert!(matches!(
+        action,
+        AppAction::ClientCommand(ClientCommand::UpdateProvider { .. })
+    ));
+    assert!(render_app(&app).contains("Saving..."));
+
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot_from(
+                patched_mcp_snapshot(),
+                "op-2",
+                "ready",
+                None,
+            ))),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert!(app.provider_section().config_form().is_some());
+
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot_from(
+                patched_mcp_snapshot(),
+                "op-1",
+                "loading",
+                None,
+            ))),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot(
+                "op-1",
+                "failed",
+                Some("write failed"),
+            ))),
+            now
+        ),
+        AppAction::Continue
+    );
+
+    assert!(app.provider_section().config_form().is_some());
+    let rendered = render_app(&app);
+    assert!(rendered.contains("error: write failed"));
+    assert!(!rendered.contains("Saving..."));
+}
+
+#[test]
+fn config_mcp_patch_failure_uses_keyed_operation_result() {
+    let mut app = open_config_app_with_mcp();
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    let action = app.handle_event(&enter_press(), now);
+    assert!(matches!(
+        action,
+        AppAction::ClientCommand(ClientCommand::UpdateMcpServer { .. })
+    ));
+    assert!(render_app(&app).contains("Saving..."));
+
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot_from(
+                patched_mcp_snapshot(),
+                "op-2",
+                "ready",
+                None,
+            ))),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert!(app.mcp_section().config_form().is_some());
+
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot_from(
+                patched_mcp_snapshot(),
+                "op-1",
+                "loading",
+                None,
+            ))),
+            now
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot_from(
+                patched_mcp_snapshot(),
+                "op-1",
+                "failed",
+                Some("mcp write failed"),
+            ))),
+            now
+        ),
+        AppAction::Continue
+    );
+
+    assert!(app.mcp_section().config_form().is_some());
+    let rendered = render_app(&app);
+    assert!(rendered.contains("error: mcp write failed"));
+    assert!(!rendered.contains("Saving..."));
 }
 
 #[test]
@@ -1169,21 +1302,55 @@ fn open_config_app_with(snapshot: ClientSnapshot) -> App {
     app
 }
 
-const fn ready_snapshot() -> ClientSnapshot {
+fn config_patch_snapshot(key: &str, status: &'static str, error: Option<&str>) -> ClientSnapshot {
+    config_patch_snapshot_from(watched_config_snapshot(), key, status, error)
+}
+
+fn config_patch_snapshot_from(
+    mut snapshot: ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) -> ClientSnapshot {
+    snapshot.config.patch = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::ConfigPatch {
+            status,
+            error: error.map(str::to_owned),
+            config: (status == "ready")
+                .then(|| snapshot.config.current.clone())
+                .flatten(),
+        },
+    );
+    snapshot
+}
+
+fn ready_snapshot() -> ClientSnapshot {
     ClientSnapshot {
+        operations: OperationCollectionSnapshot {
+            current: BTreeMap::new(),
+        },
         config: ConfigSnapshot {
             current: None,
             load: OperationSnapshot {
                 status: "idle",
                 error: None,
+                key: None,
             },
             patch: OperationSnapshot {
                 status: "idle",
                 error: None,
+                key: None,
             },
             watch: OperationSnapshot {
                 status: "idle",
                 error: None,
+                key: None,
             },
         },
         status: StatusSnapshot {
@@ -1191,6 +1358,7 @@ const fn ready_snapshot() -> ClientSnapshot {
             watch: OperationSnapshot {
                 status: "ready",
                 error: None,
+                key: None,
             },
         },
         sessions: SessionSnapshot {
@@ -1198,14 +1366,17 @@ const fn ready_snapshot() -> ClientSnapshot {
             create: OperationSnapshot {
                 status: "idle",
                 error: None,
+                key: None,
             },
             list: OperationSnapshot {
                 status: "idle",
                 error: None,
+                key: None,
             },
             watch: OperationSnapshot {
                 status: "idle",
                 error: None,
+                key: None,
             },
         },
     }

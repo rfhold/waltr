@@ -1,15 +1,15 @@
-use waltr_client::{ClientCommand, ClientRuntime};
+use waltr_client::ClientRuntime;
 
-use crate::support::{server::server_endpoint, snapshots::no_sleep};
+use crate::support::{
+    server::server_endpoint,
+    snapshots::{next_snapshot_until, no_sleep},
+};
 
 #[tokio::test]
-async fn runtime_dispatches_readiness_command() {
-    let mut runtime = ClientRuntime::for_endpoint(server_endpoint());
+async fn shared_state_stream_reaches_readiness() {
+    let mut stream = ClientRuntime::for_endpoint(server_endpoint()).into_state_stream(no_sleep);
 
-    let ready = runtime
-        .dispatch(ClientCommand::WaitForSystemReady, no_sleep)
-        .await
-        .expect("system should become ready");
+    let ready = next_snapshot_until(&mut stream, |snapshot| snapshot.status.ready).await;
     assert!(ready.status.ready);
     assert_eq!(ready.status.watch.status, "received");
 }

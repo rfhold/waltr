@@ -7,8 +7,9 @@
 use std::collections::BTreeMap;
 
 use waltr_client::{
-    ClientCommand, ConfigView, ModelCapabilitiesView, ModelLimitsView, ModelOptionsView,
-    ModelTypeView, ModelView, ProviderKindView, ProviderView,
+    ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, ModelCapabilitiesView,
+    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationKey, ProviderKindView,
+    ProviderView,
 };
 use ratatui::{
     Frame,
@@ -414,6 +415,7 @@ pub struct ProviderSection {
     delete_provider: Option<String>,
     selected_provider: usize,
     pending_patch: bool,
+    pending_patch_key: Option<OperationKey>,
     patch_error: Option<String>,
 }
 
@@ -426,6 +428,7 @@ impl ProviderSection {
             delete_provider: None,
             selected_provider: 0,
             pending_patch: false,
+            pending_patch_key: None,
             patch_error: None,
         }
     }
@@ -459,21 +462,43 @@ impl ProviderSection {
     }
 
     /// Reconcile a submitted patch against the shared reducer operation state.
-    pub fn reconcile_patch(&mut self, status: &str, error: Option<&str>) {
+    pub fn reconcile_patch(&mut self, snapshot: &ClientSnapshot) {
         if !self.pending_patch {
             return;
         }
 
-        match status {
+        if self.pending_patch_key.is_none() {
+            if snapshot.config.patch.status != "loading" {
+                return;
+            }
+
+            self.pending_patch_key
+                .clone_from(&snapshot.config.patch.key);
+        }
+
+        let Some(key) = &self.pending_patch_key else {
+            return;
+        };
+
+        let Some(ClientOperationView::ConfigPatch { status, error, .. }) =
+            snapshot.operations.current.get(key)
+        else {
+            return;
+        };
+
+        match *status {
             "ready" => {
                 self.pending_patch = false;
+                self.pending_patch_key = None;
                 self.patch_error = None;
                 self.config_form = None;
                 self.delete_provider = None;
             }
             "failed" => {
                 self.pending_patch = false;
-                self.patch_error = Some(error.unwrap_or("config patch failed").to_owned());
+                self.pending_patch_key = None;
+                self.patch_error =
+                    Some(error.as_deref().unwrap_or("config patch failed").to_owned());
             }
             _ => {}
         }
@@ -648,6 +673,7 @@ impl ProviderSection {
         let original_name = form.original_name.clone();
         let provider = form.clone().provider();
         self.pending_patch = true;
+        self.pending_patch_key = None;
         self.patch_error = None;
         match mode {
             ProviderFormMode::Create => {
@@ -667,6 +693,7 @@ impl ProviderSection {
 
     fn delete_selected(&mut self, name: &str) -> SectionAction {
         self.pending_patch = true;
+        self.pending_patch_key = None;
         self.patch_error = None;
         SectionAction::ClientCommand(ClientCommand::DeleteProvider {
             name: name.to_owned(),

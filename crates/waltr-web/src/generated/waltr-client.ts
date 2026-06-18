@@ -180,6 +180,38 @@ updatedAt: TimestampView | null,
  */
 lastActivityAt: TimestampView | null, };
 
+export type ClientOperationView = { "kind": "configPatch", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Patched configuration, when the operation completed successfully.
+ */
+config: ConfigView | null, } | { "kind": "sessionCreate", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Created session, when the operation completed successfully.
+ */
+session: SessionView | null, };
+
+export type OperationCollectionSnapshot = { 
+/**
+ * Operation results by runtime-local operation key.
+ */
+current: { [key in string]?: ClientOperationView }, };
+
 export type OperationSnapshot = { 
 /**
  * Stable operation status name.
@@ -188,7 +220,11 @@ status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, };
+error: string | null, 
+/**
+ * Runtime-local key for the latest operation of this kind.
+ */
+key: string | null, };
 
 export type ConfigSnapshot = { 
 /**
@@ -237,6 +273,10 @@ list: OperationSnapshot,
 watch: OperationSnapshot, };
 
 export type ClientSnapshot = { 
+/**
+ * Command operation result snapshots.
+ */
+operations: OperationCollectionSnapshot, 
 /**
  * Configuration coordination snapshot.
  */

@@ -2,20 +2,24 @@
 
 use std::fmt;
 use std::future::Future;
+use std::rc::Rc;
 
 use futures_channel::oneshot;
-use futures_util::{StreamExt, future::Either, future::select, pin_mut};
+use futures_util::{StreamExt, future::Either, future::LocalBoxFuture, future::select, pin_mut};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::executor::{ConfigWatchUpdateStream, SessionWatchUpdateStream};
 use crate::{
-    Client, ClientEffect, ClientError, ClientEvent, ClientUpdate, ConfigEffect, ConfigEvent,
-    ConfigView, GrpcEffectExecutor, McpServerView, OperationStatus, ProviderView, SessionEffect,
-    SessionEvent, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
+    Client, ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate,
+    ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey,
+    OperationStatus, ProviderView, SessionEffect, SessionEvent, SessionView, StatusChangeStream,
+    StatusEffect, StatusEvent,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
+
+type ClientSleep = Rc<dyn Fn(u64) -> LocalBoxFuture<'static, ()>>;
 
 /// Command accepted by the shared client runtime.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
@@ -79,12 +83,46 @@ pub enum ClientCommand {
 #[derive(Clone, Debug, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSnapshot {
+    /// Command operation result snapshots.
+    pub operations: OperationCollectionSnapshot,
     /// Configuration coordination snapshot.
     pub config: ConfigSnapshot,
     /// System status coordination snapshot.
     pub status: StatusSnapshot,
     /// Session coordination snapshot.
     pub sessions: SessionSnapshot,
+}
+
+/// Stable snapshot of command operation results.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationCollectionSnapshot {
+    /// Operation results by runtime-local operation key.
+    pub current: std::collections::BTreeMap<OperationKey, ClientOperationView>,
+}
+
+/// Stable snapshot of one command operation result.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ClientOperationView {
+    /// Configuration patch command result.
+    ConfigPatch {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Patched configuration, when the operation completed successfully.
+        config: Option<ConfigView>,
+    },
+    /// Session creation command result.
+    SessionCreate {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Created session, when the operation completed successfully.
+        session: Option<SessionView>,
+    },
 }
 
 /// Stable snapshot of configuration coordination state.
@@ -133,6 +171,8 @@ pub struct OperationSnapshot {
     pub status: &'static str,
     /// Last operation error, when present.
     pub error: Option<String>,
+    /// Runtime-local key for the latest operation of this kind.
+    pub key: Option<OperationKey>,
 }
 
 /// Shared reducer plus effect executor loop used by shells.
@@ -217,179 +257,12 @@ impl ClientRuntime {
 
     /// Convert this runtime into a startup/config state stream.
     #[must_use]
-    pub const fn into_state_stream(self) -> ClientStateStream {
-        ClientStateStream::new(self)
-    }
-
-    /// Dispatch a shell command through the shared reducer/effect loop.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the dispatched command's effect fails and the
-    /// reducer records an operation error.
-    pub async fn dispatch<Sleep, SleepFuture>(
-        &mut self,
-        command: ClientCommand,
-        sleep: Sleep,
-    ) -> Result<ClientSnapshot, ClientError>
+    pub fn into_state_stream<Sleep, SleepFuture>(self, sleep: Sleep) -> ClientStateStream
     where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
+        Sleep: Fn(u64) -> SleepFuture + 'static,
+        SleepFuture: Future<Output = ()> + 'static,
     {
-        match command {
-            ClientCommand::RequestConfig => {
-                let update = self.reducer.request_config();
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.load.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::AddProvider { provider } => {
-                let update = self.reducer.add_provider(provider.into())?;
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.patch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::UpdateProvider {
-                original_name,
-                provider,
-            } => {
-                let update = self
-                    .reducer
-                    .update_provider(&original_name, provider.into())?;
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.patch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::DeleteProvider { name } => {
-                let update = self.reducer.delete_provider(&name)?;
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.patch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::AddMcpServer { server } => {
-                let update = self.reducer.add_mcp_server(server.into())?;
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.patch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::UpdateMcpServer {
-                original_name,
-                server,
-            } => {
-                let update = self
-                    .reducer
-                    .update_mcp_server(&original_name, server.into())?;
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.patch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::DeleteMcpServer { name } => {
-                let update = self.reducer.delete_mcp_server(&name)?;
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.patch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::RegisterConfigWatchInterest => {
-                let update = self.reducer.register_config_watch_interest();
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().config.watch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::ReleaseConfigWatchInterest => {
-                let update = self.reducer.release_config_watch_interest();
-                if self.reducer.state().config.watch.interests == 0 {
-                    self.config_watch = None;
-                }
-                self.run_update(update, sleep).await;
-            }
-            ClientCommand::CreateSession => {
-                let update = self.reducer.create_session();
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().sessions.create.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::RegisterSessionWatchInterest => {
-                let update = self.reducer.register_session_watch_interest();
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().sessions.watch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::ReleaseSessionWatchInterest => {
-                let update = self.reducer.release_session_watch_interest();
-                if self.reducer.state().sessions.watch.interests == 0 {
-                    self.session_watch = None;
-                }
-                self.run_update(update, sleep).await;
-            }
-            ClientCommand::WatchStatus => {
-                let update = self.reducer.request_status_watch();
-                self.run_update(update, sleep).await;
-
-                if let Some(error) = self.reducer.state().status.watch.error.as_deref() {
-                    return Err(ClientError::new(error));
-                }
-            }
-            ClientCommand::WaitForSystemReady => {
-                while !self
-                    .reducer
-                    .state()
-                    .status
-                    .current
-                    .is_some_and(|status| status.ready)
-                {
-                    let update = self.reducer.maintain_watches();
-                    self.run_update(update, sleep).await;
-                    if !self
-                        .reducer
-                        .state()
-                        .status
-                        .current
-                        .is_some_and(|status| status.ready)
-                    {
-                        self.apply_next_watch_event(sleep).await;
-                    }
-                }
-            }
-        }
-
-        Ok(self.snapshot())
-    }
-
-    async fn run_update<Sleep, SleepFuture>(&mut self, update: ClientUpdate, sleep: Sleep)
-    where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
-    {
-        let mut effects = update.effects().to_vec();
-
-        while let Some(effect) = effects.pop() {
-            let events = self.execute_effect(effect, sleep).await;
-
-            for event in events {
-                let update = self.reducer.apply(event);
-                effects.extend(update.effects().iter().cloned().rev());
-            }
-        }
+        ClientStateStream::new(self, sleep)
     }
 
     async fn execute_effect<Sleep, SleepFuture>(
@@ -429,16 +302,6 @@ impl ClientRuntime {
             }
             effect => self.executor.execute_effect(effect, sleep).await,
         }
-    }
-
-    async fn apply_next_watch_event<Sleep, SleepFuture>(&mut self, sleep: Sleep)
-    where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
-    {
-        let event = self.next_watch_event().await;
-        let update = self.reducer.apply(event);
-        self.run_update(update, sleep).await;
     }
 
     async fn next_watch_event(&mut self) -> ClientEvent {
@@ -614,6 +477,7 @@ pub struct ClientStateStream {
     runtime: ClientRuntime,
     phase: ClientStateStreamPhase,
     effects: Vec<ClientEffect>,
+    sleep: ClientSleep,
 }
 
 impl fmt::Debug for ClientStateStream {
@@ -628,23 +492,24 @@ impl fmt::Debug for ClientStateStream {
 }
 
 impl ClientStateStream {
-    const fn new(runtime: ClientRuntime) -> Self {
+    fn new<Sleep, SleepFuture>(runtime: ClientRuntime, sleep: Sleep) -> Self
+    where
+        Sleep: Fn(u64) -> SleepFuture + 'static,
+        SleepFuture: Future<Output = ()> + 'static,
+    {
         Self {
             runtime,
             phase: ClientStateStreamPhase::WaitForSystemReady,
             effects: Vec::new(),
+            sleep: Rc::new(move |delay_ms| Box::pin(sleep(delay_ms))),
         }
     }
 
     /// Return the next state snapshot from shared startup/config orchestration.
-    pub async fn next<Sleep, SleepFuture>(&mut self, sleep: Sleep) -> ClientSnapshot
-    where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
-    {
+    pub async fn next(&mut self) -> ClientSnapshot {
         loop {
             if let Some(effect) = self.effects.pop() {
-                self.apply_effect(effect, sleep).await;
+                self.apply_effect(effect).await;
                 return self.snapshot();
             }
 
@@ -674,7 +539,7 @@ impl ClientStateStream {
                         && self.runtime.reducer.state().config.watch.interests == 0
                         && self.runtime.reducer.state().sessions.watch.interests == 0
                     {
-                        sleep(READY_IDLE_DELAY_MS).await;
+                        (self.sleep)(READY_IDLE_DELAY_MS).await;
                         let update = self.runtime.reducer.maintain_watches();
                         self.extend_effects(&update);
                         return self.snapshot();
@@ -697,31 +562,28 @@ impl ClientStateStream {
     }
 
     /// Advance until either a client snapshot changes or a command arrives.
-    pub async fn next_or_dispatch<Sleep, SleepFuture, CommandFuture>(
+    pub async fn next_or_dispatch<CommandFuture>(
         &mut self,
         command: CommandFuture,
-        sleep: Sleep,
     ) -> ClientStateStreamEvent
     where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
         CommandFuture: Future<Output = Option<ClientCommandRequest>>,
     {
         let request = {
-            let next = self.next(sleep);
+            let next = self.next();
             pin_mut!(next);
             pin_mut!(command);
 
-            match select(next, command).await {
-                Either::Left((snapshot, _)) => {
+            match select(command, next).await {
+                Either::Left((Some(request), _pending_next)) => request,
+                Either::Left((None, _)) => return ClientStateStreamEvent::CommandsClosed,
+                Either::Right((snapshot, _)) => {
                     return ClientStateStreamEvent::Snapshot(Box::new(snapshot));
                 }
-                Either::Right((Some(request), _pending_next)) => request,
-                Either::Right((None, _)) => return ClientStateStreamEvent::CommandsClosed,
             }
         };
 
-        ClientStateStreamEvent::Snapshot(Box::new(self.dispatch_request(request, sleep).await))
+        ClientStateStreamEvent::Snapshot(Box::new(self.dispatch_request(request).await))
     }
 
     /// Return the current stream snapshot.
@@ -730,33 +592,10 @@ impl ClientStateStream {
         self.runtime.snapshot()
     }
 
-    /// Dispatch a one-off command against the stream-owned runtime.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the command cannot be reduced or executed.
-    pub async fn dispatch<Sleep, SleepFuture>(
-        &mut self,
-        command: ClientCommand,
-        sleep: Sleep,
-    ) -> Result<ClientSnapshot, ClientError>
-    where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
-    {
-        self.runtime.dispatch(command, sleep).await
-    }
-
-    async fn dispatch_request<Sleep, SleepFuture>(
-        &mut self,
-        request: ClientCommandRequest,
-        sleep: Sleep,
-    ) -> ClientSnapshot
-    where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
-    {
-        let result = self.dispatch(request.command, sleep).await;
+    async fn dispatch_request(&mut self, request: ClientCommandRequest) -> ClientSnapshot {
+        let result = self
+            .begin_command(request.command)
+            .map(|()| self.snapshot());
         let snapshot = result.clone().unwrap_or_else(|_| self.snapshot());
 
         if let Some(reply) = request.result {
@@ -766,12 +605,70 @@ impl ClientStateStream {
         snapshot
     }
 
-    async fn apply_effect<Sleep, SleepFuture>(&mut self, effect: ClientEffect, sleep: Sleep)
-    where
-        Sleep: Copy + FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
-    {
-        let events = self.runtime.execute_effect(effect, sleep).await;
+    fn begin_command(&mut self, command: ClientCommand) -> Result<(), ClientError> {
+        let update = match command {
+            ClientCommand::RequestConfig => self.runtime.reducer.request_config(),
+            ClientCommand::AddProvider { provider } => {
+                self.runtime.reducer.add_provider(provider.into())?
+            }
+            ClientCommand::UpdateProvider {
+                original_name,
+                provider,
+            } => self
+                .runtime
+                .reducer
+                .update_provider(&original_name, provider.into())?,
+            ClientCommand::DeleteProvider { name } => {
+                self.runtime.reducer.delete_provider(&name)?
+            }
+            ClientCommand::AddMcpServer { server } => {
+                self.runtime.reducer.add_mcp_server(server.into())?
+            }
+            ClientCommand::UpdateMcpServer {
+                original_name,
+                server,
+            } => self
+                .runtime
+                .reducer
+                .update_mcp_server(&original_name, server.into())?,
+            ClientCommand::DeleteMcpServer { name } => {
+                self.runtime.reducer.delete_mcp_server(&name)?
+            }
+            ClientCommand::RegisterConfigWatchInterest => {
+                self.runtime.reducer.register_config_watch_interest()
+            }
+            ClientCommand::ReleaseConfigWatchInterest => {
+                let update = self.runtime.reducer.release_config_watch_interest();
+                if self.runtime.reducer.state().config.watch.interests == 0 {
+                    self.runtime.config_watch = None;
+                }
+                update
+            }
+            ClientCommand::CreateSession => self.runtime.reducer.create_session(),
+            ClientCommand::RegisterSessionWatchInterest => {
+                self.runtime.reducer.register_session_watch_interest()
+            }
+            ClientCommand::ReleaseSessionWatchInterest => {
+                let update = self.runtime.reducer.release_session_watch_interest();
+                if self.runtime.reducer.state().sessions.watch.interests == 0 {
+                    self.runtime.session_watch = None;
+                }
+                update
+            }
+            ClientCommand::WatchStatus => self.runtime.reducer.request_status_watch(),
+            ClientCommand::WaitForSystemReady => self.runtime.reducer.maintain_watches(),
+        };
+
+        self.extend_effects(&update);
+        Ok(())
+    }
+
+    async fn apply_effect(&mut self, effect: ClientEffect) {
+        let sleep = Rc::clone(&self.sleep);
+        let events = self
+            .runtime
+            .execute_effect(effect, move |delay_ms| sleep(delay_ms))
+            .await;
 
         for event in events {
             let update = self.runtime.reducer.apply(event);
@@ -801,16 +698,19 @@ impl ClientSnapshot {
         let state = client.state();
 
         Self {
+            operations: OperationCollectionSnapshot {
+                current: state
+                    .operations
+                    .iter()
+                    .map(|(key, operation)| {
+                        (key.clone(), ClientOperationView::from(operation.clone()))
+                    })
+                    .collect(),
+            },
             config: ConfigSnapshot {
                 current: state.config.current.clone().map(ConfigView::from),
-                load: OperationSnapshot::from_parts(
-                    state.config.load.status,
-                    state.config.load.error.clone(),
-                ),
-                patch: OperationSnapshot::from_parts(
-                    state.config.patch.status,
-                    state.config.patch.error.clone(),
-                ),
+                load: OperationSnapshot::from_state(&state.config.load),
+                patch: OperationSnapshot::from_state(&state.config.patch),
                 watch: OperationSnapshot::from_parts(
                     state.config.watch.status,
                     state.config.watch.error.clone(),
@@ -831,14 +731,8 @@ impl ClientSnapshot {
                     .cloned()
                     .map(SessionView::from)
                     .collect(),
-                create: OperationSnapshot::from_parts(
-                    state.sessions.create.status,
-                    state.sessions.create.error.clone(),
-                ),
-                list: OperationSnapshot::from_parts(
-                    state.sessions.list.status,
-                    state.sessions.list.error.clone(),
-                ),
+                create: OperationSnapshot::from_state(&state.sessions.create),
+                list: OperationSnapshot::from_state(&state.sessions.list),
                 watch: OperationSnapshot::from_parts(
                     state.sessions.watch.status,
                     state.sessions.watch.error.clone(),
@@ -848,11 +742,45 @@ impl ClientSnapshot {
     }
 }
 
+impl From<ClientOperationState> for ClientOperationView {
+    fn from(operation: ClientOperationState) -> Self {
+        match operation {
+            ClientOperationState::ConfigPatch {
+                status,
+                error,
+                config,
+            } => Self::ConfigPatch {
+                status: operation_status_name(status),
+                error,
+                config: config.map(ConfigView::from),
+            },
+            ClientOperationState::SessionCreate {
+                status,
+                error,
+                session,
+            } => Self::SessionCreate {
+                status: operation_status_name(status),
+                error,
+                session: session.map(SessionView::from),
+            },
+        }
+    }
+}
+
 impl OperationSnapshot {
+    fn from_state(state: &crate::OperationState) -> Self {
+        Self {
+            status: operation_status_name(state.status),
+            error: state.error.clone(),
+            key: state.key.clone(),
+        }
+    }
+
     const fn from_parts(status: OperationStatus, error: Option<String>) -> Self {
         Self {
             status: operation_status_name(status),
             error,
+            key: None,
         }
     }
 }
@@ -879,9 +807,10 @@ mod tests {
 
     #[tokio::test]
     async fn state_stream_yields_status_loading_before_transport_work() {
-        let mut stream = ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream();
+        let mut stream =
+            ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream(no_sleep);
 
-        let snapshot = stream.next(no_sleep).await;
+        let snapshot = stream.next().await;
 
         assert_eq!(snapshot.status.watch.status, "loading");
         assert!(!snapshot.status.ready);
@@ -889,10 +818,11 @@ mod tests {
 
     #[tokio::test]
     async fn state_stream_yields_failed_status_before_reconnect_sleep() {
-        let mut stream = ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream();
+        let mut stream =
+            ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream(no_sleep);
 
-        drop(stream.next(no_sleep).await);
-        let snapshot = stream.next(no_sleep).await;
+        drop(stream.next().await);
+        let snapshot = stream.next().await;
 
         assert_eq!(snapshot.status.watch.status, "failed");
         assert!(snapshot.status.watch.error.is_some());
@@ -979,12 +909,12 @@ mod tests {
             runtime,
             phase: ClientStateStreamPhase::Ready,
             effects: Vec::new(),
+            sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
         };
 
-        let snapshot =
-            tokio::time::timeout(std::time::Duration::from_millis(10), stream.next(no_sleep))
-                .await
-                .expect("ready stream should not wait indefinitely for idle status watch");
+        let snapshot = tokio::time::timeout(std::time::Duration::from_millis(10), stream.next())
+            .await
+            .expect("ready stream should not wait indefinitely for idle status watch");
 
         assert_eq!(snapshot.status.watch.status, "received");
         assert_eq!(snapshot.config.watch.status, "idle");

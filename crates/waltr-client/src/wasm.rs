@@ -43,7 +43,8 @@ impl WaltrClient {
     #[must_use]
     pub fn new(endpoint: Option<String>) -> Self {
         let endpoint = normalize_endpoint(endpoint);
-        let runtime = ClientRuntime::for_endpoint(endpoint.clone()).into_state_stream();
+        let runtime =
+            ClientRuntime::for_endpoint(endpoint.clone()).into_state_stream(browser_sleep);
         let latest_snapshot = Rc::new(RefCell::new(
             serde_json::to_string(&runtime.snapshot()).unwrap_or_else(|error| error.to_string()),
         ));
@@ -137,9 +138,7 @@ fn spawn_client_loop(
 ) {
     spawn_local(async move {
         loop {
-            let event = runtime
-                .next_or_dispatch(commands.next(), browser_sleep)
-                .await;
+            let event = runtime.next_or_dispatch(commands.next()).await;
             let ClientStateStreamEvent::Snapshot(snapshot) = event else {
                 return;
             };

@@ -12,13 +12,16 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::support::{
     input::{char_press, ctrl_x_press, delete_press, enter_press, right_press, tab_press},
     render::render_app,
-    server::{dispatch_app_command, drive_app_to_landing, next_snapshot_until, open_config_screen},
+    server::{
+        dispatch_app_command, drive_app_to_landing, next_snapshot_until, no_sleep,
+        open_config_screen,
+    },
 };
 
 #[tokio::test]
 async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
     let server = setup_server();
-    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream();
+    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
 
     drive_app_to_landing(&mut stream, &mut app).await;
@@ -99,7 +102,7 @@ async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
 #[allow(clippy::too_many_lines)]
 async fn client_stream_manages_provider_models_via_update_provider_with_real_server() {
     let server = setup_server();
-    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream();
+    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
 
     drive_app_to_landing(&mut stream, &mut app).await;
