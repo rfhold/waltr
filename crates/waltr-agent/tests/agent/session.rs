@@ -160,8 +160,9 @@ mod completion {
     use futures_util::StreamExt;
     use waltr_agent::{
         AgentRuntime, AgentSessions, AgentTimelineEvent, AgentTool, CompletionEvent,
-        MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionId, SessionStatus, SessionStore,
-        TimelineContent, TimelineEventKind, TimelineStatus, ToolCall, ToolDefinition,
+        MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionId, SessionListEvent,
+        SessionStatus, SessionStore, TimelineContent, TimelineEventKind, TimelineStatus, ToolCall,
+        ToolDefinition,
     };
     use serde_json::json;
     use tokio::time::{Duration, timeout};
@@ -237,8 +238,10 @@ mod completion {
         let listed = sessions.list().await.expect("listed sessions");
 
         assert_eq!(update.sequence, 1);
-        assert_eq!(&update.session.id, created.id());
-        assert_eq!(update.session.status, created.record.summary().status);
+        assert_eq!(
+            update.event,
+            SessionListEvent::Upsert(created.record.summary())
+        );
         assert!(listed.iter().any(|session| &session.id == created.id()));
     }
 
@@ -262,8 +265,14 @@ mod completion {
 
         assert_eq!(first_update.sequence, 1);
         assert_eq!(second_update.sequence, 2);
-        assert_eq!(&first_update.session.id, first.id());
-        assert_eq!(&second_update.session.id, second.id());
+        assert_eq!(
+            first_update.event,
+            SessionListEvent::Upsert(first.record.summary())
+        );
+        assert_eq!(
+            second_update.event,
+            SessionListEvent::Upsert(second.record.summary())
+        );
         assert!(listed.iter().any(|session| &session.id == first.id()));
         assert!(listed.iter().any(|session| &session.id == second.id()));
     }
@@ -283,7 +292,10 @@ mod completion {
         let listed = sessions_clone.list().await.expect("listed sessions");
 
         assert_eq!(update.sequence, 1);
-        assert_eq!(&update.session.id, created.id());
+        assert_eq!(
+            update.event,
+            SessionListEvent::Upsert(created.record.summary())
+        );
         assert!(listed.iter().any(|session| &session.id == created.id()));
     }
 
@@ -310,7 +322,108 @@ mod completion {
             .expect("session update item");
 
         assert_eq!(update.sequence, 2);
-        assert_eq!(&update.session.id, created.id());
+        assert_eq!(
+            update.event,
+            SessionListEvent::Upsert(created.record.summary())
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_session_from_list_and_is_idempotent() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let created = sessions.create().await.expect("created session");
+
+        sessions
+            .delete(created.id())
+            .await
+            .expect("deleted session");
+        sessions
+            .delete(created.id())
+            .await
+            .expect("deleted session again");
+        sessions
+            .delete(&SessionId::new("never-created"))
+            .await
+            .expect("deleted missing session");
+
+        let listed = sessions.list().await.expect("listed sessions");
+        assert!(!listed.iter().any(|session| &session.id == created.id()));
+    }
+
+    #[tokio::test]
+    async fn delete_emits_deleted_watch_event_with_monotonic_sequence() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let created = sessions.create().await.expect("created session");
+        let mut watch = sessions.watch_sessions();
+
+        sessions
+            .delete(created.id())
+            .await
+            .expect("deleted session");
+        let update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("session update")
+            .expect("session update item");
+
+        assert_eq!(update.sequence, 2);
+        assert_eq!(
+            update.event,
+            SessionListEvent::Deleted(created.id().clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_missing_session_emits_deleted_watch_event() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let mut watch = sessions.watch_sessions();
+        let missing = SessionId::new("never-created");
+
+        sessions
+            .delete(&missing)
+            .await
+            .expect("deleted missing session");
+        let update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("session update")
+            .expect("session update item");
+
+        assert_eq!(update.sequence, 1);
+        assert_eq!(update.event, SessionListEvent::Deleted(missing));
+    }
+
+    #[tokio::test]
+    async fn create_then_delete_emits_upsert_then_deleted() {
+        let store = MemorySessionStore::new();
+        let sessions = AgentSessions::new(store);
+        let mut watch = sessions.watch_sessions();
+
+        let created = sessions.create().await.expect("created session");
+        sessions
+            .delete(created.id())
+            .await
+            .expect("deleted session");
+        let upsert = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("upsert update")
+            .expect("upsert update item");
+        let deleted = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("delete update")
+            .expect("delete update item");
+
+        assert_eq!(upsert.sequence, 1);
+        assert_eq!(
+            upsert.event,
+            SessionListEvent::Upsert(created.record.summary())
+        );
+        assert_eq!(deleted.sequence, 2);
+        assert_eq!(
+            deleted.event,
+            SessionListEvent::Deleted(created.id().clone())
+        );
     }
 
     #[tokio::test]

@@ -53,6 +53,15 @@ where
         self.store.load(id).await.map_err(session_store_error)
     }
 
+    /// Delete a durable session record if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot complete the delete operation.
+    pub async fn delete_session(&self, id: &SessionId) -> Result<()> {
+        self.store.delete(id).await.map_err(session_store_error)
+    }
+
     /// List durable sessions, newest activity first.
     ///
     /// # Errors

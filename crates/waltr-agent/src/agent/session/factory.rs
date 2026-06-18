@@ -2,7 +2,7 @@
 
 use crate::Result;
 
-use super::watch::SessionListBroadcaster;
+use super::watch::{SessionListBroadcaster, SessionListEvent};
 use super::{
     AgentSessionRuntime, ResumeInput, SessionId, SessionListSubscription, SessionStore,
     SessionSummary,
@@ -39,8 +39,22 @@ where
     pub async fn create(&self) -> Result<AgentSession> {
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime.create_session(SessionId::generate()).await?;
-        self.sessions.publish(record.summary());
+        self.sessions
+            .publish(SessionListEvent::Upsert(record.summary()));
         Ok(AgentSession::new(record))
+    }
+
+    /// Delete a durable session if it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session store cannot complete the delete operation.
+    pub async fn delete(&self, id: &SessionId) -> Result<()> {
+        AgentSessionRuntime::new(&self.store)
+            .delete_session(id)
+            .await?;
+        self.sessions.publish(SessionListEvent::Deleted(id.clone()));
+        Ok(())
     }
 
     /// Watch newly created or updated sessions.

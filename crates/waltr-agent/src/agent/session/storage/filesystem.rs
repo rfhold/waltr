@@ -118,6 +118,23 @@ impl SessionStore for FilesystemSessionStore {
         async move { store.load_sync(&id) }
     }
 
+    fn delete(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            fs::remove_file(store.path(&id)).or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(backend_error(error))
+                }
+            })
+        }
+    }
+
     fn list(
         &self,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
@@ -205,6 +222,24 @@ mod tests {
         let summaries = store.list().await.unwrap();
 
         assert!(summaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FilesystemSessionStore::new(temp.path());
+        let id = SessionId::new("session-delete");
+
+        store.create(id.clone()).await.unwrap();
+        store.delete(&id).await.unwrap();
+        store.delete(&id).await.unwrap();
+        store
+            .delete(&SessionId::new("never-created"))
+            .await
+            .unwrap();
+
+        let error = store.load(&id).await.unwrap_err();
+        assert_eq!(error, SessionStoreError::NotFound { id });
     }
 
     #[tokio::test]

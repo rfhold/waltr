@@ -13,17 +13,26 @@ use futures_util::Stream;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
-use super::SessionSummary;
+use super::{SessionId, SessionSummary};
 
 const SESSION_LIST_CHANNEL_CAPACITY: usize = 128;
+
+/// Kind of session list change emitted by [`AgentSessions`](super::AgentSessions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionListEvent {
+    /// A session was created or updated.
+    Upsert(SessionSummary),
+    /// A session was deleted.
+    Deleted(SessionId),
+}
 
 /// A session list update emitted by [`AgentSessions`](super::AgentSessions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListUpdate {
     /// Monotonic sequence for detecting missed updates.
     pub sequence: u64,
-    /// Complete current summary for the changed session.
-    pub session: SessionSummary,
+    /// Session list change event.
+    pub event: SessionListEvent,
 }
 
 /// Live stream of session list updates.
@@ -68,8 +77,8 @@ impl SessionListBroadcaster {
         }
     }
 
-    pub(crate) fn publish(&self, session: SessionSummary) {
+    pub(crate) fn publish(&self, event: SessionListEvent) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        drop(self.sender.send(SessionListUpdate { sequence, session }));
+        drop(self.sender.send(SessionListUpdate { sequence, event }));
     }
 }
