@@ -522,7 +522,12 @@ async fn shell_cancellation_kills_running_command() {
     let record = store.load(&session_id).await.expect("stored session");
     assert!(record.snapshot().pending_work.iter().any(|work| {
         work.id == "shell-cancel-call"
-            && matches!(work.status, waltr_agent::PendingWorkStatus::Pending)
+            && matches!(
+                work.status,
+                waltr_agent::PendingWorkStatus::Canceled(
+                    waltr_agent::CancelReason::SessionInterrupted
+                )
+            )
     }));
 }
 
