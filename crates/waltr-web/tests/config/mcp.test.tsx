@@ -83,6 +83,30 @@ describe("mcp servers section", () => {
     expect(update).toMatchObject({ type: "updateMcpServer", originalName: "search" });
   });
 
+  test("keeps MCP form open until keyed patch failure is surfaced", async () => {
+    const commands: ClientCommand[] = [];
+
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      configPatchError: "mcp write failed",
+      snapshot: snapshotWithConfig(configWithMcp()),
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "MCP Servers" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(testHistory().get()).toBe("/config/mcp/create"));
+    fireEvent.input(screen.getByLabelText("Name"), { target: { value: "search" } });
+    fireEvent.input(screen.getByLabelText("Command"), { target: { value: "mcp-search" } });
+    fireEvent.submit(screen.getByLabelText("Create MCP server"));
+
+    expect(screen.getByRole("button", { name: "Save" }).hasAttribute("disabled")).toBe(true);
+    await waitFor(() => expect(screen.getByText("mcp write failed")).toBeTruthy());
+
+    expect(screen.getByRole("dialog", { name: "Create MCP server dialog" })).toBeTruthy();
+    expect(testHistory().get()).toBe("/config/mcp/create");
+    expect(commands.map((command) => command.type)).toContain("addMcpServer");
+  });
+
   test("shows a URL field for sse servers and a command field for stdio servers", async () => {
     renderWithAppState(() => <ConfigRouteWithChildren />, {
       snapshot: snapshotWithConfig(configWithMcp()),

@@ -9,13 +9,14 @@ use crate::support::server::{drive_app_to_landing, no_sleep, unused_addr};
 #[tokio::test]
 async fn client_stream_retries_until_delayed_real_server_is_ready() {
     let addr = unused_addr();
-    let mut stream = ClientRuntime::for_endpoint(format!("http://{addr}")).into_state_stream();
+    let mut stream =
+        ClientRuntime::for_endpoint(format!("http://{addr}")).into_state_stream(no_sleep);
     let mut app = App::new();
 
-    let loading = stream.next(no_sleep).await;
+    let loading = stream.next().await;
     assert_eq!(loading.status.watch.status, "loading");
 
-    let failed = tokio::time::timeout(Duration::from_secs(1), stream.next(no_sleep))
+    let failed = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
         .expect("client should surface the initial connection failure");
     assert_eq!(failed.status.watch.status, "failed");

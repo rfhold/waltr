@@ -16,8 +16,9 @@ mod tests {
     use ts_rs::TS as _;
 
     use crate::{
-        ClientCommand, ClientSnapshot, ConfigSnapshot, Configuration, OperationSnapshot, Provider,
-        ProviderType, SessionSnapshot, StatusSnapshot,
+        ClientCommand, ClientOperationView, ClientSnapshot, ConfigSnapshot, Configuration,
+        OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType, SessionSnapshot,
+        StatusSnapshot,
     };
 
     use super::*;
@@ -76,6 +77,8 @@ mod tests {
             SessionPhaseView::decl(),
             SessionStatusView::decl(),
             SessionView::decl(),
+            ClientOperationView::decl(),
+            OperationCollectionSnapshot::decl(),
             OperationSnapshot::decl(),
             ConfigSnapshot::decl(),
             StatusSnapshot::decl(),

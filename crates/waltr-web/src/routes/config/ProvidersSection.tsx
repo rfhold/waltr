@@ -164,7 +164,7 @@ export function ProvidersSection(props: ParentProps & {
     currentProviderDraft: providerFormDraft,
     operationError,
     operationPending,
-    saveProvider: (form) => saveProvider(app.dispatch, form, navigate, setOperationPending, setOperationError),
+    saveProvider: (form) => saveProvider(app.dispatchConfigPatch, form, navigate, setOperationPending, setOperationError),
     stageModelDelete,
     stageModelSave,
     setDeleteModel,
@@ -244,7 +244,7 @@ export function ProvidersSection(props: ParentProps & {
                         confirmAriaLabel={`Confirm delete ${providerName}`}
                         cancelAriaLabel={`Cancel delete ${providerName}`}
                         pending={operationPending()}
-                        onConfirm={() => deleteProviderByName(app.dispatch, providerName, setDeleteProvider, setOperationPending, setOperationError)}
+                        onConfirm={() => deleteProviderByName(app.dispatchConfigPatch, providerName, setDeleteProvider, setOperationPending, setOperationError)}
                         onCancel={() => setDeleteProvider(undefined)}
                       />
                     </Show>

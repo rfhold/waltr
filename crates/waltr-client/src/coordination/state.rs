@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 
 use crate::{Configuration, SessionSummary, StreamId, SystemStatus};
 
+/// Runtime-local operation identifier used by shells to track command results.
+pub type OperationKey = String;
+
 /// Return the capped watch reconnect delay for a retry attempt.
 #[must_use]
 pub fn watch_reconnect_delay_ms(attempt: usize) -> u64 {
@@ -23,6 +26,9 @@ pub struct ClientState {
     pub sessions: SessionClientState,
     /// Stream coordination state.
     pub streams: StreamClientState,
+    /// Command operation results by runtime-local key.
+    pub operations: BTreeMap<OperationKey, ClientOperationState>,
+    next_operation_id: u64,
 }
 
 /// Configuration coordination state.
@@ -75,6 +81,31 @@ pub struct OperationState {
     pub status: OperationStatus,
     /// Last operation error, when present.
     pub error: Option<String>,
+    /// Runtime-local key for the latest operation of this kind.
+    pub key: Option<OperationKey>,
+}
+
+/// Result state for a command operation that UI shells may observe by key.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClientOperationState {
+    /// Configuration patch command result.
+    ConfigPatch {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Patched configuration, when the operation completed successfully.
+        config: Option<Configuration>,
+    },
+    /// Session creation command result.
+    SessionCreate {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Created session, when the operation completed successfully.
+        session: Option<SessionSummary>,
+    },
 }
 
 /// Shared state for one watch-style operation.
@@ -89,6 +120,12 @@ pub struct WatchState {
 }
 
 impl ClientState {
+    pub(crate) fn next_operation_key(&mut self) -> OperationKey {
+        let key = format!("op-{}", self.next_operation_id);
+        self.next_operation_id = self.next_operation_id.saturating_add(1);
+        key
+    }
+
     #[must_use]
     pub(crate) fn is_system_ready(&self) -> bool {
         self.status.current.is_some_and(|status| status.ready)
@@ -115,20 +152,47 @@ impl ClientState {
         self.config.load.error = Some(message);
     }
 
-    pub(crate) fn set_config_patch_loading(&mut self) {
+    pub(crate) fn set_config_patch_loading(&mut self, key: OperationKey) {
         self.config.patch.status = OperationStatus::Loading;
         self.config.patch.error = None;
+        self.config.patch.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::ConfigPatch {
+                status: OperationStatus::Loading,
+                error: None,
+                config: None,
+            },
+        );
     }
 
-    pub(crate) fn set_config_patch_ready(&mut self, config: Configuration) {
-        self.config.current = Some(config);
+    pub(crate) fn set_config_patch_ready(&mut self, key: OperationKey, config: Configuration) {
+        self.config.current = Some(config.clone());
         self.config.patch.status = OperationStatus::Ready;
         self.config.patch.error = None;
+        self.config.patch.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::ConfigPatch {
+                status: OperationStatus::Ready,
+                error: None,
+                config: Some(config),
+            },
+        );
     }
 
-    pub(crate) fn set_config_patch_failed(&mut self, message: String) {
+    pub(crate) fn set_config_patch_failed(&mut self, key: OperationKey, message: String) {
         self.config.patch.status = OperationStatus::Failed;
-        self.config.patch.error = Some(message);
+        self.config.patch.error = Some(message.clone());
+        self.config.patch.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::ConfigPatch {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                config: None,
+            },
+        );
     }
 
     pub(crate) fn set_config_watch_loading(&mut self) {
@@ -217,20 +281,47 @@ impl ClientState {
         delay
     }
 
-    pub(crate) fn set_session_create_loading(&mut self) {
+    pub(crate) fn set_session_create_loading(&mut self, key: OperationKey) {
         self.sessions.create.status = OperationStatus::Loading;
         self.sessions.create.error = None;
+        self.sessions.create.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionCreate {
+                status: OperationStatus::Loading,
+                error: None,
+                session: None,
+            },
+        );
     }
 
-    pub(crate) fn set_session_create_ready(&mut self, session: SessionSummary) {
-        self.upsert_session(session);
+    pub(crate) fn set_session_create_ready(&mut self, key: OperationKey, session: SessionSummary) {
+        self.upsert_session(session.clone());
         self.sessions.create.status = OperationStatus::Ready;
         self.sessions.create.error = None;
+        self.sessions.create.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionCreate {
+                status: OperationStatus::Ready,
+                error: None,
+                session: Some(session),
+            },
+        );
     }
 
-    pub(crate) fn set_session_create_failed(&mut self, message: String) {
+    pub(crate) fn set_session_create_failed(&mut self, key: OperationKey, message: String) {
         self.sessions.create.status = OperationStatus::Failed;
-        self.sessions.create.error = Some(message);
+        self.sessions.create.error = Some(message.clone());
+        self.sessions.create.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionCreate {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session: None,
+            },
+        );
     }
 
     pub(crate) fn set_session_list_loading(&mut self) {

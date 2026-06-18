@@ -5,7 +5,10 @@
 //! "MCP Servers" tab and does not depend on the surrounding tab chrome. The
 //! shell holds no MCP-specific state; all of it lives here.
 
-use waltr_client::{ClientCommand, ConfigView, McpServerTypeView, McpServerView};
+use waltr_client::{
+    ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, McpServerTypeView,
+    McpServerView, OperationKey,
+};
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyEvent},
@@ -159,6 +162,7 @@ pub struct McpSection {
     delete_server: Option<String>,
     selected_server: usize,
     pending_patch: bool,
+    pending_patch_key: Option<OperationKey>,
     patch_error: Option<String>,
 }
 
@@ -171,6 +175,7 @@ impl McpSection {
             delete_server: None,
             selected_server: 0,
             pending_patch: false,
+            pending_patch_key: None,
             patch_error: None,
         }
     }
@@ -200,21 +205,43 @@ impl McpSection {
     }
 
     /// Reconcile a submitted patch against the shared reducer operation state.
-    pub fn reconcile_patch(&mut self, status: &str, error: Option<&str>) {
+    pub fn reconcile_patch(&mut self, snapshot: &ClientSnapshot) {
         if !self.pending_patch {
             return;
         }
 
-        match status {
+        if self.pending_patch_key.is_none() {
+            if snapshot.config.patch.status != "loading" {
+                return;
+            }
+
+            self.pending_patch_key
+                .clone_from(&snapshot.config.patch.key);
+        }
+
+        let Some(key) = &self.pending_patch_key else {
+            return;
+        };
+
+        let Some(ClientOperationView::ConfigPatch { status, error, .. }) =
+            snapshot.operations.current.get(key)
+        else {
+            return;
+        };
+
+        match *status {
             "ready" => {
                 self.pending_patch = false;
+                self.pending_patch_key = None;
                 self.patch_error = None;
                 self.config_form = None;
                 self.delete_server = None;
             }
             "failed" => {
                 self.pending_patch = false;
-                self.patch_error = Some(error.unwrap_or("config patch failed").to_owned());
+                self.pending_patch_key = None;
+                self.patch_error =
+                    Some(error.as_deref().unwrap_or("config patch failed").to_owned());
             }
             _ => {}
         }
@@ -338,6 +365,7 @@ impl McpSection {
         let original_name = form.original_name.clone();
         let server = form.server();
         self.pending_patch = true;
+        self.pending_patch_key = None;
         self.patch_error = None;
 
         match mode {
@@ -358,6 +386,7 @@ impl McpSection {
 
     fn delete_selected(&mut self, name: &str) -> SectionAction {
         self.pending_patch = true;
+        self.pending_patch_key = None;
         self.patch_error = None;
         SectionAction::ClientCommand(ClientCommand::DeleteMcpServer {
             name: name.to_owned(),

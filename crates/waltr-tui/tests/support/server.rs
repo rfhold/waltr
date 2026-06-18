@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use waltr_client::{
-    ClientCommand, ClientSnapshot, ClientStateStream, ProviderKindView, ProviderView,
+    ClientCommand, ClientCommandRequest, ClientOperationView, ClientSnapshot, ClientStateStream,
+    ClientStateStreamEvent, ProviderKindView, ProviderView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -14,7 +15,7 @@ pub async fn drive_app_to_landing(stream: &mut ClientStateStream, app: &mut App)
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
 
     while std::time::Instant::now() < deadline {
-        let snapshot = tokio::time::timeout(Duration::from_secs(1), stream.next(no_sleep))
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
             .expect("client stream should produce snapshots");
 
@@ -42,10 +43,7 @@ pub async fn open_config_screen(stream: &mut ClientStateStream, app: &mut App) {
     };
     assert_eq!(register, ClientCommand::RegisterConfigWatchInterest);
 
-    let opened = stream
-        .dispatch(register, no_sleep)
-        .await
-        .expect("config watch interest should register");
+    let opened = dispatch_client_command(stream, register).await;
     assert_eq!(
         app.handle_event(
             &AppEvent::Client(Box::new(opened)),
@@ -64,10 +62,7 @@ pub async fn dispatch_app_command(
         panic!("expected app to emit client command, saw {action:?}");
     };
 
-    let snapshot = stream
-        .dispatch(command, no_sleep)
-        .await
-        .expect("client command should succeed");
+    let snapshot = dispatch_client_command(stream, command).await;
     assert_eq!(
         app.handle_event(
             &AppEvent::Client(Box::new(snapshot.clone())),
@@ -76,7 +71,51 @@ pub async fn dispatch_app_command(
         AppAction::Continue
     );
 
+    if let Some(key) = snapshot.config.patch.key.clone()
+        && snapshot.config.patch.status == "loading"
+    {
+        return next_snapshot_until(stream, app, |snapshot| {
+            matches!(
+                snapshot.operations.current.get(&key),
+                Some(ClientOperationView::ConfigPatch {
+                    status: "ready" | "failed",
+                    ..
+                })
+            )
+        })
+        .await;
+    }
+
+    if let Some(key) = snapshot.sessions.create.key.clone()
+        && snapshot.sessions.create.status == "loading"
+    {
+        return next_snapshot_until(stream, app, |snapshot| {
+            matches!(
+                snapshot.operations.current.get(&key),
+                Some(ClientOperationView::SessionCreate {
+                    status: "ready" | "failed",
+                    ..
+                })
+            )
+        })
+        .await;
+    }
+
     snapshot
+}
+
+pub async fn dispatch_client_command(
+    stream: &mut ClientStateStream,
+    command: ClientCommand,
+) -> ClientSnapshot {
+    let event = stream
+        .next_or_dispatch(async { Some(ClientCommandRequest::new(command)) })
+        .await;
+    let ClientStateStreamEvent::Snapshot(snapshot) = event else {
+        panic!("client stream closed while dispatching command");
+    };
+
+    *snapshot
 }
 
 pub async fn next_snapshot_until(
@@ -87,7 +126,7 @@ pub async fn next_snapshot_until(
     let mut last_snapshot = None;
 
     for _ in 0..32 {
-        let snapshot = tokio::time::timeout(Duration::from_secs(2), stream.next(no_sleep))
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
             .expect("client stream should produce snapshots");
 

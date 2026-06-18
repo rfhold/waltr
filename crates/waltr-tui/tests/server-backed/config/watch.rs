@@ -7,28 +7,33 @@ use waltr_tui::app::{App, AppAction, AppScreen};
 use crate::support::{
     input::{char_press, ctrl_x_press, escape_press},
     render::render_app,
-    server::{drive_app_to_landing, next_snapshot_until, no_sleep, provider_view},
+    server::{
+        dispatch_client_command, drive_app_to_landing, next_snapshot_until, no_sleep, provider_view,
+    },
 };
 
 #[tokio::test]
 async fn client_stream_renders_config_status_with_real_server() {
     let server = setup_server();
-    let mut seeder = ClientRuntime::for_endpoint(server.base_url());
-    seeder
-        .dispatch(ClientCommand::RequestConfig, no_sleep)
-        .await
-        .expect("seed config load should succeed");
-    seeder
-        .dispatch(
-            ClientCommand::AddProvider {
-                provider: provider_view("anthropic"),
-            },
-            no_sleep,
-        )
-        .await
-        .expect("seed provider add should succeed");
+    let mut seeder = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
+    dispatch_client_command(&mut seeder, ClientCommand::RequestConfig).await;
+    next_snapshot_until(&mut seeder, &mut App::new(), |snapshot| {
+        snapshot.config.current.is_some()
+    })
+    .await;
+    dispatch_client_command(
+        &mut seeder,
+        ClientCommand::AddProvider {
+            provider: provider_view("anthropic"),
+        },
+    )
+    .await;
+    next_snapshot_until(&mut seeder, &mut App::new(), |snapshot| {
+        snapshot.config.patch.status == "ready"
+    })
+    .await;
 
-    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream();
+    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
 
     drive_app_to_landing(&mut stream, &mut app).await;
@@ -41,18 +46,18 @@ async fn client_stream_renders_config_status_with_real_server() {
     assert_eq!(register, ClientCommand::RegisterConfigWatchInterest);
     assert_eq!(app.screen(), AppScreen::Config);
 
-    let opened = stream
-        .dispatch(register, no_sleep)
-        .await
-        .expect("config watch interest should register");
-    assert_eq!(opened.config.watch.status, "opened");
+    let opening = dispatch_client_command(&mut stream, register).await;
     assert_eq!(
         app.handle_event(
-            &waltr_tui::event::AppEvent::Client(Box::new(opened)),
+            &waltr_tui::event::AppEvent::Client(Box::new(opening)),
             Instant::now()
         ),
         AppAction::Continue
     );
+    next_snapshot_until(&mut stream, &mut app, |snapshot| {
+        snapshot.config.watch.status == "opened"
+    })
+    .await;
 
     let rendered = render_app(&app);
     assert!(rendered.contains("┌ Configuration"));
@@ -83,10 +88,7 @@ async fn client_stream_renders_config_status_with_real_server() {
     };
     assert_eq!(release, ClientCommand::ReleaseConfigWatchInterest);
 
-    let released = stream
-        .dispatch(release, no_sleep)
-        .await
-        .expect("config watch interest should release");
+    let released = dispatch_client_command(&mut stream, release).await;
     assert_eq!(released.config.watch.status, "idle");
     assert_eq!(app.screen(), AppScreen::Landing);
 }

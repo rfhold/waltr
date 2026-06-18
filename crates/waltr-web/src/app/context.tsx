@@ -18,6 +18,7 @@ export type AppState = {
   clientLoaded: Accessor<boolean>;
   systemReady: Accessor<boolean>;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
+  dispatchConfigPatch: (command: ClientCommand) => Promise<ClientSnapshot>;
 };
 
 export const AppStateContext = createContext<AppState>();

@@ -8,16 +8,24 @@ use crate::{
 
 pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
     match event {
-        SessionEvent::CreateRequested => {
-            state.set_session_create_loading();
-            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Create))
+        SessionEvent::CreateRequested(operation_key) => {
+            state.set_session_create_loading(operation_key.clone());
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Create {
+                operation_key,
+            }))
         }
-        SessionEvent::Created(session) => {
-            state.set_session_create_ready(session);
+        SessionEvent::Created {
+            operation_key,
+            session,
+        } => {
+            state.set_session_create_ready(operation_key, session);
             ClientUpdate::default()
         }
-        SessionEvent::CreateFailed(error) => {
-            state.set_session_create_failed(error.to_string());
+        SessionEvent::CreateFailed {
+            operation_key,
+            error,
+        } => {
+            state.set_session_create_failed(operation_key, error.to_string());
             ClientUpdate::default()
         }
         SessionEvent::ListRequested => {

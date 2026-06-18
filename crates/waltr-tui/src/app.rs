@@ -267,14 +267,8 @@ impl App {
             self.screen = AppScreen::Landing;
         }
 
-        self.provider_section.reconcile_patch(
-            snapshot.config.patch.status,
-            snapshot.config.patch.error.as_deref(),
-        );
-        self.mcp_section.reconcile_patch(
-            snapshot.config.patch.status,
-            snapshot.config.patch.error.as_deref(),
-        );
+        self.provider_section.reconcile_patch(&snapshot);
+        self.mcp_section.reconcile_patch(&snapshot);
 
         let provider_count = snapshot
             .config

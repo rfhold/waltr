@@ -85,7 +85,7 @@ export function McpServersSection(props: ParentProps & {
   const closeForm = () => navigate("/config/mcp");
 
   const saveServer = (form: McpServerForm) =>
-    saveMcpServer(app.dispatch, form, closeForm, setOperationPending, setOperationError);
+    saveMcpServer(app.dispatchConfigPatch, form, closeForm, setOperationPending, setOperationError);
 
   const sectionState: McpServersSectionState = {
     watchedConfig,
@@ -168,7 +168,7 @@ export function McpServersSection(props: ParentProps & {
                         confirmAriaLabel={`Confirm delete ${serverName}`}
                         cancelAriaLabel={`Cancel delete ${serverName}`}
                         pending={operationPending()}
-                        onConfirm={() => deleteMcpServerByName(app.dispatch, serverName, setDeleteServer, setOperationPending, setOperationError)}
+                        onConfirm={() => deleteMcpServerByName(app.dispatchConfigPatch, serverName, setDeleteServer, setOperationPending, setOperationError)}
                         onCancel={() => setDeleteServer(undefined)}
                       />
                     </Show>

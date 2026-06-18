@@ -13,6 +13,7 @@ export function snapshotWithConfig(
   options: { ready?: boolean } = {},
 ): ClientSnapshot {
   return {
+    operations: { current: {} },
     config: {
       current: config,
       load: operationSnapshot("idle"),
@@ -37,7 +38,7 @@ export function emptySessionSnapshot(): SessionSnapshot {
 }
 
 export function operationSnapshot(status: string): OperationSnapshot {
-  return { status, error: null };
+  return { status, error: null, key: null };
 }
 
 export function emptyConfig(etag = "v1"): ConfigView {

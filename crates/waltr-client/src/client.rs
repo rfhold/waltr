@@ -3,7 +3,8 @@
 use crate::coordination::{config, session, status, stream};
 use crate::{
     ClientEffect, ClientError, ClientEvent, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
-    Configuration, McpServer, Provider, ProviderEditBaseline, SessionEvent, StatusEvent,
+    Configuration, McpServer, OperationKey, Provider, ProviderEditBaseline, SessionEvent,
+    StatusEvent,
 };
 
 /// Single headless client reducer used by shells.
@@ -57,7 +58,10 @@ impl Client {
 
     /// Request that a new server-side session be created.
     pub fn create_session(&mut self) -> ClientUpdate {
-        self.apply(ClientEvent::Session(SessionEvent::CreateRequested))
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(SessionEvent::CreateRequested(
+            operation_key,
+        )))
     }
 
     /// Request that the current server-side sessions be loaded.
@@ -112,10 +116,23 @@ impl Client {
         patch: ConfigPatch,
         expected_etag: impl Into<String>,
     ) -> ClientUpdate {
-        let mut update = self.apply(ClientEvent::Config(ConfigEvent::PatchRequested));
+        let operation_key = self.state.next_operation_key();
+        self.request_config_patch_with_key(patch, expected_etag, operation_key)
+    }
+
+    fn request_config_patch_with_key(
+        &mut self,
+        patch: ConfigPatch,
+        expected_etag: impl Into<String>,
+        operation_key: OperationKey,
+    ) -> ClientUpdate {
+        let mut update = self.apply(ClientEvent::Config(ConfigEvent::PatchRequested(
+            operation_key.clone(),
+        )));
         update
             .effects
             .push(ClientEffect::Config(ConfigEffect::Patch {
+                operation_key,
                 patch,
                 expected_etag: expected_etag.into(),
             }));
@@ -506,10 +523,13 @@ mod tests {
         let config = config_with_provider("anthropic", "etag-1");
 
         client.apply(ClientEvent::Config(ConfigEvent::Loaded(config.clone())));
-        client.apply(ClientEvent::Config(ConfigEvent::PatchRequested));
-        client.apply(ClientEvent::Config(ConfigEvent::PatchFailed(
-            ClientError::new("patch failed"),
+        client.apply(ClientEvent::Config(ConfigEvent::PatchRequested(
+            "op-test".to_owned(),
         )));
+        client.apply(ClientEvent::Config(ConfigEvent::PatchFailed {
+            operation_key: "op-test".to_owned(),
+            error: ClientError::new("patch failed"),
+        }));
 
         assert_eq!(client.state().config.load.status, OperationStatus::Ready);
         assert_eq!(client.state().config.patch.status, OperationStatus::Failed);
@@ -1108,6 +1128,7 @@ mod tests {
             ClientEffect::Config(ConfigEffect::Patch {
                 patch,
                 expected_etag,
+                ..
             }) => (patch, expected_etag),
             effect => panic!("expected patch effect, got {effect:?}"),
         }

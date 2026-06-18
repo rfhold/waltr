@@ -53,7 +53,7 @@ describe("config read", () => {
           current: null,
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
-          watch: { status: "waiting", error: "watch failed" },
+          watch: { status: "waiting", error: "watch failed", key: null },
         },
       },
     });

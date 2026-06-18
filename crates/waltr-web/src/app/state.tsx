@@ -21,6 +21,7 @@ type AppStateProviderProps = ParentProps<{
 export function AppStateProvider(props: AppStateProviderProps) {
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
+  const configPatchWaiters = new Set<ConfigPatchWaiter>();
   const [wasmClient] = createResource(() =>
     (props.loadWasmClient ?? loadWasmClient)(),
   );
@@ -37,8 +38,14 @@ export function AppStateProvider(props: AppStateProviderProps) {
       return;
     }
 
-    setSnapshot(client.snapshot());
-    const unsubscribe = client.subscribe(setSnapshot);
+    const initialSnapshot = client.snapshot();
+    if (initialSnapshot) {
+      publishSnapshot(initialSnapshot, setSnapshot, configPatchWaiters);
+    }
+
+    const unsubscribe = client.subscribe((snapshot) => {
+      publishSnapshot(snapshot, setSnapshot, configPatchWaiters);
+    });
     let cancelled = false;
 
     void client.start().catch((error) => {
@@ -71,6 +78,36 @@ export function AppStateProvider(props: AppStateProviderProps) {
     return client.dispatch(command);
   };
 
+  const dispatchConfigPatch = async (command: ClientCommand) => {
+    const client = wasmClient();
+
+    if (!client) {
+      throw new Error("client is not loaded");
+    }
+
+    const immediate = await client.dispatch(command);
+    const key = immediate.config.patch.key;
+
+    if (!key) {
+      throw new Error("config patch command did not produce an operation key");
+    }
+
+    const current = snapshot() ?? immediate;
+    const currentResult = configPatchResult(current, key);
+    if (currentResult?.status === "ready") {
+      return current;
+    }
+    if (currentResult?.status === "failed") {
+      throw new Error(currentResult.error ?? "config patch failed");
+    }
+
+    return new Promise<ClientSnapshot>((resolve, reject) => {
+      const waiter: ConfigPatchWaiter = { key, resolve, reject };
+      configPatchWaiters.add(waiter);
+      settleConfigPatchWaiter(waiter, snapshot() ?? immediate, configPatchWaiters);
+    });
+  };
+
   return (
     <AppStateContextProvider
       value={{
@@ -82,11 +119,58 @@ export function AppStateProvider(props: AppStateProviderProps) {
         clientLoaded: () => Boolean(wasmClient()),
         systemReady,
         dispatch,
+        dispatchConfigPatch,
       }}
     >
       {props.children}
     </AppStateContextProvider>
   );
+}
+
+type ConfigPatchWaiter = {
+  key: string;
+  resolve: (snapshot: ClientSnapshot) => void;
+  reject: (error: Error) => void;
+};
+
+function publishSnapshot(
+  snapshot: ClientSnapshot,
+  setSnapshot: (snapshot: ClientSnapshot) => void,
+  configPatchWaiters: Set<ConfigPatchWaiter>,
+) {
+  setSnapshot(snapshot);
+  settleConfigPatchWaiters(snapshot, configPatchWaiters);
+}
+
+function settleConfigPatchWaiters(
+  snapshot: ClientSnapshot,
+  configPatchWaiters: Set<ConfigPatchWaiter>,
+) {
+  for (const waiter of configPatchWaiters) {
+    settleConfigPatchWaiter(waiter, snapshot, configPatchWaiters);
+  }
+}
+
+function settleConfigPatchWaiter(
+  waiter: ConfigPatchWaiter,
+  snapshot: ClientSnapshot,
+  configPatchWaiters: Set<ConfigPatchWaiter>,
+) {
+  const result = configPatchResult(snapshot, waiter.key);
+
+  if (result?.status === "ready") {
+    configPatchWaiters.delete(waiter);
+    waiter.resolve(snapshot);
+  } else if (result?.status === "failed") {
+    configPatchWaiters.delete(waiter);
+    waiter.reject(new Error(result.error ?? "config patch failed"));
+  }
+}
+
+function configPatchResult(snapshot: ClientSnapshot, key: string) {
+  const result = snapshot.operations.current[key];
+
+  return result?.kind === "configPatch" ? result : undefined;
 }
 
 function sleep(milliseconds: number): Promise<void> {

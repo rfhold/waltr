@@ -43,4 +43,28 @@ describe("provider config", () => {
     expect(commands.map((command) => command.type)).toContain("updateProvider");
     expect(commands.map((command) => command.type)).toContain("deleteProvider");
   });
+
+  test("keeps provider form open until keyed patch failure is surfaced", async () => {
+    const commands: ClientCommand[] = [];
+
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      configPatchError: "provider write failed",
+      snapshot: snapshotWithConfig(claudeConfig()),
+    });
+
+    fireEvent.click(screen.getByText("Create"));
+    await waitFor(() => expect(testHistory().get()).toBe("/config/provider/create"));
+    fireEvent.input(screen.getByLabelText("Name"), { target: { value: "openai" } });
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "openAi" } });
+    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://api.openai.com" } });
+    fireEvent.submit(screen.getByLabelText("Create provider"));
+
+    expect(screen.getByRole("button", { name: "Save" }).hasAttribute("disabled")).toBe(true);
+    await waitFor(() => expect(screen.getByText("provider write failed")).toBeTruthy());
+
+    expect(screen.getByRole("dialog", { name: "Create provider dialog" })).toBeTruthy();
+    expect(testHistory().get()).toBe("/config/provider/create");
+    expect(commands.map((command) => command.type)).toContain("addProvider");
+  });
 });

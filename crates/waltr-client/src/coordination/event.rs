@@ -1,7 +1,7 @@
 //! Shell-neutral client events and side-effect intents.
 
 use crate::transport::{ConfigWatchUpdate, SessionWatchUpdate};
-use crate::{ClientError, Configuration, Provider, SessionSummary, SystemStatus};
+use crate::{ClientError, Configuration, OperationKey, Provider, SessionSummary, SystemStatus};
 
 /// Runtime-local identifier for a streamed response.
 pub type StreamId = u64;
@@ -29,11 +29,21 @@ pub enum ConfigEvent {
     /// The current configuration failed to load.
     LoadFailed(ClientError),
     /// A caller requested a configuration patch.
-    PatchRequested,
+    PatchRequested(OperationKey),
     /// The configuration patch completed successfully.
-    Patched(Configuration),
+    Patched {
+        /// Operation key allocated when the patch was requested.
+        operation_key: OperationKey,
+        /// Patched configuration returned by the server.
+        config: Configuration,
+    },
     /// The configuration patch failed.
-    PatchFailed(ClientError),
+    PatchFailed {
+        /// Operation key allocated when the patch was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the patch effect.
+        error: ClientError,
+    },
     /// A caller registered interest in configuration watch updates.
     WatchInterestRegistered,
     /// A caller released interest in configuration watch updates.
@@ -71,11 +81,21 @@ pub enum StatusEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
     /// A caller requested a new session.
-    CreateRequested,
+    CreateRequested(OperationKey),
     /// A session was created successfully.
-    Created(SessionSummary),
+    Created {
+        /// Operation key allocated when session creation was requested.
+        operation_key: OperationKey,
+        /// Created session returned by the server.
+        session: SessionSummary,
+    },
     /// Session creation failed.
-    CreateFailed(ClientError),
+    CreateFailed {
+        /// Operation key allocated when session creation was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the create effect.
+        error: ClientError,
+    },
     /// A caller requested the current session list.
     ListRequested,
     /// The current session list loaded successfully.
@@ -125,6 +145,8 @@ pub enum ConfigEffect {
     Load,
     /// Patch top-level configuration sections using an expected entity tag.
     Patch {
+        /// Operation key allocated when the patch was requested.
+        operation_key: OperationKey,
         /// Top-level section patch to submit.
         patch: ConfigPatch,
         /// Entity tag expected by the caller.
@@ -155,7 +177,10 @@ pub enum StatusEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEffect {
     /// Create a server-side session.
-    Create,
+    Create {
+        /// Operation key allocated when session creation was requested.
+        operation_key: OperationKey,
+    },
     /// Load the current server-side session list.
     List,
     /// Open or continue the session watch stream.

@@ -3,7 +3,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use waltr_client::{ConfigChange, ConfigView, ProviderKindView, ProviderView};
+use futures_channel::oneshot;
+use waltr_client::{
+    ClientCommand, ClientCommandRequest, ClientError, ClientSnapshot, ClientStateStream,
+    ClientStateStreamEvent, ConfigChange, ConfigView, ProviderKindView, ProviderView,
+};
 
 pub fn assert_config_matches(actual: &ConfigView, expected: &ConfigView) {
     assert_config_matches_without_etag(actual, expected);
@@ -63,13 +67,43 @@ pub fn provider_view(name: &str) -> ProviderView {
 pub async fn no_sleep(_delay_ms: u64) {}
 
 #[allow(clippy::future_not_send)]
+pub async fn dispatch_stream_command(
+    stream: &mut ClientStateStream,
+    command: ClientCommand,
+) -> Result<ClientSnapshot, ClientError> {
+    for _ in 0..32 {
+        let (sender, receiver) = oneshot::channel();
+        let event = stream
+            .next_or_dispatch(async {
+                Some(ClientCommandRequest::with_result(command.clone(), sender))
+            })
+            .await;
+
+        let ClientStateStreamEvent::Snapshot(snapshot) = event else {
+            panic!("shared state stream closed while dispatching command");
+        };
+
+        match receiver.await {
+            Ok(result) => {
+                if let Ok(result_snapshot) = &result {
+                    assert_eq!(snapshot.as_ref(), result_snapshot);
+                }
+                return result;
+            }
+            Err(oneshot::Canceled) => {}
+        }
+    }
+
+    panic!("shared state stream did not accept command before retry limit");
+}
+
 pub async fn next_snapshot_until(
-    stream: &mut waltr_client::ClientStateStream,
-    mut matches: impl FnMut(&waltr_client::ClientSnapshot) -> bool,
-) -> waltr_client::ClientSnapshot {
+    stream: &mut ClientStateStream,
+    mut matches: impl FnMut(&ClientSnapshot) -> bool,
+) -> ClientSnapshot {
     let mut last_snapshot = None;
     for _ in 0..32 {
-        let snapshot = tokio::time::timeout(Duration::from_secs(2), stream.next(no_sleep))
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
             .expect("shared state stream should make progress");
         if matches(&snapshot) {

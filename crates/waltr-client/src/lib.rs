@@ -18,13 +18,14 @@ pub use coordination::event::{
     SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
-    ClientCommand, ClientCommandRequest, ClientRuntime, ClientSnapshot, ClientStateStream,
-    ClientStateStreamEvent, ConfigSnapshot, OperationSnapshot, SessionSnapshot, StatusSnapshot,
+    ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime, ClientSnapshot,
+    ClientStateStream, ClientStateStreamEvent, ConfigSnapshot, OperationCollectionSnapshot,
+    OperationSnapshot, SessionSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
-    ClientState, ConfigClientState, OperationState, OperationStatus, SessionClientState,
-    StatusClientState, StreamClientState, StreamState, StreamStatus, WatchState,
-    watch_reconnect_delay_ms,
+    ClientOperationState, ClientState, ConfigClientState, OperationKey, OperationState,
+    OperationStatus, SessionClientState, StatusClientState, StreamClientState, StreamState,
+    StreamStatus, WatchState, watch_reconnect_delay_ms,
 };
 pub use error::ClientError;
 pub use executor::{

@@ -1,18 +1,22 @@
-use waltr_client::{ClientCommand, ClientRuntime};
+use waltr_client::{ClientCommand, ClientOperationView, ClientRuntime};
 
 use crate::support::{
     server::server_endpoint,
-    snapshots::{no_sleep, provider_view},
+    snapshots::{dispatch_stream_command, next_snapshot_until, no_sleep, provider_view},
 };
 
 #[tokio::test]
-async fn runtime_dispatches_config_provider_commands() {
-    let mut runtime = ClientRuntime::for_endpoint(server_endpoint());
+async fn stream_dispatches_config_provider_commands() {
+    let runtime = ClientRuntime::for_endpoint(server_endpoint());
+    let mut stream = runtime.into_state_stream(no_sleep);
 
-    let initial = runtime
-        .dispatch(ClientCommand::RequestConfig, no_sleep)
+    dispatch_stream_command(&mut stream, ClientCommand::RequestConfig)
         .await
         .expect("config should load");
+    let initial = next_snapshot_until(&mut stream, |snapshot| {
+        snapshot.config.load.status == "ready" && snapshot.config.current.is_some()
+    })
+    .await;
     let initial_config = initial
         .config
         .current
@@ -20,31 +24,66 @@ async fn runtime_dispatches_config_provider_commands() {
     assert!(initial_config.providers.is_empty());
     assert!(!initial_config.etag.is_empty());
 
-    let patched = runtime
-        .dispatch(
-            ClientCommand::AddProvider {
-                provider: provider_view("anthropic"),
-            },
-            no_sleep,
+    let patch_started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::AddProvider {
+            provider: provider_view("anthropic"),
+        },
+    )
+    .await
+    .expect("provider should be added");
+    assert_eq!(patch_started.config.patch.status, "loading");
+    let operation_key = patch_started
+        .config
+        .patch
+        .key
+        .clone()
+        .expect("config patch should expose operation key");
+    assert!(matches!(
+        patch_started.operations.current.get(&operation_key),
+        Some(ClientOperationView::ConfigPatch {
+            status: "loading",
+            ..
+        })
+    ));
+
+    let patched = next_snapshot_until(&mut stream, |snapshot| {
+        matches!(
+            snapshot.operations.current.get(&operation_key),
+            Some(ClientOperationView::ConfigPatch {
+                status: "ready",
+                ..
+            })
         )
-        .await
-        .expect("provider should be added");
+    })
+    .await;
     let patched_config = patched
         .config
         .current
         .expect("patched snapshot should include config");
+    assert_eq!(
+        patched.config.patch.key.as_deref(),
+        Some(operation_key.as_str())
+    );
+    let Some(ClientOperationView::ConfigPatch {
+        config: Some(operation_config),
+        ..
+    }) = patched.operations.current.get(&operation_key)
+    else {
+        panic!("patch operation should include patched config result");
+    };
+    assert_eq!(operation_config, &patched_config);
     assert_eq!(patched_config.providers.len(), 1);
     assert!(patched_config.providers.contains_key("anthropic"));
     assert_ne!(patched_config.etag, initial_config.etag);
 
-    let duplicate_error = runtime
-        .dispatch(
-            ClientCommand::AddProvider {
-                provider: provider_view("anthropic"),
-            },
-            no_sleep,
-        )
-        .await
-        .expect_err("duplicate provider should be rejected");
+    let duplicate_error = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::AddProvider {
+            provider: provider_view("anthropic"),
+        },
+    )
+    .await
+    .expect_err("duplicate provider should be rejected");
     assert!(duplicate_error.to_string().contains("already used"));
 }
