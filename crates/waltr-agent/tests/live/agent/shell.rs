@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use waltr_agent::{
-    AgentRuntime, AgentSessions, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef,
+    AgentRuntime, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmStream, ModelRef,
     PermissionCommandPattern, PermissionEffect, PermissionPolicy, PermissionToolSelector,
     TimelineContent, tools::shell::ShellConfig,
 };
