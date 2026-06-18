@@ -12,8 +12,8 @@ use waltr_agent::{
     AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST,
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse,
     FilesystemSessionStore, OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore,
-    SessionStore, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery,
-    TimelineStatus, opendal_postgresql_session_store,
+    SessionStore, SessionStoreError, TimelineChannel, TimelineContent, TimelineEventKind,
+    TimelineQuery, TimelineStatus, opendal_postgresql_session_store,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 use opendal::{Operator, services};
@@ -164,6 +164,13 @@ where
     );
 
     assert_timeline_surface(&store, &session_id, label).await?;
+    store.delete(&session_id).await.map_err(store_error)?;
+    store.delete(&session_id).await.map_err(store_error)?;
+    let error = store.load(&session_id).await.unwrap_err();
+    assert!(
+        matches!(error, SessionStoreError::NotFound { .. }),
+        "{label}: deleted session should not load: {error:?}"
+    );
     Ok(())
 }
 

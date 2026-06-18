@@ -176,6 +176,25 @@ impl SessionStore for ScyllaSessionStore {
         async move { store.load_record(&id).await }
     }
 
+    fn delete(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            store
+                .session
+                .query_unpaged(
+                    format!("DELETE FROM {} WHERE session_id = ?", store.table_name()),
+                    (id.as_str(),),
+                )
+                .await
+                .map_err(backend_error)?;
+            Ok(())
+        }
+    }
+
     fn list(
         &self,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {

@@ -125,6 +125,21 @@ impl SessionStore for OpenDalSessionStore {
         async move { store.load_record(&id).await }
     }
 
+    fn delete(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            match store.operator.delete(&store.key(&id)).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(backend_error(error)),
+            }
+        }
+    }
+
     fn list(
         &self,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {

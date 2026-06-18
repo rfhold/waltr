@@ -166,6 +166,25 @@ impl SessionStore for S3SessionStore {
         async move { store.load_record(&id).await }
     }
 
+    fn delete(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            store
+                .client
+                .delete_object()
+                .bucket(&store.bucket)
+                .key(store.key(&id))
+                .send()
+                .await
+                .map_err(backend_error)?;
+            Ok(())
+        }
+    }
+
     fn list(
         &self,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {

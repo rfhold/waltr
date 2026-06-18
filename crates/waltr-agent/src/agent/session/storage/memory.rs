@@ -102,6 +102,22 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    fn delete(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            records.remove(&id);
+            Ok(())
+        }
+    }
+
     fn list(
         &self,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
@@ -292,6 +308,23 @@ mod tests {
         assert_eq!(loaded_again.id, id);
         assert_eq!(loaded_again.revision, Revision::ZERO);
         assert!(loaded_again.journal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+
+        store.create(id.clone()).await.unwrap();
+        store.delete(&id).await.unwrap();
+        store.delete(&id).await.unwrap();
+        store
+            .delete(&SessionId::new("never-created"))
+            .await
+            .unwrap();
+
+        let error = store.load(&id).await.unwrap_err();
+        assert_eq!(error, SessionStoreError::NotFound { id });
     }
 
     #[tokio::test]

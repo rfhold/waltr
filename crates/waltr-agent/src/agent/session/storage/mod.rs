@@ -132,6 +132,9 @@ pub trait SessionStore: Send + Sync {
         id: &SessionId,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
+    /// Delete a session record if present.
+    fn delete(&self, id: &SessionId) -> impl Future<Output = SessionStoreResult<()>> + Send;
+
     /// List known sessions, newest activity first.
     fn list(&self) -> impl Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send;
 

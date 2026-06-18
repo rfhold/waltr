@@ -23,4 +23,4 @@ pub use types::{
     RequestRecord, ResumeInput, Revision, SessionId, SessionJournalEvent, SessionRecord,
     SessionSnapshot, SessionStatus, SessionSummary, Suspension,
 };
-pub use watch::{SessionListSubscription, SessionListUpdate};
+pub use watch::{SessionListEvent, SessionListSubscription, SessionListUpdate};
