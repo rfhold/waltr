@@ -3,7 +3,7 @@
 use crate::transport::ConfigWatchUpdate;
 use crate::{
     ClientEffect, ClientState, ClientUpdate, ConfigEffect, ConfigEvent, Configuration,
-    OperationStatus, StatusEffect,
+    OperationStatus,
 };
 
 pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
@@ -130,14 +130,6 @@ fn merged_watch_config(state: &ClientState, update: &ConfigWatchUpdate) -> Optio
 fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {
     if state.config.watch.interests == 0 {
         return ClientUpdate::default();
-    }
-
-    if state.status.watch.status == OperationStatus::Received {
-        let delay_ms = state.set_status_watch_failed(message);
-        state.set_config_watch_waiting();
-        return ClientUpdate::with_effect(ClientEffect::Status(StatusEffect::SleepReconnect {
-            delay_ms,
-        }));
     }
 
     let delay_ms = state.set_config_watch_failed(message);

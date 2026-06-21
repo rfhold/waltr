@@ -11,14 +11,34 @@ async fn client_surface_deletes_session_and_updates_snapshot() {
 
     next_snapshot_until(&mut stream, |snapshot| snapshot.status.ready).await;
 
-    dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
+    let create_started = dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
         .await
         .expect("session create should succeed");
+    let create_key = create_started
+        .sessions
+        .create
+        .key
+        .clone()
+        .expect("session create should expose operation key");
     let created = next_snapshot_until(&mut stream, |snapshot| {
-        snapshot.sessions.current.len() == 1 && snapshot.sessions.create.status == "ready"
+        matches!(
+            snapshot.operations.current.get(&create_key),
+            Some(ClientOperationView::SessionCreate {
+                status: "ready",
+                ..
+            })
+        )
     })
     .await;
-    let id = created.sessions.current[0].id.clone();
+    let Some(ClientOperationView::SessionCreate {
+        session: Some(session),
+        ..
+    }) = created.operations.current.get(&create_key)
+    else {
+        panic!("session create operation should include created session result");
+    };
+    let id = session.id.clone();
+    assert!(created.sessions.current.is_empty());
 
     let started =
         dispatch_stream_command(&mut stream, ClientCommand::DeleteSession { id: id.clone() })

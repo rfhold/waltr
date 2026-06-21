@@ -886,7 +886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_transport_loss_reconnects_status_before_config() {
+    async fn config_transport_loss_reconnects_config_without_failing_status() {
         let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
         runtime
             .reducer
@@ -908,12 +908,12 @@ mod tests {
         let update = runtime.reducer.apply(event);
         let snapshot = runtime.snapshot();
 
-        assert_eq!(snapshot.status.watch.status, "failed");
-        assert!(!snapshot.status.ready);
-        assert_eq!(snapshot.config.watch.status, "waiting");
+        assert_eq!(snapshot.status.watch.status, "received");
+        assert!(snapshot.status.ready);
+        assert_eq!(snapshot.config.watch.status, "failed");
         assert!(matches!(
             update.effects(),
-            [ClientEffect::Status(StatusEffect::SleepReconnect {
+            [ClientEffect::Config(ConfigEffect::SleepReconnect {
                 delay_ms: 500,
             })]
         ));

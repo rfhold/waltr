@@ -26,6 +26,8 @@ pub struct SessionWatchUpdate {
 /// Internal session watch event from the transport layer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionWatchEvent {
+    /// Full session list snapshot sent when the watch opens.
+    Snapshot(Vec<SessionSummary>),
     /// Full created or changed session summary.
     Upsert(SessionSummary),
     /// Deleted session id.
@@ -124,6 +126,9 @@ fn session_watch_update(
     response: WatchSessionsResponse,
 ) -> Result<SessionWatchUpdate, tonic::Status> {
     let event = match response.event {
+        Some(watch_sessions_response::Event::Snapshot(snapshot)) => {
+            SessionWatchEvent::Snapshot(snapshot.sessions)
+        }
         Some(watch_sessions_response::Event::Session(session)) => {
             SessionWatchEvent::Upsert(session)
         }
