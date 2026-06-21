@@ -20,6 +20,8 @@ pub enum KeyCommand {
 pub enum LeaderCommand {
     /// Open the configuration screen.
     Config,
+    /// Open the sessions screen.
+    Sessions,
     /// Quit the app immediately.
     Quit,
     /// Unknown leader command text for notices.
@@ -50,6 +52,10 @@ pub fn key_command(key: KeyEvent, leader_armed: bool) -> KeyCommand {
 fn leader_command(key: KeyEvent) -> LeaderCommand {
     if matches!(key.code, KeyCode::Char('c')) {
         return LeaderCommand::Config;
+    }
+
+    if matches!(key.code, KeyCode::Char('s')) {
+        return LeaderCommand::Sessions;
     }
 
     if matches!(key.code, KeyCode::Char('q')) {

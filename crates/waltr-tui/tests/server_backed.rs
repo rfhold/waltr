@@ -9,3 +9,6 @@ mod config;
 
 #[path = "server-backed/status.rs"]
 mod status;
+
+#[path = "server-backed/sessions.rs"]
+mod sessions;

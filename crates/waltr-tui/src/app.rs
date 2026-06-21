@@ -10,7 +10,7 @@ use crate::{
     event::AppEvent,
     input::InputEvent,
     keys::{KeyCommand, LeaderCommand, key_command},
-    screens::{ConfigTab, McpSection, ProviderSection, SectionAction},
+    screens::{ConfigTab, McpSection, ProviderSection, SectionAction, SessionsSection},
     ui,
     ui::Notice,
 };
@@ -52,6 +52,8 @@ pub enum AppScreen {
     Landing,
     /// Read-only configuration view.
     Config,
+    /// Server-side session list/detail view.
+    Sessions,
 }
 
 impl CloseIntent {
@@ -70,6 +72,7 @@ pub struct App {
     active_config_tab: ConfigTab,
     provider_section: ProviderSection,
     mcp_section: McpSection,
+    sessions_section: SessionsSection,
     leader_armed: bool,
     notice: Option<TransientNotice>,
     screen: AppScreen,
@@ -85,6 +88,7 @@ impl App {
             active_config_tab: ConfigTab::Providers,
             provider_section: ProviderSection::new(),
             mcp_section: McpSection::new(),
+            sessions_section: SessionsSection::new(),
             leader_armed: false,
             notice: None,
             screen: AppScreen::Waiting,
@@ -122,6 +126,9 @@ impl App {
             InputEvent::CtrlC => self.handle_close_intent(CloseIntent::CtrlC, now),
             InputEvent::Key(key) if self.screen == AppScreen::Config => {
                 self.handle_config_key(key, now)
+            }
+            InputEvent::Key(key) if self.screen == AppScreen::Sessions => {
+                self.handle_sessions_key(key, now)
             }
             InputEvent::Key(key) => {
                 self.handle_key_command(key_command(key, self.leader_armed), now)
@@ -188,6 +195,12 @@ impl App {
         &self.mcp_section
     }
 
+    /// Return the sessions screen state.
+    #[must_use]
+    pub const fn sessions_section(&self) -> &SessionsSection {
+        &self.sessions_section
+    }
+
     fn handle_close_intent(&mut self, intent: CloseIntent, now: Instant) -> AppAction {
         self.leader_armed = false;
 
@@ -219,6 +232,16 @@ impl App {
                 self.armed_close = None;
                 AppAction::ClientCommand(ClientCommand::ReleaseConfigWatchInterest)
             }
+            KeyCommand::Escape if self.screen == AppScreen::Sessions => {
+                if self.sessions_section.dismiss_route_or_overlay() {
+                    return AppAction::Continue;
+                }
+
+                self.screen = AppScreen::Landing;
+                self.leader_armed = false;
+                self.armed_close = None;
+                AppAction::ClientCommand(ClientCommand::ReleaseSessionWatchInterest)
+            }
             KeyCommand::Escape => self.handle_close_intent(CloseIntent::Escape, now),
             KeyCommand::Leader => {
                 self.leader_armed = true;
@@ -246,6 +269,27 @@ impl App {
 
                 AppAction::Continue
             }
+            KeyCommand::LeaderCommand(LeaderCommand::Sessions) => {
+                self.leader_armed = false;
+
+                if self.screen == AppScreen::Sessions {
+                    return match self.sessions_section.create_session() {
+                        SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                        SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+                    };
+                }
+
+                if self
+                    .client_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.status.ready)
+                {
+                    self.screen = AppScreen::Sessions;
+                    return AppAction::ClientCommand(ClientCommand::RegisterSessionWatchInterest);
+                }
+
+                AppAction::Continue
+            }
             KeyCommand::LeaderCommand(LeaderCommand::Quit) => {
                 self.leader_armed = false;
                 AppAction::Exit
@@ -269,6 +313,7 @@ impl App {
 
         self.provider_section.reconcile_patch(&snapshot);
         self.mcp_section.reconcile_patch(&snapshot);
+        self.sessions_section.reconcile_operations(&snapshot);
 
         let provider_count = snapshot
             .config
@@ -283,6 +328,9 @@ impl App {
             .as_ref()
             .map_or(0, |config| config.mcp_servers.len());
         self.mcp_section.sync_selection(server_count);
+
+        self.sessions_section
+            .sync_selection(snapshot.sessions.current.len());
 
         self.client_snapshot = Some(snapshot);
     }
@@ -324,6 +372,21 @@ impl App {
             ConfigTab::Mcp => self.mcp_section.handle_key(key, config.as_ref()),
         };
         match action {
+            SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+            SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+        }
+    }
+
+    fn handle_sessions_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        let command = key_command(key, self.leader_armed);
+        if !matches!(command, KeyCommand::None) {
+            return self.handle_key_command(command, now);
+        }
+
+        match self
+            .sessions_section
+            .handle_key(key, self.client_snapshot.as_ref())
+        {
             SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
             SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
         }
