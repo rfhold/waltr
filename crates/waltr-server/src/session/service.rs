@@ -5,8 +5,9 @@ use std::{pin::Pin, sync::Arc};
 use super::{convert::session_summary_to_proto, error::agent_error_to_status};
 use waltr::grpc::waltr::session::v1::{
     CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
-    ListSessionsRequest, ListSessionsResponse, WatchSessionsRequest, WatchSessionsResponse,
-    session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
+    ListSessionsRequest, ListSessionsResponse, SessionListSnapshot, WatchSessionsRequest,
+    WatchSessionsResponse, session_service_server::SessionService as GeneratedSessionService,
+    watch_sessions_response,
 };
 use waltr_agent::{AgentSessions, SessionId, SessionListEvent, SessionStore};
 use tokio_stream::{Stream, StreamExt as _};
@@ -103,7 +104,23 @@ where
         _request: Request<WatchSessionsRequest>,
     ) -> Result<Response<Self::WatchSessionsStream>, Status> {
         tracing::trace!("watch sessions requested");
-        let stream = self.sessions.watch_sessions().map(|update| {
+        let subscription = self.sessions.watch_sessions();
+        let sequence = subscription.initial_sequence();
+        let sessions = self
+            .sessions
+            .list()
+            .await
+            .map_err(agent_error_to_status)?
+            .into_iter()
+            .map(session_summary_to_proto)
+            .collect();
+        let snapshot = Ok(WatchSessionsResponse {
+            sequence,
+            event: Some(watch_sessions_response::Event::Snapshot(
+                SessionListSnapshot { sessions },
+            )),
+        });
+        let stream = tokio_stream::once(snapshot).chain(subscription.map(|update| {
             let event = match update.event {
                 SessionListEvent::Upsert(session) => {
                     watch_sessions_response::Event::Session(session_summary_to_proto(session))
@@ -117,7 +134,7 @@ where
                 sequence: update.sequence,
                 event: Some(event),
             })
-        });
+        }));
 
         Ok(Response::new(Box::pin(stream)))
     }
