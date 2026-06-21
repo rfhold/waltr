@@ -31,7 +31,7 @@ pub struct WatchSessionsRequest {
 pub struct WatchSessionsResponse {
     #[prost(uint64, tag="1")]
     pub sequence: u64,
-    #[prost(oneof="watch_sessions_response::Event", tags="2, 3")]
+    #[prost(oneof="watch_sessions_response::Event", tags="2, 3, 4")]
     pub event: ::core::option::Option<watch_sessions_response::Event>,
 }
 /// Nested message and enum types in `WatchSessionsResponse`.
@@ -39,10 +39,17 @@ pub mod watch_sessions_response {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Event {
         #[prost(message, tag="2")]
+        Snapshot(super::SessionListSnapshot),
+        #[prost(message, tag="3")]
         Session(super::SessionSummary),
-        #[prost(string, tag="3")]
+        #[prost(string, tag="4")]
         DeletedId(::prost::alloc::string::String),
     }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionListSnapshot {
+    #[prost(message, repeated, tag="1")]
+    pub sessions: ::prost::alloc::vec::Vec<SessionSummary>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionSummary {
