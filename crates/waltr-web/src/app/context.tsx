@@ -19,6 +19,8 @@ export type AppState = {
   systemReady: Accessor<boolean>;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispatchConfigPatch: (command: ClientCommand) => Promise<ClientSnapshot>;
+  dispatchCreateSession: () => Promise<ClientSnapshot>;
+  dispatchDeleteSession: (id: string) => Promise<ClientSnapshot>;
 };
 
 export const AppStateContext = createContext<AppState>();

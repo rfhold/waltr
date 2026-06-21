@@ -14,4 +14,13 @@ describe("shell routing", () => {
 
     expect(screen.getByText("Config").classList.contains("active")).toBe(true);
   });
+
+  test("marks session routes active in the shell", () => {
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions/session-a",
+      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {} }),
+    });
+
+    expect(screen.getAllByRole("link", { name: "Sessions" })[0]!.classList.contains("active")).toBe(true);
+  });
 });

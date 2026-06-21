@@ -12,12 +12,17 @@ import {
   ConfigRoute,
 } from "./config/ConfigRoute";
 import { LandingRoute } from "./landing/LandingRoute";
+import { SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "./sessions/SessionsRoute";
 
 export function AppRouter() {
   return (
     <Router root={AppLayout}>
       <Route path="/" component={ShellLayout}>
         <Route path="/" component={LandingRoute} />
+        <Route path="/sessions" component={SessionsRoute}>
+          <Route path="/" component={SessionsListRoute} />
+          <Route path="/:sessionId" component={SessionsDetailRoute} />
+        </Route>
         <Route path="/config" component={ConfigRoute}>
           <Route path="/" component={() => <Navigate href="/config/provider" />} />
           <Route path="/provider/create/models/create" component={ConfigModelCreateRoute} />

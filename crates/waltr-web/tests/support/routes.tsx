@@ -13,6 +13,7 @@ import {
 import { LandingRoute } from "../../src/routes/landing/LandingRoute";
 import { AppLayout } from "../../src/routes/layouts/AppLayout";
 import { ShellLayout } from "../../src/routes/layouts/ShellLayout";
+import { SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "../../src/routes/sessions/SessionsRoute";
 import { SplashRoute } from "../../src/routes/splash/SplashRoute";
 
 let currentHistory: MemoryHistory = createMemoryHistory();
@@ -52,6 +53,10 @@ export function ShellRouteWithChildren() {
       <MemoryRouter history={currentHistory}>
         <Route path="/" component={ShellLayout}>
           <Route path="/" component={LandingRoute} />
+          <Route path="/sessions" component={SessionsRoute}>
+            <Route path="/" component={SessionsListRoute} />
+            <Route path="/:sessionId" component={SessionsDetailRoute} />
+          </Route>
           <Route path="/config" component={ConfigRoute}>
             <Route path="/" component={() => <Navigate href="/config/provider" />} />
             <Route path="/provider/create/models/create" component={ConfigModelCreateRoute} />
@@ -68,6 +73,17 @@ export function ShellRouteWithChildren() {
         </Route>
       </MemoryRouter>
     </AppLayout>
+  );
+}
+
+export function SessionsRouteWithRouter() {
+  return (
+    <MemoryRouter history={currentHistory}>
+      <Route path="/sessions" component={SessionsRoute}>
+        <Route path="/" component={SessionsListRoute} />
+        <Route path="/:sessionId" component={SessionsDetailRoute} />
+      </Route>
+    </MemoryRouter>
   );
 }
 

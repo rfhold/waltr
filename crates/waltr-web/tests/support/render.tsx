@@ -3,7 +3,7 @@ import { createMemo, createSignal, type JSX } from "solid-js";
 import { afterEach } from "vitest";
 
 import { AppStateContextProvider } from "../../src/app/context";
-import type { ClientCommand, ClientSnapshot, ConfigView } from "../../src/generated/waltr-client";
+import type { ClientCommand, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
 import { resetTestHistory } from "./routes";
 import { emptyConfig, snapshotWithConfig } from "./snapshots";
 
@@ -22,6 +22,8 @@ export function renderWithAppState(
     minimumSplashElapsed?: boolean;
     routePath?: string;
     configPatchError?: string;
+    sessionCreateError?: string;
+    sessionDeleteError?: string;
   } = {},
 ) {
   const commands = options.commands ?? [];
@@ -82,6 +84,139 @@ export function renderWithAppState(
       return ready;
     };
 
+    const dispatchCreateSession = async () => {
+      const command: ClientCommand = { type: "createSession" };
+      commands.push(command);
+      const key = `op-${nextOperationId++}`;
+      const current = snapshot() ?? snapshotWithConfig(emptyConfig(""));
+      const session: SessionView = {
+        id: `session-${nextOperationId}`,
+        revision: 0n,
+        status: { phase: "idle", failedMessage: "" },
+        currentPrompt: null,
+        createdAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
+        updatedAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
+        lastActivityAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
+      };
+      const loading: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current } },
+        sessions: {
+          ...current.sessions,
+          create: { status: "loading", error: null, key },
+        },
+      };
+      loading.operations.current[key] = {
+        kind: "sessionCreate",
+        status: "loading",
+        error: null,
+        session: null,
+      };
+      setSnapshot(loading);
+
+      await Promise.resolve();
+
+      if (options.sessionCreateError) {
+        const failed: ClientSnapshot = {
+          ...current,
+          operations: { current: { ...current.operations.current } },
+          sessions: {
+            ...current.sessions,
+            create: { status: "failed", error: options.sessionCreateError, key },
+          },
+        };
+        failed.operations.current[key] = {
+          kind: "sessionCreate",
+          status: "failed",
+          error: options.sessionCreateError,
+          session: null,
+        };
+        setSnapshot(failed);
+        throw new Error(options.sessionCreateError);
+      }
+
+      const ready: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current } },
+        sessions: {
+          ...current.sessions,
+          current: [...current.sessions.current, session],
+          create: { status: "ready", error: null, key },
+        },
+      };
+      ready.operations.current[key] = {
+        kind: "sessionCreate",
+        status: "ready",
+        error: null,
+        session,
+      };
+      setSnapshot(ready);
+
+      return ready;
+    };
+
+    const dispatchDeleteSession = async (id: string) => {
+      const command: ClientCommand = { type: "deleteSession", id };
+      commands.push(command);
+      const key = `op-${nextOperationId++}`;
+      const current = snapshot() ?? snapshotWithConfig(emptyConfig(""));
+      const loading: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current } },
+        sessions: {
+          ...current.sessions,
+          delete: { status: "loading", error: null, key },
+        },
+      };
+      loading.operations.current[key] = {
+        kind: "sessionDelete",
+        status: "loading",
+        error: null,
+        id,
+      };
+      setSnapshot(loading);
+
+      await Promise.resolve();
+
+      if (options.sessionDeleteError) {
+        const failed: ClientSnapshot = {
+          ...current,
+          operations: { current: { ...current.operations.current } },
+          sessions: {
+            ...current.sessions,
+            delete: { status: "failed", error: options.sessionDeleteError, key },
+          },
+        };
+        failed.operations.current[key] = {
+          kind: "sessionDelete",
+          status: "failed",
+          error: options.sessionDeleteError,
+          id,
+        };
+        setSnapshot(failed);
+        throw new Error(options.sessionDeleteError);
+      }
+
+      const ready: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current } },
+        sessions: {
+          ...current.sessions,
+          current: current.sessions.current.filter((session) => session.id !== id),
+          delete: { status: "ready", error: null, key },
+        },
+      };
+      ready.operations.current[key] = {
+        kind: "sessionDelete",
+        status: "ready",
+        error: null,
+        id,
+      };
+      setSnapshot(ready);
+
+      return ready;
+    };
+
     return (
       <AppStateContextProvider
         value={{
@@ -94,6 +229,8 @@ export function renderWithAppState(
           systemReady,
           dispatch,
           dispatchConfigPatch,
+          dispatchCreateSession,
+          dispatchDeleteSession,
         }}
       >
         {ui()}

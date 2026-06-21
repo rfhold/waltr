@@ -6,6 +6,7 @@ import type {
   OperationSnapshot,
   ProviderView,
   SessionSnapshot,
+  SessionView,
 } from "../../src/generated/waltr-client";
 
 export function snapshotWithConfig(
@@ -33,6 +34,7 @@ export function emptySessionSnapshot(): SessionSnapshot {
     current: [],
     create: operationSnapshot("idle"),
     list: operationSnapshot("idle"),
+    delete: operationSnapshot("idle"),
     watch: operationSnapshot("idle"),
   };
 }
@@ -43,6 +45,38 @@ export function operationSnapshot(status: string): OperationSnapshot {
 
 export function emptyConfig(etag = "v1"): ConfigView {
   return { etag, providers: {}, mcpServers: {} };
+}
+
+export function snapshotWithSessions(sessions: SessionView[]): ClientSnapshot {
+  const snapshot = snapshotWithConfig(emptyConfig("v1"));
+  snapshot.sessions = {
+    current: sessions,
+    create: operationSnapshot("idle"),
+    list: operationSnapshot("ready"),
+    delete: operationSnapshot("idle"),
+    watch: operationSnapshot("received"),
+  };
+
+  return snapshot;
+}
+
+export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
+  const id = overrides.id ?? "session-a";
+
+  return {
+    id,
+    revision: 0n,
+    status: { phase: "idle", failedMessage: "" },
+    currentPrompt: null,
+    createdAt: timestamp(1_700_000_000),
+    updatedAt: timestamp(1_700_000_000),
+    lastActivityAt: timestamp(1_700_000_000),
+    ...overrides,
+  };
+}
+
+export function timestamp(seconds: number) {
+  return { seconds: BigInt(seconds), nanos: 0 };
 }
 
 export function modelView(overrides: Partial<ModelView> = {}): ModelView {
