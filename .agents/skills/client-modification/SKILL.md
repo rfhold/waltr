@@ -27,7 +27,8 @@ Do not use this skill for browser-only forms or terminal-only rendering unless t
 6. Keep RPC execution in the transport, executor, runtime, or stream orchestration layer.
 7. Add command helpers on `Client` when web and TUI need the same server-data mutation path.
 8. Build config patches from the latest loaded config and current ETag; treat stale ETag failures as conflicts rather than success.
-9. Preserve watch maintenance rules: status readiness gates config watch opening, watch interest drives config watch lifetime, and reconnects flow through reducer effects.
+9. Preserve watch maintenance rules: status readiness gates child watch opening, watch interest drives watch lifetime, child watch failures stay local, and failed status blocks child watch reconnects until status recovers.
+10. Keep server-data collections authoritative from list/read/watch events: mutation completions should update keyed operation results, not directly mutate local collection state for config, sessions, or future server data.
 
 ## Test Selection
 
