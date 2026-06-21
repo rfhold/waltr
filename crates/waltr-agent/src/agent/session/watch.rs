@@ -38,7 +38,16 @@ pub struct SessionListUpdate {
 /// Live stream of session list updates.
 #[derive(Debug)]
 pub struct SessionListSubscription {
+    initial_sequence: u64,
     inner: BroadcastStream<SessionListUpdate>,
+}
+
+impl SessionListSubscription {
+    /// Sequence observed when this subscription was opened.
+    #[must_use]
+    pub const fn initial_sequence(&self) -> u64 {
+        self.initial_sequence
+    }
 }
 
 impl Stream for SessionListSubscription {
@@ -73,6 +82,7 @@ impl SessionListBroadcaster {
 
     pub(crate) fn subscribe(&self) -> SessionListSubscription {
         SessionListSubscription {
+            initial_sequence: self.sequence.load(Ordering::Relaxed),
             inner: BroadcastStream::new(self.sender.subscribe()),
         }
     }
