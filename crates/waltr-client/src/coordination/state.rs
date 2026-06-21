@@ -307,7 +307,6 @@ impl ClientState {
     }
 
     pub(crate) fn set_session_create_ready(&mut self, key: OperationKey, session: SessionSummary) {
-        self.upsert_session(session.clone());
         self.sessions.create.status = OperationStatus::Ready;
         self.sessions.create.error = None;
         self.sessions.create.key = Some(key.clone());
@@ -350,7 +349,6 @@ impl ClientState {
     }
 
     pub(crate) fn set_session_delete_ready(&mut self, key: OperationKey, id: String) {
-        self.remove_session(&id);
         self.sessions.delete.status = OperationStatus::Ready;
         self.sessions.delete.error = None;
         self.sessions.delete.key = Some(key.clone());
@@ -431,6 +429,21 @@ impl ClientState {
 
     pub(crate) const fn set_session_watch_waiting(&mut self) {
         self.sessions.watch.status = OperationStatus::Waiting;
+    }
+
+    pub(crate) fn set_session_watch_snapshot(
+        &mut self,
+        sequence: u64,
+        sessions: Vec<SessionSummary>,
+    ) {
+        self.sessions.last_sequence = sequence;
+        self.sessions.current = sessions
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect();
+        self.sessions.watch.status = OperationStatus::Received;
+        self.sessions.watch.error = None;
+        self.sessions.watch.retry_attempt = 0;
     }
 
     pub(crate) fn set_session_watch_changed(&mut self, sequence: u64, session: SessionSummary) {

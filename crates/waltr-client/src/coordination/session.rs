@@ -3,7 +3,6 @@
 use crate::transport::{SessionWatchEvent, SessionWatchUpdate};
 use crate::{
     ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect, SessionEvent,
-    StatusEffect,
 };
 
 pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
@@ -61,10 +60,7 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
         }
         SessionEvent::WatchInterestRegistered => {
             state.add_session_watch_interest();
-            state.set_session_list_loading();
-            let mut update = ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::List));
-            update.extend(maintain_watch(state));
-            update
+            maintain_watch(state)
         }
         SessionEvent::WatchInterestReleased => {
             state.remove_session_watch_interest();
@@ -103,6 +99,11 @@ pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
 }
 
 fn apply_watch_update(state: &mut ClientState, update: SessionWatchUpdate) -> ClientUpdate {
+    if matches!(update.event, SessionWatchEvent::Snapshot(_)) {
+        apply_watch_event(state, update);
+        return ClientUpdate::default();
+    }
+
     if update.sequence != state.sessions.last_sequence.saturating_add(1) {
         apply_watch_event(state, update);
         return ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::List));
@@ -114,6 +115,9 @@ fn apply_watch_update(state: &mut ClientState, update: SessionWatchUpdate) -> Cl
 
 fn apply_watch_event(state: &mut ClientState, update: SessionWatchUpdate) {
     match update.event {
+        SessionWatchEvent::Snapshot(sessions) => {
+            state.set_session_watch_snapshot(update.sequence, sessions)
+        }
         SessionWatchEvent::Upsert(session) => {
             state.set_session_watch_changed(update.sequence, session)
         }
@@ -124,14 +128,6 @@ fn apply_watch_event(state: &mut ClientState, update: SessionWatchUpdate) {
 fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {
     if state.sessions.watch.interests == 0 {
         return ClientUpdate::default();
-    }
-
-    if state.status.watch.status == OperationStatus::Received {
-        let delay_ms = state.set_status_watch_failed(message);
-        state.set_session_watch_waiting();
-        return ClientUpdate::with_effect(ClientEffect::Status(StatusEffect::SleepReconnect {
-            delay_ms,
-        }));
     }
 
     let delay_ms = state.set_session_watch_failed(message);

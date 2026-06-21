@@ -1,6 +1,6 @@
 //! Status reducer responsibilities.
 
-use super::config;
+use super::{config, session};
 use crate::{ClientEffect, ClientState, ClientUpdate, OperationStatus, StatusEffect, StatusEvent};
 
 pub fn reduce(state: &mut ClientState, event: StatusEvent) -> ClientUpdate {
@@ -15,7 +15,9 @@ pub fn reduce(state: &mut ClientState, event: StatusEvent) -> ClientUpdate {
         }
         StatusEvent::WatchChanged(status) => {
             state.set_status_watch_changed(status);
-            config::maintain_watch(state)
+            let mut update = config::maintain_watch(state);
+            update.extend(session::maintain_watch(state));
+            update
         }
         StatusEvent::WatchFailed(error) => watch_failed(state, error.to_string()),
         StatusEvent::WatchEnded => watch_failed(state, "status watch ended".to_owned()),
@@ -37,6 +39,9 @@ fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {
     let delay_ms = state.set_status_watch_failed(message);
     if state.config.watch.interests > 0 {
         state.set_config_watch_waiting();
+    }
+    if state.sessions.watch.interests > 0 {
+        state.set_session_watch_waiting();
     }
     ClientUpdate::with_effect(ClientEffect::Status(StatusEffect::SleepReconnect {
         delay_ms,

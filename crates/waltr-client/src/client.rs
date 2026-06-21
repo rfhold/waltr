@@ -712,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn config_watch_retries_with_shared_backoff_and_resets_after_success() {
+    fn config_watch_failure_reconnects_config_watch_directly() {
         let mut client = Client::new();
 
         client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
@@ -725,20 +725,18 @@ mod tests {
         )));
         assert_eq!(
             update.effects(),
-            &[ClientEffect::Status(StatusEffect::SleepReconnect {
+            &[ClientEffect::Config(ConfigEffect::SleepReconnect {
                 delay_ms: 500
             })]
         );
-        assert_eq!(client.state().config.watch.status, OperationStatus::Waiting);
-        assert_eq!(client.state().status.watch.status, OperationStatus::Failed);
-        assert!(!client.state().is_system_ready());
+        assert_eq!(client.state().config.watch.status, OperationStatus::Failed);
+        assert_eq!(
+            client.state().status.watch.status,
+            OperationStatus::Received
+        );
+        assert!(client.state().is_system_ready());
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::ReconnectReady));
-        assert!(update.is_empty());
-
-        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
-            SystemStatus { ready: true },
-        )));
         assert_eq!(
             update.effects(),
             &[ClientEffect::Config(ConfigEffect::Watch)]
@@ -753,9 +751,41 @@ mod tests {
         )));
         assert_eq!(
             update.effects(),
+            &[ClientEffect::Config(ConfigEffect::SleepReconnect {
+                delay_ms: 500
+            })]
+        );
+    }
+
+    #[test]
+    fn config_watch_reconnect_waits_for_status_recovery() {
+        let mut client = Client::new();
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        drop(client.apply(ClientEvent::Config(ConfigEvent::WatchInterestRegistered)));
+        let status_update = client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
+            ClientError::new("lost status"),
+        )));
+        assert_eq!(client.state().config.watch.status, OperationStatus::Waiting);
+        assert_eq!(
+            status_update.effects(),
             &[ClientEffect::Status(StatusEffect::SleepReconnect {
                 delay_ms: 500
             })]
+        );
+
+        let config_update = client.apply(ClientEvent::Config(ConfigEvent::ReconnectReady));
+        assert!(config_update.is_empty());
+        assert_eq!(client.state().config.watch.status, OperationStatus::Waiting);
+
+        let recovery_update = client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        assert_eq!(
+            recovery_update.effects(),
+            &[ClientEffect::Config(ConfigEffect::Watch)]
         );
     }
 
@@ -798,6 +828,154 @@ mod tests {
         assert_eq!(
             update.effects(),
             &[ClientEffect::Session(SessionEffect::List)]
+        );
+    }
+
+    #[test]
+    fn session_watch_snapshot_replaces_current_sessions() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "stale",
+        )])));
+
+        let update = client.apply(ClientEvent::Session(SessionEvent::WatchChanged(
+            SessionWatchUpdate {
+                sequence: 7,
+                event: SessionWatchEvent::Snapshot(vec![session("fresh")]),
+            },
+        )));
+
+        assert!(update.is_empty());
+        assert!(!client.state().sessions.current.contains_key("stale"));
+        assert!(client.state().sessions.current.contains_key("fresh"));
+        assert_eq!(client.state().sessions.last_sequence, 7);
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Received
+        );
+    }
+
+    #[test]
+    fn session_create_completion_does_not_mutate_current_sessions() {
+        let mut client = Client::new();
+        let operation_key = OperationKey::from("create-session");
+
+        client.apply(ClientEvent::Session(SessionEvent::Created {
+            operation_key,
+            session: session("one"),
+        }));
+
+        assert!(client.state().sessions.current.is_empty());
+        assert_eq!(
+            client.state().sessions.create.status,
+            OperationStatus::Ready
+        );
+    }
+
+    #[test]
+    fn session_delete_completion_does_not_mutate_current_sessions() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+        let operation_key = OperationKey::from("delete-session");
+
+        client.apply(ClientEvent::Session(SessionEvent::Deleted {
+            operation_key,
+            id: "one".to_owned(),
+        }));
+
+        assert!(client.state().sessions.current.contains_key("one"));
+        assert_eq!(
+            client.state().sessions.delete.status,
+            OperationStatus::Ready
+        );
+    }
+
+    #[test]
+    fn session_watch_failure_reconnects_session_watch_directly() {
+        let mut client = Client::new();
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        drop(client.apply(ClientEvent::Session(SessionEvent::WatchInterestRegistered)));
+        drop(client.apply(ClientEvent::Session(SessionEvent::WatchStarted)));
+
+        let update = client.apply(ClientEvent::Session(SessionEvent::WatchFailed(
+            ClientError::new("lost session watch"),
+        )));
+
+        assert_eq!(
+            client.state().status.watch.status,
+            OperationStatus::Received
+        );
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Failed
+        );
+        assert_eq!(
+            update.effects(),
+            &[ClientEffect::Session(SessionEffect::SleepReconnect {
+                delay_ms: 500
+            })]
+        );
+    }
+
+    #[test]
+    fn status_recovery_maintains_waiting_session_watch() {
+        let mut client = Client::new();
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        drop(client.apply(ClientEvent::Session(SessionEvent::WatchInterestRegistered)));
+
+        let status_update = client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
+            ClientError::new("lost status"),
+        )));
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Waiting
+        );
+        assert_eq!(
+            status_update.effects(),
+            &[ClientEffect::Status(StatusEffect::SleepReconnect {
+                delay_ms: 500
+            })]
+        );
+
+        let recovery_update = client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Loading
+        );
+        assert_eq!(
+            recovery_update.effects(),
+            &[ClientEffect::Session(SessionEffect::Watch)]
+        );
+    }
+
+    #[test]
+    fn session_watch_reconnect_waits_for_status_recovery() {
+        let mut client = Client::new();
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        drop(client.apply(ClientEvent::Session(SessionEvent::WatchInterestRegistered)));
+        drop(client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
+            ClientError::new("lost status"),
+        ))));
+
+        let session_update = client.apply(ClientEvent::Session(SessionEvent::ReconnectReady));
+        assert!(session_update.is_empty());
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Waiting
         );
     }
 
