@@ -34,9 +34,14 @@ message WatchSessionsRequest {}
 message WatchSessionsResponse {
   uint64 sequence = 1;
   oneof event {
-    SessionSummary session = 2;
-    string deleted_id = 3;
+    SessionListSnapshot snapshot = 2;
+    SessionSummary session = 3;
+    string deleted_id = 4;
   }
+}
+
+message SessionListSnapshot {
+  repeated SessionSummary sessions = 1;
 }
 
 message SessionSummary {
