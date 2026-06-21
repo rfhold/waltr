@@ -9,7 +9,8 @@ use waltr_client::{
     ClientCommand, ClientOperationView, ClientSnapshot, ConfigSnapshot, ConfigView,
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView, ModelOptionsView,
     ModelTypeView, ModelView, OperationCollectionSnapshot, OperationSnapshot, ProviderKindView,
-    ProviderView, SessionSnapshot, StatusSnapshot,
+    ProviderView, SessionPhaseView, SessionSnapshot, SessionStatusView, SessionView,
+    StatusSnapshot, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -262,6 +263,292 @@ fn leader_c_opens_config_after_ready() {
 }
 
 #[test]
+fn leader_s_opens_sessions_after_ready() {
+    let mut app = App::new();
+    let now = Instant::now();
+
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::RegisterSessionWatchInterest)
+    );
+
+    assert_eq!(app.screen(), AppScreen::Sessions);
+    let rendered = render_app(&app);
+    assert!(rendered.contains("┌ Sessions"));
+    assert!(rendered.contains("Loading sessions"));
+}
+
+#[test]
+fn sessions_escape_releases_watch_interest() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(vec![session_view("one", 1)]));
+    let now = Instant::now();
+
+    assert_eq!(app.screen(), AppScreen::Sessions);
+    assert_eq!(
+        app.handle_event(&escape_press(), now),
+        AppAction::ClientCommand(ClientCommand::ReleaseSessionWatchInterest)
+    );
+    assert_eq!(app.screen(), AppScreen::Landing);
+}
+
+#[test]
+fn sessions_create_dispatches_and_completion_opens_detail() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::CreateSession)
+    );
+
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_create_snapshot(
+                "op-create",
+                "loading",
+                None,
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_create_snapshot(
+                "op-create",
+                "ready",
+                Some(session_view("created", 2)),
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+
+    assert_eq!(app.sessions_section().detail_session_id(), Some("created"));
+    let rendered = render_app(&app);
+    assert!(rendered.contains("Session detail"));
+    assert!(rendered.contains("Sessions / created"));
+}
+
+#[test]
+fn sessions_detail_delete_dispatches_and_returns_to_list() {
+    let mut app =
+        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("doomed", 1)]));
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(app.sessions_section().detail_session_id(), Some("doomed"));
+    assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
+
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::DeleteSession {
+            id: "doomed".to_owned(),
+        })
+    );
+
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_delete_snapshot(
+                "op-delete",
+                "loading",
+                "doomed",
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_delete_snapshot(
+                "op-delete",
+                "ready",
+                "doomed",
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+
+    assert_eq!(app.sessions_section().detail_session_id(), None);
+    assert!(render_app(&app).contains("Recent sessions"));
+}
+
+#[test]
+fn sessions_list_renders_snapshot() {
+    let app = open_sessions_app_with(watched_sessions_snapshot(vec![
+        session_view("older", 1),
+        session_view("newer", 2),
+    ]));
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_loading_renders_snapshot() {
+    let mut app = App::new();
+    let now = Instant::now();
+
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::RegisterSessionWatchInterest)
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_empty_renders_snapshot() {
+    let app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_detail_renders_snapshot() {
+    let mut app =
+        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("detail", 3)]));
+
+    assert_eq!(
+        app.handle_event(&right_press(), Instant::now()),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_delete_confirmation_renders_snapshot() {
+    let mut app =
+        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("doomed", 1)]));
+
+    assert_eq!(
+        app.handle_event(&delete_press(), Instant::now()),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_create_pending_renders_snapshot() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::CreateSession)
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_create_error_renders_snapshot() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::CreateSession)
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_create_snapshot(
+                "op-create",
+                "loading",
+                None,
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_create_snapshot_with_error(
+                "op-create",
+                "failed",
+                "create failed",
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_delete_pending_renders_snapshot() {
+    let mut app =
+        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("doomed", 1)]));
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::DeleteSession {
+            id: "doomed".to_owned(),
+        })
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn sessions_delete_error_renders_snapshot() {
+    let mut app =
+        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("doomed", 1)]));
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::DeleteSession {
+            id: "doomed".to_owned(),
+        })
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_delete_snapshot(
+                "op-delete",
+                "loading",
+                "doomed",
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(session_delete_snapshot_with_error(
+                "op-delete",
+                "failed",
+                "doomed",
+                "delete failed",
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
 fn config_renders_watched_snapshot_as_modal_with_escape_hint() {
     let mut app = App::new();
     let now = Instant::now();
@@ -290,6 +577,92 @@ fn config_renders_watched_snapshot_as_modal_with_escape_hint() {
     assert!(!rendered.contains("Waltr / Configuration"));
     assert!(!rendered.contains("load: ready"));
     assert!(!rendered.contains("Read-only settings synced from the local runtime."));
+}
+
+#[test]
+fn config_view_renders_snapshot() {
+    let app = open_config_app();
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn config_mcp_tab_renders_snapshot() {
+    let mut app = open_config_app_with_mcp();
+
+    assert_eq!(
+        app.handle_event(&tab_press(), Instant::now()),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn config_provider_create_form_renders_snapshot() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press('c'), now), AppAction::Continue);
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn config_mcp_create_form_renders_snapshot() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press('c'), now), AppAction::Continue);
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn config_provider_delete_confirmation_renders_snapshot() {
+    let mut app = open_config_app();
+
+    assert_eq!(
+        app.handle_event(&delete_press(), Instant::now()),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!(render_app(&app));
+}
+
+#[test]
+fn config_provider_patch_error_renders_snapshot() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::UpdateProvider { .. })
+    ));
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot("op-1", "loading", None,))),
+            now,
+        ),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(config_patch_snapshot(
+                "op-1",
+                "failed",
+                Some("write failed"),
+            ))),
+            now,
+        ),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!(render_app(&app));
 }
 
 #[test]
@@ -1302,6 +1675,23 @@ fn open_config_app_with(snapshot: ClientSnapshot) -> App {
     app
 }
 
+fn open_sessions_app_with(snapshot: ClientSnapshot) -> App {
+    let mut app = App::new();
+    let now = Instant::now();
+
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(snapshot)), now),
+        AppAction::Continue
+    );
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::RegisterSessionWatchInterest)
+    );
+
+    app
+}
+
 fn config_patch_snapshot(key: &str, status: &'static str, error: Option<&str>) -> ClientSnapshot {
     config_patch_snapshot_from(watched_config_snapshot(), key, status, error)
 }
@@ -1328,6 +1718,114 @@ fn config_patch_snapshot_from(
         },
     );
     snapshot
+}
+
+fn watched_sessions_snapshot(sessions: Vec<SessionView>) -> ClientSnapshot {
+    let mut snapshot = ready_snapshot();
+    snapshot.sessions.current = sessions;
+    snapshot.sessions.list.status = "ready";
+    snapshot.sessions.watch.status = "received";
+    snapshot
+}
+
+fn session_create_snapshot(
+    key: &str,
+    status: &'static str,
+    session: Option<SessionView>,
+) -> ClientSnapshot {
+    let mut snapshot = watched_sessions_snapshot(session.iter().cloned().collect());
+    snapshot.sessions.create = OperationSnapshot {
+        status,
+        error: None,
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionCreate {
+            status,
+            error: None,
+            session,
+        },
+    );
+    snapshot
+}
+
+fn session_create_snapshot_with_error(
+    key: &str,
+    status: &'static str,
+    error: &str,
+) -> ClientSnapshot {
+    let mut snapshot = watched_sessions_snapshot(Vec::new());
+    snapshot.sessions.create = OperationSnapshot {
+        status,
+        error: Some(error.to_owned()),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionCreate {
+            status,
+            error: Some(error.to_owned()),
+            session: None,
+        },
+    );
+    snapshot
+}
+
+fn session_delete_snapshot(key: &str, status: &'static str, id: &str) -> ClientSnapshot {
+    let mut snapshot = watched_sessions_snapshot(Vec::new());
+    snapshot.sessions.delete = OperationSnapshot {
+        status,
+        error: None,
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionDelete {
+            status,
+            error: None,
+            id: id.to_owned(),
+        },
+    );
+    snapshot
+}
+
+fn session_delete_snapshot_with_error(
+    key: &str,
+    status: &'static str,
+    id: &str,
+    error: &str,
+) -> ClientSnapshot {
+    let mut snapshot = watched_sessions_snapshot(vec![session_view(id, 1)]);
+    snapshot.sessions.delete = OperationSnapshot {
+        status,
+        error: Some(error.to_owned()),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionDelete {
+            status,
+            error: Some(error.to_owned()),
+            id: id.to_owned(),
+        },
+    );
+    snapshot
+}
+
+fn session_view(id: &str, seconds: i64) -> SessionView {
+    SessionView {
+        id: id.to_owned(),
+        revision: 1,
+        status: SessionStatusView {
+            phase: SessionPhaseView::Idle,
+            failed_message: String::new(),
+        },
+        current_prompt: None,
+        created_at: Some(TimestampView { seconds, nanos: 0 }),
+        updated_at: Some(TimestampView { seconds, nanos: 0 }),
+        last_activity_at: None,
+    }
 }
 
 fn ready_snapshot() -> ClientSnapshot {
@@ -1369,6 +1867,11 @@ fn ready_snapshot() -> ClientSnapshot {
                 key: None,
             },
             list: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            delete: OperationSnapshot {
                 status: "idle",
                 error: None,
                 key: None,

@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        ┌ Configuration ────────────────────────────────────────────────┐       "
+"        │  Providers   MCP Servers                                      │       "
+"        │───────────────────────────────────────────────────────────────│       "
+"        │No MCP servers configured.                                     │       "
+"        │   ┌ Create MCP server ───────────────────────────────────┐    │       "
+"        │   │* name                                                │    │       "
+"        │   │  type  stdio                                         │    │       "
+"        │   │  command                                             │    │       "
+"        │   │command required before saving                        │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   └ Tab field  Left/Right type  Enter save  Esc cancel ──┘    │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        └ Esc back  Tab switch  C-x c create  Right/Enter edit  Backspac┘       "
+"                                                                                "
+"                                                                                "
+"Esc  back    Ctrl-X q  quit                                          Waltr  ready"

@@ -49,6 +49,10 @@ fn palette_widget() -> Paragraph<'static> {
             Span::raw("  open configuration"),
         ]),
         Line::from(vec![
+            Span::styled("Ctrl-X s", THEME.focus_style()),
+            Span::raw("  open sessions"),
+        ]),
+        Line::from(vec![
             Span::styled("Ctrl-X q", THEME.focus_style()),
             Span::raw("  quit Waltr"),
         ]),

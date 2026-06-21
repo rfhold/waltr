@@ -7,7 +7,7 @@
 
 use waltr_client::{
     ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, McpServerTypeView,
-    McpServerView, OperationKey,
+    McpServerView,
 };
 use ratatui::{
     Frame,
@@ -18,7 +18,11 @@ use ratatui::{
     widgets::{Clear, Paragraph, Wrap},
 };
 
-use crate::{theme::THEME, ui};
+use crate::{
+    screens::{OperationResult, OperationTracker},
+    theme::THEME,
+    ui,
+};
 
 use super::SectionAction;
 
@@ -161,9 +165,7 @@ pub struct McpSection {
     config_form: Option<McpForm>,
     delete_server: Option<String>,
     selected_server: usize,
-    pending_patch: bool,
-    pending_patch_key: Option<OperationKey>,
-    patch_error: Option<String>,
+    patch: OperationTracker,
 }
 
 impl McpSection {
@@ -174,9 +176,7 @@ impl McpSection {
             config_form: None,
             delete_server: None,
             selected_server: 0,
-            pending_patch: false,
-            pending_patch_key: None,
-            patch_error: None,
+            patch: OperationTracker::new(),
         }
     }
 
@@ -206,44 +206,25 @@ impl McpSection {
 
     /// Reconcile a submitted patch against the shared reducer operation state.
     pub fn reconcile_patch(&mut self, snapshot: &ClientSnapshot) {
-        if !self.pending_patch {
-            return;
-        }
+        if let Some(result) = self
+            .patch
+            .reconcile(&snapshot.config.patch, snapshot, |operation| {
+                let ClientOperationView::ConfigPatch { status, error, .. } = operation else {
+                    return None;
+                };
 
-        if self.pending_patch_key.is_none() {
-            if snapshot.config.patch.status != "loading" {
-                return;
-            }
-
-            self.pending_patch_key
-                .clone_from(&snapshot.config.patch.key);
-        }
-
-        let Some(key) = &self.pending_patch_key else {
-            return;
-        };
-
-        let Some(ClientOperationView::ConfigPatch { status, error, .. }) =
-            snapshot.operations.current.get(key)
-        else {
-            return;
-        };
-
-        match *status {
-            "ready" => {
-                self.pending_patch = false;
-                self.pending_patch_key = None;
-                self.patch_error = None;
-                self.config_form = None;
-                self.delete_server = None;
-            }
-            "failed" => {
-                self.pending_patch = false;
-                self.pending_patch_key = None;
-                self.patch_error =
-                    Some(error.as_deref().unwrap_or("config patch failed").to_owned());
-            }
-            _ => {}
+                Some(match *status {
+                    "ready" => OperationResult::Ready(()),
+                    "failed" => OperationResult::Failed(
+                        error.as_deref().unwrap_or("config patch failed").to_owned(),
+                    ),
+                    _ => OperationResult::Pending,
+                })
+            })
+            && result.is_ok()
+        {
+            self.config_form = None;
+            self.delete_server = None;
         }
     }
 
@@ -258,36 +239,36 @@ impl McpSection {
 
     /// Dismiss any active overlay. Returns true if something was dismissed.
     pub fn dismiss_overlay(&mut self) -> bool {
-        if self.pending_patch {
+        if self.patch.is_pending() {
             return false;
         }
 
         let dismissed = self.config_form.take().is_some() || self.delete_server.take().is_some();
         if dismissed {
-            self.patch_error = None;
+            self.patch.clear_error();
         }
         dismissed
     }
 
     /// Open the MCP server create form.
     pub fn open_create_form(&mut self) {
-        if self.pending_patch {
+        if self.patch.is_pending() {
             return;
         }
 
         self.delete_server = None;
-        self.patch_error = None;
+        self.patch.clear_error();
         self.config_form = Some(McpForm::create());
     }
 
     /// Open the MCP server edit form for the current selection.
     pub fn open_edit_form(&mut self, config: Option<&ConfigView>) {
-        if self.pending_patch {
+        if self.patch.is_pending() {
             return;
         }
 
         self.delete_server = None;
-        self.patch_error = None;
+        self.patch.clear_error();
         self.config_form = self
             .selected_server_view(config)
             .map(|(key, server)| McpForm::edit(&key, server));
@@ -295,18 +276,18 @@ impl McpSection {
 
     /// Arm the delete confirmation for the current selection.
     pub fn arm_delete(&mut self, config: Option<&ConfigView>) {
-        if self.pending_patch {
+        if self.patch.is_pending() {
             return;
         }
 
         self.config_form = None;
-        self.patch_error = None;
+        self.patch.clear_error();
         self.delete_server = self.selected_server_key(config);
     }
 
     /// Route a key event into the section, using the current config snapshot.
     pub fn handle_key(&mut self, key: KeyEvent, config: Option<&ConfigView>) -> SectionAction {
-        if self.pending_patch {
+        if self.patch.is_pending() {
             return SectionAction::Continue;
         }
 
@@ -364,9 +345,7 @@ impl McpSection {
         let mode = form.mode;
         let original_name = form.original_name.clone();
         let server = form.server();
-        self.pending_patch = true;
-        self.pending_patch_key = None;
-        self.patch_error = None;
+        self.patch.begin();
 
         match mode {
             McpFormMode::Create => {
@@ -385,9 +364,7 @@ impl McpSection {
     }
 
     fn delete_selected(&mut self, name: &str) -> SectionAction {
-        self.pending_patch = true;
-        self.pending_patch_key = None;
-        self.patch_error = None;
+        self.patch.begin();
         SectionAction::ClientCommand(ClientCommand::DeleteMcpServer {
             name: name.to_owned(),
         })
@@ -429,8 +406,8 @@ impl McpSection {
                     config,
                     self.selected_server,
                     self.delete_server(),
-                    self.pending_patch,
-                    self.patch_error.as_deref(),
+                    self.patch.is_pending(),
+                    self.patch.error(),
                 )
             })
         } else {
@@ -451,7 +428,7 @@ impl McpSection {
             let form_area = ui::centered_percent_rect(area, 70, 10);
             frame.render_widget(Clear, form_area);
             frame.render_widget(
-                form_widget(form, self.pending_patch, self.patch_error.as_deref()),
+                form_widget(form, self.patch.is_pending(), self.patch.error()),
                 form_area,
             );
         }

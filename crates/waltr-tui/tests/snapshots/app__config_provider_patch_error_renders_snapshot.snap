@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        ┌ Configuration ────────────────────────────────────────────────┐       "
+"        │  Providers   MCP Servers                                      │       "
+"        │───┌ Edit provider ───────────────────────────────────────┐────│       "
+"        │> a│* name  anthropic                                     │    │       "
+"        │   │  type  anthropic                                     │    │       "
+"        │   │  url  https://api.anthropic.com                      │    │       "
+"        │   │                                                      │    │       "
+"        │   │Models staged in this provider draft                  │    │       "
+"        │   │No models configured.                                 │    │       "
+"        │   │error: write failed                                   │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   │                                                      │    │       "
+"        │   └ Tab focus  C-x c model  Model: Right/Enter edit  Back┘    │       "
+"        └ Esc back  Tab switch  C-x c create  Right/Enter edit  Backspac┘       "
+"                                                                                "
+"                                                                                "
+"Esc  back    Ctrl-X q  quit                                          Waltr  ready"

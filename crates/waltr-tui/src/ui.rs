@@ -44,6 +44,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             });
             screens::draw_config(frame, frame.area(), app);
         }
+        AppScreen::Sessions => {
+            draw_app_shell(frame, app, true, |frame, area| {
+                screens::draw_landing(frame, area, false);
+            });
+            screens::draw_sessions(
+                frame,
+                frame.area(),
+                app.sessions_section(),
+                app.client_snapshot(),
+            );
+        }
     });
 }
 

@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        ┌ Sessions ─────────────────────────────────────────────────────┐       "
+"        │Sessions                                                       │       "
+"        │Session detail  Create: C-x s                                  │       "
+"        │Sessions / detail                                              │       "
+"        │                                                               │       "
+"        │id  detail                                                     │       "
+"        │revision  1                                                    │       "
+"        │phase  idle                                                    │       "
+"        │created  3s                                                    │       "
+"        │updated  3s                                                    │       "
+"        │last activity  No updates                                      │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        │Delete  Backspace/Delete                                       │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        └ Esc back  C-x s create  Right/Enter detail  Backspace/Delete d┘       "
+"                                                                                "
+"                                                                                "
+"Esc  back    Ctrl-X q  quit                                          Waltr  ready"

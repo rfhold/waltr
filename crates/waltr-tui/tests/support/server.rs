@@ -53,6 +53,24 @@ pub async fn open_config_screen(stream: &mut ClientStateStream, app: &mut App) {
     );
 }
 
+pub async fn open_sessions_screen(stream: &mut ClientStateStream, app: &mut App) {
+    let now = std::time::Instant::now();
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    let AppAction::ClientCommand(register) = app.handle_event(&char_press('s'), now) else {
+        panic!("sessions entry should register session watch interest");
+    };
+    assert_eq!(register, ClientCommand::RegisterSessionWatchInterest);
+
+    let opened = dispatch_client_command(stream, register).await;
+    assert_eq!(
+        app.handle_event(
+            &AppEvent::Client(Box::new(opened)),
+            std::time::Instant::now()
+        ),
+        AppAction::Continue
+    );
+}
+
 pub async fn dispatch_app_command(
     stream: &mut ClientStateStream,
     app: &mut App,
@@ -93,6 +111,21 @@ pub async fn dispatch_app_command(
             matches!(
                 snapshot.operations.current.get(&key),
                 Some(ClientOperationView::SessionCreate {
+                    status: "ready" | "failed",
+                    ..
+                })
+            )
+        })
+        .await;
+    }
+
+    if let Some(key) = snapshot.sessions.delete.key.clone()
+        && snapshot.sessions.delete.status == "loading"
+    {
+        return next_snapshot_until(stream, app, |snapshot| {
+            matches!(
+                snapshot.operations.current.get(&key),
+                Some(ClientOperationView::SessionDelete {
                     status: "ready" | "failed",
                     ..
                 })
