@@ -204,7 +204,19 @@ error: string | null,
 /**
  * Created session, when the operation completed successfully.
  */
-session: SessionView | null, };
+session: SessionView | null, } | { "kind": "sessionDelete", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Deleted session id.
+ */
+id: string, };
 
 export type OperationCollectionSnapshot = { 
 /**
@@ -268,6 +280,10 @@ create: OperationSnapshot,
  */
 list: OperationSnapshot, 
 /**
+ * Session delete operation snapshot.
+ */
+delete: OperationSnapshot, 
+/**
  * Session watch operation snapshot.
  */
 watch: OperationSnapshot, };
@@ -322,4 +338,8 @@ server: McpServerView, } | { "type": "deleteMcpServer",
 /**
  * MCP server key to delete.
  */
-name: string, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };
+name: string, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "deleteSession", 
+/**
+ * Session id to delete.
+ */
+id: string, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };

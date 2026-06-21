@@ -8,7 +8,7 @@ import {
 } from "solid-js";
 
 import { AppStateContextProvider, type AppPhase } from "./context";
-import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
+import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../generated/waltr-client";
 import {
   loadWasmClient,
   type WasmClientLoader,
@@ -21,7 +21,7 @@ type AppStateProviderProps = ParentProps<{
 export function AppStateProvider(props: AppStateProviderProps) {
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
-  const configPatchWaiters = new Set<ConfigPatchWaiter>();
+  const operationWaiters = new Set<OperationWaiter>();
   const [wasmClient] = createResource(() =>
     (props.loadWasmClient ?? loadWasmClient)(),
   );
@@ -40,11 +40,11 @@ export function AppStateProvider(props: AppStateProviderProps) {
 
     const initialSnapshot = client.snapshot();
     if (initialSnapshot) {
-      publishSnapshot(initialSnapshot, setSnapshot, configPatchWaiters);
+      publishSnapshot(initialSnapshot, setSnapshot, operationWaiters);
     }
 
     const unsubscribe = client.subscribe((snapshot) => {
-      publishSnapshot(snapshot, setSnapshot, configPatchWaiters);
+      publishSnapshot(snapshot, setSnapshot, operationWaiters);
     });
     let cancelled = false;
 
@@ -69,44 +69,74 @@ export function AppStateProvider(props: AppStateProviderProps) {
   });
 
   const dispatch = async (command: ClientCommand) => {
-    const client = wasmClient();
-
-    if (!client) {
-      throw new Error("client is not loaded");
-    }
-
-    return client.dispatch(command);
+    return getLoadedClient(wasmClient()).dispatch(command);
   };
 
   const dispatchConfigPatch = async (command: ClientCommand) => {
-    const client = wasmClient();
+    return dispatchAndWaitForOperation({
+      command,
+      key: (snapshot) => snapshot.config.patch.key,
+      kind: "configPatch",
+      missingKeyMessage: "config patch command did not produce an operation key",
+      failureMessage: "config patch failed",
+    });
+  };
 
-    if (!client) {
-      throw new Error("client is not loaded");
-    }
+  const dispatchCreateSession = async () => {
+    return dispatchAndWaitForOperation({
+      command: { type: "createSession" },
+      key: (snapshot) => snapshot.sessions.create.key,
+      kind: "sessionCreate",
+      missingKeyMessage: "session create command did not produce an operation key",
+      failureMessage: "session create failed",
+    });
+  };
 
-    const immediate = await client.dispatch(command);
-    const key = immediate.config.patch.key;
+  const dispatchDeleteSession = async (id: string) => {
+    return dispatchAndWaitForOperation({
+      command: { type: "deleteSession", id },
+      key: (snapshot) => snapshot.sessions.delete.key,
+      kind: "sessionDelete",
+      missingKeyMessage: "session delete command did not produce an operation key",
+      failureMessage: "session delete failed",
+    });
+  };
+
+  async function dispatchAndWaitForOperation(options: {
+    command: ClientCommand;
+    key: (snapshot: ClientSnapshot) => string | null;
+    kind: OperationKind;
+    missingKeyMessage: string;
+    failureMessage: string;
+  }) {
+    const immediate = await getLoadedClient(wasmClient()).dispatch(options.command);
+    const key = options.key(immediate);
 
     if (!key) {
-      throw new Error("config patch command did not produce an operation key");
+      throw new Error(options.missingKeyMessage);
     }
 
     const current = snapshot() ?? immediate;
-    const currentResult = configPatchResult(current, key);
-    if (currentResult?.status === "ready") {
+    const result = operationResult(current, key, options.kind);
+    if (result?.status === "ready") {
       return current;
     }
-    if (currentResult?.status === "failed") {
-      throw new Error(currentResult.error ?? "config patch failed");
+    if (result?.status === "failed") {
+      throw new Error(result.error ?? options.failureMessage);
     }
 
     return new Promise<ClientSnapshot>((resolve, reject) => {
-      const waiter: ConfigPatchWaiter = { key, resolve, reject };
-      configPatchWaiters.add(waiter);
-      settleConfigPatchWaiter(waiter, snapshot() ?? immediate, configPatchWaiters);
+      const waiter: OperationWaiter = {
+        key,
+        kind: options.kind,
+        failureMessage: options.failureMessage,
+        resolve,
+        reject,
+      };
+      operationWaiters.add(waiter);
+      settleOperationWaiter(waiter, snapshot() ?? immediate, operationWaiters);
     });
-  };
+  }
 
   return (
     <AppStateContextProvider
@@ -120,6 +150,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         systemReady,
         dispatch,
         dispatchConfigPatch,
+        dispatchCreateSession,
+        dispatchDeleteSession,
       }}
     >
       {props.children}
@@ -127,50 +159,64 @@ export function AppStateProvider(props: AppStateProviderProps) {
   );
 }
 
-type ConfigPatchWaiter = {
+type OperationKind = ClientOperationView["kind"];
+
+type OperationWaiter = {
   key: string;
+  kind: OperationKind;
+  failureMessage: string;
   resolve: (snapshot: ClientSnapshot) => void;
   reject: (error: Error) => void;
 };
 
+type LoadedWasmClient = NonNullable<ReturnType<WasmClientLoader> extends Promise<infer Client> ? Client : never>;
+
 function publishSnapshot(
   snapshot: ClientSnapshot,
   setSnapshot: (snapshot: ClientSnapshot) => void,
-  configPatchWaiters: Set<ConfigPatchWaiter>,
+  operationWaiters: Set<OperationWaiter>,
 ) {
   setSnapshot(snapshot);
-  settleConfigPatchWaiters(snapshot, configPatchWaiters);
+  settleOperationWaiters(snapshot, operationWaiters);
 }
 
-function settleConfigPatchWaiters(
+function settleOperationWaiters(
   snapshot: ClientSnapshot,
-  configPatchWaiters: Set<ConfigPatchWaiter>,
+  operationWaiters: Set<OperationWaiter>,
 ) {
-  for (const waiter of configPatchWaiters) {
-    settleConfigPatchWaiter(waiter, snapshot, configPatchWaiters);
+  for (const waiter of operationWaiters) {
+    settleOperationWaiter(waiter, snapshot, operationWaiters);
   }
 }
 
-function settleConfigPatchWaiter(
-  waiter: ConfigPatchWaiter,
+function settleOperationWaiter(
+  waiter: OperationWaiter,
   snapshot: ClientSnapshot,
-  configPatchWaiters: Set<ConfigPatchWaiter>,
+  operationWaiters: Set<OperationWaiter>,
 ) {
-  const result = configPatchResult(snapshot, waiter.key);
+  const result = operationResult(snapshot, waiter.key, waiter.kind);
 
   if (result?.status === "ready") {
-    configPatchWaiters.delete(waiter);
+    operationWaiters.delete(waiter);
     waiter.resolve(snapshot);
   } else if (result?.status === "failed") {
-    configPatchWaiters.delete(waiter);
-    waiter.reject(new Error(result.error ?? "config patch failed"));
+    operationWaiters.delete(waiter);
+    waiter.reject(new Error(result.error ?? waiter.failureMessage));
   }
 }
 
-function configPatchResult(snapshot: ClientSnapshot, key: string) {
+function operationResult(snapshot: ClientSnapshot, key: string, kind: OperationKind) {
   const result = snapshot.operations.current[key];
 
-  return result?.kind === "configPatch" ? result : undefined;
+  return result?.kind === kind ? result : undefined;
+}
+
+function getLoadedClient(client: LoadedWasmClient | undefined) {
+  if (!client) {
+    throw new Error("client is not loaded");
+  }
+
+  return client;
 }
 
 function sleep(milliseconds: number): Promise<void> {

@@ -83,3 +83,20 @@ export async function waitForMissingText(page, selector, unexpectedText) {
 
   throw new Error(`Timed out waiting for ${selector} to omit ${unexpectedText}; saw ${text}`);
 }
+
+export async function waitForPathname(page, expectedPathname) {
+  const deadline = Date.now() + 10_000;
+  let pathname = "";
+
+  while (Date.now() < deadline) {
+    pathname = await page.evaluate(() => window.location.pathname);
+
+    if (pathname === expectedPathname) {
+      return true;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for route ${expectedPathname}; saw ${pathname}`);
+}

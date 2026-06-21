@@ -19,6 +19,7 @@ const webUrl = `http://127.0.0.1:${webPort}`;
 const dockerWebUrl = `http://${getHostAddress()}:${webPort}`;
 const browserScripts = [
   "tests/web/k6/status/landing.browser.js",
+  "tests/web/k6/sessions/sessions.browser.js",
   "tests/web/k6/config/watch.browser.js",
   "tests/web/k6/config/providers.browser.js",
   "tests/web/k6/config/mcp.browser.js",
