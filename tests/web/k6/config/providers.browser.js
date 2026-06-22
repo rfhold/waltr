@@ -1,6 +1,6 @@
 import { check, sleep } from "k6";
 
-import { baseUrl, options as browserOptions, withPage } from "../support/browser.js";
+import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
 import { typeAndKeepFocus, waitForButton, waitForMissingText, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
@@ -14,8 +14,11 @@ export default async function () {
     await page.locator('a[href="/config/provider"]').click();
     await waitForText(page, "#config-title", "Settings");
     await waitForText(page, '[aria-label="Provider actions"]', "Create");
+    await screenshot(page, "config-provider-list-empty");
 
     await page.locator(".config__actions button").click();
+    await waitForText(page, 'form[aria-label="Create provider"]', "Name");
+    await screenshot(page, "config-provider-create-form-empty");
     await typeAndKeepFocus(
       page,
       'form[aria-label="Create provider"] input[name="name"]',
@@ -34,6 +37,7 @@ export default async function () {
     const createModelRoute = await waitForPathname(page, "/config/provider/create/models/create");
     const createModelSeparate = await separateModelFormExists(page, modelsSelector, "Create model");
     const createModelActionsReachable = await modelFormActionsReachable(page, "Create model");
+    await screenshot(page, "config-provider-model-create-dialog-empty");
     await typeAndKeepFocus(
       page,
       'form[aria-label="Create model"] input[name="key"]',
@@ -52,13 +56,16 @@ export default async function () {
     const createdProvider = await waitForText(page, '[aria-label="Provider list"]', "openai");
     const createdUrl = await waitForText(page, '[aria-label="Provider list"]', "https://api.openai.com");
     await waitForButton(page, "Edit openai");
+    await screenshot(page, "config-provider-list-created");
 
     await page.locator('button[aria-label="Edit openai"]').click();
     const persistedCreatedModel = await waitForText(page, modelsSelector, "GPT-4o");
+    await screenshot(page, "config-provider-edit-form-with-model");
     await page.locator('button[aria-label="Edit model gpt4o"]').click();
     const editModelRoute = await waitForPathname(page, "/config/provider/edit/openai/models/edit/gpt4o");
     const editModelSeparate = await separateModelFormExists(page, modelsSelector, "Edit model");
     const editModelActionsReachable = await modelFormActionsReachable(page, "Edit model");
+    await screenshot(page, "config-provider-model-edit-dialog");
     await setInputValue(
       page,
       'form[aria-label="Edit model"] input[name="name"]',
@@ -81,6 +88,7 @@ export default async function () {
       '[aria-label="Delete model gpt4o confirmation"]',
       "Delete?",
     );
+    await screenshot(page, "config-provider-model-delete-confirmation");
     await page.locator('button[aria-label="Cancel delete model gpt4o"]').click();
     const cancelledDeleteModel = await waitForText(page, modelsSelector, "GPT-4o Embeddings");
     await page.locator('button[aria-label="Delete model gpt4o"]').click();
@@ -102,6 +110,7 @@ export default async function () {
       '[aria-label="Delete openai confirmation"]',
       "Delete?",
     );
+    await screenshot(page, "config-provider-delete-confirmation");
     await page.locator('button[aria-label="Confirm delete openai"]').click();
     await waitForMissingText(page, '[aria-label="Provider list"]', "openai");
 

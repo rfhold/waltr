@@ -19,7 +19,7 @@ describe("config read", () => {
   test("renders loading with the watch status until a snapshot is received", () => {
     renderWithAppState(() => <ConfigRouteWithChildren />, {
       snapshot: {
-        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {} }),
+        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }),
         config: {
           current: null,
           load: operationSnapshot("idle"),
@@ -48,7 +48,7 @@ describe("config read", () => {
   test("renders the error panel instead of the loading panel on a watch error", () => {
     renderWithAppState(() => <ConfigRouteWithChildren />, {
       snapshot: {
-        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {} }),
+        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }),
         config: {
           current: null,
           load: operationSnapshot("idle"),
