@@ -196,9 +196,16 @@ async fn durable_session_timeline_ranges_preserve_cursor_order() {
     );
     assert!(matches!(
         &all[0].content,
+        TimelineContent::TextSnapshot { text } if text == "range prompt"
+    ));
+    let first_assistant = all
+        .iter()
+        .find(|event| crate::session::channel_is(event, CHANNEL_ASSISTANT_TEXT))
+        .expect("assistant event");
+    assert!(matches!(
+        &first_assistant.content,
         TimelineContent::TextDelta { delta } if delta == "first"
     ));
-    assert!(crate::session::channel_is(&all[0], CHANNEL_ASSISTANT_TEXT));
     assert_eq!(
         all.last().map(|event| (event.kind, event.status)),
         Some((
@@ -268,7 +275,7 @@ async fn assistant_and_thinking_deltas_use_stable_items_and_reconstruct_text() {
         .filter(|event| crate::session::channel_is(event, CHANNEL_THINKING))
         .collect::<Vec<_>>();
 
-    assert_eq!(assistant_events.len(), 2);
+    assert_eq!(assistant_events.len(), 3);
     assert_eq!(thinking_events.len(), 2);
     assert!(
         assistant_events
@@ -280,11 +287,13 @@ async fn assistant_and_thinking_deltas_use_stable_items_and_reconstruct_text() {
             .iter()
             .all(|event| event.item_id == thinking_events[0].item_id)
     );
-    assert!(
-        assistant_events
-            .iter()
-            .all(|event| event.kind == TimelineEventKind::ContentDelta)
-    );
+    assert_eq!(assistant_events[0].kind, TimelineEventKind::ContentDelta);
+    assert_eq!(assistant_events[1].kind, TimelineEventKind::ContentDelta);
+    assert_eq!(assistant_events[2].kind, TimelineEventKind::ItemFinished);
+    assert!(matches!(
+        &assistant_events[2].content,
+        TimelineContent::TextSnapshot { text } if text == "answer-1 answer-2"
+    ));
     assert!(
         thinking_events
             .iter()

@@ -37,7 +37,8 @@ use super::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, ExternalResponse, RequestId, RequestRecord,
         ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent, SessionRecord,
-        SessionSnapshot, SessionStore, SessionStoreError, Suspension as SessionSuspension,
+        SessionSnapshot, SessionStore, SessionStoreError, SessionTimelineBroadcaster,
+        Suspension as SessionSuspension,
     },
 };
 
@@ -59,6 +60,7 @@ where
     session_id: SessionId,
     session_revision: Revision,
     session_store: S,
+    timeline_broadcaster: Option<SessionTimelineBroadcaster>,
     session_initialized: bool,
     middleware_state: MiddlewareStateLog,
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
@@ -118,6 +120,7 @@ where
             session_id: run.session_id,
             session_revision: Revision::ZERO,
             session_store: run.session_store,
+            timeline_broadcaster: run.timeline_broadcaster,
             session_initialized: false,
             middleware_state: MiddlewareStateLog::default(),
             system_prompt_override: run.system_prompt_override,
@@ -269,6 +272,11 @@ where
                         events.push(SessionJournalEvent::Finished);
                         if let Err(error) = self.append_journal_events(events).await {
                             return Some((Err(error), self));
+                        }
+                        match self.append_final_assistant_snapshot().await {
+                            Ok(Some(event)) => self.pending.push_back(Ok(event)),
+                            Ok(None) => {}
+                            Err(error) => return Some((Err(error), self)),
                         }
                         let status = match self.append_finished_status_event().await {
                             Ok(event) => event,
@@ -722,6 +730,14 @@ where
             .map_err(session_store_error)?;
         self.append_journal_event(SessionJournalEvent::PromptAppended { prompt })
             .await?;
+        let event = self
+            .append_timeline_event(user_prompt_timeline_event(
+                &self.session_id,
+                self.turn as u64,
+                self.prompt.clone(),
+            ))
+            .await?;
+        self.pending.push_back(Ok(event));
         self.session_initialized = true;
         Ok(true)
     }
@@ -742,7 +758,8 @@ where
                 {
                     record
                 } else {
-                    match AgentSessionRuntime::new(&self.session_store)
+                    match self
+                        .session_runtime()
                         .resume(&self.session_id, ResumeInput::Prompt(prompt))
                         .await?
                     {
@@ -757,7 +774,8 @@ where
             } => {
                 let retry = permission_retry_tool_call(&record.snapshot(), &request_id, &response)?;
                 let cancel = permission_cancel_response(&record.snapshot(), &request_id, &response);
-                let record = match AgentSessionRuntime::new(&self.session_store)
+                let record = match self
+                    .session_runtime()
                     .resume(
                         &self.session_id,
                         ResumeInput::ExternalResponse {
@@ -780,7 +798,8 @@ where
                 record
             }
             ResumeInput::ToolResults(results) => {
-                match AgentSessionRuntime::new(&self.session_store)
+                match self
+                    .session_runtime()
                     .resume(&self.session_id, ResumeInput::ToolResults(results))
                     .await?
                 {
@@ -828,9 +847,7 @@ where
         if !self.session_initialized {
             return Ok(());
         }
-        let record = AgentSessionRuntime::new(&self.session_store)
-            .interrupt(&self.session_id)
-            .await?;
+        let record = self.session_runtime().interrupt(&self.session_id).await?;
         self.hydrate_from_record(&record);
         Ok(())
     }
@@ -857,6 +874,9 @@ where
             .append_timeline(&self.session_id, self.session_revision, events)
             .await
             .map_err(session_store_error)?;
+        if let Some(timeline) = &self.timeline_broadcaster {
+            timeline.publish_all(assigned.clone());
+        }
         self.session_revision = self.session_revision.next();
         Ok(assigned)
     }
@@ -879,6 +899,26 @@ where
             delta,
         ))
         .await
+    }
+
+    async fn append_final_assistant_snapshot(&mut self) -> Result<Option<AgentTimelineEvent>> {
+        let text = self
+            .turns
+            .iter()
+            .find(|turn| turn.turn == self.turn as u64)
+            .map(|turn| turn.assistant_texts().collect::<String>())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        self.append_timeline_event(PendingTimelineEvent::assistant_text_snapshot(
+            self.session_id.clone(),
+            self.turn as u64,
+            assistant_text_item_id(self.turn as u64),
+            text,
+        ))
+        .await
+        .map(Some)
     }
 
     async fn append_finished_status_event(&mut self) -> Result<AgentTimelineEvent> {
@@ -958,10 +998,23 @@ where
         ))
         .await
     }
+
+    fn session_runtime(&self) -> AgentSessionRuntime<'_, S> {
+        let runtime = AgentSessionRuntime::new(&self.session_store);
+        if let Some(timeline) = &self.timeline_broadcaster {
+            runtime.with_timeline_broadcaster(timeline.clone())
+        } else {
+            runtime
+        }
+    }
 }
 
 fn assistant_text_item_id(turn: u64) -> TimelineItemId {
     TimelineItemId::new(format!("assistant-turn-{turn}"))
+}
+
+fn user_text_item_id(turn: u64) -> TimelineItemId {
+    TimelineItemId::new(format!("user-turn-{turn}"))
 }
 
 fn thinking_item_id(turn: u64) -> TimelineItemId {
@@ -1000,6 +1053,19 @@ fn tool_call_timeline_event(
     call: ToolCall,
 ) -> PendingTimelineEvent {
     PendingTimelineEvent::tool_call(session_id.clone(), turn, tool_call_item_id(&call.id), call)
+}
+
+fn user_prompt_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    prompt: String,
+) -> PendingTimelineEvent {
+    PendingTimelineEvent::user_text_snapshot(
+        session_id.clone(),
+        turn,
+        user_text_item_id(turn),
+        prompt,
+    )
 }
 
 fn tool_result_timeline_event(

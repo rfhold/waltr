@@ -13,6 +13,8 @@ use crate::{
 
 /// Assistant text display channel.
 pub const CHANNEL_ASSISTANT_TEXT: &str = "assistant_text";
+/// User text display channel.
+pub const CHANNEL_USER_TEXT: &str = "user_text";
 /// Provider thinking/reasoning display channel.
 pub const CHANNEL_THINKING: &str = "thinking";
 /// Tool call preview display channel.
@@ -426,6 +428,42 @@ impl PendingTimelineEvent {
         text_delta_event(session_id, turn, item_id, CHANNEL_ASSISTANT_TEXT, delta)
     }
 
+    /// Create a user text snapshot event.
+    #[must_use]
+    pub fn user_text_snapshot(
+        session_id: SessionId,
+        turn: u64,
+        item_id: impl Into<TimelineItemId>,
+        text: impl Into<String>,
+    ) -> Self {
+        text_snapshot_event(
+            session_id,
+            turn,
+            item_id,
+            TimelineEventKind::ItemFinished,
+            CHANNEL_USER_TEXT,
+            text,
+        )
+    }
+
+    /// Create a final assistant text snapshot event.
+    #[must_use]
+    pub fn assistant_text_snapshot(
+        session_id: SessionId,
+        turn: u64,
+        item_id: impl Into<TimelineItemId>,
+        text: impl Into<String>,
+    ) -> Self {
+        text_snapshot_event(
+            session_id,
+            turn,
+            item_id,
+            TimelineEventKind::ItemFinished,
+            CHANNEL_ASSISTANT_TEXT,
+            text,
+        )
+    }
+
     /// Create a thinking delta event.
     #[must_use]
     pub fn thinking_delta(
@@ -580,6 +618,26 @@ fn text_delta_event(
         Some(TimelineChannel::from(channel)),
         TimelineContent::text_delta(delta),
     )
+}
+
+fn text_snapshot_event(
+    session_id: SessionId,
+    turn: u64,
+    item_id: impl Into<TimelineItemId>,
+    kind: TimelineEventKind,
+    channel: &str,
+    text: impl Into<String>,
+) -> PendingTimelineEvent {
+    let mut event = PendingTimelineEvent::new(
+        session_id,
+        turn,
+        item_id,
+        kind,
+        Some(TimelineChannel::from(channel)),
+        TimelineContent::TextSnapshot { text: text.into() },
+    );
+    event.status = Some(TimelineStatus::Finished);
+    event
 }
 
 fn empty_metadata() -> Value {

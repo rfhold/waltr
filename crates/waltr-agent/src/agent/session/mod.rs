@@ -23,4 +23,8 @@ pub use types::{
     RequestRecord, ResumeInput, Revision, SessionId, SessionJournalEvent, SessionRecord,
     SessionSnapshot, SessionStatus, SessionSummary, Suspension,
 };
-pub use watch::{SessionListEvent, SessionListSubscription, SessionListUpdate};
+pub(crate) use watch::SessionTimelineBroadcaster;
+pub use watch::{
+    SessionListEvent, SessionListSubscription, SessionListUpdate, SessionTimelineSubscription,
+    SessionTimelineUpdate,
+};

@@ -20,9 +20,9 @@ pub use agent::{
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
     S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListEvent,
     SessionListSubscription, SessionListUpdate, SessionRecord, SessionSnapshot, SessionStatus,
-    SessionStore, SessionStoreError, SessionStoreResult, SessionSummary, Suspension,
-    ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
-    run_postgresql_migrations,
+    SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
+    SessionTimelineSubscription, SessionTimelineUpdate, Suspension, ToolExecutionContext,
+    ToolProgressSink, opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
@@ -47,9 +47,9 @@ pub use stream::{
 pub use timeline::{
     AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING,
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO,
-    CHANNEL_TOOL_RESULT, PendingTimelineEvent, TimelineChannel, TimelineContent, TimelineContentId,
-    TimelineCursor, TimelineDirection, TimelineEventKind, TimelineItemId, TimelineItemText,
-    TimelineQuery, TimelineStatus,
+    CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, PendingTimelineEvent, TimelineChannel, TimelineContent,
+    TimelineContentId, TimelineCursor, TimelineDirection, TimelineEventKind, TimelineItemId,
+    TimelineItemText, TimelineQuery, TimelineStatus,
 };
 pub use tools::filesystem;
 pub use tools::question;

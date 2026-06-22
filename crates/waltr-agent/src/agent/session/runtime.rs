@@ -7,7 +7,7 @@ use crate::{
     permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
     timeline::{
         CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
-        TimelineEventKind,
+        TimelineEventKind, TimelineItemId,
     },
 };
 
@@ -18,7 +18,8 @@ use serde_json::Value;
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
     ExternalResponse, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
-    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionSummary, Suspension,
+    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
+    SessionTimelineBroadcaster, Suspension,
 };
 
 /// Runtime facade for durable session resume operations.
@@ -28,6 +29,7 @@ where
     S: SessionStore + ?Sized,
 {
     store: &'a S,
+    timeline: Option<SessionTimelineBroadcaster>,
 }
 
 impl<'a, S> AgentSessionRuntime<'a, S>
@@ -36,7 +38,18 @@ where
 {
     /// Create a runtime over a session store.
     pub const fn new(store: &'a S) -> Self {
-        Self { store }
+        Self {
+            store,
+            timeline: None,
+        }
+    }
+
+    pub(crate) fn with_timeline_broadcaster(
+        mut self,
+        timeline: SessionTimelineBroadcaster,
+    ) -> Self {
+        self.timeline = Some(timeline);
+        self
     }
 
     /// Create a new durable session record.
@@ -226,6 +239,11 @@ where
                 reason: CancelReason::SupersededByUserPrompt,
             });
         }
+        timeline.push(user_prompt_timeline_event(
+            &record.id,
+            snapshot.turn,
+            prompt.clone(),
+        ));
         journal.push(SessionJournalEvent::PromptAppended { prompt });
 
         let mut record = self.append_journal_and_reload(record, journal).await?;
@@ -406,10 +424,14 @@ where
         events: Vec<PendingTimelineEvent>,
     ) -> Result<SessionRecord> {
         let id = record.id.clone();
-        self.store
+        let assigned = self
+            .store
             .append_timeline(&id, record.revision, events)
             .await
             .map_err(session_store_error)?;
+        if let Some(timeline) = &self.timeline {
+            timeline.publish_all(assigned);
+        }
         self.load_session(&id).await
     }
 }
@@ -501,6 +523,19 @@ fn tool_result_timeline_event(
         format!("tool-result:{call_id}"),
         format!("tool-call:{call_id}"),
         result,
+    )
+}
+
+fn user_prompt_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    prompt: String,
+) -> PendingTimelineEvent {
+    PendingTimelineEvent::user_text_snapshot(
+        session_id.clone(),
+        turn,
+        TimelineItemId::new(format!("user-turn-{turn}")),
+        prompt,
     )
 }
 
