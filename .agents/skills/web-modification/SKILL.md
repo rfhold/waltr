@@ -32,6 +32,7 @@ Do not use this skill for shared server-data behavior that belongs in `waltr-cli
 
 - Use `pnpm --filter @rfhold/waltr-web test` for browser routing, forms, dialogs, tabs, transitions, app context wiring, component behavior, and UI-specific watch rendering.
 - Use `pnpm test:web:integration` for browser-level server-backed k6 flows that need a real server, real web build, and end-to-end user navigation.
+- Use `pnpm test:web:screenshots` for the same k6 flows with local screenshot capture under ignored `.dev/web-screenshots/`; do not commit generated PNGs.
 - Add or update `tests/web/k6/` when the browser flow depends on actual server coordination, gRPC-web/WASM wiring, readiness, config persistence, or watch behavior.
 - Keep web unit tests for UI-state-heavy cases that can use test doubles instead of a real server.
 
@@ -44,6 +45,10 @@ Run web tests:
 Run web server-backed k6 tests:
 
 `pnpm test:web:integration`
+
+Run web server-backed k6 tests with local screenshot capture:
+
+`pnpm test:web:screenshots`
 
 Build the web client:
 

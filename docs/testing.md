@@ -59,6 +59,16 @@ Run web server-backed k6 tests:
 
 `pnpm test:web:integration`
 
+Run web server-backed k6 tests and validate screenshot snapshots:
+
+`pnpm test:web:screenshots`
+
+Actual screenshot PNGs are written under `.dev/web-screenshots/current/`, which is ignored by git, and compared against static snapshots under `tests/web/k6/snapshots/screenshots/`.
+
+Update the static screenshot snapshots after an intentional visual change:
+
+`pnpm test:web:screenshots:update`
+
 Run agent unit tests:
 
 `cargo test -p waltr-agent --features shell --lib`
