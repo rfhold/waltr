@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/server-backed/config/providers.rs
+expression: defaults
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        ┌ Configuration ────────────────────────────────────────────────┐       "
+"        │  Providers   MCP Servers   Defaults                           │       "
+"        │───────────────────────────────────────────────────────────────│       "
+"        │Provider none                                                  │       "
+"        │Model none                                                     │       "
+"        │MCP no MCP servers                                             │       "
+"        │                                                               │       "
+"        │No MCP servers configured.                                     │       "
+"        │                                                               │       "
+"        │Up/Down provider  Left/Right model  Space all MCP  j/k MCP  m  │       "
+"        │toggle MCP  Enter save  Del clear                              │       "
+"        │No providers configured.                                       │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        │                                                               │       "
+"        └ Esc back  Tab switch  C-x c create  Right/Enter edit  Backspac┘       "
+"                                                                                "
+"                                                                                "
+"Esc  back    Ctrl-X q  quit                                          Waltr  ready"

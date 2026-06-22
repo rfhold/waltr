@@ -70,6 +70,7 @@ async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
         .expect("created MCP server should be persisted");
     assert_eq!(server_view.kind, McpServerTypeView::Sse);
     assert_eq!(server_view.url, "https://mcp.example");
+    insta::assert_snapshot!("config_mcp_saved_real_server", render_app(&app));
 
     // Edit the selected server (still on the MCP tab).
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);

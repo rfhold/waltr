@@ -1,14 +1,14 @@
 ---
-source: crates/waltr-tui/tests/app.rs
-expression: render_app(&app)
+source: crates/waltr-tui/tests/server-backed/config/providers.rs
+expression: switched
 ---
 "                                                                                "
 "                                                                                "
 "                                                                                "
 "        ┌ Configuration ────────────────────────────────────────────────┐       "
-"        │  Providers   MCP Servers                                      │       "
+"        │  Providers   MCP Servers   Defaults                           │       "
 "        │───────────────────────────────────────────────────────────────│       "
-"        │> anthropic  anthropic  https://api.anthropic.com              │       "
+"        │No MCP servers configured.                                     │       "
 "        │                                                               │       "
 "        │                                                               │       "
 "        │                                                               │       "

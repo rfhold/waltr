@@ -1,15 +1,14 @@
 ---
-source: crates/waltr-tui/tests/app.rs
+source: crates/waltr-tui/tests/server-backed/config/mcp.rs
 expression: render_app(&app)
 ---
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"        ┌ Sessions ─────────────────────────────────────────────────────┐       "
-"        │Sessions                                                       │       "
-"        │Recent sessions  Create: C-x s                                 │       "
-"        │> newer  idle  2s                                              │       "
-"        │  older  idle  1s                                              │       "
+"        ┌ Configuration ────────────────────────────────────────────────┐       "
+"        │  Providers   MCP Servers   Defaults                           │       "
+"        │───────────────────────────────────────────────────────────────│       "
+"        │> remote  sse  https://mcp.example                             │       "
 "        │                                                               │       "
 "        │                                                               │       "
 "        │                                                               │       "
@@ -22,7 +21,8 @@ expression: render_app(&app)
 "        │                                                               │       "
 "        │                                                               │       "
 "        │                                                               │       "
-"        └ Esc back  C-x s create  Right/Enter detail  Backspace/Delete d┘       "
+"        │                                                               │       "
+"        └ Esc back  Tab switch  C-x c create  Right/Enter edit  Backspac┘       "
 "                                                                                "
 "                                                                                "
 "Esc  back    Ctrl-X q  quit                                          Waltr  ready"

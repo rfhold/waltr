@@ -46,14 +46,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         }
         AppScreen::Sessions => {
             draw_app_shell(frame, app, true, |frame, area| {
-                screens::draw_landing(frame, area, false);
+                if !app.sessions_section().in_detail() {
+                    screens::draw_landing(frame, area, false);
+                }
+                screens::draw_sessions(frame, area, app.sessions_section(), app.client_snapshot());
             });
-            screens::draw_sessions(
-                frame,
-                frame.area(),
-                app.sessions_section(),
-                app.client_snapshot(),
-            );
         }
     });
 }

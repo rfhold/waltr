@@ -6,7 +6,7 @@ expression: render_app(&app)
 "                                                                                "
 "                                                                                "
 "        ┌ Configuration ────────────────────────────────────────────────┐       "
-"        │  Providers   MCP Servers                                      │       "
+"        │  Providers   MCP Servers   Defaults                           │       "
 "        │───────────────────────────────────────────────────────────────│       "
 "        │> anthropic  Delete? Enter/y confirm, n/Esc cancel             │       "
 "        │                                                               │       "
