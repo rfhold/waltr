@@ -3,15 +3,19 @@ syntax = "proto3";
 package waltr.session.v1;
 
 import "google/protobuf/timestamp.proto";
+import "waltr/config/v1/config_service.proto";
 
 service SessionService {
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+  rpc UpdateSessionRuntimeConfig(UpdateSessionRuntimeConfigRequest) returns (UpdateSessionRuntimeConfigResponse);
   rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
 }
 
-message CreateSessionRequest {}
+message CreateSessionRequest {
+  SessionRuntimeConfigRequest runtime_config = 1;
+}
 
 message CreateSessionResponse {
   SessionSummary session = 1;
@@ -28,6 +32,15 @@ message DeleteSessionRequest {
 }
 
 message DeleteSessionResponse {}
+
+message UpdateSessionRuntimeConfigRequest {
+  string id = 1;
+  SessionRuntimeConfigRequest runtime_config = 2;
+}
+
+message UpdateSessionRuntimeConfigResponse {
+  SessionSummary session = 1;
+}
 
 message WatchSessionsRequest {}
 
@@ -52,6 +65,41 @@ message SessionSummary {
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
   google.protobuf.Timestamp last_activity_at = 7;
+  SessionRuntimeConfig runtime_config = 8;
+}
+
+message SessionRuntimeConfig {
+  SessionProviderRuntime provider = 1;
+  repeated SessionMcpServerRuntime mcp_servers = 2;
+}
+
+message SessionRuntimeConfigRequest {
+  string provider_key = 1;
+  string model_id = 2;
+  repeated string enabled_mcp_server_keys = 3;
+}
+
+message SessionProviderRuntime {
+  string key = 1;
+  waltr.config.v1.ProviderType type = 2;
+  string url = 3;
+  string model_id = 4;
+  RuntimeConfigMatch match = 5;
+}
+
+message SessionMcpServerRuntime {
+  string key = 1;
+  waltr.config.v1.McpServerType type = 2;
+  string command = 3;
+  string url = 4;
+  RuntimeConfigMatch match = 5;
+}
+
+enum RuntimeConfigMatch {
+  RUNTIME_CONFIG_MATCH_UNSPECIFIED = 0;
+  RUNTIME_CONFIG_MATCH_CONFIGURED = 1;
+  RUNTIME_CONFIG_MATCH_MISSING = 2;
+  RUNTIME_CONFIG_MATCH_CHANGED = 3;
 }
 
 message SessionStatus {

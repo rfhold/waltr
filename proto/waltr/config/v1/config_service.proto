@@ -12,6 +12,14 @@ message Configuration {
   map<string, Provider> providers = 1;
   string etag = 2;
   map<string, McpServer> mcp_servers = 3;
+  RuntimeDefaults runtime_defaults = 4;
+}
+
+message RuntimeDefaults {
+  string provider_key = 1;
+  string model_key = 2;
+  optional bool mcp_default_enabled = 3;
+  repeated string enabled_mcp_server_keys = 4;
 }
 
 message Provider {
@@ -85,6 +93,7 @@ message PatchConfigRequest {
   string expected_etag = 1;
   ProviderMapPatch providers = 2;
   McpServerMapPatch mcp_servers = 3;
+  RuntimeDefaults runtime_defaults = 4;
 }
 
 message ProviderMapPatch {
