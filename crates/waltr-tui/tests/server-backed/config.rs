@@ -11,3 +11,6 @@ mod providers;
 
 #[path = "config/mcp.rs"]
 mod mcp;
+
+#[path = "config/defaults.rs"]
+mod defaults;

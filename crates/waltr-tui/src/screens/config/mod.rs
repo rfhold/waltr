@@ -5,9 +5,11 @@
 //! state; the provider section module ([`providers::ProviderSection`]) owns the
 //! provider list, selection, form, and delete interactions.
 
+mod defaults;
 mod mcp;
 mod providers;
 
+pub use defaults::RuntimeDefaultsSection;
 pub use mcp::{McpForm, McpFormMode, McpSection};
 pub use providers::{
     ModelForm, ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection, SectionAction,
@@ -35,11 +37,13 @@ pub enum ConfigTab {
     Providers,
     /// MCP server configuration section.
     Mcp,
+    /// Runtime defaults configuration section.
+    Defaults,
 }
 
 impl ConfigTab {
     /// The ordered set of tabs presented in the strip.
-    pub const ALL: [Self; 2] = [Self::Providers, Self::Mcp];
+    pub const ALL: [Self; 3] = [Self::Providers, Self::Mcp, Self::Defaults];
 
     /// The tab's display label.
     #[must_use]
@@ -47,6 +51,7 @@ impl ConfigTab {
         match self {
             Self::Providers => "Providers",
             Self::Mcp => "MCP Servers",
+            Self::Defaults => "Defaults",
         }
     }
 
@@ -55,7 +60,8 @@ impl ConfigTab {
     pub const fn next(self) -> Self {
         match self {
             Self::Providers => Self::Mcp,
-            Self::Mcp => Self::Providers,
+            Self::Mcp => Self::Defaults,
+            Self::Defaults => Self::Providers,
         }
     }
 }
@@ -112,6 +118,13 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         ConfigTab::Mcp => {
             let section = app.mcp_section();
+            if !pending {
+                section.render_content(frame, content_area, config, loaded);
+            }
+            section.render_overlay(frame, area);
+        }
+        ConfigTab::Defaults => {
+            let section = app.runtime_defaults_section();
             if !pending {
                 section.render_content(frame, content_area, config, loaded);
             }

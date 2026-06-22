@@ -10,7 +10,10 @@ use crate::{
     event::AppEvent,
     input::InputEvent,
     keys::{KeyCommand, LeaderCommand, key_command},
-    screens::{ConfigTab, McpSection, ProviderSection, SectionAction, SessionsSection},
+    screens::{
+        ConfigTab, McpSection, ProviderSection, RuntimeDefaultsSection, SectionAction,
+        SessionsSection,
+    },
     ui,
     ui::Notice,
 };
@@ -72,6 +75,7 @@ pub struct App {
     active_config_tab: ConfigTab,
     provider_section: ProviderSection,
     mcp_section: McpSection,
+    runtime_defaults_section: RuntimeDefaultsSection,
     sessions_section: SessionsSection,
     leader_armed: bool,
     notice: Option<TransientNotice>,
@@ -88,6 +92,7 @@ impl App {
             active_config_tab: ConfigTab::Providers,
             provider_section: ProviderSection::new(),
             mcp_section: McpSection::new(),
+            runtime_defaults_section: RuntimeDefaultsSection::new(),
             sessions_section: SessionsSection::new(),
             leader_armed: false,
             notice: None,
@@ -195,6 +200,12 @@ impl App {
         &self.mcp_section
     }
 
+    /// Return the runtime defaults config section.
+    #[must_use]
+    pub const fn runtime_defaults_section(&self) -> &RuntimeDefaultsSection {
+        &self.runtime_defaults_section
+    }
+
     /// Return the sessions screen state.
     #[must_use]
     pub const fn sessions_section(&self) -> &SessionsSection {
@@ -254,6 +265,7 @@ impl App {
                     match self.active_config_tab {
                         ConfigTab::Providers => self.provider_section.open_create_form(),
                         ConfigTab::Mcp => self.mcp_section.open_create_form(),
+                        ConfigTab::Defaults => self.runtime_defaults_section.open_create_form(),
                     }
                     return AppAction::Continue;
                 }
@@ -313,6 +325,7 @@ impl App {
 
         self.provider_section.reconcile_patch(&snapshot);
         self.mcp_section.reconcile_patch(&snapshot);
+        self.runtime_defaults_section.reconcile_patch(&snapshot);
         self.sessions_section.reconcile_operations(&snapshot);
 
         let provider_count = snapshot
@@ -328,6 +341,8 @@ impl App {
             .as_ref()
             .map_or(0, |config| config.mcp_servers.len());
         self.mcp_section.sync_selection(server_count);
+        self.runtime_defaults_section
+            .sync_selection(snapshot.config.current.as_ref());
 
         self.sessions_section
             .sync_selection(snapshot.sessions.current.len());
@@ -339,6 +354,7 @@ impl App {
         match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.has_overlay(),
             ConfigTab::Mcp => self.mcp_section.has_overlay(),
+            ConfigTab::Defaults => self.runtime_defaults_section.has_overlay(),
         }
     }
 
@@ -346,6 +362,7 @@ impl App {
         match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.dismiss_overlay(),
             ConfigTab::Mcp => self.mcp_section.dismiss_overlay(),
+            ConfigTab::Defaults => self.runtime_defaults_section.dismiss_overlay(),
         }
     }
 
@@ -370,6 +387,9 @@ impl App {
         let action = match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.handle_key(key, config.as_ref()),
             ConfigTab::Mcp => self.mcp_section.handle_key(key, config.as_ref()),
+            ConfigTab::Defaults => self
+                .runtime_defaults_section
+                .handle_key(key, config.as_ref()),
         };
         match action {
             SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),

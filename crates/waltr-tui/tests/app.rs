@@ -332,8 +332,9 @@ fn sessions_create_dispatches_and_completion_opens_detail() {
 
     assert_eq!(app.sessions_section().detail_session_id(), Some("created"));
     let rendered = render_app(&app);
-    assert!(rendered.contains("Session detail"));
-    assert!(rendered.contains("Sessions / created"));
+    assert!(
+        rendered.contains("status idle  provider none (p)  mcp none (m)  delete Backspace/Delete")
+    );
 }
 
 #[test]
@@ -381,16 +382,6 @@ fn sessions_detail_delete_dispatches_and_returns_to_list() {
 }
 
 #[test]
-fn sessions_list_renders_snapshot() {
-    let app = open_sessions_app_with(watched_sessions_snapshot(vec![
-        session_view("older", 1),
-        session_view("newer", 2),
-    ]));
-
-    insta::assert_snapshot!(render_app(&app));
-}
-
-#[test]
 fn sessions_loading_renders_snapshot() {
     let mut app = App::new();
     let now = Instant::now();
@@ -403,26 +394,6 @@ fn sessions_loading_renders_snapshot() {
     assert_eq!(
         app.handle_event(&char_press('s'), now),
         AppAction::ClientCommand(ClientCommand::RegisterSessionWatchInterest)
-    );
-
-    insta::assert_snapshot!(render_app(&app));
-}
-
-#[test]
-fn sessions_empty_renders_snapshot() {
-    let app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
-
-    insta::assert_snapshot!(render_app(&app));
-}
-
-#[test]
-fn sessions_detail_renders_snapshot() {
-    let mut app =
-        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("detail", 3)]));
-
-    assert_eq!(
-        app.handle_event(&right_press(), Instant::now()),
-        AppAction::Continue
     );
 
     insta::assert_snapshot!(render_app(&app));
@@ -580,25 +551,6 @@ fn config_renders_watched_snapshot_as_modal_with_escape_hint() {
 }
 
 #[test]
-fn config_view_renders_snapshot() {
-    let app = open_config_app();
-
-    insta::assert_snapshot!(render_app(&app));
-}
-
-#[test]
-fn config_mcp_tab_renders_snapshot() {
-    let mut app = open_config_app_with_mcp();
-
-    assert_eq!(
-        app.handle_event(&tab_press(), Instant::now()),
-        AppAction::Continue
-    );
-
-    insta::assert_snapshot!(render_app(&app));
-}
-
-#[test]
 fn config_provider_create_form_renders_snapshot() {
     let mut app = open_config_app();
     let now = Instant::now();
@@ -678,17 +630,21 @@ fn config_surface_renders_tab_strip_with_active_providers_tab() {
 }
 
 #[test]
-fn config_tab_switch_cycles_between_providers_and_mcp() {
+fn config_tab_switch_cycles_between_providers_mcp_and_defaults() {
     let mut app = open_config_app();
     let now = Instant::now();
 
     assert_eq!(app.active_config_tab(), ConfigTab::Providers);
     assert!(app.provider_section().config_form().is_none());
 
-    // Tab cycles Providers -> MCP -> Providers.
+    // Tab cycles Providers -> MCP -> Defaults -> Providers.
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.active_config_tab(), ConfigTab::Mcp);
     assert!(render_app(&app).contains("No MCP servers configured."));
+
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    assert_eq!(app.active_config_tab(), ConfigTab::Defaults);
+    assert!(render_app(&app).contains("Space all MCP"));
 
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.active_config_tab(), ConfigTab::Providers);
@@ -1825,10 +1781,11 @@ fn session_view(id: &str, seconds: i64) -> SessionView {
         created_at: Some(TimestampView { seconds, nanos: 0 }),
         updated_at: Some(TimestampView { seconds, nanos: 0 }),
         last_activity_at: None,
+        runtime_config: None,
     }
 }
 
-fn ready_snapshot() -> ClientSnapshot {
+const fn ready_snapshot() -> ClientSnapshot {
     ClientSnapshot {
         operations: OperationCollectionSnapshot {
             current: BTreeMap::new(),
@@ -1876,6 +1833,11 @@ fn ready_snapshot() -> ClientSnapshot {
                 error: None,
                 key: None,
             },
+            runtime_config_update: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
             watch: OperationSnapshot {
                 status: "idle",
                 error: None,
@@ -1900,6 +1862,7 @@ fn loaded_config_snapshot() -> ClientSnapshot {
             },
         )]),
         mcp_servers: BTreeMap::new(),
+        runtime_defaults: None,
     });
     snapshot.config.load.status = "ready";
     snapshot

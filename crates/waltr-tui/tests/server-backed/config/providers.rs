@@ -34,12 +34,18 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     assert!(rendered.contains("MCP Servers"));
     assert!(rendered.contains("Tab switch"));
     assert!(rendered.contains("No providers configured."));
+    insta::assert_snapshot!("config_providers_empty_real_server", rendered);
 
     let now = Instant::now();
-    // Switching tabs moves to the MCP section, then back to providers.
+    // Switching tabs moves through MCP and Defaults, then back to providers.
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let switched = render_app(&app);
     assert!(switched.contains("No MCP servers configured."));
+    insta::assert_snapshot!("config_mcp_empty_real_server", switched);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    let defaults = render_app(&app);
+    assert!(defaults.contains("Space all MCP"));
+    insta::assert_snapshot!("config_defaults_empty_real_server", defaults);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let switched_back = render_app(&app);
     assert!(switched_back.contains("No providers configured."));

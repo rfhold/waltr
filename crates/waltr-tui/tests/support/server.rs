@@ -104,6 +104,11 @@ pub async fn dispatch_app_command(
         .await;
     }
 
+    if snapshot.config.load.status == "loading" {
+        return next_snapshot_until(stream, app, |snapshot| snapshot.config.current.is_some())
+            .await;
+    }
+
     if let Some(key) = snapshot.sessions.create.key.clone()
         && snapshot.sessions.create.status == "loading"
     {
@@ -126,6 +131,21 @@ pub async fn dispatch_app_command(
             matches!(
                 snapshot.operations.current.get(&key),
                 Some(ClientOperationView::SessionDelete {
+                    status: "ready" | "failed",
+                    ..
+                })
+            )
+        })
+        .await;
+    }
+
+    if let Some(key) = snapshot.sessions.runtime_config_update.key.clone()
+        && snapshot.sessions.runtime_config_update.status == "loading"
+    {
+        return next_snapshot_until(stream, app, |snapshot| {
+            matches!(
+                snapshot.operations.current.get(&key),
+                Some(ClientOperationView::SessionRuntimeConfigUpdate {
                     status: "ready" | "failed",
                     ..
                 })

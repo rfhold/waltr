@@ -6,7 +6,7 @@ expression: render_app(&app)
 "                                                                                "
 "                                                                                "
 "        ┌ Configuration ────────────────────────────────────────────────┐       "
-"        │  Providers   MCP Servers                                      │       "
+"        │  Providers   MCP Servers   Defaults                           │       "
 "        │───────────────────────────────────────────────────────────────│       "
 "        │No MCP servers configured.                                     │       "
 "        │   ┌ Create MCP server ───────────────────────────────────┐    │       "

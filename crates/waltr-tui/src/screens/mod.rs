@@ -8,7 +8,7 @@ mod splash;
 
 pub use config::{
     ConfigTab, McpForm, McpFormMode, McpSection, ModelForm, ModelFormMode, ProviderForm,
-    ProviderFormMode, ProviderSection, SectionAction, draw_config,
+    ProviderFormMode, ProviderSection, RuntimeDefaultsSection, SectionAction, draw_config,
 };
 pub use landing::draw_landing;
 pub use operation::{OperationResult, OperationTracker};

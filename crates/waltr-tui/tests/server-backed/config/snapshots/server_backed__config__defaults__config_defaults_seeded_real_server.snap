@@ -1,22 +1,22 @@
 ---
-source: crates/waltr-tui/tests/app.rs
+source: crates/waltr-tui/tests/server-backed/config/defaults.rs
 expression: render_app(&app)
 ---
 "                                                                                "
 "                                                                                "
 "                                                                                "
 "        ┌ Configuration ────────────────────────────────────────────────┐       "
-"        │  Providers   MCP Servers                                      │       "
+"        │  Providers   MCP Servers   Defaults                           │       "
 "        │───────────────────────────────────────────────────────────────│       "
-"        │> files  stdio  fs-server                                      │       "
+"        │Provider anthropic                                             │       "
+"        │Model sonnet                                                   │       "
+"        │MCP no MCP servers                                             │       "
 "        │                                                               │       "
+"        │MCP servers                                                    │       "
+"        │> [ ] files  stdio  fs-server                                  │       "
 "        │                                                               │       "
-"        │                                                               │       "
-"        │                                                               │       "
-"        │                                                               │       "
-"        │                                                               │       "
-"        │                                                               │       "
-"        │                                                               │       "
+"        │Up/Down provider  Left/Right model  Space all MCP  j/k MCP  m  │       "
+"        │toggle MCP  Enter save  Del clear                              │       "
 "        │                                                               │       "
 "        │                                                               │       "
 "        │                                                               │       "
