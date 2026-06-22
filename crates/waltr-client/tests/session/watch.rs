@@ -1,3 +1,5 @@
+#![allow(clippy::future_not_send)]
+
 use waltr_client::{ClientCommand, ClientRuntime, SessionPhaseView};
 
 use crate::support::{

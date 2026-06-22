@@ -5,6 +5,7 @@ use crate::{
     ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect, SessionEvent,
 };
 
+#[allow(clippy::too_many_lines)]
 pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
     match event {
         SessionEvent::CreateRequested(operation_key) => {
@@ -44,6 +45,32 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             error,
         } => {
             state.set_session_delete_failed(operation_key, id, error.to_string());
+            ClientUpdate::default()
+        }
+        SessionEvent::RuntimeConfigUpdateRequested {
+            operation_key,
+            id,
+            runtime_config,
+        } => {
+            state.set_session_runtime_config_update_loading(operation_key.clone());
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::UpdateRuntimeConfig {
+                operation_key,
+                id,
+                runtime_config,
+            }))
+        }
+        SessionEvent::RuntimeConfigUpdated {
+            operation_key,
+            session,
+        } => {
+            state.set_session_runtime_config_update_ready(operation_key, session);
+            ClientUpdate::default()
+        }
+        SessionEvent::RuntimeConfigUpdateFailed {
+            operation_key,
+            error,
+        } => {
+            state.set_session_runtime_config_update_failed(operation_key, error.to_string());
             ClientUpdate::default()
         }
         SessionEvent::ListRequested => {
@@ -113,6 +140,7 @@ fn apply_watch_update(state: &mut ClientState, update: SessionWatchUpdate) -> Cl
     ClientUpdate::default()
 }
 
+#[allow(clippy::semicolon_if_nothing_returned)]
 fn apply_watch_event(state: &mut ClientState, update: SessionWatchUpdate) {
     match update.event {
         SessionWatchEvent::Snapshot(sessions) => {

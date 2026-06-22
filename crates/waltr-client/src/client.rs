@@ -3,8 +3,8 @@
 use crate::coordination::{config, session, status, stream};
 use crate::{
     ClientEffect, ClientError, ClientEvent, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
-    Configuration, McpServer, OperationKey, Provider, ProviderEditBaseline, SessionEvent,
-    StatusEvent,
+    Configuration, McpServer, OperationKey, Provider, ProviderEditBaseline, RuntimeDefaults,
+    SessionEvent, SessionRuntimeConfigRequest, StatusEvent,
 };
 
 /// Single headless client reducer used by shells.
@@ -71,6 +71,22 @@ impl Client {
             operation_key,
             id: id.into(),
         }))
+    }
+
+    /// Request that a server-side session runtime config metadata snapshot be replaced.
+    pub fn update_session_runtime_config(
+        &mut self,
+        id: impl Into<String>,
+        runtime_config: SessionRuntimeConfigRequest,
+    ) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(
+            SessionEvent::RuntimeConfigUpdateRequested {
+                operation_key,
+                id: id.into(),
+                runtime_config: Box::new(runtime_config),
+            },
+        ))
     }
 
     /// Request that the current server-side sessions be loaded.
@@ -280,6 +296,24 @@ impl Client {
         Ok(self.request_config_patch(mcp_servers_patch(config.mcp_servers), expected_etag))
     }
 
+    /// Request a patch that replaces runtime defaults in the latest configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configuration has loaded or defaults reference missing config.
+    pub fn set_runtime_defaults(
+        &mut self,
+        defaults: Option<RuntimeDefaults>,
+    ) -> Result<ClientUpdate, ClientError> {
+        let config = self.current_config()?;
+        let expected_etag = config.etag.clone();
+        if let Some(defaults) = defaults.as_ref() {
+            Self::validate_runtime_defaults(defaults, &config)?;
+        }
+
+        Ok(self.request_config_patch(runtime_defaults_patch(defaults), expected_etag))
+    }
+
     /// Request a patch that renames a provider in the latest configuration.
     ///
     /// # Errors
@@ -431,21 +465,79 @@ impl Client {
 
         Ok(())
     }
-}
 
-fn providers_patch(providers: std::collections::HashMap<String, Provider>) -> crate::ConfigPatch {
-    crate::ConfigPatch {
-        providers: Some(providers),
-        mcp_servers: None,
+    fn validate_runtime_defaults(
+        defaults: &RuntimeDefaults,
+        config: &Configuration,
+    ) -> Result<(), ClientError> {
+        if defaults.provider_key.trim().is_empty() && defaults.model_key.trim().is_empty() {
+            for key in &defaults.enabled_mcp_server_keys {
+                if !config.mcp_servers.contains_key(key) {
+                    return Err(ClientError::new(format!(
+                        "runtime default MCP server '{key}' not found"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        let provider = config
+            .providers
+            .get(&defaults.provider_key)
+            .ok_or_else(|| {
+                ClientError::new(format!(
+                    "runtime default provider '{}' not found",
+                    defaults.provider_key
+                ))
+            })?;
+        if defaults.model_key.trim().is_empty() {
+            return Err(ClientError::new(
+                "runtime default model id cannot be empty when provider is set",
+            ));
+        }
+        if !provider.models.contains_key(&defaults.model_key) {
+            return Err(ClientError::new(format!(
+                "runtime default model '{}' not found in provider '{}'",
+                defaults.model_key, defaults.provider_key
+            )));
+        }
+        for key in &defaults.enabled_mcp_server_keys {
+            if !config.mcp_servers.contains_key(key) {
+                return Err(ClientError::new(format!(
+                    "runtime default MCP server '{key}' not found"
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
-fn mcp_servers_patch(
+const fn providers_patch(
+    providers: std::collections::HashMap<String, Provider>,
+) -> crate::ConfigPatch {
+    crate::ConfigPatch {
+        providers: Some(providers),
+        mcp_servers: None,
+        runtime_defaults: None,
+    }
+}
+
+const fn mcp_servers_patch(
     mcp_servers: std::collections::HashMap<String, McpServer>,
 ) -> crate::ConfigPatch {
     crate::ConfigPatch {
         providers: None,
         mcp_servers: Some(mcp_servers),
+        runtime_defaults: None,
+    }
+}
+
+const fn runtime_defaults_patch(defaults: Option<RuntimeDefaults>) -> crate::ConfigPatch {
+    crate::ConfigPatch {
+        providers: None,
+        mcp_servers: None,
+        runtime_defaults: defaults,
     }
 }
 
@@ -614,6 +706,7 @@ mod tests {
             etag: "etag-1".to_owned(),
             providers: providers([provider("anthropic")]),
             mcp_servers: mcp_servers([mcp_server("filesystem")]),
+            runtime_defaults: None,
         });
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
@@ -856,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn session_create_completion_does_not_mutate_current_sessions() {
+    fn session_create_completion_upserts_current_session() {
         let mut client = Client::new();
         let operation_key = OperationKey::from("create-session");
 
@@ -865,7 +958,7 @@ mod tests {
             session: session("one"),
         }));
 
-        assert!(client.state().sessions.current.is_empty());
+        assert!(client.state().sessions.current.contains_key("one"));
         assert_eq!(
             client.state().sessions.create.status,
             OperationStatus::Ready
@@ -873,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn session_delete_completion_does_not_mutate_current_sessions() {
+    fn session_delete_completion_removes_current_session() {
         let mut client = Client::new();
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
@@ -885,7 +978,7 @@ mod tests {
             id: "one".to_owned(),
         }));
 
-        assert!(client.state().sessions.current.contains_key("one"));
+        assert!(!client.state().sessions.current.contains_key("one"));
         assert_eq!(
             client.state().sessions.delete.status,
             OperationStatus::Ready
@@ -1106,7 +1199,7 @@ mod tests {
             patch
                 .providers
                 .as_ref()
-                .is_some_and(|providers| providers.is_empty())
+                .is_some_and(std::collections::HashMap::is_empty)
         );
     }
 
@@ -1188,7 +1281,7 @@ mod tests {
             patch
                 .mcp_servers
                 .as_ref()
-                .is_some_and(|servers| servers.is_empty())
+                .is_some_and(std::collections::HashMap::is_empty)
         );
     }
 

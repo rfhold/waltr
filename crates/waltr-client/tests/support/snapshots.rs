@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::future_not_send)]
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -51,6 +51,7 @@ pub fn config_with_provider(name: &str) -> ConfigView {
         providers: BTreeMap::from([(name.to_owned(), provider_view(name))]),
         mcp_servers: BTreeMap::new(),
         etag: String::new(),
+        runtime_defaults: None,
     }
 }
 
@@ -83,14 +84,11 @@ pub async fn dispatch_stream_command(
             panic!("shared state stream closed while dispatching command");
         };
 
-        match receiver.await {
-            Ok(result) => {
-                if let Ok(result_snapshot) = &result {
-                    assert_eq!(snapshot.as_ref(), result_snapshot);
-                }
-                return result;
+        if let Ok(result) = receiver.await {
+            if let Ok(result_snapshot) = &result {
+                assert_eq!(snapshot.as_ref(), result_snapshot);
             }
-            Err(oneshot::Canceled) => {}
+            return result;
         }
     }
 

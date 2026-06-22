@@ -2,6 +2,7 @@ use std::pin::Pin;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
+use waltr::config::ConfigWatchUpdate;
 use waltr::grpc::waltr::config::v1::{
     GetConfigRequest, McpServerMapPatch, PatchConfigRequest, ProviderMapPatch, WatchConfigRequest,
     WatchConfigResponse,
@@ -13,21 +14,6 @@ use crate::{ClientError, ConfigPatch, Configuration};
 
 /// Stream returned by configuration watch transports.
 pub type ConfigWatchStream = Pin<Box<dyn Stream<Item = Result<ConfigWatchUpdate, ClientError>>>>;
-
-/// Internal configuration watch update from the transport layer.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ConfigWatchUpdate {
-    /// Previous entity tag, if supplied by the server.
-    pub previous_etag: String,
-    /// New entity tag for the configuration.
-    pub etag: String,
-    /// Changed configuration keys reported by the server.
-    pub changed_keys: Vec<String>,
-    /// Optional watch error message.
-    pub error: String,
-    /// Full configuration snapshot, if supplied by the server.
-    pub config: Option<Configuration>,
-}
 
 pub(super) async fn get_config<T>(transport: &T) -> Result<Configuration, ClientError>
 where
@@ -75,6 +61,7 @@ where
             mcp_servers: patch
                 .mcp_servers
                 .map(|mcp_servers| McpServerMapPatch { mcp_servers }),
+            runtime_defaults: patch.runtime_defaults,
         })
         .await
         .map_err(|error| status_error(&error))?

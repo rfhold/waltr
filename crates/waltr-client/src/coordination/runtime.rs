@@ -13,8 +13,8 @@ use crate::executor::{ConfigWatchUpdateStream, SessionWatchUpdateStream};
 use crate::{
     Client, ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate,
     ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey,
-    OperationStatus, ProviderView, SessionEffect, SessionEvent, SessionView, StatusChangeStream,
-    StatusEffect, StatusEvent,
+    OperationStatus, ProviderView, RuntimeDefaultsView, SessionEffect, SessionEvent,
+    SessionRuntimeConfigRequest, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -63,6 +63,11 @@ pub enum ClientCommand {
         /// MCP server key to delete.
         name: String,
     },
+    /// Replace runtime defaults for newly created sessions.
+    SetRuntimeDefaults {
+        /// Runtime defaults to store, or null to clear defaults.
+        defaults: Option<RuntimeDefaultsView>,
+    },
     /// Register current interest in configuration watch updates.
     RegisterConfigWatchInterest,
     /// Release current interest in configuration watch updates.
@@ -73,6 +78,20 @@ pub enum ClientCommand {
     DeleteSession {
         /// Session id to delete.
         id: String,
+    },
+    /// Replace runtime config metadata for a server-side session.
+    UpdateSessionRuntimeConfig {
+        /// Session id to update.
+        id: String,
+        /// Provider key to use on subsequent prompts.
+        #[serde(rename = "providerKey")]
+        provider_key: String,
+        /// Model id to use on subsequent prompts.
+        #[serde(rename = "modelId")]
+        model_id: String,
+        /// MCP server keys enabled for subsequent prompts.
+        #[serde(rename = "enabledMcpServerKeys")]
+        enabled_mcp_server_keys: Vec<String>,
     },
     /// Register current interest in session watch updates.
     RegisterSessionWatchInterest,
@@ -137,6 +156,15 @@ pub enum ClientOperationView {
         /// Deleted session id.
         id: String,
     },
+    /// Session runtime metadata update command result.
+    SessionRuntimeConfigUpdate {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Updated session, when the operation completed successfully.
+        session: Option<SessionView>,
+    },
 }
 
 /// Stable snapshot of configuration coordination state.
@@ -164,7 +192,7 @@ pub struct StatusSnapshot {
 }
 
 /// Stable snapshot of session coordination state.
-#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
     /// Last known sessions.
@@ -175,6 +203,8 @@ pub struct SessionSnapshot {
     pub list: OperationSnapshot,
     /// Session delete operation snapshot.
     pub delete: OperationSnapshot,
+    /// Session runtime metadata update operation snapshot.
+    pub runtime_config_update: OperationSnapshot,
     /// Session watch operation snapshot.
     pub watch: OperationSnapshot,
 }
@@ -320,6 +350,7 @@ impl ClientRuntime {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn next_watch_event(&mut self) -> ClientEvent {
         if self.reducer.state().sessions.watch.interests > 0 {
             if let (Some(session), Some(config), Some(status)) = (
@@ -503,7 +534,7 @@ impl fmt::Debug for ClientStateStream {
             .field("runtime", &self.runtime)
             .field("phase", &self.phase)
             .field("effects", &self.effects)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -599,7 +630,7 @@ impl ClientStateStream {
             }
         };
 
-        ClientStateStreamEvent::Snapshot(Box::new(self.dispatch_request(request).await))
+        ClientStateStreamEvent::Snapshot(Box::new(self.dispatch_request(request)))
     }
 
     /// Return the current stream snapshot.
@@ -608,7 +639,7 @@ impl ClientStateStream {
         self.runtime.snapshot()
     }
 
-    async fn dispatch_request(&mut self, request: ClientCommandRequest) -> ClientSnapshot {
+    fn dispatch_request(&mut self, request: ClientCommandRequest) -> ClientSnapshot {
         let result = self
             .begin_command(request.command)
             .map(|()| self.snapshot());
@@ -650,6 +681,10 @@ impl ClientStateStream {
             ClientCommand::DeleteMcpServer { name } => {
                 self.runtime.reducer.delete_mcp_server(&name)?
             }
+            ClientCommand::SetRuntimeDefaults { defaults } => self
+                .runtime
+                .reducer
+                .set_runtime_defaults(defaults.map(Into::into))?,
             ClientCommand::RegisterConfigWatchInterest => {
                 self.runtime.reducer.register_config_watch_interest()
             }
@@ -662,6 +697,19 @@ impl ClientStateStream {
             }
             ClientCommand::CreateSession => self.runtime.reducer.create_session(),
             ClientCommand::DeleteSession { id } => self.runtime.reducer.delete_session(id),
+            ClientCommand::UpdateSessionRuntimeConfig {
+                id,
+                provider_key,
+                model_id,
+                enabled_mcp_server_keys,
+            } => self.runtime.reducer.update_session_runtime_config(
+                id,
+                SessionRuntimeConfigRequest {
+                    provider_key,
+                    model_id,
+                    enabled_mcp_server_keys,
+                },
+            ),
             ClientCommand::RegisterSessionWatchInterest => {
                 self.runtime.reducer.register_session_watch_interest()
             }
@@ -751,6 +799,9 @@ impl ClientSnapshot {
                 create: OperationSnapshot::from_state(&state.sessions.create),
                 list: OperationSnapshot::from_state(&state.sessions.list),
                 delete: OperationSnapshot::from_state(&state.sessions.delete),
+                runtime_config_update: OperationSnapshot::from_state(
+                    &state.sessions.runtime_config_update,
+                ),
                 watch: OperationSnapshot::from_parts(
                     state.sessions.watch.status,
                     state.sessions.watch.error.clone(),
@@ -785,6 +836,15 @@ impl From<ClientOperationState> for ClientOperationView {
                 status: operation_status_name(status),
                 error,
                 id,
+            },
+            ClientOperationState::SessionRuntimeConfigUpdate {
+                status,
+                error,
+                session,
+            } => Self::SessionRuntimeConfigUpdate {
+                status: operation_status_name(status),
+                error,
+                session: session.map(SessionView::from),
             },
         }
     }

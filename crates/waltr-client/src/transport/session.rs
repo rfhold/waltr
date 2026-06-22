@@ -3,8 +3,9 @@ use std::pin::Pin;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use waltr::grpc::waltr::session::v1::{
-    CreateSessionRequest, DeleteSessionRequest, ListSessionsRequest, SessionSummary,
-    WatchSessionsRequest, WatchSessionsResponse, watch_sessions_response,
+    CreateSessionRequest, DeleteSessionRequest, ListSessionsRequest, SessionRuntimeConfigRequest,
+    SessionSummary, UpdateSessionRuntimeConfigRequest, WatchSessionsRequest, WatchSessionsResponse,
+    watch_sessions_response,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
@@ -25,6 +26,7 @@ pub struct SessionWatchUpdate {
 
 /// Internal session watch event from the transport layer.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionWatchEvent {
     /// Full session list snapshot sent when the watch opens.
     Snapshot(Vec<SessionSummary>),
@@ -94,6 +96,34 @@ where
         .map_err(|error| status_error(&error))?;
 
     Ok(())
+}
+
+pub(super) async fn update_session_runtime_config<T>(
+    transport: &T,
+    id: String,
+    runtime_config: SessionRuntimeConfigRequest,
+) -> Result<SessionSummary, ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    let response = transport
+        .session_client()
+        .await?
+        .update_session_runtime_config(UpdateSessionRuntimeConfigRequest {
+            id,
+            runtime_config: Some(runtime_config),
+        })
+        .await
+        .map_err(|error| status_error(&error))?
+        .into_inner();
+
+    Ok(response.session.unwrap_or_default())
 }
 
 pub(super) async fn watch_sessions<T>(transport: &T) -> Result<SessionWatchStream, ClientError>

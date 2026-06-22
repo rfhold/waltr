@@ -1,13 +1,17 @@
 //! Shell-neutral client events and side-effect intents.
 
 use crate::transport::{ConfigWatchUpdate, SessionWatchUpdate};
-use crate::{ClientError, Configuration, OperationKey, Provider, SessionSummary, SystemStatus};
+use crate::{
+    ClientError, Configuration, OperationKey, Provider, RuntimeDefaults,
+    SessionRuntimeConfigRequest, SessionSummary, SystemStatus,
+};
 
 /// Runtime-local identifier for a streamed response.
 pub type StreamId = u64;
 
 /// Event applied to the headless client state machine.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
     /// Configuration coordination event.
     Config(ConfigEvent),
@@ -119,6 +123,29 @@ pub enum SessionEvent {
         /// Failure returned by the delete effect.
         error: ClientError,
     },
+    /// A caller requested session runtime metadata replacement.
+    RuntimeConfigUpdateRequested {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Session id to update.
+        id: String,
+        /// Runtime config request to resolve and store.
+        runtime_config: Box<SessionRuntimeConfigRequest>,
+    },
+    /// Session runtime metadata replacement completed successfully.
+    RuntimeConfigUpdated {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Updated session returned by the server.
+        session: SessionSummary,
+    },
+    /// Session runtime metadata replacement failed.
+    RuntimeConfigUpdateFailed {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the update effect.
+        error: ClientError,
+    },
     /// A caller requested the current session list.
     ListRequested,
     /// The current session list loaded successfully.
@@ -143,6 +170,7 @@ pub enum SessionEvent {
 
 /// Side-effect intent emitted by the client for shells or runtimes to execute.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientEffect {
     /// Configuration side-effect intent.
     Config(ConfigEffect),
@@ -159,10 +187,13 @@ pub struct ConfigPatch {
     pub providers: Option<std::collections::HashMap<String, crate::Provider>>,
     /// Replacement MCP servers map. `None` leaves MCP servers unchanged.
     pub mcp_servers: Option<std::collections::HashMap<String, crate::McpServer>>,
+    /// Replacement runtime defaults. `None` leaves defaults unchanged.
+    pub runtime_defaults: Option<RuntimeDefaults>,
 }
 
 /// Configuration side-effect intent emitted by the client.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConfigEffect {
     /// Load the current configuration snapshot.
     Load,
@@ -210,6 +241,15 @@ pub enum SessionEffect {
         operation_key: OperationKey,
         /// Session id to delete.
         id: String,
+    },
+    /// Replace server-side session runtime metadata.
+    UpdateRuntimeConfig {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Session id to update.
+        id: String,
+        /// Runtime config request to resolve and store.
+        runtime_config: Box<SessionRuntimeConfigRequest>,
     },
     /// Load the current server-side session list.
     List,

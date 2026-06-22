@@ -160,6 +160,7 @@ impl GrpcEffectExecutor {
     }
 
     /// Execute one client side-effect intent and return client events for the reducer.
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_effect<Sleep, SleepFuture>(
         &self,
         effect: ClientEffect,
@@ -225,6 +226,28 @@ impl GrpcEffectExecutor {
                     })],
                 }
             }
+            ClientEffect::Session(SessionEffect::UpdateRuntimeConfig {
+                operation_key,
+                id,
+                runtime_config,
+            }) => {
+                match self
+                    .transport
+                    .update_session_runtime_config(id, *runtime_config)
+                    .await
+                {
+                    Ok(session) => vec![ClientEvent::Session(SessionEvent::RuntimeConfigUpdated {
+                        operation_key,
+                        session,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(
+                        SessionEvent::RuntimeConfigUpdateFailed {
+                            operation_key,
+                            error,
+                        },
+                    )],
+                }
+            }
             ClientEffect::Session(SessionEffect::List) => {
                 match self.transport.list_sessions().await {
                     Ok(sessions) => vec![ClientEvent::Session(SessionEvent::Listed(sessions))],
@@ -258,6 +281,7 @@ impl From<crate::Configuration> for ConfigPatch {
         Self {
             providers: Some(config.providers),
             mcp_servers: Some(config.mcp_servers),
+            runtime_defaults: config.runtime_defaults,
         }
     }
 }
