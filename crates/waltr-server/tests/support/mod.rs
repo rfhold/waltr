@@ -1,4 +1,4 @@
 #![allow(dead_code)]
 
-pub(crate) mod grpc;
-pub(crate) mod server;
+pub mod grpc;
+pub mod server;

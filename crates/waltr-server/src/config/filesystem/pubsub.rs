@@ -21,6 +21,7 @@ const WATCH_CHANNEL_CAPACITY: usize = 128;
 
 /// Event emitted by the configuration watcher.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConfigWatchEvent {
     /// The config file was loaded successfully and changed from the previous state.
     Changed {

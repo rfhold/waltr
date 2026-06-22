@@ -5,7 +5,7 @@ use waltr_server::test_support::setup_server;
 #[tokio::test]
 async fn config_service_patch_persists_provider() -> Result<(), Box<dyn std::error::Error>> {
     let server = setup_server();
-    let mut client = config_client(&server).await?;
+    let mut client = config_client(server).await?;
     let initial = get_config(&mut client).await?;
 
     let patch = config_with_provider("anthropic");
@@ -16,6 +16,7 @@ async fn config_service_patch_persists_provider() -> Result<(), Box<dyn std::err
                 providers: patch.providers.clone(),
             }),
             mcp_servers: None,
+            runtime_defaults: None,
         })
         .await?
         .into_inner()

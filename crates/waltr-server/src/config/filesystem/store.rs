@@ -1,7 +1,9 @@
 //! Filesystem-backed TOML configuration store.
 
 use crate::config::{ConfigError, ConfigPatch, ConfigStore};
-use waltr::grpc::waltr::config::v1::{Configuration, McpServer, McpServerType, ModelType, Provider};
+use waltr::grpc::waltr::config::v1::{
+    Configuration, McpServer, McpServerType, ModelType, Provider, RuntimeDefaults,
+};
 use sha2::{Digest, Sha256};
 use std::{fmt::Write as _, io, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
@@ -95,6 +97,9 @@ impl ConfigStore for FilesystemConfigStore {
         if let Some(mcp_servers) = patch.mcp_servers {
             next.mcp_servers = mcp_servers;
         }
+        if let Some(runtime_defaults) = patch.runtime_defaults {
+            next.runtime_defaults = Some(runtime_defaults);
+        }
         validate_config(&next)?;
         self.save_unlocked(next).await
     }
@@ -147,6 +152,58 @@ fn validate_config(config: &Configuration) -> Result<(), ConfigError> {
     }
 
     validate_mcp_servers(config)?;
+    validate_runtime_defaults(config)?;
+
+    Ok(())
+}
+
+fn validate_runtime_defaults(config: &Configuration) -> Result<(), ConfigError> {
+    let Some(defaults) = &config.runtime_defaults else {
+        return Ok(());
+    };
+
+    if defaults.provider_key.trim().is_empty() && defaults.model_key.trim().is_empty() {
+        validate_default_mcp_keys(defaults, config)?;
+        return Ok(());
+    }
+
+    let provider = config
+        .providers
+        .get(&defaults.provider_key)
+        .ok_or_else(|| {
+            ConfigError::invalid(format!(
+                "runtime default provider '{}' does not exist",
+                defaults.provider_key
+            ))
+        })?;
+
+    if defaults.model_key.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "runtime default model key must not be empty when provider key is set",
+        ));
+    }
+
+    if !provider.models.contains_key(&defaults.model_key) {
+        return Err(ConfigError::invalid(format!(
+            "runtime default model '{}' does not exist in provider '{}'",
+            defaults.model_key, defaults.provider_key
+        )));
+    }
+
+    validate_default_mcp_keys(defaults, config)
+}
+
+fn validate_default_mcp_keys(
+    defaults: &RuntimeDefaults,
+    config: &Configuration,
+) -> Result<(), ConfigError> {
+    for key in &defaults.enabled_mcp_server_keys {
+        if !config.mcp_servers.contains_key(key) {
+            return Err(ConfigError::invalid(format!(
+                "runtime default mcp server '{key}' does not exist"
+            )));
+        }
+    }
 
     Ok(())
 }
@@ -261,6 +318,7 @@ mod tests {
                 ConfigPatch {
                     providers: Some(config_with_provider("anthropic").providers),
                     mcp_servers: None,
+                    runtime_defaults: None,
                 },
                 "stale",
             )

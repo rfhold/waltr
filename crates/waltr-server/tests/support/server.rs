@@ -6,13 +6,11 @@ use std::{
 };
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct HealthResponse {
-    pub(crate) status: String,
+pub struct HealthResponse {
+    pub status: String,
 }
 
-pub(crate) async fn wait_for_health(
-    addr: std::net::SocketAddr,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn wait_for_health(addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/health");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -32,7 +30,7 @@ pub(crate) async fn wait_for_health(
     Err("server did not serve /health before timeout".into())
 }
 
-pub(crate) fn temp_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn temp_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let root = std::env::temp_dir().join(format!(
         "waltr-server-boot-{}-{}",
         std::process::id(),

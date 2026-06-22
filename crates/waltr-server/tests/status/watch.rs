@@ -5,7 +5,7 @@ use waltr_server::test_support::setup_server;
 #[tokio::test]
 async fn status_service_watch_reports_ready() -> Result<(), Box<dyn std::error::Error>> {
     let server = setup_server();
-    let mut client = status_client(&server).await?;
+    let mut client = status_client(server).await?;
 
     let message = client
         .watch_status(WatchStatusRequest::default())
