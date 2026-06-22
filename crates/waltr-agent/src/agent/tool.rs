@@ -143,6 +143,10 @@ impl ToolProgressSink {
     }
 
     /// Emit informational tool progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying timeline sink rejects the progress event.
     pub fn info(&self, delta: impl Into<String>) -> Result<()> {
         match &*self.inner {
             ToolProgressSinkInner::Noop => Ok(()),
@@ -163,6 +167,10 @@ impl ToolProgressSink {
     }
 
     /// Emit error tool progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying timeline sink rejects the progress event.
     pub fn error(&self, delta: impl Into<String>) -> Result<()> {
         match &*self.inner {
             ToolProgressSinkInner::Noop => Ok(()),
@@ -183,6 +191,10 @@ impl ToolProgressSink {
     }
 
     /// Emit a generic tool progress event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying timeline sink rejects the progress event.
     pub fn event(
         &self,
         channel: impl Into<TimelineChannel>,

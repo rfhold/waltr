@@ -177,6 +177,7 @@ where
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl<S> fmt::Debug for AgentRunBuilder<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,

@@ -1,6 +1,6 @@
 //! Filesystem-backed session storage.
 
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
@@ -12,6 +12,7 @@ use crate::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
 };
+use serde_json::Value;
 
 /// Local JSON-file implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
@@ -86,8 +87,8 @@ impl FilesystemSessionStore {
             });
         }
         let revision = record.revision.next();
-        let value = update(&mut record, revision)?;
         record.revision = revision;
+        let value = update(&mut record, revision)?;
         self.save_sync(&record)?;
         Ok((revision, value))
     }
@@ -101,6 +102,22 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         async move {
             let record = SessionRecord::new(id);
+            if store.path(&record.id).exists() {
+                return Err(SessionStoreError::AlreadyExists { id: record.id });
+            }
+            store.save_sync(&record)?;
+            Ok(record)
+        }
+    }
+
+    fn create_with_metadata_values(
+        &self,
+        id: SessionId,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        async move {
+            let record = SessionRecord::with_metadata_values(id, metadata_values);
             if store.path(&record.id).exists() {
                 return Err(SessionStoreError::AlreadyExists { id: record.id });
             }
@@ -173,6 +190,41 @@ impl SessionStore for FilesystemSessionStore {
                 Ok(())
             })?;
             Ok(revision)
+        }
+    }
+
+    fn set_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let (_, record) =
+                store.update_sync(&id, store.load_sync(&id)?.revision, |record, _| {
+                    record.set_metadata_value(key, value);
+                    Ok(record.clone())
+                })?;
+            Ok(record)
+        }
+    }
+
+    fn remove_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let (_, record) =
+                store.update_sync(&id, store.load_sync(&id)?.revision, |record, _| {
+                    record.remove_metadata_value(&key);
+                    Ok(record.clone())
+                })?;
+            Ok(record)
         }
     }
 

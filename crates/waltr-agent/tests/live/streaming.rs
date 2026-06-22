@@ -61,7 +61,7 @@ async fn assert_provider_streams_expected_text(provider: impl LlmStream) -> walt
         match event? {
             CompletionEvent::Delta(delta) => {
                 delta_count += 1;
-                text.push_str(&delta);
+                text.push_str(delta.as_str());
             }
             CompletionEvent::ToolCall(tool_call) => {
                 return Err(LlmError::Protocol {

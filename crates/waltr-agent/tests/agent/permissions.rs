@@ -1,4 +1,4 @@
-//! AgentRuntime permission integration tests.
+//! `AgentRuntime` permission integration tests.
 
 use std::{env, fs, path::PathBuf, sync::Arc};
 
@@ -206,7 +206,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         if let TimelineContent::TextDelta { delta } = &event.content
             && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
         {
-            text.push_str(&delta);
+            text.push_str(delta);
         }
         if let TimelineContent::ToolResult { result } = &event.content
             && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)

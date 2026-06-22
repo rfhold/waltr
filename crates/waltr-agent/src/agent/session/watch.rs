@@ -19,6 +19,7 @@ const SESSION_LIST_CHANNEL_CAPACITY: usize = 128;
 
 /// Kind of session list change emitted by [`AgentSessions`](super::AgentSessions).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionListEvent {
     /// A session was created or updated.
     Upsert(SessionSummary),
@@ -57,7 +58,7 @@ impl Stream for SessionListSubscription {
         loop {
             match Pin::new(&mut self.inner).poll_next(context) {
                 Poll::Ready(Some(Ok(update))) => return Poll::Ready(Some(update)),
-                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => continue,
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {}
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }
@@ -66,6 +67,7 @@ impl Stream for SessionListSubscription {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct SessionListBroadcaster {
     sequence: Arc<AtomicU64>,
     sender: broadcast::Sender<SessionListUpdate>,

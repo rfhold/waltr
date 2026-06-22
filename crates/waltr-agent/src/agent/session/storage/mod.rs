@@ -9,7 +9,7 @@ mod postgresql;
 mod s3;
 mod scylla;
 
-use std::{error::Error, fmt, future::Future};
+use std::{collections::BTreeMap, error::Error, fmt, future::Future};
 
 pub use filesystem::FilesystemSessionStore;
 pub use memory::MemorySessionStore;
@@ -22,6 +22,7 @@ use crate::timeline::{
     AgentTimelineEvent, PendingTimelineEvent, TimelineContent, TimelineCursor, TimelineDirection,
     TimelineItemId, TimelineItemText, TimelineQuery,
 };
+use serde_json::Value;
 
 use super::types::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary};
 
@@ -126,6 +127,13 @@ pub trait SessionStore: Send + Sync {
         id: SessionId,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
+    /// Create a new session record with initial host-defined metadata values.
+    fn create_with_metadata_values(
+        &self,
+        id: SessionId,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
+
     /// Load a session record.
     fn load(
         &self,
@@ -153,6 +161,21 @@ pub trait SessionStore: Send + Sync {
         expected_revision: Revision,
         events: Vec<SessionJournalEvent>,
     ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
+
+    /// Set a host-defined metadata value and return the updated record.
+    fn set_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
+
+    /// Remove a host-defined metadata value and return the updated record.
+    fn remove_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
     /// Read timeline events using a bounded store-neutral query.
     fn timeline(
@@ -241,7 +264,7 @@ pub(super) fn timeline_query_slice(
     match query.direction {
         TimelineDirection::Forward => record
             .timeline_events()
-            .filter(|event| query.cursor.map_or(true, |cursor| event.cursor > cursor))
+            .filter(|event| query.cursor.is_none_or(|cursor| event.cursor > cursor))
             .filter(|event| channel_matches(event, query.channels.as_deref()))
             .take(limit)
             .cloned()
@@ -249,7 +272,7 @@ pub(super) fn timeline_query_slice(
         TimelineDirection::Backward => {
             let events = record
                 .timeline_events()
-                .filter(|event| query.cursor.map_or(true, |cursor| event.cursor < cursor))
+                .filter(|event| query.cursor.is_none_or(|cursor| event.cursor < cursor))
                 .filter(|event| channel_matches(event, query.channels.as_deref()))
                 .cloned()
                 .collect::<Vec<_>>();
@@ -313,11 +336,10 @@ fn channel_matches(
     event: &AgentTimelineEvent,
     channels: Option<&[crate::timeline::TimelineChannel]>,
 ) -> bool {
-    match channels {
-        None => true,
-        Some(channels) => event
+    channels.is_none_or(|channels| {
+        event
             .channel
             .as_ref()
-            .is_some_and(|channel| channels.contains(channel)),
-    }
+            .is_some_and(|channel| channels.contains(channel))
+    })
 }

@@ -179,7 +179,7 @@ pub struct SessionRecord {
 }
 
 /// Durable session metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetadata {
     /// Time the session record was created.
     pub created_at: SystemTime,
@@ -187,6 +187,9 @@ pub struct SessionMetadata {
     pub updated_at: SystemTime,
     /// Time the session last had user-visible activity.
     pub last_activity_at: SystemTime,
+    /// Host-defined durable metadata values.
+    #[serde(default)]
+    pub values: BTreeMap<String, Value>,
 }
 
 impl SessionMetadata {
@@ -198,6 +201,7 @@ impl SessionMetadata {
             created_at: now,
             updated_at: now,
             last_activity_at: now,
+            values: BTreeMap::new(),
         }
     }
 }
@@ -219,6 +223,9 @@ pub struct SessionSummary {
     pub updated_at: SystemTime,
     /// Time the session last had user-visible activity.
     pub last_activity_at: SystemTime,
+    /// Host-defined durable metadata values.
+    #[serde(default)]
+    pub metadata_values: BTreeMap<String, Value>,
 }
 
 impl SessionRecord {
@@ -230,6 +237,42 @@ impl SessionRecord {
             metadata: SessionMetadata::now(),
             journal: Vec::new(),
         }
+    }
+
+    /// Create a session record with initial metadata values.
+    pub fn with_metadata_values(
+        id: impl Into<SessionId>,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> Self {
+        let mut record = Self::new(id);
+        record.metadata.values = metadata_values;
+        record
+    }
+
+    /// Borrow a host-defined metadata value.
+    #[must_use]
+    pub fn metadata_value(&self, key: &str) -> Option<&Value> {
+        self.metadata.values.get(key)
+    }
+
+    /// Set a host-defined metadata value and mark the record metadata as updated.
+    pub fn set_metadata_value(&mut self, key: impl Into<String>, value: Value) {
+        self.metadata.values.insert(key.into(), value);
+        self.touch_metadata();
+    }
+
+    /// Remove a host-defined metadata value and mark the record metadata as updated.
+    pub fn remove_metadata_value(&mut self, key: &str) -> Option<Value> {
+        let value = self.metadata.values.remove(key);
+        if value.is_some() {
+            self.touch_metadata();
+        }
+        value
+    }
+
+    /// Mark this record metadata as updated without changing activity time.
+    pub fn touch_metadata(&mut self) {
+        self.metadata.updated_at = SystemTime::now();
     }
 
     /// Derive the current compact session projection from the journal.
@@ -252,6 +295,7 @@ impl SessionRecord {
             created_at: self.metadata.created_at,
             updated_at: self.metadata.updated_at,
             last_activity_at: self.metadata.last_activity_at,
+            metadata_values: self.metadata.values.clone(),
         }
     }
 
@@ -261,7 +305,7 @@ impl SessionRecord {
     }
 
     /// Mark this record as having user-visible activity at a specific time.
-    pub fn touch_activity_at(&mut self, time: SystemTime) {
+    pub const fn touch_activity_at(&mut self, time: SystemTime) {
         self.metadata.updated_at = time;
         self.metadata.last_activity_at = time;
     }
@@ -297,6 +341,7 @@ impl SessionRecord {
     }
 
     /// Last assigned timeline cursor, if any.
+    #[must_use]
     pub fn last_timeline_cursor(&self) -> Option<crate::timeline::TimelineCursor> {
         self.timeline_events().last().map(|event| event.cursor)
     }
@@ -351,7 +396,7 @@ pub struct SessionSnapshot {
 impl SessionSnapshot {
     /// Create an empty session snapshot.
     #[must_use]
-    pub fn new(id: SessionId) -> Self {
+    pub const fn new(id: SessionId) -> Self {
         Self {
             id,
             revision: Revision::ZERO,
@@ -505,12 +550,11 @@ impl SessionSnapshot {
                     .rev()
                     .find(|request| matches!(request.status, ExternalRequestStatus::Pending))
                     .cloned();
-                match request {
-                    Some(request) => SessionStatus::Suspended(Suspension::AwaitingExternalInput {
+                request.map_or(SessionStatus::RunningTool, |request| {
+                    SessionStatus::Suspended(Suspension::AwaitingExternalInput {
                         request: Box::new(request),
-                    }),
-                    None => SessionStatus::RunningTool,
-                }
+                    })
+                })
             }
             TimelineStatus::Interrupted => SessionStatus::Suspended(Suspension::Interrupted {
                 work: self.pending_work.clone(),
@@ -659,6 +703,7 @@ pub enum SessionStatus {
 
 /// Ordered durable session journal event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionJournalEvent {
     /// Cursor-assigned timeline event.
     Timeline(AgentTimelineEvent),
@@ -1025,7 +1070,7 @@ mod tests {
 
         let snapshot = SessionSnapshot::from_journal(id, &[assigned(1, pending)]);
 
-        assert_eq!(snapshot.external_requests, [request.clone()]);
+        assert_eq!(snapshot.external_requests, std::slice::from_ref(&request));
         assert_eq!(
             snapshot.status,
             SessionStatus::Suspended(Suspension::AwaitingExternalInput {

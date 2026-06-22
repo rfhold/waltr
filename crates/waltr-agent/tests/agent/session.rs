@@ -61,7 +61,7 @@ impl AgentTestSession {
                     if saw_tool_result && !delta.is_empty() {
                         session.saw_text_after_tool_result = true;
                     }
-                    session.text.push_str(&delta);
+                    session.text.push_str(delta);
                 }
                 TimelineContent::ToolCall { call } if channel_is(&event, CHANNEL_TOOL_CALL) => {
                     session.tool_calls.push(call.clone());
@@ -624,6 +624,7 @@ mod tool_projection {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn root_hint_is_request_scoped_and_absent_from_stored_definitions() {
         let first_root = TempRoot::new("waltr-session-root-hint-a");
         let second_root = TempRoot::new("waltr-session-root-hint-b");

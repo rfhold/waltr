@@ -133,11 +133,7 @@ async fn read_output_async(
             progress_error = Some(error);
         }
     }
-    if let Some(error) = progress_error {
-        Err(error)
-    } else {
-        Ok(output)
-    }
+    progress_error.map_or_else(|| Ok(output), Err)
 }
 
 async fn join_output_async(handle: tokio::task::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
