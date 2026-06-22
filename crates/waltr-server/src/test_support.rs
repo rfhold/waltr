@@ -75,7 +75,9 @@ fn setup_server_with_listener(
                 .expect("test server listener should become async");
             axum::serve(
                 listener,
-                build_app_with_services(config_service, session::add_default_service),
+                build_app_with_services(config_service, |routes, config| {
+                    session::add_memory_service(routes, config);
+                }),
             )
             .await
             .expect("test server should run");

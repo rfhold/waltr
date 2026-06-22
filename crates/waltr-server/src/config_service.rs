@@ -69,6 +69,18 @@ where
         tracing::debug!("creating config service from explicit parts");
         Arc::new(Self { store, pubsub })
     }
+
+    /// Return the backing config store.
+    #[must_use]
+    pub const fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Return the backing config pubsub.
+    #[must_use]
+    pub const fn pubsub(&self) -> &P {
+        &self.pubsub
+    }
 }
 
 #[tonic::async_trait]
@@ -90,6 +102,7 @@ where
         let patch = ConfigPatch {
             providers: request.providers.map(|patch| patch.providers),
             mcp_servers: request.mcp_servers.map(|patch| patch.mcp_servers),
+            runtime_defaults: request.runtime_defaults,
         };
         let config = self
             .store

@@ -1,18 +1,27 @@
 use std::time::SystemTime;
 
-use waltr::grpc::waltr::session::v1::{
-    ExternalRequest as ProtoExternalRequest, ExternalRequestKind as ProtoExternalRequestKind,
-    PendingWork as ProtoPendingWork, PendingWorkStatus as ProtoPendingWorkStatus,
-    SessionPhase as ProtoSessionPhase, SessionStatus as ProtoSessionStatus,
-    SessionSummary as ProtoSessionSummary, Suspension as ProtoSuspension,
-    SuspensionKind as ProtoSuspensionKind,
+use super::runtime_config::{runtime_config_from_summary, runtime_config_to_proto};
+use waltr::grpc::waltr::{
+    config::v1::Configuration,
+    session::v1::{
+        ExternalRequest as ProtoExternalRequest, ExternalRequestKind as ProtoExternalRequestKind,
+        PendingWork as ProtoPendingWork, PendingWorkStatus as ProtoPendingWorkStatus,
+        SessionPhase as ProtoSessionPhase, SessionStatus as ProtoSessionStatus,
+        SessionSummary as ProtoSessionSummary, Suspension as ProtoSuspension,
+        SuspensionKind as ProtoSuspensionKind,
+    },
 };
 use waltr_agent::{
     ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, SessionStatus,
     SessionSummary, Suspension,
 };
 
-pub(super) fn session_summary_to_proto(summary: SessionSummary) -> ProtoSessionSummary {
+pub(super) fn session_summary_to_proto(
+    summary: SessionSummary,
+    config: &Configuration,
+) -> ProtoSessionSummary {
+    let runtime_config = runtime_config_from_summary(&summary)
+        .map(|runtime_config| runtime_config_to_proto(runtime_config, config));
     ProtoSessionSummary {
         id: summary.id.as_str().to_owned(),
         revision: summary.revision.get(),
@@ -21,6 +30,7 @@ pub(super) fn session_summary_to_proto(summary: SessionSummary) -> ProtoSessionS
         created_at: Some(timestamp_to_proto(summary.created_at)),
         updated_at: Some(timestamp_to_proto(summary.updated_at)),
         last_activity_at: Some(timestamp_to_proto(summary.last_activity_at)),
+        runtime_config,
     }
 }
 
@@ -45,7 +55,7 @@ fn session_status_to_proto(status: SessionStatus) -> ProtoSessionStatus {
     }
 }
 
-fn proto_status(phase: ProtoSessionPhase) -> ProtoSessionStatus {
+const fn proto_status(phase: ProtoSessionPhase) -> ProtoSessionStatus {
     ProtoSessionStatus {
         phase: phase as i32,
         suspension: None,
@@ -77,11 +87,11 @@ fn pending_work_to_proto(work: PendingWork) -> ProtoPendingWork {
     ProtoPendingWork {
         id: work.id,
         turn: work.turn,
-        status: pending_work_status_to_proto(work.status) as i32,
+        status: pending_work_status_to_proto(&work.status) as i32,
     }
 }
 
-fn pending_work_status_to_proto(status: PendingWorkStatus) -> ProtoPendingWorkStatus {
+const fn pending_work_status_to_proto(status: &PendingWorkStatus) -> ProtoPendingWorkStatus {
     match status {
         PendingWorkStatus::Pending => ProtoPendingWorkStatus::Pending,
         PendingWorkStatus::Canceled(_) => ProtoPendingWorkStatus::Canceled,
@@ -93,14 +103,14 @@ fn pending_work_status_to_proto(status: PendingWorkStatus) -> ProtoPendingWorkSt
 fn external_request_to_proto(request: ExternalRequest) -> ProtoExternalRequest {
     ProtoExternalRequest {
         id: request.id.as_str().to_owned(),
-        kind: external_request_kind_to_proto(request.kind) as i32,
+        kind: external_request_kind_to_proto(&request.kind) as i32,
         tool_call_id: request.tool_call_id,
         prompt: request.prompt,
         payload_json: serde_json::to_string(&request.payload).unwrap_or_else(|_| "null".to_owned()),
     }
 }
 
-fn external_request_kind_to_proto(kind: ExternalRequestKind) -> ProtoExternalRequestKind {
+const fn external_request_kind_to_proto(kind: &ExternalRequestKind) -> ProtoExternalRequestKind {
     match kind {
         ExternalRequestKind::Permission => ProtoExternalRequestKind::Permission,
         ExternalRequestKind::Question => ProtoExternalRequestKind::Question,

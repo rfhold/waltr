@@ -1,6 +1,8 @@
 //! HTTP and gRPC router construction.
 
-use crate::{config_service::ConfigService, session, status_service::StatusService};
+use crate::{
+    config::ConfigHandle, config_service::ConfigService, session, status_service::StatusService,
+};
 use axum::{Json, Router, routing::get};
 use waltr::grpc::waltr::config::v1::config_service_server::ConfigServiceServer;
 use waltr::grpc::waltr::status::v1::status_service_server::StatusServiceServer;
@@ -29,9 +31,13 @@ pub fn build_app() -> Router {
 }
 
 /// Build the Axum application using an explicit config service.
+///
+/// # Panics
+///
+/// Panics when session storage environment configuration is invalid.
 pub fn build_app_with_config_service(config_service: std::sync::Arc<ConfigService>) -> Router {
-    build_app_with_services(config_service, |grpc_routes| {
-        session::add_service_from_env(grpc_routes).expect("session service should start");
+    build_app_with_services(config_service, |grpc_routes, config| {
+        session::add_service_from_env(grpc_routes, config).expect("session service should start");
     })
 }
 
@@ -41,12 +47,16 @@ pub fn build_app_with_services<F>(
     add_session_service: F,
 ) -> Router
 where
-    F: FnOnce(&mut RoutesBuilder),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle),
 {
     tracing::debug!("building app router");
+    let config = ConfigHandle::watching(
+        config_service.store().clone(),
+        config_service.pubsub().clone(),
+    );
     let mut grpc_routes = Routes::builder();
     grpc_routes.add_service(ConfigServiceServer::from_arc(config_service));
-    add_session_service(&mut grpc_routes);
+    add_session_service(&mut grpc_routes, config);
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
     let grpc_routes = grpc_routes.routes();
     let grpc = ServiceBuilder::new()

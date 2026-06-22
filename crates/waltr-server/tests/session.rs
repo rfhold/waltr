@@ -13,3 +13,6 @@ mod delete;
 
 #[path = "session/watch.rs"]
 mod watch;
+
+#[path = "session/runtime_config.rs"]
+mod runtime_config;
