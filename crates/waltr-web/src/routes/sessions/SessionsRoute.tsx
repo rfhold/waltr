@@ -18,8 +18,16 @@ import {
 } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { ConfirmAction, InlineAlert } from "../../components/ui";
-import type { ClientCommand, SessionView, TimestampView } from "../../generated/waltr-client";
+import { ConfirmAction, Dialog, InlineAlert } from "../../components/ui";
+import type {
+  ClientCommand,
+  ConfigView,
+  McpServerView,
+  ProviderView,
+  RuntimeConfigMatchView,
+  SessionView,
+  TimestampView,
+} from "../../generated/waltr-client";
 
 type SessionsContextValue = {
   sessions: Accessor<SessionView[]>;
@@ -66,6 +74,7 @@ export function SessionsRoute(props: ParentProps) {
       && sessionsSnapshot.watch.status !== "received";
   });
   let registeredSessionWatchInterest = false;
+  let requestedConfig = false;
   const readyForSessionWatch = createMemo(() => app.clientLoaded() && app.systemReady());
 
   createEffect(on(readyForSessionWatch, (ready) => {
@@ -78,6 +87,15 @@ export function SessionsRoute(props: ParentProps) {
       type: "registerSessionWatchInterest",
     }));
   }));
+
+  createEffect(() => {
+    if (!readyForSessionWatch() || requestedConfig || snapshot()?.config.current) {
+      return;
+    }
+
+    requestedConfig = true;
+    untrack(() => dispatchSessionWatchCommand(app.dispatch, { type: "requestConfig" }));
+  });
 
   onCleanup(() => {
     if (!registeredSessionWatchInterest) {
@@ -225,7 +243,7 @@ export function SessionsDetailRoute() {
   });
 
   return (
-    <section class="sessions sessions--detail" aria-labelledby="session-detail-title">
+    <section class="sessions sessions--detail" aria-label="Session detail">
       <Show when={params.sessionId}>
         {(sessionId) => (
           <Switch>
@@ -284,28 +302,325 @@ function SessionRouteAlerts() {
 
 function SessionDetail(props: { session: SessionView }) {
   const sessions = useSessionsRoute();
+  const [editingRuntime, setEditingRuntime] = createSignal<"provider" | "mcp">();
 
   return (
-    <>
-      <nav class="sessions__breadcrumb" aria-label="Session breadcrumb">
-        <A href="/sessions">Sessions</A>
-        <span>/</span>
-        <span>{props.session.id}</span>
-      </nav>
-      <div class="sessions__detail-card">
-        <div class="sessions__detail-heading">
-          <h1 id="session-detail-title">Session</h1>
-          <StatusChit phase={props.session.status.phase} />
-        </div>
-        <div class="sessions__detail-actions">
-          <SessionDeleteAction session={props.session} />
-        </div>
+    <div class="sessions__detail-page">
+      <div class="sessions__detail-main">
         <Show when={sessions.deleteErrors()[props.session.id]}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>
       </div>
-    </>
+      <SessionDetailStatusBar
+        session={props.session}
+        onEditProvider={() => setEditingRuntime("provider")}
+        onEditMcp={() => setEditingRuntime("mcp")}
+      />
+      <Show when={editingRuntime() === "provider"}>
+        <SessionProviderDialog session={props.session} onClose={() => setEditingRuntime(undefined)} />
+      </Show>
+      <Show when={editingRuntime() === "mcp"}>
+        <SessionMcpDialog session={props.session} onClose={() => setEditingRuntime(undefined)} />
+      </Show>
+    </div>
   );
+}
+
+function SessionDetailStatusBar(props: {
+  session: SessionView;
+  onEditProvider: () => void;
+  onEditMcp: () => void;
+}) {
+  return (
+    <footer class="sessions__detail-status" aria-label="Session status summary">
+      <span><strong>Status</strong> {props.session.status.phase}</span>
+      <span class="sessions__detail-status-item">
+        <strong>Provider</strong> {formatRuntimeProvider(props.session)}
+        <button
+          type="button"
+          class="sessions__detail-status-button"
+          aria-label="Edit provider/model"
+          onClick={props.onEditProvider}
+        >
+          Edit
+        </button>
+      </span>
+      <span class="sessions__detail-status-item">
+        <strong>MCP</strong> {formatRuntimeMcpServers(props.session)}
+        <button
+          type="button"
+          class="sessions__detail-status-button"
+          aria-label="Edit MCP"
+          onClick={props.onEditMcp}
+        >
+          Edit
+        </button>
+      </span>
+      <SessionDeleteAction session={props.session} compact />
+    </footer>
+  );
+}
+
+function SessionProviderDialog(props: { session: SessionView; onClose: () => void }) {
+  const app = useAppState();
+  const [query, setQuery] = createSignal("");
+  const [providerKey, setProviderKey] = createSignal(props.session.runtimeConfig?.provider?.key ?? "");
+  const [modelId, setModelId] = createSignal(props.session.runtimeConfig?.provider?.modelId ?? "");
+  const [error, setError] = createSignal<string>();
+  const [saving, setSaving] = createSignal(false);
+  const config = createMemo(() => app.snapshot()?.config.current ?? undefined);
+  const providers = createMemo(() => providerEntries(config(), query()));
+  const selectedProvider = createMemo(() => config()?.providers[providerKey()]);
+  const models = createMemo(() => Object.entries(selectedProvider()?.models ?? {}));
+
+  createEffect(() => {
+    const provider = selectedProvider();
+    if (provider && !provider.models[modelId()]) {
+      setModelId(Object.keys(provider.models)[0] ?? "");
+    }
+  });
+
+  const save = async () => {
+    const provider = providerKey();
+    const model = modelId();
+    if (!provider || !model) {
+      setError("Choose a provider and model.");
+      return;
+    }
+    await updateRuntimeConfig(app.dispatch, props.session, {
+      providerKey: provider,
+      modelId: model,
+      enabledMcpServerKeys: props.session.runtimeConfig?.mcpServers.map((server) => server.key) ?? [],
+      setSaving,
+      setError,
+      onClose: props.onClose,
+    });
+  };
+
+  return (
+    <Dialog title="Edit provider/model" onClose={props.onClose} class="sessions__runtime-dialog">
+      <div class="sessions__runtime-editor">
+        <p class="sessions__runtime-note">
+          Updates this session metadata immediately. The next prompt will use the selected runtime.
+        </p>
+        <Show when={error()}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
+        <label class="sessions__runtime-search">
+          Search providers
+          <input value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
+        </label>
+        <div class="sessions__runtime-list" role="listbox" aria-label="Provider options">
+          <For each={providers()}>
+            {([key, provider]) => (
+              <button
+                type="button"
+                class={`sessions__runtime-option ${providerKey() === key ? "is-selected" : ""}`.trim()}
+                onClick={() => {
+                  setProviderKey(key);
+                  setModelId(Object.keys(provider.models)[0] ?? "");
+                }}
+              >
+                <span>{key}</span>
+                <RuntimeStateBadge state={providerRuntimeState(props.session, key)} />
+              </button>
+            )}
+          </For>
+        </div>
+        <label class="sessions__runtime-search">
+          Model
+          <select value={modelId()} onChange={(event) => setModelId(event.currentTarget.value)}>
+            <For each={models()}>
+              {([key, model]) => <option value={key}>{model?.name ? `${key} - ${model.name}` : key}</option>}
+            </For>
+          </select>
+        </label>
+        <div class="sessions__runtime-actions">
+          <button type="button" onClick={props.onClose}>Cancel</button>
+          <button type="button" onClick={() => void save()} disabled={saving()}>
+            {saving() ? "Saving..." : "Save runtime"}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function SessionMcpDialog(props: { session: SessionView; onClose: () => void }) {
+  const app = useAppState();
+  const [query, setQuery] = createSignal("");
+  const [selected, setSelected] = createSignal(new Set(props.session.runtimeConfig?.mcpServers.map((server) => server.key) ?? []));
+  const [error, setError] = createSignal<string>();
+  const [saving, setSaving] = createSignal(false);
+  const config = createMemo(() => app.snapshot()?.config.current ?? undefined);
+  const servers = createMemo(() => mcpEntries(config(), props.session, query()));
+
+  const toggle = (key: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
+  const save = async () => {
+    await updateRuntimeConfig(app.dispatch, props.session, {
+      providerKey: props.session.runtimeConfig?.provider?.key ?? "",
+      modelId: props.session.runtimeConfig?.provider?.modelId ?? "",
+      enabledMcpServerKeys: Array.from(selected()),
+      setSaving,
+      setError,
+      onClose: props.onClose,
+    });
+  };
+
+  return (
+    <Dialog title="Edit MCP servers" onClose={props.onClose} class="sessions__runtime-dialog">
+      <div class="sessions__runtime-editor">
+        <p class="sessions__runtime-note">
+          Missing servers stay visible so drift is explicit before you save.
+        </p>
+        <Show when={error()}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
+        <label class="sessions__runtime-search">
+          Search MCP servers
+          <input value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
+        </label>
+        <div class="sessions__runtime-list" aria-label="MCP server options">
+          <For each={servers()}>
+            {(server) => (
+              <label class={`sessions__runtime-option ${selected().has(server.key) ? "is-selected" : ""}`.trim()}>
+                <input
+                  type="checkbox"
+                  checked={selected().has(server.key)}
+                  onChange={() => toggle(server.key)}
+                  disabled={!server.configured}
+                />
+                <span>{server.key}</span>
+                <RuntimeStateBadge state={server.state} />
+              </label>
+            )}
+          </For>
+        </div>
+        <div class="sessions__runtime-actions">
+          <button type="button" onClick={props.onClose}>Cancel</button>
+          <button type="button" onClick={() => void save()} disabled={saving()}>
+            {saving() ? "Saving..." : "Save MCP"}
+          </button>
+        </div>
+      </div>
+    </Dialog>
+  );
+}
+
+function formatRuntimeProvider(session: SessionView) {
+  const provider = session.runtimeConfig?.provider;
+
+  if (!provider) {
+    return "none";
+  }
+
+  return `${provider.key}/${provider.modelId}`;
+}
+
+function formatRuntimeMcpServers(session: SessionView) {
+  const servers = session.runtimeConfig?.mcpServers ?? [];
+
+  if (servers.length === 0) {
+    return "none";
+  }
+
+  return servers.map((server) => server.key).join(", ");
+}
+
+function RuntimeStateBadge(props: { state: RuntimeConfigMatchView | "available" }) {
+  return <span class={`sessions__runtime-state sessions__runtime-state--${props.state}`}>{runtimeStateLabel(props.state)}</span>;
+}
+
+function providerEntries(config: ConfigView | undefined, query: string): Array<[string, ProviderView]> {
+  return Object.entries(config?.providers ?? {})
+    .filter((entry): entry is [string, ProviderView] => Boolean(entry[1]))
+    .filter(([key, provider]) => searchable(`${key} ${provider.name}`, query));
+}
+
+function mcpEntries(config: ConfigView | undefined, session: SessionView, query: string) {
+  const configured = Object.entries(config?.mcpServers ?? {})
+    .filter((entry): entry is [string, McpServerView] => Boolean(entry[1]))
+    .map(([key]) => ({
+      key,
+      configured: true,
+      state: mcpRuntimeState(session, key) ?? "available" as const,
+    }));
+  const missing = (session.runtimeConfig?.mcpServers ?? [])
+    .filter((server) => !(config?.mcpServers ?? {})[server.key])
+    .map((server) => ({
+      key: server.key,
+      configured: false,
+      state: server.matchStatus,
+    }));
+
+  return [...configured, ...missing].filter((server) => searchable(server.key, query));
+}
+
+function providerRuntimeState(session: SessionView, key: string) {
+  return session.runtimeConfig?.provider?.key === key
+    ? session.runtimeConfig.provider.matchStatus
+    : "available";
+}
+
+function mcpRuntimeState(session: SessionView, key: string) {
+  return session.runtimeConfig?.mcpServers.find((server) => server.key === key)?.matchStatus;
+}
+
+function runtimeStateLabel(state: RuntimeConfigMatchView | "available") {
+  switch (state) {
+    case "configured":
+      return "Configured";
+    case "changed":
+      return "Changed";
+    case "missing":
+      return "Missing";
+    case "available":
+      return "Available";
+    default:
+      return "Unknown";
+  }
+}
+
+function searchable(value: string, query: string) {
+  return value.toLowerCase().includes(query.trim().toLowerCase());
+}
+
+async function updateRuntimeConfig(
+  dispatch: (command: ClientCommand) => Promise<unknown>,
+  session: SessionView,
+  options: {
+    providerKey: string;
+    modelId: string;
+    enabledMcpServerKeys: string[];
+    setSaving: (saving: boolean) => void;
+    setError: (message: string | undefined) => void;
+    onClose: () => void;
+  },
+) {
+  options.setSaving(true);
+  options.setError(undefined);
+
+  try {
+    await dispatch({
+      type: "updateSessionRuntimeConfig",
+      id: session.id,
+      providerKey: options.providerKey,
+      modelId: options.modelId,
+      enabledMcpServerKeys: options.enabledMcpServerKeys,
+    });
+    options.onClose();
+  } catch (error) {
+    options.setError(error instanceof Error ? error.message : "Unable to update session runtime.");
+  } finally {
+    options.setSaving(false);
+  }
 }
 
 function SessionDeleteAction(props: { session: SessionView; compact?: boolean }) {

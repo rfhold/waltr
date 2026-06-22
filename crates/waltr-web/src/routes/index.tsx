@@ -35,6 +35,7 @@ export function AppRouter() {
           <Route path="/mcp/create" component={ConfigMcpCreateRoute} />
           <Route path="/mcp/edit/:server" component={ConfigMcpEditRoute} />
           <Route path="/mcp" />
+          <Route path="/defaults" />
         </Route>
       </Route>
     </Router>

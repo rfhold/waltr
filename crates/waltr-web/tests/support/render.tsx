@@ -97,6 +97,7 @@ export function renderWithAppState(
         createdAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         updatedAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         lastActivityAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
+        runtimeConfig: null,
       };
       const loading: ClientSnapshot = {
         ...current,
@@ -278,6 +279,10 @@ function applyConfigPatchCommand(current: ConfigView, command: ClientCommand): C
     const mcpServers = { ...current.mcpServers };
     delete mcpServers[command.name];
     return { ...current, mcpServers };
+  }
+
+  if (command.type === "setRuntimeDefaults") {
+    return { ...current, runtimeDefaults: command.defaults };
   }
 
   return current;

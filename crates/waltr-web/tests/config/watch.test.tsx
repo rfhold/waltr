@@ -11,7 +11,7 @@ describe("config watch", () => {
     const commands: ClientCommand[] = [];
     const result = renderWithAppState(() => <ConfigRouteWithChildren />, {
       commands,
-      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {} }),
+      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }),
     });
 
     await waitFor(() =>
@@ -33,7 +33,7 @@ describe("config watch", () => {
 
     renderWithAppState(() => <ConfigRouteWithChildren />, {
       commands,
-      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {} }, { ready: false }),
+      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }, { ready: false }),
     });
 
     await Promise.resolve();

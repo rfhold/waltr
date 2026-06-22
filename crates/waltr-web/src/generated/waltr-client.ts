@@ -92,6 +92,24 @@ command: string,
  */
 url: string, };
 
+export type RuntimeDefaultsView = { 
+/**
+ * Default provider key.
+ */
+providerKey: string, 
+/**
+ * Default model id within the selected provider.
+ */
+modelId: string, 
+/**
+ * Whether all configured MCP servers are enabled by default.
+ */
+mcpDefaultEnabled: boolean, 
+/**
+ * Explicit MCP server keys enabled by default.
+ */
+enabledMcpServerKeys: Array<string>, };
+
 export type ProviderView = { 
 /**
  * Provider type as a shell-friendly enum.
@@ -126,7 +144,11 @@ providers: { [key in string]?: ProviderView },
 /**
  * Configured MCP servers.
  */
-mcpServers: { [key in string]?: McpServerView }, };
+mcpServers: { [key in string]?: McpServerView }, 
+/**
+ * Default runtime selection for newly created sessions.
+ */
+runtimeDefaults: RuntimeDefaultsView | null, };
 
 export type TimestampView = { 
 /**
@@ -149,6 +171,62 @@ phase: SessionPhaseView,
  * Failure message, when phase is failed.
  */
 failedMessage: string, };
+
+export type RuntimeConfigMatchView = "unspecified" | "configured" | "missing" | "changed" | "unknown";
+
+export type SessionProviderRuntimeView = { 
+/**
+ * Provider key selected when runtime config was stored.
+ */
+key: string, 
+/**
+ * Provider type selected when runtime config was stored.
+ */
+kind: ProviderKindView, 
+/**
+ * Provider URL selected when runtime config was stored.
+ */
+url: string, 
+/**
+ * Exact provider model id selected when runtime config was stored.
+ */
+modelId: string, 
+/**
+ * Whether the stored provider/model still matches current config.
+ */
+matchStatus: RuntimeConfigMatchView, };
+
+export type SessionMcpServerRuntimeView = { 
+/**
+ * MCP server key selected when runtime config was stored.
+ */
+key: string, 
+/**
+ * MCP server type selected when runtime config was stored.
+ */
+kind: McpServerTypeView, 
+/**
+ * MCP command selected when runtime config was stored.
+ */
+command: string, 
+/**
+ * MCP URL selected when runtime config was stored.
+ */
+url: string, 
+/**
+ * Whether the stored MCP server still matches current config.
+ */
+matchStatus: RuntimeConfigMatchView, };
+
+export type SessionRuntimeConfigView = { 
+/**
+ * Stored provider runtime snapshot.
+ */
+provider: SessionProviderRuntimeView | null, 
+/**
+ * Stored MCP server runtime snapshots.
+ */
+mcpServers: Array<SessionMcpServerRuntimeView>, };
 
 export type SessionView = { 
 /**
@@ -178,7 +256,11 @@ updatedAt: TimestampView | null,
 /**
  * Last activity timestamp, when supplied by the server.
  */
-lastActivityAt: TimestampView | null, };
+lastActivityAt: TimestampView | null, 
+/**
+ * Runtime configuration snapshot stored with the session.
+ */
+runtimeConfig: SessionRuntimeConfigView | null, };
 
 export type ClientOperationView = { "kind": "configPatch", 
 /**
@@ -216,7 +298,19 @@ error: string | null,
 /**
  * Deleted session id.
  */
-id: string, };
+id: string, } | { "kind": "sessionRuntimeConfigUpdate", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Updated session, when the operation completed successfully.
+ */
+session: SessionView | null, };
 
 export type OperationCollectionSnapshot = { 
 /**
@@ -284,6 +378,10 @@ list: OperationSnapshot,
  */
 delete: OperationSnapshot, 
 /**
+ * Session runtime metadata update operation snapshot.
+ */
+runtimeConfigUpdate: OperationSnapshot, 
+/**
  * Session watch operation snapshot.
  */
 watch: OperationSnapshot, };
@@ -338,8 +436,28 @@ server: McpServerView, } | { "type": "deleteMcpServer",
 /**
  * MCP server key to delete.
  */
-name: string, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "deleteSession", 
+name: string, } | { "type": "setRuntimeDefaults", 
+/**
+ * Runtime defaults to store, or null to clear defaults.
+ */
+defaults: RuntimeDefaultsView | null, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "deleteSession", 
 /**
  * Session id to delete.
  */
-id: string, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };
+id: string, } | { "type": "updateSessionRuntimeConfig", 
+/**
+ * Session id to update.
+ */
+id: string, 
+/**
+ * Provider key to use on subsequent prompts.
+ */
+providerKey: string, 
+/**
+ * Model id to use on subsequent prompts.
+ */
+modelId: string, 
+/**
+ * MCP server keys enabled for subsequent prompts.
+ */
+enabledMcpServerKeys: Array<string>, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };

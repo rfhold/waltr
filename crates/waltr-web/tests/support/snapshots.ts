@@ -35,6 +35,7 @@ export function emptySessionSnapshot(): SessionSnapshot {
     create: operationSnapshot("idle"),
     list: operationSnapshot("idle"),
     delete: operationSnapshot("idle"),
+    runtimeConfigUpdate: operationSnapshot("idle"),
     watch: operationSnapshot("idle"),
   };
 }
@@ -44,7 +45,7 @@ export function operationSnapshot(status: string): OperationSnapshot {
 }
 
 export function emptyConfig(etag = "v1"): ConfigView {
-  return { etag, providers: {}, mcpServers: {} };
+  return { etag, providers: {}, mcpServers: {}, runtimeDefaults: null };
 }
 
 export function snapshotWithSessions(sessions: SessionView[]): ClientSnapshot {
@@ -54,6 +55,7 @@ export function snapshotWithSessions(sessions: SessionView[]): ClientSnapshot {
     create: operationSnapshot("idle"),
     list: operationSnapshot("ready"),
     delete: operationSnapshot("idle"),
+    runtimeConfigUpdate: operationSnapshot("idle"),
     watch: operationSnapshot("received"),
   };
 
@@ -71,6 +73,7 @@ export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),
     lastActivityAt: timestamp(1_700_000_000),
+    runtimeConfig: null,
     ...overrides,
   };
 }
@@ -120,5 +123,6 @@ export function claudeConfig(): ConfigView {
     etag: "v1",
     providers: { claude },
     mcpServers: {},
+    runtimeDefaults: null,
   };
 }

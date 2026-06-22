@@ -8,6 +8,7 @@ import type { TabItem } from "../../components/ui";
 import type { ClientCommand } from "../../generated/waltr-client";
 import { McpServersSection } from "./McpServersSection";
 import { ProvidersSection } from "./ProvidersSection";
+import { RuntimeDefaultsSection } from "./RuntimeDefaultsSection";
 
 export {
   ConfigCreateRoute,
@@ -17,11 +18,12 @@ export {
 } from "./ProvidersSection";
 export { ConfigMcpCreateRoute, ConfigMcpEditRoute } from "./McpServersSection";
 
-type ConfigTabId = "providers" | "mcp";
+type ConfigTabId = "providers" | "mcp" | "defaults";
 
 const CONFIG_TABS: readonly TabItem<ConfigTabId>[] = [
   { id: "providers", label: "Providers", href: "/config/provider" },
   { id: "mcp", label: "MCP Servers", href: "/config/mcp" },
+  { id: "defaults", label: "Defaults", href: "/config/defaults" },
 ];
 
 export function ConfigRoute(props: ParentProps) {
@@ -42,6 +44,9 @@ export function ConfigRoute(props: ParentProps) {
   const routeTab = createMemo<ConfigTabId | undefined>(() => {
     if (location.pathname.startsWith("/config/mcp")) {
       return "mcp";
+    }
+    if (location.pathname.startsWith("/config/defaults")) {
+      return "defaults";
     }
     if (location.pathname.startsWith("/config/provider")) {
       return "providers";
@@ -93,7 +98,7 @@ export function ConfigRoute(props: ParentProps) {
         selected={visibleTab()}
         onSelect={(tab) => {
           setActiveTab(tab);
-          navigate(tab === "mcp" ? "/config/mcp" : "/config/provider");
+          navigate(tab === "mcp" ? "/config/mcp" : tab === "defaults" ? "/config/defaults" : "/config/provider");
         }}
       />
       <TabPanel
@@ -118,6 +123,9 @@ export function ConfigRoute(props: ParentProps) {
             <McpServersSection watchedConfig={watchedConfig}>
               {props.children}
             </McpServersSection>
+          </Match>
+          <Match when={visibleTab() === "defaults"}>
+            <RuntimeDefaultsSection watchedConfig={watchedConfig} />
           </Match>
         </Switch>
       </TabPanel>

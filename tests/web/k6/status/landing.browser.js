@@ -1,6 +1,6 @@
 import { check } from "k6";
 
-import { baseUrl, options as browserOptions, withPage } from "../support/browser.js";
+import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
 import { waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
@@ -21,6 +21,7 @@ export default async function () {
       '[aria-label="Global system status"]',
       "Status watch received",
     );
+    await screenshot(page, "status-landing-ready");
 
     check({ systemStatus, statusWatch }, {
       "landing receives ready status": ({ systemStatus, statusWatch }) =>

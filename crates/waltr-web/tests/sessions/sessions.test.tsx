@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import type { ClientCommand } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, testHistory } from "../support/routes";
-import { sessionView, snapshotWithSessions, timestamp } from "../support/snapshots";
+import { emptyConfig, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
 
 describe("sessions route", () => {
   test("lists sessions sorted by most recently updated", () => {
@@ -40,8 +40,8 @@ describe("sessions route", () => {
     fireEvent.click(screen.getByLabelText("Open session session-b"));
 
     await waitFor(() => expect(testHistory().get()).toBe("/sessions/session-b"));
-    expect(screen.getByLabelText("Session breadcrumb").textContent).toContain("session-b");
-    expect(screen.getByText("runningTool")).toBeTruthy();
+    expect(screen.getByLabelText("Session status summary").textContent).toContain("Status runningTool");
+    expect(screen.queryByLabelText("Session breadcrumb")).toBeNull();
     expect(screen.queryByLabelText("Session list")).toBeNull();
     expect(commands.map((command) => command.type)).toEqual(["registerSessionWatchInterest"]);
   });
@@ -58,7 +58,7 @@ describe("sessions route", () => {
     fireEvent.click(screen.getByText("Create session"));
 
     await waitFor(() => expect(testHistory().get()).toBe("/sessions/session-1"));
-    expect(screen.getByLabelText("Session breadcrumb").textContent).toContain("session-1");
+    expect(screen.getByLabelText("Session status summary").textContent).toContain("Status idle");
     expect(commands.map((command) => command.type)).toContain("createSession");
   });
 
@@ -103,7 +103,7 @@ describe("sessions route", () => {
       ]),
     });
 
-    const detail = screen.getByRole("region", { name: "Session" });
+    const detail = screen.getByRole("region", { name: "Session detail" });
     fireEvent.click(within(detail).getByLabelText("Delete session session-current"));
     fireEvent.click(within(detail).getByLabelText("Confirm delete session session-current"));
 
@@ -140,4 +140,103 @@ describe("sessions route", () => {
     expect(testHistory().get()).toBe("/sessions");
     expect(screen.getByLabelText("Confirm delete session session-stay")).toBeTruthy();
   });
+
+  test("provider editor dispatches session runtime metadata update", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithConfig({
+      ...emptyConfig("v1"),
+      providers: {
+        openai: provider("OpenAI", ["gpt-4o"]),
+        anthropic: provider("Anthropic", ["claude-4"]),
+      },
+    });
+    snapshot.sessions.current = [sessionWithRuntime("runtime-session")];
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/runtime-session",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByLabelText("Edit provider/model"));
+    fireEvent.click(screen.getByText("anthropic"));
+    fireEvent.click(screen.getByText("Save runtime"));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "updateSessionRuntimeConfig",
+      id: "runtime-session",
+      providerKey: "anthropic",
+      modelId: "claude-4",
+      enabledMcpServerKeys: ["git"],
+    }));
+  });
+
+  test("mcp editor dispatches selected session runtime servers", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithConfig({
+      ...emptyConfig("v1"),
+      providers: { openai: provider("OpenAI", ["gpt-4o"]) },
+      mcpServers: {
+        git: { name: "git", kind: "stdio", command: "git-mcp", url: "" },
+        files: { name: "files", kind: "stdio", command: "files-mcp", url: "" },
+      },
+    });
+    snapshot.sessions.current = [sessionWithRuntime("runtime-session")];
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/runtime-session",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByLabelText("Edit MCP"));
+    fireEvent.click(screen.getByText("files"));
+    fireEvent.click(screen.getByText("Save MCP"));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "updateSessionRuntimeConfig",
+      id: "runtime-session",
+      providerKey: "openai",
+      modelId: "gpt-4o",
+      enabledMcpServerKeys: ["git", "files"],
+    }));
+  });
 });
+
+function provider(name: string, modelIds: string[]) {
+  return {
+    kind: "openAi" as const,
+    name,
+    url: "https://example.invalid/v1",
+    headers: {},
+    models: Object.fromEntries(modelIds.map((id) => [id, {
+      name: id,
+      kind: "llm" as const,
+      options: { temperature: null, topP: null, topK: null, minP: null, presencePenalty: null, repetitionPenalty: null },
+      limits: { context: null, output: null },
+      capabilities: { tools: true, image: false },
+    }])),
+  };
+}
+
+function sessionWithRuntime(id: string) {
+  return sessionView({
+    id,
+    runtimeConfig: {
+      provider: {
+        key: "openai",
+        kind: "openAi",
+        url: "https://example.invalid/v1",
+        modelId: "gpt-4o",
+        matchStatus: "configured",
+      },
+      mcpServers: [{
+        key: "git",
+        kind: "stdio",
+        command: "git-mcp",
+        url: "",
+        matchStatus: "configured",
+      }],
+    },
+  });
+}
