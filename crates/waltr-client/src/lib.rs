@@ -33,16 +33,19 @@ pub use executor::{
 };
 pub use waltr::grpc::waltr::config::v1::{
     Configuration, McpServer, McpServerType, Model, ModelCapabilities, ModelLimits, ModelOptions,
-    ModelType, Provider, ProviderType,
+    ModelType, Provider, ProviderType, RuntimeDefaults,
 };
 pub use waltr::grpc::waltr::session::v1::{
-    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, SessionPhase,
-    SessionStatus, SessionSummary, Suspension, SuspensionKind,
+    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RuntimeConfigMatch,
+    SessionMcpServerRuntime, SessionPhase, SessionProviderRuntime, SessionRuntimeConfig,
+    SessionRuntimeConfigRequest, SessionStatus, SessionSummary, Suspension, SuspensionKind,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchEvent, SessionWatchUpdate};
 pub use view::{
     ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView,
-    ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView, SessionPhaseView,
-    SessionStatusView, SessionView, TimestampView,
+    ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
+    RuntimeConfigMatchView, RuntimeDefaultsView, SessionMcpServerRuntimeView, SessionPhaseView,
+    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionView,
+    TimestampView,
 };

@@ -38,7 +38,8 @@ async fn client_surface_deletes_session_and_updates_snapshot() {
         panic!("session create operation should include created session result");
     };
     let id = session.id.clone();
-    assert!(created.sessions.current.is_empty());
+    assert_eq!(created.sessions.current.len(), 1);
+    assert_eq!(created.sessions.current[0].id, id);
 
     let started =
         dispatch_stream_command(&mut stream, ClientCommand::DeleteSession { id: id.clone() })

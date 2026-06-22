@@ -6,8 +6,13 @@ mod session;
 pub use config::{
     ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView,
     ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
+    RuntimeDefaultsView,
 };
-pub use session::{SessionPhaseView, SessionStatusView, SessionView, TimestampView};
+pub use session::{
+    RuntimeConfigMatchView, SessionMcpServerRuntimeView, SessionPhaseView,
+    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionView,
+    TimestampView,
+};
 
 #[cfg(test)]
 mod tests {
@@ -38,6 +43,7 @@ mod tests {
             )]),
             etag: "v1".to_owned(),
             mcp_servers: HashMap::new(),
+            runtime_defaults: None,
         };
 
         let view = ConfigView::from(config.clone());
@@ -71,11 +77,16 @@ mod tests {
             ModelView::decl(),
             McpServerTypeView::decl(),
             McpServerView::decl(),
+            RuntimeDefaultsView::decl(),
             ProviderView::decl(),
             ConfigView::decl(),
             TimestampView::decl(),
             SessionPhaseView::decl(),
             SessionStatusView::decl(),
+            RuntimeConfigMatchView::decl(),
+            SessionProviderRuntimeView::decl(),
+            SessionMcpServerRuntimeView::decl(),
+            SessionRuntimeConfigView::decl(),
             SessionView::decl(),
             ClientOperationView::decl(),
             OperationCollectionSnapshot::decl(),

@@ -4,7 +4,8 @@ mod config;
 mod session;
 mod status;
 
-pub use config::{ConfigWatchStream, ConfigWatchUpdate};
+pub use config::ConfigWatchStream;
+pub use waltr::config::ConfigWatchUpdate;
 use waltr::grpc::waltr::config::v1::config_service_client::ConfigServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
@@ -13,7 +14,7 @@ pub use status::StatusWatchStream;
 use tonic::Code;
 use tonic::codegen::{Body, Bytes, StdError};
 
-use crate::{ClientError, ConfigPatch, Configuration, SessionSummary};
+use crate::{ClientError, ConfigPatch, Configuration, SessionRuntimeConfigRequest, SessionSummary};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type DefaultGrpcTransport = NativeGrpcTransport;
@@ -51,11 +52,18 @@ pub trait WaltrTransport {
     /// Delete a server-side session by id.
     fn delete_session(&self, id: String) -> impl Future<Output = Result<(), ClientError>>;
 
+    /// Replace runtime config metadata for a server-side session.
+    fn update_session_runtime_config(
+        &self,
+        id: String,
+        runtime_config: SessionRuntimeConfigRequest,
+    ) -> impl Future<Output = Result<SessionSummary, ClientError>>;
+
     /// Subscribe to future session changes.
     fn watch_sessions(&self) -> impl Future<Output = Result<SessionWatchStream, ClientError>>;
 }
 
-pub(super) trait RemoteTransport {
+trait RemoteTransport {
     type Inner;
 
     fn config_client(
@@ -113,6 +121,14 @@ where
 
     async fn delete_session(&self, id: String) -> Result<(), ClientError> {
         session::delete_session(self, id).await
+    }
+
+    async fn update_session_runtime_config(
+        &self,
+        id: String,
+        runtime_config: SessionRuntimeConfigRequest,
+    ) -> Result<SessionSummary, ClientError> {
+        session::update_session_runtime_config(self, id, runtime_config).await
     }
 
     async fn watch_sessions(&self) -> Result<SessionWatchStream, ClientError> {
@@ -208,7 +224,7 @@ impl RemoteTransport for WasmGrpcTransport {
     }
 }
 
-pub(super) fn status_error(error: &tonic::Status) -> ClientError {
+fn status_error(error: &tonic::Status) -> ClientError {
     ClientError::new(format!(
         "{}: {}",
         status_code_name(error.code()),

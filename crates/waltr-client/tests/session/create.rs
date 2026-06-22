@@ -46,8 +46,6 @@ async fn client_surface_creates_session_and_updates_snapshot() {
         snapshot.sessions.create.key.as_deref(),
         Some(operation_key.as_str())
     );
-    assert!(snapshot.sessions.current.is_empty());
-
     let Some(ClientOperationView::SessionCreate {
         session: Some(operation_session),
         ..
@@ -62,4 +60,6 @@ async fn client_surface_creates_session_and_updates_snapshot() {
     assert!(operation_session.created_at.is_some());
     assert!(operation_session.updated_at.is_some());
     assert!(operation_session.last_activity_at.is_some());
+    assert_eq!(snapshot.sessions.current.len(), 1);
+    assert_eq!(snapshot.sessions.current[0].id, operation_session.id);
 }

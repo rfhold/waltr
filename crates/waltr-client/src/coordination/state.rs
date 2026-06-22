@@ -64,6 +64,8 @@ pub struct SessionClientState {
     pub list: OperationState,
     /// Session delete operation state.
     pub delete: OperationState,
+    /// Session runtime metadata update operation state.
+    pub runtime_config_update: OperationState,
     /// Session watch operation state.
     pub watch: WatchState,
     pub(crate) last_sequence: u64,
@@ -89,6 +91,7 @@ pub struct OperationState {
 
 /// Result state for a command operation that UI shells may observe by key.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ClientOperationState {
     /// Configuration patch command result.
     ConfigPatch {
@@ -116,6 +119,15 @@ pub enum ClientOperationState {
         error: Option<String>,
         /// Deleted session id.
         id: String,
+    },
+    /// Session runtime metadata update command result.
+    SessionRuntimeConfigUpdate {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Updated session, when the operation completed successfully.
+        session: Option<SessionSummary>,
     },
 }
 
@@ -310,6 +322,7 @@ impl ClientState {
         self.sessions.create.status = OperationStatus::Ready;
         self.sessions.create.error = None;
         self.sessions.create.key = Some(key.clone());
+        self.upsert_session(session.clone());
         self.operations.insert(
             key,
             ClientOperationState::SessionCreate {
@@ -352,6 +365,7 @@ impl ClientState {
         self.sessions.delete.status = OperationStatus::Ready;
         self.sessions.delete.error = None;
         self.sessions.delete.key = Some(key.clone());
+        self.remove_session(&id);
         self.operations.insert(
             key,
             ClientOperationState::SessionDelete {
@@ -377,6 +391,57 @@ impl ClientState {
                 status: OperationStatus::Failed,
                 error: Some(message),
                 id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_runtime_config_update_loading(&mut self, key: OperationKey) {
+        self.sessions.runtime_config_update.status = OperationStatus::Loading;
+        self.sessions.runtime_config_update.error = None;
+        self.sessions.runtime_config_update.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRuntimeConfigUpdate {
+                status: OperationStatus::Loading,
+                error: None,
+                session: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_runtime_config_update_ready(
+        &mut self,
+        key: OperationKey,
+        session: SessionSummary,
+    ) {
+        self.sessions.runtime_config_update.status = OperationStatus::Ready;
+        self.sessions.runtime_config_update.error = None;
+        self.sessions.runtime_config_update.key = Some(key.clone());
+        self.upsert_session(session.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRuntimeConfigUpdate {
+                status: OperationStatus::Ready,
+                error: None,
+                session: Some(session),
+            },
+        );
+    }
+
+    pub(crate) fn set_session_runtime_config_update_failed(
+        &mut self,
+        key: OperationKey,
+        message: String,
+    ) {
+        self.sessions.runtime_config_update.status = OperationStatus::Failed;
+        self.sessions.runtime_config_update.error = Some(message.clone());
+        self.sessions.runtime_config_update.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRuntimeConfigUpdate {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session: None,
             },
         );
     }

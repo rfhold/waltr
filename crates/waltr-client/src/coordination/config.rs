@@ -1,10 +1,7 @@
 //! Configuration reducer responsibilities.
 
-use crate::transport::ConfigWatchUpdate;
-use crate::{
-    ClientEffect, ClientState, ClientUpdate, ConfigEffect, ConfigEvent, Configuration,
-    OperationStatus,
-};
+use crate::{ClientEffect, ClientState, ClientUpdate, ConfigEffect, ConfigEvent, OperationStatus};
+use waltr::config::{ConfigWatchApplyOutcome, ConfigWatchUpdate, apply_config_watch_update};
 
 pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
     match event {
@@ -50,7 +47,7 @@ pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
             state.set_config_watch_opened();
             ClientUpdate::default()
         }
-        ConfigEvent::WatchChanged(update) => apply_watch_update(state, update),
+        ConfigEvent::WatchChanged(update) => apply_watch_update(state, &update),
         ConfigEvent::WatchFailed(error) => watch_failed(state, error.to_string()),
         ConfigEvent::WatchEnded => watch_failed(state, "config watch ended".to_owned()),
         ConfigEvent::ReconnectReady => maintain_watch(state),
@@ -78,53 +75,21 @@ pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
     ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::Watch))
 }
 
-fn apply_watch_update(state: &mut ClientState, update: ConfigWatchUpdate) -> ClientUpdate {
-    let has_error = !update.error.is_empty();
-    if has_error {
-        state.set_config_watch_changed(None, update.error);
-        return watch_retry(state);
+fn apply_watch_update(state: &mut ClientState, update: &ConfigWatchUpdate) -> ClientUpdate {
+    match apply_config_watch_update(state.config.current.as_ref(), update) {
+        ConfigWatchApplyOutcome::Retry(error) => {
+            state.set_config_watch_changed(None, error);
+            watch_retry(state)
+        }
+        ConfigWatchApplyOutcome::ReloadRequired => {
+            state.set_config_watch_changed(None, String::new());
+            ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::Load))
+        }
+        ConfigWatchApplyOutcome::Updated(config) => {
+            state.set_config_watch_changed(Some(config), String::new());
+            ClientUpdate::default()
+        }
     }
-
-    if watch_update_needs_reload(state, &update) {
-        state.set_config_watch_changed(None, String::new());
-        return ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::Load));
-    }
-
-    state.set_config_watch_changed(merged_watch_config(state, &update), String::new());
-    ClientUpdate::default()
-}
-
-fn watch_update_needs_reload(state: &ClientState, update: &ConfigWatchUpdate) -> bool {
-    if update.previous_etag.is_empty() {
-        return false;
-    }
-
-    let Some(current) = state.config.current.as_ref() else {
-        return true;
-    };
-
-    current.etag != update.previous_etag || update.config.is_none()
-}
-
-fn merged_watch_config(state: &ClientState, update: &ConfigWatchUpdate) -> Option<Configuration> {
-    let patch = update.config.as_ref()?;
-    if update.previous_etag.is_empty() {
-        return Some(patch.clone());
-    }
-
-    let mut config = state.config.current.as_ref()?.clone();
-    if update.changed_keys.iter().any(|key| key == "providers") {
-        config.providers.clone_from(&patch.providers);
-    }
-    if update.changed_keys.iter().any(|key| key == "mcp_servers") {
-        config.mcp_servers.clone_from(&patch.mcp_servers);
-    }
-    if update.etag.is_empty() {
-        patch.etag.clone_into(&mut config.etag);
-    } else {
-        update.etag.clone_into(&mut config.etag);
-    }
-    Some(config)
 }
 
 fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {

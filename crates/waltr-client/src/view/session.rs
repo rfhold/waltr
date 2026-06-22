@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{SessionPhase, SessionStatus, SessionSummary};
+use crate::{
+    McpServerTypeView, ProviderKindView, RuntimeConfigMatch, SessionMcpServerRuntime, SessionPhase,
+    SessionProviderRuntime, SessionRuntimeConfig, SessionStatus, SessionSummary,
+};
 
 /// Stable session summary view shared by Waltr shells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -21,6 +24,66 @@ pub struct SessionView {
     pub updated_at: Option<TimestampView>,
     /// Last activity timestamp, when supplied by the server.
     pub last_activity_at: Option<TimestampView>,
+    /// Runtime configuration snapshot stored with the session.
+    pub runtime_config: Option<SessionRuntimeConfigView>,
+}
+
+/// Stable session runtime config snapshot view shared by Waltr shells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntimeConfigView {
+    /// Stored provider runtime snapshot.
+    pub provider: Option<SessionProviderRuntimeView>,
+    /// Stored MCP server runtime snapshots.
+    pub mcp_servers: Vec<SessionMcpServerRuntimeView>,
+}
+
+/// Stable provider runtime snapshot view shared by Waltr shells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProviderRuntimeView {
+    /// Provider key selected when runtime config was stored.
+    pub key: String,
+    /// Provider type selected when runtime config was stored.
+    pub kind: ProviderKindView,
+    /// Provider URL selected when runtime config was stored.
+    pub url: String,
+    /// Exact provider model id selected when runtime config was stored.
+    pub model_id: String,
+    /// Whether the stored provider/model still matches current config.
+    pub match_status: RuntimeConfigMatchView,
+}
+
+/// Stable MCP server runtime snapshot view shared by Waltr shells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMcpServerRuntimeView {
+    /// MCP server key selected when runtime config was stored.
+    pub key: String,
+    /// MCP server type selected when runtime config was stored.
+    pub kind: McpServerTypeView,
+    /// MCP command selected when runtime config was stored.
+    pub command: String,
+    /// MCP URL selected when runtime config was stored.
+    pub url: String,
+    /// Whether the stored MCP server still matches current config.
+    pub match_status: RuntimeConfigMatchView,
+}
+
+/// Stable runtime snapshot match status shared by Waltr shells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeConfigMatchView {
+    /// Match status was omitted or intentionally unspecified.
+    Unspecified,
+    /// Stored runtime config still matches current server config.
+    Configured,
+    /// Stored runtime config references a missing provider/model/MCP entry.
+    Missing,
+    /// Stored runtime config differs from current server config.
+    Changed,
+    /// Match status is unknown to this client version.
+    Unknown,
 }
 
 /// Stable session status view shared by Waltr shells.
@@ -81,6 +144,7 @@ impl From<SessionSummary> for SessionView {
             created_at: session.created_at.map(Into::into),
             updated_at: session.updated_at.map(Into::into),
             last_activity_at: session.last_activity_at.map(Into::into),
+            runtime_config: session.runtime_config.map(Into::into),
         }
     }
 }
@@ -121,6 +185,51 @@ impl From<i32> for SessionPhaseView {
             Ok(SessionPhase::Suspended) => Self::Suspended,
             Ok(SessionPhase::Finished) => Self::Finished,
             Ok(SessionPhase::Failed) => Self::Failed,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<SessionRuntimeConfig> for SessionRuntimeConfigView {
+    fn from(config: SessionRuntimeConfig) -> Self {
+        Self {
+            provider: config.provider.map(Into::into),
+            mcp_servers: config.mcp_servers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<SessionProviderRuntime> for SessionProviderRuntimeView {
+    fn from(provider: SessionProviderRuntime) -> Self {
+        Self {
+            key: provider.key,
+            kind: provider.r#type.into(),
+            url: provider.url,
+            model_id: provider.model_id,
+            match_status: provider.r#match.into(),
+        }
+    }
+}
+
+impl From<SessionMcpServerRuntime> for SessionMcpServerRuntimeView {
+    fn from(server: SessionMcpServerRuntime) -> Self {
+        Self {
+            key: server.key,
+            kind: server.r#type.into(),
+            command: server.command,
+            url: server.url,
+            match_status: server.r#match.into(),
+        }
+    }
+}
+
+impl From<i32> for RuntimeConfigMatchView {
+    fn from(value: i32) -> Self {
+        match RuntimeConfigMatch::try_from(value) {
+            Ok(RuntimeConfigMatch::Unspecified) => Self::Unspecified,
+            Ok(RuntimeConfigMatch::Configured) => Self::Configured,
+            Ok(RuntimeConfigMatch::Missing) => Self::Missing,
+            Ok(RuntimeConfigMatch::Changed) => Self::Changed,
             Err(_) => Self::Unknown,
         }
     }
