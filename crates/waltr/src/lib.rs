@@ -9,6 +9,17 @@
     clippy::pedantic
 )]
 #[cfg(feature = "grpc")]
+pub mod config;
+
+#[allow(
+    missing_debug_implementations,
+    missing_docs,
+    clippy::all,
+    clippy::cargo,
+    clippy::nursery,
+    clippy::pedantic
+)]
+#[cfg(feature = "grpc")]
 pub mod grpc;
 
 /// Returns the package name for this crate.
