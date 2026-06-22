@@ -1,4 +1,4 @@
-//! AgentRuntime question tool integration tests.
+//! `AgentRuntime` question tool integration tests.
 
 use std::sync::Arc;
 

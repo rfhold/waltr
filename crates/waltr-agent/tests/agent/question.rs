@@ -1,4 +1,4 @@
-//! AgentRuntime question tool integration tests.
+//! `AgentRuntime` question tool integration tests.
 
 use std::sync::Arc;
 
@@ -135,7 +135,7 @@ async fn question_external_request_resumes_from_durable_session() -> waltr_agent
         if let TimelineContent::TextDelta { delta } = &event.content
             && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
         {
-            text.push_str(&delta);
+            text.push_str(delta);
         }
     }
     assert_eq!(text, "question-flow-complete");

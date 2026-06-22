@@ -1,7 +1,7 @@
 //! Process-memory session store.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -15,6 +15,7 @@ use crate::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
 };
+use serde_json::Value;
 
 /// Process-memory implementation of [`SessionStore`].
 #[derive(Debug, Clone, Default)]
@@ -52,8 +53,8 @@ impl MemorySessionStore {
         }
 
         let next_revision = record.revision.next();
-        let value = update(record, next_revision)?;
         record.revision = next_revision;
+        let value = update(record, next_revision)?;
         drop(records);
 
         Ok((next_revision, value))
@@ -68,6 +69,29 @@ impl SessionStore for MemorySessionStore {
         let store = self.clone();
         async move {
             let record = SessionRecord::new(id);
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+
+            if records.contains_key(&record.id) {
+                return Err(SessionStoreError::AlreadyExists { id: record.id });
+            }
+
+            records.insert(record.id.clone(), record.clone());
+            drop(records);
+            Ok(record)
+        }
+    }
+
+    fn create_with_metadata_values(
+        &self,
+        id: SessionId,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        async move {
+            let record = SessionRecord::with_metadata_values(id, metadata_values);
             let mut records = store
                 .records
                 .lock()
@@ -114,6 +138,7 @@ impl SessionStore for MemorySessionStore {
                 .lock()
                 .map_err(|_| SessionStoreError::LockPoisoned)?;
             records.remove(&id);
+            drop(records);
             Ok(())
         }
     }
@@ -164,6 +189,53 @@ impl SessionStore for MemorySessionStore {
             })?;
 
             Ok(revision)
+        }
+    }
+
+    fn set_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            let record = records
+                .get_mut(&id)
+                .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
+            record.set_metadata_value(key, value);
+            record.revision = record.revision.next();
+            let record = record.clone();
+            drop(records);
+            Ok(record)
+        }
+    }
+
+    fn remove_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            let record = records
+                .get_mut(&id)
+                .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
+            record.remove_metadata_value(&key);
+            record.revision = record.revision.next();
+            let record = record.clone();
+            drop(records);
+            Ok(record)
         }
     }
 
@@ -371,6 +443,36 @@ mod tests {
         assert_eq!(summaries[0].current_prompt.as_deref(), Some("hello"));
         assert_eq!(summaries[0].created_at, created.metadata.created_at);
         assert!(summaries[0].last_activity_at > created.metadata.last_activity_at);
+    }
+
+    #[tokio::test]
+    async fn metadata_values_are_stored_without_activity_bump() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        let created = store.create(id.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let updated = store
+            .set_metadata_value(&id, "host.key".to_owned(), json!({ "value": true }))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.revision, Revision::new(1));
+        assert_eq!(
+            updated.metadata_value("host.key"),
+            Some(&json!({ "value": true }))
+        );
+        assert!(updated.metadata.updated_at > created.metadata.updated_at);
+        assert_eq!(
+            updated.metadata.last_activity_at,
+            created.metadata.last_activity_at
+        );
+
+        let summary = updated.summary();
+        assert_eq!(
+            summary.metadata_values.get("host.key"),
+            Some(&json!({ "value": true }))
+        );
     }
 
     #[tokio::test]
@@ -696,6 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn timeline_query_slices_by_direction_cursor_limit_and_channel() {
         let store = MemorySessionStore::new();
         let id = session_id();

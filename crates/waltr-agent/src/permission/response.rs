@@ -6,6 +6,7 @@ use serde_json::Value;
 use super::PermissionPattern;
 use crate::{ExternalRequestId, LlmError, Result};
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) const PERMISSION_STATE_NAMESPACE: &str = "permissions";
 
 /// Host decision for a pending permission request.
@@ -31,6 +32,10 @@ pub enum PermissionResponse {
 
 impl PermissionResponse {
     /// Parse a permission response from a provider-neutral JSON payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload does not match a supported permission response shape.
     pub fn from_value(value: Value) -> Result<Self> {
         if let Some(value) = value.as_str() {
             return match value {
@@ -61,6 +66,7 @@ pub enum PermissionDenyMode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct PermissionRuntimeState {
     #[serde(default)]
     pub(crate) one_shot: Vec<PermissionOneShotApproval>,
@@ -105,6 +111,7 @@ impl PermissionRuntimeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct PermissionOneShotApproval {
     pub(crate) request_id: String,
     pub(crate) tool_call_id: String,

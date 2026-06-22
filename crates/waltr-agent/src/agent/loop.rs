@@ -126,6 +126,7 @@ where
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::needless_continue, clippy::single_match_else)]
     pub(super) async fn next(mut self) -> Option<(Result<AgentTimelineEvent>, Self)> {
         loop {
             if self.cancellation_token.is_cancelled() {
@@ -417,6 +418,7 @@ where
         Some(Ok((tool_index, tool_definition)))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn start_tool(&mut self, mut call: ToolCall) -> Result<ToolExecution> {
         let resolved = match self.resolve_tool_call(&call) {
             Some(Ok(resolved)) => Some(resolved),
@@ -726,7 +728,7 @@ where
 
     async fn apply_resume_input(&mut self, record: SessionRecord) -> Result<bool> {
         let Some(input) = self.input.take() else {
-            self.hydrate_from_record(record);
+            self.hydrate_from_record(&record);
             return Ok(true);
         };
 
@@ -754,8 +756,7 @@ where
                 response,
             } => {
                 let retry = permission_retry_tool_call(&record.snapshot(), &request_id, &response)?;
-                let cancel =
-                    permission_cancel_response(&record.snapshot(), &request_id, &response)?;
+                let cancel = permission_cancel_response(&record.snapshot(), &request_id, &response);
                 let record = match AgentSessionRuntime::new(&self.session_store)
                     .resume(
                         &self.session_id,
@@ -789,11 +790,11 @@ where
             }
         };
 
-        self.hydrate_from_record(record);
+        self.hydrate_from_record(&record);
         Ok(continue_start_turn)
     }
 
-    fn hydrate_from_record(&mut self, record: SessionRecord) {
+    fn hydrate_from_record(&mut self, record: &SessionRecord) {
         let snapshot = record.snapshot();
         self.middleware_state = MiddlewareStateLog::from_snapshot(&snapshot);
         self.prompt = snapshot.current_prompt.unwrap_or_default();
@@ -830,7 +831,7 @@ where
         let record = AgentSessionRuntime::new(&self.session_store)
             .interrupt(&self.session_id)
             .await?;
-        self.hydrate_from_record(record);
+        self.hydrate_from_record(&record);
         Ok(())
     }
 
@@ -1217,13 +1218,13 @@ fn permission_cancel_response(
     _snapshot: &SessionSnapshot,
     _request_id: &ExternalRequestId,
     response: &ExternalResponse,
-) -> Result<bool> {
+) -> bool {
     match PermissionResponse::from_value(response.payload.clone()) {
         Ok(PermissionResponse::Deny {
             mode: crate::PermissionDenyMode::CancelWork,
             ..
-        }) => Ok(true),
-        Ok(_) | Err(_) => Ok(false),
+        }) => true,
+        Ok(_) | Err(_) => false,
     }
 }
 

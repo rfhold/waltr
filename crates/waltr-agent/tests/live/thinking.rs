@@ -132,7 +132,7 @@ async fn assert_provider_thinking(
             message: "agent stream ended without finished status".to_owned(),
         });
     }
-    assert!(text.contains(EXPECTED_TEXT), "{}: {text}", provider_name);
+    assert!(text.contains(EXPECTED_TEXT), "{provider_name}: {text}");
 
     let stored = store
         .load(&session_id)
@@ -146,7 +146,7 @@ async fn assert_provider_thinking(
             && matches!(&event.content, TimelineContent::TextDelta { .. })
     }) || stored.snapshot().thinking_blocks().next().is_some();
     let saw_thinking = thinking_delta_count > 0 || saw_stored_thinking;
-    assert_eq!(saw_thinking, expect_thinking, "{}", provider_name);
+    assert_eq!(saw_thinking, expect_thinking, "{provider_name}");
 
     Ok(())
 }

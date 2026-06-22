@@ -393,6 +393,7 @@ pub struct PendingTimelineEvent {
 impl PendingTimelineEvent {
     /// Create a pending timeline event.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: SessionId,
         turn: u64,
@@ -582,7 +583,7 @@ fn text_delta_event(
 }
 
 fn empty_metadata() -> Value {
-    Value::Object(Default::default())
+    Value::Object(serde_json::Map::default())
 }
 
 #[cfg(test)]

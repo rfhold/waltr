@@ -1,4 +1,4 @@
-//! AgentRuntime context-loading integration tests.
+//! `AgentRuntime` context-loading integration tests.
 
 use std::{env, fs, path::PathBuf, sync::Arc};
 

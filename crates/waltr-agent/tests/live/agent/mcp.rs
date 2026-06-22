@@ -68,8 +68,8 @@ async fn run_live_mcp(
     assert_tool_was_not_surfaced(&provider, "get_mcp_tool_details");
     assert_tool_was_not_surfaced(&provider, "call_mcp_tool");
     require_timeline_tool_execution(provider.name(), &session, &context)?;
-    assert_tool_call(&session, "mcp_stdio_test_echo_marker", &context)?;
-    assert_tool_call(&session, "mcp_http_test_echo_marker", &context)?;
+    assert_tool_call(&session, "mcp_stdio_test_echo_marker", &context);
+    assert_tool_call(&session, "mcp_http_test_echo_marker", &context);
     assert!(
         direct_results.contains("stdio-mcp-tool-called-707"),
         "{context}"
@@ -188,11 +188,7 @@ fn tool_result_text(session: &AgentTestSession) -> String {
         .join("\n")
 }
 
-fn assert_tool_call(
-    session: &AgentTestSession,
-    name: &str,
-    context: &str,
-) -> waltr_agent::Result<()> {
+fn assert_tool_call(session: &AgentTestSession, name: &str, context: &str) {
     assert!(
         session.timeline.iter().any(|event| {
             crate::session::channel_is(event, CHANNEL_TOOL_CALL)
@@ -207,7 +203,6 @@ fn assert_tool_call(
         }),
         "{context}"
     );
-    Ok(())
 }
 
 fn require_timeline_tool_execution(

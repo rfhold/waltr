@@ -1,5 +1,7 @@
 //! S3-backed session storage.
 
+use std::collections::BTreeMap;
+
 use aws_sdk_s3::{Client, error::DisplayErrorContext, primitives::ByteStream};
 
 use super::{
@@ -12,6 +14,7 @@ use crate::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
 };
+use serde_json::Value;
 
 /// S3 JSON-object implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
@@ -88,7 +91,10 @@ impl S3SessionStore {
                 .map_err(backend_error)?;
             for object in output.contents() {
                 let Some(key) = object.key() else { continue };
-                if !key.ends_with(".json") {
+                if !key
+                    .rsplit_once('.')
+                    .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("json"))
+                {
                     continue;
                 }
                 let output = self
@@ -131,8 +137,8 @@ impl S3SessionStore {
             });
         }
         let revision = record.revision.next();
-        let value = update(&mut record, revision)?;
         record.revision = revision;
+        let value = update(&mut record, revision)?;
         self.save_record(&record).await?;
         Ok((revision, value))
     }
@@ -146,6 +152,25 @@ impl SessionStore for S3SessionStore {
         let store = self.clone();
         async move {
             let record = SessionRecord::new(id);
+            match store.load_record(&record.id).await {
+                Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
+                Err(SessionStoreError::NotFound { .. }) => {
+                    store.save_record(&record).await?;
+                    Ok(record)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn create_with_metadata_values(
+        &self,
+        id: SessionId,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        async move {
+            let record = SessionRecord::with_metadata_values(id, metadata_values);
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
                 Err(SessionStoreError::NotFound { .. }) => {
@@ -227,6 +252,45 @@ impl SessionStore for S3SessionStore {
                 })
                 .await?;
             Ok(revision)
+        }
+    }
+
+    fn set_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let revision = store.load_record(&id).await?.revision;
+            let (_, record) = store
+                .update_record(&id, revision, |record, _| {
+                    record.set_metadata_value(key, value);
+                    Ok(record.clone())
+                })
+                .await?;
+            Ok(record)
+        }
+    }
+
+    fn remove_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let revision = store.load_record(&id).await?.revision;
+            let (_, record) = store
+                .update_record(&id, revision, |record, _| {
+                    record.remove_metadata_value(&key);
+                    Ok(record.clone())
+                })
+                .await?;
+            Ok(record)
         }
     }
 

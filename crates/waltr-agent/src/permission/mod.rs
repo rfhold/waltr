@@ -17,6 +17,7 @@ pub use pattern::{
     PermissionCommandPattern, PermissionPathPattern, PermissionPattern, PermissionResourcePattern,
 };
 pub use policy::PermissionPolicy;
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) use response::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState};
 pub use response::{PermissionDenyMode, PermissionResponse};
 pub use rule::{

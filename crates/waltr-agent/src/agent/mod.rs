@@ -1,4 +1,4 @@
-//! AgentRuntime configuration and loop execution.
+//! `AgentRuntime` configuration and loop execution.
 
 use std::{fmt, sync::Arc};
 

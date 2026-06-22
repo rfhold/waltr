@@ -85,7 +85,7 @@ async fn durable_session_resume_continues_same_agent_loop() {
         if let TimelineContent::TextDelta { delta } = &event.content
             && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
         {
-            text.push_str(&delta);
+            text.push_str(delta);
         }
     }
 
@@ -549,7 +549,7 @@ async fn agents_system_prompt_is_sent_to_provider() {
         if let TimelineContent::TextDelta { delta } = &event.content
             && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
         {
-            text.push_str(&delta);
+            text.push_str(delta);
         }
     }
 
@@ -775,7 +775,7 @@ async fn agent_system_prompt_fragments_are_sent_in_order() {
         if let TimelineContent::TextDelta { delta } = &event.content
             && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
         {
-            text.push_str(&delta);
+            text.push_str(delta);
         }
     }
 

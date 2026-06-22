@@ -11,6 +11,10 @@ use crate::{
     },
 };
 
+use std::collections::BTreeMap;
+
+use serde_json::Value;
+
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
     ExternalResponse, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
@@ -42,6 +46,22 @@ where
     /// Returns an error when the store rejects the new record.
     pub async fn create_session(&self, id: SessionId) -> Result<SessionRecord> {
         self.store.create(id).await.map_err(session_store_error)
+    }
+
+    /// Create a new durable session record with initial host-defined metadata values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store rejects the new record.
+    pub async fn create_session_with_metadata_values(
+        &self,
+        id: SessionId,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> Result<SessionRecord> {
+        self.store
+            .create_with_metadata_values(id, metadata_values)
+            .await
+            .map_err(session_store_error)
     }
 
     /// Load a durable session record.
@@ -99,6 +119,39 @@ where
     pub async fn interrupt(&self, id: &SessionId) -> Result<SessionRecord> {
         let record = self.load_session(id).await?;
         self.interrupt_record(record).await
+    }
+
+    /// Set a host-defined metadata value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
+    pub async fn set_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+    ) -> Result<SessionRecord> {
+        self.store
+            .set_metadata_value(id, key, value)
+            .await
+            .map_err(session_store_error)
+    }
+
+    /// Remove a host-defined metadata value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
+    pub async fn remove_metadata_value(
+        &self,
+        id: &SessionId,
+        key: String,
+    ) -> Result<SessionRecord> {
+        self.store
+            .remove_metadata_value(id, key)
+            .await
+            .map_err(session_store_error)
     }
 
     async fn interrupt_record(&self, record: SessionRecord) -> Result<SessionRecord> {
@@ -251,6 +304,7 @@ where
         Ok(RuntimeResumeOutput::Resumed { record })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_permission_response(
         &self,
         record: SessionRecord,

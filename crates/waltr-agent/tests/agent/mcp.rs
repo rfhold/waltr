@@ -103,6 +103,7 @@ async fn mcp_tool_discovery_observes_cancellation() -> waltr_agent::Result<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
     let temp = tempfile::tempdir()?;
     let marker = temp.path().join("mcp-cancel-marker.txt");

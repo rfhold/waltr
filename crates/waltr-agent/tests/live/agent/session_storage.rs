@@ -174,6 +174,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn assert_timeline_surface<S>(
     store: &S,
     session_id: &waltr_agent::SessionId,

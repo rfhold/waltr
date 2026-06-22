@@ -20,7 +20,7 @@ pub(in crate::mcp) struct StdioTransport {
 }
 
 struct StdioConnection {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
 }
@@ -108,7 +108,7 @@ impl StdioTransport {
             .take()
             .ok_or_else(|| protocol_error("missing stdout"))?;
         Ok(StdioConnection {
-            _child: child,
+            child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
         })
@@ -117,7 +117,7 @@ impl StdioTransport {
 
 async fn reset_connection(connection: &mut Option<StdioConnection>) {
     if let Some(mut connection) = connection.take() {
-        drop(connection._child.start_kill());
-        drop(connection._child.wait().await);
+        drop(connection.child.start_kill());
+        drop(connection.child.wait().await);
     }
 }

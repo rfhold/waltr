@@ -64,16 +64,16 @@ impl FilesystemConfig {
 
     fn into_agent_tool(self, kind: FilesystemToolKind) -> AgentTool {
         AgentTool::new(kind.definition(), move |context| {
-            self.call_agent_tool(kind, context)
+            self.call_agent_tool(kind, &context)
         })
     }
 
     fn call_agent_tool(
         &self,
         kind: FilesystemToolKind,
-        context: ToolExecutionContext,
+        context: &ToolExecutionContext,
     ) -> Result<ToolResult> {
-        let content = match kind {
+        let output = match kind {
             FilesystemToolKind::Read => self.read_unscoped(&tool_input(context.call())?)?,
             FilesystemToolKind::Glob => self.glob_unscoped(&tool_input(context.call())?)?,
             FilesystemToolKind::Grep => self.grep_unscoped(&tool_input(context.call())?)?,
@@ -84,7 +84,7 @@ impl FilesystemConfig {
                 self.apply_patch_unscoped(&tool_input(context.call())?)?
             }
         };
-        Ok(context.result(content))
+        Ok(context.result(output))
     }
 }
 
