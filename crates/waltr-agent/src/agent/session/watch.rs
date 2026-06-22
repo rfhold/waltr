@@ -1,4 +1,4 @@
-//! Session list watch support.
+//! Session watch support.
 
 use std::{
     pin::Pin,
@@ -13,9 +13,12 @@ use futures_util::Stream;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
+use crate::timeline::AgentTimelineEvent;
+
 use super::{SessionId, SessionSummary};
 
 const SESSION_LIST_CHANNEL_CAPACITY: usize = 128;
+const SESSION_TIMELINE_CHANNEL_CAPACITY: usize = 1024;
 
 /// Kind of session list change emitted by [`AgentSessions`](super::AgentSessions).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +74,85 @@ impl Stream for SessionListSubscription {
 pub(crate) struct SessionListBroadcaster {
     sequence: Arc<AtomicU64>,
     sender: broadcast::Sender<SessionListUpdate>,
+}
+
+/// A timeline update emitted by [`AgentSessions`](super::AgentSessions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTimelineUpdate {
+    /// Monotonic sequence for detecting missed live updates.
+    pub sequence: u64,
+    /// Persisted timeline event with an assigned cursor.
+    pub event: AgentTimelineEvent,
+}
+
+/// Live stream of persisted timeline updates for one session.
+#[derive(Debug)]
+pub struct SessionTimelineSubscription {
+    session_id: SessionId,
+    initial_sequence: u64,
+    inner: BroadcastStream<SessionTimelineUpdate>,
+}
+
+impl SessionTimelineSubscription {
+    /// Sequence observed when this subscription was opened.
+    #[must_use]
+    pub const fn initial_sequence(&self) -> u64 {
+        self.initial_sequence
+    }
+}
+
+impl Stream for SessionTimelineSubscription {
+    type Item = SessionTimelineUpdate;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match Pin::new(&mut self.inner).poll_next(context) {
+                Poll::Ready(Some(Ok(update))) if update.event.session_id == self.session_id => {
+                    return Poll::Ready(Some(update));
+                }
+                Poll::Ready(Some(Ok(_)))
+                | Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {}
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct SessionTimelineBroadcaster {
+    sequence: Arc<AtomicU64>,
+    sender: broadcast::Sender<SessionTimelineUpdate>,
+}
+
+impl SessionTimelineBroadcaster {
+    pub(crate) fn new() -> Self {
+        let (sender, _) = broadcast::channel(SESSION_TIMELINE_CHANNEL_CAPACITY);
+        Self {
+            sequence: Arc::new(AtomicU64::new(0)),
+            sender,
+        }
+    }
+
+    pub(crate) fn subscribe(&self, session_id: SessionId) -> SessionTimelineSubscription {
+        SessionTimelineSubscription {
+            session_id,
+            initial_sequence: self.sequence.load(Ordering::Relaxed),
+            inner: BroadcastStream::new(self.sender.subscribe()),
+        }
+    }
+
+    pub(crate) fn publish(&self, event: AgentTimelineEvent) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        drop(self.sender.send(SessionTimelineUpdate { sequence, event }));
+    }
+
+    pub(crate) fn publish_all(&self, events: impl IntoIterator<Item = AgentTimelineEvent>) {
+        for event in events {
+            self.publish(event);
+        }
+    }
 }
 
 impl SessionListBroadcaster {

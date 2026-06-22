@@ -21,7 +21,8 @@ pub use session::{
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
     S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListEvent,
     SessionListSubscription, SessionListUpdate, SessionRecord, SessionSnapshot, SessionStatus,
-    SessionStore, SessionStoreError, SessionStoreResult, SessionSummary, Suspension,
+    SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
+    SessionTimelineSubscription, SessionTimelineUpdate, Suspension,
     opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
@@ -82,10 +83,10 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
-        CompletionRequest, ExternalRequestId, ExternalResponse, MemorySessionStore, ModelApi,
-        ModelRef, ProviderId, ResumeInput, SessionJournalEvent, SessionStore, TimelineContent,
-        ToolCall,
+        AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
+        CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse,
+        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionJournalEvent,
+        SessionStore, TimelineContent, TimelineEventKind, TimelineQuery, ToolCall,
         middleware::{
             AgentMiddleware, HookOutcome,
             chain::MiddlewareChain,
@@ -250,6 +251,54 @@ mod tests {
                 ])) as BoxCompletionStream)
             })
         }
+    }
+
+    #[tokio::test]
+    async fn durable_session_publishes_user_prompt_and_final_assistant_snapshot() {
+        let provider = Arc::new(TextOnlyProvider);
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = AgentRuntime::builder(model, provider).build();
+        let sessions = AgentSessions::new(MemorySessionStore::new());
+        let session_id = sessions
+            .create()
+            .await
+            .expect("created session")
+            .id()
+            .clone();
+        let mut watch = sessions.watch_timeline(session_id.clone());
+
+        drain(
+            sessions
+                .prompt(&agent, session_id.clone(), "hello")
+                .stream(),
+        )
+        .await;
+
+        let mut watched = Vec::new();
+        while watched.len() < 4 {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
+                .await
+                .expect("timeline update timeout")
+                .expect("timeline update");
+            watched.push(update.event);
+        }
+
+        assert!(watched.iter().any(|event| {
+            event.channel.as_ref().map(|channel| channel.as_str()) == Some(CHANNEL_USER_TEXT)
+                && event.kind == TimelineEventKind::ItemFinished
+                && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "hello")
+        }));
+        assert!(watched.iter().any(|event| {
+            event.channel.as_ref().map(|channel| channel.as_str()) == Some(CHANNEL_ASSISTANT_TEXT)
+                && event.kind == TimelineEventKind::ItemFinished
+                && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "ok")
+        }));
+
+        let timeline = sessions
+            .timeline(&session_id, TimelineQuery::forward(None, 16))
+            .await
+            .expect("timeline read");
+        assert_eq!(timeline, watched);
     }
 
     #[tokio::test]

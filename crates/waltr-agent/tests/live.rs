@@ -28,6 +28,8 @@ mod session_storage;
 #[cfg(feature = "shell")]
 #[path = "live/agent/shell.rs"]
 mod shell;
+#[path = "live/agent/timeline.rs"]
+mod timeline;
 
 #[path = "live/streaming.rs"]
 mod streaming;

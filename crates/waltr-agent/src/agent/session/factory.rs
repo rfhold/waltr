@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use crate::Result;
+use crate::{AgentTimelineEvent, Result, TimelineItemId, TimelineItemText, TimelineQuery};
 use serde_json::Value;
 
 use super::watch::{SessionListBroadcaster, SessionListEvent};
 use super::{
     AgentSessionRuntime, ResumeInput, SessionId, SessionListSubscription, SessionStore,
-    SessionSummary,
+    SessionSummary, SessionTimelineBroadcaster, SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 
@@ -20,6 +20,7 @@ where
 {
     store: S,
     sessions: SessionListBroadcaster,
+    timeline: SessionTimelineBroadcaster,
 }
 
 impl<S> AgentSessions<S>
@@ -31,6 +32,7 @@ where
         Self {
             store,
             sessions: SessionListBroadcaster::new(),
+            timeline: SessionTimelineBroadcaster::new(),
         }
     }
 
@@ -106,8 +108,49 @@ where
     ///
     /// Returns an error when the session does not exist or the store fails.
     pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
-        let record = AgentSessionRuntime::new(&self.store).interrupt(id).await?;
+        let record = AgentSessionRuntime::new(&self.store)
+            .with_timeline_broadcaster(self.timeline.clone())
+            .interrupt(id)
+            .await?;
         Ok(AgentSession::new(record))
+    }
+
+    /// Read persisted timeline events for a durable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
+    pub async fn timeline(
+        &self,
+        id: &SessionId,
+        query: TimelineQuery,
+    ) -> Result<Vec<AgentTimelineEvent>> {
+        self.store
+            .timeline(id, query)
+            .await
+            .map_err(session_store_error)
+    }
+
+    /// Reconstruct text content for one persisted timeline item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the item does not exist, is not text-like, or the store fails.
+    pub async fn timeline_item_text(
+        &self,
+        id: &SessionId,
+        item_id: &TimelineItemId,
+    ) -> Result<TimelineItemText> {
+        self.store
+            .timeline_item_text(id, item_id)
+            .await
+            .map_err(session_store_error)
+    }
+
+    /// Watch persisted timeline updates for one durable session.
+    #[must_use]
+    pub fn watch_timeline(&self, id: SessionId) -> SessionTimelineSubscription {
+        self.timeline.subscribe(id)
     }
 
     /// Set a host-defined metadata value and publish an updated session summary.
@@ -157,6 +200,7 @@ where
         runtime
             .prompt(prompt)
             .with_session_store(self.store.clone(), session_id)
+            .with_timeline_broadcaster(self.timeline.clone())
     }
 
     /// Resume an existing durable session with explicit input.
@@ -167,11 +211,19 @@ where
         input: ResumeInput,
     ) -> AgentRunBuilder<S> {
         AgentRunBuilder::resume(runtime, session_id, self.store.clone(), input)
+            .with_timeline_broadcaster(self.timeline.clone())
     }
 
     /// Return the session store used by this factory.
     pub const fn store(&self) -> &S {
         &self.store
+    }
+}
+
+fn session_store_error(error: impl std::fmt::Display) -> crate::LlmError {
+    crate::LlmError::Protocol {
+        provider: "session-store",
+        message: error.to_string(),
     }
 }
 
