@@ -13,7 +13,7 @@ pub(super) struct AnthropicParser {
     provider: &'static str,
     url: String,
     model: String,
-    tool_call: Option<AnthropicToolCall>,
+    tool_calls: HashMap<usize, AnthropicToolCall>,
     thinking_blocks: HashMap<usize, AnthropicThinkingBlock>,
     message_id: Option<String>,
     input_tokens: Option<u64>,
@@ -29,7 +29,7 @@ impl AnthropicParser {
             provider,
             url: url.into(),
             model: model.into(),
-            tool_call: None,
+            tool_calls: HashMap::new(),
             thinking_blocks: HashMap::new(),
             message_id: None,
             input_tokens: None,
@@ -46,11 +46,14 @@ impl AnthropicParser {
                     .unwrap_or(0);
                 let block = &value["content_block"];
                 if block["type"].as_str() == Some("tool_use") {
-                    self.tool_call = Some(AnthropicToolCall {
-                        id: block["id"].as_str().unwrap_or_default().to_owned(),
-                        name: block["name"].as_str().unwrap_or_default().to_owned(),
-                        input: block["input"].to_string(),
-                    });
+                    self.tool_calls.insert(
+                        index,
+                        AnthropicToolCall {
+                            id: block["id"].as_str().unwrap_or_default().to_owned(),
+                            name: block["name"].as_str().unwrap_or_default().to_owned(),
+                            input: block["input"].to_string(),
+                        },
+                    );
                 } else if block["type"].as_str() == Some("thinking") {
                     self.thinking_blocks.insert(
                         index,
@@ -69,7 +72,11 @@ impl AnthropicParser {
                         .as_str()
                         .map(|text| CompletionEvent::Delta(text.to_owned()))),
                     Some("input_json_delta") => {
-                        if let Some(tool_call) = self.tool_call.as_mut() {
+                        let index = value["index"]
+                            .as_u64()
+                            .and_then(|index| usize::try_from(index).ok())
+                            .unwrap_or(0);
+                        if let Some(tool_call) = self.tool_calls.get_mut(&index) {
                             if tool_call.input == "null" || tool_call.input == "{}" {
                                 tool_call.input.clear();
                             }
@@ -112,8 +119,8 @@ impl AnthropicParser {
                 if let Some(block) = self.thinking_blocks.remove(&index) {
                     return Ok(Some(CompletionEvent::ThinkingBlock(block.into_event())));
                 }
-                self.tool_call
-                    .take()
+                self.tool_calls
+                    .remove(&index)
                     .map(AnthropicToolCall::into_event)
                     .transpose()
             }
@@ -229,5 +236,77 @@ mod tests {
             })
         );
         assert_eq!(metadata.resume, json!({ "message_id": "msg_123" }));
+    }
+
+    #[test]
+    fn parses_multiple_tool_calls_by_content_block_index() {
+        let mut parser = AnthropicParser::new(
+            ANTHROPIC_MESSAGES_NAME,
+            "https://example.test/v1/messages",
+            "claude-test",
+        );
+
+        assert!(
+            parser
+                .map_event(&json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": "call-1", "name": "first", "input": {} }
+                }))
+                .expect("first start parses")
+                .is_none()
+        );
+        assert!(
+            parser
+                .map_event(&json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": { "type": "tool_use", "id": "call-2", "name": "second", "input": {} }
+                }))
+                .expect("second start parses")
+                .is_none()
+        );
+        assert!(
+            parser
+                .map_event(&json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"a\":1}" }
+                }))
+                .expect("first delta parses")
+                .is_none()
+        );
+        assert!(
+            parser
+                .map_event(&json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": { "type": "input_json_delta", "partial_json": "{\"b\":2}" }
+                }))
+                .expect("second delta parses")
+                .is_none()
+        );
+
+        let first = parser
+            .map_event(&json!({ "type": "content_block_stop", "index": 0 }))
+            .expect("first stop parses")
+            .expect("first stop emits tool call");
+        let second = parser
+            .map_event(&json!({ "type": "content_block_stop", "index": 1 }))
+            .expect("second stop parses")
+            .expect("second stop emits tool call");
+
+        let CompletionEvent::ToolCall(first) = first else {
+            panic!("expected first tool call");
+        };
+        let CompletionEvent::ToolCall(second) = second else {
+            panic!("expected second tool call");
+        };
+        assert_eq!(first.id, "call-1");
+        assert_eq!(first.name, "first");
+        assert_eq!(first.arguments, json!({ "a": 1 }));
+        assert_eq!(second.id, "call-2");
+        assert_eq!(second.name, "second");
+        assert_eq!(second.arguments, json!({ "b": 2 }));
     }
 }

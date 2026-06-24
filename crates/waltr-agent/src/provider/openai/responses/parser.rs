@@ -1,5 +1,7 @@
 //! `OpenAI` Responses parser.
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use crate::stream::{CompletionEvent, ThinkingBlock, ThinkingBlockKind, ThinkingDelta};
@@ -12,7 +14,8 @@ pub(super) struct ResponsesParser {
     provider: &'static str,
     url: String,
     model: String,
-    tool_call: Option<PartialToolCall>,
+    tool_calls: HashMap<String, PartialToolCall>,
+    tool_call_aliases: HashMap<String, String>,
     reasoning_item: Option<Value>,
 }
 
@@ -26,7 +29,8 @@ impl ResponsesParser {
             provider,
             url: url.into(),
             model: model.into(),
-            tool_call: None,
+            tool_calls: HashMap::new(),
+            tool_call_aliases: HashMap::new(),
             reasoning_item: None,
         }
     }
@@ -43,7 +47,7 @@ impl ResponsesParser {
                 .map(|delta| vec![CompletionEvent::Delta(delta.to_owned())])
                 .unwrap_or_default()),
             Some("response.output_item.added") => {
-                self.output_item_added(&value["item"]);
+                self.output_item_added(value);
                 Ok(Vec::new())
             }
             Some("response.output_item.done") => {
@@ -66,7 +70,9 @@ impl ResponsesParser {
             Some("response.reasoning_summary_text.done") => Ok(self.reasoning_summary_done(value)),
             Some("response.function_call_arguments.delta") => {
                 let delta = value["delta"].as_str().unwrap_or_default();
-                if let Some(call) = self.tool_call.as_mut() {
+                if let Some(key) = self.resolve_tool_call_key(value)
+                    && let Some(call) = self.tool_calls.get_mut(&key)
+                {
                     call.arguments.push_str(delta);
                 }
                 Ok(Vec::new())
@@ -81,9 +87,18 @@ impl ResponsesParser {
         }
     }
 
-    fn output_item_added(&mut self, item: &Value) {
+    fn output_item_added(&mut self, value: &Value) {
+        let item = &value["item"];
         if item["type"].as_str() == Some("function_call") {
-            self.tool_call = Some(partial_tool_call_from_response_item(item));
+            if let Some(key) = response_item_key(item).or_else(|| tool_call_key(value)) {
+                if let Some(alias) = tool_call_key(value)
+                    && alias != key
+                {
+                    self.tool_call_aliases.insert(alias, key.clone());
+                }
+                self.tool_calls
+                    .insert(key, partial_tool_call_from_response_item(item));
+            }
         } else if item["type"].as_str() == Some("reasoning") {
             self.reasoning_item = Some(item.clone());
         }
@@ -104,18 +119,23 @@ impl ResponsesParser {
     }
 
     fn function_call_done(&mut self, value: &Value) -> Result<Vec<CompletionEvent>> {
+        let Some(key) = self.resolve_tool_call_key(value) else {
+            return Ok(Vec::new());
+        };
         if let Some(arguments) = value["arguments"].as_str()
-            && let Some(call) = self.tool_call.as_mut()
+            && let Some(call) = self.tool_calls.get_mut(&key)
         {
             arguments.clone_into(&mut call.arguments);
         }
-        Ok(self
-            .tool_call
-            .take()
+        let event = self
+            .tool_calls
+            .remove(&key)
             .map(PartialToolCall::into_event)
             .transpose()?
             .map(|event| vec![event])
-            .unwrap_or_default())
+            .unwrap_or_default();
+        self.tool_call_aliases.retain(|_, primary| primary != &key);
+        Ok(event)
     }
 
     fn response_completed(&self, response: &Value) -> Vec<CompletionEvent> {
@@ -137,6 +157,26 @@ impl ResponsesParser {
             CompletionEvent::Finished,
         ]
     }
+
+    fn resolve_tool_call_key(&self, value: &Value) -> Option<String> {
+        let key = tool_call_key(value)?;
+        self.tool_call_aliases.get(&key).cloned().or(Some(key))
+    }
+}
+
+fn response_item_key(item: &Value) -> Option<String> {
+    item["id"]
+        .as_str()
+        .or_else(|| item["call_id"].as_str())
+        .map(str::to_owned)
+}
+
+fn tool_call_key(value: &Value) -> Option<String> {
+    value["item_id"].as_str().map(str::to_owned).or_else(|| {
+        value["output_index"]
+            .as_u64()
+            .map(|index| index.to_string())
+    })
 }
 
 fn openai_thinking_block(item: &Value) -> ThinkingBlock {
@@ -227,5 +267,71 @@ mod tests {
         assert_eq!(metadata.model, "gpt-test");
         assert_eq!(metadata.usage, None);
         assert_eq!(metadata.resume, json!({ "response_id": "resp_2" }));
+    }
+
+    #[test]
+    fn parses_multiple_function_calls_by_item_identity() {
+        let mut parser = ResponsesParser::new(
+            RESPONSES_NAME,
+            "https://example.test/v1/responses",
+            "gpt-test",
+        );
+
+        assert!(
+            parser
+                .parse_event(
+                    r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"item_1","call_id":"call-1","name":"first","arguments":""}}"#,
+                )
+                .expect("first item parses")
+                .is_empty()
+        );
+        assert!(
+            parser
+                .parse_event(
+                    r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item_2","call_id":"call-2","name":"second","arguments":""}}"#,
+                )
+                .expect("second item parses")
+                .is_empty()
+        );
+        assert!(
+            parser
+                .parse_event(
+                    r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"a\":"}"#,
+                )
+                .expect("first delta parses")
+                .is_empty()
+        );
+        assert!(
+            parser
+                .parse_event(
+                    r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"b\":"}"#,
+                )
+                .expect("second delta parses")
+                .is_empty()
+        );
+
+        let first = parser
+            .parse_event(
+                r#"{"type":"response.function_call_arguments.done","item_id":"item_1","arguments":"{\"a\":1}"}"#,
+            )
+            .expect("first done parses");
+        let second = parser
+            .parse_event(
+                r#"{"type":"response.function_call_arguments.done","item_id":"item_2","arguments":"{\"b\":2}"}"#,
+            )
+            .expect("second done parses");
+
+        let [CompletionEvent::ToolCall(first)] = first.as_slice() else {
+            panic!("expected first tool call, got {first:?}");
+        };
+        let [CompletionEvent::ToolCall(second)] = second.as_slice() else {
+            panic!("expected second tool call, got {second:?}");
+        };
+        assert_eq!(first.id, "call-1");
+        assert_eq!(first.name, "first");
+        assert_eq!(first.arguments, json!({ "a": 1 }));
+        assert_eq!(second.id, "call-2");
+        assert_eq!(second.name, "second");
+        assert_eq!(second.arguments, json!({ "b": 2 }));
     }
 }
