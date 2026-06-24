@@ -16,3 +16,9 @@ mod watch;
 
 #[path = "session/runtime_config.rs"]
 mod runtime_config;
+
+#[path = "session/timeline.rs"]
+mod timeline;
+
+#[path = "session/commands.rs"]
+mod commands;

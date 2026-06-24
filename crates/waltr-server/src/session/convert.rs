@@ -100,7 +100,7 @@ const fn pending_work_status_to_proto(status: &PendingWorkStatus) -> ProtoPendin
     }
 }
 
-fn external_request_to_proto(request: ExternalRequest) -> ProtoExternalRequest {
+pub(super) fn external_request_to_proto(request: ExternalRequest) -> ProtoExternalRequest {
     ProtoExternalRequest {
         id: request.id.as_str().to_owned(),
         kind: external_request_kind_to_proto(&request.kind) as i32,

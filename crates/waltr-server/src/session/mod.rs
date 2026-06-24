@@ -2,7 +2,7 @@
 
 use crate::config::ConfigHandle;
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
-use waltr_agent::{FilesystemSessionStore, MemorySessionStore, SessionStore};
+use waltr_agent::{AgentSessions, FilesystemSessionStore, MemorySessionStore, SessionStore};
 use tonic::service::RoutesBuilder;
 
 pub mod service;
@@ -10,7 +10,10 @@ pub mod storage;
 
 mod convert;
 mod error;
+mod run_manager;
+mod runtime;
 mod runtime_config;
+mod timeline_convert;
 
 pub use service::SessionService;
 pub use storage::SessionStorageConfigError;
@@ -48,6 +51,19 @@ pub fn add_default_service(routes: &mut RoutesBuilder) {
 /// Add an in-memory session service using an explicit config store.
 pub fn add_memory_service(routes: &mut RoutesBuilder, config: ConfigHandle) {
     add_store_service(routes, MemorySessionStore::new(), config);
+}
+
+/// Add an in-memory session service using an existing session coordinator.
+pub fn add_sessions_service<S>(
+    routes: &mut RoutesBuilder,
+    sessions: AgentSessions<S>,
+    config: ConfigHandle,
+) where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    routes.add_service(SessionServiceServer::from_arc(
+        SessionService::from_sessions_with_config(sessions, config),
+    ));
 }
 
 fn add_store_service<S>(routes: &mut RoutesBuilder, store: S, config: ConfigHandle)

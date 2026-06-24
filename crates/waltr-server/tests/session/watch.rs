@@ -3,7 +3,8 @@ use waltr::grpc::waltr::session::v1::{
     CreateSessionRequest, DeleteSessionRequest, SessionPhase, WatchSessionsRequest,
     watch_sessions_response,
 };
-use waltr_server::test_support::setup_server;
+use waltr_agent::{PendingTimelineEvent, TimelineItemId};
+use waltr_server::test_support::{setup_server, setup_server_with_sessions};
 
 #[tokio::test]
 async fn session_service_watch_emits_created_sessions() -> Result<(), Box<dyn std::error::Error>> {
@@ -193,6 +194,42 @@ async fn session_service_watch_initial_snapshot_includes_existing_sessions()
     Ok(())
 }
 
+#[tokio::test]
+async fn session_service_watch_emits_runtime_status_updates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (server, sessions) = setup_server_with_sessions();
+    let mut watch_client = session_client(server).await?;
+    let created = sessions.create().await?;
+    let session_id = created.id().clone();
+    let mut watch = watch_client
+        .watch_sessions(WatchSessionsRequest::default())
+        .await?
+        .into_inner();
+    let snapshot = next_watch_message(&mut watch).await?;
+    assert_snapshot_event(&snapshot, &[session_id.as_str()]);
+
+    sessions
+        .append_timeline(
+            &session_id,
+            vec![PendingTimelineEvent::assistant_text_delta(
+                session_id.clone(),
+                0,
+                TimelineItemId::new("assistant-1"),
+                "hello",
+            )],
+        )
+        .await?;
+
+    let update = next_watch_message(&mut watch).await?;
+    let watched = session_event(update, session_id.as_str());
+    assert_eq!(
+        watched.status.expect("status should be present").phase,
+        SessionPhase::StreamingProvider as i32
+    );
+
+    Ok(())
+}
+
 async fn next_watch_message(
     watch: &mut tonic::Streaming<waltr::grpc::waltr::session::v1::WatchSessionsResponse>,
 ) -> Result<waltr::grpc::waltr::session::v1::WatchSessionsResponse, Box<dyn std::error::Error>> {
@@ -213,6 +250,27 @@ fn assert_session_event(
         .expect("watched event should be present")
     {
         watch_sessions_response::Event::Session(session) => assert_eq!(session.id, expected_id),
+        watch_sessions_response::Event::DeletedId(id) => {
+            panic!("expected session event, got deleted id {id}")
+        }
+        watch_sessions_response::Event::Snapshot(snapshot) => {
+            panic!(
+                "expected session event, got snapshot with {} sessions",
+                snapshot.sessions.len()
+            )
+        }
+    }
+}
+
+fn session_event(
+    update: waltr::grpc::waltr::session::v1::WatchSessionsResponse,
+    expected_id: &str,
+) -> waltr::grpc::waltr::session::v1::SessionSummary {
+    match update.event.expect("watched event should be present") {
+        watch_sessions_response::Event::Session(session) => {
+            assert_eq!(session.id, expected_id);
+            session
+        }
         watch_sessions_response::Event::DeletedId(id) => {
             panic!("expected session event, got deleted id {id}")
         }
