@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 use crate::PermissionPolicy;
 
 use super::session::{
-    EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId, SessionStore,
-    SessionTimelineBroadcaster,
+    EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId, SessionListBroadcaster,
+    SessionStore, SessionTimelineBroadcaster,
 };
 use super::{AgentRuntime, AgentTool, BoxAgentTimelineStream, r#loop::AgentLoopState};
 use crate::middleware::{
@@ -27,6 +27,7 @@ where
     input: ResumeInput,
     session_id: SessionId,
     session_store: S,
+    session_broadcaster: Option<SessionListBroadcaster>,
     timeline_broadcaster: Option<SessionTimelineBroadcaster>,
     system_prompt: SystemPromptOverride,
     cancellation_token: Option<CancellationToken>,
@@ -40,6 +41,7 @@ impl AgentRunBuilder {
             input: ResumeInput::Prompt(prompt),
             session_id: SessionId::new("ephemeral"),
             session_store: MemorySessionStore::new(),
+            session_broadcaster: None,
             timeline_broadcaster: None,
             system_prompt: SystemPromptOverride::default(),
             cancellation_token: None,
@@ -65,6 +67,7 @@ impl AgentRunBuilder {
             input,
             session_id,
             session_store,
+            session_broadcaster: None,
             timeline_broadcaster: None,
             system_prompt: SystemPromptOverride::default(),
             cancellation_token: None,
@@ -119,6 +122,14 @@ where
         self
     }
 
+    pub(crate) fn with_session_broadcaster(
+        mut self,
+        session_broadcaster: SessionListBroadcaster,
+    ) -> Self {
+        self.session_broadcaster = Some(session_broadcaster);
+        self
+    }
+
     /// Persist this run in the supplied session store and session id.
     #[must_use]
     pub fn with_session_store<T>(self, store: T, id: SessionId) -> AgentRunBuilder<T>
@@ -131,6 +142,7 @@ where
             input,
             session_id: _,
             session_store: _,
+            session_broadcaster,
             timeline_broadcaster,
             system_prompt,
             cancellation_token,
@@ -141,6 +153,7 @@ where
             input,
             session_id: id,
             session_store: store,
+            session_broadcaster,
             timeline_broadcaster,
             system_prompt,
             cancellation_token,
@@ -186,6 +199,7 @@ where
             permission_policy,
             session_id: self.session_id,
             session_store: self.session_store,
+            session_broadcaster: self.session_broadcaster,
             timeline_broadcaster: self.timeline_broadcaster,
             cancellation_token: self.cancellation_token.unwrap_or_default(),
         }
@@ -203,6 +217,7 @@ where
             .field("runtime", &self.runtime)
             .field("prompt", &self.prompt)
             .field("system_prompt", &self.system_prompt)
+            .field("session_broadcaster", &self.session_broadcaster.is_some())
             .field("timeline_broadcaster", &self.timeline_broadcaster.is_some())
             .field("cancellation_token", &self.cancellation_token.is_some())
             .finish()

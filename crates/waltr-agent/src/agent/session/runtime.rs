@@ -18,8 +18,8 @@ use serde_json::Value;
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
     ExternalResponse, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
-    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
-    SessionTimelineBroadcaster, Suspension,
+    SessionListBroadcaster, SessionListEvent, SessionRecord, SessionSnapshot, SessionStatus,
+    SessionStore, SessionSummary, SessionTimelineBroadcaster, Suspension,
 };
 
 /// Runtime facade for durable session resume operations.
@@ -29,6 +29,7 @@ where
     S: SessionStore + ?Sized,
 {
     store: &'a S,
+    sessions: Option<SessionListBroadcaster>,
     timeline: Option<SessionTimelineBroadcaster>,
 }
 
@@ -40,8 +41,14 @@ where
     pub const fn new(store: &'a S) -> Self {
         Self {
             store,
+            sessions: None,
             timeline: None,
         }
+    }
+
+    pub(crate) fn with_session_broadcaster(mut self, sessions: SessionListBroadcaster) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 
     pub(crate) fn with_timeline_broadcaster(
@@ -415,7 +422,9 @@ where
             .append_journal(&id, record.revision, events)
             .await
             .map_err(session_store_error)?;
-        self.load_session(&id).await
+        let record = self.load_session(&id).await?;
+        self.publish_session_summary(&record);
+        Ok(record)
     }
 
     async fn append_timeline_and_reload(
@@ -432,7 +441,15 @@ where
         if let Some(timeline) = &self.timeline {
             timeline.publish_all(assigned);
         }
-        self.load_session(&id).await
+        let record = self.load_session(&id).await?;
+        self.publish_session_summary(&record);
+        Ok(record)
+    }
+
+    fn publish_session_summary(&self, record: &SessionRecord) {
+        if let Some(sessions) = &self.sessions {
+            sessions.publish(SessionListEvent::Upsert(record.summary()));
+        }
     }
 }
 

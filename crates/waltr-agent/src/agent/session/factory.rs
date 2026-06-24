@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::{AgentTimelineEvent, Result, TimelineItemId, TimelineItemText, TimelineQuery};
+use crate::{
+    AgentTimelineEvent, PendingTimelineEvent, Result, TimelineItemId, TimelineItemText,
+    TimelineQuery,
+};
 use serde_json::Value;
 
 use super::watch::{SessionListBroadcaster, SessionListEvent};
@@ -109,6 +112,7 @@ where
     /// Returns an error when the session does not exist or the store fails.
     pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
         let record = AgentSessionRuntime::new(&self.store)
+            .with_session_broadcaster(self.sessions.clone())
             .with_timeline_broadcaster(self.timeline.clone())
             .interrupt(id)
             .await?;
@@ -129,6 +133,29 @@ where
             .timeline(id, query)
             .await
             .map_err(session_store_error)
+    }
+
+    /// Append timeline events to an existing durable session and publish the assigned events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store rejects the append.
+    pub async fn append_timeline(
+        &self,
+        id: &SessionId,
+        events: Vec<PendingTimelineEvent>,
+    ) -> Result<Vec<AgentTimelineEvent>> {
+        let record = self.load(id).await?;
+        let assigned = self
+            .store
+            .append_timeline(id, record.revision(), events)
+            .await
+            .map_err(session_store_error)?;
+        self.timeline.publish_all(assigned.clone());
+        let record = self.load(id).await?;
+        self.sessions
+            .publish(SessionListEvent::Upsert(record.record.summary()));
+        Ok(assigned)
     }
 
     /// Reconstruct text content for one persisted timeline item.
@@ -200,6 +227,7 @@ where
         runtime
             .prompt(prompt)
             .with_session_store(self.store.clone(), session_id)
+            .with_session_broadcaster(self.sessions.clone())
             .with_timeline_broadcaster(self.timeline.clone())
     }
 
@@ -211,6 +239,7 @@ where
         input: ResumeInput,
     ) -> AgentRunBuilder<S> {
         AgentRunBuilder::resume(runtime, session_id, self.store.clone(), input)
+            .with_session_broadcaster(self.sessions.clone())
             .with_timeline_broadcaster(self.timeline.clone())
     }
 
@@ -229,11 +258,34 @@ fn session_store_error(error: impl std::fmt::Display) -> crate::LlmError {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::StreamExt as _;
+    use std::sync::Arc;
+
+    use futures_util::{StreamExt as _, stream};
     use serde_json::json;
 
     use super::*;
-    use crate::agent::session::{MemorySessionStore, SessionListEvent};
+    use crate::{
+        BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest, LlmStream,
+        ModelApi, ModelRef, ProviderId, SessionStatus, TimelineItemId,
+        agent::session::{MemorySessionStore, SessionListEvent},
+    };
+
+    struct TextOnlyProvider;
+
+    impl LlmStream for TextOnlyProvider {
+        fn name(&self) -> &'static str {
+            "text_only_provider"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async move {
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(CompletionEvent::Delta("ok".to_owned())),
+                    Ok(CompletionEvent::Finished),
+                ])) as BoxCompletionStream)
+            })
+        }
+    }
 
     #[tokio::test]
     async fn metadata_update_publishes_session_upsert() {
@@ -262,5 +314,75 @@ mod tests {
             }
             SessionListEvent::Deleted(id) => panic!("expected upsert, got deleted {id:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn append_timeline_publishes_session_summary_upsert() {
+        let sessions = AgentSessions::new(MemorySessionStore::new());
+        let session = sessions.create().await.unwrap();
+        let mut watch = sessions.watch_sessions();
+
+        sessions
+            .append_timeline(
+                &session.record.id,
+                vec![PendingTimelineEvent::assistant_text_delta(
+                    session.record.id.clone(),
+                    0,
+                    TimelineItemId::new("assistant-1"),
+                    "hi",
+                )],
+            )
+            .await
+            .unwrap();
+
+        let update = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .expect("timeline append should publish session summary");
+
+        match update.event {
+            SessionListEvent::Upsert(summary) => {
+                assert_eq!(summary.id, session.record.id);
+                assert!(matches!(summary.status, SessionStatus::StreamingProvider));
+            }
+            SessionListEvent::Deleted(id) => panic!("expected upsert, got deleted {id:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_run_publishes_live_session_status_upserts() {
+        let provider = Arc::new(TextOnlyProvider);
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = AgentRuntime::builder(model, provider).build();
+        let sessions = AgentSessions::new(MemorySessionStore::new());
+        let session = sessions.create().await.unwrap();
+        let mut watch = sessions.watch_sessions();
+
+        let mut run = sessions
+            .prompt(&agent, session.record.id.clone(), "hello")
+            .stream();
+        while let Some(event) = run.next().await {
+            event.unwrap();
+        }
+
+        let mut saw_streaming = false;
+        let mut saw_finished = false;
+        for _ in 0..8 {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
+                .await
+                .unwrap()
+                .expect("run should publish session summaries");
+            let SessionListEvent::Upsert(summary) = update.event else {
+                continue;
+            };
+            saw_streaming |= matches!(summary.status, SessionStatus::StreamingProvider);
+            saw_finished |= matches!(summary.status, SessionStatus::Finished);
+            if saw_streaming && saw_finished {
+                break;
+            }
+        }
+
+        assert!(saw_streaming, "expected streaming summary update");
+        assert!(saw_finished, "expected finished summary update");
     }
 }

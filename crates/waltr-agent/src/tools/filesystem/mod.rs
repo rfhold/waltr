@@ -56,7 +56,7 @@ impl FilesystemConfig {
         RootHintsMiddleware::new(
             tool_names,
             format!(
-                " Paths must be relative to the filesystem root or absolute paths inside the filesystem root. Filesystem root: {}. Use path '.' or omit optional path fields to search the root. Never use '/', a parent directory, or any path outside this root.",
+                " Paths resolve relative to the filesystem root unless absolute. Filesystem root: {}. Use path '.' or omit optional path fields to search the root. You may use absolute paths or '..' when needed;",
                 root.display()
             ),
         )
