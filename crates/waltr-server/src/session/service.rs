@@ -1,26 +1,35 @@
 //! Implementation of the generated `SessionService`.
 
-use std::{collections::BTreeMap, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, pin::Pin, sync::Arc};
 
 use crate::config::ConfigHandle;
 
 use super::{
     convert::session_summary_to_proto,
     error::agent_error_to_status,
+    run_manager::SessionRunManager,
+    runtime::ServerRuntimeFactory,
     runtime_config::{
         SESSION_RUNTIME_CONFIG_METADATA_KEY, resolve_runtime_config,
         resolve_runtime_config_for_create, runtime_config_to_metadata_value,
         runtime_metadata_values,
     },
+    timeline_convert::{
+        catchup_query, channel_matches, initial_query, query_from_proto, timeline_event_to_proto,
+    },
 };
 use waltr::grpc::waltr::session::v1::{
     CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
-    ListSessionsRequest, ListSessionsResponse, SessionListSnapshot,
-    UpdateSessionRuntimeConfigRequest, UpdateSessionRuntimeConfigResponse, WatchSessionsRequest,
-    WatchSessionsResponse, session_service_server::SessionService as GeneratedSessionService,
-    watch_sessions_response,
+    GetTimelineRequest, GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
+    ListSessionsRequest, ListSessionsResponse, RespondExternalRequestRequest,
+    RespondExternalRequestResponse, SessionListSnapshot, SubmitUserMessageRequest,
+    SubmitUserMessageResponse, UpdateSessionRuntimeConfigRequest,
+    UpdateSessionRuntimeConfigResponse, WatchSessionsRequest, WatchSessionsResponse,
+    WatchTimelineRequest, WatchTimelineResponse,
+    session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
 };
-use waltr_agent::{AgentSessions, SessionId, SessionListEvent, SessionStore};
+use waltr_agent::{AgentSessions, ExternalRequestId, SessionId, SessionListEvent, SessionStore};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
 
@@ -32,6 +41,8 @@ where
 {
     sessions: AgentSessions<S>,
     config: ConfigHandle,
+    runtime_factory: ServerRuntimeFactory,
+    runs: SessionRunManager,
 }
 
 impl<S> SessionService<S>
@@ -50,6 +61,8 @@ where
         Arc::new(Self {
             sessions,
             config: ConfigHandle::default(),
+            runtime_factory: ServerRuntimeFactory::new(default_root()),
+            runs: SessionRunManager::new(),
         })
     }
 }
@@ -70,7 +83,12 @@ where
         sessions: AgentSessions<S>,
         config: ConfigHandle,
     ) -> Arc<Self> {
-        Arc::new(Self { sessions, config })
+        Arc::new(Self {
+            sessions,
+            config,
+            runtime_factory: ServerRuntimeFactory::new(default_root()),
+            runs: SessionRunManager::new(),
+        })
     }
 
     async fn load_config(&self) -> waltr::grpc::waltr::config::v1::Configuration {
@@ -85,6 +103,8 @@ where
 {
     type WatchSessionsStream =
         Pin<Box<dyn Stream<Item = Result<WatchSessionsResponse, Status>> + Send>>;
+    type WatchTimelineStream =
+        Pin<Box<dyn Stream<Item = Result<WatchTimelineResponse, Status>> + Send>>;
 
     async fn create_session(
         &self,
@@ -221,4 +241,181 @@ where
 
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn get_timeline(
+        &self,
+        request: Request<GetTimelineRequest>,
+    ) -> Result<Response<GetTimelineResponse>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.session_id)?;
+        self.sessions
+            .load(&session_id)
+            .await
+            .map_err(agent_error_to_status)?;
+        let events = self
+            .sessions
+            .timeline(&session_id, query_from_proto(request.query))
+            .await
+            .map_err(agent_error_to_status)?
+            .into_iter()
+            .map(timeline_event_to_proto)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Response::new(GetTimelineResponse { events }))
+    }
+
+    async fn watch_timeline(
+        &self,
+        request: Request<WatchTimelineRequest>,
+    ) -> Result<Response<Self::WatchTimelineStream>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.session_id)?;
+        self.sessions
+            .load(&session_id)
+            .await
+            .map_err(agent_error_to_status)?;
+        let subscription = self.sessions.watch_timeline(session_id.clone());
+        let initial_sequence = subscription.initial_sequence();
+        let channels = request.channels.clone();
+        let highest_cursor = Arc::new(AtomicU64::new(request.after_cursor.unwrap_or(0)));
+        let mut historical = vec![Ok(WatchTimelineResponse {
+            sequence: initial_sequence,
+            event: None,
+        })];
+
+        if let Some(limit) = request.initial_limit {
+            let events = self
+                .sessions
+                .timeline(&session_id, initial_query(limit, &channels))
+                .await
+                .map_err(agent_error_to_status)?;
+            push_history(&mut historical, &highest_cursor, events)?;
+        }
+
+        let catchup = self
+            .sessions
+            .timeline(
+                &session_id,
+                catchup_query(request.after_cursor, 1000, &channels),
+            )
+            .await
+            .map_err(agent_error_to_status)?;
+        push_history(&mut historical, &highest_cursor, catchup)?;
+
+        let highest_cursor_for_live = highest_cursor.clone();
+        let live_channels = channels.clone();
+        let live = subscription.filter_map(move |update| {
+            let highest_cursor = highest_cursor_for_live.clone();
+            let channels = live_channels.clone();
+            let cursor = update.event.cursor.get();
+            if cursor <= highest_cursor.load(Ordering::Relaxed)
+                || !channel_matches(&update.event, &channels)
+            {
+                return None;
+            }
+            highest_cursor.fetch_max(cursor, Ordering::Relaxed);
+            Some(
+                timeline_event_to_proto(update.event).map(|event| WatchTimelineResponse {
+                    sequence: update.sequence,
+                    event: Some(event),
+                }),
+            )
+        });
+        let stream = tokio_stream::iter(historical).chain(live);
+
+        tracing::trace!(session_id = %session_id.as_str(), sequence = initial_sequence, "watch timeline requested");
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn submit_user_message(
+        &self,
+        request: Request<SubmitUserMessageRequest>,
+    ) -> Result<Response<SubmitUserMessageResponse>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.session_id)?;
+        if request.text.trim().is_empty() {
+            return Err(Status::invalid_argument("text must not be empty"));
+        }
+        let config = self.load_config().await;
+        self.runs
+            .submit_user_message(
+                self.sessions.clone(),
+                self.runtime_factory.clone(),
+                config,
+                session_id,
+                request.text,
+            )
+            .await?;
+
+        Ok(Response::new(SubmitUserMessageResponse {}))
+    }
+
+    async fn respond_external_request(
+        &self,
+        request: Request<RespondExternalRequestRequest>,
+    ) -> Result<Response<RespondExternalRequestResponse>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.session_id)?;
+        if request.request_id.trim().is_empty() {
+            return Err(Status::invalid_argument("request id must not be empty"));
+        }
+        let response = serde_json::from_str(&request.response_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let config = self.load_config().await;
+        self.runs
+            .respond_external_request(
+                self.sessions.clone(),
+                self.runtime_factory.clone(),
+                config,
+                session_id,
+                ExternalRequestId::new(request.request_id),
+                response,
+            )
+            .await?;
+
+        Ok(Response::new(RespondExternalRequestResponse {}))
+    }
+
+    async fn interrupt_session(
+        &self,
+        request: Request<InterruptSessionRequest>,
+    ) -> Result<Response<InterruptSessionResponse>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.session_id)?;
+        self.runs.interrupt(&self.sessions, &session_id).await?;
+        Ok(Response::new(InterruptSessionResponse {}))
+    }
+}
+
+fn required_session_id(value: &str) -> Result<SessionId, Status> {
+    if value.trim().is_empty() {
+        Err(Status::invalid_argument("session id must not be empty"))
+    } else {
+        Ok(SessionId::new(value.to_owned()))
+    }
+}
+
+fn push_history(
+    output: &mut Vec<Result<WatchTimelineResponse, Status>>,
+    highest_cursor: &AtomicU64,
+    events: Vec<waltr_agent::AgentTimelineEvent>,
+) -> Result<(), Status> {
+    for event in events {
+        let cursor = event.cursor.get();
+        if cursor <= highest_cursor.load(Ordering::Relaxed) {
+            continue;
+        }
+        highest_cursor.fetch_max(cursor, Ordering::Relaxed);
+        output.push(
+            timeline_event_to_proto(event).map(|event| WatchTimelineResponse {
+                sequence: 0,
+                event: Some(event),
+            }),
+        );
+    }
+    Ok(())
+}
+
+fn default_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }

@@ -1,6 +1,7 @@
 //! Shared integration test server setup.
 
 use crate::{build_app_with_services, config_service::ConfigService, session};
+use waltr_agent::{AgentSessions, MemorySessionStore};
 use std::{
     net::{SocketAddr, TcpListener},
     path::PathBuf,
@@ -53,9 +54,42 @@ pub fn setup_server_with_services(
     setup_server_with_listener(config_service, listener)
 }
 
+/// Start an isolated integration test server with an explicit session coordinator.
+#[must_use]
+pub fn setup_server_with_sessions() -> (&'static TestServer, AgentSessions<MemorySessionStore>) {
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let sessions = AgentSessions::new(MemorySessionStore::new());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    let server =
+        setup_server_with_listener_and_sessions(config_service, listener, sessions.clone());
+    (server, sessions)
+}
+
+/// Start an isolated integration test server with a caller-seeded session coordinator.
+#[must_use]
+pub fn setup_server_with_seeded_sessions(
+    sessions: AgentSessions<MemorySessionStore>,
+) -> &'static TestServer {
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    setup_server_with_listener_and_sessions(config_service, listener, sessions)
+}
+
 fn setup_server_with_listener(
     config_service: std::sync::Arc<ConfigService>,
     listener: TcpListener,
+) -> &'static TestServer {
+    setup_server_with_listener_and_sessions(
+        config_service,
+        listener,
+        AgentSessions::new(MemorySessionStore::new()),
+    )
+}
+
+fn setup_server_with_listener_and_sessions(
+    config_service: std::sync::Arc<ConfigService>,
+    listener: TcpListener,
+    sessions: AgentSessions<MemorySessionStore>,
 ) -> &'static TestServer {
     listener
         .set_nonblocking(true)
@@ -76,7 +110,7 @@ fn setup_server_with_listener(
             axum::serve(
                 listener,
                 build_app_with_services(config_service, |routes, config| {
-                    session::add_memory_service(routes, config);
+                    session::add_sessions_service(routes, sessions, config);
                 }),
             )
             .await
