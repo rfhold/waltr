@@ -7,7 +7,8 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 
 use crate::transport::{
-    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, SessionWatchStream, StatusWatchStream,
+    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, SessionTimelineWatchStream,
+    SessionWatchStream, StatusWatchStream,
 };
 use crate::{
     ClientEffect, ClientError, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch, ConfigView,
@@ -28,6 +29,9 @@ pub type SessionChangeStream = SessionWatchStream;
 
 /// Stream of session watch updates observed through the gRPC executor.
 pub type SessionWatchUpdateStream = SessionWatchStream;
+
+/// Stream of timeline watch updates observed through the gRPC executor.
+pub type SessionTimelineWatchUpdateStream = SessionTimelineWatchStream;
 
 /// Stable shell-facing configuration watch change.
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +163,18 @@ impl GrpcEffectExecutor {
         self.transport.watch_sessions().await
     }
 
+    pub(crate) async fn watch_session_timeline_updates(
+        &self,
+        session_id: String,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+    ) -> Result<SessionTimelineWatchUpdateStream, ClientError> {
+        self.transport
+            .watch_timeline(session_id, after_cursor, channels, initial_limit)
+            .await
+    }
+
     /// Execute one client side-effect intent and return client events for the reducer.
     #[allow(clippy::too_many_lines)]
     pub async fn execute_effect<Sleep, SleepFuture>(
@@ -254,12 +270,91 @@ impl GrpcEffectExecutor {
                     Err(error) => vec![ClientEvent::Session(SessionEvent::ListFailed(error))],
                 }
             }
+            ClientEffect::Session(SessionEffect::GetTimeline { session_id, query }) => {
+                match self.transport.get_timeline(session_id.clone(), query).await {
+                    Ok(events) => vec![ClientEvent::Session(SessionEvent::TimelineLoaded {
+                        session_id,
+                        events,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineLoadFailed {
+                        session_id,
+                        error,
+                    })],
+                }
+            }
             ClientEffect::Session(SessionEffect::Watch) => {
                 match self.transport.watch_sessions().await {
                     Ok(_) => vec![ClientEvent::Session(SessionEvent::WatchStarted)],
                     Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
                 }
             }
+            ClientEffect::Session(SessionEffect::WatchTimeline {
+                session_id,
+                after_cursor,
+                channels,
+                initial_limit,
+            }) => {
+                match self
+                    .transport
+                    .watch_timeline(session_id.clone(), after_cursor, channels, initial_limit)
+                    .await
+                {
+                    Ok(_) => vec![ClientEvent::Session(SessionEvent::TimelineWatchStarted {
+                        session_id,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineWatchFailed {
+                        session_id,
+                        error,
+                    })],
+                }
+            }
+            ClientEffect::Session(SessionEffect::SubmitUserMessage {
+                operation_key,
+                session_id,
+                text,
+            }) => match self.transport.submit_user_message(session_id, text).await {
+                Ok(()) => vec![ClientEvent::Session(SessionEvent::UserMessageSubmitted {
+                    operation_key,
+                })],
+                Err(error) => vec![ClientEvent::Session(
+                    SessionEvent::UserMessageSubmitFailed {
+                        operation_key,
+                        error,
+                    },
+                )],
+            },
+            ClientEffect::Session(SessionEffect::RespondExternalRequest {
+                operation_key,
+                session_id,
+                request_id,
+                response_json,
+            }) => match self
+                .transport
+                .respond_external_request(session_id, request_id, response_json)
+                .await
+            {
+                Ok(()) => vec![ClientEvent::Session(
+                    SessionEvent::ExternalRequestResponded { operation_key },
+                )],
+                Err(error) => vec![ClientEvent::Session(
+                    SessionEvent::ExternalRequestRespondFailed {
+                        operation_key,
+                        error,
+                    },
+                )],
+            },
+            ClientEffect::Session(SessionEffect::Interrupt {
+                operation_key,
+                session_id,
+            }) => match self.transport.interrupt_session(session_id).await {
+                Ok(()) => vec![ClientEvent::Session(SessionEvent::Interrupted {
+                    operation_key,
+                })],
+                Err(error) => vec![ClientEvent::Session(SessionEvent::InterruptFailed {
+                    operation_key,
+                    error,
+                })],
+            },
             ClientEffect::Config(ConfigEffect::SleepReconnect { delay_ms }) => {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Config(ConfigEvent::ReconnectReady)]
@@ -271,6 +366,15 @@ impl GrpcEffectExecutor {
             ClientEffect::Session(SessionEffect::SleepReconnect { delay_ms }) => {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Session(SessionEvent::ReconnectReady)]
+            }
+            ClientEffect::Session(SessionEffect::SleepTimelineReconnect {
+                session_id,
+                delay_ms,
+            }) => {
+                sleep(delay_ms).await;
+                vec![ClientEvent::Session(SessionEvent::TimelineReconnectReady {
+                    session_id,
+                })]
             }
         }
     }

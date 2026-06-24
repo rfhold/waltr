@@ -1,9 +1,9 @@
 //! Shell-neutral client events and side-effect intents.
 
-use crate::transport::{ConfigWatchUpdate, SessionWatchUpdate};
+use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
     ClientError, Configuration, OperationKey, Provider, RuntimeDefaults,
-    SessionRuntimeConfigRequest, SessionSummary, SystemStatus,
+    SessionRuntimeConfigRequest, SessionSummary, SystemStatus, TimelineEvent, TimelineQuery,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -152,6 +152,130 @@ pub enum SessionEvent {
     Listed(Vec<SessionSummary>),
     /// The current session list failed to load.
     ListFailed(ClientError),
+    /// A caller requested a session timeline page.
+    TimelineRequested {
+        /// Session id whose timeline should load.
+        session_id: String,
+        /// Timeline query to submit.
+        query: Option<TimelineQuery>,
+    },
+    /// A session timeline page loaded successfully.
+    TimelineLoaded {
+        /// Session id whose timeline loaded.
+        session_id: String,
+        /// Timeline events returned by the server.
+        events: Vec<TimelineEvent>,
+    },
+    /// A session timeline page failed to load.
+    TimelineLoadFailed {
+        /// Session id whose timeline failed to load.
+        session_id: String,
+        /// Failure returned by the load effect.
+        error: ClientError,
+    },
+    /// A caller registered interest in timeline updates for one session.
+    TimelineWatchInterestRegistered {
+        /// Session id whose timeline should be watched.
+        session_id: String,
+        /// Optional cursor boundary for the watch.
+        after_cursor: Option<u64>,
+        /// Optional display-channel filter.
+        channels: Vec<String>,
+        /// Optional initial history batch size.
+        initial_limit: Option<u32>,
+    },
+    /// A caller released interest in timeline updates for one session.
+    TimelineWatchInterestReleased {
+        /// Session id whose timeline interest should be released.
+        session_id: String,
+    },
+    /// A session timeline watch stream opened.
+    TimelineWatchStarted {
+        /// Session id whose timeline watch opened.
+        session_id: String,
+    },
+    /// A session timeline watch stream produced an update.
+    TimelineWatchChanged(SessionTimelineWatchUpdate),
+    /// A session timeline watch stream failed.
+    TimelineWatchFailed {
+        /// Session id whose watch failed.
+        session_id: String,
+        /// Failure returned by the watch stream.
+        error: ClientError,
+    },
+    /// A session timeline watch stream ended.
+    TimelineWatchEnded {
+        /// Session id whose watch ended.
+        session_id: String,
+    },
+    /// A timeline watch retry delay elapsed.
+    TimelineReconnectReady {
+        /// Session id whose watch can reconnect.
+        session_id: String,
+    },
+    /// A caller requested a user message submission.
+    UserMessageSubmitRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to submit to.
+        session_id: String,
+        /// User message text.
+        text: String,
+    },
+    /// A user message submission completed successfully.
+    UserMessageSubmitted {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+    },
+    /// A user message submission failed.
+    UserMessageSubmitFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the submit effect.
+        error: ClientError,
+    },
+    /// A caller requested a response to an external request.
+    ExternalRequestRespondRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to respond to.
+        session_id: String,
+        /// External request id.
+        request_id: String,
+        /// JSON response payload.
+        response_json: String,
+    },
+    /// An external request response completed successfully.
+    ExternalRequestResponded {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+    },
+    /// An external request response failed.
+    ExternalRequestRespondFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the response effect.
+        error: ClientError,
+    },
+    /// A caller requested an active session interruption.
+    InterruptRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to interrupt.
+        session_id: String,
+    },
+    /// Session interruption completed successfully.
+    Interrupted {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+    },
+    /// Session interruption failed.
+    InterruptFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the interrupt effect.
+        error: ClientError,
+    },
     /// A caller registered interest in session watch updates.
     WatchInterestRegistered,
     /// A caller released interest in session watch updates.
@@ -253,10 +377,62 @@ pub enum SessionEffect {
     },
     /// Load the current server-side session list.
     List,
+    /// Load a timeline page for one session.
+    GetTimeline {
+        /// Session id whose timeline should load.
+        session_id: String,
+        /// Timeline query to submit.
+        query: Option<TimelineQuery>,
+    },
     /// Open or continue the session watch stream.
     Watch,
+    /// Open or continue one session timeline watch stream.
+    WatchTimeline {
+        /// Session id whose timeline should be watched.
+        session_id: String,
+        /// Optional cursor boundary for the watch.
+        after_cursor: Option<u64>,
+        /// Optional display-channel filter.
+        channels: Vec<String>,
+        /// Optional initial history batch size.
+        initial_limit: Option<u32>,
+    },
+    /// Submit a user message to a session.
+    SubmitUserMessage {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to submit to.
+        session_id: String,
+        /// User message text.
+        text: String,
+    },
+    /// Respond to an external session request.
+    RespondExternalRequest {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to respond to.
+        session_id: String,
+        /// External request id.
+        request_id: String,
+        /// JSON response payload.
+        response_json: String,
+    },
+    /// Interrupt an active session run.
+    Interrupt {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to interrupt.
+        session_id: String,
+    },
     /// Sleep before attempting a session watch reconnect.
     SleepReconnect {
+        /// Delay duration in milliseconds.
+        delay_ms: u64,
+    },
+    /// Sleep before attempting a timeline watch reconnect.
+    SleepTimelineReconnect {
+        /// Session id whose watch should reconnect.
+        session_id: String,
         /// Delay duration in milliseconds.
         delay_ms: u64,
     },

@@ -4,7 +4,7 @@ use crate::coordination::{config, session, status, stream};
 use crate::{
     ClientEffect, ClientError, ClientEvent, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
     Configuration, McpServer, OperationKey, Provider, ProviderEditBaseline, RuntimeDefaults,
-    SessionEvent, SessionRuntimeConfigRequest, StatusEvent,
+    SessionEvent, SessionRuntimeConfigRequest, StatusEvent, TimelineQuery,
 };
 
 /// Single headless client reducer used by shells.
@@ -94,6 +94,18 @@ impl Client {
         self.apply(ClientEvent::Session(SessionEvent::ListRequested))
     }
 
+    /// Request that a session timeline page be loaded.
+    pub fn request_session_timeline(
+        &mut self,
+        session_id: impl Into<String>,
+        query: Option<TimelineQuery>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Session(SessionEvent::TimelineRequested {
+            session_id: session_id.into(),
+            query,
+        }))
+    }
+
     /// Request that session changes be watched.
     #[must_use]
     pub fn register_session_watch_interest(&mut self) -> ClientUpdate {
@@ -104,6 +116,81 @@ impl Client {
     #[must_use]
     pub fn release_session_watch_interest(&mut self) -> ClientUpdate {
         self.apply(ClientEvent::Session(SessionEvent::WatchInterestReleased))
+    }
+
+    /// Request that timeline changes for one session be watched.
+    #[must_use]
+    pub fn register_session_timeline_watch_interest(
+        &mut self,
+        session_id: impl Into<String>,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Session(
+            SessionEvent::TimelineWatchInterestRegistered {
+                session_id: session_id.into(),
+                after_cursor,
+                channels,
+                initial_limit,
+            },
+        ))
+    }
+
+    /// Release interest in timeline changes for one session.
+    #[must_use]
+    pub fn release_session_timeline_watch_interest(
+        &mut self,
+        session_id: impl Into<String>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Session(
+            SessionEvent::TimelineWatchInterestReleased {
+                session_id: session_id.into(),
+            },
+        ))
+    }
+
+    /// Request that a user message be submitted to a session.
+    pub fn submit_user_message(
+        &mut self,
+        session_id: impl Into<String>,
+        text: impl Into<String>,
+    ) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(
+            SessionEvent::UserMessageSubmitRequested {
+                operation_key,
+                session_id: session_id.into(),
+                text: text.into(),
+            },
+        ))
+    }
+
+    /// Request that an external request be responded to.
+    pub fn respond_external_request(
+        &mut self,
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+        response_json: impl Into<String>,
+    ) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(
+            SessionEvent::ExternalRequestRespondRequested {
+                operation_key,
+                session_id: session_id.into(),
+                request_id: request_id.into(),
+                response_json: response_json.into(),
+            },
+        ))
+    }
+
+    /// Request that an active session run be interrupted.
+    pub fn interrupt_session(&mut self, session_id: impl Into<String>) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(SessionEvent::InterruptRequested {
+            operation_key,
+            session_id: session_id.into(),
+        }))
     }
 
     /// Request that system status changes be watched.
@@ -127,6 +214,13 @@ impl Client {
 
         if self.state.sessions.watch.interests > 0 {
             let update = session::maintain_watch(&mut self.state);
+            if !update.is_empty() {
+                return update;
+            }
+        }
+
+        for session_id in self.state.timeline_watch_session_ids() {
+            let update = session::maintain_timeline_watch(&mut self.state, &session_id);
             if !update.is_empty() {
                 return update;
             }

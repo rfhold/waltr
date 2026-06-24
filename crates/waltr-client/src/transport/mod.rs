@@ -9,12 +9,18 @@ pub use waltr::config::ConfigWatchUpdate;
 use waltr::grpc::waltr::config::v1::config_service_client::ConfigServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
-pub use session::{SessionWatchEvent, SessionWatchStream, SessionWatchUpdate};
+pub use session::{
+    SessionTimelineWatchStream, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchStream,
+    SessionWatchUpdate,
+};
 pub use status::StatusWatchStream;
 use tonic::Code;
 use tonic::codegen::{Body, Bytes, StdError};
 
-use crate::{ClientError, ConfigPatch, Configuration, SessionRuntimeConfigRequest, SessionSummary};
+use crate::{
+    ClientError, ConfigPatch, Configuration, SessionRuntimeConfigRequest, SessionSummary,
+    TimelineEvent, TimelineQuery,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type DefaultGrpcTransport = NativeGrpcTransport;
@@ -61,6 +67,43 @@ pub trait WaltrTransport {
 
     /// Subscribe to future session changes.
     fn watch_sessions(&self) -> impl Future<Output = Result<SessionWatchStream, ClientError>>;
+
+    /// Load a timeline page for one session.
+    fn get_timeline(
+        &self,
+        session_id: String,
+        query: Option<TimelineQuery>,
+    ) -> impl Future<Output = Result<Vec<TimelineEvent>, ClientError>>;
+
+    /// Subscribe to timeline changes for one session.
+    fn watch_timeline(
+        &self,
+        session_id: String,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+    ) -> impl Future<Output = Result<SessionTimelineWatchStream, ClientError>>;
+
+    /// Submit a user message to a session.
+    fn submit_user_message(
+        &self,
+        session_id: String,
+        text: String,
+    ) -> impl Future<Output = Result<(), ClientError>>;
+
+    /// Respond to an external request.
+    fn respond_external_request(
+        &self,
+        session_id: String,
+        request_id: String,
+        response_json: String,
+    ) -> impl Future<Output = Result<(), ClientError>>;
+
+    /// Interrupt an active session run.
+    fn interrupt_session(
+        &self,
+        session_id: String,
+    ) -> impl Future<Output = Result<(), ClientError>>;
 }
 
 trait RemoteTransport {
@@ -133,6 +176,45 @@ where
 
     async fn watch_sessions(&self) -> Result<SessionWatchStream, ClientError> {
         session::watch_sessions(self).await
+    }
+
+    async fn get_timeline(
+        &self,
+        session_id: String,
+        query: Option<TimelineQuery>,
+    ) -> Result<Vec<TimelineEvent>, ClientError> {
+        session::get_timeline(self, session_id, query).await
+    }
+
+    async fn watch_timeline(
+        &self,
+        session_id: String,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+    ) -> Result<SessionTimelineWatchStream, ClientError> {
+        session::watch_timeline(self, session_id, after_cursor, channels, initial_limit).await
+    }
+
+    async fn submit_user_message(
+        &self,
+        session_id: String,
+        text: String,
+    ) -> Result<(), ClientError> {
+        session::submit_user_message(self, session_id, text).await
+    }
+
+    async fn respond_external_request(
+        &self,
+        session_id: String,
+        request_id: String,
+        response_json: String,
+    ) -> Result<(), ClientError> {
+        session::respond_external_request(self, session_id, request_id, response_json).await
+    }
+
+    async fn interrupt_session(&self, session_id: String) -> Result<(), ClientError> {
+        session::interrupt_session(self, session_id).await
     }
 }
 

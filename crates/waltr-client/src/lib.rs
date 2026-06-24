@@ -39,13 +39,16 @@ pub use waltr::grpc::waltr::session::v1::{
     ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RuntimeConfigMatch,
     SessionMcpServerRuntime, SessionPhase, SessionProviderRuntime, SessionRuntimeConfig,
     SessionRuntimeConfigRequest, SessionStatus, SessionSummary, Suspension, SuspensionKind,
+    TimelineContent, TimelineDirection, TimelineEvent, TimelineEventKind, TimelineQuery,
+    TimelineStatus,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchEvent, SessionWatchUpdate};
 pub use view::{
-    ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView,
-    ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
+    ConfigView, ExternalRequestView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
+    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
     RuntimeConfigMatchView, RuntimeDefaultsView, SessionMcpServerRuntimeView, SessionPhaseView,
-    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionView,
+    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionTimelineView,
+    SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
     TimestampView,
 };

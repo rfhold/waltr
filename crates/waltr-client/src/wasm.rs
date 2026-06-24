@@ -109,7 +109,7 @@ impl WaltrClient {
             .await
             .next()
             .await
-            .ok_or_else(|| JsValue::from_str("client state stream ended"))
+            .ok_or_else(|| JsValue::from_str("client state stream closed"))
     }
 
     /// Advance the shared state stream, returning the current snapshot on timeout.

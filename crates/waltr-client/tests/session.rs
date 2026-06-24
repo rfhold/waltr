@@ -8,5 +8,8 @@ mod create;
 #[path = "session/delete.rs"]
 mod delete;
 
+#[path = "session/timeline.rs"]
+mod timeline;
+
 #[path = "session/watch.rs"]
 mod watch;
