@@ -9,8 +9,9 @@ pub use config::{
     RuntimeDefaultsView,
 };
 pub use session::{
-    RuntimeConfigMatchView, SessionMcpServerRuntimeView, SessionPhaseView,
-    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionView,
+    ExternalRequestView, RuntimeConfigMatchView, SessionMcpServerRuntimeView, SessionPhaseView,
+    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionTimelineView,
+    SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
     TimestampView,
 };
 
@@ -88,6 +89,12 @@ mod tests {
             SessionMcpServerRuntimeView::decl(),
             SessionRuntimeConfigView::decl(),
             SessionView::decl(),
+            TimelineEventKindView::decl(),
+            TimelineStatusView::decl(),
+            ExternalRequestView::decl(),
+            TimelineContentView::decl(),
+            TimelineEventView::decl(),
+            SessionTimelineView::decl(),
             ClientOperationView::decl(),
             OperationCollectionSnapshot::decl(),
             OperationSnapshot::decl(),

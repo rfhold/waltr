@@ -1,13 +1,16 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use waltr::grpc::waltr::session::v1::timeline_content;
+
 use crate::{
     McpServerTypeView, ProviderKindView, RuntimeConfigMatch, SessionMcpServerRuntime, SessionPhase,
-    SessionProviderRuntime, SessionRuntimeConfig, SessionStatus, SessionSummary,
+    SessionProviderRuntime, SessionRuntimeConfig, SessionStatus, SessionSummary, TimelineContent,
+    TimelineEvent, TimelineEventKind, TimelineStatus,
 };
 
 /// Stable session summary view shared by Waltr shells.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionView {
     /// Server-assigned session id.
@@ -29,7 +32,7 @@ pub struct SessionView {
 }
 
 /// Stable session runtime config snapshot view shared by Waltr shells.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeConfigView {
     /// Stored provider runtime snapshot.
@@ -130,6 +133,128 @@ pub struct TimestampView {
     pub seconds: i64,
     /// Nanoseconds within the second.
     pub nanos: i32,
+}
+
+/// Stable session timeline view shared by Waltr shells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTimelineView {
+    /// Persisted timeline events ordered by cursor.
+    pub events: Vec<TimelineEventView>,
+    /// Timeline page load operation snapshot.
+    pub load: crate::OperationSnapshot,
+    /// Timeline watch operation snapshot.
+    pub watch: crate::OperationSnapshot,
+}
+
+/// Stable timeline event view shared by Waltr shells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineEventView {
+    /// Durable timeline cursor.
+    pub cursor: u64,
+    /// Session id that owns the event.
+    pub session_id: String,
+    /// Turn number that produced the event.
+    pub turn: u64,
+    /// Timeline item id.
+    pub item_id: String,
+    /// Parent timeline item id, when present.
+    pub parent_id: Option<String>,
+    /// Event kind.
+    pub kind: TimelineEventKindView,
+    /// Display channel, when present.
+    pub channel: Option<String>,
+    /// Event content.
+    pub content: TimelineContentView,
+    /// Event status, when present.
+    pub status: Option<TimelineStatusView>,
+    /// JSON metadata object as returned by the server.
+    pub metadata_json: String,
+}
+
+/// Stable timeline event kind view shared by Waltr shells.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum TimelineEventKindView {
+    Unspecified,
+    ItemStarted,
+    ContentDelta,
+    ItemUpdated,
+    ItemFinished,
+    ExternalRequestOpened,
+    ExternalRequestResolved,
+    SessionStatusChanged,
+    Unknown,
+}
+
+/// Stable timeline status view shared by Waltr shells.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum TimelineStatusView {
+    Unspecified,
+    Idle,
+    BuildingRequest,
+    StreamingProvider,
+    EvaluatingToolCall,
+    RunningTool,
+    Pending,
+    AwaitingToolResults,
+    AwaitingExternalInput,
+    Interrupted,
+    Resolved,
+    Finished,
+    Failed,
+    Canceled,
+    Unknown,
+}
+
+/// Stable timeline content view shared by Waltr shells.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TimelineContentView {
+    Empty,
+    TextDelta {
+        delta: String,
+    },
+    TextSnapshot {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments_json: String,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        content: String,
+        error: bool,
+    },
+    ExternalRequest {
+        request: Option<ExternalRequestView>,
+    },
+    ContentRef {
+        content_id: String,
+        bytes: u64,
+    },
+    Json {
+        value_json: String,
+    },
+    Unknown,
+}
+
+/// Stable external request view embedded in timeline content.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalRequestView {
+    pub id: String,
+    pub kind: i32,
+    pub payload_json: String,
 }
 
 impl From<SessionSummary> for SessionView {
@@ -240,6 +365,100 @@ impl From<prost_types::Timestamp> for TimestampView {
         Self {
             seconds: timestamp.seconds,
             nanos: timestamp.nanos,
+        }
+    }
+}
+
+impl From<TimelineEvent> for TimelineEventView {
+    fn from(event: TimelineEvent) -> Self {
+        Self {
+            cursor: event.cursor,
+            session_id: event.session_id,
+            turn: event.turn,
+            item_id: event.item_id,
+            parent_id: event.parent_id,
+            kind: event.kind.into(),
+            channel: event.channel,
+            content: event.content.map_or(TimelineContentView::Empty, Into::into),
+            status: event.status.map(TimelineStatusView::from),
+            metadata_json: event.metadata_json,
+        }
+    }
+}
+
+impl From<TimelineContent> for TimelineContentView {
+    fn from(content: TimelineContent) -> Self {
+        match content.content {
+            Some(timeline_content::Content::Empty(_)) | None => Self::Empty,
+            Some(timeline_content::Content::TextDelta(content)) => Self::TextDelta {
+                delta: content.delta,
+            },
+            Some(timeline_content::Content::TextSnapshot(content)) => {
+                Self::TextSnapshot { text: content.text }
+            }
+            Some(timeline_content::Content::ToolCall(content)) => Self::ToolCall {
+                id: content.id,
+                name: content.name,
+                arguments_json: content.arguments_json,
+            },
+            Some(timeline_content::Content::ToolResult(content)) => Self::ToolResult {
+                id: content.id,
+                name: content.name,
+                content: content.content,
+                error: content.error,
+            },
+            Some(timeline_content::Content::ExternalRequest(content)) => Self::ExternalRequest {
+                request: content.request.map(|request| ExternalRequestView {
+                    id: request.id,
+                    kind: request.kind,
+                    payload_json: request.payload_json,
+                }),
+            },
+            Some(timeline_content::Content::ContentRef(content)) => Self::ContentRef {
+                content_id: content.content_id,
+                bytes: content.bytes,
+            },
+            Some(timeline_content::Content::Json(content)) => Self::Json {
+                value_json: content.value_json,
+            },
+        }
+    }
+}
+
+impl From<i32> for TimelineEventKindView {
+    fn from(value: i32) -> Self {
+        match TimelineEventKind::try_from(value) {
+            Ok(TimelineEventKind::Unspecified) => Self::Unspecified,
+            Ok(TimelineEventKind::ItemStarted) => Self::ItemStarted,
+            Ok(TimelineEventKind::ContentDelta) => Self::ContentDelta,
+            Ok(TimelineEventKind::ItemUpdated) => Self::ItemUpdated,
+            Ok(TimelineEventKind::ItemFinished) => Self::ItemFinished,
+            Ok(TimelineEventKind::ExternalRequestOpened) => Self::ExternalRequestOpened,
+            Ok(TimelineEventKind::ExternalRequestResolved) => Self::ExternalRequestResolved,
+            Ok(TimelineEventKind::SessionStatusChanged) => Self::SessionStatusChanged,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<i32> for TimelineStatusView {
+    fn from(value: i32) -> Self {
+        match TimelineStatus::try_from(value) {
+            Ok(TimelineStatus::Unspecified) => Self::Unspecified,
+            Ok(TimelineStatus::Idle) => Self::Idle,
+            Ok(TimelineStatus::BuildingRequest) => Self::BuildingRequest,
+            Ok(TimelineStatus::StreamingProvider) => Self::StreamingProvider,
+            Ok(TimelineStatus::EvaluatingToolCall) => Self::EvaluatingToolCall,
+            Ok(TimelineStatus::RunningTool) => Self::RunningTool,
+            Ok(TimelineStatus::Pending) => Self::Pending,
+            Ok(TimelineStatus::AwaitingToolResults) => Self::AwaitingToolResults,
+            Ok(TimelineStatus::AwaitingExternalInput) => Self::AwaitingExternalInput,
+            Ok(TimelineStatus::Interrupted) => Self::Interrupted,
+            Ok(TimelineStatus::Resolved) => Self::Resolved,
+            Ok(TimelineStatus::Finished) => Self::Finished,
+            Ok(TimelineStatus::Failed) => Self::Failed,
+            Ok(TimelineStatus::Canceled) => Self::Canceled,
+            Err(_) => Self::Unknown,
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Shared reducer runtime used by shell adapters.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::rc::Rc;
@@ -9,12 +10,15 @@ use futures_util::{StreamExt, future::Either, future::LocalBoxFuture, future::se
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::executor::{ConfigWatchUpdateStream, SessionWatchUpdateStream};
+use crate::executor::{
+    ConfigWatchUpdateStream, SessionTimelineWatchUpdateStream, SessionWatchUpdateStream,
+};
 use crate::{
     Client, ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate,
     ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey,
     OperationStatus, ProviderView, RuntimeDefaultsView, SessionEffect, SessionEvent,
-    SessionRuntimeConfigRequest, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
+    SessionRuntimeConfigRequest, SessionTimelineView, SessionView, StatusChangeStream,
+    StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -97,6 +101,64 @@ pub enum ClientCommand {
     RegisterSessionWatchInterest,
     /// Release current interest in session watch updates.
     ReleaseSessionWatchInterest,
+    /// Load a page of timeline events for one session.
+    RequestSessionTimeline {
+        /// Session id whose timeline should load.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Exclusive cursor boundary.
+        cursor: Option<u64>,
+        /// Maximum events to return.
+        limit: u32,
+        /// Display-channel filter.
+        channels: Vec<String>,
+    },
+    /// Register interest in timeline updates for one session.
+    RegisterSessionTimelineWatchInterest {
+        /// Session id whose timeline should be watched.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Optional cursor boundary for replay.
+        #[serde(rename = "afterCursor")]
+        after_cursor: Option<u64>,
+        /// Display-channel filter.
+        channels: Vec<String>,
+        /// Optional history batch size.
+        #[serde(rename = "initialLimit")]
+        initial_limit: Option<u32>,
+    },
+    /// Release interest in timeline updates for one session.
+    ReleaseSessionTimelineWatchInterest {
+        /// Session id whose timeline watch interest should be released.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    /// Submit a user message to a session.
+    SubmitUserMessage {
+        /// Session id to submit to.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// User message text.
+        text: String,
+    },
+    /// Respond to an external request.
+    RespondExternalRequest {
+        /// Session id to respond to.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// External request id.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// JSON response payload.
+        #[serde(rename = "responseJson")]
+        response_json: String,
+    },
+    /// Interrupt an active session run.
+    InterruptSession {
+        /// Session id to interrupt.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     /// Process one status watch update.
     WatchStatus,
     /// Keep watching status until the reducer observes readiness.
@@ -165,6 +227,39 @@ pub enum ClientOperationView {
         /// Updated session, when the operation completed successfully.
         session: Option<SessionView>,
     },
+    /// User message submit command result.
+    SessionSubmitUserMessage {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id submitted to.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    /// External request response command result.
+    SessionRespondExternalRequest {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id responded to.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// External request id.
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    /// Session interrupt command result.
+    SessionInterrupt {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id interrupted.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
 }
 
 /// Stable snapshot of configuration coordination state.
@@ -205,8 +300,16 @@ pub struct SessionSnapshot {
     pub delete: OperationSnapshot,
     /// Session runtime metadata update operation snapshot.
     pub runtime_config_update: OperationSnapshot,
+    /// User message submit operation snapshot.
+    pub submit_user_message: OperationSnapshot,
+    /// External request response operation snapshot.
+    pub respond_external_request: OperationSnapshot,
+    /// Session interrupt operation snapshot.
+    pub interrupt: OperationSnapshot,
     /// Session watch operation snapshot.
     pub watch: OperationSnapshot,
+    /// Session timelines by session id.
+    pub timelines: BTreeMap<String, SessionTimelineView>,
 }
 
 /// Stable snapshot of one operation.
@@ -228,6 +331,7 @@ pub struct ClientRuntime {
     status_watch: Option<StatusChangeStream>,
     config_watch: Option<ConfigWatchUpdateStream>,
     session_watch: Option<SessionWatchUpdateStream>,
+    timeline_watches: BTreeMap<String, SessionTimelineWatchUpdateStream>,
 }
 
 /// Command sent to a shared client state stream loop.
@@ -278,6 +382,7 @@ impl fmt::Debug for ClientRuntime {
             .field("status_watch_active", &self.status_watch.is_some())
             .field("config_watch_active", &self.config_watch.is_some())
             .field("session_watch_active", &self.session_watch.is_some())
+            .field("timeline_watch_count", &self.timeline_watches.len())
             .finish()
     }
 }
@@ -292,6 +397,7 @@ impl ClientRuntime {
             status_watch: None,
             config_watch: None,
             session_watch: None,
+            timeline_watches: BTreeMap::new(),
         }
     }
 
@@ -346,13 +452,143 @@ impl ClientRuntime {
                     Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
                 }
             }
+            ClientEffect::Session(SessionEffect::WatchTimeline {
+                session_id,
+                after_cursor,
+                channels,
+                initial_limit,
+            }) => {
+                match self
+                    .executor
+                    .watch_session_timeline_updates(
+                        session_id.clone(),
+                        after_cursor,
+                        channels,
+                        initial_limit,
+                    )
+                    .await
+                {
+                    Ok(stream) => {
+                        self.timeline_watches.insert(session_id.clone(), stream);
+                        vec![ClientEvent::Session(SessionEvent::TimelineWatchStarted {
+                            session_id,
+                        })]
+                    }
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineWatchFailed {
+                        session_id,
+                        error,
+                    })],
+                }
+            }
             effect => self.executor.execute_effect(effect, sleep).await,
         }
     }
 
     #[allow(clippy::too_many_lines)]
     async fn next_watch_event(&mut self) -> ClientEvent {
+        let timeline_session_id = self
+            .reducer
+            .state()
+            .timeline_watch_session_ids()
+            .into_iter()
+            .find(|session_id| self.timeline_watches.contains_key(session_id));
+
         if self.reducer.state().sessions.watch.interests > 0 {
+            if let Some(session_id) = timeline_session_id.clone() {
+                if let (Some(session), Some(status), Some(timeline)) = (
+                    &mut self.session_watch,
+                    &mut self.status_watch,
+                    self.timeline_watches.get_mut(&session_id),
+                ) {
+                    let timeline_next = timeline.next();
+                    let session_next = session.next();
+                    let status_next = status.next();
+                    pin_mut!(timeline_next);
+                    pin_mut!(session_next);
+                    pin_mut!(status_next);
+
+                    let session_status_next = select(session_next, status_next);
+                    pin_mut!(session_status_next);
+
+                    return match select(timeline_next, session_status_next).await {
+                        Either::Left((Some(Ok(update)), _)) => {
+                            ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
+                        }
+                        Either::Left((Some(Err(error)), _)) => {
+                            self.timeline_watches.remove(&session_id);
+                            ClientEvent::Session(SessionEvent::TimelineWatchFailed {
+                                session_id,
+                                error,
+                            })
+                        }
+                        Either::Left((None, _)) => {
+                            self.timeline_watches.remove(&session_id);
+                            ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
+                        }
+                        Either::Right((Either::Left((Some(Ok(update)), _)), _)) => {
+                            ClientEvent::Session(SessionEvent::WatchChanged(update))
+                        }
+                        Either::Right((Either::Left((Some(Err(error)), _)), _)) => {
+                            self.session_watch = None;
+                            ClientEvent::Session(SessionEvent::WatchFailed(error))
+                        }
+                        Either::Right((Either::Left((None, _)), _)) => {
+                            self.session_watch = None;
+                            ClientEvent::Session(SessionEvent::WatchEnded)
+                        }
+                        Either::Right((Either::Right((Some(Ok(status)), _)), _)) => {
+                            ClientEvent::Status(StatusEvent::WatchChanged(status))
+                        }
+                        Either::Right((Either::Right((Some(Err(error)), _)), _)) => {
+                            self.status_watch = None;
+                            ClientEvent::Status(StatusEvent::WatchFailed(error))
+                        }
+                        Either::Right((Either::Right((None, _)), _)) => {
+                            self.status_watch = None;
+                            ClientEvent::Status(StatusEvent::WatchEnded)
+                        }
+                    };
+                }
+
+                if let (Some(session), Some(timeline)) = (
+                    &mut self.session_watch,
+                    self.timeline_watches.get_mut(&session_id),
+                ) {
+                    let timeline_next = timeline.next();
+                    let session_next = session.next();
+                    pin_mut!(timeline_next);
+                    pin_mut!(session_next);
+
+                    return match select(timeline_next, session_next).await {
+                        Either::Left((Some(Ok(update)), _)) => {
+                            ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
+                        }
+                        Either::Left((Some(Err(error)), _)) => {
+                            self.timeline_watches.remove(&session_id);
+                            ClientEvent::Session(SessionEvent::TimelineWatchFailed {
+                                session_id,
+                                error,
+                            })
+                        }
+                        Either::Left((None, _)) => {
+                            self.timeline_watches.remove(&session_id);
+                            ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
+                        }
+                        Either::Right((Some(Ok(update)), _)) => {
+                            ClientEvent::Session(SessionEvent::WatchChanged(update))
+                        }
+                        Either::Right((Some(Err(error)), _)) => {
+                            self.session_watch = None;
+                            ClientEvent::Session(SessionEvent::WatchFailed(error))
+                        }
+                        Either::Right((None, _)) => {
+                            self.session_watch = None;
+                            ClientEvent::Session(SessionEvent::WatchEnded)
+                        }
+                    };
+                }
+            }
+
             if let (Some(session), Some(config), Some(status)) = (
                 &mut self.session_watch,
                 &mut self.config_watch,
@@ -448,6 +684,33 @@ impl ClientRuntime {
                     None => {
                         self.session_watch = None;
                         ClientEvent::Session(SessionEvent::WatchEnded)
+                    }
+                };
+            }
+        }
+
+        if let Some(session_id) = self
+            .reducer
+            .state()
+            .timeline_watch_session_ids()
+            .into_iter()
+            .find(|session_id| self.timeline_watches.contains_key(session_id))
+        {
+            if let Some(stream) = self.timeline_watches.get_mut(&session_id) {
+                return match stream.next().await {
+                    Some(Ok(update)) => {
+                        ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
+                    }
+                    Some(Err(error)) => {
+                        self.timeline_watches.remove(&session_id);
+                        ClientEvent::Session(SessionEvent::TimelineWatchFailed {
+                            session_id,
+                            error,
+                        })
+                    }
+                    None => {
+                        self.timeline_watches.remove(&session_id);
+                        ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
                     }
                 };
             }
@@ -585,6 +848,12 @@ impl ClientStateStream {
                     if self.runtime.reducer.state().status.watch.status == OperationStatus::Received
                         && self.runtime.reducer.state().config.watch.interests == 0
                         && self.runtime.reducer.state().sessions.watch.interests == 0
+                        && self
+                            .runtime
+                            .reducer
+                            .state()
+                            .timeline_watch_session_ids()
+                            .is_empty()
                     {
                         (self.sleep)(READY_IDLE_DELAY_MS).await;
                         let update = self.runtime.reducer.maintain_watches();
@@ -594,6 +863,7 @@ impl ClientStateStream {
 
                     if self.runtime.config_watch.is_some()
                         || self.runtime.session_watch.is_some()
+                        || !self.runtime.timeline_watches.is_empty()
                         || self.runtime.status_watch.is_some()
                     {
                         self.apply_next_watch_event().await;
@@ -720,6 +990,67 @@ impl ClientStateStream {
                 }
                 update
             }
+            ClientCommand::RequestSessionTimeline {
+                session_id,
+                cursor,
+                limit,
+                channels,
+            } => self.runtime.reducer.request_session_timeline(
+                session_id,
+                Some(TimelineQuery {
+                    direction: TimelineDirection::Forward as i32,
+                    cursor,
+                    limit,
+                    channels,
+                }),
+            ),
+            ClientCommand::RegisterSessionTimelineWatchInterest {
+                session_id,
+                after_cursor,
+                channels,
+                initial_limit,
+            } => self
+                .runtime
+                .reducer
+                .register_session_timeline_watch_interest(
+                    session_id,
+                    after_cursor,
+                    channels,
+                    initial_limit,
+                ),
+            ClientCommand::ReleaseSessionTimelineWatchInterest { session_id } => {
+                let update = self
+                    .runtime
+                    .reducer
+                    .release_session_timeline_watch_interest(session_id.clone());
+                let active = self
+                    .runtime
+                    .reducer
+                    .state()
+                    .sessions
+                    .timelines
+                    .get(&session_id)
+                    .is_some_and(|timeline| timeline.watch.interests > 0);
+                if !active {
+                    self.runtime.timeline_watches.remove(&session_id);
+                }
+                update
+            }
+            ClientCommand::SubmitUserMessage { session_id, text } => {
+                self.runtime.reducer.submit_user_message(session_id, text)
+            }
+            ClientCommand::RespondExternalRequest {
+                session_id,
+                request_id,
+                response_json,
+            } => {
+                self.runtime
+                    .reducer
+                    .respond_external_request(session_id, request_id, response_json)
+            }
+            ClientCommand::InterruptSession { session_id } => {
+                self.runtime.reducer.interrupt_session(session_id)
+            }
             ClientCommand::WatchStatus => self.runtime.reducer.request_status_watch(),
             ClientCommand::WaitForSystemReady => self.runtime.reducer.maintain_watches(),
         };
@@ -802,10 +1133,35 @@ impl ClientSnapshot {
                 runtime_config_update: OperationSnapshot::from_state(
                     &state.sessions.runtime_config_update,
                 ),
+                submit_user_message: OperationSnapshot::from_state(
+                    &state.sessions.submit_user_message,
+                ),
+                respond_external_request: OperationSnapshot::from_state(
+                    &state.sessions.respond_external_request,
+                ),
+                interrupt: OperationSnapshot::from_state(&state.sessions.interrupt),
                 watch: OperationSnapshot::from_parts(
                     state.sessions.watch.status,
                     state.sessions.watch.error.clone(),
                 ),
+                timelines: state
+                    .sessions
+                    .timelines
+                    .iter()
+                    .map(|(session_id, timeline)| {
+                        (
+                            session_id.clone(),
+                            SessionTimelineView {
+                                events: timeline.events.values().cloned().map(Into::into).collect(),
+                                load: OperationSnapshot::from_state(&timeline.load),
+                                watch: OperationSnapshot::from_parts(
+                                    timeline.watch.status,
+                                    timeline.watch.error.clone(),
+                                ),
+                            },
+                        )
+                    })
+                    .collect(),
             },
         }
     }
@@ -845,6 +1201,35 @@ impl From<ClientOperationState> for ClientOperationView {
                 status: operation_status_name(status),
                 error,
                 session: session.map(SessionView::from),
+            },
+            ClientOperationState::SessionSubmitUserMessage {
+                status,
+                error,
+                session_id,
+            } => Self::SessionSubmitUserMessage {
+                status: operation_status_name(status),
+                error,
+                session_id,
+            },
+            ClientOperationState::SessionRespondExternalRequest {
+                status,
+                error,
+                session_id,
+                request_id,
+            } => Self::SessionRespondExternalRequest {
+                status: operation_status_name(status),
+                error,
+                session_id,
+                request_id,
+            },
+            ClientOperationState::SessionInterrupt {
+                status,
+                error,
+                session_id,
+            } => Self::SessionInterrupt {
+                status: operation_status_name(status),
+                error,
+                session_id,
             },
         }
     }

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{Configuration, SessionSummary, StreamId, SystemStatus};
+use crate::{Configuration, SessionSummary, StreamId, SystemStatus, TimelineEvent};
 
 /// Runtime-local operation identifier used by shells to track command results.
 pub type OperationKey = String;
@@ -66,9 +66,32 @@ pub struct SessionClientState {
     pub delete: OperationState,
     /// Session runtime metadata update operation state.
     pub runtime_config_update: OperationState,
+    /// User message submit operation state.
+    pub submit_user_message: OperationState,
+    /// External request response operation state.
+    pub respond_external_request: OperationState,
+    /// Session interrupt operation state.
+    pub interrupt: OperationState,
     /// Session watch operation state.
     pub watch: WatchState,
+    /// Timeline state by session id.
+    pub timelines: BTreeMap<String, SessionTimelineState>,
     pub(crate) last_sequence: u64,
+}
+
+/// Timeline coordination state for one session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionTimelineState {
+    /// Last known persisted timeline events by cursor.
+    pub events: BTreeMap<u64, TimelineEvent>,
+    /// Timeline page load operation state.
+    pub load: OperationState,
+    /// Timeline watch operation state.
+    pub watch: WatchState,
+    pub(crate) last_sequence: u64,
+    pub(crate) watch_after_cursor: Option<u64>,
+    pub(crate) watch_channels: Vec<String>,
+    pub(crate) watch_initial_limit: Option<u32>,
 }
 
 /// Stream coordination state.
@@ -128,6 +151,35 @@ pub enum ClientOperationState {
         error: Option<String>,
         /// Updated session, when the operation completed successfully.
         session: Option<SessionSummary>,
+    },
+    /// User message submit command result.
+    SessionSubmitUserMessage {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id submitted to.
+        session_id: String,
+    },
+    /// External request response command result.
+    SessionRespondExternalRequest {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id responded to.
+        session_id: String,
+        /// External request id.
+        request_id: String,
+    },
+    /// Session interrupt command result.
+    SessionInterrupt {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id interrupted.
+        session_id: String,
     },
 }
 
@@ -465,6 +517,287 @@ impl ClientState {
         self.sessions.list.error = Some(message);
     }
 
+    pub(crate) fn set_session_timeline_load_loading(&mut self, session_id: &str) {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.load.status = OperationStatus::Loading;
+        timeline.load.error = None;
+    }
+
+    pub(crate) fn set_session_timeline_load_ready(
+        &mut self,
+        session_id: &str,
+        events: Vec<TimelineEvent>,
+    ) {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.events = events
+            .into_iter()
+            .map(|event| (event.cursor, event))
+            .collect();
+        timeline.load.status = OperationStatus::Ready;
+        timeline.load.error = None;
+    }
+
+    pub(crate) fn set_session_timeline_load_failed(&mut self, session_id: &str, message: String) {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.load.status = OperationStatus::Failed;
+        timeline.load.error = Some(message);
+    }
+
+    pub(crate) fn configure_session_timeline_watch(
+        &mut self,
+        session_id: &str,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+    ) {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.watch.interests = timeline.watch.interests.saturating_add(1);
+        timeline.watch_after_cursor = after_cursor;
+        timeline.watch_channels = channels;
+        timeline.watch_initial_limit = initial_limit;
+    }
+
+    pub(crate) fn remove_session_timeline_watch_interest(&mut self, session_id: &str) -> usize {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.watch.interests = timeline.watch.interests.saturating_sub(1);
+
+        if timeline.watch.interests == 0 {
+            timeline.watch.status = OperationStatus::Idle;
+            timeline.watch.error = None;
+            timeline.watch.retry_attempt = 0;
+        }
+
+        timeline.watch.interests
+    }
+
+    pub(crate) fn set_session_timeline_watch_loading(&mut self, session_id: &str) {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.watch.status = OperationStatus::Loading;
+        timeline.watch.error = None;
+    }
+
+    pub(crate) fn set_session_timeline_watch_opened(&mut self, session_id: &str) {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.watch.status = OperationStatus::Opened;
+        timeline.watch.error = None;
+    }
+
+    pub(crate) fn set_session_timeline_watch_waiting(&mut self, session_id: &str) {
+        self.session_timeline_mut(session_id).watch.status = OperationStatus::Waiting;
+    }
+
+    pub(crate) fn set_session_timeline_watch_changed(
+        &mut self,
+        sequence: u64,
+        event: TimelineEvent,
+    ) {
+        let timeline = self.session_timeline_mut(&event.session_id.clone());
+        timeline.last_sequence = sequence;
+        timeline.events.insert(event.cursor, event);
+        timeline.watch.status = OperationStatus::Received;
+        timeline.watch.error = None;
+        timeline.watch.retry_attempt = 0;
+    }
+
+    pub(crate) fn set_session_timeline_watch_failed(
+        &mut self,
+        session_id: &str,
+        message: String,
+    ) -> u64 {
+        let timeline = self.session_timeline_mut(session_id);
+        timeline.watch.status = OperationStatus::Failed;
+        timeline.watch.error = Some(message);
+
+        let delay = watch_reconnect_delay_ms(timeline.watch.retry_attempt);
+        timeline.watch.retry_attempt = timeline.watch.retry_attempt.saturating_add(1);
+        delay
+    }
+
+    pub(crate) fn session_timeline_watch_request(
+        &self,
+        session_id: &str,
+    ) -> Option<(Option<u64>, Vec<String>, Option<u32>)> {
+        self.sessions.timelines.get(session_id).map(|timeline| {
+            (
+                timeline.watch_after_cursor,
+                timeline.watch_channels.clone(),
+                timeline.watch_initial_limit,
+            )
+        })
+    }
+
+    pub(crate) fn timeline_watch_session_ids(&self) -> Vec<String> {
+        self.sessions
+            .timelines
+            .iter()
+            .filter(|(_, timeline)| timeline.watch.interests > 0)
+            .map(|(session_id, _)| session_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn set_session_submit_user_message_loading(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+    ) {
+        self.sessions.submit_user_message.status = OperationStatus::Loading;
+        self.sessions.submit_user_message.error = None;
+        self.sessions.submit_user_message.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionSubmitUserMessage {
+                status: OperationStatus::Loading,
+                error: None,
+                session_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_submit_user_message_ready(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+    ) {
+        self.sessions.submit_user_message.status = OperationStatus::Ready;
+        self.sessions.submit_user_message.error = None;
+        self.sessions.submit_user_message.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionSubmitUserMessage {
+                status: OperationStatus::Ready,
+                error: None,
+                session_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_submit_user_message_failed(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        message: String,
+    ) {
+        self.sessions.submit_user_message.status = OperationStatus::Failed;
+        self.sessions.submit_user_message.error = Some(message.clone());
+        self.sessions.submit_user_message.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionSubmitUserMessage {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_respond_external_request_loading(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        request_id: String,
+    ) {
+        self.sessions.respond_external_request.status = OperationStatus::Loading;
+        self.sessions.respond_external_request.error = None;
+        self.sessions.respond_external_request.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRespondExternalRequest {
+                status: OperationStatus::Loading,
+                error: None,
+                session_id,
+                request_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_respond_external_request_ready(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        request_id: String,
+    ) {
+        self.sessions.respond_external_request.status = OperationStatus::Ready;
+        self.sessions.respond_external_request.error = None;
+        self.sessions.respond_external_request.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRespondExternalRequest {
+                status: OperationStatus::Ready,
+                error: None,
+                session_id,
+                request_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_respond_external_request_failed(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        request_id: String,
+        message: String,
+    ) {
+        self.sessions.respond_external_request.status = OperationStatus::Failed;
+        self.sessions.respond_external_request.error = Some(message.clone());
+        self.sessions.respond_external_request.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRespondExternalRequest {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session_id,
+                request_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_interrupt_loading(&mut self, key: OperationKey, session_id: String) {
+        self.sessions.interrupt.status = OperationStatus::Loading;
+        self.sessions.interrupt.error = None;
+        self.sessions.interrupt.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionInterrupt {
+                status: OperationStatus::Loading,
+                error: None,
+                session_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_interrupt_ready(&mut self, key: OperationKey, session_id: String) {
+        self.sessions.interrupt.status = OperationStatus::Ready;
+        self.sessions.interrupt.error = None;
+        self.sessions.interrupt.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionInterrupt {
+                status: OperationStatus::Ready,
+                error: None,
+                session_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_interrupt_failed(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        message: String,
+    ) {
+        self.sessions.interrupt.status = OperationStatus::Failed;
+        self.sessions.interrupt.error = Some(message.clone());
+        self.sessions.interrupt.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionInterrupt {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session_id,
+            },
+        );
+    }
+
     pub(crate) fn set_session_watch_loading(&mut self) {
         self.sessions.watch.status = OperationStatus::Loading;
         self.sessions.watch.error = None;
@@ -542,6 +875,14 @@ impl ClientState {
 
     fn remove_session(&mut self, id: &str) {
         self.sessions.current.remove(id);
+        self.sessions.timelines.remove(id);
+    }
+
+    fn session_timeline_mut(&mut self, session_id: &str) -> &mut SessionTimelineState {
+        self.sessions
+            .timelines
+            .entry(session_id.to_owned())
+            .or_default()
     }
 
     pub(crate) fn stream_mut(&mut self, stream_id: StreamId) -> &mut StreamState {
