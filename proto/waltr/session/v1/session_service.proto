@@ -11,6 +11,11 @@ service SessionService {
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
   rpc UpdateSessionRuntimeConfig(UpdateSessionRuntimeConfigRequest) returns (UpdateSessionRuntimeConfigResponse);
   rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
+  rpc GetTimeline(GetTimelineRequest) returns (GetTimelineResponse);
+  rpc WatchTimeline(WatchTimelineRequest) returns (stream WatchTimelineResponse);
+  rpc SubmitUserMessage(SubmitUserMessageRequest) returns (SubmitUserMessageResponse);
+  rpc RespondExternalRequest(RespondExternalRequestRequest) returns (RespondExternalRequestResponse);
+  rpc InterruptSession(InterruptSessionRequest) returns (InterruptSessionResponse);
 }
 
 message CreateSessionRequest {
@@ -55,6 +60,164 @@ message WatchSessionsResponse {
 
 message SessionListSnapshot {
   repeated SessionSummary sessions = 1;
+}
+
+message GetTimelineRequest {
+  string session_id = 1;
+  TimelineQuery query = 2;
+}
+
+message GetTimelineResponse {
+  repeated TimelineEvent events = 1;
+}
+
+message WatchTimelineRequest {
+  string session_id = 1;
+
+  // Server emits persisted events after this cursor before switching to live updates.
+  optional uint64 after_cursor = 2;
+
+  // Optional live display-channel filter.
+  repeated string channels = 3;
+
+  // Optional backward history batch emitted before catch-up and live updates.
+  optional uint32 initial_limit = 4;
+}
+
+message WatchTimelineResponse {
+  uint64 sequence = 1;
+  TimelineEvent event = 2;
+}
+
+message SubmitUserMessageRequest {
+  string session_id = 1;
+  string text = 2;
+}
+
+message SubmitUserMessageResponse {}
+
+message RespondExternalRequestRequest {
+  string session_id = 1;
+  string request_id = 2;
+
+  // JSON payload encoded as UTF-8 JSON until response schemas stabilize.
+  string response_json = 3;
+}
+
+message RespondExternalRequestResponse {}
+
+message InterruptSessionRequest {
+  string session_id = 1;
+}
+
+message InterruptSessionResponse {}
+
+message TimelineQuery {
+  TimelineDirection direction = 1;
+
+  // Exclusive cursor boundary.
+  optional uint64 cursor = 2;
+
+  uint32 limit = 3;
+  repeated string channels = 4;
+}
+
+enum TimelineDirection {
+  TIMELINE_DIRECTION_UNSPECIFIED = 0;
+  TIMELINE_DIRECTION_FORWARD = 1;
+  TIMELINE_DIRECTION_BACKWARD = 2;
+}
+
+message TimelineEvent {
+  uint64 cursor = 1;
+  string session_id = 2;
+  uint64 turn = 3;
+  string item_id = 4;
+  optional string parent_id = 5;
+  TimelineEventKind kind = 6;
+  optional string channel = 7;
+  TimelineContent content = 8;
+  optional TimelineStatus status = 9;
+
+  // JSON object encoded as UTF-8 JSON until metadata schemas stabilize.
+  string metadata_json = 10;
+}
+
+enum TimelineEventKind {
+  TIMELINE_EVENT_KIND_UNSPECIFIED = 0;
+  TIMELINE_EVENT_KIND_ITEM_STARTED = 1;
+  TIMELINE_EVENT_KIND_CONTENT_DELTA = 2;
+  TIMELINE_EVENT_KIND_ITEM_UPDATED = 3;
+  TIMELINE_EVENT_KIND_ITEM_FINISHED = 4;
+  TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_OPENED = 5;
+  TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_RESOLVED = 6;
+  TIMELINE_EVENT_KIND_SESSION_STATUS_CHANGED = 7;
+}
+
+enum TimelineStatus {
+  TIMELINE_STATUS_UNSPECIFIED = 0;
+  TIMELINE_STATUS_IDLE = 1;
+  TIMELINE_STATUS_BUILDING_REQUEST = 2;
+  TIMELINE_STATUS_STREAMING_PROVIDER = 3;
+  TIMELINE_STATUS_EVALUATING_TOOL_CALL = 4;
+  TIMELINE_STATUS_RUNNING_TOOL = 5;
+  TIMELINE_STATUS_PENDING = 6;
+  TIMELINE_STATUS_AWAITING_TOOL_RESULTS = 7;
+  TIMELINE_STATUS_AWAITING_EXTERNAL_INPUT = 8;
+  TIMELINE_STATUS_INTERRUPTED = 9;
+  TIMELINE_STATUS_RESOLVED = 10;
+  TIMELINE_STATUS_FINISHED = 11;
+  TIMELINE_STATUS_FAILED = 12;
+  TIMELINE_STATUS_CANCELED = 13;
+}
+
+message TimelineContent {
+  oneof content {
+    EmptyTimelineContent empty = 1;
+    TextDeltaTimelineContent text_delta = 2;
+    TextSnapshotTimelineContent text_snapshot = 3;
+    ToolCallTimelineContent tool_call = 4;
+    ToolResultTimelineContent tool_result = 5;
+    ExternalRequestTimelineContent external_request = 6;
+    ContentRefTimelineContent content_ref = 7;
+    JsonTimelineContent json = 8;
+  }
+}
+
+message EmptyTimelineContent {}
+
+message TextDeltaTimelineContent {
+  string delta = 1;
+}
+
+message TextSnapshotTimelineContent {
+  string text = 1;
+}
+
+message ToolCallTimelineContent {
+  string id = 1;
+  string name = 2;
+  string arguments_json = 3;
+}
+
+message ToolResultTimelineContent {
+  string id = 1;
+  string name = 2;
+  string content = 3;
+  bool error = 4;
+}
+
+message ExternalRequestTimelineContent {
+  ExternalRequest request = 1;
+}
+
+message ContentRefTimelineContent {
+  string content_id = 1;
+  uint64 bytes = 2;
+}
+
+message JsonTimelineContent {
+  string value_json = 1;
 }
 
 message SessionSummary {
