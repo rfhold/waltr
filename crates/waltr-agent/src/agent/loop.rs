@@ -1273,9 +1273,7 @@ fn permission_suspension(
 fn permission_patterns(claims: &[PermissionClaim]) -> Vec<PermissionPattern> {
     let mut patterns = Vec::new();
     for claim in claims {
-        let Some(pattern) = permission_pattern(claim) else {
-            continue;
-        };
+        let pattern = permission_pattern(claim);
         if !patterns.contains(&pattern) {
             patterns.push(pattern);
         }
@@ -1283,7 +1281,7 @@ fn permission_patterns(claims: &[PermissionClaim]) -> Vec<PermissionPattern> {
     patterns
 }
 
-fn permission_pattern(claim: &PermissionClaim) -> Option<PermissionPattern> {
+fn permission_pattern(claim: &PermissionClaim) -> PermissionPattern {
     let resource = match &claim.resource {
         PermissionResource::FilesystemPath(path) => {
             let parent = path.parent().unwrap_or(path.as_path()).to_path_buf();
@@ -1296,16 +1294,16 @@ fn permission_pattern(claim: &PermissionClaim) -> Option<PermissionPattern> {
             PermissionResourcePattern::WorkingDirectoryPrefix(path.clone())
         }
         PermissionResource::ShellCommand(command) => {
-            return Some(PermissionPattern {
+            return PermissionPattern {
                 operation: Some(PermissionOperation::Execute),
                 resource: PermissionResourcePattern::ShellCommand(command.clone()),
-            });
+            };
         }
     };
-    Some(PermissionPattern {
+    PermissionPattern {
         operation: Some(claim.operation),
         resource,
-    })
+    }
 }
 
 fn permission_retry_tool_call(

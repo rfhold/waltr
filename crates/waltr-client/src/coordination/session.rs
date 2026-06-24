@@ -347,10 +347,10 @@ fn timeline_watch_failed(
 
 fn operation_session_id(state: &ClientState, operation_key: &str) -> String {
     match state.operations.get(operation_key) {
-        Some(crate::ClientOperationState::SessionSubmitUserMessage { session_id, .. })
-        | Some(crate::ClientOperationState::SessionInterrupt { session_id, .. }) => {
-            session_id.clone()
-        }
+        Some(
+            crate::ClientOperationState::SessionSubmitUserMessage { session_id, .. }
+            | crate::ClientOperationState::SessionInterrupt { session_id, .. },
+        ) => session_id.clone(),
         _ => String::new(),
     }
 }

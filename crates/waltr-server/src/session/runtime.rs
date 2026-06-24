@@ -21,7 +21,7 @@ pub(super) struct ServerRuntimeFactory {
 }
 
 impl ServerRuntimeFactory {
-    pub(super) fn new(root: PathBuf) -> Self {
+    pub(super) const fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
@@ -41,64 +41,7 @@ impl ServerRuntimeFactory {
         runtime_config: StoredSessionRuntimeConfig,
         config: &Configuration,
     ) -> Result<AgentRuntime, Status> {
-        let provider_config = config
-            .providers
-            .get(&runtime_config.provider.key)
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "provider '{}' does not exist",
-                    runtime_config.provider.key
-                ))
-            })?;
-        let model_config = provider_config
-            .models
-            .get(&runtime_config.provider.model_id)
-            .ok_or_else(|| {
-                Status::failed_precondition(format!(
-                    "model '{}' does not exist in provider '{}'",
-                    runtime_config.provider.model_id, runtime_config.provider.key
-                ))
-            })?;
-        if model_config.r#type != waltr::grpc::waltr::config::v1::ModelType::Llm as i32 {
-            return Err(Status::failed_precondition(format!(
-                "model '{}' is not an LLM",
-                runtime_config.provider.model_id
-            )));
-        }
-
-        let provider_type = ProviderType::try_from(runtime_config.provider.r#type)
-            .unwrap_or(ProviderType::Unspecified);
-        let api_key = configured_api_key(&provider_config.headers);
-        let model_id = runtime_config.provider.model_id.clone();
-        let base_url = (!runtime_config.provider.url.trim().is_empty())
-            .then_some(runtime_config.provider.url.as_str());
-
-        let builder = match provider_type {
-            ProviderType::Anthropic => {
-                let mut provider = AnthropicMessages::new(api_key, model_id.clone());
-                if let Some(base_url) = base_url {
-                    provider = provider.with_base_url(base_url);
-                }
-                let model =
-                    ModelRef::new(ProviderId::Anthropic, model_id, ModelApi::AnthropicMessages);
-                AgentRuntimeBuilder::new(model, Arc::new(provider))
-            }
-            ProviderType::Openai => {
-                let mut provider = OpenAiChatCompletions::new(api_key, model_id.clone());
-                if let Some(base_url) = base_url {
-                    provider = provider.with_base_url(base_url);
-                }
-                let model = ModelRef::new(
-                    ProviderId::OpenAi,
-                    model_id,
-                    ModelApi::OpenAiChatCompletions,
-                );
-                AgentRuntimeBuilder::new(model, Arc::new(provider))
-            }
-            ProviderType::Unspecified => {
-                return Err(Status::failed_precondition("provider type is unspecified"));
-            }
-        };
+        let builder = provider_builder(&runtime_config, config)?;
 
         let mut builder = builder
             .with_base_system_prompt()
@@ -124,13 +67,76 @@ impl ServerRuntimeFactory {
         }
 
         builder = builder
-            .with_mcp_servers(mcp_config(runtime_config, config)?)
+            .with_mcp_servers(mcp_config(&runtime_config, config)?)
             .await
             .map_err(|error| {
                 Status::failed_precondition(format!("failed to initialize MCP tools: {error}"))
             })?;
 
         Ok(builder.build())
+    }
+}
+
+fn provider_builder(
+    runtime_config: &StoredSessionRuntimeConfig,
+    config: &Configuration,
+) -> Result<AgentRuntimeBuilder, Status> {
+    let provider_config = config
+        .providers
+        .get(&runtime_config.provider.key)
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "provider '{}' does not exist",
+                runtime_config.provider.key
+            ))
+        })?;
+    let model_config = provider_config
+        .models
+        .get(&runtime_config.provider.model_id)
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "model '{}' does not exist in provider '{}'",
+                runtime_config.provider.model_id, runtime_config.provider.key
+            ))
+        })?;
+    if model_config.r#type != waltr::grpc::waltr::config::v1::ModelType::Llm as i32 {
+        return Err(Status::failed_precondition(format!(
+            "model '{}' is not an LLM",
+            runtime_config.provider.model_id
+        )));
+    }
+
+    let provider_type =
+        ProviderType::try_from(runtime_config.provider.r#type).unwrap_or(ProviderType::Unspecified);
+    let api_key = configured_api_key(&provider_config.headers);
+    let model_id = runtime_config.provider.model_id.clone();
+    let base_url = (!runtime_config.provider.url.trim().is_empty())
+        .then_some(runtime_config.provider.url.as_str());
+
+    match provider_type {
+        ProviderType::Anthropic => {
+            let mut provider = AnthropicMessages::new(api_key, model_id.clone());
+            if let Some(base_url) = base_url {
+                provider = provider.with_base_url(base_url);
+            }
+            let model = ModelRef::new(ProviderId::Anthropic, model_id, ModelApi::AnthropicMessages);
+            Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
+        }
+        ProviderType::Openai => {
+            let mut provider = OpenAiChatCompletions::new(api_key, model_id.clone());
+            if let Some(base_url) = base_url {
+                provider = provider.with_base_url(base_url);
+            }
+            let model = ModelRef::new(
+                ProviderId::OpenAi,
+                model_id,
+                ModelApi::OpenAiChatCompletions,
+            );
+            Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
+        }
+        ProviderType::Unspecified => {
+            Err(Status::failed_precondition("provider type is unspecified"))
+        }
     }
 }
 
@@ -151,11 +157,11 @@ fn configured_api_key(headers: &std::collections::HashMap<String, String>) -> St
 }
 
 fn mcp_config(
-    runtime_config: StoredSessionRuntimeConfig,
+    runtime_config: &StoredSessionRuntimeConfig,
     config: &Configuration,
 ) -> Result<McpConfig, Status> {
     let mut mcp = McpConfig::new();
-    for stored in runtime_config.mcp_servers {
+    for stored in &runtime_config.mcp_servers {
         let current = config.mcp_servers.get(&stored.key).ok_or_else(|| {
             Status::failed_precondition(format!("mcp server '{}' does not exist", stored.key))
         })?;
@@ -170,9 +176,11 @@ fn mcp_config(
                         stored.key
                     ))
                 })?;
-                McpServerConfig::stdio(stored.key, command, parts)
+                McpServerConfig::stdio(stored.key.clone(), command, parts)
             }
-            McpServerType::Sse => McpServerConfig::streamable_http(stored.key, current.url.clone()),
+            McpServerType::Sse => {
+                McpServerConfig::streamable_http(stored.key.clone(), current.url.clone())
+            }
             McpServerType::Unspecified => {
                 return Err(Status::failed_precondition(format!(
                     "mcp server '{}' type is unspecified",

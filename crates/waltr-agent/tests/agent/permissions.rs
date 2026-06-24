@@ -908,38 +908,38 @@ impl LlmStream for ScriptedPermissionProvider {
     }
 }
 
-fn scripted_shell_or_finished(_completed: &[&str]) -> Vec<waltr_agent::Result<CompletionEvent>> {
+fn scripted_shell_or_finished(completed: &[&str]) -> Vec<waltr_agent::Result<CompletionEvent>> {
     #[cfg(feature = "shell")]
     {
-        if !_completed.contains(&"call_6") {
+        if !completed.contains(&"call_6") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_6",
                 "printf shell-one",
                 "first shell command",
             )))];
         }
-        if !_completed.contains(&"call_7") {
+        if !completed.contains(&"call_7") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_7",
                 "printf shell-two",
                 "second shell command",
             )))];
         }
-        if !_completed.contains(&"call_8") {
+        if !completed.contains(&"call_8") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_8",
                 "cat ../outside/nested/shell-walk.txt",
                 "read a shell path covered by the approved nested directory",
             )))];
         }
-        if !_completed.contains(&"call_9") {
+        if !completed.contains(&"call_9") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_9",
                 "cat ../outside/denied.txt",
                 "read a shell path denied by external filesystem policy",
             )))];
         }
-        if !_completed.contains(&"call_10") {
+        if !completed.contains(&"call_10") {
             return vec![Ok(CompletionEvent::ToolCall(shell_call(
                 "call_10",
                 "git status",

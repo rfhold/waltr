@@ -18,6 +18,16 @@ use tonic::Status;
 
 use super::{error::agent_error_to_status, runtime::ServerRuntimeFactory};
 
+pub(super) struct SessionRunRequest<S>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    pub(super) sessions: AgentSessions<S>,
+    pub(super) runtime_factory: ServerRuntimeFactory,
+    pub(super) config: Configuration,
+    pub(super) session_id: SessionId,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SessionRunManager {
     active: Arc<Mutex<BTreeMap<String, ActiveRun>>>,
@@ -40,23 +50,24 @@ impl SessionRunManager {
 
     pub(super) async fn submit_user_message<S>(
         &self,
-        sessions: AgentSessions<S>,
-        runtime_factory: ServerRuntimeFactory,
-        config: Configuration,
-        session_id: SessionId,
+        request: SessionRunRequest<S>,
         text: String,
     ) -> Result<(), Status>
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        let session = sessions
-            .load(&session_id)
+        let session = request
+            .sessions
+            .load(&request.session_id)
             .await
             .map_err(agent_error_to_status)?;
-        let runtime = runtime_factory
-            .build(&session.record.summary(), &config)
+        let runtime = request
+            .runtime_factory
+            .build(&session.record.summary(), &request.config)
             .await?;
-        let active = self.replace_active(&session_id).await;
+        let active = self.replace_active(&request.session_id).await;
+        let sessions = request.sessions;
+        let session_id = request.session_id;
         let manager = self.clone();
         tokio::spawn(async move {
             let mut stream = sessions
@@ -76,24 +87,25 @@ impl SessionRunManager {
 
     pub(super) async fn respond_external_request<S>(
         &self,
-        sessions: AgentSessions<S>,
-        runtime_factory: ServerRuntimeFactory,
-        config: Configuration,
-        session_id: SessionId,
+        request: SessionRunRequest<S>,
         request_id: ExternalRequestId,
         response: Value,
     ) -> Result<(), Status>
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        let session = sessions
-            .load(&session_id)
+        let session = request
+            .sessions
+            .load(&request.session_id)
             .await
             .map_err(agent_error_to_status)?;
-        let runtime = runtime_factory
-            .build(&session.record.summary(), &config)
+        let runtime = request
+            .runtime_factory
+            .build(&session.record.summary(), &request.config)
             .await?;
-        let active = self.insert_active(&session_id).await?;
+        let active = self.insert_active(&request.session_id).await?;
+        let sessions = request.sessions;
+        let session_id = request.session_id;
         let manager = self.clone();
         tokio::spawn(async move {
             let input = ResumeInput::ExternalResponse {
@@ -123,7 +135,8 @@ impl SessionRunManager {
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        if let Some(active) = self.active.lock().await.remove(session_id.as_str()) {
+        let active = self.active.lock().await.remove(session_id.as_str());
+        if let Some(active) = active {
             active.token.cancel();
         }
         sessions
@@ -142,6 +155,7 @@ impl SessionRunManager {
         }
         let run = self.new_active_run();
         active.insert(session_id.as_str().to_owned(), run.clone());
+        drop(active);
         Ok(run)
     }
 
@@ -151,6 +165,7 @@ impl SessionRunManager {
         if let Some(previous) = active.insert(session_id.as_str().to_owned(), run.clone()) {
             previous.token.cancel();
         }
+        drop(active);
         run
     }
 

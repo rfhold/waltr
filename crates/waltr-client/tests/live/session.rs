@@ -24,7 +24,7 @@ const GATEWAY_ANTHROPIC_TEST_MODEL: &str = "anthropic/claude-haiku-4-5";
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY"]
 async fn openai_chat_completions_submits_user_message() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(provider) = skip_if_missing(openai_chat_completions_provider())? else {
+    let Some(provider) = skip_if_missing(openai_chat_completions_provider()) else {
         return Ok(());
     };
     assert_client_can_submit_user_message(provider).await
@@ -33,7 +33,7 @@ async fn openai_chat_completions_submits_user_message() -> Result<(), Box<dyn st
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY"]
 async fn anthropic_messages_submits_user_message() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(provider) = skip_if_missing(anthropic_messages_provider())? else {
+    let Some(provider) = skip_if_missing(anthropic_messages_provider()) else {
         return Ok(());
     };
     assert_client_can_submit_user_message(provider).await
@@ -43,7 +43,7 @@ async fn anthropic_messages_submits_user_message() -> Result<(), Box<dyn std::er
 #[ignore = "requires WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn gateway_openai_chat_completions_submits_user_message()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(provider) = skip_if_missing(gateway_openai_chat_completions_provider())? else {
+    let Some(provider) = skip_if_missing(gateway_openai_chat_completions_provider()) else {
         return Ok(());
     };
     assert_client_can_submit_user_message(provider).await
@@ -53,7 +53,7 @@ async fn gateway_openai_chat_completions_submits_user_message()
 #[ignore = "requires WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn gateway_anthropic_messages_submits_user_message() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(provider) = skip_if_missing(gateway_anthropic_messages_provider())? else {
+    let Some(provider) = skip_if_missing(gateway_anthropic_messages_provider()) else {
         return Ok(());
     };
     assert_client_can_submit_user_message(provider).await
@@ -66,19 +66,42 @@ async fn assert_client_can_submit_user_message(
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
 
     wait_for_system_ready(&mut stream).await;
-    dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
+    let session_id = create_live_session(&mut stream).await;
+    open_live_timeline_watch(&mut stream, &session_id).await;
+    submit_and_assert_timeline_text(
+        &mut stream,
+        &session_id,
+        "Reply with one short sentence.",
+        |text| !text.trim().is_empty(),
+    )
+    .await;
+    submit_and_assert_timeline_text(
+        &mut stream,
+        &session_id,
+        "Reply with another short sentence.",
+        |text| text.contains("Reply with another short sentence."),
+    )
+    .await;
+
+    Ok(())
+}
+
+async fn create_live_session(stream: &mut waltr_client::ClientStateStream) -> String {
+    dispatch_stream_command(stream, ClientCommand::CreateSession)
         .await
         .expect("session create should dispatch");
-    let snapshot = next_live_snapshot_until(&mut stream, |snapshot| {
+    let snapshot = next_live_snapshot_until(stream, |snapshot| {
         snapshot.sessions.create.status == "ready" && !snapshot.sessions.current.is_empty()
     })
     .await;
-    let session_id = snapshot.sessions.current[0].id.clone();
+    snapshot.sessions.current[0].id.clone()
+}
 
+async fn open_live_timeline_watch(stream: &mut waltr_client::ClientStateStream, session_id: &str) {
     dispatch_stream_command(
-        &mut stream,
+        stream,
         ClientCommand::RegisterSessionTimelineWatchInterest {
-            session_id: session_id.clone(),
+            session_id: session_id.to_owned(),
             after_cursor: Some(0),
             channels: vec!["user_text".to_owned(), "assistant_text".to_owned()],
             initial_limit: None,
@@ -86,77 +109,46 @@ async fn assert_client_can_submit_user_message(
     )
     .await
     .expect("timeline watch interest should dispatch");
-    next_live_snapshot_until(&mut stream, |snapshot| {
+    next_live_snapshot_until(stream, |snapshot| {
         snapshot
             .sessions
             .timelines
-            .get(&session_id)
+            .get(session_id)
             .is_some_and(|timeline| timeline.watch.status == "opened")
     })
     .await;
+}
 
+async fn submit_and_assert_timeline_text(
+    stream: &mut waltr_client::ClientStateStream,
+    session_id: &str,
+    text: &str,
+    matches: impl Fn(&str) -> bool,
+) {
     dispatch_stream_command(
-        &mut stream,
+        stream,
         ClientCommand::SubmitUserMessage {
-            session_id: session_id.clone(),
-            text: "Reply with one short sentence.".to_owned(),
+            session_id: session_id.to_owned(),
+            text: text.to_owned(),
         },
     )
     .await
     .expect("user message submit should dispatch");
 
-    let snapshot = next_live_snapshot_until(&mut stream, |snapshot| {
+    let snapshot = next_live_snapshot_until(stream, |snapshot| {
         snapshot
             .sessions
             .timelines
-            .get(&session_id)
+            .get(session_id)
             .is_some_and(|timeline| {
                 timeline
                     .events
                     .iter()
-                    .any(|event| !timeline_text(&event.content).trim().is_empty())
+                    .any(|event| matches(timeline_text(&event.content)))
             })
     })
     .await;
     assert_eq!(snapshot.sessions.submit_user_message.status, "ready");
-
-    let timeline = snapshot
-        .sessions
-        .timelines
-        .get(&session_id)
-        .expect("timeline should be present");
-    assert!(
-        timeline
-            .events
-            .iter()
-            .any(|event| !timeline_text(&event.content).trim().is_empty())
-    );
-
-    dispatch_stream_command(
-        &mut stream,
-        ClientCommand::SubmitUserMessage {
-            session_id: session_id.clone(),
-            text: "Reply with another short sentence.".to_owned(),
-        },
-    )
-    .await
-    .expect("follow-up user message submit should dispatch");
-
-    let snapshot = next_live_snapshot_until(&mut stream, |snapshot| {
-        snapshot
-            .sessions
-            .timelines
-            .get(&session_id)
-            .is_some_and(|timeline| {
-                timeline.events.iter().any(|event| {
-                    timeline_text(&event.content).contains("Reply with another short sentence.")
-                })
-            })
-    })
-    .await;
-    assert_eq!(snapshot.sessions.submit_user_message.status, "ready");
-
-    Ok(())
 }
 
 async fn wait_for_system_ready(stream: &mut waltr_client::ClientStateStream) {
@@ -314,17 +306,15 @@ fn require_gateway() -> Result<(), MissingLiveConfig> {
     }
 }
 
-fn skip_if_missing<T>(
-    result: Result<T, MissingLiveConfig>,
-) -> Result<Option<T>, MissingLiveConfig> {
+fn skip_if_missing<T>(result: Result<T, MissingLiveConfig>) -> Option<T> {
     match result {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => Some(value),
         Err(error) => {
             eprintln!(
                 "skipping live test: missing {}; set {} or use the matching live provider setup",
                 error.name, error.name
             );
-            Ok(None)
+            None
         }
     }
 }
