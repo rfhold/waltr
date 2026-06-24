@@ -65,6 +65,183 @@ pub struct SessionListSnapshot {
     #[prost(message, repeated, tag="1")]
     pub sessions: ::prost::alloc::vec::Vec<SessionSummary>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetTimelineRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub query: ::core::option::Option<TimelineQuery>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetTimelineResponse {
+    #[prost(message, repeated, tag="1")]
+    pub events: ::prost::alloc::vec::Vec<TimelineEvent>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchTimelineRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// Server emits persisted events after this cursor before switching to live updates.
+    #[prost(uint64, optional, tag="2")]
+    pub after_cursor: ::core::option::Option<u64>,
+    /// Optional live display-channel filter.
+    #[prost(string, repeated, tag="3")]
+    pub channels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Optional backward history batch emitted before catch-up and live updates.
+    #[prost(uint32, optional, tag="4")]
+    pub initial_limit: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WatchTimelineResponse {
+    #[prost(uint64, tag="1")]
+    pub sequence: u64,
+    #[prost(message, optional, tag="2")]
+    pub event: ::core::option::Option<TimelineEvent>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SubmitUserMessageRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub text: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SubmitUserMessageResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RespondExternalRequestRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub request_id: ::prost::alloc::string::String,
+    /// JSON payload encoded as UTF-8 JSON until response schemas stabilize.
+    #[prost(string, tag="3")]
+    pub response_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RespondExternalRequestResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InterruptSessionRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InterruptSessionResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimelineQuery {
+    #[prost(enumeration="TimelineDirection", tag="1")]
+    pub direction: i32,
+    /// Exclusive cursor boundary.
+    #[prost(uint64, optional, tag="2")]
+    pub cursor: ::core::option::Option<u64>,
+    #[prost(uint32, tag="3")]
+    pub limit: u32,
+    #[prost(string, repeated, tag="4")]
+    pub channels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimelineEvent {
+    #[prost(uint64, tag="1")]
+    pub cursor: u64,
+    #[prost(string, tag="2")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag="3")]
+    pub turn: u64,
+    #[prost(string, tag="4")]
+    pub item_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="5")]
+    pub parent_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration="TimelineEventKind", tag="6")]
+    pub kind: i32,
+    #[prost(string, optional, tag="7")]
+    pub channel: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag="8")]
+    pub content: ::core::option::Option<TimelineContent>,
+    #[prost(enumeration="TimelineStatus", optional, tag="9")]
+    pub status: ::core::option::Option<i32>,
+    /// JSON object encoded as UTF-8 JSON until metadata schemas stabilize.
+    #[prost(string, tag="10")]
+    pub metadata_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimelineContent {
+    #[prost(oneof="timeline_content::Content", tags="1, 2, 3, 4, 5, 6, 7, 8")]
+    pub content: ::core::option::Option<timeline_content::Content>,
+}
+/// Nested message and enum types in `TimelineContent`.
+pub mod timeline_content {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Content {
+        #[prost(message, tag="1")]
+        Empty(super::EmptyTimelineContent),
+        #[prost(message, tag="2")]
+        TextDelta(super::TextDeltaTimelineContent),
+        #[prost(message, tag="3")]
+        TextSnapshot(super::TextSnapshotTimelineContent),
+        #[prost(message, tag="4")]
+        ToolCall(super::ToolCallTimelineContent),
+        #[prost(message, tag="5")]
+        ToolResult(super::ToolResultTimelineContent),
+        #[prost(message, tag="6")]
+        ExternalRequest(super::ExternalRequestTimelineContent),
+        #[prost(message, tag="7")]
+        ContentRef(super::ContentRefTimelineContent),
+        #[prost(message, tag="8")]
+        Json(super::JsonTimelineContent),
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EmptyTimelineContent {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextDeltaTimelineContent {
+    #[prost(string, tag="1")]
+    pub delta: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TextSnapshotTimelineContent {
+    #[prost(string, tag="1")]
+    pub text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolCallTimelineContent {
+    #[prost(string, tag="1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub arguments_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolResultTimelineContent {
+    #[prost(string, tag="1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub content: ::prost::alloc::string::String,
+    #[prost(bool, tag="4")]
+    pub error: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ExternalRequestTimelineContent {
+    #[prost(message, optional, tag="1")]
+    pub request: ::core::option::Option<ExternalRequest>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContentRefTimelineContent {
+    #[prost(string, tag="1")]
+    pub content_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag="2")]
+    pub bytes: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct JsonTimelineContent {
+    #[prost(string, tag="1")]
+    pub value_json: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionSummary {
     #[prost(string, tag="1")]
@@ -168,6 +345,141 @@ pub struct ExternalRequest {
     /// JSON payload encoded as UTF-8 JSON until request payload protos stabilize.
     #[prost(string, tag="5")]
     pub payload_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TimelineDirection {
+    Unspecified = 0,
+    Forward = 1,
+    Backward = 2,
+}
+impl TimelineDirection {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIMELINE_DIRECTION_UNSPECIFIED",
+            Self::Forward => "TIMELINE_DIRECTION_FORWARD",
+            Self::Backward => "TIMELINE_DIRECTION_BACKWARD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIMELINE_DIRECTION_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIMELINE_DIRECTION_FORWARD" => Some(Self::Forward),
+            "TIMELINE_DIRECTION_BACKWARD" => Some(Self::Backward),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TimelineEventKind {
+    Unspecified = 0,
+    ItemStarted = 1,
+    ContentDelta = 2,
+    ItemUpdated = 3,
+    ItemFinished = 4,
+    ExternalRequestOpened = 5,
+    ExternalRequestResolved = 6,
+    SessionStatusChanged = 7,
+}
+impl TimelineEventKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIMELINE_EVENT_KIND_UNSPECIFIED",
+            Self::ItemStarted => "TIMELINE_EVENT_KIND_ITEM_STARTED",
+            Self::ContentDelta => "TIMELINE_EVENT_KIND_CONTENT_DELTA",
+            Self::ItemUpdated => "TIMELINE_EVENT_KIND_ITEM_UPDATED",
+            Self::ItemFinished => "TIMELINE_EVENT_KIND_ITEM_FINISHED",
+            Self::ExternalRequestOpened => "TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_OPENED",
+            Self::ExternalRequestResolved => "TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_RESOLVED",
+            Self::SessionStatusChanged => "TIMELINE_EVENT_KIND_SESSION_STATUS_CHANGED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIMELINE_EVENT_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIMELINE_EVENT_KIND_ITEM_STARTED" => Some(Self::ItemStarted),
+            "TIMELINE_EVENT_KIND_CONTENT_DELTA" => Some(Self::ContentDelta),
+            "TIMELINE_EVENT_KIND_ITEM_UPDATED" => Some(Self::ItemUpdated),
+            "TIMELINE_EVENT_KIND_ITEM_FINISHED" => Some(Self::ItemFinished),
+            "TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_OPENED" => Some(Self::ExternalRequestOpened),
+            "TIMELINE_EVENT_KIND_EXTERNAL_REQUEST_RESOLVED" => Some(Self::ExternalRequestResolved),
+            "TIMELINE_EVENT_KIND_SESSION_STATUS_CHANGED" => Some(Self::SessionStatusChanged),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TimelineStatus {
+    Unspecified = 0,
+    Idle = 1,
+    BuildingRequest = 2,
+    StreamingProvider = 3,
+    EvaluatingToolCall = 4,
+    RunningTool = 5,
+    Pending = 6,
+    AwaitingToolResults = 7,
+    AwaitingExternalInput = 8,
+    Interrupted = 9,
+    Resolved = 10,
+    Finished = 11,
+    Failed = 12,
+    Canceled = 13,
+}
+impl TimelineStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIMELINE_STATUS_UNSPECIFIED",
+            Self::Idle => "TIMELINE_STATUS_IDLE",
+            Self::BuildingRequest => "TIMELINE_STATUS_BUILDING_REQUEST",
+            Self::StreamingProvider => "TIMELINE_STATUS_STREAMING_PROVIDER",
+            Self::EvaluatingToolCall => "TIMELINE_STATUS_EVALUATING_TOOL_CALL",
+            Self::RunningTool => "TIMELINE_STATUS_RUNNING_TOOL",
+            Self::Pending => "TIMELINE_STATUS_PENDING",
+            Self::AwaitingToolResults => "TIMELINE_STATUS_AWAITING_TOOL_RESULTS",
+            Self::AwaitingExternalInput => "TIMELINE_STATUS_AWAITING_EXTERNAL_INPUT",
+            Self::Interrupted => "TIMELINE_STATUS_INTERRUPTED",
+            Self::Resolved => "TIMELINE_STATUS_RESOLVED",
+            Self::Finished => "TIMELINE_STATUS_FINISHED",
+            Self::Failed => "TIMELINE_STATUS_FAILED",
+            Self::Canceled => "TIMELINE_STATUS_CANCELED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIMELINE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIMELINE_STATUS_IDLE" => Some(Self::Idle),
+            "TIMELINE_STATUS_BUILDING_REQUEST" => Some(Self::BuildingRequest),
+            "TIMELINE_STATUS_STREAMING_PROVIDER" => Some(Self::StreamingProvider),
+            "TIMELINE_STATUS_EVALUATING_TOOL_CALL" => Some(Self::EvaluatingToolCall),
+            "TIMELINE_STATUS_RUNNING_TOOL" => Some(Self::RunningTool),
+            "TIMELINE_STATUS_PENDING" => Some(Self::Pending),
+            "TIMELINE_STATUS_AWAITING_TOOL_RESULTS" => Some(Self::AwaitingToolResults),
+            "TIMELINE_STATUS_AWAITING_EXTERNAL_INPUT" => Some(Self::AwaitingExternalInput),
+            "TIMELINE_STATUS_INTERRUPTED" => Some(Self::Interrupted),
+            "TIMELINE_STATUS_RESOLVED" => Some(Self::Resolved),
+            "TIMELINE_STATUS_FINISHED" => Some(Self::Finished),
+            "TIMELINE_STATUS_FAILED" => Some(Self::Failed),
+            "TIMELINE_STATUS_CANCELED" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

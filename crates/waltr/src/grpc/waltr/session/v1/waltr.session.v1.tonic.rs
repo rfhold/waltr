@@ -212,6 +212,142 @@ pub mod session_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        pub async fn get_timeline(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetTimelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetTimelineResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/GetTimeline",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("waltr.session.v1.SessionService", "GetTimeline"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn watch_timeline(
+            &mut self,
+            request: impl tonic::IntoRequest<super::WatchTimelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::WatchTimelineResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/WatchTimeline",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("waltr.session.v1.SessionService", "WatchTimeline"),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn submit_user_message(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SubmitUserMessageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SubmitUserMessageResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/SubmitUserMessage",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "SubmitUserMessage",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn respond_external_request(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RespondExternalRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RespondExternalRequestResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/RespondExternalRequest",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "RespondExternalRequest",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn interrupt_session(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InterruptSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InterruptSessionResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/InterruptSession",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("waltr.session.v1.SessionService", "InterruptSession"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -266,6 +402,47 @@ pub mod session_service_server {
             request: tonic::Request<super::WatchSessionsRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::WatchSessionsStream>,
+            tonic::Status,
+        >;
+        async fn get_timeline(
+            &self,
+            request: tonic::Request<super::GetTimelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetTimelineResponse>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the WatchTimeline method.
+        type WatchTimelineStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::WatchTimelineResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn watch_timeline(
+            &self,
+            request: tonic::Request<super::WatchTimelineRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::WatchTimelineStream>,
+            tonic::Status,
+        >;
+        async fn submit_user_message(
+            &self,
+            request: tonic::Request<super::SubmitUserMessageRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::SubmitUserMessageResponse>,
+            tonic::Status,
+        >;
+        async fn respond_external_request(
+            &self,
+            request: tonic::Request<super::RespondExternalRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RespondExternalRequestResponse>,
+            tonic::Status,
+        >;
+        async fn interrupt_session(
+            &self,
+            request: tonic::Request<super::InterruptSessionRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InterruptSessionResponse>,
             tonic::Status,
         >;
     }
@@ -574,6 +751,238 @@ pub mod session_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/GetTimeline" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetTimelineSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::GetTimelineRequest>
+                    for GetTimelineSvc<T> {
+                        type Response = super::GetTimelineResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetTimelineRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::get_timeline(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetTimelineSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/WatchTimeline" => {
+                    #[allow(non_camel_case_types)]
+                    struct WatchTimelineSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::ServerStreamingService<super::WatchTimelineRequest>
+                    for WatchTimelineSvc<T> {
+                        type Response = super::WatchTimelineResponse;
+                        type ResponseStream = T::WatchTimelineStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::WatchTimelineRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::watch_timeline(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WatchTimelineSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/SubmitUserMessage" => {
+                    #[allow(non_camel_case_types)]
+                    struct SubmitUserMessageSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::SubmitUserMessageRequest>
+                    for SubmitUserMessageSvc<T> {
+                        type Response = super::SubmitUserMessageResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SubmitUserMessageRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::submit_user_message(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SubmitUserMessageSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/RespondExternalRequest" => {
+                    #[allow(non_camel_case_types)]
+                    struct RespondExternalRequestSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::RespondExternalRequestRequest>
+                    for RespondExternalRequestSvc<T> {
+                        type Response = super::RespondExternalRequestResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RespondExternalRequestRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::respond_external_request(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RespondExternalRequestSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/InterruptSession" => {
+                    #[allow(non_camel_case_types)]
+                    struct InterruptSessionSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::InterruptSessionRequest>
+                    for InterruptSessionSvc<T> {
+                        type Response = super::InterruptSessionResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::InterruptSessionRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::interrupt_session(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InterruptSessionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
