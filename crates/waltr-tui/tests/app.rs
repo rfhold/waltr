@@ -1838,11 +1838,27 @@ const fn ready_snapshot() -> ClientSnapshot {
                 error: None,
                 key: None,
             },
+            submit_user_message: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            respond_external_request: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            interrupt: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
             watch: OperationSnapshot {
                 status: "idle",
                 error: None,
                 key: None,
             },
+            timelines: BTreeMap::new(),
         },
     }
 }

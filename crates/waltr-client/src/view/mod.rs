@@ -22,9 +22,9 @@ mod tests {
     use ts_rs::TS as _;
 
     use crate::{
-        ClientCommand, ClientOperationView, ClientSnapshot, ConfigSnapshot, Configuration,
-        OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType, SessionSnapshot,
-        StatusSnapshot,
+        ClientCommand, ClientOperationView, ClientSnapshot, ClientTimelineDirection,
+        ConfigSnapshot, Configuration, OperationCollectionSnapshot, OperationSnapshot, Provider,
+        ProviderType, SessionSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -102,6 +102,7 @@ mod tests {
             StatusSnapshot::decl(),
             SessionSnapshot::decl(),
             ClientSnapshot::decl(),
+            ClientTimelineDirection::decl(),
             ClientCommand::decl(),
         ]
         .join("\n\n")

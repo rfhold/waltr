@@ -671,9 +671,10 @@ impl ClientUpdate {
 mod tests {
     use super::*;
 
+    use crate::transport::SessionTimelineWatchUpdate;
     use crate::{
         ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary, SessionWatchEvent,
-        SessionWatchUpdate, StatusEffect, StreamEvent, StreamStatus, SystemStatus,
+        SessionWatchUpdate, StatusEffect, StreamEvent, StreamStatus, SystemStatus, TimelineEvent,
         watch_reconnect_delay_ms,
     };
 
@@ -1040,6 +1041,35 @@ mod tests {
             client.state().sessions.watch.status,
             OperationStatus::Received
         );
+    }
+
+    #[test]
+    fn session_timeline_page_loads_merge_by_cursor() {
+        let mut client = Client::new();
+
+        client.apply(ClientEvent::Session(SessionEvent::TimelineWatchChanged(
+            SessionTimelineWatchUpdate {
+                sequence: 1,
+                event: timeline_event(10),
+            },
+        )));
+        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
+            session_id: "session".to_owned(),
+            events: vec![timeline_event(8), timeline_event(9)],
+        }));
+
+        let timeline = client
+            .state()
+            .sessions
+            .timelines
+            .get("session")
+            .expect("timeline exists");
+        assert_eq!(
+            timeline.events.keys().copied().collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        assert_eq!(timeline.load.status, OperationStatus::Ready);
+        assert_eq!(timeline.watch.status, OperationStatus::Received);
     }
 
     #[test]
@@ -1509,6 +1539,14 @@ mod tests {
         SessionSummary {
             id: id.to_owned(),
             ..SessionSummary::default()
+        }
+    }
+
+    fn timeline_event(cursor: u64) -> TimelineEvent {
+        TimelineEvent {
+            cursor,
+            session_id: "session".to_owned(),
+            ..TimelineEvent::default()
         }
     }
 

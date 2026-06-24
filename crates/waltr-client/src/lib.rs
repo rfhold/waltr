@@ -19,8 +19,8 @@ pub use coordination::event::{
 };
 pub use coordination::runtime::{
     ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime, ClientSnapshot,
-    ClientStateStream, ClientStateStreamEvent, ConfigSnapshot, OperationCollectionSnapshot,
-    OperationSnapshot, SessionSnapshot, StatusSnapshot,
+    ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
+    OperationCollectionSnapshot, OperationSnapshot, SessionSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
     ClientOperationState, ClientState, ConfigClientState, OperationKey, OperationState,
