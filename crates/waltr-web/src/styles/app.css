@@ -481,6 +481,7 @@
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
+  overflow-anchor: none;
   padding: clamp(1rem, 3vw, 2.75rem) clamp(1rem, 3vw, 2.75rem) 0;
 }
 
@@ -503,6 +504,10 @@
   list-style: none;
 }
 
+.sessions__timeline-virtual-item {
+  padding-bottom: var(--space-4);
+}
+
 .sessions__timeline-item {
   max-width: min(48rem, 100%);
   border-left: 3px solid transparent;
@@ -519,6 +524,7 @@
 }
 
 .sessions__timeline-item--tool {
+  max-width: 100%;
   color: var(--color-text-muted);
 }
 
@@ -532,6 +538,123 @@
   font-size: 0.9rem;
   font-weight: 700;
   letter-spacing: 0.06em;
+}
+
+.sessions__markdown {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+  color: var(--color-text);
+}
+
+.sessions__markdown :where(p, blockquote, ul, ol, h1, h2, h3, h4, h5, h6, table, pre),
+.sessions__code-block {
+  margin: 0;
+}
+
+.sessions__markdown :where(h1, h2, h3, h4, h5, h6) {
+  color: var(--color-text);
+  line-height: 1.2;
+}
+
+.sessions__markdown h1 {
+  font-size: 1.35rem;
+}
+
+.sessions__markdown h2 {
+  font-size: 1.18rem;
+}
+
+.sessions__markdown :where(h3, h4, h5, h6) {
+  font-size: 1rem;
+}
+
+.sessions__markdown :where(ul, ol) {
+  padding-left: 1.25rem;
+}
+
+.sessions__markdown blockquote {
+  border-left: 2px solid var(--border-subtle);
+  padding-left: var(--space-3);
+  color: var(--color-text-muted);
+}
+
+.sessions__markdown a {
+  color: var(--color-accent);
+}
+
+.sessions__inline-code {
+  color: var(--color-accent);
+  font: 0.88em/1.35 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
+.sessions__markdown-table {
+  overflow-x: auto;
+}
+
+.sessions__markdown table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+
+.sessions__markdown :where(th, td) {
+  border: 1px solid var(--border-subtle);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.sessions__code-block {
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+}
+
+.sessions__code-block-header {
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 0.35rem var(--space-3);
+  color: var(--color-text-muted);
+  font: 0.76rem/1.2 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sessions__code-block-body,
+.sessions__code-block-highlight pre {
+  overflow-x: auto;
+  margin: 0;
+  padding: var(--space-3);
+  background: transparent !important;
+  color: var(--color-text);
+  font: 0.88rem/1.45 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
+.sessions__code-block-body code,
+.sessions__code-block-highlight code {
+  font: inherit;
+}
+
+.sessions__code-block-highlight {
+  min-width: 0;
+}
+
+.sessions__shell-command {
+  border-color: transparent;
+  border-left: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: transparent;
+}
+
+.sessions__shell-command .sessions__code-block-header {
+  display: none;
+}
+
+.sessions__shell-command .sessions__code-block-body,
+.sessions__shell-command .sessions__code-block-highlight pre {
+  padding: 0.25rem 0 0.25rem var(--space-3);
 }
 
 .sessions__timeline-tool-loading {
@@ -551,6 +674,7 @@
 .sessions__shell-tool {
   display: grid;
   gap: var(--space-2);
+  width: 100%;
   color: var(--color-text-muted);
 }
 
@@ -585,6 +709,32 @@
 
 .sessions__shell-tool--error .sessions__tool-terminal {
   border-left-color: var(--border-danger);
+}
+
+.sessions__shell-output {
+  display: grid;
+  min-width: 0;
+}
+
+.sessions__shell-output[role="button"] {
+  cursor: pointer;
+}
+
+.sessions__shell-output[role="button"]:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.sessions__shell-output--collapsed:hover .sessions__tool-terminal,
+.sessions__shell-output--collapsed:focus-visible .sessions__tool-terminal {
+  color: var(--color-text-muted);
+}
+
+.sessions__shell-output-expand {
+  border-left: 1px solid var(--border-subtle);
+  padding: 0.1rem 0 0.2rem var(--space-3);
+  color: var(--color-accent);
+  font: 0.78rem/1.45 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
 }
 
 .sessions__file-tool {
@@ -708,22 +858,71 @@
 }
 
 .sessions__tool-diff-line {
+  display: grid;
+  grid-template-columns: 2.4rem minmax(0, 1fr);
+  gap: 0.35rem;
+  min-width: max-content;
   margin: 0;
+  border-left: 2px solid transparent;
+  padding: 0.08rem 0.6rem 0.08rem 0;
+  color: var(--color-text);
+  font: inherit;
   white-space: pre-wrap;
 }
 
+.sessions__tool-diff-prefix {
+  color: var(--color-text-subtle);
+  text-align: right;
+  user-select: none;
+}
+
+.sessions__tool-diff-code {
+  min-width: 0;
+}
+
 .sessions__tool-diff-line--add {
+  border-left-color: #22c55e;
+  background: rgba(34, 197, 94, 0.12);
   color: #86efac;
 }
 
 .sessions__tool-diff-line--remove {
+  border-left-color: #ef4444;
+  background: rgba(239, 68, 68, 0.13);
   color: #fca5a5;
 }
 
 .sessions__tool-diff-line--file,
 .sessions__tool-diff-line--meta {
+  border-left-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent-soft) 42%, transparent);
   color: var(--color-accent);
   font-weight: 700;
+}
+
+.sessions__tool-diff-line--context {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.sessions__highlighted-code,
+.sessions__highlighted-code-fallback {
+  display: contents;
+}
+
+.sessions__highlighted-code pre {
+  display: inline;
+  overflow: visible;
+  margin: 0;
+  padding: 0;
+  background: transparent !important;
+  color: inherit;
+  font: inherit;
+  white-space: pre-wrap;
+}
+
+.sessions__highlighted-code code,
+.sessions__highlighted-code-fallback {
+  font: inherit;
 }
 
 .sessions__tool-result {

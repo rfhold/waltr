@@ -11,8 +11,19 @@
     "wasm:build": "cargo build -p waltr-client --lib --features wasm --target wasm32-unknown-unknown && wasm-bindgen --target web --out-dir generated/wasm --out-name waltr_client ../../target/wasm32-unknown-unknown/debug/waltr_client.wasm"
   },
   "dependencies": {
+    "@shikijs/core": "^4.2.0",
+    "@shikijs/engine-javascript": "^4.2.0",
+    "@shikijs/langs": "^4.2.0",
+    "@shikijs/themes": "^4.2.0",
     "@solidjs/router": "0.16.1",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-rehype": "^11.1.2",
+    "shiki": "^4.2.0",
     "solid-js": "1.9.13",
+    "unified": "^11.0.5",
+    "virtua": "^0.49.1",
     "vite": "7.2.4",
     "vite-plugin-solid": "2.11.8"
   },

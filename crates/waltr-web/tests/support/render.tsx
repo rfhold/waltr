@@ -24,6 +24,7 @@ export function renderWithAppState(
     configPatchError?: string;
     sessionCreateError?: string;
     sessionDeleteError?: string;
+    onSnapshotSetter?: (setSnapshot: (snapshot: ClientSnapshot) => void) => void;
   } = {},
 ) {
   const commands = options.commands ?? [];
@@ -34,6 +35,7 @@ export function renderWithAppState(
     const [snapshot, setSnapshot] = createSignal<ClientSnapshot | undefined>(
       options.snapshot,
     );
+    options.onSnapshotSetter?.(setSnapshot);
     const systemReady = createMemo(() => snapshot()?.status.ready ?? false);
     const phase = createMemo(() => systemReady() ? "ready" : "splash");
     const dispatch = async (command: ClientCommand) => {
