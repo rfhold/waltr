@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use crate::permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState};
 use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
-    ModelRef, PendingTimelineEvent, PermissionClaim, PermissionLevel, PermissionPolicy,
+    ModelRef, PendingTimelineEvent, PermissionClaim, PermissionLevel, PermissionOperation,
+    PermissionPattern, PermissionPolicy, PermissionResource, PermissionResourcePattern,
     PermissionResponse, Result, TimelineChannel, TimelineContent, TimelineEventKind,
     TimelineItemId, ToolCall, ToolDefinition, ToolExecutionContext, ToolProgressSink, ToolResult,
     TurnItem,
@@ -36,9 +37,9 @@ use super::{
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, ExternalResponse, RequestId, RequestRecord,
-        ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent, SessionRecord,
-        SessionSnapshot, SessionStore, SessionStoreError, SessionTimelineBroadcaster,
-        Suspension as SessionSuspension,
+        ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent,
+        SessionListBroadcaster, SessionListEvent, SessionRecord, SessionSnapshot, SessionStore,
+        SessionStoreError, SessionTimelineBroadcaster, Suspension as SessionSuspension,
     },
 };
 
@@ -60,6 +61,7 @@ where
     session_id: SessionId,
     session_revision: Revision,
     session_store: S,
+    session_broadcaster: Option<SessionListBroadcaster>,
     timeline_broadcaster: Option<SessionTimelineBroadcaster>,
     session_initialized: bool,
     middleware_state: MiddlewareStateLog,
@@ -120,6 +122,7 @@ where
             session_id: run.session_id,
             session_revision: Revision::ZERO,
             session_store: run.session_store,
+            session_broadcaster: run.session_broadcaster,
             timeline_broadcaster: run.timeline_broadcaster,
             session_initialized: false,
             middleware_state: MiddlewareStateLog::default(),
@@ -835,6 +838,12 @@ where
             .append_journal(&self.session_id, self.session_revision, events)
             .await
             .map_err(session_store_error)?;
+        Self::publish_session_summary(
+            self.session_store.clone(),
+            self.session_id.clone(),
+            self.session_broadcaster.clone(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -878,6 +887,12 @@ where
             timeline.publish_all(assigned.clone());
         }
         self.session_revision = self.session_revision.next();
+        Self::publish_session_summary(
+            self.session_store.clone(),
+            self.session_id.clone(),
+            self.session_broadcaster.clone(),
+        )
+        .await?;
         Ok(assigned)
     }
 
@@ -1000,12 +1015,28 @@ where
     }
 
     fn session_runtime(&self) -> AgentSessionRuntime<'_, S> {
-        let runtime = AgentSessionRuntime::new(&self.session_store);
+        let mut runtime = AgentSessionRuntime::new(&self.session_store);
+        if let Some(sessions) = &self.session_broadcaster {
+            runtime = runtime.with_session_broadcaster(sessions.clone());
+        }
         if let Some(timeline) = &self.timeline_broadcaster {
             runtime.with_timeline_broadcaster(timeline.clone())
         } else {
             runtime
         }
+    }
+
+    async fn publish_session_summary(
+        store: S,
+        session_id: SessionId,
+        sessions: Option<SessionListBroadcaster>,
+    ) -> Result<()> {
+        let Some(sessions) = sessions else {
+            return Ok(());
+        };
+        let record = store.load(&session_id).await.map_err(session_store_error)?;
+        sessions.publish(SessionListEvent::Upsert(record.summary()));
+        Ok(())
     }
 }
 
@@ -1224,6 +1255,7 @@ fn permission_suspension(
                 })
             })
             .collect::<Vec<_>>(),
+        "patterns": permission_patterns(claims),
     });
     middleware::Suspension::external(
         "permission",
@@ -1236,6 +1268,44 @@ fn permission_suspension(
             status: middleware::ExternalRequestStatus::Pending,
         },
     )
+}
+
+fn permission_patterns(claims: &[PermissionClaim]) -> Vec<PermissionPattern> {
+    let mut patterns = Vec::new();
+    for claim in claims {
+        let Some(pattern) = permission_pattern(claim) else {
+            continue;
+        };
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
+    patterns
+}
+
+fn permission_pattern(claim: &PermissionClaim) -> Option<PermissionPattern> {
+    let resource = match &claim.resource {
+        PermissionResource::FilesystemPath(path) => {
+            let parent = path.parent().unwrap_or(path.as_path()).to_path_buf();
+            PermissionResourcePattern::FilesystemPathPrefix(parent)
+        }
+        PermissionResource::FilesystemPathPrefix(path) => {
+            PermissionResourcePattern::FilesystemPathPrefix(path.clone())
+        }
+        PermissionResource::WorkingDirectory(path) => {
+            PermissionResourcePattern::WorkingDirectoryPrefix(path.clone())
+        }
+        PermissionResource::ShellCommand(command) => {
+            return Some(PermissionPattern {
+                operation: Some(PermissionOperation::Execute),
+                resource: PermissionResourcePattern::ShellCommand(command.clone()),
+            });
+        }
+    };
+    Some(PermissionPattern {
+        operation: Some(claim.operation),
+        resource,
+    })
 }
 
 fn permission_retry_tool_call(

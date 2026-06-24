@@ -9,8 +9,8 @@ use waltr_agent::{
     CancelReason, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
     PendingWorkStatus, PermissionEffect, PermissionOperation, PermissionPattern, PermissionPolicy,
-    PermissionResponse, PermissionToolSelector, ProviderId, ResumeInput, RuntimeResumeOutput,
-    SessionStatus, SessionStore, TimelineContent, ToolCall,
+    PermissionResourcePattern, PermissionResponse, PermissionToolSelector, ProviderId, ResumeInput,
+    RuntimeResumeOutput, SessionStatus, SessionStore, TimelineContent, ToolCall,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -108,6 +108,20 @@ async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
     assert_eq!(request.kind, ExternalRequestKind::Permission);
     assert_eq!(request.tool_call_id.as_deref(), Some("call_2"));
     assert!(request.prompt.contains("external.txt"), "{request:#?}");
+    let patterns = serde_json::from_value::<Vec<PermissionPattern>>(
+        request
+            .payload
+            .get("patterns")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )?;
+    assert!(
+        patterns.contains(&PermissionPattern {
+            operation: Some(PermissionOperation::Read),
+            resource: PermissionResourcePattern::FilesystemPathPrefix(fixture.outside.path()),
+        }),
+        "permission request should include directory-wide outside approval pattern: {patterns:#?}"
+    );
     assert!(
         request
             .id

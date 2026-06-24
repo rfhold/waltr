@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{LlmStream, ModelRef, PermissionPolicy};
 use tokio_util::sync::CancellationToken;
 
-use super::watch::SessionTimelineBroadcaster;
+use super::watch::{SessionListBroadcaster, SessionTimelineBroadcaster};
 use super::{ResumeInput, SessionId, SessionStore};
 use crate::middleware::{chain::MiddlewareChain, prompt::SystemPromptOverride};
 
@@ -24,6 +24,7 @@ where
     pub permission_policy: PermissionPolicy,
     pub session_id: SessionId,
     pub session_store: S,
+    pub session_broadcaster: Option<SessionListBroadcaster>,
     pub timeline_broadcaster: Option<SessionTimelineBroadcaster>,
     pub cancellation_token: CancellationToken,
 }

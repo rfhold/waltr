@@ -5,6 +5,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
+default = ["shell"]
 shell = ["dep:tree-sitter", "dep:tree-sitter-bash"]
 
 [dependencies]
