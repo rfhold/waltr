@@ -1,4 +1,5 @@
 import { A, useNavigate, useParams } from "@solidjs/router";
+import { Virtualizer, type CustomContainerComponentProps, type CustomItemComponentProps, type VirtualizerHandle } from "virtua/solid";
 import {
   For,
   Match,
@@ -18,7 +19,10 @@ import {
 } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { CodeBlock, HighlightedCode } from "../../components/markdown/CodeBlock";
+import { MarkdownMessage } from "../../components/markdown/MarkdownMessage";
 import { ConfirmAction, Dialog, InlineAlert } from "../../components/ui";
+import { languageFromFilePath } from "../../web-lib/language";
 import type {
   ClientCommand,
   ConfigView,
@@ -41,6 +45,9 @@ const TIMELINE_CHANNELS = [
   "tool_result",
   "external_request",
 ];
+const TIMELINE_PAGE_SIZE = 64;
+const TIMELINE_TOP_LOAD_THRESHOLD_PX = 320;
+const SHELL_OUTPUT_RECENT_LINE_COUNT = 15;
 
 const EXTERNAL_REQUEST_PERMISSION = 1;
 const EXTERNAL_REQUEST_QUESTION = 2;
@@ -322,13 +329,25 @@ function SessionDetail(props: { session: SessionView }) {
   const [editingRuntime, setEditingRuntime] = createSignal<"provider" | "mcp">();
   const [draft, setDraft] = createSignal("");
   const [commandError, setCommandError] = createSignal<string>();
+  const [expandedShellOutputs, setExpandedShellOutputs] = createSignal<Record<string, boolean>>({});
+  const [historyShift, setHistoryShift] = createSignal(false);
   let timelineScroll: HTMLDivElement | undefined;
+  let timelineVirtualizer: VirtualizerHandle | undefined;
   let registeredTimelineSession: string | undefined;
   let previousTimelineItemKeys: string[] = [];
+  let initialScrollSession: string | undefined;
+  let pendingHistoryCursor: SessionTimelineView["events"][number]["cursor"] | undefined;
+  let exhaustedHistoryCursor: SessionTimelineView["events"][number]["cursor"] | undefined;
+  let followTail = true;
+  let lastTimelineScrollTop: number | undefined;
+  let viewportUpdateFrame: number | undefined;
+  let viewportUpdateShouldStickToTail = false;
+  let clearHistoryShiftFrame: number | undefined;
 
   const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[props.session.id]);
   const active = createMemo(() => sessionActive(props.session));
   const items = createMemo(() => timelineItems(timeline()));
+  const testKeepMountedIndexes = createMemo(() => import.meta.env.MODE === "test" ? items().map((_, index) => index) : undefined);
   const working = createMemo(() => active() && !hasOpenExternalPrompt(items()));
   const importantStatus = createMemo(() => sessionImportantStatus(props.session, working(), timeline()?.watch.error));
   const timelineReady = createMemo(() => {
@@ -352,6 +371,15 @@ function SessionDetail(props: { session: SessionView }) {
     }
 
     registeredTimelineSession = sessionId;
+    initialScrollSession = undefined;
+    pendingHistoryCursor = undefined;
+    exhaustedHistoryCursor = undefined;
+    followTail = true;
+    lastTimelineScrollTop = undefined;
+    cancelScheduledTimelineViewportUpdate();
+    cancelScheduledHistoryShiftClear();
+    setHistoryShift(false);
+    previousTimelineItemKeys = [];
     void (async () => {
       try {
         await app.dispatch({
@@ -359,7 +387,7 @@ function SessionDetail(props: { session: SessionView }) {
           sessionId,
           afterCursor: null,
           channels: TIMELINE_CHANNELS,
-          initialLimit: 256,
+          initialLimit: TIMELINE_PAGE_SIZE,
         });
       } catch (error) {
         setCommandError(error instanceof Error ? error.message : "Unable to watch session timeline.");
@@ -368,6 +396,8 @@ function SessionDetail(props: { session: SessionView }) {
   });
 
   onCleanup(() => {
+    cancelScheduledTimelineViewportUpdate();
+    cancelScheduledHistoryShiftClear();
     if (!registeredTimelineSession) {
       return;
     }
@@ -379,19 +409,174 @@ function SessionDetail(props: { session: SessionView }) {
   });
 
   createEffect(() => {
+    const currentTimeline = timeline();
     const currentItems = items();
     const scroller = timelineScroll;
+    const sessionId = props.session.id;
+    reconcilePendingHistory(currentTimeline);
     const itemKeys = currentItems.map(timelineItemKey);
     const hasNewExternalPrompt = currentItems.some((item) => isExternalPromptItem(item) && !previousTimelineItemKeys.includes(timelineItemKey(item)));
     previousTimelineItemKeys = itemKeys;
-    if (!scroller || (!hasNewExternalPrompt && !isNearScrollBottom(scroller))) {
+    if (hasNewExternalPrompt) {
+      followTail = true;
+    }
+    const shouldInitialScroll = currentItems.length > 0 && initialScrollSession !== sessionId;
+
+    if (!scroller) {
       return;
     }
 
-    queueMicrotask(() => {
-      scroller.scrollTop = scroller.scrollHeight;
+    if (!shouldInitialScroll && !followTail) {
+      return;
+    }
+
+    scheduleTimelineScroll(() => {
+      if (initialScrollSession !== sessionId && currentItems.length > 0) {
+        initialScrollSession = sessionId;
+        if (followTail) {
+          scrollTimelineToBottom(scroller);
+          rememberTimelineScrollTop(scroller);
+        }
+        maybeLoadOlderTimeline();
+        return;
+      }
+
+      if (followTail) {
+        scrollTimelineToBottom(scroller);
+        rememberTimelineScrollTop(scroller);
+      }
+      maybeLoadOlderTimeline();
     });
   });
+
+  const scheduleTimelineViewportUpdate = (scroller: HTMLElement, options: { stickToTail?: boolean; updateFollowTail?: boolean } = {}) => {
+    viewportUpdateShouldStickToTail = viewportUpdateShouldStickToTail || options.stickToTail === true;
+    const followTailUpdated = options.updateFollowTail !== false;
+    if (followTailUpdated) {
+      updateTimelineFollowTail(scroller);
+    }
+
+    if (viewportUpdateFrame !== undefined) {
+      return;
+    }
+
+    viewportUpdateFrame = requestAnimationFrame(() => {
+      viewportUpdateFrame = undefined;
+      const shouldStickToTail = viewportUpdateShouldStickToTail;
+      viewportUpdateShouldStickToTail = false;
+      if (shouldStickToTail && followTail) {
+        scrollTimelineToBottom(scroller);
+        rememberTimelineScrollTop(scroller);
+      }
+      if (followTailUpdated) {
+        maybeLoadOlderTimeline();
+      } else {
+        updateTimelineViewport(scroller);
+      }
+    });
+  };
+
+  const cancelScheduledTimelineViewportUpdate = () => {
+    if (viewportUpdateFrame !== undefined) {
+      cancelAnimationFrame(viewportUpdateFrame);
+      viewportUpdateFrame = undefined;
+    }
+    viewportUpdateShouldStickToTail = false;
+  };
+
+  const cancelScheduledHistoryShiftClear = () => {
+    if (clearHistoryShiftFrame !== undefined) {
+      cancelAnimationFrame(clearHistoryShiftFrame);
+      clearHistoryShiftFrame = undefined;
+    }
+  };
+
+  const scheduleHistoryShiftClear = () => {
+    cancelScheduledHistoryShiftClear();
+    clearHistoryShiftFrame = requestAnimationFrame(() => {
+      clearHistoryShiftFrame = undefined;
+      setHistoryShift(false);
+    });
+  };
+
+  const updateTimelineViewport = (scroller: HTMLElement, options: { topBoundary?: "near" | "strict" } = {}) => {
+    updateTimelineFollowTail(scroller);
+    maybeLoadOlderTimeline(options);
+  };
+
+  const updateTimelineFollowTail = (scroller: HTMLElement) => {
+    if (lastTimelineScrollTop === undefined || scroller.scrollTop !== lastTimelineScrollTop) {
+      followTail = isNearScrollBottom(scroller);
+    }
+    rememberTimelineScrollTop(scroller);
+  };
+
+  const rememberTimelineScrollTop = (scroller: HTMLElement) => {
+    lastTimelineScrollTop = scroller.scrollTop;
+  };
+
+  const maybeLoadOlderTimeline = (options: { topBoundary?: "near" | "strict" } = {}) => {
+    const scroller = timelineScroll;
+    if (!scroller) {
+      return;
+    }
+
+    if (!isScrollable(scroller)) {
+      void loadOlderTimeline({ preserveAnchor: false });
+      return;
+    }
+
+    const nearTop = options.topBoundary === "strict" ? isStrictlyNearScrollTop(scroller) : isNearScrollTop(scroller);
+    if (!followTail && nearTop) {
+      void loadOlderTimeline();
+    }
+  };
+
+  const reconcilePendingHistory = (currentTimeline: SessionTimelineView | undefined) => {
+    if (pendingHistoryCursor === undefined || !currentTimeline || currentTimeline.load.status === "loading") {
+      return;
+    }
+
+    const requestedCursor = pendingHistoryCursor;
+    pendingHistoryCursor = undefined;
+    if (currentTimeline.load.status === "failed") {
+      scheduleHistoryShiftClear();
+      return;
+    }
+
+    if (currentTimeline.events[0]?.cursor === requestedCursor) {
+      exhaustedHistoryCursor = requestedCursor;
+    }
+    scheduleHistoryShiftClear();
+  };
+
+  const loadOlderTimeline = async (options: { preserveAnchor: boolean } = { preserveAnchor: true }) => {
+    const scroller = timelineScroll;
+    const currentTimeline = timeline();
+    const earliestCursor = currentTimeline?.events[0]?.cursor;
+
+    if (!scroller || !currentTimeline || earliestCursor === undefined || pendingHistoryCursor !== undefined || exhaustedHistoryCursor === earliestCursor || currentTimeline.load.status === "loading") {
+      return;
+    }
+
+    pendingHistoryCursor = earliestCursor;
+    setHistoryShift(options.preserveAnchor);
+    setCommandError(undefined);
+    try {
+      await app.dispatch({
+        type: "requestSessionTimeline",
+        sessionId: props.session.id,
+        direction: "backward",
+        cursor: earliestCursor,
+        limit: TIMELINE_PAGE_SIZE,
+        channels: TIMELINE_CHANNELS,
+      });
+    } catch (error) {
+      pendingHistoryCursor = undefined;
+      scheduleHistoryShiftClear();
+      setCommandError(error instanceof Error ? error.message : "Unable to load earlier history.");
+    }
+  };
 
   const submit = async () => {
     const text = draft().trim();
@@ -431,9 +616,26 @@ function SessionDetail(props: { session: SessionView }) {
     }
   };
 
+  const scrollTimelineToBottom = (scroller: HTMLElement) => {
+    const scrollSize = import.meta.env.MODE === "test" ? scroller.scrollHeight : timelineVirtualizer?.scrollSize ?? scroller.scrollHeight;
+    timelineVirtualizer?.scrollTo(scrollSize);
+    scroller.scrollTop = scrollSize;
+  };
+
   return (
     <div class="sessions__detail-page">
-      <div class="sessions__detail-main" ref={timelineScroll} aria-label="Session timeline">
+      <div
+        class="sessions__detail-main"
+        ref={timelineScroll}
+        aria-label="Session timeline"
+        onWheel={(event) => scheduleTimelineViewportUpdate(event.currentTarget)}
+        onKeyDown={(event) => {
+          if (isScrollKey(event.key)) {
+            scheduleTimelineViewportUpdate(event.currentTarget);
+          }
+        }}
+        onScroll={(event) => scheduleTimelineViewportUpdate(event.currentTarget)}
+      >
         <Show when={sessions.deleteErrors()[props.session.id]}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>
@@ -442,15 +644,35 @@ function SessionDetail(props: { session: SessionView }) {
           when={items().length > 0}
           fallback={<p class="sessions__timeline-empty">No messages yet.</p>}
         >
-          <ol class="sessions__timeline" aria-label="Timeline messages">
-            <For each={items()}>
-              {(item) => (
-                <li class={`sessions__timeline-item sessions__timeline-item--${item.kind}`}>
-                  <TimelineItem item={item} onRespond={respond} onInterrupt={interrupt} />
-                </li>
-              )}
-            </For>
-          </ol>
+          <Virtualizer
+            as={TimelineVirtualizerList}
+            item={TimelineVirtualizerItem}
+            data={items()}
+            shift={historyShift()}
+            keepMounted={testKeepMountedIndexes()}
+            scrollRef={timelineScroll}
+            ref={(handle) => {
+              timelineVirtualizer = handle;
+            }}
+            onScroll={(offset) => {
+              if (timelineScroll) {
+                timelineScroll.scrollTop = offset;
+                scheduleTimelineViewportUpdate(timelineScroll);
+              }
+            }}
+          >
+            {(item) => (
+              <div class={`sessions__timeline-item sessions__timeline-item--${item.kind}`} data-timeline-item-key={timelineItemKey(item)}>
+                <TimelineItem
+                  item={item}
+                  expandedShellOutputs={expandedShellOutputs()}
+                  onSetShellOutputExpanded={(id, expanded) => setExpandedShellOutputs((current) => ({ ...current, [id]: expanded }))}
+                  onRespond={respond}
+                  onInterrupt={interrupt}
+                />
+              </div>
+            )}
+          </Virtualizer>
         </Show>
       </div>
       <div
@@ -536,8 +758,33 @@ type ToolTimelineItem = {
   progressError: string;
 };
 
+function TimelineVirtualizerList(props: CustomContainerComponentProps) {
+  return (
+    <ol ref={props.ref} class="sessions__timeline" aria-label="Timeline messages" style={props.style}>
+      {props.children}
+    </ol>
+  );
+}
+
+function TimelineVirtualizerItem(props: CustomItemComponentProps) {
+  const style = () => ({
+    ...props.style,
+    visibility: import.meta.env.MODE === "test" ? undefined : props.style.visibility,
+  });
+
+  return (
+    <li ref={props.ref} style={style()}>
+      <div class="sessions__timeline-virtual-item">
+        {props.children}
+      </div>
+    </li>
+  );
+}
+
 function TimelineItem(props: {
   item: TimelineItemModel;
+  expandedShellOutputs: Record<string, boolean>;
+  onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
   onInterrupt: () => Promise<void>;
 }) {
@@ -546,10 +793,16 @@ function TimelineItem(props: {
   return (
     <Switch>
       <Match when={textTimelineItem(item())}>
-        {(textItem) => <p class="sessions__timeline-text">{textItem().text}</p>}
+        {(textItem) => <TextTimelineItemView item={textItem()} />}
       </Match>
       <Match when={toolTimelineItem(item())}>
-        {(toolItem) => <ToolTimelineItemView item={toolItem()} />}
+        {(toolItem) => (
+          <ToolTimelineItemView
+            item={toolItem()}
+            expandedShellOutputs={props.expandedShellOutputs}
+            onSetShellOutputExpanded={props.onSetShellOutputExpanded}
+          />
+        )}
       </Match>
       <Match when={permissionTimelineItem(item())}>
         {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
@@ -564,11 +817,30 @@ function TimelineItem(props: {
   );
 }
 
-function ToolTimelineItemView(props: { item: ToolTimelineItem }) {
+function TextTimelineItemView(props: { item: Extract<TimelineItemModel, { kind: "user" | "assistant" | "thinking" }> }) {
+  return (
+    <Show
+      when={props.item.kind !== "thinking"}
+      fallback={<p class="sessions__timeline-text sessions__timeline-text--thinking">{props.item.text}</p>}
+    >
+      <MarkdownMessage text={props.item.text} tone={props.item.kind} />
+    </Show>
+  );
+}
+
+function ToolTimelineItemView(props: {
+  item: ToolTimelineItem;
+  expandedShellOutputs: Record<string, boolean>;
+  onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
+}) {
   return (
     <Switch fallback={<GenericToolTimelineItem item={props.item} />}>
       <Match when={props.item.name === "shell"}>
-        <ShellToolTimelineItem item={props.item} />
+        <ShellToolTimelineItem
+          item={props.item}
+          expanded={props.expandedShellOutputs[props.item.id] ?? false}
+          onSetExpanded={(expanded) => props.onSetShellOutputExpanded(props.item.id, expanded)}
+        />
       </Match>
       <Match when={props.item.name === "edit"}>
         <EditToolTimelineItem item={props.item} />
@@ -589,12 +861,32 @@ function GenericToolTimelineItem(props: { item: ToolTimelineItem }) {
   );
 }
 
-function ShellToolTimelineItem(props: { item: ToolTimelineItem }) {
+function ShellToolTimelineItem(props: { item: ToolTimelineItem; expanded: boolean; onSetExpanded: (expanded: boolean) => void }) {
   const command = () => stringInput(props.item.input.command) || "(empty command)";
   const description = () => stringInput(props.item.input.description) || "Shell command";
   const output = () => props.item.progressInfo || props.item.progressError
     ? `${props.item.progressInfo}${props.item.progressError}`
     : props.item.resultContent;
+  const outputLines = createMemo(() => {
+    const lines = output().split("\n");
+    return lines.at(-1) === "" ? lines.slice(0, -1) : lines;
+  });
+  const canCollapse = () => outputLines().length > SHELL_OUTPUT_RECENT_LINE_COUNT;
+  const expanded = () => props.expanded;
+  const visibleOutput = () => canCollapse() && !expanded()
+    ? outputLines().slice(-SHELL_OUTPUT_RECENT_LINE_COUNT).join("\n")
+    : output();
+  const toggleOutput = () => {
+    if (canCollapse()) {
+      props.onSetExpanded(!expanded());
+    }
+  };
+  const toggleOutputFromKey = (event: KeyboardEvent) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleOutput();
+    }
+  };
 
   return (
     <section class={`sessions__shell-tool sessions__shell-tool--${props.item.state}`} aria-label="Shell tool">
@@ -602,7 +894,22 @@ function ShellToolTimelineItem(props: { item: ToolTimelineItem }) {
         <strong>{description()}</strong>
         <ToolStateText state={props.item.state} />
       </p>
-      <pre class="sessions__tool-terminal"><code>{`$ ${command()}${output() ? `\n${output()}` : ""}`}</code></pre>
+      <CodeBlock code={`$ ${command()}`} language="bash" label="command" class="sessions__shell-command" />
+      <Show when={output()}>
+        <div
+          class={`sessions__shell-output${canCollapse() && !expanded() ? " sessions__shell-output--collapsed" : ""}`}
+          role={canCollapse() ? "button" : undefined}
+          tabIndex={canCollapse() ? 0 : undefined}
+          aria-label={canCollapse() ? `Shell output ${expanded() ? "expanded" : `truncated to last ${SHELL_OUTPUT_RECENT_LINE_COUNT} of ${outputLines().length} lines`}. Click to ${expanded() ? "collapse" : "expand"}.` : undefined}
+          onClick={toggleOutput}
+          onKeyDown={toggleOutputFromKey}
+        >
+          <Show when={canCollapse() && !expanded()}>
+            <span class="sessions__shell-output-expand">... click to expand</span>
+          </Show>
+          <pre class="sessions__tool-terminal"><code>{visibleOutput()}</code></pre>
+        </div>
+      </Show>
     </section>
   );
 }
@@ -611,6 +918,7 @@ function EditToolTimelineItem(props: { item: ToolTimelineItem }) {
   const filePath = () => stringInput(props.item.input.filePath) || "Unknown file";
   const oldString = () => stringInput(props.item.input.oldString);
   const newString = () => stringInput(props.item.input.newString);
+  const language = () => languageFromFilePath(filePath());
 
   return (
     <section class={`sessions__file-tool sessions__file-tool--${props.item.state}`} aria-label="Edit tool">
@@ -623,10 +931,10 @@ function EditToolTimelineItem(props: { item: ToolTimelineItem }) {
         <DiffLine kind="file" text={`--- ${filePath()}`} />
         <DiffLine kind="file" text={`+++ ${filePath()}`} />
         <For each={diffTextLines(oldString(), "remove")}>
-          {(line) => <DiffLine kind={line.kind} text={line.text} />}
+          {(line) => <DiffLine kind={line.kind} text={line.text} language={language()} />}
         </For>
         <For each={diffTextLines(newString(), "add")}>
-          {(line) => <DiffLine kind={line.kind} text={line.text} />}
+          {(line) => <DiffLine kind={line.kind} text={line.text} language={language()} />}
         </For>
       </div>
     </section>
@@ -645,8 +953,8 @@ function PatchToolTimelineItem(props: { item: ToolTimelineItem }) {
       </div>
       <ToolFiles files={files()} />
       <div class="sessions__tool-diff" role="region" aria-label="Patch diff">
-        <For each={patchText().split("\n")}>
-          {(line) => <DiffLine kind={patchLineKind(line)} text={line} />}
+        <For each={patchDiffLines(patchText())}>
+          {(line) => <DiffLine kind={line.kind} text={line.text} language={line.language} />}
         </For>
       </div>
       <Show when={props.item.resultContent}>
@@ -677,8 +985,22 @@ function ToolFiles(props: { files: Array<{ status: string; path: string }> }) {
   );
 }
 
-function DiffLine(props: { kind: "add" | "remove" | "file" | "meta" | "context"; text: string }) {
-  return <pre class={`sessions__tool-diff-line sessions__tool-diff-line--${props.kind}`}>{props.text}</pre>;
+function DiffLine(props: { kind: "add" | "remove" | "file" | "meta" | "context"; text: string; language?: string }) {
+  const parts = () => diffLineParts(props.text, props.kind);
+  const highlight = () => props.language && (props.kind === "add" || props.kind === "remove" || props.kind === "context");
+  return (
+    <div class={`sessions__tool-diff-line sessions__tool-diff-line--${props.kind}`}>
+      <span class="sessions__tool-diff-prefix" aria-hidden="true">{parts().prefix}</span>
+      <span class="sessions__tool-diff-code">
+        <Show
+          when={highlight()}
+          fallback={parts().code}
+        >
+          <HighlightedCode code={parts().code} language={props.language} />
+        </Show>
+      </span>
+    </div>
+  );
 }
 
 function textTimelineItem(item: TimelineItemModel) {
@@ -1119,6 +1441,23 @@ function patchFiles(patchText: string) {
   return files;
 }
 
+function patchDiffLines(patchText: string) {
+  let currentLanguage: string | undefined;
+  return patchText.split("\n").map((text) => {
+    const fileMatch = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/.exec(text);
+    if (fileMatch) {
+      currentLanguage = languageFromFilePath(fileMatch[1]);
+    }
+
+    const kind = patchLineKind(text);
+    return {
+      kind,
+      text,
+      language: kind === "add" || kind === "remove" || kind === "context" ? currentLanguage : undefined,
+    };
+  });
+}
+
 function patchFileStatus(action: string) {
   if (action === "Add") {
     return "A";
@@ -1145,8 +1484,22 @@ function patchLineKind(line: string): "add" | "remove" | "file" | "meta" | "cont
   return "context";
 }
 
+function diffLineParts(text: string, kind: "add" | "remove" | "file" | "meta" | "context") {
+  if ((kind === "add" || kind === "remove") && (text.startsWith("+ ") || text.startsWith("- "))) {
+    return { prefix: text.slice(0, 2), code: text.slice(2) };
+  }
+  if ((kind === "add" || kind === "remove") && (text.startsWith("+") || text.startsWith("-"))) {
+    return { prefix: text.slice(0, 1), code: text.slice(1) };
+  }
+  if (kind === "context" && text.startsWith(" ")) {
+    return { prefix: " ", code: text.slice(1) };
+  }
+
+  return { prefix: "", code: text };
+}
+
 function sessionActive(session: SessionView) {
-  return !["idle", "finished", "failed", "unknown", "unspecified"].includes(session.status.phase);
+  return !["idle", "suspended", "finished", "failed", "unknown", "unspecified"].includes(session.status.phase);
 }
 
 function sessionImportantStatus(session: SessionView, working: boolean, watchError?: string | null) {
@@ -1169,6 +1522,32 @@ function sessionImportantStatus(session: SessionView, working: boolean, watchErr
 
 function isNearScrollBottom(element: HTMLElement) {
   return element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+}
+
+function isScrollable(element: HTMLElement) {
+  return element.scrollHeight - element.clientHeight > 48;
+}
+
+function isNearScrollTop(element: HTMLElement) {
+  return element.scrollTop <= Math.max(TIMELINE_TOP_LOAD_THRESHOLD_PX, element.clientHeight * 0.5);
+}
+
+function isStrictlyNearScrollTop(element: HTMLElement) {
+  return element.scrollTop <= Math.max(TIMELINE_TOP_LOAD_THRESHOLD_PX * 0.5, element.clientHeight * 0.25);
+}
+
+function scheduleTimelineScroll(action: () => void) {
+  requestAnimationFrame(() => requestAnimationFrame(action));
+}
+
+function isScrollKey(key: string) {
+  return key === "ArrowUp"
+    || key === "ArrowDown"
+    || key === "PageUp"
+    || key === "PageDown"
+    || key === "Home"
+    || key === "End"
+    || key === " ";
 }
 
 function parseJsonRecord(value: string): Record<string, unknown> {
