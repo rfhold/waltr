@@ -384,6 +384,168 @@ async fn tool_progress_streams_between_call_preview_and_result() {
 }
 
 #[tokio::test]
+async fn provider_turn_can_execute_multiple_tool_calls() {
+    let requests = Arc::new(Mutex::new(0usize));
+    let provider = ScriptedProvider::new("multi_tool_provider", {
+        let requests = requests.clone();
+        move |request| {
+            let mut count = requests.lock().expect("request count");
+            let index = *count;
+            *count += 1;
+            drop(count);
+
+            match index {
+                0 => vec![
+                    Ok(CompletionEvent::ToolCall(ToolCall::new(
+                        "multi-call-1",
+                        "multi_tool",
+                        json!({ "value": 1 }),
+                    ))),
+                    Ok(CompletionEvent::ToolCall(ToolCall::new(
+                        "multi-call-2",
+                        "multi_tool",
+                        json!({ "value": 2 }),
+                    ))),
+                    Ok(CompletionEvent::Finished),
+                ],
+                1 => {
+                    let results = request.tool_results().collect::<Vec<_>>();
+                    assert_eq!(results.len(), 2, "provider should receive both results");
+                    assert_eq!(results[0].call_id, "multi-call-1");
+                    assert_eq!(results[0].content, "result-multi-call-1");
+                    assert_eq!(results[1].call_id, "multi-call-2");
+                    assert_eq!(results[1].content, "result-multi-call-2");
+                    vec![Ok(CompletionEvent::Finished)]
+                }
+                _ => panic!("unexpected provider request {index}"),
+            }
+        }
+    });
+    let tool = AgentTool::new(
+        ToolDefinition::new("multi_tool", "Return the call id.", json!({})),
+        |context| Ok(context.result(format!("result-{}", context.call().id))),
+    );
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_tool(tool)
+        .build();
+
+    let events = agent
+        .prompt("run multiple tools")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("agent event"))
+        .collect::<Vec<_>>();
+
+    let call_ids = events
+        .iter()
+        .filter_map(|event| match &event.content {
+            TimelineContent::ToolCall { call }
+                if crate::session::channel_is(event, CHANNEL_TOOL_CALL) =>
+            {
+                Some(call.id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let result_ids = events
+        .iter()
+        .filter_map(|event| match &event.content {
+            TimelineContent::ToolResult { result }
+                if crate::session::channel_is(event, CHANNEL_TOOL_RESULT) =>
+            {
+                Some(result.call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(call_ids, vec!["multi-call-1", "multi-call-2"]);
+    assert_eq!(result_ids, vec!["multi-call-1", "multi-call-2"]);
+    assert_eq!(*requests.lock().expect("request count"), 2);
+}
+
+#[tokio::test]
+async fn interrupting_multi_tool_turn_preserves_finished_results() {
+    let provider = ScriptedProvider::from_turns(
+        "multi_tool_interrupt_provider",
+        vec![vec![
+            CompletionEvent::ToolCall(ToolCall::new("finished-call", "fast_tool", json!({}))),
+            CompletionEvent::ToolCall(ToolCall::new("pending-call", "slow_tool", json!({}))),
+            CompletionEvent::Finished,
+        ]],
+    );
+    let fast_tool = AgentTool::new(
+        ToolDefinition::new("fast_tool", "Finish immediately.", json!({})),
+        |context| Ok(context.result("fast-result")),
+    );
+    let slow_tool = AgentTool::new_async(
+        ToolDefinition::new("slow_tool", "Wait for cancellation.", json!({})),
+        |context| {
+            Box::pin(async move {
+                context.cancellation_token().cancelled().await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok(context.result("should-not-finish"))
+            })
+        },
+    );
+    let agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_tool(fast_tool)
+        .with_tool(slow_tool)
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = AgentSessions::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+    let cancellation = CancellationToken::new();
+    let mut stream = sessions
+        .prompt(&agent, session_id.clone(), "run partial batch")
+        .with_cancellation_token(cancellation.clone())
+        .stream();
+
+    let mut saw_finished_result = false;
+    while let Some(event) = stream.next().await {
+        let event = event.expect("agent event");
+        if let TimelineContent::ToolResult { result } = &event.content
+            && result.call_id == "finished-call"
+        {
+            saw_finished_result = true;
+            cancellation.cancel();
+            break;
+        }
+    }
+    assert!(
+        saw_finished_result,
+        "first tool should finish before cancellation"
+    );
+    drain(stream).await;
+
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert_eq!(snapshot.turn, 0, "interrupted batch must not finish turn");
+    assert!(snapshot.pending_work.iter().any(|work| {
+        work.id == "finished-call"
+            && matches!(
+                &work.status,
+                waltr_agent::PendingWorkStatus::Finished(result)
+                    if result.content == "fast-result"
+            )
+    }));
+    assert!(snapshot.pending_work.iter().any(|work| {
+        work.id == "pending-call"
+            && matches!(
+                work.status,
+                waltr_agent::PendingWorkStatus::Canceled(
+                    waltr_agent::CancelReason::SessionInterrupted
+                )
+            )
+    }));
+}
+
+#[tokio::test]
 async fn cancellation_token_stops_running_tool_without_finishing_result() {
     let provider = ScriptedProvider::from_turns(
         "cancel_tool_provider",

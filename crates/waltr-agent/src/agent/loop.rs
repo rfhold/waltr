@@ -71,10 +71,19 @@ where
 
 enum AgentLoopPhase {
     StartTurn,
-    Streaming(BoxCompletionStream),
-    ExecuteTool(ToolCall),
-    RunningTool(RunningTool),
+    Streaming(StreamingTurn),
+    ExecuteTools(ToolBatch),
+    RunningTool(RunningTool, ToolBatch),
     Done,
+}
+
+struct StreamingTurn {
+    stream: BoxCompletionStream,
+    tool_calls: Vec<ToolCall>,
+}
+
+struct ToolBatch {
+    calls: VecDeque<ToolCall>,
 }
 
 struct RunningTool {
@@ -179,14 +188,19 @@ where
                         result = self.provider.stream_request(request) => result,
                     };
                     match stream_result {
-                        Ok(stream) => self.phase = AgentLoopPhase::Streaming(stream),
+                        Ok(stream) => {
+                            self.phase = AgentLoopPhase::Streaming(StreamingTurn {
+                                stream,
+                                tool_calls: Vec::new(),
+                            });
+                        }
                         Err(error) => {
                             self.pending_failed_session_event(&error).await;
                             return Some((Err(error), self));
                         }
                     }
                 }
-                AgentLoopPhase::Streaming(mut stream) => match tokio::select! {
+                AgentLoopPhase::Streaming(mut streaming) => match tokio::select! {
                     biased;
 
                     () = self.cancellation_token.cancelled() => {
@@ -196,7 +210,7 @@ where
                         self.phase = AgentLoopPhase::Done;
                         return None;
                     }
-                    event = stream.next() => event,
+                    event = streaming.stream.next() => event,
                 } {
                     Some(Ok(CompletionEvent::Delta(delta))) => {
                         let event = match self.append_assistant_delta(delta.clone()).await {
@@ -205,7 +219,7 @@ where
                         };
                         CompletionTurn::entry(&mut self.turns, self.turn as u64)
                             .append_assistant_text(&delta);
-                        self.phase = AgentLoopPhase::Streaming(stream);
+                        self.phase = AgentLoopPhase::Streaming(streaming);
                         return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::ThinkingDelta(delta))) => {
@@ -213,7 +227,7 @@ where
                             Ok(event) => event,
                             Err(error) => return Some((Err(error), self)),
                         };
-                        self.phase = AgentLoopPhase::Streaming(stream);
+                        self.phase = AgentLoopPhase::Streaming(streaming);
                         return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::ThinkingBlock(block))) => {
@@ -231,7 +245,7 @@ where
                         {
                             return Some((Err(error), self));
                         }
-                        self.phase = AgentLoopPhase::Streaming(stream);
+                        self.phase = AgentLoopPhase::Streaming(streaming);
                     }
                     Some(Ok(CompletionEvent::ProviderMetadata(metadata))) => {
                         CompletionTurn::entry(&mut self.turns, self.turn as u64).metadata =
@@ -247,7 +261,7 @@ where
                         {
                             return Some((Err(error), self));
                         }
-                        self.phase = AgentLoopPhase::Streaming(stream);
+                        self.phase = AgentLoopPhase::Streaming(streaming);
                     }
                     Some(Ok(CompletionEvent::ToolCall(call))) => {
                         CompletionTurn::entry(&mut self.turns, self.turn as u64)
@@ -264,10 +278,17 @@ where
                             Ok(event) => event,
                             Err(error) => return Some((Err(error), self)),
                         };
-                        self.phase = AgentLoopPhase::ExecuteTool(call);
+                        streaming.tool_calls.push(call);
+                        self.phase = AgentLoopPhase::Streaming(streaming);
                         return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::Finished)) | None => {
+                        if !streaming.tool_calls.is_empty() {
+                            self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
+                                calls: streaming.tool_calls.into(),
+                            });
+                            continue;
+                        }
                         let mut events = self.middleware_state.drain_pending();
                         events.push(SessionJournalEvent::TurnFinished {
                             turn: self.turn as u64,
@@ -293,21 +314,30 @@ where
                         return Some((Err(error), self));
                     }
                 },
-                AgentLoopPhase::ExecuteTool(call) => match self.start_tool(call).await {
-                    Ok(ToolExecution::Running(running)) => {
-                        self.phase = AgentLoopPhase::RunningTool(running);
-                        continue;
-                    }
-                    Ok(ToolExecution::Finished(Some(result))) => {
-                        if let Err(error) = self.finish_tool_turn(result).await {
+                AgentLoopPhase::ExecuteTools(mut batch) => {
+                    let Some(call) = batch.calls.pop_front() else {
+                        if let Err(error) = self.finish_tool_batch().await {
                             return Some((Err(error), self));
                         }
                         continue;
+                    };
+                    match self.start_tool(call).await {
+                        Ok(ToolExecution::Running(running)) => {
+                            self.phase = AgentLoopPhase::RunningTool(running, batch);
+                            continue;
+                        }
+                        Ok(ToolExecution::Finished(Some(result))) => {
+                            if let Err(error) = self.finish_tool_result(result).await {
+                                return Some((Err(error), self));
+                            }
+                            self.phase = AgentLoopPhase::ExecuteTools(batch);
+                            continue;
+                        }
+                        Ok(ToolExecution::Finished(None)) => continue,
+                        Err(error) => return Some((Err(error), self)),
                     }
-                    Ok(ToolExecution::Finished(None)) => continue,
-                    Err(error) => return Some((Err(error), self)),
-                },
-                AgentLoopPhase::RunningTool(mut running) => {
+                }
+                AgentLoopPhase::RunningTool(mut running, batch) => {
                     if let Some(rx) = running.progress_rx.as_mut() {
                         tokio::select! {
                             biased;
@@ -319,12 +349,12 @@ where
                                             Ok(event) => event,
                                             Err(error) => return Some((Err(error), self)),
                                         };
-                                        self.phase = AgentLoopPhase::RunningTool(running);
+                                        self.phase = AgentLoopPhase::RunningTool(running, batch);
                                         return Some((Ok(event), self));
                                     }
                                     None => {
                                         running.progress_rx = None;
-                                        self.phase = AgentLoopPhase::RunningTool(running);
+                                        self.phase = AgentLoopPhase::RunningTool(running, batch);
                                         continue;
                                     }
                                 }
@@ -336,8 +366,10 @@ where
                                         Err(error) => return Some((Err(error), self)),
                                     }
                                 }
-                                if let Err(error) = self.finish_running_tool(running.call, result).await {
-                                    return Some((Err(error), self));
+                                match self.finish_running_tool(running.call, result).await {
+                                    Ok(true) => self.phase = AgentLoopPhase::ExecuteTools(batch),
+                                    Ok(false) => {}
+                                    Err(error) => return Some((Err(error), self)),
                                 }
                                 continue;
                             }
@@ -362,8 +394,10 @@ where
                             }
                             result = running.result => result,
                         };
-                        if let Err(error) = self.finish_running_tool(running.call, result).await {
-                            return Some((Err(error), self));
+                        match self.finish_running_tool(running.call, result).await {
+                            Ok(true) => self.phase = AgentLoopPhase::ExecuteTools(batch),
+                            Ok(false) => {}
+                            Err(error) => return Some((Err(error), self)),
                         }
                         continue;
                     }
@@ -534,7 +568,7 @@ where
         &mut self,
         call: ToolCall,
         result: Result<ToolResult>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut result = match result {
             Ok(result) => result,
             Err(error) => error_tool_result(&call, &error),
@@ -549,21 +583,27 @@ where
             self.middleware_chain.after_tool_call(&mut ctx).await
         };
         match after_outcome {
-            Ok(HookOutcome::Continue) => self.finish_tool_turn(result).await,
+            Ok(HookOutcome::Continue) => {
+                self.finish_tool_result(result).await?;
+                Ok(true)
+            }
             Ok(outcome) => {
                 if let Some(result) = self.tool_result_from_hook_outcome(&call, outcome).await? {
-                    self.finish_tool_turn(result).await?;
+                    self.finish_tool_result(result).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
-                Ok(())
             }
             Err(error) => {
-                self.finish_tool_turn(error_tool_result(&call, &error))
-                    .await
+                self.finish_tool_result(error_tool_result(&call, &error))
+                    .await?;
+                Ok(true)
             }
         }
     }
 
-    async fn finish_tool_turn(&mut self, result: ToolResult) -> Result<()> {
+    async fn finish_tool_result(&mut self, result: ToolResult) -> Result<()> {
         CompletionTurn::entry(&mut self.turns, self.turn as u64)
             .items
             .push(TurnItem::ToolResult(result.clone()));
@@ -576,13 +616,17 @@ where
                 result,
             ))
             .await?;
+        self.pending.push_back(Ok(event));
+        Ok(())
+    }
+
+    async fn finish_tool_batch(&mut self) -> Result<()> {
         self.append_journal_event(SessionJournalEvent::TurnFinished {
             turn: self.turn as u64,
         })
         .await?;
         self.turn += 1;
         self.phase = AgentLoopPhase::StartTurn;
-        self.pending.push_back(Ok(event));
         Ok(())
     }
 
@@ -792,7 +836,9 @@ where
                     | RuntimeResumeOutput::Suspended { record, .. } => record,
                 };
                 if let Some(call) = retry {
-                    self.phase = AgentLoopPhase::ExecuteTool(call);
+                    self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
+                        calls: VecDeque::from([call]),
+                    });
                     continue_start_turn = false;
                 } else if cancel {
                     self.phase = AgentLoopPhase::Done;
