@@ -23,5 +23,6 @@ Preserve Waltr's intentional layered feature testing strategy.
 | [references/tui-server-backed.md](references/tui-server-backed.md) | TUI tests that run against a real server. |
 | [references/web-k6.md](references/web-k6.md) | Browser-level k6 end-to-end tests. |
 | [references/agent-live.md](references/agent-live.md) | Ignored live-provider agent tests. |
+| [references/server-live.md](references/server-live.md) | Ignored live-provider server contract tests. |
 | [references/client-server.md](references/client-server.md) | Client and server integration test boundaries. |
 | [references/test-containers.md](references/test-containers.md) | Tests that require Docker or container-backed services. |

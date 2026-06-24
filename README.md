@@ -1,6 +1,6 @@
 # Waltr
 
-Waltr is a local AI workspace for running agent-assisted work from either a terminal UI or a browser UI.
+Waltr is an AI workspace for running agent-assisted work from either a terminal UI or a browser UI.
 
 It is designed around shared workspace state, so configuration and status stay consistent while different clients interact with the same project.
 
