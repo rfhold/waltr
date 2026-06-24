@@ -5,13 +5,17 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
+default = ["shell"]
+shell = ["waltr-agent/shell"]
 test = []
 
 [dependencies]
 axum.workspace = true
 waltr = { path = "../waltr", version = "0.1.0", default-features = false, features = ["grpc"] }
-waltr-agent.workspace = true
+waltr-agent = { path = "../waltr-agent", version = "0.1.0", default-features = false }
+futures-util.workspace = true
 notify.workspace = true
+tokio-util.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
