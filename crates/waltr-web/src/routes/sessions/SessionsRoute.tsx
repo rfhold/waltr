@@ -22,12 +22,28 @@ import { ConfirmAction, Dialog, InlineAlert } from "../../components/ui";
 import type {
   ClientCommand,
   ConfigView,
+  ExternalRequestView,
   McpServerView,
   ProviderView,
   RuntimeConfigMatchView,
+  SessionTimelineView,
   SessionView,
   TimestampView,
 } from "../../generated/waltr-client";
+
+const TIMELINE_CHANNELS = [
+  "user_text",
+  "assistant_text",
+  "thinking",
+  "tool_call",
+  "tool_progress_info",
+  "tool_progress_error",
+  "tool_result",
+  "external_request",
+];
+
+const EXTERNAL_REQUEST_PERMISSION = 1;
+const EXTERNAL_REQUEST_QUESTION = 2;
 
 type SessionsContextValue = {
   sessions: Accessor<SessionView[]>;
@@ -301,16 +317,191 @@ function SessionRouteAlerts() {
 }
 
 function SessionDetail(props: { session: SessionView }) {
+  const app = useAppState();
   const sessions = useSessionsRoute();
   const [editingRuntime, setEditingRuntime] = createSignal<"provider" | "mcp">();
+  const [draft, setDraft] = createSignal("");
+  const [commandError, setCommandError] = createSignal<string>();
+  let timelineScroll: HTMLDivElement | undefined;
+  let registeredTimelineSession: string | undefined;
+  let previousTimelineItemKeys: string[] = [];
+
+  const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[props.session.id]);
+  const active = createMemo(() => sessionActive(props.session));
+  const items = createMemo(() => timelineItems(timeline()));
+  const working = createMemo(() => active() && !hasOpenExternalPrompt(items()));
+  const importantStatus = createMemo(() => sessionImportantStatus(props.session, working(), timeline()?.watch.error));
+  const timelineReady = createMemo(() => {
+    const status = timeline()?.watch.status;
+
+    return status === "opened" || status === "received";
+  });
+
+  createEffect(() => {
+    const sessionId = props.session.id;
+
+    if (!app.clientLoaded() || !app.systemReady() || registeredTimelineSession === sessionId) {
+      return;
+    }
+
+    if (registeredTimelineSession) {
+      dispatchSessionWatchCommand(app.dispatch, {
+        type: "releaseSessionTimelineWatchInterest",
+        sessionId: registeredTimelineSession,
+      });
+    }
+
+    registeredTimelineSession = sessionId;
+    void (async () => {
+      try {
+        await app.dispatch({
+          type: "registerSessionTimelineWatchInterest",
+          sessionId,
+          afterCursor: null,
+          channels: TIMELINE_CHANNELS,
+          initialLimit: 256,
+        });
+      } catch (error) {
+        setCommandError(error instanceof Error ? error.message : "Unable to watch session timeline.");
+      }
+    })();
+  });
+
+  onCleanup(() => {
+    if (!registeredTimelineSession) {
+      return;
+    }
+
+    dispatchSessionWatchCommand(app.dispatch, {
+      type: "releaseSessionTimelineWatchInterest",
+      sessionId: registeredTimelineSession,
+    });
+  });
+
+  createEffect(() => {
+    const currentItems = items();
+    const scroller = timelineScroll;
+    const itemKeys = currentItems.map(timelineItemKey);
+    const hasNewExternalPrompt = currentItems.some((item) => isExternalPromptItem(item) && !previousTimelineItemKeys.includes(timelineItemKey(item)));
+    previousTimelineItemKeys = itemKeys;
+    if (!scroller || (!hasNewExternalPrompt && !isNearScrollBottom(scroller))) {
+      return;
+    }
+
+    queueMicrotask(() => {
+      scroller.scrollTop = scroller.scrollHeight;
+    });
+  });
+
+  const submit = async () => {
+    const text = draft().trim();
+    if (!text || !timelineReady()) {
+      return;
+    }
+
+    setCommandError(undefined);
+    try {
+      await app.dispatch({ type: "submitUserMessage", sessionId: props.session.id, text });
+      setDraft("");
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to send message.");
+    }
+  };
+
+  const interrupt = async () => {
+    setCommandError(undefined);
+    try {
+      await app.dispatch({ type: "interruptSession", sessionId: props.session.id });
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to stop session.");
+    }
+  };
+
+  const respond = async (requestId: string, response: unknown) => {
+    setCommandError(undefined);
+    try {
+      await app.dispatch({
+        type: "respondExternalRequest",
+        sessionId: props.session.id,
+        requestId,
+        responseJson: JSON.stringify(response),
+      });
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to answer prompt.");
+    }
+  };
 
   return (
     <div class="sessions__detail-page">
-      <div class="sessions__detail-main">
+      <div class="sessions__detail-main" ref={timelineScroll} aria-label="Session timeline">
         <Show when={sessions.deleteErrors()[props.session.id]}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>
+        <Show when={commandError()}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
+        <Show
+          when={items().length > 0}
+          fallback={<p class="sessions__timeline-empty">No messages yet.</p>}
+        >
+          <ol class="sessions__timeline" aria-label="Timeline messages">
+            <For each={items()}>
+              {(item) => (
+                <li class={`sessions__timeline-item sessions__timeline-item--${item.kind}`}>
+                  <TimelineItem item={item} onRespond={respond} onInterrupt={interrupt} />
+                </li>
+              )}
+            </For>
+          </ol>
+        </Show>
       </div>
+      <div
+        class={`sessions__detail-important-status sessions__detail-important-status--${importantStatus()?.tone ?? "empty"}`}
+        aria-label="Session activity status"
+        aria-live="polite"
+      >
+        <Show when={importantStatus()}>
+          {(status) => (
+            <>
+              <span aria-hidden="true" /> {status().message}
+            </>
+          )}
+        </Show>
+      </div>
+      <form
+        class="sessions__composer"
+        aria-label="Send session message"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit();
+        }}
+      >
+        <textarea
+          aria-label="Session message"
+          placeholder="Send a message..."
+          value={draft()}
+          onInput={(event) => setDraft(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              void submit();
+            }
+          }}
+        />
+        <div class="sessions__composer-actions">
+          <button
+            type="button"
+            class={`sessions__composer-stop${active() ? "" : " sessions__composer-stop--hidden"}`}
+            disabled={!active()}
+            aria-hidden={!active()}
+            tabIndex={active() ? 0 : -1}
+            onClick={() => void interrupt()}
+          >
+            Stop
+          </button>
+          <button type="submit" disabled={!draft().trim() || !timelineReady()}>
+            Send
+          </button>
+        </div>
+      </form>
       <SessionDetailStatusBar
         session={props.session}
         onEditProvider={() => setEditingRuntime("provider")}
@@ -326,6 +517,713 @@ function SessionDetail(props: { session: SessionView }) {
   );
 }
 
+type TimelineItemModel =
+  | { id: string; kind: "user" | "assistant" | "thinking"; text: string }
+  | ToolTimelineItem
+  | { id: string; kind: "permission" | "question" | "prompt"; request: ExternalRequestView; resolved: boolean };
+
+type ToolInputEntry = { key: string; value: string };
+type ToolState = "loading" | "complete" | "error";
+type ToolTimelineItem = {
+  id: string;
+  kind: "tool";
+  name: string;
+  state: ToolState;
+  input: Record<string, unknown>;
+  inputEntries: ToolInputEntry[];
+  resultContent: string;
+  progressInfo: string;
+  progressError: string;
+};
+
+function TimelineItem(props: {
+  item: TimelineItemModel;
+  onRespond: (requestId: string, response: unknown) => Promise<void>;
+  onInterrupt: () => Promise<void>;
+}) {
+  const item = () => props.item;
+
+  return (
+    <Switch>
+      <Match when={textTimelineItem(item())}>
+        {(textItem) => <p class="sessions__timeline-text">{textItem().text}</p>}
+      </Match>
+      <Match when={toolTimelineItem(item())}>
+        {(toolItem) => <ToolTimelineItemView item={toolItem()} />}
+      </Match>
+      <Match when={permissionTimelineItem(item())}>
+        {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+      </Match>
+      <Match when={questionTimelineItem(item())}>
+        {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+      </Match>
+      <Match when={externalTimelineItem(item())}>
+        {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+      </Match>
+    </Switch>
+  );
+}
+
+function ToolTimelineItemView(props: { item: ToolTimelineItem }) {
+  return (
+    <Switch fallback={<GenericToolTimelineItem item={props.item} />}>
+      <Match when={props.item.name === "shell"}>
+        <ShellToolTimelineItem item={props.item} />
+      </Match>
+      <Match when={props.item.name === "edit"}>
+        <EditToolTimelineItem item={props.item} />
+      </Match>
+      <Match when={props.item.name === "apply_patch"}>
+        <PatchToolTimelineItem item={props.item} />
+      </Match>
+    </Switch>
+  );
+}
+
+function GenericToolTimelineItem(props: { item: ToolTimelineItem }) {
+  return (
+    <p class="sessions__timeline-tool">
+      {toolLabel(props.item.name, props.item.inputEntries)}
+      <ToolStateText state={props.item.state} />
+    </p>
+  );
+}
+
+function ShellToolTimelineItem(props: { item: ToolTimelineItem }) {
+  const command = () => stringInput(props.item.input.command) || "(empty command)";
+  const description = () => stringInput(props.item.input.description) || "Shell command";
+  const output = () => props.item.progressInfo || props.item.progressError
+    ? `${props.item.progressInfo}${props.item.progressError}`
+    : props.item.resultContent;
+
+  return (
+    <section class={`sessions__shell-tool sessions__shell-tool--${props.item.state}`} aria-label="Shell tool">
+      <p class="sessions__shell-tool-header">
+        <strong>{description()}</strong>
+        <ToolStateText state={props.item.state} />
+      </p>
+      <pre class="sessions__tool-terminal"><code>{`$ ${command()}${output() ? `\n${output()}` : ""}`}</code></pre>
+    </section>
+  );
+}
+
+function EditToolTimelineItem(props: { item: ToolTimelineItem }) {
+  const filePath = () => stringInput(props.item.input.filePath) || "Unknown file";
+  const oldString = () => stringInput(props.item.input.oldString);
+  const newString = () => stringInput(props.item.input.newString);
+
+  return (
+    <section class={`sessions__file-tool sessions__file-tool--${props.item.state}`} aria-label="Edit tool">
+      <div class="sessions__file-tool-header">
+        <strong>edit</strong>
+        <ToolStateText state={props.item.state} />
+      </div>
+      <ToolFiles files={[{ status: "M", path: filePath() }]} />
+      <div class="sessions__tool-diff" role="region" aria-label={`Diff for ${filePath()}`}>
+        <DiffLine kind="file" text={`--- ${filePath()}`} />
+        <DiffLine kind="file" text={`+++ ${filePath()}`} />
+        <For each={diffTextLines(oldString(), "remove")}>
+          {(line) => <DiffLine kind={line.kind} text={line.text} />}
+        </For>
+        <For each={diffTextLines(newString(), "add")}>
+          {(line) => <DiffLine kind={line.kind} text={line.text} />}
+        </For>
+      </div>
+    </section>
+  );
+}
+
+function PatchToolTimelineItem(props: { item: ToolTimelineItem }) {
+  const patchText = () => stringInput(props.item.input.patchText);
+  const files = () => patchFiles(patchText());
+
+  return (
+    <section class={`sessions__file-tool sessions__file-tool--${props.item.state}`} aria-label="Patch tool">
+      <div class="sessions__file-tool-header">
+        <strong>apply_patch</strong>
+        <ToolStateText state={props.item.state} />
+      </div>
+      <ToolFiles files={files()} />
+      <div class="sessions__tool-diff" role="region" aria-label="Patch diff">
+        <For each={patchText().split("\n")}>
+          {(line) => <DiffLine kind={patchLineKind(line)} text={line} />}
+        </For>
+      </div>
+      <Show when={props.item.resultContent}>
+        <p class="sessions__tool-result">{props.item.resultContent}</p>
+      </Show>
+    </section>
+  );
+}
+
+function ToolStateText(props: { state: ToolState }) {
+  return (
+    <>
+      <Show when={props.state === "loading"}>
+        {" "}<span class="sessions__timeline-tool-loading">loading...<span aria-hidden="true" /></span>
+      </Show>
+      <Show when={props.state === "error"}> <span class="sessions__tool-state-error">error</span></Show>
+    </>
+  );
+}
+
+function ToolFiles(props: { files: Array<{ status: string; path: string }> }) {
+  return (
+    <ul class="sessions__tool-files" aria-label="Files modified">
+      <For each={props.files} fallback={<li><span>?</span> Unknown files</li>}>
+        {(file) => <li><span>{file.status}</span> {file.path}</li>}
+      </For>
+    </ul>
+  );
+}
+
+function DiffLine(props: { kind: "add" | "remove" | "file" | "meta" | "context"; text: string }) {
+  return <pre class={`sessions__tool-diff-line sessions__tool-diff-line--${props.kind}`}>{props.text}</pre>;
+}
+
+function textTimelineItem(item: TimelineItemModel) {
+  return item.kind === "user" || item.kind === "assistant" || item.kind === "thinking" ? item : undefined;
+}
+
+function toolTimelineItem(item: TimelineItemModel) {
+  return item.kind === "tool" ? item : undefined;
+}
+
+function permissionTimelineItem(item: TimelineItemModel) {
+  return item.kind === "permission" ? item : undefined;
+}
+
+function questionTimelineItem(item: TimelineItemModel) {
+  return item.kind === "question" ? item : undefined;
+}
+
+function externalTimelineItem(item: TimelineItemModel) {
+  return item.kind === "prompt" ? item : undefined;
+}
+
+function ExternalRequestTimelineItem(props: {
+  item: Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>;
+  onRespond: (requestId: string, response: unknown) => Promise<void>;
+  onInterrupt: () => Promise<void>;
+}) {
+  return (
+    <Show when={!props.item.resolved} fallback={<ExternalRequestResult item={props.item} />}>
+      <Switch>
+        <Match when={props.item.kind === "permission"}>
+          <PermissionPrompt request={props.item.request} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />
+        </Match>
+        <Match when={props.item.kind === "question"}>
+          <QuestionPrompt request={props.item.request} onRespond={props.onRespond} />
+        </Match>
+        <Match when={props.item.kind === "prompt"}>
+          <ExternalPrompt request={props.item.request} />
+        </Match>
+      </Switch>
+    </Show>
+  );
+}
+
+function ExternalRequestResult(props: { item: Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }> }) {
+  return (
+    <p class="sessions__timeline-tool sessions__timeline-external-result">
+      {externalRequestLabel(props.item.kind)}: answered
+    </p>
+  );
+}
+
+function PermissionPrompt(props: {
+  request: ExternalRequestView;
+  onRespond: (requestId: string, response: unknown) => Promise<void>;
+  onInterrupt: () => Promise<void>;
+}) {
+  const [message, setMessage] = createSignal("");
+  const [confirmingAlways, setConfirmingAlways] = createSignal(false);
+  const payload = createMemo(() => parseJsonRecord(props.request.payloadJson));
+  const toolCall = createMemo(() => asRecord(payload().tool_call));
+  const patterns = createMemo(() => permissionPatterns(payload()));
+  const patternLabel = createMemo(() => JSON.stringify(patterns(), null, 2));
+
+  const deny = (mode: "return_tool_result" | "cancel_work") => ({
+    decision: "deny",
+    message: message().trim() || null,
+    mode,
+  });
+
+  return (
+    <section class="sessions__prompt sessions__prompt--permission" aria-label="Permission prompt">
+      <p class="sessions__prompt-kicker">Permission required</p>
+      <h2>{props.request.id}</h2>
+      <p>{String(toolCall()?.name ?? "Tool call")}</p>
+      <pre>{JSON.stringify(toolCall()?.arguments ?? {}, null, 2)}</pre>
+      <Show when={patterns().length > 0}>
+        <details open={confirmingAlways()}>
+          <summary>Always approval pattern</summary>
+          <pre>{patternLabel()}</pre>
+        </details>
+      </Show>
+      <label class="sessions__prompt-field">
+        Denial message
+        <textarea value={message()} onInput={(event) => setMessage(event.currentTarget.value)} />
+      </label>
+      <div class="sessions__prompt-actions">
+        <button type="button" onClick={() => void props.onRespond(props.request.id, { decision: "allow_once" })}>
+          Allow once
+        </button>
+        <Show
+          when={confirmingAlways()}
+          fallback={
+            <button type="button" disabled={patterns().length === 0} onClick={() => setConfirmingAlways(true)}>
+              Allow always
+            </button>
+          }
+        >
+          <button
+            type="button"
+            disabled={patterns().length === 0}
+            onClick={() => void props.onRespond(props.request.id, { decision: "allow_always", patterns: patterns() })}
+          >
+            Confirm always
+          </button>
+        </Show>
+        <button type="button" onClick={() => void props.onRespond(props.request.id, deny("return_tool_result"))}>
+          Deny and resume
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            void props.onRespond(props.request.id, deny("cancel_work")).then(() => props.onInterrupt());
+          }}
+        >
+          Deny with interrupt
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function QuestionPrompt(props: {
+  request: ExternalRequestView;
+  onRespond: (requestId: string, response: unknown) => Promise<void>;
+}) {
+  const payload = createMemo(() => parseJsonRecord(props.request.payloadJson));
+  const questions = createMemo(() => asArray(payload().questions).map(normalizeQuestion));
+  const [answers, setAnswers] = createSignal<Record<string, { selections: string[]; custom: string }>>({});
+
+  const answerFor = (header: string) => answers()[header] ?? { selections: [], custom: "" };
+  const setSelection = (header: string, label: string, multiple: boolean, selected: boolean) => {
+    setAnswers((current) => {
+      const answer = current[header] ?? { selections: [], custom: "" };
+      const selections = multiple
+        ? selected
+          ? [...answer.selections, label]
+          : answer.selections.filter((selection) => selection !== label)
+        : selected
+          ? [label]
+          : [];
+
+      return { ...current, [header]: { ...answer, selections } };
+    });
+  };
+  const setCustom = (header: string, custom: string) => {
+    setAnswers((current) => ({
+      ...current,
+      [header]: { ...(current[header] ?? { selections: [], custom: "" }), custom },
+    }));
+  };
+  const submit = () => ({
+    answers: questions().map((question) => {
+      const answer = answerFor(question.header);
+      return {
+        header: question.header,
+        selections: answer.selections,
+        ...(answer.custom.trim() ? { custom: answer.custom.trim() } : {}),
+      };
+    }),
+  });
+
+  return (
+    <section class="sessions__prompt sessions__prompt--question" aria-label="Question prompt">
+      <p class="sessions__prompt-kicker">Question</p>
+      <For each={questions()}>
+        {(question) => (
+          <fieldset class="sessions__question">
+            <legend>{question.header}</legend>
+            <p>{question.question}</p>
+            <For each={question.options}>
+              {(option) => (
+                <label>
+                  <input
+                    type={question.multiple ? "checkbox" : "radio"}
+                    name={`${props.request.id}-${question.header}`}
+                    checked={answerFor(question.header).selections.includes(option.label)}
+                    onChange={(event) => setSelection(question.header, option.label, question.multiple, event.currentTarget.checked)}
+                  />
+                  <span>{option.label}</span>
+                  <small>{option.description}</small>
+                </label>
+              )}
+            </For>
+            <Show when={question.custom}>
+              <label class="sessions__prompt-field">
+                Custom answer
+                <textarea
+                  value={answerFor(question.header).custom}
+                  onInput={(event) => setCustom(question.header, event.currentTarget.value)}
+                />
+              </label>
+            </Show>
+          </fieldset>
+        )}
+      </For>
+      <div class="sessions__prompt-actions">
+        <button type="button" onClick={() => void props.onRespond(props.request.id, submit())}>
+          Resume session
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function ExternalPrompt(props: { request: ExternalRequestView }) {
+  return (
+    <section class="sessions__prompt" aria-label="External prompt">
+      <p class="sessions__prompt-kicker">External request</p>
+      <pre>{props.request.payloadJson}</pre>
+    </section>
+  );
+}
+
+function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemModel[] {
+  const items: TimelineItemModel[] = [];
+  const textByItem = new Map<string, Extract<TimelineItemModel, { kind: "user" | "assistant" | "thinking" }>>();
+  const toolById = new Map<string, ToolTimelineItem>();
+  const toolIdByItemId = new Map<string, string>();
+  const externalById = new Map<string, Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>>();
+
+  for (const event of timeline?.events ?? []) {
+    const channel = event.channel ?? "";
+    switch (event.content.kind) {
+      case "textDelta":
+      case "textSnapshot": {
+        const kind = textKind(channel);
+        if (!kind) {
+          appendToolProgress(toolById, toolIdByItemId, event.itemId, event.parentId, channel, event.content.kind === "textSnapshot" ? event.content.text : event.content.delta, event.content.kind);
+          break;
+        }
+
+        const existing = textByItem.get(event.itemId);
+        const text = event.content.kind === "textSnapshot"
+          ? event.content.text
+          : `${existing?.text ?? ""}${event.content.delta}`;
+        if (existing) {
+          existing.text = text;
+        } else {
+          const item = { id: event.itemId, kind, text };
+          textByItem.set(event.itemId, item);
+          items.push(item);
+        }
+        break;
+      }
+      case "toolCall": {
+        const id = event.content.id || event.itemId;
+        toolIdByItemId.set(event.itemId, id);
+        upsertToolItem(items, toolById, id, event.content.name, "loading", parseJsonRecord(event.content.arguments_json), undefined);
+        break;
+      }
+      case "toolResult":
+        upsertToolItem(
+          items,
+          toolById,
+          event.content.id || event.itemId,
+          event.content.name,
+          event.content.error ? "error" : "complete",
+          undefined,
+          event.content.content,
+        );
+        break;
+      case "externalRequest": {
+        const request = event.content.request;
+        if (!request) {
+          break;
+        }
+
+        upsertExternalRequestItem(items, externalById, event.itemId, request, event.kind === "externalRequestResolved" || event.status === "resolved");
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  return items;
+}
+
+function upsertToolItem(
+  items: TimelineItemModel[],
+  toolById: Map<string, ToolTimelineItem>,
+  id: string,
+  name: string,
+  state: ToolState,
+  input: Record<string, unknown> | undefined,
+  resultContent: string | undefined,
+) {
+  const existing = toolById.get(id);
+  if (existing) {
+    existing.name = name || existing.name;
+    existing.state = state;
+    existing.input = input ?? existing.input;
+    existing.inputEntries = input ? topLevelInputEntries(input) : existing.inputEntries;
+    existing.resultContent = resultContent ?? existing.resultContent;
+    return;
+  }
+
+  const item = {
+    id,
+    kind: "tool" as const,
+    name,
+    state,
+    input: input ?? {},
+    inputEntries: input ? topLevelInputEntries(input) : [],
+    resultContent: resultContent ?? "",
+    progressInfo: "",
+    progressError: "",
+  };
+  toolById.set(id, item);
+  items.push(item);
+}
+
+function appendToolProgress(
+  toolById: Map<string, ToolTimelineItem>,
+  toolIdByItemId: Map<string, string>,
+  itemId: string,
+  parentId: string | null,
+  channel: string,
+  text: string,
+  contentKind: "textDelta" | "textSnapshot",
+) {
+  if (channel !== "tool_progress_info" && channel !== "tool_progress_error") {
+    return;
+  }
+
+  const toolItemId = parentId ?? itemId;
+  const tool = toolById.get(toolIdByItemId.get(toolItemId) ?? toolItemId);
+  if (!tool) {
+    return;
+  }
+
+  const key = channel === "tool_progress_info" ? "progressInfo" : "progressError";
+  tool[key] = contentKind === "textSnapshot" ? text : `${tool[key]}${text}`;
+}
+
+function upsertExternalRequestItem(
+  items: TimelineItemModel[],
+  externalById: Map<string, Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>>,
+  id: string,
+  request: ExternalRequestView,
+  resolved: boolean,
+) {
+  const existing = externalById.get(id);
+  if (existing) {
+    existing.request = request;
+    existing.resolved = resolved;
+    return;
+  }
+
+  const item = { id, kind: requestKind(request), request, resolved };
+  externalById.set(id, item);
+  items.push(item);
+}
+
+function hasOpenExternalPrompt(items: TimelineItemModel[]) {
+  return items.some((item) => isExternalPromptItem(item) && !item.resolved);
+}
+
+function isExternalPromptItem(item: TimelineItemModel): item is Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }> {
+  return item.kind === "permission" || item.kind === "question" || item.kind === "prompt";
+}
+
+function timelineItemKey(item: TimelineItemModel) {
+  return isExternalPromptItem(item) ? `${item.id}:${item.resolved ? "resolved" : "open"}` : item.id;
+}
+
+function textKind(channel: string): "user" | "assistant" | "thinking" | undefined {
+  if (channel === "user_text") {
+    return "user";
+  }
+  if (channel === "assistant_text") {
+    return "assistant";
+  }
+  if (channel === "thinking") {
+    return "thinking";
+  }
+
+  return undefined;
+}
+
+function requestKind(request: ExternalRequestView): "permission" | "question" | "prompt" {
+  if (request.kind === EXTERNAL_REQUEST_PERMISSION) {
+    return "permission";
+  }
+  if (request.kind === EXTERNAL_REQUEST_QUESTION) {
+    return "question";
+  }
+
+  return "prompt";
+}
+
+function externalRequestLabel(kind: "permission" | "question" | "prompt") {
+  if (kind === "permission") {
+    return "permission";
+  }
+  if (kind === "question") {
+    return "question";
+  }
+  return "external request";
+}
+
+function toolLabel(name: string, inputEntries: ToolInputEntry[]) {
+  if (inputEntries.length === 0) {
+    return name;
+  }
+  return `${name}(${inputEntries.map(({ key, value }) => `${key}: ${value}`).join(", ")})`;
+}
+
+function topLevelInputEntries(record: Record<string, unknown>): ToolInputEntry[] {
+  return Object.keys(record).sort().map((key) => ({ key, value: formatToolInputValue(record[key]) }));
+}
+
+function formatToolInputValue(value: unknown) {
+  return JSON.stringify(value) ?? String(value);
+}
+
+function stringInput(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
+function diffTextLines(text: string, kind: "add" | "remove") {
+  const prefix = kind === "add" ? "+" : "-";
+  return (text.length > 0 ? text.split("\n") : [""]).map((line) => ({ kind, text: `${prefix} ${line}` }));
+}
+
+function patchFiles(patchText: string) {
+  const files: Array<{ status: string; path: string }> = [];
+  for (const line of patchText.split("\n")) {
+    const match = /^\*\*\* (Add|Update|Delete) File: (.+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+
+    files.push({ status: patchFileStatus(match[1]), path: match[2] });
+  }
+
+  return files;
+}
+
+function patchFileStatus(action: string) {
+  if (action === "Add") {
+    return "A";
+  }
+  if (action === "Delete") {
+    return "D";
+  }
+  return "M";
+}
+
+function patchLineKind(line: string): "add" | "remove" | "file" | "meta" | "context" {
+  if (line.startsWith("***")) {
+    return "file";
+  }
+  if (line.startsWith("@@")) {
+    return "meta";
+  }
+  if (line.startsWith("+")) {
+    return "add";
+  }
+  if (line.startsWith("-")) {
+    return "remove";
+  }
+  return "context";
+}
+
+function sessionActive(session: SessionView) {
+  return !["idle", "finished", "failed", "unknown", "unspecified"].includes(session.status.phase);
+}
+
+function sessionImportantStatus(session: SessionView, working: boolean, watchError?: string | null) {
+  if (watchError) {
+    return {
+      tone: "error",
+      message: watchError,
+    };
+  }
+
+  if (session.status.phase === "failed") {
+    return {
+      tone: "error",
+      message: session.status.failedMessage || "Session failed.",
+    };
+  }
+
+  return working ? { tone: "working", message: "Working..." } : undefined;
+}
+
+function isNearScrollBottom(element: HTMLElement) {
+  return element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+}
+
+function parseJsonRecord(value: string): Record<string, unknown> {
+  try {
+    return asRecord(JSON.parse(value)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function permissionPatterns(payload: Record<string, unknown>) {
+  const patterns = asArray(payload.patterns);
+  if (patterns.length > 0) {
+    return patterns;
+  }
+
+  const pattern = payload.pattern;
+  return pattern === undefined ? [] : [pattern];
+}
+
+type QuestionModel = {
+  question: string;
+  header: string;
+  options: Array<{ label: string; description: string }>;
+  multiple: boolean;
+  custom: boolean;
+};
+
+function normalizeQuestion(value: unknown): QuestionModel {
+  const record = asRecord(value) ?? {};
+  return {
+    question: String(record.question ?? ""),
+    header: String(record.header ?? "Question"),
+    multiple: Boolean(record.multiple),
+    custom: Boolean(record.custom),
+    options: asArray(record.options).map((option) => {
+      const optionRecord = asRecord(option) ?? {};
+      return {
+        label: String(optionRecord.label ?? ""),
+        description: String(optionRecord.description ?? ""),
+      };
+    }),
+  };
+}
+
 function SessionDetailStatusBar(props: {
   session: SessionView;
   onEditProvider: () => void;
@@ -333,7 +1231,6 @@ function SessionDetailStatusBar(props: {
 }) {
   return (
     <footer class="sessions__detail-status" aria-label="Session status summary">
-      <span><strong>Status</strong> {props.session.status.phase}</span>
       <span class="sessions__detail-status-item">
         <strong>Provider</strong> {formatRuntimeProvider(props.session)}
         <button

@@ -20,18 +20,21 @@ const webUrl = `http://127.0.0.1:${webPort}`;
 const dockerWebUrl = `http://${getHostAddress()}:${webPort}`;
 const screenshotsEnabled = process.env.WALTR_WEB_SCREENSHOTS === "1";
 const screenshotsUpdate = process.env.WALTR_WEB_UPDATE_SCREENSHOTS === "1";
+const liveEnabled = process.env.WALTR_WEB_LIVE === "1";
 const screenshotsDir = screenshotsEnabled
   ? `${repoRoot}/.dev/web-screenshots/current`
   : null;
 const screenshotSnapshotDir = `${repoRoot}/tests/web/k6/snapshots/screenshots`;
-const browserScripts = [
-  "tests/web/k6/status/landing.browser.js",
-  "tests/web/k6/sessions/sessions.browser.js",
-  "tests/web/k6/config/watch.browser.js",
-  "tests/web/k6/config/providers.browser.js",
-  "tests/web/k6/config/mcp.browser.js",
-  "tests/web/k6/config/defaults.browser.js",
-];
+const browserScripts = liveEnabled
+  ? ["tests/web/k6/sessions/session-live.browser.js"]
+  : [
+    "tests/web/k6/status/landing.browser.js",
+    "tests/web/k6/sessions/sessions.browser.js",
+    "tests/web/k6/config/watch.browser.js",
+    "tests/web/k6/config/providers.browser.js",
+    "tests/web/k6/config/mcp.browser.js",
+    "tests/web/k6/config/defaults.browser.js",
+  ];
 
 process.once("SIGINT", () => stop(130));
 process.once("SIGTERM", () => stop(143));
@@ -45,6 +48,10 @@ if (screenshotsDir) {
   chmodSync(screenshotsDir, 0o777);
   console.log(`web integration screenshots: ${screenshotsDir}`);
   console.log(`web integration screenshot snapshots: ${screenshotSnapshotDir}`);
+}
+if (liveEnabled && process.env.WALTR_AGENT_LIVE_GATEWAY !== "1") {
+  console.log("skipping web live tests: set WALTR_AGENT_LIVE_GATEWAY=1");
+  process.exit(0);
 }
 
 try {
@@ -101,6 +108,8 @@ try {
       `WALTR_WEB_SCREENSHOTS=${process.env.WALTR_WEB_SCREENSHOTS ?? "0"}`,
       "-e",
       "WALTR_WEB_SCREENSHOTS_DIR=/screenshots",
+      "-e",
+      `WALTR_AGENT_LIVE_GATEWAY=${process.env.WALTR_AGENT_LIVE_GATEWAY ?? "0"}`,
       "grafana/k6:master-with-browser",
       "run",
       browserScript,

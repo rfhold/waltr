@@ -6,6 +6,7 @@ import type {
   OperationSnapshot,
   ProviderView,
   SessionSnapshot,
+  SessionTimelineView,
   SessionView,
 } from "../../src/generated/waltr-client";
 
@@ -36,12 +37,24 @@ export function emptySessionSnapshot(): SessionSnapshot {
     list: operationSnapshot("idle"),
     delete: operationSnapshot("idle"),
     runtimeConfigUpdate: operationSnapshot("idle"),
+    submitUserMessage: operationSnapshot("idle"),
+    respondExternalRequest: operationSnapshot("idle"),
+    interrupt: operationSnapshot("idle"),
     watch: operationSnapshot("idle"),
+    timelines: {},
   };
 }
 
 export function operationSnapshot(status: string): OperationSnapshot {
   return { status, error: null, key: null };
+}
+
+export function readySessionTimeline(): SessionTimelineView {
+  return {
+    events: [],
+    load: operationSnapshot("ready"),
+    watch: operationSnapshot("opened"),
+  };
 }
 
 export function emptyConfig(etag = "v1"): ConfigView {
@@ -56,7 +69,11 @@ export function snapshotWithSessions(sessions: SessionView[]): ClientSnapshot {
     list: operationSnapshot("ready"),
     delete: operationSnapshot("idle"),
     runtimeConfigUpdate: operationSnapshot("idle"),
+    submitUserMessage: operationSnapshot("idle"),
+    respondExternalRequest: operationSnapshot("idle"),
+    interrupt: operationSnapshot("idle"),
     watch: operationSnapshot("received"),
+    timelines: {},
   };
 
   return snapshot;
