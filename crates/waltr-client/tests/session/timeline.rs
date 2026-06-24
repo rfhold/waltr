@@ -1,6 +1,6 @@
 #![allow(clippy::future_not_send)]
 
-use waltr_client::{ClientCommand, ClientRuntime, TimelineContentView};
+use waltr_client::{ClientCommand, ClientRuntime, ClientTimelineDirection, TimelineContentView};
 
 use crate::support::{
     server::server_endpoint_with_seeded_timeline,
@@ -19,6 +19,7 @@ async fn request_session_timeline_loads_seeded_events_through_client_state() {
         &mut stream,
         ClientCommand::RequestSessionTimeline {
             session_id: session_id.clone(),
+            direction: ClientTimelineDirection::Backward,
             cursor: None,
             limit: 10,
             channels: Vec::new(),

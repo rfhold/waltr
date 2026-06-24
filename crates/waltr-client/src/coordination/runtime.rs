@@ -106,6 +106,8 @@ pub enum ClientCommand {
         /// Session id whose timeline should load.
         #[serde(rename = "sessionId")]
         session_id: String,
+        /// Direction from the exclusive cursor boundary.
+        direction: ClientTimelineDirection,
         /// Exclusive cursor boundary.
         cursor: Option<u64>,
         /// Maximum events to return.
@@ -163,6 +165,16 @@ pub enum ClientCommand {
     WatchStatus,
     /// Keep watching status until the reducer observes readiness.
     WaitForSystemReady,
+}
+
+/// Direction for loading a timeline page from an exclusive cursor boundary.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ClientTimelineDirection {
+    /// Load events after the cursor.
+    Forward,
+    /// Load events before the cursor.
+    Backward,
 }
 
 /// Stable snapshot of shared client state.
@@ -1051,13 +1063,14 @@ impl ClientStateStream {
         match command {
             ClientCommand::RequestSessionTimeline {
                 session_id,
+                direction,
                 cursor,
                 limit,
                 channels,
             } => self.runtime.reducer.request_session_timeline(
                 session_id,
                 Some(TimelineQuery {
-                    direction: TimelineDirection::Forward as i32,
+                    direction: timeline_direction(direction) as i32,
                     cursor,
                     limit,
                     channels,
@@ -1120,6 +1133,13 @@ impl ClientStateStream {
 
     fn extend_effects(&mut self, update: &ClientUpdate) {
         self.effects.extend(update.effects().iter().cloned().rev());
+    }
+}
+
+const fn timeline_direction(direction: ClientTimelineDirection) -> TimelineDirection {
+    match direction {
+        ClientTimelineDirection::Forward => TimelineDirection::Forward,
+        ClientTimelineDirection::Backward => TimelineDirection::Backward,
     }
 }
 
@@ -1426,6 +1446,35 @@ mod tests {
 
         assert_eq!(snapshot.status.watch.status, "received");
         assert_eq!(snapshot.config.watch.status, "idle");
+    }
+
+    #[test]
+    fn request_timeline_command_uses_requested_direction() {
+        let mut runtime = ClientStateStream {
+            runtime: ClientRuntime::for_endpoint("http://127.0.0.1:0"),
+            phase: ClientStateStreamPhase::Ready,
+            effects: Vec::new(),
+            sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
+        };
+
+        let update = runtime.begin_timeline_command(ClientCommand::RequestSessionTimeline {
+            session_id: "session".to_owned(),
+            direction: ClientTimelineDirection::Backward,
+            cursor: Some(42),
+            limit: 25,
+            channels: vec!["tool_result".to_owned()],
+        });
+
+        assert!(matches!(
+            update.effects(),
+            [ClientEffect::Session(SessionEffect::GetTimeline { query, .. })]
+                if query.as_ref().is_some_and(|query| {
+                    query.direction == TimelineDirection::Backward as i32
+                        && query.cursor == Some(42)
+                        && query.limit == 25
+                        && query.channels == ["tool_result"]
+                })
+        ));
     }
 
     async fn no_sleep(_: u64) {}

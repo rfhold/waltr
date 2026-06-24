@@ -524,6 +524,8 @@ status: StatusSnapshot,
  */
 sessions: SessionSnapshot, };
 
+export type ClientTimelineDirection = "forward" | "backward";
+
 export type ClientCommand = { "type": "requestConfig" } | { "type": "addProvider", 
 /**
  * Provider to add.
@@ -585,6 +587,10 @@ enabledMcpServerKeys: Array<string>, } | { "type": "registerSessionWatchInterest
  * Session id whose timeline should load.
  */
 sessionId: string, 
+/**
+ * Direction from the exclusive cursor boundary.
+ */
+direction: ClientTimelineDirection, 
 /**
  * Exclusive cursor boundary.
  */

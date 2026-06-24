@@ -531,10 +531,9 @@ impl ClientState {
         events: Vec<TimelineEvent>,
     ) {
         let timeline = self.session_timeline_mut(session_id);
-        timeline.events = events
-            .into_iter()
-            .map(|event| (event.cursor, event))
-            .collect();
+        timeline
+            .events
+            .extend(events.into_iter().map(|event| (event.cursor, event)));
         timeline.load.status = OperationStatus::Ready;
         timeline.load.error = None;
     }
