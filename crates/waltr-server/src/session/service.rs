@@ -7,7 +7,7 @@ use crate::config::ConfigHandle;
 use super::{
     convert::session_summary_to_proto,
     error::agent_error_to_status,
-    run_manager::SessionRunManager,
+    run_manager::{SessionRunManager, SessionRunRequest},
     runtime::ServerRuntimeFactory,
     runtime_config::{
         SESSION_RUNTIME_CONFIG_METADATA_KEY, resolve_runtime_config,
@@ -289,7 +289,7 @@ where
                 .timeline(&session_id, initial_query(limit, &channels))
                 .await
                 .map_err(agent_error_to_status)?;
-            push_history(&mut historical, &highest_cursor, events)?;
+            push_history(&mut historical, &highest_cursor, events);
         }
 
         let catchup = self
@@ -300,7 +300,7 @@ where
             )
             .await
             .map_err(agent_error_to_status)?;
-        push_history(&mut historical, &highest_cursor, catchup)?;
+        push_history(&mut historical, &highest_cursor, catchup);
 
         let highest_cursor_for_live = highest_cursor.clone();
         let live_channels = channels.clone();
@@ -339,10 +339,12 @@ where
         let config = self.load_config().await;
         self.runs
             .submit_user_message(
-                self.sessions.clone(),
-                self.runtime_factory.clone(),
-                config,
-                session_id,
+                SessionRunRequest {
+                    sessions: self.sessions.clone(),
+                    runtime_factory: self.runtime_factory.clone(),
+                    config,
+                    session_id,
+                },
                 request.text,
             )
             .await?;
@@ -364,10 +366,12 @@ where
         let config = self.load_config().await;
         self.runs
             .respond_external_request(
-                self.sessions.clone(),
-                self.runtime_factory.clone(),
-                config,
-                session_id,
+                SessionRunRequest {
+                    sessions: self.sessions.clone(),
+                    runtime_factory: self.runtime_factory.clone(),
+                    config,
+                    session_id,
+                },
                 ExternalRequestId::new(request.request_id),
                 response,
             )
@@ -399,7 +403,7 @@ fn push_history(
     output: &mut Vec<Result<WatchTimelineResponse, Status>>,
     highest_cursor: &AtomicU64,
     events: Vec<waltr_agent::AgentTimelineEvent>,
-) -> Result<(), Status> {
+) {
     for event in events {
         let cursor = event.cursor.get();
         if cursor <= highest_cursor.load(Ordering::Relaxed) {
@@ -413,7 +417,6 @@ fn push_history(
             }),
         );
     }
-    Ok(())
 }
 
 fn default_root() -> PathBuf {

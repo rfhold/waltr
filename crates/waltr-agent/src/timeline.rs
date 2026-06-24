@@ -436,14 +436,7 @@ impl PendingTimelineEvent {
         item_id: impl Into<TimelineItemId>,
         text: impl Into<String>,
     ) -> Self {
-        text_snapshot_event(
-            session_id,
-            turn,
-            item_id,
-            TimelineEventKind::ItemFinished,
-            CHANNEL_USER_TEXT,
-            text,
-        )
+        text_snapshot_event(session_id, turn, item_id, CHANNEL_USER_TEXT, text)
     }
 
     /// Create a final assistant text snapshot event.
@@ -454,14 +447,7 @@ impl PendingTimelineEvent {
         item_id: impl Into<TimelineItemId>,
         text: impl Into<String>,
     ) -> Self {
-        text_snapshot_event(
-            session_id,
-            turn,
-            item_id,
-            TimelineEventKind::ItemFinished,
-            CHANNEL_ASSISTANT_TEXT,
-            text,
-        )
+        text_snapshot_event(session_id, turn, item_id, CHANNEL_ASSISTANT_TEXT, text)
     }
 
     /// Create a thinking delta event.
@@ -624,7 +610,6 @@ fn text_snapshot_event(
     session_id: SessionId,
     turn: u64,
     item_id: impl Into<TimelineItemId>,
-    kind: TimelineEventKind,
     channel: &str,
     text: impl Into<String>,
 ) -> PendingTimelineEvent {
@@ -632,7 +617,7 @@ fn text_snapshot_event(
         session_id,
         turn,
         item_id,
-        kind,
+        TimelineEventKind::ItemFinished,
         Some(TimelineChannel::from(channel)),
         TimelineContent::TextSnapshot { text: text.into() },
     );

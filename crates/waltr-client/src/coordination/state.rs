@@ -7,6 +7,8 @@ use crate::{Configuration, SessionSummary, StreamId, SystemStatus, TimelineEvent
 /// Runtime-local operation identifier used by shells to track command results.
 pub type OperationKey = String;
 
+type TimelineWatchRequest = (Option<u64>, Vec<String>, Option<u32>);
+
 /// Return the capped watch reconnect delay for a retry attempt.
 #[must_use]
 pub fn watch_reconnect_delay_ms(attempt: usize) -> u64 {
@@ -591,7 +593,8 @@ impl ClientState {
         sequence: u64,
         event: TimelineEvent,
     ) {
-        let timeline = self.session_timeline_mut(&event.session_id.clone());
+        let session_id = event.session_id.clone();
+        let timeline = self.session_timeline_mut(&session_id);
         timeline.last_sequence = sequence;
         timeline.events.insert(event.cursor, event);
         timeline.watch.status = OperationStatus::Received;
@@ -616,7 +619,7 @@ impl ClientState {
     pub(crate) fn session_timeline_watch_request(
         &self,
         session_id: &str,
-    ) -> Option<(Option<u64>, Vec<String>, Option<u32>)> {
+    ) -> Option<TimelineWatchRequest> {
         self.sessions.timelines.get(session_id).map(|timeline| {
             (
                 timeline.watch_after_cursor,

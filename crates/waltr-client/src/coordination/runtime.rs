@@ -695,25 +695,21 @@ impl ClientRuntime {
             .timeline_watch_session_ids()
             .into_iter()
             .find(|session_id| self.timeline_watches.contains_key(session_id))
+            && let Some(stream) = self.timeline_watches.get_mut(&session_id)
         {
-            if let Some(stream) = self.timeline_watches.get_mut(&session_id) {
-                return match stream.next().await {
-                    Some(Ok(update)) => {
-                        ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
-                    }
-                    Some(Err(error)) => {
-                        self.timeline_watches.remove(&session_id);
-                        ClientEvent::Session(SessionEvent::TimelineWatchFailed {
-                            session_id,
-                            error,
-                        })
-                    }
-                    None => {
-                        self.timeline_watches.remove(&session_id);
-                        ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
-                    }
-                };
-            }
+            return match stream.next().await {
+                Some(Ok(update)) => {
+                    ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
+                }
+                Some(Err(error)) => {
+                    self.timeline_watches.remove(&session_id);
+                    ClientEvent::Session(SessionEvent::TimelineWatchFailed { session_id, error })
+                }
+                None => {
+                    self.timeline_watches.remove(&session_id);
+                    ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
+                }
+            };
         }
 
         if self.reducer.state().config.watch.interests > 0 {
@@ -924,6 +920,42 @@ impl ClientStateStream {
 
     fn begin_command(&mut self, command: ClientCommand) -> Result<(), ClientError> {
         let update = match command {
+            ClientCommand::RequestConfig
+            | ClientCommand::AddProvider { .. }
+            | ClientCommand::UpdateProvider { .. }
+            | ClientCommand::DeleteProvider { .. }
+            | ClientCommand::AddMcpServer { .. }
+            | ClientCommand::UpdateMcpServer { .. }
+            | ClientCommand::DeleteMcpServer { .. }
+            | ClientCommand::SetRuntimeDefaults { .. }
+            | ClientCommand::RegisterConfigWatchInterest
+            | ClientCommand::ReleaseConfigWatchInterest => self.begin_config_command(command)?,
+            ClientCommand::CreateSession
+            | ClientCommand::DeleteSession { .. }
+            | ClientCommand::UpdateSessionRuntimeConfig { .. }
+            | ClientCommand::RegisterSessionWatchInterest
+            | ClientCommand::ReleaseSessionWatchInterest
+            | ClientCommand::SubmitUserMessage { .. }
+            | ClientCommand::RespondExternalRequest { .. }
+            | ClientCommand::InterruptSession { .. } => self.begin_session_command(command),
+            ClientCommand::RequestSessionTimeline { .. }
+            | ClientCommand::RegisterSessionTimelineWatchInterest { .. }
+            | ClientCommand::ReleaseSessionTimelineWatchInterest { .. } => {
+                self.begin_timeline_command(command)
+            }
+            ClientCommand::WatchStatus => self.runtime.reducer.request_status_watch(),
+            ClientCommand::WaitForSystemReady => self.runtime.reducer.maintain_watches(),
+        };
+
+        self.extend_effects(&update);
+        Ok(())
+    }
+
+    fn begin_config_command(
+        &mut self,
+        command: ClientCommand,
+    ) -> Result<ClientUpdate, ClientError> {
+        Ok(match command {
             ClientCommand::RequestConfig => self.runtime.reducer.request_config(),
             ClientCommand::AddProvider { provider } => {
                 self.runtime.reducer.add_provider(provider.into())?
@@ -965,6 +997,12 @@ impl ClientStateStream {
                 }
                 update
             }
+            _ => unreachable!("non-config command routed to config handler"),
+        })
+    }
+
+    fn begin_session_command(&mut self, command: ClientCommand) -> ClientUpdate {
+        match command {
             ClientCommand::CreateSession => self.runtime.reducer.create_session(),
             ClientCommand::DeleteSession { id } => self.runtime.reducer.delete_session(id),
             ClientCommand::UpdateSessionRuntimeConfig {
@@ -990,6 +1028,27 @@ impl ClientStateStream {
                 }
                 update
             }
+            ClientCommand::SubmitUserMessage { session_id, text } => {
+                self.runtime.reducer.submit_user_message(session_id, text)
+            }
+            ClientCommand::RespondExternalRequest {
+                session_id,
+                request_id,
+                response_json,
+            } => {
+                self.runtime
+                    .reducer
+                    .respond_external_request(session_id, request_id, response_json)
+            }
+            ClientCommand::InterruptSession { session_id } => {
+                self.runtime.reducer.interrupt_session(session_id)
+            }
+            _ => unreachable!("non-session command routed to session handler"),
+        }
+    }
+
+    fn begin_timeline_command(&mut self, command: ClientCommand) -> ClientUpdate {
+        match command {
             ClientCommand::RequestSessionTimeline {
                 session_id,
                 cursor,
@@ -1036,27 +1095,8 @@ impl ClientStateStream {
                 }
                 update
             }
-            ClientCommand::SubmitUserMessage { session_id, text } => {
-                self.runtime.reducer.submit_user_message(session_id, text)
-            }
-            ClientCommand::RespondExternalRequest {
-                session_id,
-                request_id,
-                response_json,
-            } => {
-                self.runtime
-                    .reducer
-                    .respond_external_request(session_id, request_id, response_json)
-            }
-            ClientCommand::InterruptSession { session_id } => {
-                self.runtime.reducer.interrupt_session(session_id)
-            }
-            ClientCommand::WatchStatus => self.runtime.reducer.request_status_watch(),
-            ClientCommand::WaitForSystemReady => self.runtime.reducer.maintain_watches(),
-        };
-
-        self.extend_effects(&update);
-        Ok(())
+            _ => unreachable!("non-timeline command routed to timeline handler"),
+        }
     }
 
     async fn apply_effect(&mut self, effect: ClientEffect) {

@@ -110,8 +110,7 @@ impl Stream for SessionTimelineSubscription {
                 Poll::Ready(Some(Ok(update))) if update.event.session_id == self.session_id => {
                     return Poll::Ready(Some(update));
                 }
-                Poll::Ready(Some(Ok(_)))
-                | Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_)))) => {}
+                Poll::Ready(Some(Ok(_) | Err(BroadcastStreamRecvError::Lagged(_)))) => {}
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             }

@@ -24,7 +24,7 @@ const GATEWAY_ANTHROPIC_TEST_MODEL: &str = "anthropic/claude-haiku-4-5";
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY"]
 async fn openai_chat_completions_submits_user_message() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(provider) = skip_if_missing(openai_chat_completions_provider())? else {
+    let Some(provider) = skip_if_missing(openai_chat_completions_provider()) else {
         return Ok(());
     };
     assert_provider_submit_user_message(provider).await
@@ -33,7 +33,7 @@ async fn openai_chat_completions_submits_user_message() -> Result<(), Box<dyn st
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY"]
 async fn anthropic_messages_submits_user_message() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(provider) = skip_if_missing(anthropic_messages_provider())? else {
+    let Some(provider) = skip_if_missing(anthropic_messages_provider()) else {
         return Ok(());
     };
     assert_provider_submit_user_message(provider).await
@@ -43,7 +43,7 @@ async fn anthropic_messages_submits_user_message() -> Result<(), Box<dyn std::er
 #[ignore = "requires WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn gateway_openai_chat_completions_submits_user_message()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(provider) = skip_if_missing(gateway_openai_chat_completions_provider())? else {
+    let Some(provider) = skip_if_missing(gateway_openai_chat_completions_provider()) else {
         return Ok(());
     };
     assert_provider_submit_user_message(provider).await
@@ -53,7 +53,7 @@ async fn gateway_openai_chat_completions_submits_user_message()
 #[ignore = "requires WALTR_AGENT_LIVE_GATEWAY=1"]
 async fn gateway_anthropic_messages_submits_user_message() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(provider) = skip_if_missing(gateway_anthropic_messages_provider())? else {
+    let Some(provider) = skip_if_missing(gateway_anthropic_messages_provider()) else {
         return Ok(());
     };
     assert_provider_submit_user_message(provider).await
@@ -63,7 +63,7 @@ async fn gateway_anthropic_messages_submits_user_message() -> Result<(), Box<dyn
 #[ignore = "requires OPENAI_API_KEY"]
 async fn openai_chat_completions_watch_timeline_reconnects_with_cursor()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(provider) = skip_if_missing(openai_chat_completions_provider())? else {
+    let Some(provider) = skip_if_missing(openai_chat_completions_provider()) else {
         return Ok(());
     };
     assert_provider_watch_timeline_reconnects_with_cursor(provider).await
@@ -133,7 +133,7 @@ async fn assert_provider_watch_timeline_reconnects_with_cursor(
         .expect("watch should replay assistant event after cursor");
     let replayed = update.event.expect("timeline event should be present");
     assert!(replayed.cursor > after_cursor);
-    assert_eq!(assistant_text(&replayed).is_empty(), false);
+    assert!(!assistant_text(&replayed).is_empty());
 
     Ok(())
 }
@@ -266,17 +266,15 @@ fn require_gateway() -> Result<(), MissingLiveConfig> {
     }
 }
 
-fn skip_if_missing<T>(
-    result: Result<T, MissingLiveConfig>,
-) -> Result<Option<T>, MissingLiveConfig> {
+fn skip_if_missing<T>(result: Result<T, MissingLiveConfig>) -> Option<T> {
     match result {
-        Ok(value) => Ok(Some(value)),
+        Ok(value) => Some(value),
         Err(error) => {
             eprintln!(
                 "skipping live test: missing {}; set {} or use the matching live provider setup",
                 error.name, error.name
             );
-            Ok(None)
+            None
         }
     }
 }
@@ -304,7 +302,7 @@ async fn wait_for_assistant_event(
     >,
     session_id: &str,
 ) -> Result<waltr::grpc::waltr::session::v1::TimelineEvent, Box<dyn std::error::Error>> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
     while tokio::time::Instant::now() < deadline {
         let events = client
             .get_timeline(GetTimelineRequest {

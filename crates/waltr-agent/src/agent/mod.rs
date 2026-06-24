@@ -86,7 +86,7 @@ mod tests {
         AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
         CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse,
         MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionJournalEvent,
-        SessionStore, TimelineContent, TimelineEventKind, TimelineQuery, ToolCall,
+        SessionStore, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery, ToolCall,
         middleware::{
             AgentMiddleware, HookOutcome,
             chain::MiddlewareChain,
@@ -284,12 +284,12 @@ mod tests {
         }
 
         assert!(watched.iter().any(|event| {
-            event.channel.as_ref().map(|channel| channel.as_str()) == Some(CHANNEL_USER_TEXT)
+            event.channel.as_ref().map(TimelineChannel::as_str) == Some(CHANNEL_USER_TEXT)
                 && event.kind == TimelineEventKind::ItemFinished
                 && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "hello")
         }));
         assert!(watched.iter().any(|event| {
-            event.channel.as_ref().map(|channel| channel.as_str()) == Some(CHANNEL_ASSISTANT_TEXT)
+            event.channel.as_ref().map(TimelineChannel::as_str) == Some(CHANNEL_ASSISTANT_TEXT)
                 && event.kind == TimelineEventKind::ItemFinished
                 && matches!(&event.content, TimelineContent::TextSnapshot { text } if text == "ok")
         }));
