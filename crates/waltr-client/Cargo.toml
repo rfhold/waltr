@@ -31,6 +31,7 @@ tonic = { workspace = true, features = ["transport"] }
 tonic-web-wasm-client.workspace = true
 
 [dev-dependencies]
+waltr-agent.workspace = true
 waltr-server = { workspace = true, features = ["test"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 

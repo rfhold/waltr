@@ -2816,6 +2816,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "waltr",
+ "waltr-agent",
  "waltr-server",
  "prost-types",
  "serde",
@@ -2833,6 +2834,7 @@ name = "waltr-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "waltr",
  "waltr-agent",
  "notify",
@@ -2848,6 +2850,7 @@ dependencies = [
  "sha2 0.11.0",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml 1.1.2+spec-1.1.0",
  "tonic",
  "tonic-otel-layer",
