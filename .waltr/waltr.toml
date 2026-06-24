@@ -1,28 +1,9 @@
 etag = ""
 
-[providers.agent-gateway-anthropic]
-type = 1
-name = "agent-gateway-anthropic"
-url = "https://agentgateway.holdenitdown.net/v1"
-
-[providers.agent-gateway-anthropic.headers]
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6"]
-name = "Sonnet 4.6"
-type = 1
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".options]
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".limits]
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".capabilities]
-tools = false
-image = false
-
 [providers.agent-gateway-openai]
 type = 2
 name = "agent-gateway-openai"
-url = "https://agentgateway.holdenitdown.net/v1"
+url = "https://agent-gateway.holdenitdown.net"
 
 [providers.agent-gateway-openai.headers]
 
@@ -37,6 +18,25 @@ type = 1
 [providers.agent-gateway-openai.models."openai/gpt-5.5".capabilities]
 tools = true
 image = true
+
+[providers.agent-gateway-anthropic]
+type = 1
+name = "agent-gateway-anthropic"
+url = "https://agent-gateway.holdenitdown.net"
+
+[providers.agent-gateway-anthropic.headers]
+
+[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6"]
+name = "Sonnet 4.6"
+type = 1
+
+[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".options]
+
+[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".limits]
+
+[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".capabilities]
+tools = false
+image = false
 
 [mcp_servers.playwrite]
 name = "playwrite"
