@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
+    ExternalResponse, PendingWork, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
     SessionListBroadcaster, SessionListEvent, SessionRecord, SessionSnapshot, SessionStatus,
     SessionStore, SessionSummary, SessionTimelineBroadcaster, Suspension,
 };
@@ -187,7 +187,8 @@ where
         }
 
         let mut journal = Vec::new();
-        let mut timeline = Vec::new();
+        let mut cancellation_timeline = Vec::new();
+        let mut status_timeline = Vec::new();
         for request in pending_external_requests(&snapshot) {
             let reason = CancelReason::SessionInterrupted;
             journal.push(SessionJournalEvent::ExternalRequestCanceled {
@@ -196,24 +197,36 @@ where
             });
             let mut request = request.clone();
             request.status = ExternalRequestStatus::Canceled(reason);
-            timeline.push(external_request_timeline_event(
+            cancellation_timeline.push(external_request_timeline_event(
                 &record.id,
                 snapshot.turn,
                 request,
                 TimelineEventKind::ExternalRequestResolved,
             ));
         }
-        for work_id in pending_work_ids(&snapshot) {
+        for work in pending_work(&snapshot) {
+            if let Some(result) = interrupted_tool_result(work) {
+                cancellation_timeline
+                    .push(tool_result_timeline_event(&record.id, work.turn, result));
+            }
             journal.push(SessionJournalEvent::WorkCanceled {
-                work_id,
+                work_id: work.id.clone(),
                 reason: CancelReason::SessionInterrupted,
             });
         }
         journal.push(SessionJournalEvent::Interrupted);
-        timeline.push(interrupted_status_timeline_event(&record.id, snapshot.turn));
+        status_timeline.push(interrupted_status_timeline_event(&record.id, snapshot.turn));
 
-        let mut record = self.append_journal_and_reload(record, journal).await?;
-        record = self.append_timeline_and_reload(record, timeline).await?;
+        let mut record = if cancellation_timeline.is_empty() {
+            record
+        } else {
+            self.append_timeline_and_reload(record, cancellation_timeline)
+                .await?
+        };
+        record = self.append_journal_and_reload(record, journal).await?;
+        record = self
+            .append_timeline_and_reload(record, status_timeline)
+            .await?;
         Ok(record)
     }
 
@@ -224,7 +237,8 @@ where
     ) -> Result<RuntimeResumeOutput> {
         let snapshot = record.snapshot();
         let mut journal = Vec::new();
-        let mut timeline = Vec::new();
+        let mut cancellation_timeline = Vec::new();
+        let mut prompt_timeline = Vec::new();
         for request in pending_external_requests(&snapshot) {
             let reason = CancelReason::SupersededByUserPrompt;
             journal.push(SessionJournalEvent::ExternalRequestCanceled {
@@ -233,29 +247,41 @@ where
             });
             let mut request = request.clone();
             request.status = ExternalRequestStatus::Canceled(reason);
-            timeline.push(external_request_timeline_event(
+            cancellation_timeline.push(external_request_timeline_event(
                 &record.id,
                 snapshot.turn,
                 request,
                 TimelineEventKind::ExternalRequestResolved,
             ));
         }
-        for work_id in pending_work_ids(&snapshot) {
+        for work in pending_work(&snapshot) {
+            if let Some(result) = interrupted_tool_result(work) {
+                cancellation_timeline
+                    .push(tool_result_timeline_event(&record.id, work.turn, result));
+            }
             journal.push(SessionJournalEvent::WorkCanceled {
-                work_id,
+                work_id: work.id.clone(),
                 reason: CancelReason::SupersededByUserPrompt,
             });
         }
-        timeline.push(user_prompt_timeline_event(
+        prompt_timeline.push(user_prompt_timeline_event(
             &record.id,
             snapshot.turn,
             prompt.clone(),
         ));
         journal.push(SessionJournalEvent::PromptAppended { prompt });
 
-        let mut record = self.append_journal_and_reload(record, journal).await?;
-        if !timeline.is_empty() {
-            record = self.append_timeline_and_reload(record, timeline).await?;
+        let mut record = if cancellation_timeline.is_empty() {
+            record
+        } else {
+            self.append_timeline_and_reload(record, cancellation_timeline)
+                .await?
+        };
+        record = self.append_journal_and_reload(record, journal).await?;
+        if !prompt_timeline.is_empty() {
+            record = self
+                .append_timeline_and_reload(record, prompt_timeline)
+                .await?;
         }
         Ok(RuntimeResumeOutput::Resumed { record })
     }
@@ -502,13 +528,21 @@ fn pending_external_requests(snapshot: &SessionSnapshot) -> Vec<&ExternalRequest
         .collect()
 }
 
-fn pending_work_ids(snapshot: &SessionSnapshot) -> Vec<String> {
+fn pending_work(snapshot: &SessionSnapshot) -> Vec<&PendingWork> {
     snapshot
         .pending_work
         .iter()
         .filter(|work| matches!(work.status, PendingWorkStatus::Pending))
-        .map(|work| work.id.clone())
         .collect()
+}
+
+fn interrupted_tool_result(work: &PendingWork) -> Option<ToolResult> {
+    let call = work.tool_call.as_ref()?;
+    Some(ToolResult::new(
+        call.id.clone(),
+        call.name.clone(),
+        "interrupted",
+    ))
 }
 
 fn permission_state(snapshot: &SessionSnapshot) -> Result<PermissionRuntimeState> {
@@ -797,6 +831,11 @@ mod tests {
             snapshot.pending_work[0].status,
             PendingWorkStatus::Canceled(CancelReason::SupersededByUserPrompt)
         );
+        let tool_results: Vec<_> = snapshot.tool_results().collect();
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].call_id, "call-question");
+        assert_eq!(tool_results[0].name, "question");
+        assert_eq!(tool_results[0].content, "interrupted");
     }
 
     #[tokio::test]
@@ -820,6 +859,11 @@ mod tests {
             snapshot.pending_work[0].status,
             PendingWorkStatus::Canceled(CancelReason::SessionInterrupted)
         );
+        let tool_results: Vec<_> = snapshot.tool_results().collect();
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].call_id, "call-question");
+        assert_eq!(tool_results[0].name, "question");
+        assert_eq!(tool_results[0].content, "interrupted");
         assert!(
             record
                 .journal
