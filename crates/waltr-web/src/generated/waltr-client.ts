@@ -262,6 +262,70 @@ lastActivityAt: TimestampView | null,
  */
 runtimeConfig: SessionRuntimeConfigView | null, };
 
+export type TimelineEventKindView = "unspecified" | "itemStarted" | "contentDelta" | "itemUpdated" | "itemFinished" | "externalRequestOpened" | "externalRequestResolved" | "sessionStatusChanged" | "unknown";
+
+export type TimelineStatusView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "evaluatingToolCall" | "runningTool" | "pending" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "resolved" | "finished" | "failed" | "canceled" | "unknown";
+
+export type ExternalRequestView = { id: string, kind: number, payloadJson: string, };
+
+export type TimelineContentView = { "kind": "empty" } | { "kind": "textDelta", delta: string, } | { "kind": "textSnapshot", text: string, } | { "kind": "toolCall", id: string, name: string, arguments_json: string, } | { "kind": "toolResult", id: string, name: string, content: string, error: boolean, } | { "kind": "externalRequest", request: ExternalRequestView | null, } | { "kind": "contentRef", content_id: string, bytes: bigint, } | { "kind": "json", value_json: string, } | { "kind": "unknown" };
+
+export type TimelineEventView = { 
+/**
+ * Durable timeline cursor.
+ */
+cursor: bigint, 
+/**
+ * Session id that owns the event.
+ */
+sessionId: string, 
+/**
+ * Turn number that produced the event.
+ */
+turn: bigint, 
+/**
+ * Timeline item id.
+ */
+itemId: string, 
+/**
+ * Parent timeline item id, when present.
+ */
+parentId: string | null, 
+/**
+ * Event kind.
+ */
+kind: TimelineEventKindView, 
+/**
+ * Display channel, when present.
+ */
+channel: string | null, 
+/**
+ * Event content.
+ */
+content: TimelineContentView, 
+/**
+ * Event status, when present.
+ */
+status: TimelineStatusView | null, 
+/**
+ * JSON metadata object as returned by the server.
+ */
+metadataJson: string, };
+
+export type SessionTimelineView = { 
+/**
+ * Persisted timeline events ordered by cursor.
+ */
+events: Array<TimelineEventView>, 
+/**
+ * Timeline page load operation snapshot.
+ */
+load: OperationSnapshot, 
+/**
+ * Timeline watch operation snapshot.
+ */
+watch: OperationSnapshot, };
+
 export type ClientOperationView = { "kind": "configPatch", 
 /**
  * Stable operation status name.
@@ -310,7 +374,47 @@ error: string | null,
 /**
  * Updated session, when the operation completed successfully.
  */
-session: SessionView | null, };
+session: SessionView | null, } | { "kind": "sessionSubmitUserMessage", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Session id submitted to.
+ */
+sessionId: string, } | { "kind": "sessionRespondExternalRequest", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Session id responded to.
+ */
+sessionId: string, 
+/**
+ * External request id.
+ */
+requestId: string, } | { "kind": "sessionInterrupt", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Session id interrupted.
+ */
+sessionId: string, };
 
 export type OperationCollectionSnapshot = { 
 /**
@@ -382,9 +486,25 @@ delete: OperationSnapshot,
  */
 runtimeConfigUpdate: OperationSnapshot, 
 /**
+ * User message submit operation snapshot.
+ */
+submitUserMessage: OperationSnapshot, 
+/**
+ * External request response operation snapshot.
+ */
+respondExternalRequest: OperationSnapshot, 
+/**
+ * Session interrupt operation snapshot.
+ */
+interrupt: OperationSnapshot, 
+/**
  * Session watch operation snapshot.
  */
-watch: OperationSnapshot, };
+watch: OperationSnapshot, 
+/**
+ * Session timelines by session id.
+ */
+timelines: { [key in string]?: SessionTimelineView }, };
 
 export type ClientSnapshot = { 
 /**
@@ -460,4 +580,64 @@ modelId: string,
 /**
  * MCP server keys enabled for subsequent prompts.
  */
-enabledMcpServerKeys: Array<string>, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };
+enabledMcpServerKeys: Array<string>, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "requestSessionTimeline", 
+/**
+ * Session id whose timeline should load.
+ */
+sessionId: string, 
+/**
+ * Exclusive cursor boundary.
+ */
+cursor: bigint | null, 
+/**
+ * Maximum events to return.
+ */
+limit: number, 
+/**
+ * Display-channel filter.
+ */
+channels: Array<string>, } | { "type": "registerSessionTimelineWatchInterest", 
+/**
+ * Session id whose timeline should be watched.
+ */
+sessionId: string, 
+/**
+ * Optional cursor boundary for replay.
+ */
+afterCursor: bigint | null, 
+/**
+ * Display-channel filter.
+ */
+channels: Array<string>, 
+/**
+ * Optional history batch size.
+ */
+initialLimit: number | null, } | { "type": "releaseSessionTimelineWatchInterest", 
+/**
+ * Session id whose timeline watch interest should be released.
+ */
+sessionId: string, } | { "type": "submitUserMessage", 
+/**
+ * Session id to submit to.
+ */
+sessionId: string, 
+/**
+ * User message text.
+ */
+text: string, } | { "type": "respondExternalRequest", 
+/**
+ * Session id to respond to.
+ */
+sessionId: string, 
+/**
+ * External request id.
+ */
+requestId: string, 
+/**
+ * JSON response payload.
+ */
+responseJson: string, } | { "type": "interruptSession", 
+/**
+ * Session id to interrupt.
+ */
+sessionId: string, } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };

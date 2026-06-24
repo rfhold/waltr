@@ -8,6 +8,7 @@
     "build": "pnpm --filter @rfhold/waltr-web build",
     "test": "pnpm --filter @rfhold/waltr-web test",
     "test:web:integration": "node scripts/test-web-integration.mjs",
+    "test:web:live": "WALTR_WEB_LIVE=1 node scripts/test-web-integration.mjs",
     "test:web:screenshots": "WALTR_WEB_SCREENSHOTS=1 node scripts/test-web-integration.mjs",
     "test:web:screenshots:update": "WALTR_WEB_SCREENSHOTS=1 WALTR_WEB_UPDATE_SCREENSHOTS=1 node scripts/test-web-integration.mjs"
   },
