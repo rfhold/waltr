@@ -20,7 +20,7 @@ use super::request::{responses_input, responses_tools};
 /// `OpenAI` Responses websocket streaming provider.
 #[derive(Debug, Clone)]
 pub struct OpenAiResponsesWebSocket {
-    api_key: String,
+    headers: Vec<(&'static str, String)>,
     model: String,
     responses_url: String,
     reasoning: Option<OpenAiReasoningConfig>,
@@ -28,9 +28,9 @@ pub struct OpenAiResponsesWebSocket {
 
 impl OpenAiResponsesWebSocket {
     /// Create an `OpenAI` Responses websocket provider.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            headers: Vec::new(),
             model: model.into(),
             responses_url: "wss://api.openai.com/v1/responses".to_owned(),
             reasoning: None,
@@ -45,6 +45,13 @@ impl OpenAiResponsesWebSocket {
             .strip_prefix("https://")
             .map_or_else(|| base_url.to_owned(), |rest| format!("wss://{rest}"));
         self.responses_url = format!("{websocket_base_url}/v1/responses");
+        self
+    }
+
+    /// Add a static request header to this provider.
+    #[must_use]
+    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
         self
     }
 
@@ -128,15 +135,12 @@ impl LlmStream for OpenAiResponsesWebSocket {
                 &self.model,
             );
             let mut websocket_request = self.responses_url.as_str().into_client_request()?;
-            if !self.api_key.is_empty() {
-                let authorization = HeaderValue::from_str(&format!("Bearer {}", self.api_key))
-                    .map_err(|error| LlmError::Protocol {
-                        provider: RESPONSES_WEBSOCKET_NAME,
-                        message: format!("invalid authorization header: {error}"),
-                    })?;
-                websocket_request
-                    .headers_mut()
-                    .insert("Authorization", authorization);
+            for (name, value) in &self.headers {
+                let value = HeaderValue::from_str(value).map_err(|error| LlmError::Protocol {
+                    provider: RESPONSES_WEBSOCKET_NAME,
+                    message: format!("invalid {name} header: {error}"),
+                })?;
+                websocket_request.headers_mut().insert(*name, value);
             }
             let (mut websocket, _) = connect_async_tls_with_config(
                 websocket_request,
