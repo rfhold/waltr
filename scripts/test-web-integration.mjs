@@ -19,6 +19,7 @@ const serverUrl = `http://127.0.0.1:${serverPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const dockerWebUrl = `http://${getHostAddress()}:${webPort}`;
 const modelsDevFixture = `${repoRoot}/tests/web/k6/support/models-dev-api.fixture.json`;
+const sessionsRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/sessions-runtime-config.fixture.toml`;
 const screenshotsEnabled = process.env.WALTR_WEB_SCREENSHOTS === "1";
 const screenshotsUpdate = process.env.WALTR_WEB_UPDATE_SCREENSHOTS === "1";
 const liveEnabled = process.env.WALTR_WEB_LIVE === "1";
@@ -90,6 +91,8 @@ try {
   let k6ExitCode = 0;
 
   for (const browserScript of browserScripts) {
+    seedConfigForBrowserScript(browserScript);
+
     const dockerArgs = [
       "run",
       "--rm",
@@ -142,6 +145,20 @@ try {
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   stop(1);
+}
+
+function seedConfigForBrowserScript(browserScript) {
+  const configDir = `${serverRoot}/.waltr`;
+  const configPath = `${configDir}/waltr.toml`;
+
+  mkdirSync(configDir, { recursive: true });
+
+  if (browserScript === "tests/web/k6/sessions/sessions.browser.js") {
+    copyFileSync(sessionsRuntimeConfigFixture, configPath);
+    return;
+  }
+
+  copyFileSync(`${repoRoot}/tests/web/k6/support/empty-config.fixture.toml`, configPath);
 }
 
 function run(command, args, options = {}) {
