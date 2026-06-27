@@ -119,6 +119,7 @@ mod tests {
                 model_key: "sonnet".to_owned(),
                 mcp_default_enabled: None,
                 enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: None,
             }),
             ..Configuration::default()
         };

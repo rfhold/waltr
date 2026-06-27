@@ -23,6 +23,8 @@ pub struct RuntimeDefaults {
     pub mcp_default_enabled: ::core::option::Option<bool>,
     #[prost(string, repeated, tag="4")]
     pub enabled_mcp_server_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="5")]
+    pub reasoning_effort: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -37,6 +39,54 @@ pub struct Provider {
     pub headers: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(map="string, message", tag="5")]
     pub models: ::std::collections::HashMap<::prost::alloc::string::String, Model>,
+    #[prost(bool, tag="7")]
+    pub oauth_compatible: bool,
+    #[prost(message, optional, tag="8")]
+    pub oauth_settings: ::core::option::Option<OAuthProvider>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OAuthProvider {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub authorize_url: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub token_url: ::prost::alloc::string::String,
+    #[prost(string, tag="4")]
+    pub client_id: ::prost::alloc::string::String,
+    #[prost(string, tag="5")]
+    pub redirect_uri: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag="6")]
+    pub scopes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration="OauthTokenRequestStyle", tag="7")]
+    pub token_request_style: i32,
+    #[prost(message, repeated, tag="8")]
+    pub auth_url_params: ::prost::alloc::vec::Vec<OauthUrlParam>,
+    #[prost(message, repeated, tag="9")]
+    pub jwt_metadata: ::prost::alloc::vec::Vec<OauthJwtMetadata>,
+    #[prost(bool, tag="10")]
+    pub send_state_in_token_request: bool,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OauthUrlParam {
+    #[prost(string, tag="1")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OauthJwtMetadata {
+    #[prost(enumeration="OauthTokenField", tag="1")]
+    pub token: i32,
+    #[prost(string, tag="2")]
+    pub metadata_key: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag="3")]
+    pub claim_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, tag="4")]
+    pub required: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -52,10 +102,26 @@ pub struct Model {
     pub limits: ::core::option::Option<ModelLimits>,
     #[prost(message, optional, tag="5")]
     pub capabilities: ::core::option::Option<ModelCapabilities>,
+    #[prost(message, optional, tag="6")]
+    pub catalog_match: ::core::option::Option<ModelCatalogMatch>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ModelCatalogMatch {
+    #[prost(string, tag="1")]
+    pub provider_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub model_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="3")]
+    pub upstream_provider_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub upstream_model_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration="CatalogMatchSource", tag="5")]
+    pub source: i32,
 }
 /// All option fields are optional; an absent field means "unset".
 #[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ModelOptions {
     #[prost(double, optional, tag="1")]
     pub temperature: ::core::option::Option<f64>,
@@ -69,6 +135,9 @@ pub struct ModelOptions {
     pub presence_penalty: ::core::option::Option<f64>,
     #[prost(double, optional, tag="6")]
     pub repetition_penalty: ::core::option::Option<f64>,
+    #[prost(string, repeated, tag="7")]
+    #[serde(default)]
+    pub reasoning_efforts: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -162,10 +231,71 @@ pub struct WatchConfigResponse {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
+pub enum OauthTokenRequestStyle {
+    Unspecified = 0,
+    Json = 1,
+    FormUrlencoded = 2,
+}
+impl OauthTokenRequestStyle {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "OAUTH_TOKEN_REQUEST_STYLE_UNSPECIFIED",
+            Self::Json => "OAUTH_TOKEN_REQUEST_STYLE_JSON",
+            Self::FormUrlencoded => "OAUTH_TOKEN_REQUEST_STYLE_FORM_URLENCODED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "OAUTH_TOKEN_REQUEST_STYLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "OAUTH_TOKEN_REQUEST_STYLE_JSON" => Some(Self::Json),
+            "OAUTH_TOKEN_REQUEST_STYLE_FORM_URLENCODED" => Some(Self::FormUrlencoded),
+            _ => None,
+        }
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum OauthTokenField {
+    Unspecified = 0,
+    Access = 1,
+    Id = 2,
+}
+impl OauthTokenField {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "OAUTH_TOKEN_FIELD_UNSPECIFIED",
+            Self::Access => "OAUTH_TOKEN_FIELD_ACCESS",
+            Self::Id => "OAUTH_TOKEN_FIELD_ID",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "OAUTH_TOKEN_FIELD_UNSPECIFIED" => Some(Self::Unspecified),
+            "OAUTH_TOKEN_FIELD_ACCESS" => Some(Self::Access),
+            "OAUTH_TOKEN_FIELD_ID" => Some(Self::Id),
+            _ => None,
+        }
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
 pub enum ProviderType {
     Unspecified = 0,
     Anthropic = 1,
     Openai = 2,
+    OpenaiCodex = 3,
 }
 impl ProviderType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -177,6 +307,7 @@ impl ProviderType {
             Self::Unspecified => "PROVIDER_TYPE_UNSPECIFIED",
             Self::Anthropic => "PROVIDER_TYPE_ANTHROPIC",
             Self::Openai => "PROVIDER_TYPE_OPENAI",
+            Self::OpenaiCodex => "PROVIDER_TYPE_OPENAI_CODEX",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -185,6 +316,40 @@ impl ProviderType {
             "PROVIDER_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
             "PROVIDER_TYPE_ANTHROPIC" => Some(Self::Anthropic),
             "PROVIDER_TYPE_OPENAI" => Some(Self::Openai),
+            "PROVIDER_TYPE_OPENAI_CODEX" => Some(Self::OpenaiCodex),
+            _ => None,
+        }
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CatalogMatchSource {
+    Unspecified = 0,
+    Auto = 1,
+    Manual = 2,
+    Applied = 3,
+}
+impl CatalogMatchSource {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CATALOG_MATCH_SOURCE_UNSPECIFIED",
+            Self::Auto => "CATALOG_MATCH_SOURCE_AUTO",
+            Self::Manual => "CATALOG_MATCH_SOURCE_MANUAL",
+            Self::Applied => "CATALOG_MATCH_SOURCE_APPLIED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CATALOG_MATCH_SOURCE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CATALOG_MATCH_SOURCE_AUTO" => Some(Self::Auto),
+            "CATALOG_MATCH_SOURCE_MANUAL" => Some(Self::Manual),
+            "CATALOG_MATCH_SOURCE_APPLIED" => Some(Self::Applied),
             _ => None,
         }
     }

@@ -20,6 +20,7 @@ message RuntimeDefaults {
   string model_key = 2;
   optional bool mcp_default_enabled = 3;
   repeated string enabled_mcp_server_keys = 4;
+  optional string reasoning_effort = 5;
 }
 
 message Provider {
@@ -28,12 +29,52 @@ message Provider {
   string url = 3;
   map<string, string> headers = 4;
   map<string, Model> models = 5;
+  bool oauth_compatible = 7;
+  OAuthProvider oauth_settings = 8;
+}
+
+message OAuthProvider {
+  string name = 1;
+  string authorize_url = 2;
+  string token_url = 3;
+  string client_id = 4;
+  string redirect_uri = 5;
+  repeated string scopes = 6;
+  OauthTokenRequestStyle token_request_style = 7;
+  repeated OauthUrlParam auth_url_params = 8;
+  repeated OauthJwtMetadata jwt_metadata = 9;
+  bool send_state_in_token_request = 10;
+}
+
+message OauthUrlParam {
+  string key = 1;
+  string value = 2;
+}
+
+message OauthJwtMetadata {
+  OauthTokenField token = 1;
+  string metadata_key = 2;
+  repeated string claim_names = 3;
+  bool required = 4;
+}
+
+enum OauthTokenRequestStyle {
+  OAUTH_TOKEN_REQUEST_STYLE_UNSPECIFIED = 0;
+  OAUTH_TOKEN_REQUEST_STYLE_JSON = 1;
+  OAUTH_TOKEN_REQUEST_STYLE_FORM_URLENCODED = 2;
+}
+
+enum OauthTokenField {
+  OAUTH_TOKEN_FIELD_UNSPECIFIED = 0;
+  OAUTH_TOKEN_FIELD_ACCESS = 1;
+  OAUTH_TOKEN_FIELD_ID = 2;
 }
 
 enum ProviderType {
   PROVIDER_TYPE_UNSPECIFIED = 0;
   PROVIDER_TYPE_ANTHROPIC = 1;
   PROVIDER_TYPE_OPENAI = 2;
+  PROVIDER_TYPE_OPENAI_CODEX = 3;
 }
 
 message Model {
@@ -43,6 +84,22 @@ message Model {
   ModelOptions options = 3;
   ModelLimits limits = 4;
   ModelCapabilities capabilities = 5;
+  ModelCatalogMatch catalog_match = 6;
+}
+
+message ModelCatalogMatch {
+  string provider_id = 1;
+  string model_id = 2;
+  optional string upstream_provider_id = 3;
+  optional string upstream_model_id = 4;
+  CatalogMatchSource source = 5;
+}
+
+enum CatalogMatchSource {
+  CATALOG_MATCH_SOURCE_UNSPECIFIED = 0;
+  CATALOG_MATCH_SOURCE_AUTO = 1;
+  CATALOG_MATCH_SOURCE_MANUAL = 2;
+  CATALOG_MATCH_SOURCE_APPLIED = 3;
 }
 
 // All option fields are optional; an absent field means "unset".
@@ -53,6 +110,7 @@ message ModelOptions {
   optional double min_p = 4;
   optional double presence_penalty = 5;
   optional double repetition_penalty = 6;
+  repeated string reasoning_efforts = 7;
 }
 
 message ModelLimits {
