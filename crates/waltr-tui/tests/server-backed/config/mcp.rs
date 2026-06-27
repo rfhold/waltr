@@ -118,7 +118,7 @@ async fn client_stream_manages_provider_models_via_update_provider_with_real_ser
     // Create a provider to host models.
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&char_press('c'), now), AppAction::Continue);
-    for character in "anthropic".chars() {
+    for character in "aaa-anthropic".chars() {
         assert_eq!(
             app.handle_event(&char_press(character), now),
             AppAction::Continue
@@ -174,7 +174,7 @@ async fn client_stream_manages_provider_models_via_update_provider_with_real_ser
         .config
         .current
         .as_ref()
-        .and_then(|config| config.providers.get("anthropic"))
+        .and_then(|config| config.providers.get("aaa-anthropic"))
         .expect("provider should be persisted");
     assert!(
         provider.models.contains_key("opus"),
@@ -183,6 +183,7 @@ async fn client_stream_manages_provider_models_via_update_provider_with_real_ser
 
     // Reopen the provider form, edit the model type, and save one provider update.
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
@@ -206,13 +207,14 @@ async fn client_stream_manages_provider_models_via_update_provider_with_real_ser
         .config
         .current
         .as_ref()
-        .and_then(|config| config.providers.get("anthropic"))
+        .and_then(|config| config.providers.get("aaa-anthropic"))
         .and_then(|provider| provider.models.get("opus"))
         .expect("edited model should remain persisted");
     assert_eq!(model.kind, ModelTypeView::Embedding);
 
     // Reopen the provider form, delete the model from the draft, then save.
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
@@ -238,7 +240,7 @@ async fn client_stream_manages_provider_models_via_update_provider_with_real_ser
             .config
             .current
             .as_ref()
-            .and_then(|config| config.providers.get("anthropic"))
+            .and_then(|config| config.providers.get("aaa-anthropic"))
             .is_some_and(|provider| provider.models.is_empty()),
         "deleted model should be removed by the provider update"
     );

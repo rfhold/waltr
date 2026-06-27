@@ -214,6 +214,8 @@ pub fn provider_view(name: &str) -> ProviderView {
         name: name.to_owned(),
         url: String::new(),
         headers: BTreeMap::new(),
+        oauth_compatible: false,
+        oauth_settings: None,
         models: BTreeMap::new(),
     }
 }

@@ -6,11 +6,11 @@ use std::{
 };
 
 use waltr_client::{
-    ClientCommand, ClientOperationView, ClientSnapshot, ConfigSnapshot, ConfigView,
-    McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView, ModelOptionsView,
-    ModelTypeView, ModelView, OperationCollectionSnapshot, OperationSnapshot, ProviderKindView,
-    ProviderView, SessionPhaseView, SessionSnapshot, SessionStatusView, SessionView,
-    StatusSnapshot, TimestampView,
+    CatalogMatchSourceView, ClientCommand, ClientOperationView, ClientSnapshot, ConfigSnapshot,
+    ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
+    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
+    OperationSnapshot, ProviderKindView, ProviderView, SessionPhaseView, SessionSnapshot,
+    SessionStatusView, SessionView, StatusSnapshot, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -1000,10 +1000,12 @@ fn config_provider_form_stages_model_edit_and_delete_until_provider_save() {
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert!(render_app(&app).contains("> Claude"));
     assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
     let rendered = render_app(&app);
     assert!(rendered.contains("Edit model"));
+    assert!(rendered.contains("catalog: anthropic / claude-sonnet-4-5 (manual)"));
     assert_eq!(rendered.matches("Edit model").count(), 1);
 
     let action = app.handle_event(&enter_press(), now);
@@ -1020,7 +1022,22 @@ fn config_provider_form_stages_model_edit_and_delete_until_provider_save() {
         panic!("expected update provider command, saw {action:?}");
     };
     assert_eq!(original_name, "anthropic");
-    assert!(provider.models.contains_key("sonnet"));
+    let model = provider
+        .models
+        .get("sonnet")
+        .expect("edited model should still exist");
+    assert_eq!(
+        model.catalog_match.as_ref().map(|catalog_match| (
+            catalog_match.provider_id.as_str(),
+            catalog_match.model_id.as_str(),
+            catalog_match.source,
+        )),
+        Some((
+            "anthropic",
+            "claude-sonnet-4-5",
+            CatalogMatchSourceView::Manual,
+        ))
+    );
 }
 
 #[test]
@@ -1029,6 +1046,7 @@ fn config_provider_model_form_escape_returns_to_provider_draft() {
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
@@ -1048,6 +1066,7 @@ fn config_provider_form_list_keys_edit_and_delete_models() {
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
@@ -1092,6 +1111,7 @@ fn config_provider_form_stages_model_delete_until_provider_save() {
     assert!(render_app(&app).contains("Claude"));
 
     // Delete the selected model; no command is emitted until the provider saves.
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
@@ -1599,6 +1619,7 @@ fn open_config_app_with_model() -> App {
                     min_p: None,
                     presence_penalty: None,
                     repetition_penalty: None,
+                    reasoning_efforts: Vec::new(),
                 },
                 limits: ModelLimitsView {
                     context: None,
@@ -1608,6 +1629,13 @@ fn open_config_app_with_model() -> App {
                     tools: false,
                     image: false,
                 },
+                catalog_match: Some(ModelCatalogMatchView {
+                    provider_id: "anthropic".to_owned(),
+                    model_id: "claude-sonnet-4-5".to_owned(),
+                    upstream_provider_id: None,
+                    upstream_model_id: None,
+                    source: CatalogMatchSourceView::Manual,
+                }),
             },
         );
     }
@@ -1874,6 +1902,8 @@ fn loaded_config_snapshot() -> ClientSnapshot {
                 name: "anthropic".to_owned(),
                 url: "https://api.anthropic.com".to_owned(),
                 headers: BTreeMap::new(),
+                oauth_compatible: false,
+                oauth_settings: None,
                 models: BTreeMap::new(),
             },
         )]),
