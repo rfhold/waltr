@@ -15,15 +15,15 @@ pub(super) const RESPONSES_WEBSOCKET_NAME: &str = "openai_responses_websocket";
 pub(super) async fn stream_openai_http(
     provider: &'static str,
     url: &str,
-    api_key: &str,
     body: Value,
+    headers: impl IntoIterator<Item = (&'static str, String)>,
     parse_event: impl FnMut(&str) -> Result<Vec<CompletionEvent>> + Send + 'static,
 ) -> Result<BoxCompletionStream> {
     // `body` is the projected payload journaled by the agent loop; crash
     // recovery retries the whole turn rather than resuming mid-stream.
     let mut request_builder = reqwest::Client::new().post(url).json(&body);
-    if !api_key.is_empty() {
-        request_builder = request_builder.bearer_auth(api_key);
+    for (name, value) in headers {
+        request_builder = request_builder.header(name, value);
     }
     let response = request_builder.send().await?;
 

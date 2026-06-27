@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use globset::GlobSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -213,7 +214,7 @@ pub struct GrepMatch {
 pub(super) struct GrepSearch<'a> {
     pub(super) base: &'a Path,
     pub(super) pattern: &'a str,
-    pub(super) include: Option<&'a str>,
+    pub(super) include: Option<&'a GlobSet>,
 }
 
 /// Filesystem tool kind.

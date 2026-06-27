@@ -14,16 +14,16 @@ use super::shared::{CHAT_COMPLETIONS_NAME, stream_openai_http};
 /// `OpenAI` Chat Completions HTTP streaming provider.
 #[derive(Debug, Clone)]
 pub struct OpenAiChatCompletions {
-    api_key: String,
+    headers: Vec<(&'static str, String)>,
     model: String,
     completions_url: String,
 }
 
 impl OpenAiChatCompletions {
     /// Create an `OpenAI` Chat Completions provider.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            headers: Vec::new(),
             model: model.into(),
             completions_url: "https://api.openai.com/v1/chat/completions".to_owned(),
         }
@@ -36,6 +36,13 @@ impl OpenAiChatCompletions {
             "{}/v1/chat/completions",
             base_url.as_ref().trim_end_matches('/')
         );
+        self
+    }
+
+    /// Add a static request header to this provider.
+    #[must_use]
+    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
         self
     }
 }
@@ -71,8 +78,8 @@ impl LlmStream for OpenAiChatCompletions {
             stream_openai_http(
                 CHAT_COMPLETIONS_NAME,
                 &self.completions_url,
-                &self.api_key,
                 body,
+                self.headers.clone(),
                 move |data| parser.parse_event(data),
             )
             .await

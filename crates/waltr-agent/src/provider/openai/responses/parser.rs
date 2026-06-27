@@ -1,6 +1,6 @@
 //! `OpenAI` Responses parser.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -10,17 +10,18 @@ use crate::{ProviderTurnMetadata, Result, TokenUsage};
 use crate::provider::openai::shared::{PartialToolCall, RESPONSES_NAME, api_error};
 
 #[derive(Debug)]
-pub(super) struct ResponsesParser {
+pub(in crate::provider::openai) struct ResponsesParser {
     provider: &'static str,
     url: String,
     model: String,
     tool_calls: HashMap<String, PartialToolCall>,
     tool_call_aliases: HashMap<String, String>,
     reasoning_item: Option<Value>,
+    streamed_reasoning_summaries: HashSet<String>,
 }
 
 impl ResponsesParser {
-    pub(super) fn new(
+    pub(in crate::provider::openai) fn new(
         provider: &'static str,
         url: impl Into<String>,
         model: impl Into<String>,
@@ -32,10 +33,14 @@ impl ResponsesParser {
             tool_calls: HashMap::new(),
             tool_call_aliases: HashMap::new(),
             reasoning_item: None,
+            streamed_reasoning_summaries: HashSet::new(),
         }
     }
 
-    pub(super) fn parse_event(&mut self, data: &str) -> Result<Vec<CompletionEvent>> {
+    pub(in crate::provider::openai) fn parse_event(
+        &mut self,
+        data: &str,
+    ) -> Result<Vec<CompletionEvent>> {
         let value: Value = serde_json::from_str(data)?;
         self.map_event(&value)
     }
@@ -59,14 +64,9 @@ impl ResponsesParser {
                 }
                 Ok(Vec::new())
             }
-            Some("response.reasoning_summary_text.delta") => Ok(value["delta"]
-                .as_str()
-                .map(|text| {
-                    vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
-                        text: text.to_owned(),
-                    })]
-                })
-                .unwrap_or_default()),
+            Some("response.reasoning_summary_text.delta") => {
+                Ok(self.reasoning_summary_delta(value))
+            }
             Some("response.reasoning_summary_text.done") => Ok(self.reasoning_summary_done(value)),
             Some("response.function_call_arguments.delta") => {
                 let delta = value["delta"].as_str().unwrap_or_default();
@@ -110,6 +110,27 @@ impl ResponsesParser {
             .map(|text| {
                 if let Some(item) = self.reasoning_item.as_mut() {
                     item["summary"] = json!([{ "type": "summary_text", "text": text }]);
+                }
+                if self
+                    .streamed_reasoning_summaries
+                    .contains(&reasoning_summary_key(value))
+                {
+                    return Vec::new();
+                }
+                vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
+                    text: text.to_owned(),
+                })]
+            })
+            .unwrap_or_default()
+    }
+
+    fn reasoning_summary_delta(&mut self, value: &Value) -> Vec<CompletionEvent> {
+        value["delta"]
+            .as_str()
+            .map(|text| {
+                if !text.is_empty() {
+                    self.streamed_reasoning_summaries
+                        .insert(reasoning_summary_key(value));
                 }
                 vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
                     text: text.to_owned(),
@@ -177,6 +198,12 @@ fn tool_call_key(value: &Value) -> Option<String> {
             .as_u64()
             .map(|index| index.to_string())
     })
+}
+
+fn reasoning_summary_key(value: &Value) -> String {
+    let item_key = tool_call_key(value).unwrap_or_else(|| "unknown".to_owned());
+    let summary_index = value["summary_index"].as_u64().unwrap_or_default();
+    format!("{item_key}:{summary_index}")
 }
 
 fn openai_thinking_block(item: &Value) -> ThinkingBlock {
@@ -267,6 +294,67 @@ mod tests {
         assert_eq!(metadata.model, "gpt-test");
         assert_eq!(metadata.usage, None);
         assert_eq!(metadata.resume, json!({ "response_id": "resp_2" }));
+    }
+
+    #[test]
+    fn reasoning_summary_done_without_delta_emits_visible_thinking() {
+        let mut parser = ResponsesParser::new(
+            RESPONSES_NAME,
+            "https://example.test/v1/responses",
+            "gpt-test",
+        );
+
+        let events = parser
+            .parse_event(
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","summary_index":0,"text":"**PLAN** inspect"}"#,
+            )
+            .expect("reasoning summary done parses");
+
+        assert_eq!(
+            events,
+            vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
+                text: "**PLAN** inspect".to_owned(),
+            })]
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_done_after_delta_does_not_duplicate_visible_thinking() {
+        let mut parser = ResponsesParser::new(
+            RESPONSES_NAME,
+            "https://example.test/v1/responses",
+            "gpt-test",
+        );
+
+        let first = parser
+            .parse_event(
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"**PLAN** "}"#,
+            )
+            .expect("first reasoning delta parses");
+        let second = parser
+            .parse_event(
+                r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"inspect"}"#,
+            )
+            .expect("second reasoning delta parses");
+        let done = parser
+            .parse_event(
+                r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","summary_index":0,"text":"**PLAN** inspect"}"#,
+            )
+            .expect("reasoning summary done parses");
+
+        assert_eq!(
+            first,
+            vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
+                text: "**PLAN** ".to_owned(),
+            })]
+        );
+        assert_eq!(
+            second,
+            vec![CompletionEvent::ThinkingDelta(ThinkingDelta {
+                text: "inspect".to_owned(),
+            })]
+        );
+        assert!(done.is_empty());
     }
 
     #[test]

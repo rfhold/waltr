@@ -19,7 +19,7 @@ const DEFAULT_MAX_TOKENS: u32 = 256;
 /// Anthropic Messages API streaming provider.
 #[derive(Debug, Clone)]
 pub struct AnthropicMessages {
-    api_key: String,
+    headers: Vec<(&'static str, String)>,
     model: String,
     messages_url: String,
     max_tokens: u32,
@@ -28,10 +28,10 @@ pub struct AnthropicMessages {
 }
 
 impl AnthropicMessages {
-    /// Create a Messages API provider for the given API key and model.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Create a Messages API provider for the given model.
+    pub fn new(model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            headers: Vec::new(),
             model: model.into(),
             messages_url: ANTHROPIC_MESSAGES_URL.to_owned(),
             max_tokens: DEFAULT_MAX_TOKENS,
@@ -51,6 +51,13 @@ impl AnthropicMessages {
     #[must_use]
     pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Add a static request header to this provider.
+    #[must_use]
+    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
         self
     }
 

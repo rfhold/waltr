@@ -77,10 +77,11 @@ pub fn anthropic_messages() -> waltr_agent::Result<LiveProviderCase> {
 
 /// Build the Anthropic Messages provider for live tests.
 pub fn anthropic_messages_provider(max_tokens: u32) -> waltr_agent::Result<AnthropicMessages> {
-    let mut provider = AnthropicMessages::new(
-        api_key("ANTHROPIC_API_KEY")?,
-        model_name(ANTHROPIC_TEST_MODEL, GATEWAY_ANTHROPIC_TEST_MODEL),
-    )
+    let mut provider = AnthropicMessages::new(model_name(
+        ANTHROPIC_TEST_MODEL,
+        GATEWAY_ANTHROPIC_TEST_MODEL,
+    ))
+    .with_header("x-api-key", api_key("ANTHROPIC_API_KEY")?)
     .with_max_tokens(max_tokens);
     if use_gateway() {
         provider = provider.with_base_url(GATEWAY_BASE_URL);
@@ -98,7 +99,10 @@ pub fn openai_chat_completions() -> waltr_agent::Result<LiveProviderCase> {
 
 /// Build the `OpenAI` Chat Completions provider for live tests.
 pub fn openai_chat_completions_provider() -> waltr_agent::Result<OpenAiChatCompletions> {
-    let mut provider = OpenAiChatCompletions::new(api_key("OPENAI_API_KEY")?, openai_model_name());
+    let mut provider = OpenAiChatCompletions::new(openai_model_name()).with_header(
+        "Authorization",
+        format!("Bearer {}", api_key("OPENAI_API_KEY")?),
+    );
     if use_gateway() {
         provider = provider.with_base_url(GATEWAY_BASE_URL);
     }
@@ -115,7 +119,10 @@ pub fn openai_responses() -> waltr_agent::Result<LiveProviderCase> {
 
 /// Build the `OpenAI` Responses provider for live tests.
 pub fn openai_responses_provider() -> waltr_agent::Result<OpenAiResponses> {
-    let mut provider = OpenAiResponses::new(api_key("OPENAI_API_KEY")?, openai_model_name());
+    let mut provider = OpenAiResponses::new(openai_model_name()).with_header(
+        "Authorization",
+        format!("Bearer {}", api_key("OPENAI_API_KEY")?),
+    );
     if use_gateway() {
         provider = provider.with_base_url(GATEWAY_BASE_URL);
     }
@@ -132,8 +139,10 @@ pub fn openai_responses_websocket() -> waltr_agent::Result<LiveProviderCase> {
 
 /// Build the `OpenAI` Responses WebSocket provider for live tests.
 pub fn openai_responses_websocket_provider() -> waltr_agent::Result<OpenAiResponsesWebSocket> {
-    let mut provider =
-        OpenAiResponsesWebSocket::new(api_key("OPENAI_API_KEY")?, openai_model_name());
+    let mut provider = OpenAiResponsesWebSocket::new(openai_model_name()).with_header(
+        "Authorization",
+        format!("Bearer {}", api_key("OPENAI_API_KEY")?),
+    );
     if use_gateway() {
         provider = provider.with_base_url(GATEWAY_BASE_URL);
     }

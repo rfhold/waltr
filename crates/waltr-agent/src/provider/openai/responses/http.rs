@@ -35,8 +35,8 @@ impl LlmStream for OpenAiResponses {
             stream_openai_http(
                 RESPONSES_NAME,
                 &self.responses_url,
-                &self.api_key,
                 responses_body(&self.model, self.reasoning.as_ref(), &request),
+                self.headers.clone(),
                 move |data| parser.parse_event(data),
             )
             .await

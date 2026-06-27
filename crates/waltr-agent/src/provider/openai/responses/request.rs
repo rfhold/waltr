@@ -7,7 +7,7 @@ use crate::stream::{
     CompletionRequest, ThinkingBlockKind, ToolCall, ToolDefinition, ToolResult, TurnItem,
 };
 
-pub(super) fn responses_body(
+pub(in crate::provider::openai) fn responses_body(
     model: &str,
     reasoning: Option<&OpenAiReasoningConfig>,
     request: &CompletionRequest<'_>,
@@ -26,18 +26,14 @@ pub(super) fn responses_body(
     if let Some(reasoning) = reasoning {
         body["reasoning"] = openai_reasoning(reasoning);
     }
+    if let Some(system_prompt) = request.system_prompt {
+        body["instructions"] = json!(system_prompt);
+    }
     body
 }
 
 pub(super) fn responses_input(request: &CompletionRequest<'_>) -> Value {
     let mut input = Vec::new();
-    if let Some(system_prompt) = request.system_prompt {
-        input.push(json!({
-            "type": "message",
-            "role": "system",
-            "content": [{ "type": "input_text", "text": system_prompt }]
-        }));
-    }
     input.push(json!({
         "type": "message",
         "role": "user",
@@ -122,16 +118,17 @@ mod tests {
     };
 
     #[test]
-    fn responses_input_prepends_system_prompt() {
+    fn responses_body_uses_instructions_for_system_prompt() {
         let mut request = CompletionRequest::new("hello");
         request.system_prompt = Some("system text");
 
-        let input = responses_input(&request);
+        let body = responses_body("gpt-test", None, &request);
+        let input = &body["input"];
 
-        assert_eq!(input[0]["role"], "system");
-        assert_eq!(input[0]["content"][0]["text"], "system text");
-        assert_eq!(input[1]["role"], "user");
-        assert_eq!(input[1]["content"][0]["text"], "hello");
+        assert_eq!(body["instructions"], "system text");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+        assert_eq!(input.as_array().expect("input array").len(), 1);
     }
 
     #[test]
