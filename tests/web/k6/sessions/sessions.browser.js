@@ -1,10 +1,15 @@
-import { check } from "k6";
+import { check, sleep } from "k6";
 
 import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
-import { typeAndKeepFocus, waitForMissingText, waitForPathname, waitForText } from "../support/checks.js";
+import { typeAndKeepFocus, waitForMissingText, waitForPathname, waitForSelectOption, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
 export const options = browserOptions;
+
+const PRIMARY_PROVIDER = "k6-openai";
+const PRIMARY_MODEL = "gpt-5-nano";
+const SECONDARY_PROVIDER = "k6-anthropic";
+const SECONDARY_MODEL = "claude";
 
 export default async function () {
   await withPage(async (page) => {
@@ -13,27 +18,37 @@ export default async function () {
 
     await seedRuntimeConfig(page);
 
-    await page.locator('.shell__nav a[href="/sessions"]').click();
+    await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
+    await waitForPathname(page, "/sessions");
     await waitForText(page, "#sessions-title", "Sessions");
     await waitForText(page, "#sessions-list-title", "Recent sessions");
     await screenshot(page, "sessions-list-empty");
 
     await page.locator(".sessions__header button").click();
     await waitForText(page, '[aria-label="Session detail"]', "");
-    await waitForText(page, '[aria-label="Session status summary"]', "Provider openai/gpt4o");
+    await waitForText(page, '[aria-label="Session status summary"]', `Provider ${PRIMARY_PROVIDER}/${PRIMARY_MODEL}`);
     await waitForText(page, '[aria-label="Session status summary"]', "MCP git");
+    const thinkingSelectEnabled = await waitForSelectEnabled(page, '[aria-label="Session thinking level"]');
 
     const createdPathname = await page.evaluate(() => window.location.pathname);
     const sessionId = decodeURIComponent(createdPathname.replace(/^\/sessions\//, ""));
-    const detailStatus = await waitForText(page, '[aria-label="Session status summary"]', "idle");
+    const detailTimeline = await waitForText(page, '[aria-label="Session timeline"]', "No messages yet.");
+    await screenshot(page, "sessions-detail-thinking-default");
 
-    await clickButtonByText(page, "Edit provider/model");
+    await setSelectValue(page, '[aria-label="Session thinking level"]', "high");
+    const thinkingRuntime = await waitForText(page, '[aria-label="Session status summary"]', `${PRIMARY_PROVIDER}/${PRIMARY_MODEL} (high)`);
+    const thinkingSelectValue = await waitForSelectValue(page, '[aria-label="Session thinking level"]', "high");
+    await screenshot(page, "sessions-detail-thinking-high");
+
+    await clickButtonByLabel(page, "Edit provider/model");
     await waitForText(page, '[role="dialog"]', "Edit provider/model");
-    await clickButtonByText(page, "anthropic");
+    const providerDialogThinking = await waitForLabeledSelectValue(page, "Thinking level", "high");
+    await screenshot(page, "sessions-provider-runtime-thinking-dialog");
+    await clickRuntimeProviderOption(page, SECONDARY_PROVIDER);
     await clickButtonByText(page, "Save runtime");
-    const providerRuntime = await waitForText(page, '[aria-label="Session status summary"]', "Provider anthropic/claude");
+    const providerRuntime = await waitForText(page, '[aria-label="Session status summary"]', `Provider ${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`);
 
-    await clickButtonByText(page, "Edit MCP");
+    await clickButtonByLabel(page, "Edit MCP");
     await waitForText(page, '[role="dialog"]', "Edit MCP servers");
     await toggleMcpRuntime(page, "files");
     await clickButtonByText(page, "Save MCP");
@@ -47,7 +62,7 @@ export default async function () {
 
     await page.locator(`button[aria-label="Open session ${sessionId}"]`).click();
     await waitForPathname(page, `/sessions/${encodeURIComponent(sessionId)}`);
-    const reopenedDetail = await waitForText(page, '[aria-label="Session status summary"]', "anthropic/claude");
+    const reopenedDetail = await waitForText(page, '[aria-label="Session status summary"]', `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`);
 
     await clickButtonByLabel(page, `Delete session ${sessionId}`);
     await screenshot(page, "sessions-delete-confirmation");
@@ -57,41 +72,60 @@ export default async function () {
 
     check(null, {
       "session detail route reached": () => createdPathname.startsWith("/sessions/") && sessionId.length > 0,
-      "session detail shows status": () => includesText(detailStatus, "idle"),
-      "session detail edits provider runtime": () => includesText(providerRuntime, "anthropic/claude"),
+      "session detail shows empty timeline": () => includesText(detailTimeline, "No messages yet."),
+      "session thinking select is enabled": () => thinkingSelectEnabled,
+      "session thinking runtime updates": () => includesText(thinkingRuntime, `${PRIMARY_PROVIDER}/${PRIMARY_MODEL} (high)`),
+      "session thinking select persists update": () => thinkingSelectValue === "high",
+      "provider dialog shows selected thinking": () => providerDialogThinking === "high",
+      "session detail edits provider runtime": () => includesText(providerRuntime, `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`),
       "session detail edits mcp runtime": () => includesText(mcpRuntime, "files") && includesText(mcpRuntime, "git"),
       "session list contains created session": () => includesText(listedSession, sessionId),
-      "session selection reopens detail": () => includesText(reopenedDetail, "anthropic/claude"),
+      "session selection reopens detail": () => includesText(reopenedDetail, `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`),
       "session list omits deleted session": () => !includesText(listAfterDelete, sessionId),
     });
   });
 }
 
 async function seedRuntimeConfig(page) {
-  await page.locator('a[href="/config/provider"]').click();
+  await page.goto(`${baseUrl}/config/provider`, { waitUntil: "domcontentloaded" });
+  await waitForPathname(page, "/config/provider");
   await waitForText(page, "#config-title", "Settings");
-  await createProvider(page, "openai", "gpt4o");
-  await createProvider(page, "anthropic", "claude");
+  await createProvider(page, PRIMARY_PROVIDER, PRIMARY_MODEL, "low, medium, high");
+  await createProvider(page, SECONDARY_PROVIDER, SECONDARY_MODEL);
 
-  await page.locator('a[href="/config/mcp"]').click();
+  await page.goto(`${baseUrl}/config/mcp`, { waitUntil: "domcontentloaded" });
   await waitForPathname(page, "/config/mcp");
   await createMcpServer(page, "files");
   await createMcpServer(page, "git");
 
-  await page.locator('a[href="/config/defaults"]').click();
+  await page.goto(`${baseUrl}/config/defaults`, { waitUntil: "domcontentloaded" });
+  await waitForPathname(page, "/config/defaults");
   await waitForText(page, "#runtime-defaults-title", "New session defaults");
-  await setSelectValue(page, "#runtime-default-provider", "openai");
-  await setSelectValue(page, "#runtime-default-model", "gpt4o");
+  await waitForSelectOption(page, "#runtime-default-provider", PRIMARY_PROVIDER);
+  await setSelectValue(page, "#runtime-default-provider", PRIMARY_PROVIDER);
+  await waitForSelectOption(page, "#runtime-default-model", PRIMARY_MODEL);
+  await setSelectValue(page, "#runtime-default-model", PRIMARY_MODEL);
+  await waitForText(page, '[aria-label="Explicit MCP defaults"]', "git");
   await setExplicitMcpDefault(page, "git", true);
   await submitForm(page, 'section[aria-labelledby="runtime-defaults-title"] form');
   await waitForText(page, 'section[aria-labelledby="runtime-defaults-title"]', "Clear defaults");
 }
 
-async function createProvider(page, name, model) {
-  await page.locator(".config__actions button").click();
+async function createProvider(page, name, model, reasoningEfforts = "") {
+  await page.goto(`${baseUrl}/config/provider`, { waitUntil: "domcontentloaded" });
+  await waitForPathname(page, "/config/provider");
+  await waitForText(page, '[aria-label="Provider actions"]', "Create");
+  await page.locator('[aria-label="Provider actions"] button').click();
+  await waitForText(page, 'form[aria-label="Create provider"]', "Name");
+  await setInputValue(page, 'form[aria-label="Create provider"] input[name="name"]', "");
   await typeAndKeepFocus(page, 'form[aria-label="Create provider"] input[name="name"]', name);
   await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAi");
-  await setInputValue(page, 'form[aria-label="Create provider"] input[name="url"]', "https://example.invalid/v1");
+  await setInputValue(page, 'form[aria-label="Create provider"] input[name="url"]', "");
+  await typeAndKeepFocus(
+    page,
+    'form[aria-label="Create provider"] input[name="url"]',
+    "https://example.invalid/v1",
+  );
 
   const modelsSelector = `[aria-label="Models for ${name}"]`;
   await page.locator(`${modelsSelector} [aria-label="Model actions"] button`).click();
@@ -99,10 +133,94 @@ async function createProvider(page, name, model) {
   await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="key"]', model);
   await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="name"]', model);
   await page.locator('form[aria-label="Create model"] select[name="kind"]').selectOption("llm");
+  if (reasoningEfforts) {
+    await setInputValue(
+      page,
+      'form[aria-label="Create model"] input[name="reasoningEfforts"]',
+      reasoningEfforts,
+    );
+  }
   await submitForm(page, 'form[aria-label="Create model"]');
+  await waitForPathname(page, "/config/provider/create");
+  await waitForText(page, 'form[aria-label="Create provider"]', "Save");
   await waitForText(page, modelsSelector, model);
   await submitForm(page, 'form[aria-label="Create provider"]');
   await waitForText(page, '[aria-label="Provider list"]', name);
+}
+
+async function waitForSelectEnabled(page, selector) {
+  const deadline = Date.now() + 10_000;
+  let disabled = true;
+
+  while (Date.now() < deadline) {
+    disabled = await page.evaluate((selectSelector) => {
+      const select = document.querySelector(selectSelector);
+      if (!(select instanceof HTMLSelectElement)) {
+        throw new Error(`Select not found: ${selectSelector}`);
+      }
+
+      return select.disabled;
+    }, selector);
+
+    if (!disabled) {
+      return true;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for enabled select ${selector}`);
+}
+
+async function waitForSelectValue(page, selector, expectedValue) {
+  const deadline = Date.now() + 10_000;
+  let value = "";
+
+  while (Date.now() < deadline) {
+    value = await page.evaluate((selectSelector) => {
+      const select = document.querySelector(selectSelector);
+      if (!(select instanceof HTMLSelectElement)) {
+        throw new Error(`Select not found: ${selectSelector}`);
+      }
+
+      return select.value;
+    }, selector);
+
+    if (value === expectedValue) {
+      return value;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for ${selector} to equal ${expectedValue}; saw ${value}`);
+}
+
+async function waitForLabeledSelectValue(page, labelText, expectedValue) {
+  const deadline = Date.now() + 10_000;
+  let value = "";
+
+  while (Date.now() < deadline) {
+    value = await page.evaluate((labelText) => {
+      const label = Array.from(document.querySelectorAll("label")).find((candidate) =>
+        candidate.textContent?.includes(labelText),
+      );
+      const select = label?.querySelector("select");
+      if (!(select instanceof HTMLSelectElement)) {
+        throw new Error(`Labeled select not found: ${labelText}`);
+      }
+
+      return select.value;
+    }, labelText);
+
+    if (value === expectedValue) {
+      return value;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for ${labelText} to equal ${expectedValue}; saw ${value}`);
 }
 
 async function createMcpServer(page, name) {
@@ -206,4 +324,23 @@ async function clickButtonByText(page, text) {
     button.scrollIntoView({ block: "center", inline: "center" });
     button.click();
   }, text);
+}
+
+async function clickRuntimeProviderOption(page, providerKey) {
+  await page.evaluate((key) => {
+    const options = document.querySelector('[aria-label="Provider options"]');
+    if (!(options instanceof HTMLElement)) {
+      throw new Error("Provider options not found");
+    }
+
+    const button = Array.from(options.querySelectorAll("button")).find((candidate) =>
+      candidate.querySelector("span")?.textContent?.trim() === key,
+    );
+    if (!(button instanceof HTMLButtonElement)) {
+      throw new Error(`Provider option not found: ${key}`);
+    }
+
+    button.scrollIntoView({ block: "center", inline: "center" });
+    button.click();
+  }, providerKey);
 }

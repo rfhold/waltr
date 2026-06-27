@@ -100,3 +100,30 @@ export async function waitForPathname(page, expectedPathname) {
 
   throw new Error(`Timed out waiting for route ${expectedPathname}; saw ${pathname}`);
 }
+
+export async function waitForSelectOption(page, selector, value) {
+  const deadline = Date.now() + 10_000;
+  let options = [];
+
+  await page.locator(selector).waitFor({ timeout: 10_000 });
+
+  while (Date.now() < deadline) {
+    options = await page.evaluate((selectSelector) => {
+      const select = document.querySelector(selectSelector);
+
+      if (!(select instanceof HTMLSelectElement)) {
+        throw new Error(`Select not found: ${selectSelector}`);
+      }
+
+      return Array.from(select.options, (option) => option.value);
+    }, selector);
+
+    if (options.includes(value)) {
+      return;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for ${selector} to include option ${value}; saw ${JSON.stringify(options)}`);
+}

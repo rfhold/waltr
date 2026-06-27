@@ -1,0 +1,15 @@
+{
+  "name": "Waltr",
+  "short_name": "Waltr",
+  "theme_color": "#05040a",
+  "background_color": "#05040a",
+  "display": "standalone",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any maskable"
+    }
+  ]
+}

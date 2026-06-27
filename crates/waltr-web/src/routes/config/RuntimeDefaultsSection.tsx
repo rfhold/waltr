@@ -8,6 +8,7 @@ import type { ClientCommand, ConfigView, RuntimeDefaultsView } from "../../gener
 type RuntimeDefaultsForm = {
   providerKey: string;
   modelId: string;
+  reasoningEffort: string;
   mcpDefaultEnabled: boolean;
   enabledMcpServerKeys: string[];
 };
@@ -23,10 +24,12 @@ export function RuntimeDefaultsSection(props: {
   const form = createMemo(() => draft() ?? defaultsToForm(config()?.runtimeDefaults));
   const providers = createMemo(() => providerKeys(config()));
   const models = createMemo(() => modelKeys(config(), form().providerKey));
+  const reasoningEfforts = createMemo(() => modelReasoningEfforts(config(), form().providerKey, form().modelId));
   const mcpServers = createMemo(() => mcpKeys(config()));
   const providerMissing = createMemo(() => form().providerKey !== "" && !providers().includes(form().providerKey));
   const modelMissing = createMemo(() => form().modelId !== "" && !models().includes(form().modelId));
-  const saveDisabled = createMemo(() => operationPending() || providerMissing() || modelMissing());
+  const reasoningMissing = createMemo(() => form().reasoningEffort !== "" && !reasoningEfforts().includes(form().reasoningEffort));
+  const saveDisabled = createMemo(() => operationPending() || providerMissing() || modelMissing() || reasoningMissing());
 
   const update = (patch: Partial<RuntimeDefaultsForm>) => {
     setDraft((current) => ({ ...form(), ...current, ...patch }));
@@ -59,7 +62,7 @@ export function RuntimeDefaultsSection(props: {
               aria-describedby={field.describedBy}
               aria-invalid={field.invalid}
               value={form().providerKey}
-              onChange={(event) => update({ providerKey: event.currentTarget.value, modelId: "" })}
+              onChange={(event) => update({ providerKey: event.currentTarget.value, modelId: "", reasoningEffort: "" })}
             >
               <option value="">No provider default</option>
               <For each={providers()}>{(provider) => <option value={provider}>{provider}</option>}</For>
@@ -75,10 +78,26 @@ export function RuntimeDefaultsSection(props: {
               aria-invalid={field.invalid}
               disabled={form().providerKey === ""}
               value={form().modelId}
-              onChange={(event) => update({ modelId: event.currentTarget.value })}
+              onChange={(event) => update({ modelId: event.currentTarget.value, reasoningEffort: "" })}
             >
               <option value="">No model selected</option>
               <For each={models()}>{(model) => <option value={model}>{model}</option>}</For>
+            </select>
+          )}
+        </Field>
+
+        <Field id="runtime-default-reasoning" label="Reasoning effort" error={reasoningMissing() ? "Selected reasoning effort is no longer configured." : undefined}>
+          {(field) => (
+            <select
+              id={field.id}
+              aria-describedby={field.describedBy}
+              aria-invalid={field.invalid}
+              disabled={form().modelId === ""}
+              value={form().reasoningEffort}
+              onChange={(event) => update({ reasoningEffort: event.currentTarget.value })}
+            >
+              <option value="">No reasoning default</option>
+              <For each={reasoningEfforts()}>{(effort) => <option value={effort}>{effort}</option>}</For>
             </select>
           )}
         </Field>
@@ -149,6 +168,7 @@ function defaultsToForm(defaults: RuntimeDefaultsView | null | undefined): Runti
     ? {
         providerKey: defaults.providerKey,
         modelId: defaults.modelId,
+        reasoningEffort: defaults.reasoningEffort ?? "",
         mcpDefaultEnabled: defaults.mcpDefaultEnabled,
         enabledMcpServerKeys: defaults.enabledMcpServerKeys ?? [],
       }
@@ -159,6 +179,7 @@ function emptyDefaults(): RuntimeDefaultsForm {
   return {
     providerKey: "",
     modelId: "",
+    reasoningEffort: "",
     mcpDefaultEnabled: false,
     enabledMcpServerKeys: [],
   };
@@ -187,6 +208,7 @@ function formToDefaults(form: RuntimeDefaultsForm): RuntimeDefaultsView {
   return {
     providerKey: form.providerKey,
     modelId: form.modelId,
+    reasoningEffort: form.reasoningEffort || null,
     mcpDefaultEnabled: form.mcpDefaultEnabled,
     enabledMcpServerKeys: form.mcpDefaultEnabled ? [] : form.enabledMcpServerKeys,
   };
@@ -198,6 +220,10 @@ function providerKeys(config: ConfigView | undefined) {
 
 function modelKeys(config: ConfigView | undefined, providerKey: string) {
   return Object.keys(config?.providers?.[providerKey]?.models ?? {}).sort((left, right) => left.localeCompare(right));
+}
+
+function modelReasoningEfforts(config: ConfigView | undefined, providerKey: string, modelId: string) {
+  return [...(config?.providers?.[providerKey]?.models?.[modelId]?.options.reasoningEfforts ?? [])].sort((left, right) => left.localeCompare(right));
 }
 
 function mcpKeys(config: ConfigView | undefined) {

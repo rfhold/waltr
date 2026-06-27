@@ -110,9 +110,11 @@ export function modelView(overrides: Partial<ModelView> = {}): ModelView {
       minP: null,
       presencePenalty: null,
       repetitionPenalty: null,
+      reasoningEfforts: [],
     },
     limits: { context: null, output: null },
     capabilities: { tools: false, image: false },
+    catalogMatch: null,
     ...overrides,
   };
 }
@@ -133,6 +135,8 @@ export function claudeConfig(): ConfigView {
     name: "claude",
     url: "https://api.anthropic.com",
     headers: {},
+    oauthCompatible: false,
+    oauthSettings: null,
     models: {},
   };
 

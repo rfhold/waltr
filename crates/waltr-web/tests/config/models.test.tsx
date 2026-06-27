@@ -96,11 +96,24 @@ describe("provider models sub-editor", () => {
 
   test("edits a model in the provider draft and dispatches only when the provider saves", async () => {
     const commands: ClientCommand[] = [];
+    const config = configWithModel();
+    const catalogMatch = {
+      providerId: "anthropic",
+      modelId: "claude-sonnet-4-5",
+      upstreamProviderId: null,
+      upstreamModelId: null,
+      source: "manual" as const,
+    };
+    config.providers.claude!.models.sonnet = modelView({
+      name: "Claude Sonnet",
+      kind: "llm",
+      catalogMatch,
+    });
 
     renderWithAppState(() => <ConfigRouteWithChildren />, {
       commands,
       routePath: "/config/provider/edit/claude",
-      snapshot: snapshotWithConfig(configWithModel()),
+      snapshot: snapshotWithConfig(config),
     });
 
     fireEvent.click(screen.getByLabelText("Edit model sonnet"));
@@ -127,6 +140,168 @@ describe("provider models sub-editor", () => {
     if (update && update.type === "updateProvider") {
       expect(Object.keys(update.provider.models)).not.toContain("sonnet");
       expect(update.provider.models.opus).toMatchObject({ name: "Claude Sonnet 4", kind: "embedding" });
+      expect(update.provider.models.opus?.catalogMatch).toEqual(catalogMatch);
+    }
+  });
+
+  test("selects a suggested catalog match for a model draft", async () => {
+    const commands: ClientCommand[] = [];
+
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      routePath: "/config/provider/edit/claude/models/edit/sonnet",
+      snapshot: snapshotWithConfig(configWithModel()),
+      suggestCatalogMatches: async (request) => {
+        expect(request).toMatchObject({ providerKey: "claude", modelKey: "sonnet" });
+        return {
+          stale: false,
+          matches: [{
+            model: { providerId: "gateway", modelId: "anthropic/claude-sonnet-4-5" },
+            providerName: "Gateway",
+            modelName: "Claude Sonnet 4.5",
+            confidence: "high",
+            reasons: ["upstream model id"],
+            upstreamModel: { providerId: "anthropic", modelId: "claude-sonnet-4-5" },
+          }],
+        };
+      },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Suggest" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Claude Sonnet 4\.5/ })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Claude Sonnet 4\.5/ }));
+
+    expect(screen.getAllByText("gateway/anthropic/claude-sonnet-4-5").length).toBeGreaterThan(0);
+    expect(screen.getByText("anthropic/claude-sonnet-4-5")).toBeTruthy();
+
+    fireEvent.submit(screen.getByLabelText("Edit model"));
+    await waitFor(() => expect(testHistory().get()).toBe("/config/provider/edit/claude"));
+    fireEvent.submit(screen.getByLabelText("Edit provider"));
+
+    const update = commands.find((command) => command.type === "updateProvider");
+    expect(update).toMatchObject({ type: "updateProvider", originalName: "claude" });
+    if (update && update.type === "updateProvider") {
+      expect(update.provider.models.sonnet?.catalogMatch).toEqual({
+        providerId: "gateway",
+        modelId: "anthropic/claude-sonnet-4-5",
+        upstreamProviderId: "anthropic",
+        upstreamModelId: "claude-sonnet-4-5",
+        source: "manual",
+      });
+    }
+  });
+
+  test("applies catalog search facts to blank model fields", async () => {
+    const commands: ClientCommand[] = [];
+
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      routePath: "/config/provider/edit/claude/models/create",
+      snapshot: snapshotWithConfig(configWithModel()),
+      searchCatalogModels: async (request) => {
+        expect(request.query).toBe("haiku");
+        return {
+          stale: true,
+          models: [{
+            model: { providerId: "anthropic", modelId: "claude-haiku-4-5" },
+            providerName: "Anthropic",
+            modelName: "Claude Haiku 4.5",
+            family: "claude",
+            status: null,
+            limits: { context: 200000, output: 8192 },
+            cost: { inputPerMillionTokens: 1, outputPerMillionTokens: 5, currency: "USD" },
+            capabilities: { tools: true, image: true, audio: false },
+            reasoning: { supported: true, effort: "effort", efforts: ["low", "medium", "high"] },
+          }],
+        };
+      },
+    });
+
+    fireEvent.input(screen.getByLabelText("Key"), { target: { value: "haiku" } });
+    fireEvent.input(screen.getByLabelText("Search catalog"), { target: { value: "haiku" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Claude Haiku 4\.5/ })).toBeTruthy());
+    expect(screen.getByText("Catalog data is from a stale cache.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Haiku 4\.5/ }));
+
+    expect(screen.getByLabelText("Display name")).toHaveProperty("value", "Claude Haiku 4.5");
+    expect(screen.getByLabelText("Context limit")).toHaveProperty("value", "200000");
+    expect(screen.getByLabelText("Output limit")).toHaveProperty("value", "8192");
+    expect(screen.getByLabelText("Reasoning efforts")).toHaveProperty("value", "low, medium, high");
+    expect(screen.getByLabelText("Supports tools")).toHaveProperty("checked", true);
+    expect(screen.getByLabelText("Supports image input")).toHaveProperty("checked", true);
+
+    fireEvent.submit(screen.getByLabelText("Create model"));
+    await waitFor(() => expect(testHistory().get()).toBe("/config/provider/edit/claude"));
+    fireEvent.submit(screen.getByLabelText("Edit provider"));
+
+    const update = commands.find((command) => command.type === "updateProvider");
+    expect(update).toMatchObject({ type: "updateProvider", originalName: "claude" });
+    if (update && update.type === "updateProvider") {
+      expect(update.provider.models.haiku).toMatchObject({
+        name: "Claude Haiku 4.5",
+        kind: "llm",
+        limits: { context: 200000, output: 8192 },
+        capabilities: { tools: true, image: true },
+        catalogMatch: {
+          providerId: "anthropic",
+          modelId: "claude-haiku-4-5",
+          upstreamProviderId: null,
+          upstreamModelId: null,
+          source: "applied",
+        },
+      });
+    }
+  });
+
+  test("does not overwrite explicit disabled capabilities when applying catalog facts", async () => {
+    const commands: ClientCommand[] = [];
+
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      routePath: "/config/provider/edit/claude/models/edit/sonnet",
+      snapshot: snapshotWithConfig(configWithModel()),
+      searchCatalogModels: async () => ({
+        stale: false,
+        models: [{
+          model: { providerId: "gateway", modelId: "anthropic/claude-sonnet-4-5" },
+          providerName: "Gateway",
+          modelName: "Claude Sonnet 4.5",
+          family: "claude",
+          status: null,
+          limits: { context: 200000, output: 8192 },
+          cost: null,
+          capabilities: { tools: true, image: true, audio: false },
+          reasoning: null,
+        }],
+      }),
+    });
+
+    expect(screen.getByLabelText("Supports tools")).toHaveProperty("checked", false);
+    expect(screen.getByLabelText("Supports image input")).toHaveProperty("checked", false);
+    fireEvent.input(screen.getByLabelText("Search catalog"), { target: { value: "sonnet" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /Claude Sonnet 4\.5/ })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Claude Sonnet 4\.5/ }));
+
+    expect(screen.getByLabelText("Supports tools")).toHaveProperty("checked", false);
+    expect(screen.getByLabelText("Supports image input")).toHaveProperty("checked", false);
+
+    fireEvent.submit(screen.getByLabelText("Edit model"));
+    await waitFor(() => expect(testHistory().get()).toBe("/config/provider/edit/claude"));
+    fireEvent.submit(screen.getByLabelText("Edit provider"));
+
+    const update = commands.find((command) => command.type === "updateProvider");
+    expect(update).toMatchObject({ type: "updateProvider", originalName: "claude" });
+    if (update && update.type === "updateProvider") {
+      expect(update.provider.models.sonnet?.capabilities).toEqual({ tools: false, image: false });
+      expect(update.provider.models.sonnet?.catalogMatch).toEqual({
+        providerId: "gateway",
+        modelId: "anthropic/claude-sonnet-4-5",
+        upstreamProviderId: "anthropic",
+        upstreamModelId: "claude-sonnet-4-5",
+        source: "applied",
+      });
     }
   });
 
