@@ -24,7 +24,7 @@ async fn client_stream_renders_config_status_with_real_server() {
     dispatch_client_command(
         &mut seeder,
         ClientCommand::AddProvider {
-            provider: provider_view("anthropic"),
+            provider: provider_view("custom-anthropic"),
         },
     )
     .await;
@@ -79,7 +79,7 @@ async fn client_stream_renders_config_status_with_real_server() {
     // Once config is loaded the section content fills the area and the
     // standalone watch footer is gone.
     assert!(!rendered.contains("watch received"));
-    assert!(rendered.contains("> anthropic"));
+    assert!(rendered.contains("custom-anthropic"));
     assert!(!rendered.contains("load: ready"));
 
     let AppAction::ClientCommand(release) = app.handle_event(&escape_press(), Instant::now())

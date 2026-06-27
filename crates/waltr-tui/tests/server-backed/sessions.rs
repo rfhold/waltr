@@ -141,14 +141,30 @@ async fn session_detail_updates_runtime_config_with_real_server() {
         operation => panic!("expected ready session create operation, saw {operation:?}"),
     };
 
-    assert_runtime_provider(&created, &session_id, "openai", "gpt4o");
+    assert_runtime_provider(&created, &session_id, "openai", "gpt4o", None);
 
     let open_provider = app.handle_event(&char_press('p'), now);
     dispatch_app_command(&mut stream, &mut app, open_provider).await;
-    assert!(render_app(&app).contains("Edit provider/model"));
+    let provider_editor = render_app(&app);
+    assert!(provider_editor.contains("Edit provider/model"));
+    assert!(provider_editor.contains("thinking"));
+    assert!(provider_editor.contains("none"));
+    assert!(provider_editor.contains("low"));
+    assert!(provider_editor.contains("medium"));
+    assert!(provider_editor.contains("high"));
+
+    for _ in 0..3 {
+        assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
+    }
     let provider_update = app.handle_event(&enter_press(), now);
     let updated_provider = dispatch_app_command(&mut stream, &mut app, provider_update).await;
-    assert_runtime_provider(&updated_provider, &session_id, "anthropic", "claude");
+    assert_runtime_provider(
+        &updated_provider,
+        &session_id,
+        "anthropic",
+        "claude",
+        Some("high"),
+    );
 
     assert_eq!(app.handle_event(&char_press('m'), now), AppAction::Continue);
     assert!(render_app(&app).contains("Edit MCP servers"));
@@ -169,6 +185,13 @@ async fn session_detail_updates_runtime_config_with_real_server() {
             .any(|server| server.key == "files")
     );
     assert!(runtime.mcp_servers.iter().any(|server| server.key == "git"));
+    assert_eq!(
+        runtime
+            .provider
+            .as_ref()
+            .and_then(|provider| provider.reasoning_effort.as_deref()),
+        Some("high")
+    );
 }
 
 async fn setup_runtime_configured_server() -> &'static TestServer {
@@ -192,6 +215,7 @@ async fn setup_runtime_configured_server() -> &'static TestServer {
                 RuntimeDefaultsView {
                     provider_key: "openai".to_owned(),
                     model_id: "gpt4o".to_owned(),
+                    reasoning_effort: None,
                     mcp_default_enabled: false,
                     enabled_mcp_server_keys: vec!["git".to_owned()],
                 }
@@ -209,6 +233,7 @@ fn assert_runtime_provider(
     session_id: &str,
     provider_key: &str,
     model_id: &str,
+    reasoning_effort: Option<&str>,
 ) {
     let provider = snapshot
         .sessions
@@ -225,6 +250,7 @@ fn assert_runtime_provider(
         });
     assert_eq!(provider.key, provider_key);
     assert_eq!(provider.model_id, model_id);
+    assert_eq!(provider.reasoning_effort.as_deref(), reasoning_effort);
 }
 
 fn provider(name: &str, model_id: &str) -> ProviderView {
@@ -233,6 +259,8 @@ fn provider(name: &str, model_id: &str) -> ProviderView {
         name: name.to_owned(),
         url: "https://example.invalid/v1".to_owned(),
         headers: BTreeMap::new(),
+        oauth_compatible: false,
+        oauth_settings: None,
         models: BTreeMap::from([(model_id.to_owned(), model(model_id))]),
     }
 }
@@ -248,6 +276,7 @@ fn model(name: &str) -> ModelView {
             min_p: None,
             presence_penalty: None,
             repetition_penalty: None,
+            reasoning_efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
         },
         limits: ModelLimitsView {
             context: None,
@@ -257,6 +286,7 @@ fn model(name: &str) -> ModelView {
             tools: true,
             image: false,
         },
+        catalog_match: None,
     }
 }
 

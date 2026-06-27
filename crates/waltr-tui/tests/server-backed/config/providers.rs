@@ -33,7 +33,9 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     assert!(rendered.contains("Providers"));
     assert!(rendered.contains("MCP Servers"));
     assert!(rendered.contains("Tab switch"));
-    assert!(rendered.contains("No providers configured."));
+    assert!(rendered.contains("> anthropic"));
+    assert!(rendered.contains("openai"));
+    assert!(rendered.contains("openai-codex"));
     insta::assert_snapshot!("config_providers_empty_real_server", rendered);
 
     let now = Instant::now();
@@ -48,11 +50,11 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     insta::assert_snapshot!("config_defaults_empty_real_server", defaults);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let switched_back = render_app(&app);
-    assert!(switched_back.contains("No providers configured."));
+    assert!(switched_back.contains("> anthropic"));
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&char_press('c'), now), AppAction::Continue);
-    for character in "openai".chars() {
+    for character in "aaa-openai".chars() {
         assert_eq!(
             app.handle_event(&char_press(character), now),
             AppAction::Continue
@@ -74,7 +76,7 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
         .config
         .current
         .as_ref()
-        .and_then(|config| config.providers.get("openai"))
+        .and_then(|config| config.providers.get("aaa-openai"))
         .expect("created provider should be persisted");
     assert_eq!(provider.kind, ProviderKindView::OpenAi);
     assert_eq!(provider.url, "https://api.openai.com");
@@ -89,9 +91,9 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
         .config
         .current
         .as_ref()
-        .and_then(|config| config.providers.get("openai"))
+        .and_then(|config| config.providers.get("aaa-openai"))
         .expect("edited provider should remain persisted");
-    assert_eq!(provider.kind, ProviderKindView::Anthropic);
+    assert_eq!(provider.kind, ProviderKindView::OpenAiCodex);
 
     assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
     let action = app.handle_event(&enter_press(), now);
@@ -101,7 +103,7 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
             .config
             .current
             .as_ref()
-            .is_some_and(|config| config.providers.is_empty()),
+            .is_some_and(|config| !config.providers.contains_key("aaa-openai")),
         "deleted provider should be removed from persisted config"
     );
 }

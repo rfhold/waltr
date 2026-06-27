@@ -36,6 +36,7 @@ pub struct RuntimeDefaultsSection {
 struct RuntimeDefaultsDraft {
     provider_key: String,
     model_id: String,
+    reasoning_effort: Option<String>,
     mcp_default_enabled: bool,
     enabled_mcp_server_keys: BTreeSet<String>,
 }
@@ -137,6 +138,10 @@ impl RuntimeDefaultsSection {
                 self.toggle_selected_mcp(config);
                 SectionAction::Continue
             }
+            KeyCode::Char('r') => {
+                self.cycle_reasoning_effort(config);
+                SectionAction::Continue
+            }
             KeyCode::Char('j') => {
                 let max = mcp_count(config).saturating_sub(1);
                 self.selected_mcp = (self.selected_mcp + 1).min(max);
@@ -160,6 +165,9 @@ impl RuntimeDefaultsSection {
             model_id: config
                 .and_then(|config| config.runtime_defaults.as_ref())
                 .map_or_else(String::new, |defaults| defaults.model_id.clone()),
+            reasoning_effort: config
+                .and_then(|config| config.runtime_defaults.as_ref())
+                .and_then(|defaults| defaults.reasoning_effort.clone()),
             mcp_default_enabled: config
                 .and_then(|config| config.runtime_defaults.as_ref())
                 .is_some_and(|defaults| defaults.mcp_default_enabled),
@@ -192,20 +200,50 @@ impl RuntimeDefaultsSection {
         self.draft = Some(draft);
     }
 
+    fn cycle_reasoning_effort(&mut self, config: Option<&ConfigView>) {
+        let efforts =
+            selected_reasoning_efforts(config, self.selected_provider, self.selected_model);
+        if efforts.is_empty() {
+            return;
+        }
+
+        let mut draft = self.draft(config);
+        draft.reasoning_effort = match draft
+            .reasoning_effort
+            .as_ref()
+            .and_then(|effort| efforts.iter().position(|value| value == effort))
+        {
+            Some(index) if index + 1 < efforts.len() => Some(efforts[index + 1].clone()),
+            Some(_) => None,
+            None => efforts.first().cloned(),
+        };
+        self.draft = Some(draft);
+    }
+
     fn save(&mut self, config: Option<&ConfigView>) -> SectionAction {
         let provider_key = selected_provider_key(config, self.selected_provider)
             .map_or_else(String::new, ToOwned::to_owned);
         let model_id = selected_model_id(config, self.selected_provider, self.selected_model)
             .map_or_else(String::new, ToOwned::to_owned);
+        let efforts =
+            selected_reasoning_efforts(config, self.selected_provider, self.selected_model);
         let mut draft = self.draft(config);
         draft.provider_key = provider_key;
         draft.model_id = model_id;
+        if draft
+            .reasoning_effort
+            .as_ref()
+            .is_some_and(|effort| !efforts.contains(effort))
+        {
+            draft.reasoning_effort = None;
+        }
 
         self.patch.begin();
         SectionAction::ClientCommand(ClientCommand::SetRuntimeDefaults {
             defaults: Some(RuntimeDefaultsView {
                 provider_key: draft.provider_key,
                 model_id: draft.model_id,
+                reasoning_effort: draft.reasoning_effort,
                 mcp_default_enabled: draft.mcp_default_enabled,
                 enabled_mcp_server_keys: draft.enabled_mcp_server_keys.into_iter().collect(),
             }),
@@ -218,6 +256,7 @@ impl RuntimeDefaultsSection {
             defaults: Some(RuntimeDefaultsView {
                 provider_key: String::new(),
                 model_id: String::new(),
+                reasoning_effort: None,
                 mcp_default_enabled: false,
                 enabled_mcp_server_keys: Vec::new(),
             }),
@@ -267,6 +306,20 @@ impl RuntimeDefaultsSection {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let reasoning = if selected_reasoning_efforts(
+            Some(config),
+            self.selected_provider,
+            self.selected_model,
+        )
+        .is_empty()
+        {
+            "not supported".to_owned()
+        } else {
+            draft
+                .reasoning_effort
+                .clone()
+                .unwrap_or_else(|| "none".to_owned())
+        };
 
         let mut lines = vec![
             Line::from(vec![
@@ -283,6 +336,11 @@ impl RuntimeDefaultsSection {
                 ui::selected_title("MCP"),
                 Span::raw(" "),
                 Span::styled(mcp_mode, THEME.focus_style()),
+            ]),
+            Line::from(vec![
+                ui::selected_title("Reasoning"),
+                Span::raw(" "),
+                Span::styled(reasoning, THEME.focus_style()),
             ]),
             Line::from(""),
         ];
@@ -304,7 +362,7 @@ impl RuntimeDefaultsSection {
 
         lines.push(Line::from(""));
         lines.push(ui::footer_hint_line(
-            "Up/Down provider  Left/Right model  Space all MCP  j/k MCP  m toggle MCP  Enter save  Del clear",
+            "Up/Down provider  Left/Right model  r reasoning  Space all MCP  j/k MCP  m toggle MCP  Enter save  Del clear",
         ));
 
         if self.patch.is_pending() {
@@ -365,6 +423,27 @@ fn selected_model_id(
         .keys()
         .nth(model_index)
         .map(String::as_str)
+}
+
+fn selected_reasoning_efforts(
+    config: Option<&ConfigView>,
+    provider_index: usize,
+    model_index: usize,
+) -> Vec<String> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let Some(provider_key) = selected_provider_key(Some(config), provider_index) else {
+        return Vec::new();
+    };
+    let Some(model_id) = selected_model_id(Some(config), provider_index, model_index) else {
+        return Vec::new();
+    };
+    config
+        .providers
+        .get(provider_key)
+        .and_then(|provider| provider.models.get(model_id))
+        .map_or_else(Vec::new, |model| model.options.reasoning_efforts.clone())
 }
 
 fn selected_mcp_key(config: Option<&ConfigView>, index: usize) -> Option<&str> {

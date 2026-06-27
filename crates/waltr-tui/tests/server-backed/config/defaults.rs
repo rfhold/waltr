@@ -71,6 +71,8 @@ async fn setup_runtime_defaults_server() -> &'static TestServer {
                     name: "anthropic".to_owned(),
                     url: "https://api.anthropic.com".to_owned(),
                     headers: Default::default(),
+                    oauth_compatible: false,
+                    oauth_settings: None,
                     models: BTreeMap::from([("sonnet".to_owned(), model("Claude"))]),
                 }
                 .into(),
@@ -89,6 +91,7 @@ async fn setup_runtime_defaults_server() -> &'static TestServer {
                 RuntimeDefaultsView {
                     provider_key: "anthropic".to_owned(),
                     model_id: "sonnet".to_owned(),
+                    reasoning_effort: None,
                     mcp_default_enabled: false,
                     enabled_mcp_server_keys: Vec::new(),
                 }
@@ -112,6 +115,7 @@ fn model(name: &str) -> ModelView {
             min_p: None,
             presence_penalty: None,
             repetition_penalty: None,
+            reasoning_efforts: Vec::new(),
         },
         limits: ModelLimitsView {
             context: None,
@@ -121,5 +125,6 @@ fn model(name: &str) -> ModelView {
             tools: true,
             image: false,
         },
+        catalog_match: None,
     }
 }

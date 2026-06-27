@@ -40,6 +40,7 @@ enum RuntimeEditor {
         query: String,
         selected_provider: usize,
         selected_model: usize,
+        selected_reasoning: usize,
     },
     Mcp {
         query: String,
@@ -315,6 +316,7 @@ impl SessionsSection {
                 query,
                 selected_provider,
                 selected_model,
+                selected_reasoning,
             } => match key.code {
                 KeyCode::Esc => {
                     self.runtime_editor = None;
@@ -323,16 +325,19 @@ impl SessionsSection {
                 KeyCode::Up => {
                     *selected_provider = selected_provider.saturating_sub(1);
                     *selected_model = 0;
+                    *selected_reasoning = 0;
                     SectionAction::Continue
                 }
                 KeyCode::Down => {
                     let max = provider_entries(snapshot).len().saturating_sub(1);
                     *selected_provider = (*selected_provider + 1).min(max);
                     *selected_model = 0;
+                    *selected_reasoning = 0;
                     SectionAction::Continue
                 }
                 KeyCode::Left => {
                     *selected_model = selected_model.saturating_sub(1);
+                    *selected_reasoning = 0;
                     SectionAction::Continue
                 }
                 KeyCode::Right => {
@@ -340,6 +345,16 @@ impl SessionsSection {
                         .get(*selected_provider)
                         .map_or(0, |(_, provider)| provider.models.len().saturating_sub(1));
                     *selected_model = (*selected_model + 1).min(max);
+                    *selected_reasoning = 0;
+                    SectionAction::Continue
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    let len =
+                        selected_reasoning_efforts(snapshot, *selected_provider, *selected_model)
+                            .len();
+                    if len > 0 {
+                        *selected_reasoning = (*selected_reasoning + 1) % len;
+                    }
                     SectionAction::Continue
                 }
                 KeyCode::Enter => self.save_provider_runtime(snapshot),
@@ -347,12 +362,14 @@ impl SessionsSection {
                     query.pop();
                     *selected_provider = 0;
                     *selected_model = 0;
+                    *selected_reasoning = 0;
                     SectionAction::Continue
                 }
                 KeyCode::Char(character) => {
                     query.push(character);
                     *selected_provider = 0;
                     *selected_model = 0;
+                    *selected_reasoning = 0;
                     SectionAction::Continue
                 }
                 _ => SectionAction::Continue,
@@ -415,6 +432,7 @@ impl SessionsSection {
             query: String::new(),
             selected_provider: 0,
             selected_model: 0,
+            selected_reasoning: 0,
         });
     }
 
@@ -444,6 +462,7 @@ impl SessionsSection {
         let Some(RuntimeEditor::Provider {
             selected_provider,
             selected_model,
+            selected_reasoning,
             ..
         }) = &self.runtime_editor
         else {
@@ -457,6 +476,10 @@ impl SessionsSection {
         let Some(model_id) = sorted_model_keys(&provider).get(*selected_model).cloned() else {
             return SectionAction::Continue;
         };
+        let reasoning_effort =
+            selected_reasoning_efforts(snapshot, *selected_provider, *selected_model)
+                .get(*selected_reasoning)
+                .and_then(|value| (!value.is_empty()).then(|| value.clone()));
         let enabled_mcp_server_keys =
             session
                 .runtime_config
@@ -474,6 +497,7 @@ impl SessionsSection {
             id: session.id,
             provider_key,
             model_id,
+            reasoning_effort,
             enabled_mcp_server_keys,
         })
     }
@@ -498,6 +522,7 @@ impl SessionsSection {
             id: session.id,
             provider_key: provider.key.clone(),
             model_id: provider.model_id.clone(),
+            reasoning_effort: provider.reasoning_effort.clone(),
             enabled_mcp_server_keys: enabled.iter().cloned().collect(),
         })
     }
@@ -631,8 +656,12 @@ fn render_runtime_editor(
         Some(RuntimeEditor::Mcp { .. }) => " Edit MCP servers ",
         None => return,
     };
-    let block = ui::modal_block(title, " Esc cancel  type search  Enter save ")
-        .border_style(THEME.accent_style());
+    let footer = match section.runtime_editor {
+        Some(RuntimeEditor::Provider { .. }) => " Esc cancel  type search  r thinking  Enter save ",
+        Some(RuntimeEditor::Mcp { .. }) => " Esc cancel  type search  Enter save ",
+        None => return,
+    };
+    let block = ui::modal_block(title, footer).border_style(THEME.accent_style());
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
@@ -641,7 +670,14 @@ fn render_runtime_editor(
             query,
             selected_provider,
             selected_model,
-        }) => provider_editor_lines(snapshot, query, *selected_provider, *selected_model),
+            selected_reasoning,
+        }) => provider_editor_lines(
+            snapshot,
+            query,
+            *selected_provider,
+            *selected_model,
+            *selected_reasoning,
+        ),
         Some(RuntimeEditor::Mcp {
             query,
             selected,
@@ -669,6 +705,7 @@ fn provider_editor_lines(
     query: &str,
     selected_provider: usize,
     selected_model: usize,
+    selected_reasoning: usize,
 ) -> Vec<Line<'static>> {
     let entries = filtered_provider_entries(snapshot, query);
     let mut lines = vec![
@@ -701,6 +738,26 @@ fn provider_editor_lines(
                 Span::raw(" "),
                 Span::raw(model.clone()),
             ]));
+        }
+
+        let efforts = reasoning_efforts_for_provider(provider, selected_model);
+        if !efforts.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "thinking",
+                THEME.accent_bold(),
+            )]));
+            for (index, effort) in efforts.iter().enumerate() {
+                let label = if effort.is_empty() {
+                    "none".to_owned()
+                } else {
+                    effort.clone()
+                };
+                lines.push(Line::from(vec![
+                    ui::selection_marker(index == selected_reasoning),
+                    Span::raw(" "),
+                    Span::raw(label),
+                ]));
+            }
         }
     }
 
@@ -841,6 +898,32 @@ fn sorted_model_keys(provider: &ProviderView) -> Vec<String> {
     let mut keys = provider.models.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     keys
+}
+
+fn selected_reasoning_efforts(
+    snapshot: Option<&ClientSnapshot>,
+    selected_provider: usize,
+    selected_model: usize,
+) -> Vec<String> {
+    provider_entries(snapshot)
+        .get(selected_provider)
+        .map_or_else(Vec::new, |(_, provider)| {
+            reasoning_efforts_for_provider(provider, selected_model)
+        })
+}
+
+fn reasoning_efforts_for_provider(provider: &ProviderView, selected_model: usize) -> Vec<String> {
+    let model_keys = sorted_model_keys(provider);
+    let Some(model_id) = model_keys.get(selected_model) else {
+        return Vec::new();
+    };
+    let Some(model) = provider.models.get(model_id) else {
+        return Vec::new();
+    };
+
+    let mut efforts = vec![String::new()];
+    efforts.extend(model.options.reasoning_efforts.iter().cloned());
+    efforts
 }
 
 fn session_timestamp(session: &SessionView) -> i64 {

@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 
 use waltr_client::{
     ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, ModelCapabilitiesView,
-    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
+    ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
+    OAuthProviderView, ProviderKindView, ProviderView,
 };
 use ratatui::{
     Frame,
@@ -60,6 +61,8 @@ pub struct ProviderForm {
     pub kind: ProviderKindView,
     /// Provider URL draft.
     pub url: String,
+    oauth_compatible: bool,
+    oauth_settings: Option<OAuthProviderView>,
     headers: BTreeMap<String, String>,
     models: BTreeMap<String, ModelView>,
     selected_model: usize,
@@ -67,7 +70,7 @@ pub struct ProviderForm {
     delete_model: Option<String>,
 }
 
-const PROVIDER_FIELD_COUNT: usize = 3;
+const PROVIDER_FIELD_COUNT: usize = 4;
 
 impl ProviderForm {
     const fn create() -> Self {
@@ -78,6 +81,8 @@ impl ProviderForm {
             name: String::new(),
             kind: ProviderKindView::Anthropic,
             url: String::new(),
+            oauth_compatible: false,
+            oauth_settings: None,
             headers: BTreeMap::new(),
             models: BTreeMap::new(),
             selected_model: 0,
@@ -94,6 +99,8 @@ impl ProviderForm {
             name: provider.name.clone(),
             kind: provider.kind,
             url: provider.url.clone(),
+            oauth_compatible: provider.oauth_compatible,
+            oauth_settings: provider.oauth_settings.clone(),
             headers: provider.headers.clone(),
             models: provider.models.clone(),
             selected_model: 0,
@@ -115,8 +122,13 @@ impl ProviderForm {
             KeyCode::Backspace | KeyCode::Delete if self.focused_model_index().is_some() => {
                 self.arm_model_delete();
             }
-            KeyCode::Backspace if self.field != 1 => self.active_text_mut().pop().map_or((), drop),
+            KeyCode::Backspace if matches!(self.field, 0 | 2) => {
+                self.active_text_mut().pop().map_or((), drop)
+            }
             KeyCode::Left | KeyCode::Right if self.field == 1 => self.toggle_kind(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.field == 3 => {
+                self.oauth_compatible = !self.oauth_compatible;
+            }
             KeyCode::Enter => return FormAction::Submit,
             KeyCode::Char(character) if matches!(self.field, 0 | 2) => {
                 self.active_text_mut().push(character);
@@ -164,6 +176,8 @@ impl ProviderForm {
             name: self.name,
             url: self.url,
             headers: self.headers,
+            oauth_compatible: self.oauth_compatible,
+            oauth_settings: self.oauth_settings,
             models: self.models,
         }
     }
@@ -241,6 +255,7 @@ impl ProviderForm {
     const fn toggle_kind(&mut self) {
         self.kind = match self.kind {
             ProviderKindView::Anthropic => ProviderKindView::OpenAi,
+            ProviderKindView::OpenAi => ProviderKindView::OpenAiCodex,
             _ => ProviderKindView::Anthropic,
         };
     }
@@ -281,6 +296,8 @@ pub struct ModelForm {
     pub kind: Option<ModelTypeView>,
     /// Sampling temperature draft.
     pub temperature: String,
+    /// Supported reasoning effort levels draft.
+    pub reasoning_efforts: String,
     /// Maximum context window draft.
     pub context: String,
     /// Maximum output token draft.
@@ -289,9 +306,11 @@ pub struct ModelForm {
     pub tools: bool,
     /// Image-input capability draft.
     pub image: bool,
+    /// Catalog linkage preserved while editing model fields.
+    pub catalog_match: Option<ModelCatalogMatchView>,
 }
 
-const MODEL_FIELD_COUNT: usize = 7;
+const MODEL_FIELD_COUNT: usize = 8;
 
 impl ModelForm {
     const fn create() -> Self {
@@ -303,10 +322,12 @@ impl ModelForm {
             name: String::new(),
             kind: None,
             temperature: String::new(),
+            reasoning_efforts: String::new(),
             context: String::new(),
             output: String::new(),
             tools: false,
             image: false,
+            catalog_match: None,
         }
     }
 
@@ -322,6 +343,7 @@ impl ModelForm {
                 .options
                 .temperature
                 .map_or_else(String::new, |value| value.to_string()),
+            reasoning_efforts: model.options.reasoning_efforts.join(", "),
             context: model
                 .limits
                 .context
@@ -332,6 +354,7 @@ impl ModelForm {
                 .map_or_else(String::new, |value| value.to_string()),
             tools: model.capabilities.tools,
             image: model.capabilities.image,
+            catalog_match: model.catalog_match.clone(),
         }
     }
 
@@ -349,8 +372,8 @@ impl ModelForm {
                 self.field = (self.field + MODEL_FIELD_COUNT - 1) % MODEL_FIELD_COUNT;
             }
             KeyCode::Left | KeyCode::Right if self.field == 2 => self.cycle_kind(),
-            KeyCode::Left | KeyCode::Right if self.field == 5 => self.tools = !self.tools,
-            KeyCode::Left | KeyCode::Right if self.field == 6 => self.image = !self.image,
+            KeyCode::Left | KeyCode::Right if self.field == 6 => self.tools = !self.tools,
+            KeyCode::Left | KeyCode::Right if self.field == 7 => self.image = !self.image,
             KeyCode::Backspace if self.is_text_field() => drop(self.active_text_mut().pop()),
             KeyCode::Enter => return FormAction::Submit,
             KeyCode::Char(character) if self.is_text_field() => {
@@ -363,7 +386,7 @@ impl ModelForm {
     }
 
     const fn is_text_field(&self) -> bool {
-        matches!(self.field, 0 | 1 | 3 | 4)
+        matches!(self.field, 0 | 1 | 3 | 4 | 5)
     }
 
     const fn active_text_mut(&mut self) -> &mut String {
@@ -371,6 +394,7 @@ impl ModelForm {
             1 => &mut self.name,
             3 => &mut self.temperature,
             4 => &mut self.context,
+            5 => &mut self.reasoning_efforts,
             _ => &mut self.key,
         }
     }
@@ -398,6 +422,7 @@ impl ModelForm {
                 min_p: None,
                 presence_penalty: None,
                 repetition_penalty: None,
+                reasoning_efforts: split_reasoning_efforts(&self.reasoning_efforts),
             },
             limits: ModelLimitsView {
                 context: self.context.trim().parse().ok(),
@@ -407,6 +432,7 @@ impl ModelForm {
                 tools: self.tools,
                 image: self.image,
             },
+            catalog_match: self.catalog_match.clone(),
         }
     }
 }
@@ -486,8 +512,8 @@ impl ProviderSection {
 
     /// Whether the model sub-editor is open for some provider.
     #[must_use]
-    pub const fn in_model_editor(&self) -> bool {
-        false
+    pub fn in_model_editor(&self) -> bool {
+        self.model_form().is_some()
     }
 
     /// Return the active model form, if any.
@@ -804,6 +830,11 @@ fn provider_line(
         Span::raw("  "),
         Span::styled(provider_kind_name(provider.kind), THEME.focus_style()),
         Span::raw("  "),
+        Span::styled(
+            oauth_compatible_name(provider.oauth_compatible),
+            THEME.text_style(),
+        ),
+        Span::raw("  "),
         Span::styled(provider_url(provider), THEME.text_style()),
     ])
 }
@@ -830,7 +861,7 @@ fn form_widget(
         .block(
             ui::modal_block(
                 title,
-                " Tab focus  C-x c model  Model: Right/Enter edit  Backspace/Delete delete  Esc cancel ",
+                " Tab focus  Space/Left/Right toggle  C-x c model  Esc cancel ",
             )
             .style(THEME.text_style()),
         )
@@ -847,6 +878,12 @@ fn form_lines(
         form_line(0, form.field, "name", &form.name),
         form_line(1, form.field, "type", provider_kind_name(form.kind)),
         form_line(2, form.field, "url", &form.url),
+        form_line(
+            3,
+            form.field,
+            "oauth",
+            oauth_compatible_name(form.oauth_compatible),
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "Models staged in this provider draft",
@@ -879,6 +916,10 @@ fn form_lines(
     lines
 }
 
+const fn oauth_compatible_name(enabled: bool) -> &'static str {
+    if enabled { "oauth" } else { "no-oauth" }
+}
+
 fn form_line(index: usize, active: usize, label: &'static str, value: &str) -> Line<'static> {
     ui::form_field_row(index, active, label, value)
 }
@@ -888,6 +929,7 @@ const fn provider_kind_name(kind: ProviderKindView) -> &'static str {
         ProviderKindView::Unspecified => "unspecified",
         ProviderKindView::Anthropic => "anthropic",
         ProviderKindView::OpenAi => "openai",
+        ProviderKindView::OpenAiCodex => "openai-codex",
         ProviderKindView::Unknown => "unknown",
     }
 }
@@ -943,9 +985,14 @@ fn model_form_lines(form: &ModelForm) -> Vec<Line<'static>> {
         model_type_line(2, form.field, form.kind),
         form_line(3, form.field, "temperature", &form.temperature),
         form_line(4, form.field, "context", &form.context),
-        model_bool_line(5, form.field, "tools", form.tools),
-        model_bool_line(6, form.field, "image", form.image),
+        form_line(5, form.field, "reasoning", &form.reasoning_efforts),
+        model_bool_line(6, form.field, "tools", form.tools),
+        model_bool_line(7, form.field, "image", form.image),
     ];
+
+    if let Some(catalog_match) = &form.catalog_match {
+        lines.push(catalog_match_line(catalog_match));
+    }
 
     if !form.has_type() {
         lines.push(Line::from(Span::styled(
@@ -955,6 +1002,37 @@ fn model_form_lines(form: &ModelForm) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn catalog_match_line(catalog_match: &ModelCatalogMatchView) -> Line<'static> {
+    Line::from(Span::styled(
+        format!(
+            "catalog: {} / {} ({})",
+            catalog_match.provider_id,
+            catalog_match.model_id,
+            catalog_match_source_name(catalog_match.source)
+        ),
+        THEME.muted_text_style(),
+    ))
+}
+
+const fn catalog_match_source_name(source: waltr_client::CatalogMatchSourceView) -> &'static str {
+    match source {
+        waltr_client::CatalogMatchSourceView::Manual => "manual",
+        waltr_client::CatalogMatchSourceView::Auto => "auto",
+        waltr_client::CatalogMatchSourceView::Applied => "applied",
+        waltr_client::CatalogMatchSourceView::Unspecified => "unspecified",
+        waltr_client::CatalogMatchSourceView::Unknown => "unknown",
+    }
+}
+
+fn split_reasoning_efforts(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn model_type_line(index: usize, active: usize, kind: Option<ModelTypeView>) -> Line<'static> {
