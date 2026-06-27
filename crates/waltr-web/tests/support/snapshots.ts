@@ -131,9 +131,9 @@ export function mcpServerView(overrides: Partial<McpServerView> = {}): McpServer
 
 export function claudeConfig(): ConfigView {
   const claude: ProviderView = {
-    kind: "anthropic",
+    kind: "anthropicMessages",
     name: "claude",
-    url: "https://api.anthropic.com",
+    url: "https://api.anthropic.com/v1/messages",
     headers: {},
     oauthCompatible: false,
     oauthSettings: null,

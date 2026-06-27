@@ -92,12 +92,18 @@ where
     type WatchConfigStream =
         Pin<Box<dyn Stream<Item = Result<WatchConfigResponse, Status>> + Send>>;
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "patch_config", expected_etag, etag)
+    )]
     async fn patch_config(
         &self,
         request: Request<PatchConfigRequest>,
     ) -> Result<Response<PatchConfigResponse>, Status> {
         let request = request.into_inner();
-        tracing::info!("patch config requested");
+        tracing::Span::current().record("expected_etag", request.expected_etag.as_str());
+        tracing::info!("config patch accepted");
         tracing::debug!(expected_etag = %request.expected_etag, "patch config expected etag");
         let patch = ConfigPatch {
             providers: request.providers.map(|patch| patch.providers),
@@ -109,10 +115,11 @@ where
             .patch(patch, &request.expected_etag)
             .await
             .map_err(|error| {
-                tracing::warn!(%error, "patch config failed");
+                tracing::warn!(%error, "config patch failed");
                 config_error_to_status(&error)
             })?;
-        tracing::info!(etag = %config.etag, "patch config completed");
+        tracing::Span::current().record("etag", config.etag.as_str());
+        tracing::info!(etag = %config.etag, "config patch completed");
 
         Ok(Response::new(PatchConfigResponse {
             config: Some(config),

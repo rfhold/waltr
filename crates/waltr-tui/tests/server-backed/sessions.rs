@@ -255,7 +255,7 @@ fn assert_runtime_provider(
 
 fn provider(name: &str, model_id: &str) -> ProviderView {
     ProviderView {
-        kind: ProviderKindView::OpenAi,
+        kind: ProviderKindView::OpenAiChatCompletions,
         name: name.to_owned(),
         url: "https://example.invalid/v1".to_owned(),
         headers: BTreeMap::new(),

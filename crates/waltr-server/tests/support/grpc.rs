@@ -57,9 +57,9 @@ pub fn config_with_provider(name: &str) -> Configuration {
         providers: std::collections::HashMap::from([(
             name.to_owned(),
             Provider {
-                r#type: ProviderType::Anthropic as i32,
+                r#type: ProviderType::AnthropicMessages as i32,
                 name: name.to_owned(),
-                url: "https://api.anthropic.com".to_owned(),
+                url: "https://api.anthropic.com/v1/messages".to_owned(),
                 ..Provider::default()
             },
         )]),

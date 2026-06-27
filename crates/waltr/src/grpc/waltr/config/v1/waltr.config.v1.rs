@@ -293,9 +293,10 @@ impl OauthTokenField {
 #[repr(i32)]
 pub enum ProviderType {
     Unspecified = 0,
-    Anthropic = 1,
-    Openai = 2,
-    OpenaiCodex = 3,
+    AnthropicMessages = 1,
+    OpenaiChatCompletions = 2,
+    OpenaiResponses = 3,
+    OpenaiResponsesWebsocket = 4,
 }
 impl ProviderType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -305,18 +306,20 @@ impl ProviderType {
     pub fn as_str_name(&self) -> &'static str {
         match self {
             Self::Unspecified => "PROVIDER_TYPE_UNSPECIFIED",
-            Self::Anthropic => "PROVIDER_TYPE_ANTHROPIC",
-            Self::Openai => "PROVIDER_TYPE_OPENAI",
-            Self::OpenaiCodex => "PROVIDER_TYPE_OPENAI_CODEX",
+            Self::AnthropicMessages => "PROVIDER_TYPE_ANTHROPIC_MESSAGES",
+            Self::OpenaiChatCompletions => "PROVIDER_TYPE_OPENAI_CHAT_COMPLETIONS",
+            Self::OpenaiResponses => "PROVIDER_TYPE_OPENAI_RESPONSES",
+            Self::OpenaiResponsesWebsocket => "PROVIDER_TYPE_OPENAI_RESPONSES_WEBSOCKET",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
             "PROVIDER_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
-            "PROVIDER_TYPE_ANTHROPIC" => Some(Self::Anthropic),
-            "PROVIDER_TYPE_OPENAI" => Some(Self::Openai),
-            "PROVIDER_TYPE_OPENAI_CODEX" => Some(Self::OpenaiCodex),
+            "PROVIDER_TYPE_ANTHROPIC_MESSAGES" => Some(Self::AnthropicMessages),
+            "PROVIDER_TYPE_OPENAI_CHAT_COMPLETIONS" => Some(Self::OpenaiChatCompletions),
+            "PROVIDER_TYPE_OPENAI_RESPONSES" => Some(Self::OpenaiResponses),
+            "PROVIDER_TYPE_OPENAI_RESPONSES_WEBSOCKET" => Some(Self::OpenaiResponsesWebsocket),
             _ => None,
         }
     }

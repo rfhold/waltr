@@ -3,7 +3,7 @@ etag = ""
 [providers.agent-gateway-anthropic]
 type = 1
 name = "agent-gateway-anthropic"
-url = "https://agent-gateway.holdenitdown.net"
+url = "https://agent-gateway.holdenitdown.net/v1/messages"
 oauth_compatible = false
 
 [providers.agent-gateway-anthropic.headers]
@@ -24,7 +24,7 @@ image = false
 [providers.agent-gateway-openai]
 type = 2
 name = "agent-gateway-openai"
-url = "https://agent-gateway.holdenitdown.net"
+url = "https://agent-gateway.holdenitdown.net/v1/chat/completions"
 oauth_compatible = false
 
 [providers.agent-gateway-openai.headers]
@@ -45,7 +45,7 @@ image = true
 [providers.anthropic]
 type = 1
 name = "anthropic"
-url = "https://api.anthropic.com"
+url = "https://api.anthropic.com/v1/messages"
 oauth_compatible = true
 
 [providers.anthropic.headers]
@@ -58,15 +58,17 @@ type = 1
 reasoning_efforts = []
 
 [providers.anthropic.models.claude-haiku-4-5.limits]
+context = 200000
+output = 64000
 
 [providers.anthropic.models.claude-haiku-4-5.capabilities]
 tools = true
-image = false
+image = true
 
 [providers.anthropic.models.claude-haiku-4-5.catalog_match]
 provider_id = "anthropic"
 model_id = "claude-haiku-4-5"
-source = 2
+source = 3
 
 [providers.anthropic.models.claude-sonnet-4-5]
 name = "Claude Sonnet 4.5"
@@ -76,33 +78,42 @@ type = 1
 reasoning_efforts = []
 
 [providers.anthropic.models.claude-sonnet-4-5.limits]
+context = 200000
+output = 64000
 
 [providers.anthropic.models.claude-sonnet-4-5.capabilities]
 tools = true
-image = false
+image = true
 
 [providers.anthropic.models.claude-sonnet-4-5.catalog_match]
 provider_id = "anthropic"
 model_id = "claude-sonnet-4-5"
-source = 2
+source = 3
 
 [providers.anthropic.models.claude-sonnet-4-6]
 name = "Claude Sonnet 4.6"
 type = 1
 
 [providers.anthropic.models.claude-sonnet-4-6.options]
-reasoning_efforts = ["medium"]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+]
 
 [providers.anthropic.models.claude-sonnet-4-6.limits]
+context = 1000000
+output = 64000
 
 [providers.anthropic.models.claude-sonnet-4-6.capabilities]
 tools = true
-image = false
+image = true
 
 [providers.anthropic.models.claude-sonnet-4-6.catalog_match]
 provider_id = "anthropic"
 model_id = "claude-sonnet-4-6"
-source = 2
+source = 3
 
 [providers.anthropic.oauth_settings]
 name = "Claude Code"
@@ -127,12 +138,14 @@ key = "code"
 value = "true"
 
 [providers.openai-codex]
-type = 3
+type = 4
 name = "openai-codex"
-url = "https://chatgpt.com/backend-api"
+url = "wss://chatgpt.com/backend-api/codex/responses"
 oauth_compatible = true
 
 [providers.openai-codex.headers]
+OpenAI-Beta = "responses=experimental"
+originator = "waltr"
 
 [providers.openai-codex.models.gpt-5-codex]
 name = "gpt-5-codex"

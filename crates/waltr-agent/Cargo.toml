@@ -27,6 +27,7 @@ tokio-postgres.workspace = true
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-tungstenite.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 tree-sitter = { version = "0.25", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
 uuid = { workspace = true, features = ["v7"] }

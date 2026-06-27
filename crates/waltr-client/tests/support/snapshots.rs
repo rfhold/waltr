@@ -57,7 +57,7 @@ pub fn config_with_provider(name: &str) -> ConfigView {
 
 pub fn provider_view(name: &str) -> ProviderView {
     ProviderView {
-        kind: ProviderKindView::Anthropic,
+        kind: ProviderKindView::AnthropicMessages,
         name: name.to_owned(),
         url: String::new(),
         headers: BTreeMap::new(),

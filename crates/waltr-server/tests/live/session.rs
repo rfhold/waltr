@@ -189,8 +189,8 @@ struct LiveServerProvider {
 fn openai_chat_completions_provider() -> Result<LiveServerProvider, MissingLiveConfig> {
     Ok(LiveServerProvider {
         key: "openai",
-        provider_type: ProviderType::Openai,
-        url: "https://api.openai.com",
+        provider_type: ProviderType::OpenaiChatCompletions,
+        url: "https://api.openai.com/v1/chat/completions",
         api_key: required_env("OPENAI_API_KEY")?,
         model_key: OPENAI_TEST_MODEL,
     })
@@ -199,8 +199,8 @@ fn openai_chat_completions_provider() -> Result<LiveServerProvider, MissingLiveC
 fn anthropic_messages_provider() -> Result<LiveServerProvider, MissingLiveConfig> {
     Ok(LiveServerProvider {
         key: "anthropic",
-        provider_type: ProviderType::Anthropic,
-        url: "https://api.anthropic.com",
+        provider_type: ProviderType::AnthropicMessages,
+        url: "https://api.anthropic.com/v1/messages",
         api_key: required_env("ANTHROPIC_API_KEY")?,
         model_key: ANTHROPIC_TEST_MODEL,
     })
@@ -210,7 +210,7 @@ fn gateway_openai_chat_completions_provider() -> Result<LiveServerProvider, Miss
     require_gateway()?;
     Ok(LiveServerProvider {
         key: "gateway-openai",
-        provider_type: ProviderType::Openai,
+        provider_type: ProviderType::OpenaiChatCompletions,
         url: GATEWAY_BASE_URL,
         api_key: String::new(),
         model_key: GATEWAY_OPENAI_TEST_MODEL,
@@ -221,7 +221,7 @@ fn gateway_anthropic_messages_provider() -> Result<LiveServerProvider, MissingLi
     require_gateway()?;
     Ok(LiveServerProvider {
         key: "gateway-anthropic",
-        provider_type: ProviderType::Anthropic,
+        provider_type: ProviderType::AnthropicMessages,
         url: GATEWAY_BASE_URL,
         api_key: String::new(),
         model_key: GATEWAY_ANTHROPIC_TEST_MODEL,

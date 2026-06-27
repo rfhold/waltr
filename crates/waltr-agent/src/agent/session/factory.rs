@@ -44,6 +44,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the session store rejects the new record.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self),
+        fields(operation = "create", db_system = "session_store", session_id)
+    )]
     pub async fn create(&self) -> Result<AgentSession> {
         self.create_with_metadata_values(BTreeMap::new()).await
     }
@@ -53,14 +58,28 @@ where
     /// # Errors
     ///
     /// Returns an error when the session store rejects the new record.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self, metadata_values),
+        fields(
+            operation = "create_with_metadata_values",
+            db_system = "session_store",
+            session_id
+        )
+    )]
     pub async fn create_with_metadata_values(
         &self,
         metadata_values: BTreeMap<String, Value>,
     ) -> Result<AgentSession> {
+        tracing::debug!(
+            metadata_key_count = metadata_values.len(),
+            "creating session record"
+        );
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime
             .create_session_with_metadata_values(SessionId::generate(), metadata_values)
             .await?;
+        tracing::Span::current().record("session_id", record.id.as_str());
         self.sessions
             .publish(SessionListEvent::Upsert(record.summary()));
         Ok(AgentSession::new(record))
@@ -71,6 +90,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the session store cannot complete the delete operation.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self),
+        fields(operation = "delete", db_system = "session_store", session_id = %id.as_str())
+    )]
     pub async fn delete(&self, id: &SessionId) -> Result<()> {
         AgentSessionRuntime::new(&self.store)
             .delete_session(id)
@@ -90,6 +114,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the store fails.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self),
+        fields(operation = "load", db_system = "session_store", session_id = %id.as_str())
+    )]
     pub async fn load(&self, id: &SessionId) -> Result<AgentSession> {
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime.load_session(id).await?;
@@ -101,6 +130,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the session store cannot list sessions.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self),
+        fields(operation = "list", db_system = "session_store")
+    )]
     pub async fn list(&self) -> Result<Vec<SessionSummary>> {
         AgentSessionRuntime::new(&self.store).list_sessions().await
     }
@@ -110,6 +144,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the store fails.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self),
+        fields(operation = "interrupt", db_system = "session_store", session_id = %id.as_str())
+    )]
     pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
         let record = AgentSessionRuntime::new(&self.store)
             .with_session_broadcaster(self.sessions.clone())
@@ -124,6 +163,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the store fails.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self, query),
+        fields(operation = "timeline", db_system = "session_store", session_id = %id.as_str())
+    )]
     pub async fn timeline(
         &self,
         id: &SessionId,
@@ -140,6 +184,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the store rejects the append.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self, events),
+        fields(operation = "append_timeline", db_system = "session_store", session_id = %id.as_str(), event_count = events.len())
+    )]
     pub async fn append_timeline(
         &self,
         id: &SessionId,
@@ -163,6 +212,11 @@ where
     /// # Errors
     ///
     /// Returns an error when the item does not exist, is not text-like, or the store fails.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self),
+        fields(operation = "timeline_item_text", db_system = "session_store", session_id = %id.as_str(), item_id = %item_id.as_str())
+    )]
     pub async fn timeline_item_text(
         &self,
         id: &SessionId,
@@ -185,14 +239,21 @@ where
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the store fails.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self, key, value),
+        fields(operation = "set_metadata_value", db_system = "session_store", session_id = %id.as_str())
+    )]
     pub async fn set_metadata_value(
         &self,
         id: &SessionId,
         key: impl Into<String>,
         value: Value,
     ) -> Result<AgentSession> {
+        let key = key.into();
+        tracing::debug!(metadata_key = %key, "setting session metadata value");
         let record = AgentSessionRuntime::new(&self.store)
-            .set_metadata_value(id, key.into(), value)
+            .set_metadata_value(id, key, value)
             .await?;
         self.sessions
             .publish(SessionListEvent::Upsert(record.summary()));
@@ -204,13 +265,20 @@ where
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the store fails.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self, key),
+        fields(operation = "remove_metadata_value", db_system = "session_store", session_id = %id.as_str())
+    )]
     pub async fn remove_metadata_value(
         &self,
         id: &SessionId,
         key: impl Into<String>,
     ) -> Result<AgentSession> {
+        let key = key.into();
+        tracing::debug!(metadata_key = %key, "removing session metadata value");
         let record = AgentSessionRuntime::new(&self.store)
-            .remove_metadata_value(id, key.into())
+            .remove_metadata_value(id, key)
             .await?;
         self.sessions
             .publish(SessionListEvent::Upsert(record.summary()));

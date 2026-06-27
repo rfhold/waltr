@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use crate::stream::{BoxCompletionStream, CompletionEvent, ToolCall};
 use crate::{LlmError, Result};
@@ -16,23 +17,41 @@ pub(super) async fn stream_openai_http(
     provider: &'static str,
     url: &str,
     body: Value,
-    headers: impl IntoIterator<Item = (&'static str, String)>,
+    headers: impl IntoIterator<Item = (String, String)>,
     parse_event: impl FnMut(&str) -> Result<Vec<CompletionEvent>> + Send + 'static,
 ) -> Result<BoxCompletionStream> {
     // `body` is the projected payload journaled by the agent loop; crash
     // recovery retries the whole turn rather than resuming mid-stream.
     let mut request_builder = reqwest::Client::new().post(url).json(&body);
     for (name, value) in headers {
-        request_builder = request_builder.header(name, value);
+        request_builder = request_builder.header(name.as_str(), value);
     }
-    let response = request_builder.send().await?;
+    let span = tracing::info_span!(
+        "http.client.request",
+        http_request_method = "POST",
+        server_address = %url,
+        provider,
+        http_response_status_code = tracing::field::Empty,
+    );
+    let response = request_builder.send().instrument(span.clone()).await?;
 
-    if !response.status().is_success() {
+    let status = response.status();
+    span.record("http_response_status_code", status.as_u16());
+    if !status.is_success() {
+        tracing::warn!(status = status.as_u16(), "provider http request failed");
         return Err(LlmError::Api {
             provider,
             message: response.text().await?,
         });
     }
+    span.in_scope(|| tracing::debug!(status = status.as_u16(), "provider http stream opened"));
+    let stream_span = tracing::info_span!(
+        "provider.stream_body",
+        provider,
+        terminal_state = tracing::field::Empty,
+        chunk_count = tracing::field::Empty,
+        event_count = tracing::field::Empty,
+    );
 
     Ok(Box::pin(stream::unfold(
         (
@@ -42,6 +61,9 @@ pub(super) async fn stream_openai_http(
             VecDeque::<CompletionEvent>::new(),
             parse_event,
             false,
+            stream_span,
+            0_u64,
+            0_u64,
         ),
         move |(
             mut bytes,
@@ -50,6 +72,9 @@ pub(super) async fn stream_openai_http(
             mut pending_events,
             mut parse_event,
             finished,
+            stream_span,
+            mut chunk_count,
+            mut event_count,
         )| async move {
             if finished {
                 return None;
@@ -59,15 +84,47 @@ pub(super) async fn stream_openai_http(
                 if let Some(event) = pending_events.pop_front() {
                     match event {
                         CompletionEvent::Finished => {
+                            event_count += 1;
+                            stream_span.record("terminal_state", "finished");
+                            stream_span.record("chunk_count", chunk_count);
+                            stream_span.record("event_count", event_count);
+                            stream_span.in_scope(|| {
+                                tracing::info!(
+                                    chunk_count,
+                                    event_count,
+                                    "provider stream completed"
+                                )
+                            });
                             return Some((
                                 Ok(CompletionEvent::Finished),
-                                (bytes, sse, pending_sse, pending_events, parse_event, true),
+                                (
+                                    bytes,
+                                    sse,
+                                    pending_sse,
+                                    pending_events,
+                                    parse_event,
+                                    true,
+                                    stream_span,
+                                    chunk_count,
+                                    event_count,
+                                ),
                             ));
                         }
                         event => {
+                            event_count += 1;
                             return Some((
                                 Ok(event),
-                                (bytes, sse, pending_sse, pending_events, parse_event, false),
+                                (
+                                    bytes,
+                                    sse,
+                                    pending_sse,
+                                    pending_events,
+                                    parse_event,
+                                    false,
+                                    stream_span,
+                                    chunk_count,
+                                    event_count,
+                                ),
                             ));
                         }
                     }
@@ -77,9 +134,23 @@ pub(super) async fn stream_openai_http(
                     match parse_event(&event) {
                         Ok(events) => pending_events.extend(events),
                         Err(error) => {
+                            stream_span.record("terminal_state", "error");
+                            stream_span.record("chunk_count", chunk_count);
+                            stream_span.record("event_count", event_count);
+                            stream_span.in_scope(|| tracing::warn!(%error, chunk_count, event_count, "provider stream parse failed"));
                             return Some((
                                 Err(error),
-                                (bytes, sse, pending_sse, pending_events, parse_event, true),
+                                (
+                                    bytes,
+                                    sse,
+                                    pending_sse,
+                                    pending_events,
+                                    parse_event,
+                                    true,
+                                    stream_span,
+                                    chunk_count,
+                                    event_count,
+                                ),
                             ));
                         }
                     }
@@ -87,14 +158,39 @@ pub(super) async fn stream_openai_http(
                 }
 
                 match bytes.next().await {
-                    Some(Ok(chunk)) => pending_sse.extend(sse.push(chunk.as_ref())),
+                    Some(Ok(chunk)) => {
+                        chunk_count += 1;
+                        pending_sse.extend(sse.push(chunk.as_ref()));
+                    }
                     Some(Err(error)) => {
+                        stream_span.record("terminal_state", "error");
+                        stream_span.record("chunk_count", chunk_count);
+                        stream_span.record("event_count", event_count);
+                        stream_span.in_scope(|| tracing::warn!(%error, chunk_count, event_count, "provider stream read failed"));
                         return Some((
                             Err(error.into()),
-                            (bytes, sse, pending_sse, pending_events, parse_event, true),
+                            (
+                                bytes,
+                                sse,
+                                pending_sse,
+                                pending_events,
+                                parse_event,
+                                true,
+                                stream_span,
+                                chunk_count,
+                                event_count,
+                            ),
                         ));
                     }
-                    None => return None,
+                    None => {
+                        stream_span.record("terminal_state", "eof");
+                        stream_span.record("chunk_count", chunk_count);
+                        stream_span.record("event_count", event_count);
+                        stream_span.in_scope(|| {
+                            tracing::info!(chunk_count, event_count, "provider stream ended")
+                        });
+                        return None;
+                    }
                 }
             }
         },

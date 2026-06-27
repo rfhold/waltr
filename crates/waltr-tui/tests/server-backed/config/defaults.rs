@@ -67,9 +67,9 @@ async fn setup_runtime_defaults_server() -> &'static TestServer {
             providers: HashMap::from([(
                 "anthropic".to_owned(),
                 ProviderView {
-                    kind: ProviderKindView::Anthropic,
+                    kind: ProviderKindView::AnthropicMessages,
                     name: "anthropic".to_owned(),
-                    url: "https://api.anthropic.com".to_owned(),
+                    url: "https://api.anthropic.com/v1/messages".to_owned(),
                     headers: Default::default(),
                     oauth_compatible: false,
                     oauth_settings: None,

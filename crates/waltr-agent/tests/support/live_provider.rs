@@ -84,7 +84,7 @@ pub fn anthropic_messages_provider(max_tokens: u32) -> waltr_agent::Result<Anthr
     .with_header("x-api-key", api_key("ANTHROPIC_API_KEY")?)
     .with_max_tokens(max_tokens);
     if use_gateway() {
-        provider = provider.with_base_url(GATEWAY_BASE_URL);
+        provider = provider.with_url(format!("{GATEWAY_BASE_URL}/v1/messages"));
     }
     Ok(provider)
 }
@@ -104,7 +104,7 @@ pub fn openai_chat_completions_provider() -> waltr_agent::Result<OpenAiChatCompl
         format!("Bearer {}", api_key("OPENAI_API_KEY")?),
     );
     if use_gateway() {
-        provider = provider.with_base_url(GATEWAY_BASE_URL);
+        provider = provider.with_url(format!("{GATEWAY_BASE_URL}/v1/chat/completions"));
     }
     Ok(provider)
 }
@@ -124,7 +124,7 @@ pub fn openai_responses_provider() -> waltr_agent::Result<OpenAiResponses> {
         format!("Bearer {}", api_key("OPENAI_API_KEY")?),
     );
     if use_gateway() {
-        provider = provider.with_base_url(GATEWAY_BASE_URL);
+        provider = provider.with_url(format!("{GATEWAY_BASE_URL}/v1/responses"));
     }
     Ok(provider)
 }
@@ -144,7 +144,7 @@ pub fn openai_responses_websocket_provider() -> waltr_agent::Result<OpenAiRespon
         format!("Bearer {}", api_key("OPENAI_API_KEY")?),
     );
     if use_gateway() {
-        provider = provider.with_base_url(GATEWAY_BASE_URL);
+        provider = provider.with_url("wss://agent-gateway.holdenitdown.net/v1/responses");
     }
     Ok(provider)
 }

@@ -63,7 +63,7 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
-    for character in "https://api.openai.com".chars() {
+    for character in "https://api.openai.com/v1/chat/completions".chars() {
         assert_eq!(
             app.handle_event(&char_press(character), now),
             AppAction::Continue
@@ -78,8 +78,8 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
         .as_ref()
         .and_then(|config| config.providers.get("aaa-openai"))
         .expect("created provider should be persisted");
-    assert_eq!(provider.kind, ProviderKindView::OpenAi);
-    assert_eq!(provider.url, "https://api.openai.com");
+    assert_eq!(provider.kind, ProviderKindView::OpenAiChatCompletions);
+    assert_eq!(provider.url, "https://api.openai.com/v1/chat/completions");
 
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
@@ -93,7 +93,7 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
         .as_ref()
         .and_then(|config| config.providers.get("aaa-openai"))
         .expect("edited provider should remain persisted");
-    assert_eq!(provider.kind, ProviderKindView::OpenAiCodex);
+    assert_eq!(provider.kind, ProviderKindView::OpenAiResponses);
 
     assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
     let action = app.handle_event(&enter_press(), now);

@@ -1,4 +1,5 @@
 use futures_util::{Stream, StreamExt, stream as futures_stream};
+use tracing::Instrument as _;
 
 use crate::{BoxCompletionStream, CompletionEvent, CompletionRequest, LlmError, Result};
 
@@ -26,12 +27,22 @@ pub(super) async fn send_request(
             &request,
         ));
     for (name, value) in &provider.headers {
-        request_builder = request_builder.header(*name, value);
+        request_builder = request_builder.header(name.as_str(), value);
     }
-    let response = request_builder.send().await?;
+    let span = tracing::info_span!(
+        "http.client.request",
+        http_request_method = "POST",
+        server_address = %provider.messages_url,
+        provider = PROVIDER,
+        model = %provider.model,
+        http_response_status_code = tracing::field::Empty,
+    );
+    let response = request_builder.send().instrument(span.clone()).await?;
 
     let status = response.status();
+    span.record("http_response_status_code", status.as_u16());
     if !status.is_success() {
+        tracing::warn!(status = status.as_u16(), "provider http request failed");
         let text = response
             .text()
             .await
@@ -41,6 +52,15 @@ pub(super) async fn send_request(
             message: format!("{status}: {text}"),
         });
     }
+    span.in_scope(|| tracing::debug!(status = status.as_u16(), "provider http stream opened"));
+    let stream_span = tracing::info_span!(
+        "provider.stream_body",
+        provider = PROVIDER,
+        model = %provider.model,
+        terminal_state = tracing::field::Empty,
+        chunk_count = tracing::field::Empty,
+        event_count = tracing::field::Empty,
+    );
 
     Ok(completion_stream(
         response.bytes_stream(),
@@ -49,10 +69,15 @@ pub(super) async fn send_request(
             &provider.messages_url,
             &provider.model,
         ),
+        stream_span,
     ))
 }
 
-fn completion_stream<S, B>(bytes_stream: S, parser: AnthropicParser) -> BoxCompletionStream
+fn completion_stream<S, B>(
+    bytes_stream: S,
+    parser: AnthropicParser,
+    stream_span: tracing::Span,
+) -> BoxCompletionStream
 where
     S: Stream<Item = std::result::Result<B, reqwest::Error>> + Send + 'static,
     B: AsRef<[u8]> + Send + 'static,
@@ -61,8 +86,24 @@ where
     // the whole turn from the journaled request record.
     let bytes_stream = Box::pin(bytes_stream);
     Box::pin(futures_stream::unfold(
-        (bytes_stream, Vec::new(), parser, false),
-        |(mut bytes_stream, mut buffer, mut parser, done)| async move {
+        (
+            bytes_stream,
+            Vec::new(),
+            parser,
+            false,
+            stream_span,
+            0_u64,
+            0_u64,
+        ),
+        |(
+            mut bytes_stream,
+            mut buffer,
+            mut parser,
+            done,
+            stream_span,
+            mut chunk_count,
+            mut event_count,
+        )| async move {
             if done {
                 return None;
             }
@@ -72,22 +113,71 @@ where
                     match result {
                         Ok(Some(event)) => {
                             let done = matches!(event, CompletionEvent::Finished);
-                            return Some((Ok(event), (bytes_stream, buffer, parser, done)));
+                            event_count += 1;
+                            if done {
+                                record_stream_end(
+                                    &stream_span,
+                                    "finished",
+                                    chunk_count,
+                                    event_count,
+                                );
+                            }
+                            return Some((
+                                Ok(event),
+                                (
+                                    bytes_stream,
+                                    buffer,
+                                    parser,
+                                    done,
+                                    stream_span,
+                                    chunk_count,
+                                    event_count,
+                                ),
+                            ));
                         }
                         Ok(None) => continue,
                         Err(error) => {
-                            return Some((Err(error), (bytes_stream, buffer, parser, true)));
+                            record_stream_error(&stream_span, &error, chunk_count, event_count);
+                            return Some((
+                                Err(error),
+                                (
+                                    bytes_stream,
+                                    buffer,
+                                    parser,
+                                    true,
+                                    stream_span,
+                                    chunk_count,
+                                    event_count,
+                                ),
+                            ));
                         }
                     }
                 }
 
                 match bytes_stream.next().await {
-                    Some(Ok(bytes)) => buffer.extend_from_slice(bytes.as_ref()),
+                    Some(Ok(bytes)) => {
+                        chunk_count += 1;
+                        buffer.extend_from_slice(bytes.as_ref());
+                    }
                     Some(Err(error)) => {
-                        return Some((Err(error.into()), (bytes_stream, buffer, parser, true)));
+                        let error = error.into();
+                        record_stream_error(&stream_span, &error, chunk_count, event_count);
+                        return Some((
+                            Err(error),
+                            (
+                                bytes_stream,
+                                buffer,
+                                parser,
+                                true,
+                                stream_span,
+                                chunk_count,
+                                event_count,
+                            ),
+                        ));
                     }
                     None => {
                         if buffer.is_empty() {
+                            record_stream_end(&stream_span, "eof", chunk_count, event_count);
                             return None;
                         }
 
@@ -95,11 +185,46 @@ where
                         match result {
                             Ok(Some(event)) => {
                                 let done = matches!(event, CompletionEvent::Finished);
-                                return Some((Ok(event), (bytes_stream, buffer, parser, done)));
+                                event_count += 1;
+                                if done {
+                                    record_stream_end(
+                                        &stream_span,
+                                        "finished",
+                                        chunk_count,
+                                        event_count,
+                                    );
+                                }
+                                return Some((
+                                    Ok(event),
+                                    (
+                                        bytes_stream,
+                                        buffer,
+                                        parser,
+                                        done,
+                                        stream_span,
+                                        chunk_count,
+                                        event_count,
+                                    ),
+                                ));
                             }
-                            Ok(None) => return None,
+                            Ok(None) => {
+                                record_stream_end(&stream_span, "eof", chunk_count, event_count);
+                                return None;
+                            }
                             Err(error) => {
-                                return Some((Err(error), (bytes_stream, buffer, parser, true)));
+                                record_stream_error(&stream_span, &error, chunk_count, event_count);
+                                return Some((
+                                    Err(error),
+                                    (
+                                        bytes_stream,
+                                        buffer,
+                                        parser,
+                                        true,
+                                        stream_span,
+                                        chunk_count,
+                                        event_count,
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -107,6 +232,38 @@ where
             }
         },
     ))
+}
+
+fn record_stream_end(
+    stream_span: &tracing::Span,
+    terminal_state: &'static str,
+    chunk_count: u64,
+    event_count: u64,
+) {
+    stream_span.record("terminal_state", terminal_state);
+    stream_span.record("chunk_count", chunk_count);
+    stream_span.record("event_count", event_count);
+    stream_span.in_scope(|| {
+        tracing::info!(
+            chunk_count,
+            event_count,
+            terminal_state,
+            "provider stream ended"
+        )
+    });
+}
+
+fn record_stream_error(
+    stream_span: &tracing::Span,
+    error: &LlmError,
+    chunk_count: u64,
+    event_count: u64,
+) {
+    stream_span.record("terminal_state", "error");
+    stream_span.record("chunk_count", chunk_count);
+    stream_span.record("event_count", event_count);
+    stream_span
+        .in_scope(|| tracing::warn!(%error, chunk_count, event_count, "provider stream failed"));
 }
 
 fn next_event(

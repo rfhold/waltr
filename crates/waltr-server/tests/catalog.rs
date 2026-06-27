@@ -457,7 +457,7 @@ async fn patch_provider(
 
 fn openai_provider(model: Model) -> Provider {
     Provider {
-        r#type: ProviderType::Openai as i32,
+        r#type: ProviderType::OpenaiChatCompletions as i32,
         name: "openai".to_owned(),
         url: "https://api.openai.com/v1".to_owned(),
         models: HashMap::from([("gpt-5-nano".to_owned(), model)]),
@@ -467,7 +467,7 @@ fn openai_provider(model: Model) -> Provider {
 
 fn gateway_provider(model: Model) -> Provider {
     Provider {
-        r#type: ProviderType::Openai as i32,
+        r#type: ProviderType::OpenaiChatCompletions as i32,
         name: "gateway".to_owned(),
         url: "https://gateway.example/v1".to_owned(),
         models: HashMap::from([("openai/gpt-5-nano".to_owned(), model)]),

@@ -346,8 +346,8 @@ describe("provider models sub-editor", () => {
     });
 
     fireEvent.input(screen.getByLabelText("Name"), { target: { value: "openai" } });
-    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "openAi" } });
-    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://api.openai.com" } });
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "openAiChatCompletions" } });
+    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://api.openai.com/v1/chat/completions" } });
     fireEvent.click(screen.getByRole("button", { name: "Add model" }));
     await waitFor(() => expect(testHistory().get()).toBe("/config/provider/create/models/create"));
     fireEvent.input(screen.getByLabelText("Key"), { target: { value: "gpt4o" } });

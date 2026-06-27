@@ -9,7 +9,7 @@ expression: render_app(&app)
 "        │  Providers   MCP Servers   Defaults                           │       "
 "        │───┌ Create provider ─────────────────────────────────────┐────│       "
 "        │> a│* name                                                │    │       "
-"        │   │  type  anthropic                                     │    │       "
+"        │htt│  type  anthropic-messages                            │    │       "
 "        │   │  url                                                 │    │       "
 "        │   │  oauth  no-oauth                                     │    │       "
 "        │   │                                                      │    │       "

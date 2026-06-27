@@ -493,7 +493,7 @@ mod tests {
             providers: std::collections::HashMap::from([(
                 name.to_owned(),
                 Provider {
-                    r#type: ProviderType::Anthropic as i32,
+                    r#type: ProviderType::AnthropicMessages as i32,
                     name: name.to_owned(),
                     ..Provider::default()
                 },

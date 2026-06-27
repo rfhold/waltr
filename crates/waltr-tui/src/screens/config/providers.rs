@@ -79,7 +79,7 @@ impl ProviderForm {
             field: 0,
             original_name: None,
             name: String::new(),
-            kind: ProviderKindView::Anthropic,
+            kind: ProviderKindView::AnthropicMessages,
             url: String::new(),
             oauth_compatible: false,
             oauth_settings: None,
@@ -254,9 +254,10 @@ impl ProviderForm {
 
     const fn toggle_kind(&mut self) {
         self.kind = match self.kind {
-            ProviderKindView::Anthropic => ProviderKindView::OpenAi,
-            ProviderKindView::OpenAi => ProviderKindView::OpenAiCodex,
-            _ => ProviderKindView::Anthropic,
+            ProviderKindView::AnthropicMessages => ProviderKindView::OpenAiChatCompletions,
+            ProviderKindView::OpenAiChatCompletions => ProviderKindView::OpenAiResponses,
+            ProviderKindView::OpenAiResponses => ProviderKindView::OpenAiResponsesWebsocket,
+            _ => ProviderKindView::AnthropicMessages,
         };
     }
 }
@@ -927,9 +928,10 @@ fn form_line(index: usize, active: usize, label: &'static str, value: &str) -> L
 const fn provider_kind_name(kind: ProviderKindView) -> &'static str {
     match kind {
         ProviderKindView::Unspecified => "unspecified",
-        ProviderKindView::Anthropic => "anthropic",
-        ProviderKindView::OpenAi => "openai",
-        ProviderKindView::OpenAiCodex => "openai-codex",
+        ProviderKindView::AnthropicMessages => "anthropic-messages",
+        ProviderKindView::OpenAiChatCompletions => "openai-chat-completions",
+        ProviderKindView::OpenAiResponses => "openai-responses",
+        ProviderKindView::OpenAiResponsesWebsocket => "openai-responses-websocket",
         ProviderKindView::Unknown => "unknown",
     }
 }

@@ -30,6 +30,7 @@ use crate::{
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument as _, Span};
 
 use super::tool::ToolFuture;
 use super::{
@@ -67,6 +68,7 @@ where
     middleware_state: MiddlewareStateLog,
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
     cancellation_token: CancellationToken,
+    turn_span: Option<Span>,
 }
 
 enum AgentLoopPhase {
@@ -137,6 +139,7 @@ where
             middleware_state: MiddlewareStateLog::default(),
             system_prompt_override: run.system_prompt_override,
             cancellation_token: run.cancellation_token,
+            turn_span: None,
         }
     }
 
@@ -158,6 +161,7 @@ where
 
             match std::mem::replace(&mut self.phase, AgentLoopPhase::Done) {
                 AgentLoopPhase::StartTurn => {
+                    self.ensure_turn_span();
                     match self.initialize_session().await {
                         Ok(true) => {}
                         Ok(false) => continue,
@@ -175,6 +179,21 @@ where
                     if let Err(error) = self.persist_provider_request(&draft, projected).await {
                         return Some((Err(error), self));
                     }
+                    let provider_span = {
+                        let _guard = self.turn_span.as_ref().map(Span::enter);
+                        tracing::info_span!(
+                            "agent.provider_request",
+                            session_id = %self.session_id.as_str(),
+                            turn = self.turn as u64,
+                            provider = self.provider.name(),
+                            model_provider = ?self.model.provider,
+                            model_api = ?self.model.api,
+                            model = %self.model.model.as_str(),
+                            tool_count = request.tools.len(),
+                            turn_count = request.turns.len(),
+                        )
+                    };
+                    self.in_turn_span(|| tracing::info!("provider request started"));
                     let stream_result = tokio::select! {
                         biased;
 
@@ -185,16 +204,18 @@ where
                             self.phase = AgentLoopPhase::Done;
                             return None;
                         }
-                        result = self.provider.stream_request(request) => result,
+                        result = self.provider.stream_request(request).instrument(provider_span) => result,
                     };
                     match stream_result {
                         Ok(stream) => {
+                            self.in_turn_span(|| tracing::info!("provider stream opened"));
                             self.phase = AgentLoopPhase::Streaming(StreamingTurn {
                                 stream,
                                 tool_calls: Vec::new(),
                             });
                         }
                         Err(error) => {
+                            self.in_turn_span(|| tracing::warn!(%error, "provider request failed"));
                             self.pending_failed_session_event(&error).await;
                             return Some((Err(error), self));
                         }
@@ -264,6 +285,7 @@ where
                         self.phase = AgentLoopPhase::Streaming(streaming);
                     }
                     Some(Ok(CompletionEvent::ToolCall(call))) => {
+                        self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "tool call requested"));
                         CompletionTurn::entry(&mut self.turns, self.turn as u64)
                             .items
                             .push(TurnItem::ToolCall(call.clone()));
@@ -284,6 +306,12 @@ where
                     }
                     Some(Ok(CompletionEvent::Finished)) | None => {
                         if !streaming.tool_calls.is_empty() {
+                            self.in_turn_span(|| {
+                                tracing::info!(
+                                    tool_count = streaming.tool_calls.len(),
+                                    "provider turn requested tools"
+                                )
+                            });
                             self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
                                 calls: streaming.tool_calls.into(),
                             });
@@ -307,9 +335,11 @@ where
                             Err(error) => return Some((Err(error), self)),
                         };
                         self.pending.push_back(Ok(status));
+                        self.close_turn_span("finished");
                         self.phase = AgentLoopPhase::Done;
                     }
                     Some(Err(error)) => {
+                        self.in_turn_span(|| tracing::warn!(%error, "provider stream failed"));
                         self.pending_failed_session_event(&error).await;
                         return Some((Err(error), self));
                     }
@@ -511,9 +541,11 @@ where
 
         match self.permission_outcome(&call, &claims) {
             Ok(PermissionOutcome::Allow) => {
+                self.in_turn_span(|| tracing::debug!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission allowed"));
                 self.flush_middleware_state().await?;
             }
             Ok(PermissionOutcome::Deny(message)) => {
+                self.in_turn_span(|| tracing::warn!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission denied"));
                 return Ok(ToolExecution::Finished(Some(error_tool_result(
                     &call,
                     &LlmError::Protocol {
@@ -523,6 +555,7 @@ where
                 ))));
             }
             Ok(PermissionOutcome::Ask(claims)) => {
+                self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission requested"));
                 let outcome = HookOutcome::Suspend(permission_suspension(
                     &self.session_id,
                     self.turn as u64,
@@ -557,6 +590,7 @@ where
                 progress,
                 self.cancellation_token.clone(),
             ));
+        let result = self.instrument_tool_future(&call, result);
         Ok(ToolExecution::Running(RunningTool {
             call,
             result,
@@ -570,8 +604,14 @@ where
         result: Result<ToolResult>,
     ) -> Result<bool> {
         let mut result = match result {
-            Ok(result) => result,
-            Err(error) => error_tool_result(&call, &error),
+            Ok(result) => {
+                self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "tool call completed"));
+                result
+            }
+            Err(error) => {
+                self.in_turn_span(|| tracing::warn!(tool_name = %call.name, tool_call_id = %call.id, %error, "tool call failed"));
+                error_tool_result(&call, &error)
+            }
         };
 
         let after_outcome = {
@@ -625,6 +665,7 @@ where
             turn: self.turn as u64,
         })
         .await?;
+        self.close_turn_span("tools_finished");
         self.turn += 1;
         self.phase = AgentLoopPhase::StartTurn;
         Ok(())
@@ -643,6 +684,7 @@ where
             ))),
             HookOutcome::ReplaceToolResult(result) => Ok(Some(result)),
             HookOutcome::Suspend(mut suspension) => {
+                self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "agent turn suspended"));
                 let mut ctx = RunContext {
                     middleware_state: &mut self.middleware_state,
                 };
@@ -671,6 +713,7 @@ where
                     self.pending.push_back(Ok(event));
                 }
                 self.phase = AgentLoopPhase::Done;
+                self.close_turn_span("suspended");
                 Ok(None)
             }
         }
@@ -904,6 +947,7 @@ where
         }
         let record = self.session_runtime().interrupt(&self.session_id).await?;
         self.hydrate_from_record(&record);
+        self.close_turn_span("interrupted");
         Ok(())
     }
 
@@ -1004,6 +1048,54 @@ where
                 .await,
             );
         }
+        self.close_turn_span("error");
+    }
+
+    fn ensure_turn_span(&mut self) {
+        if self.turn_span.is_some() {
+            return;
+        }
+        let span = tracing::info_span!(
+            "agent.turn",
+            session_id = %self.session_id.as_str(),
+            turn = self.turn as u64,
+            provider = self.provider.name(),
+            model_provider = ?self.model.provider,
+            model_api = ?self.model.api,
+            model = %self.model.model.as_str(),
+            terminal_state = tracing::field::Empty,
+        );
+        span.in_scope(|| tracing::info!("agent turn started"));
+        self.turn_span = Some(span);
+    }
+
+    fn in_turn_span(&self, event: impl FnOnce()) {
+        if let Some(span) = &self.turn_span {
+            span.in_scope(event);
+        } else {
+            event();
+        }
+    }
+
+    fn close_turn_span(&mut self, terminal_state: &'static str) {
+        if let Some(span) = self.turn_span.take() {
+            span.record("terminal_state", terminal_state);
+            span.in_scope(|| tracing::info!(terminal_state, "agent turn completed"));
+        }
+    }
+
+    fn instrument_tool_future(&self, call: &ToolCall, result: ToolFuture) -> ToolFuture {
+        let span = {
+            let _guard = self.turn_span.as_ref().map(Span::enter);
+            tracing::info_span!(
+                "agent.tool_call",
+                session_id = %self.session_id.as_str(),
+                turn = self.turn as u64,
+                tool_name = %call.name,
+                tool_call_id = %call.id,
+            )
+        };
+        Box::pin(result.instrument(span))
     }
 
     async fn persist_provider_request(

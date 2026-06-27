@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
 use crate::Result;
 
@@ -51,6 +52,14 @@ impl StreamableHttpTransport {
                 .header("mcp-session-id", session_id)
                 .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
         }
+        let span = tracing::info_span!(
+            "http.client.request",
+            http_request_method = "POST",
+            server_address = %self.endpoint,
+            client = "mcp",
+            mcp_session = session_id.is_some(),
+            http_response_status_code = tracing::field::Empty,
+        );
         let response = tokio::select! {
             biased;
 
@@ -60,18 +69,22 @@ impl StreamableHttpTransport {
             () = time::sleep(timeout) => {
                 return Err(protocol_error("MCP request timed out"));
             }
-            response = builder.send() => response?,
+            response = builder.send().instrument(span.clone()) => response?,
         };
-        if response.status() == reqwest::StatusCode::NOT_FOUND && session_id.is_some() {
+        let status = response.status();
+        span.record("http_response_status_code", status.as_u16());
+        if status == reqwest::StatusCode::NOT_FOUND && session_id.is_some() {
             *self.session_id.lock().await = None;
             return Err(protocol_error("MCP HTTP session expired"));
         }
-        if !response.status().is_success() {
+        if !status.is_success() {
+            span.in_scope(|| tracing::warn!(status = status.as_u16(), "mcp http request failed"));
             return Err(protocol_error(format!(
                 "MCP HTTP request failed with status {}",
-                response.status()
+                status
             )));
         }
+        span.in_scope(|| tracing::debug!(status = status.as_u16(), "mcp http response received"));
         if let Some(session_id) = response
             .headers()
             .get("mcp-session-id")
