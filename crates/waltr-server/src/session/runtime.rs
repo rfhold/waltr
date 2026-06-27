@@ -1,12 +1,16 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
+use crate::auth::{FileCredentialStore, StoredCredential, oauth};
 use waltr::grpc::waltr::config::v1::{Configuration, McpServerType, ProviderType};
 use waltr_agent::{
     AgentRuntime, AgentRuntimeBuilder, AgentsPromptConfig, FilesystemPromptConfig, ModelApi,
     ModelRef, PermissionEffect, PermissionPolicy, ProviderId, SessionSummary, SkillsConfig,
     filesystem::FilesystemConfig,
     mcp::{McpConfig, McpServerConfig},
-    provider::{AnthropicMessages, OpenAiChatCompletions},
+    provider::{
+        AnthropicMessages, OpenAiChatCompletions, OpenAiReasoningConfig, OpenAiReasoningEffort,
+        OpenAiReasoningSummary, OpenAiResponses,
+    },
     question::QuestionConfig,
 };
 #[cfg(feature = "shell")]
@@ -18,11 +22,15 @@ use super::runtime_config::{StoredSessionRuntimeConfig, runtime_config_from_summ
 #[derive(Debug, Clone)]
 pub(super) struct ServerRuntimeFactory {
     root: PathBuf,
+    credential_store: FileCredentialStore,
 }
 
 impl ServerRuntimeFactory {
-    pub(super) const fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub(super) fn new(root: PathBuf, credential_store: FileCredentialStore) -> Self {
+        Self {
+            root,
+            credential_store,
+        }
     }
 
     pub(super) async fn build(
@@ -41,7 +49,7 @@ impl ServerRuntimeFactory {
         runtime_config: StoredSessionRuntimeConfig,
         config: &Configuration,
     ) -> Result<AgentRuntime, Status> {
-        let builder = provider_builder(&runtime_config, config)?;
+        let builder = provider_builder(&runtime_config, config, &self.credential_store).await?;
 
         let mut builder = builder
             .with_base_system_prompt()
@@ -77,9 +85,10 @@ impl ServerRuntimeFactory {
     }
 }
 
-fn provider_builder(
+async fn provider_builder(
     runtime_config: &StoredSessionRuntimeConfig,
     config: &Configuration,
+    credential_store: &FileCredentialStore,
 ) -> Result<AgentRuntimeBuilder, Status> {
     let provider_config = config
         .providers
@@ -108,14 +117,34 @@ fn provider_builder(
 
     let provider_type =
         ProviderType::try_from(runtime_config.provider.r#type).unwrap_or(ProviderType::Unspecified);
-    let api_key = configured_api_key(&provider_config.headers);
+    let configured_api_key = configured_api_key(&provider_config.headers);
+    let oauth = if configured_api_key.is_empty() {
+        resolve_oauth(
+            &runtime_config.provider.key,
+            oauth::provider_definition(&runtime_config.provider.key, provider_config),
+            credential_store,
+        )
+        .await?
+    } else {
+        None
+    };
     let model_id = runtime_config.provider.model_id.clone();
     let base_url = (!runtime_config.provider.url.trim().is_empty())
         .then_some(runtime_config.provider.url.as_str());
 
     match provider_type {
         ProviderType::Anthropic => {
-            let mut provider = AnthropicMessages::new(api_key, model_id.clone());
+            ensure_no_reasoning_effort(runtime_config, "Anthropic Messages")?;
+            let mut provider = if let Some(oauth) = oauth {
+                anthropic_oauth_provider(oauth, model_id.clone())
+            } else {
+                let provider = AnthropicMessages::new(model_id.clone());
+                if configured_api_key.is_empty() {
+                    provider
+                } else {
+                    provider.with_header("x-api-key", configured_api_key)
+                }
+            };
             if let Some(base_url) = base_url {
                 provider = provider.with_base_url(base_url);
             }
@@ -123,7 +152,15 @@ fn provider_builder(
             Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
         }
         ProviderType::Openai => {
-            let mut provider = OpenAiChatCompletions::new(api_key, model_id.clone());
+            ensure_no_reasoning_effort(runtime_config, "OpenAI Chat Completions")?;
+            let provider = OpenAiChatCompletions::new(model_id.clone());
+            let mut provider = if let Some(oauth) = oauth {
+                provider.with_header("Authorization", format!("Bearer {}", oauth.access))
+            } else if configured_api_key.is_empty() {
+                provider
+            } else {
+                provider.with_header("Authorization", format!("Bearer {configured_api_key}"))
+            };
             if let Some(base_url) = base_url {
                 provider = provider.with_base_url(base_url);
             }
@@ -134,10 +171,131 @@ fn provider_builder(
             );
             Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
         }
+        ProviderType::OpenaiCodex => {
+            let oauth = oauth.ok_or_else(|| {
+                Status::failed_precondition(
+                    "OpenAI Codex provider requires stored OAuth credentials",
+                )
+            })?;
+            let account_id = oauth.metadata.get("account_id").cloned().ok_or_else(|| {
+                Status::failed_precondition("OpenAI Codex OAuth credential is missing account_id")
+            })?;
+            let mut provider = OpenAiResponses::new(model_id.clone())
+                .with_header("Authorization", format!("Bearer {}", oauth.access))
+                .with_header("chatgpt-account-id", account_id)
+                .with_header("originator", "waltr")
+                .with_header("User-Agent", format!("waltr/{}", env!("CARGO_PKG_VERSION")))
+                .with_header("OpenAI-Beta", "responses=experimental")
+                .with_header("accept", "text/event-stream");
+            if let Some(reasoning) = openai_reasoning_config(runtime_config)? {
+                provider = provider.with_reasoning(reasoning);
+            }
+            if let Some(base_url) = base_url {
+                provider = provider.with_url(format!(
+                    "{}/codex/responses",
+                    base_url.trim_end_matches('/')
+                ));
+            } else {
+                provider = provider.with_url("https://chatgpt.com/backend-api/codex/responses");
+            }
+            let model = ModelRef::new(ProviderId::OpenAi, model_id, ModelApi::OpenAiResponses);
+            Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
+        }
         ProviderType::Unspecified => {
             Err(Status::failed_precondition("provider type is unspecified"))
         }
     }
+}
+
+fn anthropic_oauth_provider(oauth: ResolvedOAuth, model_id: String) -> AnthropicMessages {
+    AnthropicMessages::new(model_id)
+        .with_header("Authorization", format!("Bearer {}", oauth.access))
+        .with_header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+        .with_header("user-agent", "claude-cli/2.1.75")
+        .with_header("x-app", "cli")
+}
+
+fn ensure_no_reasoning_effort(
+    runtime_config: &StoredSessionRuntimeConfig,
+    provider_name: &str,
+) -> Result<(), Status> {
+    if runtime_config.provider.reasoning_effort.is_some() {
+        return Err(Status::failed_precondition(format!(
+            "{provider_name} does not support session reasoning effort"
+        )));
+    }
+    Ok(())
+}
+
+fn openai_reasoning_config(
+    runtime_config: &StoredSessionRuntimeConfig,
+) -> Result<Option<OpenAiReasoningConfig>, Status> {
+    let Some(effort) = runtime_config.provider.reasoning_effort.as_deref() else {
+        return Ok(None);
+    };
+
+    let effort = match effort {
+        "none" => OpenAiReasoningEffort::None,
+        "minimal" => OpenAiReasoningEffort::Minimal,
+        "low" => OpenAiReasoningEffort::Low,
+        "medium" => OpenAiReasoningEffort::Medium,
+        "high" => OpenAiReasoningEffort::High,
+        "xhigh" => OpenAiReasoningEffort::XHigh,
+        value => {
+            return Err(Status::failed_precondition(format!(
+                "reasoning effort '{value}' is not supported by OpenAI Responses"
+            )));
+        }
+    };
+
+    Ok(Some(OpenAiReasoningConfig {
+        effort,
+        summary: Some(OpenAiReasoningSummary::Auto),
+    }))
+}
+
+struct ResolvedOAuth {
+    access: String,
+    metadata: BTreeMap<String, String>,
+}
+
+async fn resolve_oauth(
+    provider_key: &str,
+    definition: Option<oauth::ProviderOAuthDefinition>,
+    credential_store: &FileCredentialStore,
+) -> Result<Option<ResolvedOAuth>, Status> {
+    let Some(definition) = definition else {
+        return Ok(None);
+    };
+    let Some(StoredCredential::OAuth(mut credential)) =
+        credential_store.read(provider_key).await.map_err(|error| {
+            Status::internal(format!("failed to read provider credentials: {error}"))
+        })?
+    else {
+        return Ok(None);
+    };
+
+    if credential.expires_at_ms <= now_ms() + 5 * 60 * 1000 {
+        credential = oauth::refresh(&definition.definition, &credential).await?;
+        let stored = credential.clone();
+        credential_store
+            .modify(provider_key, |_| Some(StoredCredential::OAuth(stored)))
+            .await
+            .map_err(|error| {
+                Status::internal(format!("failed to store refreshed credential: {error}"))
+            })?;
+    }
+
+    Ok(Some(ResolvedOAuth {
+        access: credential.access,
+        metadata: credential.metadata,
+    }))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64)
 }
 
 fn configured_api_key(headers: &std::collections::HashMap<String, String>) -> String {

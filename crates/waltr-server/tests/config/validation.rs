@@ -227,10 +227,39 @@ async fn config_service_rejects_unknown_runtime_default_provider()
                 model_key: "model".to_owned(),
                 mcp_default_enabled: None,
                 enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: None,
             }),
         })
         .await
         .expect_err("unknown default provider should be rejected");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_service_rejects_unknown_runtime_default_reasoning_effort()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = setup_server();
+    let mut client = config_client(server).await?;
+    let initial = get_config(&mut client).await?;
+
+    let error = client
+        .patch_config(PatchConfigRequest {
+            expected_etag: initial.etag,
+            providers: None,
+            mcp_servers: None,
+            runtime_defaults: Some(RuntimeDefaults {
+                provider_key: "anthropic".to_owned(),
+                model_key: "claude-haiku-4-5".to_owned(),
+                mcp_default_enabled: None,
+                enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: Some("high".to_owned()),
+            }),
+        })
+        .await
+        .expect_err("unknown default reasoning effort should be rejected");
 
     assert_eq!(error.code(), Code::InvalidArgument);
 

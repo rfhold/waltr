@@ -29,6 +29,7 @@ pub(super) struct StoredSessionProviderRuntime {
     pub r#type: i32,
     pub url: String,
     pub model_id: String,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +112,32 @@ pub(super) fn resolve_runtime_config(
             request.provider_key
         ))
     })?;
+    let model = provider.models.get(&request.model_id).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "model '{}' does not exist in provider '{}'",
+            request.model_id, request.provider_key
+        ))
+    })?;
+
+    let reasoning_effort = request
+        .reasoning_effort
+        .map(|effort| effort.trim().to_owned())
+        .filter(|effort| !effort.is_empty());
+    if let Some(effort) = &reasoning_effort {
+        let supported = model.options.as_ref().is_some_and(|options| {
+            options
+                .reasoning_efforts
+                .iter()
+                .any(|value| value == effort)
+        });
+        if !supported {
+            return Err(Status::invalid_argument(format!(
+                "reasoning effort '{effort}' is not configured for model '{}' in provider '{}'",
+                request.model_id, request.provider_key
+            )));
+        }
+    }
+
     if !provider.models.contains_key(&request.model_id) {
         return Err(Status::invalid_argument(format!(
             "model '{}' does not exist in provider '{}'",
@@ -137,6 +164,7 @@ pub(super) fn resolve_runtime_config(
             r#type: provider.r#type,
             url: provider.url.clone(),
             model_id: request.model_id,
+            reasoning_effort,
         },
         mcp_servers,
     })
@@ -169,6 +197,7 @@ fn runtime_config_from_defaults(
             provider_key: defaults.provider_key.clone(),
             model_id: defaults.model_key.clone(),
             enabled_mcp_server_keys,
+            reasoning_effort: defaults.reasoning_effort.clone(),
         },
         config,
     )
@@ -199,6 +228,7 @@ fn provider_to_proto(
         r#type: provider_type(provider.r#type) as i32,
         url: provider.url,
         model_id: provider.model_id,
+        reasoning_effort: provider.reasoning_effort,
         r#match: r#match as i32,
     }
 }

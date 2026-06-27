@@ -1,6 +1,8 @@
 //! Filesystem-driven configuration watch publisher.
 
-use crate::config::{ConfigError, ConfigPubSub, ConfigStore, ConfigWatchEvent};
+use crate::config::{
+    ConfigError, ConfigPubSub, ConfigStore, ConfigWatchEvent, default_configuration,
+};
 use waltr::grpc::waltr::config::v1::Configuration;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
@@ -97,7 +99,9 @@ pub fn spawn_config_watcher(
 
             match store.load().await {
                 Ok(config) => {
-                    let previous = last_config.replace(config.clone()).unwrap_or_default();
+                    let previous = last_config
+                        .replace(config.clone())
+                        .unwrap_or_else(default_configuration);
                     publish_change_if_needed(&pubsub, &previous, &config);
                 }
                 Err(error) => {
@@ -469,6 +473,7 @@ mod tests {
                 model_key: "sonnet".to_owned(),
                 mcp_default_enabled: None,
                 enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: None,
             }),
             ..Configuration::default()
         };

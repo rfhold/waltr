@@ -1,9 +1,16 @@
 //! HTTP and gRPC router construction.
 
 use crate::{
-    config::ConfigHandle, config_service::ConfigService, session, status_service::StatusService,
+    auth::{AuthService, FileCredentialStore},
+    catalog::{CatalogLoader, CatalogService},
+    config::ConfigHandle,
+    config_service::ConfigService,
+    session,
+    status_service::StatusService,
 };
 use axum::{Json, Router, routing::get};
+use waltr::grpc::waltr::auth::v1::auth_service_server::AuthServiceServer;
+use waltr::grpc::waltr::catalog::v1::catalog_service_server::CatalogServiceServer;
 use waltr::grpc::waltr::config::v1::config_service_server::ConfigServiceServer;
 use waltr::grpc::waltr::status::v1::status_service_server::StatusServiceServer;
 use serde::Serialize;
@@ -36,8 +43,9 @@ pub fn build_app() -> Router {
 ///
 /// Panics when session storage environment configuration is invalid.
 pub fn build_app_with_config_service(config_service: std::sync::Arc<ConfigService>) -> Router {
-    build_app_with_services(config_service, |grpc_routes, config| {
-        session::add_service_from_env(grpc_routes, config).expect("session service should start");
+    build_app_with_services(config_service, |grpc_routes, config, credential_store| {
+        session::add_service_from_env(grpc_routes, config, credential_store)
+            .expect("session service should start");
     })
 }
 
@@ -47,16 +55,37 @@ pub fn build_app_with_services<F>(
     add_session_service: F,
 ) -> Router
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+{
+    build_app_with_catalog_loader(
+        config_service,
+        CatalogLoader::from_env(),
+        add_session_service,
+    )
+}
+
+/// Build the Axum application using explicit services and catalog loader.
+pub fn build_app_with_catalog_loader<F>(
+    config_service: std::sync::Arc<ConfigService>,
+    catalog_loader: CatalogLoader,
+    add_session_service: F,
+) -> Router
+where
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
     tracing::debug!("building app router");
     let config = ConfigHandle::watching(
         config_service.store().clone(),
         config_service.pubsub().clone(),
     );
+    let credential_store = FileCredentialStore::from_env();
+    let auth_service = AuthService::new(config_service.store().clone(), credential_store.clone());
+    let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
     let mut grpc_routes = Routes::builder();
     grpc_routes.add_service(ConfigServiceServer::from_arc(config_service));
-    add_session_service(&mut grpc_routes, config);
+    grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
+    grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
+    add_session_service(&mut grpc_routes, config, credential_store);
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
     let grpc_routes = grpc_routes.routes();
     let grpc = ServiceBuilder::new()

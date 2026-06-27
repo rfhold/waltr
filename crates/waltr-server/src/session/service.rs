@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf, pin::Pin, sync::Arc};
 
-use crate::config::ConfigHandle;
+use crate::{auth::FileCredentialStore, config::ConfigHandle};
 
 use super::{
     convert::session_summary_to_proto,
@@ -58,10 +58,11 @@ where
     /// Create a session service from an existing session coordinator.
     #[must_use]
     pub fn from_sessions(sessions: AgentSessions<S>) -> Arc<Self> {
+        let credential_store = FileCredentialStore::from_env();
         Arc::new(Self {
             sessions,
             config: ConfigHandle::default(),
-            runtime_factory: ServerRuntimeFactory::new(default_root()),
+            runtime_factory: ServerRuntimeFactory::new(default_root(), credential_store),
             runs: SessionRunManager::new(),
         })
     }
@@ -73,8 +74,12 @@ where
 {
     /// Create a session service from a store and config handle.
     #[must_use]
-    pub fn new_with_config(store: S, config: ConfigHandle) -> Arc<Self> {
-        Self::from_sessions_with_config(AgentSessions::new(store), config)
+    pub fn new_with_config(
+        store: S,
+        config: ConfigHandle,
+        credential_store: FileCredentialStore,
+    ) -> Arc<Self> {
+        Self::from_sessions_with_config(AgentSessions::new(store), config, credential_store)
     }
 
     /// Create a session service from an existing session coordinator and config handle.
@@ -82,11 +87,12 @@ where
     pub fn from_sessions_with_config(
         sessions: AgentSessions<S>,
         config: ConfigHandle,
+        credential_store: FileCredentialStore,
     ) -> Arc<Self> {
         Arc::new(Self {
             sessions,
             config,
-            runtime_factory: ServerRuntimeFactory::new(default_root()),
+            runtime_factory: ServerRuntimeFactory::new(default_root(), credential_store.clone()),
             runs: SessionRunManager::new(),
         })
     }
