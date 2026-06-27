@@ -19,8 +19,8 @@ describe("provider config", () => {
     await waitFor(() => expect(testHistory().get()).toBe("/config/provider/create"));
     expect(screen.getByRole("dialog", { name: "Create provider dialog" })).toBeTruthy();
     fireEvent.input(screen.getByLabelText("Name"), { target: { value: "openai" } });
-    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "openAi" } });
-    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://api.openai.com" } });
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "openAiChatCompletions" } });
+    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://api.openai.com/v1/chat/completions" } });
     fireEvent.submit(screen.getByLabelText("Create provider"));
 
     await waitFor(() => expect(screen.getByText("openai")).toBeTruthy());
@@ -56,8 +56,8 @@ describe("provider config", () => {
     fireEvent.click(screen.getByText("Create"));
     await waitFor(() => expect(testHistory().get()).toBe("/config/provider/create"));
     fireEvent.input(screen.getByLabelText("Name"), { target: { value: "openai" } });
-    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "openAi" } });
-    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://api.openai.com" } });
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "openAiChatCompletions" } });
+    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://api.openai.com/v1/chat/completions" } });
     fireEvent.submit(screen.getByLabelText("Create provider"));
 
     expect(screen.getByRole("button", { name: "Save" }).hasAttribute("disabled")).toBe(true);

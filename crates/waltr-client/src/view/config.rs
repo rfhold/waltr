@@ -144,12 +144,14 @@ pub enum OAuthTokenFieldView {
 pub enum ProviderKindView {
     /// Provider kind was omitted or intentionally unspecified.
     Unspecified,
-    /// Anthropic-compatible provider.
-    Anthropic,
-    /// OpenAI-compatible provider.
-    OpenAi,
-    /// OpenAI Codex provider backed by ChatGPT subscription auth.
-    OpenAiCodex,
+    /// Anthropic Messages API provider.
+    AnthropicMessages,
+    /// OpenAI Chat Completions API provider.
+    OpenAiChatCompletions,
+    /// OpenAI Responses API provider over HTTP.
+    OpenAiResponses,
+    /// OpenAI Responses API provider over WebSocket.
+    OpenAiResponsesWebsocket,
     /// Provider kind is unknown to this client version.
     Unknown,
 }
@@ -494,9 +496,10 @@ impl From<i32> for ProviderKindView {
     fn from(value: i32) -> Self {
         match ProviderType::try_from(value) {
             Ok(ProviderType::Unspecified) => Self::Unspecified,
-            Ok(ProviderType::Anthropic) => Self::Anthropic,
-            Ok(ProviderType::Openai) => Self::OpenAi,
-            Ok(ProviderType::OpenaiCodex) => Self::OpenAiCodex,
+            Ok(ProviderType::AnthropicMessages) => Self::AnthropicMessages,
+            Ok(ProviderType::OpenaiChatCompletions) => Self::OpenAiChatCompletions,
+            Ok(ProviderType::OpenaiResponses) => Self::OpenAiResponses,
+            Ok(ProviderType::OpenaiResponsesWebsocket) => Self::OpenAiResponsesWebsocket,
             Err(_) => Self::Unknown,
         }
     }
@@ -506,9 +509,10 @@ impl From<ProviderKindView> for ProviderType {
     fn from(kind: ProviderKindView) -> Self {
         match kind {
             ProviderKindView::Unspecified | ProviderKindView::Unknown => Self::Unspecified,
-            ProviderKindView::Anthropic => Self::Anthropic,
-            ProviderKindView::OpenAi => Self::Openai,
-            ProviderKindView::OpenAiCodex => Self::OpenaiCodex,
+            ProviderKindView::AnthropicMessages => Self::AnthropicMessages,
+            ProviderKindView::OpenAiChatCompletions => Self::OpenaiChatCompletions,
+            ProviderKindView::OpenAiResponses => Self::OpenaiResponses,
+            ProviderKindView::OpenAiResponsesWebsocket => Self::OpenaiResponsesWebsocket,
         }
     }
 }

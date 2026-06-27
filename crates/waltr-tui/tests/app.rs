@@ -1224,7 +1224,7 @@ fn config_right_opens_edit_form_and_updates_provider() {
         panic!("expected update provider command");
     };
     assert_eq!(original_name, "anthropic");
-    assert_eq!(provider.kind, ProviderKindView::OpenAi);
+    assert_eq!(provider.kind, ProviderKindView::OpenAiChatCompletions);
 }
 
 #[test]
@@ -1898,9 +1898,9 @@ fn loaded_config_snapshot() -> ClientSnapshot {
         providers: BTreeMap::from([(
             "anthropic".to_owned(),
             ProviderView {
-                kind: ProviderKindView::Anthropic,
+                kind: ProviderKindView::AnthropicMessages,
                 name: "anthropic".to_owned(),
-                url: "https://api.anthropic.com".to_owned(),
+                url: "https://api.anthropic.com/v1/messages".to_owned(),
                 headers: BTreeMap::new(),
                 oauth_compatible: false,
                 oauth_settings: None,

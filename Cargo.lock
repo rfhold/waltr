@@ -2862,6 +2862,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tokio-util",
+ "tracing",
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",

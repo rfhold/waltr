@@ -146,7 +146,7 @@ async fn create_session_manual_runtime_config_wins_over_defaults()
 
     let provider = runtime.provider.expect("provider should be set");
     assert_eq!(provider.key, "openai");
-    assert_eq!(provider.r#type, ProviderType::Openai as i32);
+    assert_eq!(provider.r#type, ProviderType::OpenaiChatCompletions as i32);
     assert_eq!(provider.url, "https://openai.example.test");
     assert_eq!(provider.model_id, "gpt");
     assert_eq!(provider.reasoning_effort.as_deref(), Some("medium"));
@@ -322,11 +322,11 @@ fn config_with_defaults() -> Configuration {
         providers: HashMap::from([
             (
                 "anthropic".to_owned(),
-                provider("anthropic", ProviderType::Anthropic, "sonnet"),
+                provider("anthropic", ProviderType::AnthropicMessages, "sonnet"),
             ),
             (
                 "openai".to_owned(),
-                provider("openai", ProviderType::Openai, "gpt"),
+                provider("openai", ProviderType::OpenaiChatCompletions, "gpt"),
             ),
         ]),
         mcp_servers: HashMap::from([(
@@ -377,7 +377,7 @@ fn provider(name: &str, provider_type: ProviderType, model_key: &str) -> Provide
 fn assert_anthropic_runtime(runtime: SessionRuntimeConfig) {
     let provider = runtime.provider.expect("provider should be set");
     assert_eq!(provider.key, "anthropic");
-    assert_eq!(provider.r#type, ProviderType::Anthropic as i32);
+    assert_eq!(provider.r#type, ProviderType::AnthropicMessages as i32);
     assert_eq!(provider.url, "https://anthropic.example.test");
     assert_eq!(provider.model_id, "sonnet");
     assert_eq!(provider.r#match, RuntimeConfigMatch::Configured as i32);

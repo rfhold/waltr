@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+use tracing::Instrument as _;
 
 use crate::LlmError;
 use crate::provider::openai::reasoning::{OpenAiReasoningConfig, openai_reasoning};
@@ -20,7 +21,7 @@ use super::request::{responses_input, responses_tools};
 /// `OpenAI` Responses websocket streaming provider.
 #[derive(Debug, Clone)]
 pub struct OpenAiResponsesWebSocket {
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     model: String,
     responses_url: String,
     reasoning: Option<OpenAiReasoningConfig>,
@@ -37,21 +38,17 @@ impl OpenAiResponsesWebSocket {
         }
     }
 
-    /// Set the API base URL used by this provider.
+    /// Set the exact Responses WebSocket endpoint URL used by this provider.
     #[must_use]
-    pub fn with_base_url(mut self, base_url: impl AsRef<str>) -> Self {
-        let base_url = base_url.as_ref().trim_end_matches('/');
-        let websocket_base_url = base_url
-            .strip_prefix("https://")
-            .map_or_else(|| base_url.to_owned(), |rest| format!("wss://{rest}"));
-        self.responses_url = format!("{websocket_base_url}/v1/responses");
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.responses_url = url.into();
         self
     }
 
-    /// Add a static request header to this provider.
+    /// Add a request header to this provider.
     #[must_use]
-    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.headers.push((name, value.into()));
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 
@@ -140,49 +137,168 @@ impl LlmStream for OpenAiResponsesWebSocket {
                     provider: RESPONSES_WEBSOCKET_NAME,
                     message: format!("invalid {name} header: {error}"),
                 })?;
-                websocket_request.headers_mut().insert(*name, value);
+                let name =
+                    http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                        LlmError::Protocol {
+                            provider: RESPONSES_WEBSOCKET_NAME,
+                            message: format!("invalid header name {name}: {error}"),
+                        }
+                    })?;
+                websocket_request.headers_mut().insert(name, value);
             }
+            let connect_span = tracing::info_span!(
+                "websocket.client.connect",
+                server_address = %self.responses_url,
+                provider = RESPONSES_WEBSOCKET_NAME,
+                model = %self.model,
+                terminal_state = tracing::field::Empty,
+            );
             let (mut websocket, _) = connect_async_tls_with_config(
                 websocket_request,
                 None,
                 false,
                 Some(tls_connector()?),
             )
+            .instrument(connect_span.clone())
             .await?;
+            connect_span.record("terminal_state", "connected");
+            connect_span.in_scope(|| tracing::debug!("provider websocket connected"));
+
             let create = response_create_payload(&self.model, self.reasoning.as_ref(), &request);
+            let send_span = tracing::info_span!(
+                "websocket.client.send",
+                provider = RESPONSES_WEBSOCKET_NAME,
+                model = %self.model,
+                message_kind = "response.create",
+                terminal_state = tracing::field::Empty,
+            );
             websocket
                 .send(Message::Text(create.to_string().into()))
+                .instrument(send_span.clone())
                 .await?;
+            send_span.record("terminal_state", "sent");
             let parser =
                 ResponsesParser::new(RESPONSES_WEBSOCKET_NAME, &self.responses_url, &self.model);
+            let stream_span = tracing::info_span!(
+                "provider.stream_body",
+                provider = RESPONSES_WEBSOCKET_NAME,
+                model = %self.model,
+                transport = "websocket",
+                terminal_state = tracing::field::Empty,
+                message_count = tracing::field::Empty,
+                event_count = tracing::field::Empty,
+            );
 
             Ok(Box::pin(stream::unfold(
-                (websocket, parser, Vec::<CompletionEvent>::new(), false),
-                |(mut websocket, mut parser, mut pending, finished)| async move {
+                (
+                    websocket,
+                    parser,
+                    Vec::<CompletionEvent>::new(),
+                    false,
+                    stream_span,
+                    0_u64,
+                    0_u64,
+                ),
+                |(
+                    mut websocket,
+                    mut parser,
+                    mut pending,
+                    finished,
+                    stream_span,
+                    mut message_count,
+                    mut event_count,
+                )| async move {
                     if finished {
                         return None;
                     }
 
                     loop {
                         if let Some(event) = pending.pop() {
+                            event_count += 1;
                             if matches!(event, CompletionEvent::Finished) {
                                 if let Err(error) = websocket.close(None).await {
+                                    record_stream_error(
+                                        &stream_span,
+                                        &error,
+                                        message_count,
+                                        event_count,
+                                    );
                                     return Some((
                                         Err(error.into()),
-                                        (websocket, parser, pending, true),
+                                        (
+                                            websocket,
+                                            parser,
+                                            pending,
+                                            true,
+                                            stream_span,
+                                            message_count,
+                                            event_count,
+                                        ),
                                     ));
                                 }
-                                return Some((Ok(event), (websocket, parser, pending, true)));
+                                record_stream_end(
+                                    &stream_span,
+                                    "finished",
+                                    message_count,
+                                    event_count,
+                                );
+                                return Some((
+                                    Ok(event),
+                                    (
+                                        websocket,
+                                        parser,
+                                        pending,
+                                        true,
+                                        stream_span,
+                                        message_count,
+                                        event_count,
+                                    ),
+                                ));
                             }
-                            return Some((Ok(event), (websocket, parser, pending, false)));
+                            return Some((
+                                Ok(event),
+                                (
+                                    websocket,
+                                    parser,
+                                    pending,
+                                    false,
+                                    stream_span,
+                                    message_count,
+                                    event_count,
+                                ),
+                            ));
                         }
 
-                        let message = match websocket.next().await? {
-                            Ok(message) => message,
+                        let message = match websocket.next().await {
+                            Some(result) => result,
+                            None => {
+                                record_stream_end(&stream_span, "eof", message_count, event_count);
+                                return None;
+                            }
+                        };
+                        let message = match message {
+                            Ok(message) => {
+                                message_count += 1;
+                                message
+                            }
                             Err(error) => {
+                                record_stream_error(
+                                    &stream_span,
+                                    &error,
+                                    message_count,
+                                    event_count,
+                                );
                                 return Some((
                                     Err(error.into()),
-                                    (websocket, parser, pending, true),
+                                    (
+                                        websocket,
+                                        parser,
+                                        pending,
+                                        true,
+                                        stream_span,
+                                        message_count,
+                                        event_count,
+                                    ),
                                 ));
                             }
                         };
@@ -191,15 +307,54 @@ impl LlmStream for OpenAiResponsesWebSocket {
                             Message::Text(text) => match parser.parse_event(text.as_str()) {
                                 Ok(events) => pending.extend(events.into_iter().rev()),
                                 Err(error) => {
-                                    return Some((Err(error), (websocket, parser, pending, true)));
+                                    record_stream_error(
+                                        &stream_span,
+                                        &error,
+                                        message_count,
+                                        event_count,
+                                    );
+                                    return Some((
+                                        Err(error),
+                                        (
+                                            websocket,
+                                            parser,
+                                            pending,
+                                            true,
+                                            stream_span,
+                                            message_count,
+                                            event_count,
+                                        ),
+                                    ));
                                 }
                             },
-                            Message::Close(_) => return None,
+                            Message::Close(_) => {
+                                record_stream_end(
+                                    &stream_span,
+                                    "closed",
+                                    message_count,
+                                    event_count,
+                                );
+                                return None;
+                            }
                             Message::Ping(payload) => {
                                 if let Err(error) = websocket.send(Message::Pong(payload)).await {
+                                    record_stream_error(
+                                        &stream_span,
+                                        &error,
+                                        message_count,
+                                        event_count,
+                                    );
                                     return Some((
                                         Err(error.into()),
-                                        (websocket, parser, pending, true),
+                                        (
+                                            websocket,
+                                            parser,
+                                            pending,
+                                            true,
+                                            stream_span,
+                                            message_count,
+                                            event_count,
+                                        ),
                                     ));
                                 }
                             }
@@ -210,6 +365,39 @@ impl LlmStream for OpenAiResponsesWebSocket {
             )) as BoxCompletionStream)
         })
     }
+}
+
+fn record_stream_end(
+    stream_span: &tracing::Span,
+    terminal_state: &'static str,
+    message_count: u64,
+    event_count: u64,
+) {
+    stream_span.record("terminal_state", terminal_state);
+    stream_span.record("message_count", message_count);
+    stream_span.record("event_count", event_count);
+    stream_span.in_scope(|| {
+        tracing::info!(
+            message_count,
+            event_count,
+            terminal_state,
+            "provider websocket stream ended"
+        )
+    });
+}
+
+fn record_stream_error(
+    stream_span: &tracing::Span,
+    error: &dyn std::fmt::Display,
+    message_count: u64,
+    event_count: u64,
+) {
+    stream_span.record("terminal_state", "error");
+    stream_span.record("message_count", message_count);
+    stream_span.record("event_count", event_count);
+    stream_span.in_scope(
+        || tracing::warn!(%error, message_count, event_count, "provider websocket stream failed"),
+    );
 }
 
 #[cfg(test)]

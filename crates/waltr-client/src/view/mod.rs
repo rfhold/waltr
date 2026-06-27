@@ -37,9 +37,9 @@ mod tests {
             providers: HashMap::from([(
                 "anthropic".to_owned(),
                 Provider {
-                    r#type: ProviderType::Anthropic as i32,
+                    r#type: ProviderType::AnthropicMessages as i32,
                     name: "anthropic".to_owned(),
-                    url: "https://api.anthropic.com".to_owned(),
+                    url: "https://api.anthropic.com/v1/messages".to_owned(),
                     headers: HashMap::from([("x-test".to_owned(), "true".to_owned())]),
                     oauth_compatible: true,
                     oauth_settings: None,
@@ -54,7 +54,7 @@ mod tests {
         let view = ConfigView::from(config.clone());
         assert_eq!(
             view.providers["anthropic"].kind,
-            ProviderKindView::Anthropic
+            ProviderKindView::AnthropicMessages
         );
 
         let round_trip = Configuration::from(view);

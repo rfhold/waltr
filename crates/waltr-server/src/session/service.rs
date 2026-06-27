@@ -32,6 +32,7 @@ use waltr_agent::{AgentSessions, ExternalRequestId, SessionId, SessionListEvent,
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
 /// gRPC session service backed by durable agent session storage.
 #[derive(Debug)]
@@ -112,12 +113,17 @@ where
     type WatchTimelineStream =
         Pin<Box<dyn Stream<Item = Result<WatchTimelineResponse, Status>> + Send>>;
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "create_session", session_id)
+    )]
     async fn create_session(
         &self,
         request: Request<CreateSessionRequest>,
     ) -> Result<Response<CreateSessionResponse>, Status> {
         let request = request.into_inner();
-        tracing::info!("create session requested");
+        tracing::info!("session create accepted");
         let config = self.load_config().await;
         let runtime_config = resolve_runtime_config_for_create(request.runtime_config, &config)?;
         let metadata_values = runtime_config
@@ -130,6 +136,8 @@ where
             .create_with_metadata_values(metadata_values)
             .await
             .map_err(agent_error_to_status)?;
+        tracing::Span::current().record("session_id", session.record.id.as_str());
+        tracing::info!(session_id = %session.record.id.as_str(), "session create completed");
 
         Ok(Response::new(CreateSessionResponse {
             session: Some(session_summary_to_proto(session.record.summary(), &config)),
@@ -154,6 +162,11 @@ where
         Ok(Response::new(ListSessionsResponse { sessions }))
     }
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "delete_session", session_id)
+    )]
     async fn delete_session(
         &self,
         request: Request<DeleteSessionRequest>,
@@ -163,16 +176,23 @@ where
             return Err(Status::invalid_argument("session id must not be empty"));
         }
 
-        tracing::info!(session_id = %id, "delete session requested");
+        tracing::Span::current().record("session_id", id.as_str());
+        tracing::info!("session delete accepted");
         let id = SessionId::new(id);
         self.sessions
             .delete(&id)
             .await
             .map_err(agent_error_to_status)?;
+        tracing::info!("session delete completed");
 
         Ok(Response::new(DeleteSessionResponse {}))
     }
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "update_session_runtime_config", session_id)
+    )]
     async fn update_session_runtime_config(
         &self,
         request: Request<UpdateSessionRuntimeConfigRequest>,
@@ -181,6 +201,8 @@ where
         if request.id.trim().is_empty() {
             return Err(Status::invalid_argument("session id must not be empty"));
         }
+        tracing::Span::current().record("session_id", request.id.as_str());
+        tracing::info!("session runtime config update accepted");
         let runtime_config = request
             .runtime_config
             .ok_or_else(|| Status::invalid_argument("runtime config is required"))?;
@@ -196,6 +218,7 @@ where
             )
             .await
             .map_err(agent_error_to_status)?;
+        tracing::info!("session runtime config update completed");
 
         Ok(Response::new(UpdateSessionRuntimeConfigResponse {
             session: Some(session_summary_to_proto(session.record.summary(), &config)),
@@ -270,12 +293,18 @@ where
         Ok(Response::new(GetTimelineResponse { events }))
     }
 
+    #[tracing::instrument(
+        name = "server.watch",
+        skip(self, request),
+        fields(operation = "watch_timeline", session_id)
+    )]
     async fn watch_timeline(
         &self,
         request: Request<WatchTimelineRequest>,
     ) -> Result<Response<Self::WatchTimelineStream>, Status> {
         let request = request.into_inner();
         let session_id = required_session_id(&request.session_id)?;
+        tracing::Span::current().record("session_id", session_id.as_str());
         self.sessions
             .load(&session_id)
             .await
@@ -293,8 +322,15 @@ where
             let events = self
                 .sessions
                 .timeline(&session_id, initial_query(limit, &channels))
+                .instrument(tracing::info_span!(
+                    "server.watch.timeline_query",
+                    session_id = %session_id.as_str(),
+                    query_kind = "initial",
+                    limit,
+                ))
                 .await
                 .map_err(agent_error_to_status)?;
+            tracing::debug!(session_id = %session_id.as_str(), event_count = events.len(), "watch timeline initial query completed");
             push_history(&mut historical, &highest_cursor, events);
         }
 
@@ -304,8 +340,16 @@ where
                 &session_id,
                 catchup_query(request.after_cursor, 1000, &channels),
             )
+            .instrument(tracing::info_span!(
+                "server.watch.timeline_query",
+                session_id = %session_id.as_str(),
+                query_kind = "catchup",
+                after_cursor = request.after_cursor.unwrap_or(0),
+                limit = 1000_u64,
+            ))
             .await
             .map_err(agent_error_to_status)?;
+        tracing::debug!(session_id = %session_id.as_str(), event_count = catchup.len(), "watch timeline catchup query completed");
         push_history(&mut historical, &highest_cursor, catchup);
 
         let highest_cursor_for_live = highest_cursor.clone();
@@ -320,6 +364,12 @@ where
                 return None;
             }
             highest_cursor.fetch_max(cursor, Ordering::Relaxed);
+            tracing::trace!(
+                sequence = update.sequence,
+                cursor,
+                kind = ?update.event.kind,
+                "watch timeline live event delivered"
+            );
             Some(
                 timeline_event_to_proto(update.event).map(|event| WatchTimelineResponse {
                     sequence: update.sequence,
@@ -333,6 +383,11 @@ where
         Ok(Response::new(Box::pin(stream)))
     }
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "submit_user_message", session_id)
+    )]
     async fn submit_user_message(
         &self,
         request: Request<SubmitUserMessageRequest>,
@@ -342,6 +397,8 @@ where
         if request.text.trim().is_empty() {
             return Err(Status::invalid_argument("text must not be empty"));
         }
+        tracing::Span::current().record("session_id", session_id.as_str());
+        tracing::info!("session prompt accepted");
         let config = self.load_config().await;
         self.runs
             .submit_user_message(
@@ -354,10 +411,20 @@ where
                 request.text,
             )
             .await?;
+        tracing::info!("session prompt dispatched");
 
         Ok(Response::new(SubmitUserMessageResponse {}))
     }
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(
+            operation = "respond_external_request",
+            session_id,
+            external_request_id
+        )
+    )]
     async fn respond_external_request(
         &self,
         request: Request<RespondExternalRequestRequest>,
@@ -367,6 +434,9 @@ where
         if request.request_id.trim().is_empty() {
             return Err(Status::invalid_argument("request id must not be empty"));
         }
+        tracing::Span::current().record("session_id", session_id.as_str());
+        tracing::Span::current().record("external_request_id", request.request_id.as_str());
+        tracing::info!("external request response accepted");
         let response = serde_json::from_str(&request.response_json)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let config = self.load_config().await;
@@ -382,17 +452,26 @@ where
                 response,
             )
             .await?;
+        tracing::info!("external request response dispatched");
 
         Ok(Response::new(RespondExternalRequestResponse {}))
     }
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "interrupt_session", session_id)
+    )]
     async fn interrupt_session(
         &self,
         request: Request<InterruptSessionRequest>,
     ) -> Result<Response<InterruptSessionResponse>, Status> {
         let request = request.into_inner();
         let session_id = required_session_id(&request.session_id)?;
+        tracing::Span::current().record("session_id", session_id.as_str());
+        tracing::info!("session interrupt accepted");
         self.runs.interrupt(&self.sessions, &session_id).await?;
+        tracing::info!("session interrupt completed");
         Ok(Response::new(InterruptSessionResponse {}))
     }
 }

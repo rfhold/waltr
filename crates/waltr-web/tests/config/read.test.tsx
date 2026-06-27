@@ -13,7 +13,7 @@ describe("config read", () => {
 
     expect(screen.queryByText(/Loading configuration\.\.\./)).toBeNull();
     expect(screen.getByText("claude")).toBeTruthy();
-    expect(screen.getByText("https://api.anthropic.com")).toBeTruthy();
+    expect(screen.getByText("https://api.anthropic.com/v1/messages")).toBeTruthy();
   });
 
   test("renders loading with the watch status until a snapshot is received", () => {

@@ -1036,7 +1036,7 @@ async function waitForTimelineScroll() {
 
 function provider(name: string, modelIds: string[], reasoningEfforts: string[] = []) {
   return {
-    kind: "openAi" as const,
+    kind: "openAiChatCompletions" as const,
     name,
     url: "https://example.invalid/v1",
     headers: {},
@@ -1060,7 +1060,7 @@ function sessionWithRuntime(id: string, status: SessionStatusView = { phase: "id
     runtimeConfig: {
       provider: {
         key: "openai",
-        kind: "openAi",
+        kind: "openAiChatCompletions",
         url: "https://example.invalid/v1",
         modelId: "gpt-4o",
         reasoningEffort: null,

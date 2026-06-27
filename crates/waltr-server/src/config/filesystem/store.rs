@@ -517,7 +517,7 @@ etag = ""
 [providers.anthropic]
 type = 1
 name = "anthropic"
-url = "https://api.anthropic.com"
+url = "https://api.anthropic.com/v1/messages"
 oauth_compatible = false
 
 [providers.anthropic.headers]
@@ -579,7 +579,7 @@ image = false
             providers: std::collections::HashMap::from([(
                 name.to_owned(),
                 Provider {
-                    r#type: ProviderType::Anthropic as i32,
+                    r#type: ProviderType::AnthropicMessages as i32,
                     name: name.to_owned(),
                     ..Provider::default()
                 },

@@ -30,12 +30,12 @@ async fn config_service_patch_persists_provider() -> Result<(), Box<dyn std::err
     assert_eq!(current.etag, patched.etag);
     assert_eq!(
         current.providers["anthropic"].r#type,
-        ProviderType::Anthropic as i32
+        ProviderType::AnthropicMessages as i32
     );
     assert_eq!(current.providers["anthropic"].name, "anthropic");
     assert_eq!(
         current.providers["anthropic"].url,
-        "https://api.anthropic.com"
+        "https://api.anthropic.com/v1/messages"
     );
 
     Ok(())

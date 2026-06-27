@@ -401,8 +401,10 @@ function ProviderFormPanel(props: {
           <Field id="provider-kind" label="Type">
             {(field) => (
               <select name="kind" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} value={form().kind} onChange={(event) => update({ kind: event.currentTarget.value as ProviderKindView })}>
-                <option value="anthropic">Anthropic</option>
-                <option value="openAi">OpenAI</option>
+                <option value="anthropicMessages">Anthropic Messages</option>
+                <option value="openAiChatCompletions">OpenAI Chat Completions</option>
+                <option value="openAiResponses">OpenAI Responses</option>
+                <option value="openAiResponsesWebsocket">OpenAI Responses WebSocket</option>
               </select>
             )}
           </Field>
@@ -692,7 +694,7 @@ function ModelFormPanel(props: {
 
 function initialProviderForm(form: ActiveForm): ProviderForm {
   if (form.mode === "create") {
-    return { mode: "create", name: "", kind: "anthropic", url: "", headers: {}, oauthCompatible: false, oauthSettings: null, models: {} };
+    return { mode: "create", name: "", kind: "anthropicMessages", url: "", headers: {}, oauthCompatible: false, oauthSettings: null, models: {} };
   }
 
   return providerToForm(form.providerName, form.provider);

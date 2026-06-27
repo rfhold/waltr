@@ -210,7 +210,7 @@ pub fn unused_addr() -> std::net::SocketAddr {
 
 pub fn provider_view(name: &str) -> ProviderView {
     ProviderView {
-        kind: ProviderKindView::Anthropic,
+        kind: ProviderKindView::AnthropicMessages,
         name: name.to_owned(),
         url: String::new(),
         headers: BTreeMap::new(),

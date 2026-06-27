@@ -14,7 +14,7 @@ use super::shared::{CHAT_COMPLETIONS_NAME, stream_openai_http};
 /// `OpenAI` Chat Completions HTTP streaming provider.
 #[derive(Debug, Clone)]
 pub struct OpenAiChatCompletions {
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     model: String,
     completions_url: String,
 }
@@ -29,20 +29,17 @@ impl OpenAiChatCompletions {
         }
     }
 
-    /// Set the API base URL used by this provider.
+    /// Set the exact Chat Completions endpoint URL used by this provider.
     #[must_use]
-    pub fn with_base_url(mut self, base_url: impl AsRef<str>) -> Self {
-        self.completions_url = format!(
-            "{}/v1/chat/completions",
-            base_url.as_ref().trim_end_matches('/')
-        );
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.completions_url = url.into();
         self
     }
 
-    /// Add a static request header to this provider.
+    /// Add a request header to this provider.
     #[must_use]
-    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.headers.push((name, value.into()));
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 }

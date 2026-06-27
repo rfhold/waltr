@@ -16,30 +16,43 @@ pub fn default_configuration() -> Configuration {
                 "anthropic".to_owned(),
                 provider(
                     "anthropic",
-                    ProviderType::Anthropic,
-                    "https://api.anthropic.com",
+                    ProviderType::AnthropicMessages,
+                    "https://api.anthropic.com/v1/messages",
                     true,
                     "claude-haiku-4-5",
+                    HashMap::new(),
+                    Some(claude_code_oauth_settings()),
                 ),
             ),
             (
                 "openai".to_owned(),
                 provider(
                     "openai",
-                    ProviderType::Openai,
-                    "https://api.openai.com",
+                    ProviderType::OpenaiChatCompletions,
+                    "https://api.openai.com/v1/chat/completions",
                     false,
                     "gpt-5-nano",
+                    HashMap::new(),
+                    None,
                 ),
             ),
             (
                 "openai-codex".to_owned(),
                 provider(
                     "openai-codex",
-                    ProviderType::OpenaiCodex,
-                    "https://chatgpt.com/backend-api",
+                    ProviderType::OpenaiResponses,
+                    "https://chatgpt.com/backend-api/codex/responses",
                     true,
                     "gpt-5-codex",
+                    HashMap::from([
+                        ("accept".to_owned(), "text/event-stream".to_owned()),
+                        (
+                            "OpenAI-Beta".to_owned(),
+                            "responses=experimental".to_owned(),
+                        ),
+                        ("originator".to_owned(), "waltr".to_owned()),
+                    ]),
+                    Some(openai_codex_oauth_settings()),
                 ),
             ),
         ]),
@@ -53,15 +66,16 @@ fn provider(
     url: &str,
     oauth_compatible: bool,
     model_key: &str,
+    headers: HashMap<String, String>,
+    oauth_settings: Option<OAuthProvider>,
 ) -> Provider {
     Provider {
         r#type: provider_type as i32,
         name: name.to_owned(),
         url: url.to_owned(),
         oauth_compatible,
-        oauth_settings: oauth_compatible
-            .then(|| default_oauth_settings(provider_type))
-            .flatten(),
+        headers,
+        oauth_settings,
         models: HashMap::from([(
             model_key.to_owned(),
             Model {
@@ -75,14 +89,6 @@ fn provider(
             },
         )]),
         ..Provider::default()
-    }
-}
-
-fn default_oauth_settings(provider_type: ProviderType) -> Option<OAuthProvider> {
-    match provider_type {
-        ProviderType::Anthropic => Some(claude_code_oauth_settings()),
-        ProviderType::OpenaiCodex => Some(openai_codex_oauth_settings()),
-        ProviderType::Unspecified | ProviderType::Openai => None,
     }
 }
 

@@ -271,9 +271,9 @@ fn config_with_model(provider: &str, model_key: &str, model_type: ModelType) -> 
         providers: std::collections::HashMap::from([(
             provider.to_owned(),
             Provider {
-                r#type: ProviderType::Anthropic as i32,
+                r#type: ProviderType::AnthropicMessages as i32,
                 name: provider.to_owned(),
-                url: "https://api.anthropic.com".to_owned(),
+                url: "https://api.anthropic.com/v1/messages".to_owned(),
                 models: std::collections::HashMap::from([(
                     model_key.to_owned(),
                     Model {

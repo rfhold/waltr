@@ -12,7 +12,7 @@ use super::reasoning::OpenAiReasoningConfig;
 /// `OpenAI` Responses HTTP streaming provider.
 #[derive(Debug, Clone)]
 pub struct OpenAiResponses {
-    headers: Vec<(&'static str, String)>,
+    headers: Vec<(String, String)>,
     model: String,
     responses_url: String,
     reasoning: Option<OpenAiReasoningConfig>,
@@ -29,13 +29,6 @@ impl OpenAiResponses {
         }
     }
 
-    /// Set the API base URL used by this provider.
-    #[must_use]
-    pub fn with_base_url(mut self, base_url: impl AsRef<str>) -> Self {
-        self.responses_url = format!("{}/v1/responses", base_url.as_ref().trim_end_matches('/'));
-        self
-    }
-
     /// Set the exact Responses endpoint URL used by this provider.
     #[must_use]
     pub fn with_url(mut self, url: impl Into<String>) -> Self {
@@ -43,10 +36,10 @@ impl OpenAiResponses {
         self
     }
 
-    /// Add a static request header to this provider.
+    /// Add a request header to this provider.
     #[must_use]
-    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.headers.push((name, value.into()));
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 

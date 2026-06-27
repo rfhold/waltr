@@ -72,7 +72,7 @@ fn runtime_config() -> Configuration {
 
 fn provider(name: &str, model_key: &str) -> Provider {
     Provider {
-        r#type: ProviderType::Openai as i32,
+        r#type: ProviderType::OpenaiChatCompletions as i32,
         name: name.to_owned(),
         url: format!("https://{name}.example.test"),
         models: HashMap::from([(

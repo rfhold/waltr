@@ -9,12 +9,14 @@ use std::{
 use futures_util::StreamExt as _;
 use waltr::grpc::waltr::config::v1::Configuration;
 use waltr_agent::{
-    AgentSessions, ExternalRequestId, ExternalResponse, ResumeInput, SessionId, SessionStore,
+    AgentSessions, AgentTimelineEvent, ExternalRequestId, ExternalResponse, ResumeInput, SessionId,
+    SessionStore, TimelineEventKind, TimelineStatus,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tonic::Status;
+use tracing::Instrument as _;
 
 use super::{error::agent_error_to_status, runtime::ServerRuntimeFactory};
 
@@ -69,19 +71,38 @@ impl SessionRunManager {
         let sessions = request.sessions;
         let session_id = request.session_id;
         let manager = self.clone();
+        let run_id = active.id;
+        tracing::info!(session_id = %session_id.as_str(), run_id, run_kind = "prompt", "session run started");
+        let span = tracing::info_span!(
+            "session.run",
+            session_id = %session_id.as_str(),
+            run_id,
+            run_kind = "prompt",
+            terminal_state = tracing::field::Empty,
+        );
         tokio::spawn(async move {
             let mut stream = sessions
                 .prompt(&runtime, session_id.clone(), text)
                 .with_cancellation_token(active.token.clone())
                 .stream();
+            let mut terminal_state = "finished";
             while let Some(event) = stream.next().await {
-                if let Err(error) = event {
-                    tracing::warn!(session_id = %session_id.as_str(), %error, "session run failed");
-                    break;
+                match event {
+                    Ok(event) => update_terminal_state(&event, &mut terminal_state),
+                    Err(error) => {
+                        terminal_state = "error";
+                        tracing::warn!(session_id = %session_id.as_str(), %error, "session run failed");
+                        break;
+                    }
                 }
             }
+            if active.token.is_cancelled() {
+                terminal_state = "interrupted";
+            }
+            tracing::Span::current().record("terminal_state", terminal_state);
+            tracing::info!(session_id = %session_id.as_str(), run_id, terminal_state, "session run completed");
             manager.remove_active(&session_id, active.id).await;
-        });
+        }.instrument(span));
         Ok(())
     }
 
@@ -107,6 +128,17 @@ impl SessionRunManager {
         let sessions = request.sessions;
         let session_id = request.session_id;
         let manager = self.clone();
+        let run_id = active.id;
+        let external_request_id = request_id.as_str().to_owned();
+        tracing::info!(session_id = %session_id.as_str(), run_id, run_kind = "resume", external_request_id = %external_request_id, "session run started");
+        let span = tracing::info_span!(
+            "session.run",
+            session_id = %session_id.as_str(),
+            run_id,
+            run_kind = "resume",
+            external_request_id = %external_request_id,
+            terminal_state = tracing::field::Empty,
+        );
         tokio::spawn(async move {
             let input = ResumeInput::ExternalResponse {
                 request_id,
@@ -116,14 +148,24 @@ impl SessionRunManager {
                 .resume(&runtime, session_id.clone(), input)
                 .with_cancellation_token(active.token.clone())
                 .stream();
+            let mut terminal_state = "finished";
             while let Some(event) = stream.next().await {
-                if let Err(error) = event {
-                    tracing::warn!(session_id = %session_id.as_str(), %error, "session resume failed");
-                    break;
+                match event {
+                    Ok(event) => update_terminal_state(&event, &mut terminal_state),
+                    Err(error) => {
+                        terminal_state = "error";
+                        tracing::warn!(session_id = %session_id.as_str(), %error, "session resume failed");
+                        break;
+                    }
                 }
             }
+            if active.token.is_cancelled() {
+                terminal_state = "interrupted";
+            }
+            tracing::Span::current().record("terminal_state", terminal_state);
+            tracing::info!(session_id = %session_id.as_str(), run_id, terminal_state, "session run completed");
             manager.remove_active(&session_id, active.id).await;
-        });
+        }.instrument(span));
         Ok(())
     }
 
@@ -138,6 +180,9 @@ impl SessionRunManager {
         let active = self.active.lock().await.remove(session_id.as_str());
         if let Some(active) = active {
             active.token.cancel();
+            tracing::info!(session_id = %session_id.as_str(), run_id = active.id, "active session run cancellation requested");
+        } else {
+            tracing::debug!(session_id = %session_id.as_str(), "no active session run to cancel");
         }
         sessions
             .interrupt(session_id)
@@ -184,5 +229,20 @@ impl SessionRunManager {
         {
             active.remove(session_id.as_str());
         }
+    }
+}
+
+fn update_terminal_state(event: &AgentTimelineEvent, terminal_state: &mut &'static str) {
+    match event.kind {
+        TimelineEventKind::ExternalRequestOpened => *terminal_state = "external_request",
+        TimelineEventKind::SessionStatusChanged => match event.status {
+            Some(TimelineStatus::Finished) => *terminal_state = "finished",
+            Some(TimelineStatus::Failed) => *terminal_state = "error",
+            Some(TimelineStatus::Interrupted) => *terminal_state = "interrupted",
+            Some(TimelineStatus::AwaitingExternalInput) => *terminal_state = "external_request",
+            Some(TimelineStatus::AwaitingToolResults) => *terminal_state = "awaiting_tool_results",
+            _ => {}
+        },
+        _ => {}
     }
 }
