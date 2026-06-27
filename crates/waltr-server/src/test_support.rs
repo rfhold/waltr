@@ -1,12 +1,17 @@
 //! Shared integration test server setup.
 
-use crate::{build_app_with_services, config_service::ConfigService, session};
+use crate::{
+    build_app_with_catalog_loader, catalog::CatalogLoader, config_service::ConfigService, session,
+};
 use waltr_agent::{AgentSessions, MemorySessionStore};
 use std::{
     net::{SocketAddr, TcpListener},
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     thread,
 };
+
+static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Shared test server for integration tests in one test binary.
 #[derive(Debug)]
@@ -54,6 +59,14 @@ pub fn setup_server_with_services(
     setup_server_with_listener(config_service, listener)
 }
 
+/// Start an isolated integration test server with an explicit catalog loader.
+#[must_use]
+pub fn setup_server_with_catalog_loader(catalog_loader: CatalogLoader) -> &'static TestServer {
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader)
+}
+
 /// Start an isolated integration test server with an explicit session coordinator.
 #[must_use]
 pub fn setup_server_with_sessions() -> (&'static TestServer, AgentSessions<MemorySessionStore>) {
@@ -86,10 +99,37 @@ fn setup_server_with_listener(
     )
 }
 
+fn setup_server_with_listener_and_catalog_loader(
+    config_service: std::sync::Arc<ConfigService>,
+    listener: TcpListener,
+    catalog_loader: CatalogLoader,
+) -> &'static TestServer {
+    setup_server_with_listener_sessions_and_catalog_loader(
+        config_service,
+        listener,
+        AgentSessions::new(MemorySessionStore::new()),
+        catalog_loader,
+    )
+}
+
 fn setup_server_with_listener_and_sessions(
     config_service: std::sync::Arc<ConfigService>,
     listener: TcpListener,
     sessions: AgentSessions<MemorySessionStore>,
+) -> &'static TestServer {
+    setup_server_with_listener_sessions_and_catalog_loader(
+        config_service,
+        listener,
+        sessions,
+        CatalogLoader::from_env(),
+    )
+}
+
+fn setup_server_with_listener_sessions_and_catalog_loader(
+    config_service: std::sync::Arc<ConfigService>,
+    listener: TcpListener,
+    sessions: AgentSessions<MemorySessionStore>,
+    catalog_loader: CatalogLoader,
 ) -> &'static TestServer {
     listener
         .set_nonblocking(true)
@@ -109,9 +149,13 @@ fn setup_server_with_listener_and_sessions(
                 .expect("test server listener should become async");
             axum::serve(
                 listener,
-                build_app_with_services(config_service, |routes, config| {
-                    session::add_sessions_service(routes, sessions, config);
-                }),
+                build_app_with_catalog_loader(
+                    config_service,
+                    catalog_loader,
+                    |routes, config, credential_store| {
+                        session::add_sessions_service(routes, sessions, config, credential_store);
+                    },
+                ),
             )
             .await
             .expect("test server should run");
@@ -126,8 +170,9 @@ fn setup_server_with_listener_and_sessions(
 
 #[must_use]
 pub fn temp_root() -> PathBuf {
+    let counter = TEMP_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "waltr-config-test-{}",
+        "waltr-config-test-{}-{counter}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time should be after epoch")

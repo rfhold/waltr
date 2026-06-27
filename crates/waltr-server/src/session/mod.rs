@@ -1,6 +1,6 @@
 //! Session service coordination.
 
-use crate::config::ConfigHandle;
+use crate::{auth::FileCredentialStore, config::ConfigHandle};
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
 use waltr_agent::{AgentSessions, FilesystemSessionStore, MemorySessionStore, SessionStore};
 use tonic::service::RoutesBuilder;
@@ -28,13 +28,19 @@ use storage::SessionStorageConfig;
 pub fn add_service_from_env(
     routes: &mut RoutesBuilder,
     config: ConfigHandle,
+    credential_store: FileCredentialStore,
 ) -> Result<(), SessionStorageConfigError> {
     match SessionStorageConfig::from_env()? {
         SessionStorageConfig::Memory => {
-            add_store_service(routes, MemorySessionStore::new(), config);
+            add_store_service(routes, MemorySessionStore::new(), config, credential_store);
         }
         SessionStorageConfig::Filesystem { root } => {
-            add_store_service(routes, FilesystemSessionStore::new(root), config);
+            add_store_service(
+                routes,
+                FilesystemSessionStore::new(root),
+                config,
+                credential_store,
+            );
         }
     }
 
@@ -50,7 +56,12 @@ pub fn add_default_service(routes: &mut RoutesBuilder) {
 
 /// Add an in-memory session service using an explicit config store.
 pub fn add_memory_service(routes: &mut RoutesBuilder, config: ConfigHandle) {
-    add_store_service(routes, MemorySessionStore::new(), config);
+    add_store_service(
+        routes,
+        MemorySessionStore::new(),
+        config,
+        FileCredentialStore::from_env(),
+    );
 }
 
 /// Add an in-memory session service using an existing session coordinator.
@@ -58,19 +69,24 @@ pub fn add_sessions_service<S>(
     routes: &mut RoutesBuilder,
     sessions: AgentSessions<S>,
     config: ConfigHandle,
+    credential_store: FileCredentialStore,
 ) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     routes.add_service(SessionServiceServer::from_arc(
-        SessionService::from_sessions_with_config(sessions, config),
+        SessionService::from_sessions_with_config(sessions, config, credential_store),
     ));
 }
 
-fn add_store_service<S>(routes: &mut RoutesBuilder, store: S, config: ConfigHandle)
-where
+fn add_store_service<S>(
+    routes: &mut RoutesBuilder,
+    store: S,
+    config: ConfigHandle,
+    credential_store: FileCredentialStore,
+) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     routes.add_service(SessionServiceServer::from_arc(
-        SessionService::new_with_config(store, config),
+        SessionService::new_with_config(store, config, credential_store),
     ));
 }

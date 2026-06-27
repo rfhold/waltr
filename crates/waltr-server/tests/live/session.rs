@@ -172,6 +172,7 @@ fn live_config(provider: LiveServerProvider) -> Configuration {
             model_key,
             mcp_default_enabled: Some(false),
             enabled_mcp_server_keys: Vec::new(),
+            reasoning_effort: None,
         }),
         ..Configuration::default()
     }
@@ -247,6 +248,7 @@ fn provider_config(
                 ..Model::default()
             },
         )]),
+        ..Provider::default()
     }
 }
 

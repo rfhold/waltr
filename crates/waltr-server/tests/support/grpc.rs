@@ -1,3 +1,4 @@
+use waltr::grpc::waltr::catalog::v1::catalog_service_client::CatalogServiceClient;
 use waltr::grpc::waltr::config::v1::{
     Configuration, GetConfigRequest, Provider, ProviderType,
     config_service_client::ConfigServiceClient,
@@ -24,6 +25,13 @@ pub async fn status_client(
 ) -> Result<StatusServiceClient<Channel>, Box<dyn std::error::Error>> {
     let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
     Ok(StatusServiceClient::new(channel))
+}
+
+pub async fn catalog_client(
+    server: &TestServer,
+) -> Result<CatalogServiceClient<Channel>, Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
+    Ok(CatalogServiceClient::new(channel))
 }
 
 pub async fn session_client(

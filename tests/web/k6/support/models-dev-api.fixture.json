@@ -1,0 +1,58 @@
+{
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "api": "https://api.anthropic.com/v1",
+    "models": {
+      "claude-haiku-4-5": {
+        "id": "claude-haiku-4-5",
+        "name": "Claude Haiku 4.5",
+        "family": "claude-haiku",
+        "status": "stable",
+        "attachment": false,
+        "reasoning": true,
+        "tool_call": true,
+        "modalities": { "input": ["text"], "output": ["text"] },
+        "limit": { "context": 200000, "output": 8192 },
+        "cost": { "input": 1, "output": 5 }
+      }
+    }
+  },
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "api": "https://api.openai.com/v1",
+    "models": {
+      "gpt-5-nano": {
+        "id": "gpt-5-nano",
+        "name": "GPT-5 Nano",
+        "family": "gpt-5",
+        "status": "stable",
+        "attachment": true,
+        "reasoning": true,
+        "tool_call": true,
+        "structured_output": true,
+        "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high"] }],
+        "modalities": { "input": ["text", "image"], "output": ["text"] },
+        "limit": { "context": 400000, "output": 128000 },
+        "cost": { "input": 0.05, "output": 0.4 }
+      }
+    }
+  },
+  "gateway": {
+    "id": "gateway",
+    "name": "Example Gateway",
+    "api": "https://gateway.example/v1",
+    "models": {
+      "openai/gpt-5-nano": {
+        "id": "openai/gpt-5-nano",
+        "name": "GPT-5 Nano via Gateway",
+        "attachment": true,
+        "tool_call": false,
+        "modalities": { "input": ["text", "image"], "output": ["text"] },
+        "limit": { "context": 1000, "output": 2000 },
+        "provider": { "api": "https://gateway.example/openai/v1", "shape": "responses" }
+      }
+    }
+  }
+}

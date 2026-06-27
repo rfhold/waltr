@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::support::grpc::{config_client, get_config, session_client};
 use waltr::grpc::waltr::{
     config::v1::{
-        Configuration, McpServer, McpServerMapPatch, McpServerType, Model, ModelType,
+        Configuration, McpServer, McpServerMapPatch, McpServerType, Model, ModelOptions, ModelType,
         PatchConfigRequest, Provider, ProviderMapPatch, ProviderType, RuntimeDefaults,
     },
     session::v1::{
@@ -47,6 +47,42 @@ async fn create_session_uses_runtime_defaults() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test]
+async fn create_session_uses_runtime_default_reasoning_effort()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let mut config = config_with_defaults();
+    config
+        .runtime_defaults
+        .as_mut()
+        .expect("runtime defaults should be set")
+        .reasoning_effort = Some("high".to_owned());
+    config_service
+        .store()
+        .save(config)
+        .await
+        .expect("config should save");
+    let server = setup_server_with_services(config_service);
+    wait_for_config_handle().await;
+    let mut client = session_client(server).await?;
+
+    let session = client
+        .create_session(CreateSessionRequest::default())
+        .await?
+        .into_inner()
+        .session
+        .expect("created session should be present");
+    let runtime = session
+        .runtime_config
+        .expect("runtime config should be set");
+    let provider = runtime.provider.expect("provider should be set");
+
+    assert_eq!(provider.key, "anthropic");
+    assert_eq!(provider.reasoning_effort.as_deref(), Some("high"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_session_without_provider_default_keeps_runtime_unset()
 -> Result<(), Box<dyn std::error::Error>> {
     let config_service = ConfigService::new(temp_root()).expect("config service should start");
@@ -56,6 +92,7 @@ async fn create_session_without_provider_default_keeps_runtime_unset()
         model_key: String::new(),
         mcp_default_enabled: Some(true),
         enabled_mcp_server_keys: Vec::new(),
+        reasoning_effort: None,
     });
     config_service
         .store()
@@ -96,6 +133,7 @@ async fn create_session_manual_runtime_config_wins_over_defaults()
                 provider_key: "openai".to_owned(),
                 model_id: "gpt".to_owned(),
                 enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: Some("medium".to_owned()),
             }),
         })
         .await?
@@ -111,6 +149,7 @@ async fn create_session_manual_runtime_config_wins_over_defaults()
     assert_eq!(provider.r#type, ProviderType::Openai as i32);
     assert_eq!(provider.url, "https://openai.example.test");
     assert_eq!(provider.model_id, "gpt");
+    assert_eq!(provider.reasoning_effort.as_deref(), Some("medium"));
     assert_eq!(provider.r#match, RuntimeConfigMatch::Configured as i32);
     assert!(runtime.mcp_servers.is_empty());
 
@@ -151,6 +190,7 @@ async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn 
                 provider_key: "openai".to_owned(),
                 model_id: "gpt".to_owned(),
                 enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: Some("high".to_owned()),
             }),
         })
         .await?
@@ -184,7 +224,46 @@ async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn 
     let provider = runtime.provider.expect("provider should be set");
     assert_eq!(provider.key, "openai");
     assert_eq!(provider.model_id, "gpt");
+    assert_eq!(provider.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(provider.r#match, RuntimeConfigMatch::Configured as i32);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_runtime_config_rejects_unconfigured_reasoning_effort()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    config_service
+        .store()
+        .save(config_with_defaults())
+        .await
+        .expect("config should save");
+    let server = setup_server_with_services(config_service);
+    wait_for_config_handle().await;
+    let mut client = session_client(server).await?;
+    let created = client
+        .create_session(CreateSessionRequest::default())
+        .await?
+        .into_inner()
+        .session
+        .expect("created session should be present");
+
+    let status = client
+        .update_session_runtime_config(UpdateSessionRuntimeConfigRequest {
+            id: created.id,
+            runtime_config: Some(SessionRuntimeConfigRequest {
+                provider_key: "openai".to_owned(),
+                model_id: "gpt".to_owned(),
+                enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: Some("xhigh".to_owned()),
+            }),
+        })
+        .await
+        .expect_err("unsupported effort should fail");
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains("not configured"));
 
     Ok(())
 }
@@ -264,6 +343,7 @@ fn config_with_defaults() -> Configuration {
             model_key: "sonnet".to_owned(),
             mcp_default_enabled: None,
             enabled_mcp_server_keys: Vec::new(),
+            reasoning_effort: None,
         }),
         ..Configuration::default()
     }
@@ -279,6 +359,14 @@ fn provider(name: &str, provider_type: ProviderType, model_key: &str) -> Provide
             Model {
                 name: model_key.to_owned(),
                 r#type: ModelType::Llm as i32,
+                options: Some(ModelOptions {
+                    reasoning_efforts: vec![
+                        "low".to_owned(),
+                        "medium".to_owned(),
+                        "high".to_owned(),
+                    ],
+                    ..ModelOptions::default()
+                }),
                 ..Model::default()
             },
         )]),
