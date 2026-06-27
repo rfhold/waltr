@@ -1,28 +1,10 @@
 etag = ""
 
-[providers.agent-gateway-openai]
-type = 2
-name = "agent-gateway-openai"
-url = "https://agent-gateway.holdenitdown.net"
-
-[providers.agent-gateway-openai.headers]
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5"]
-name = "GPT 5.5"
-type = 1
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5".options]
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5".limits]
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5".capabilities]
-tools = true
-image = true
-
 [providers.agent-gateway-anthropic]
 type = 1
 name = "agent-gateway-anthropic"
 url = "https://agent-gateway.holdenitdown.net"
+oauth_compatible = false
 
 [providers.agent-gateway-anthropic.headers]
 
@@ -31,12 +13,203 @@ name = "Sonnet 4.6"
 type = 1
 
 [providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".options]
+reasoning_efforts = []
 
 [providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".limits]
 
 [providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".capabilities]
 tools = false
 image = false
+
+[providers.agent-gateway-openai]
+type = 2
+name = "agent-gateway-openai"
+url = "https://agent-gateway.holdenitdown.net"
+oauth_compatible = false
+
+[providers.agent-gateway-openai.headers]
+
+[providers.agent-gateway-openai.models."openai/gpt-5.5"]
+name = "GPT 5.5"
+type = 1
+
+[providers.agent-gateway-openai.models."openai/gpt-5.5".options]
+reasoning_efforts = []
+
+[providers.agent-gateway-openai.models."openai/gpt-5.5".limits]
+
+[providers.agent-gateway-openai.models."openai/gpt-5.5".capabilities]
+tools = true
+image = true
+
+[providers.anthropic]
+type = 1
+name = "anthropic"
+url = "https://api.anthropic.com"
+oauth_compatible = true
+
+[providers.anthropic.headers]
+
+[providers.anthropic.models.claude-haiku-4-5]
+name = "Claude Haiku 4.5"
+type = 1
+
+[providers.anthropic.models.claude-haiku-4-5.options]
+reasoning_efforts = []
+
+[providers.anthropic.models.claude-haiku-4-5.limits]
+
+[providers.anthropic.models.claude-haiku-4-5.capabilities]
+tools = true
+image = false
+
+[providers.anthropic.models.claude-haiku-4-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-haiku-4-5"
+source = 2
+
+[providers.anthropic.models.claude-sonnet-4-5]
+name = "Claude Sonnet 4.5"
+type = 1
+
+[providers.anthropic.models.claude-sonnet-4-5.options]
+reasoning_efforts = []
+
+[providers.anthropic.models.claude-sonnet-4-5.limits]
+
+[providers.anthropic.models.claude-sonnet-4-5.capabilities]
+tools = true
+image = false
+
+[providers.anthropic.models.claude-sonnet-4-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-sonnet-4-5"
+source = 2
+
+[providers.anthropic.models.claude-sonnet-4-6]
+name = "Claude Sonnet 4.6"
+type = 1
+
+[providers.anthropic.models.claude-sonnet-4-6.options]
+reasoning_efforts = ["medium"]
+
+[providers.anthropic.models.claude-sonnet-4-6.limits]
+
+[providers.anthropic.models.claude-sonnet-4-6.capabilities]
+tools = true
+image = false
+
+[providers.anthropic.models.claude-sonnet-4-6.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-sonnet-4-6"
+source = 2
+
+[providers.anthropic.oauth_settings]
+name = "Claude Code"
+authorize_url = "https://claude.ai/oauth/authorize"
+token_url = "https://platform.claude.com/v1/oauth/token"
+client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+redirect_uri = "http://localhost:53692/callback"
+scopes = [
+    "org:create_api_key",
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+]
+token_request_style = 1
+jwt_metadata = []
+send_state_in_token_request = true
+
+[[providers.anthropic.oauth_settings.auth_url_params]]
+key = "code"
+value = "true"
+
+[providers.openai-codex]
+type = 3
+name = "openai-codex"
+url = "https://chatgpt.com/backend-api"
+oauth_compatible = true
+
+[providers.openai-codex.headers]
+
+[providers.openai-codex.models.gpt-5-codex]
+name = "gpt-5-codex"
+type = 1
+
+[providers.openai-codex.models.gpt-5-codex.options]
+reasoning_efforts = []
+
+[providers.openai-codex.models.gpt-5-codex.limits]
+
+[providers.openai-codex.models.gpt-5-codex.capabilities]
+tools = true
+image = false
+
+[providers.openai-codex.models."gpt-5.5"]
+name = "GPT 5.5"
+type = 1
+
+[providers.openai-codex.models."gpt-5.5".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai-codex.models."gpt-5.5".limits]
+context = 128000
+output = 128000
+
+[providers.openai-codex.models."gpt-5.5".capabilities]
+tools = true
+image = true
+
+[providers.openai-codex.models."gpt-5.5".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.5"
+source = 3
+
+[providers.openai-codex.oauth_settings]
+name = "OpenAI Codex"
+authorize_url = "https://auth.openai.com/oauth/authorize"
+token_url = "https://auth.openai.com/oauth/token"
+client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+redirect_uri = "http://localhost:1455/auth/callback"
+scopes = [
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    "api.connectors.read",
+    "api.connectors.invoke",
+]
+token_request_style = 2
+send_state_in_token_request = false
+
+[[providers.openai-codex.oauth_settings.auth_url_params]]
+key = "id_token_add_organizations"
+value = "true"
+
+[[providers.openai-codex.oauth_settings.auth_url_params]]
+key = "codex_cli_simplified_flow"
+value = "true"
+
+[[providers.openai-codex.oauth_settings.auth_url_params]]
+key = "originator"
+value = "waltr"
+
+[[providers.openai-codex.oauth_settings.jwt_metadata]]
+token = 2
+metadata_key = "account_id"
+claim_names = [
+    "https://api.openai.com/auth.chatgpt_account_id",
+    "chatgpt_account_id",
+]
+required = true
 
 [mcp_servers.playwrite]
 name = "playwrite"
@@ -45,7 +218,8 @@ command = "pnpx @playwright/mcp@latest"
 url = ""
 
 [runtime_defaults]
-provider_key = "agent-gateway-openai"
-model_key = "openai/gpt-5.5"
+provider_key = "openai-codex"
+model_key = "gpt-5.5"
 mcp_default_enabled = false
 enabled_mcp_server_keys = []
+reasoning_effort = "medium"

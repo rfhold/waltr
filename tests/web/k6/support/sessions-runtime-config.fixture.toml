@@ -1,0 +1,61 @@
+etag = ""
+
+[providers.k6-openai]
+type = 2
+name = "k6-openai"
+url = "https://example.invalid/v1"
+oauth_compatible = false
+
+[providers.k6-openai.headers]
+
+[providers.k6-openai.models.gpt-5-nano]
+name = "gpt-5-nano"
+type = 1
+
+[providers.k6-openai.models.gpt-5-nano.options]
+reasoning_efforts = ["low", "medium", "high"]
+
+[providers.k6-openai.models.gpt-5-nano.limits]
+
+[providers.k6-openai.models.gpt-5-nano.capabilities]
+tools = false
+image = false
+
+[providers.k6-anthropic]
+type = 1
+name = "k6-anthropic"
+url = "https://example.invalid/v1"
+oauth_compatible = false
+
+[providers.k6-anthropic.headers]
+
+[providers.k6-anthropic.models.claude]
+name = "claude"
+type = 1
+
+[providers.k6-anthropic.models.claude.options]
+reasoning_efforts = []
+
+[providers.k6-anthropic.models.claude.limits]
+
+[providers.k6-anthropic.models.claude.capabilities]
+tools = false
+image = false
+
+[mcp_servers.files]
+name = "files"
+type = 1
+command = "files-mcp"
+url = ""
+
+[mcp_servers.git]
+name = "git"
+type = 1
+command = "git-mcp"
+url = ""
+
+[runtime_defaults]
+provider_key = "k6-openai"
+model_key = "gpt-5-nano"
+mcp_default_enabled = false
+enabled_mcp_server_keys = ["git"]

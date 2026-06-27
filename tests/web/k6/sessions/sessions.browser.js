@@ -1,7 +1,7 @@
 import { check, sleep } from "k6";
 
 import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
-import { typeAndKeepFocus, waitForMissingText, waitForPathname, waitForSelectOption, waitForText } from "../support/checks.js";
+import { waitForMissingText, waitForPathname, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
 export const options = browserOptions;
@@ -15,8 +15,6 @@ export default async function () {
   await withPage(async (page) => {
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await waitForText(page, "#landing-title", "Waltr is ready.");
-
-    await seedRuntimeConfig(page);
 
     await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
     await waitForPathname(page, "/sessions");
@@ -84,68 +82,6 @@ export default async function () {
       "session list omits deleted session": () => !includesText(listAfterDelete, sessionId),
     });
   });
-}
-
-async function seedRuntimeConfig(page) {
-  await page.goto(`${baseUrl}/config/provider`, { waitUntil: "domcontentloaded" });
-  await waitForPathname(page, "/config/provider");
-  await waitForText(page, "#config-title", "Settings");
-  await createProvider(page, PRIMARY_PROVIDER, PRIMARY_MODEL, "low, medium, high");
-  await createProvider(page, SECONDARY_PROVIDER, SECONDARY_MODEL);
-
-  await page.goto(`${baseUrl}/config/mcp`, { waitUntil: "domcontentloaded" });
-  await waitForPathname(page, "/config/mcp");
-  await createMcpServer(page, "files");
-  await createMcpServer(page, "git");
-
-  await page.goto(`${baseUrl}/config/defaults`, { waitUntil: "domcontentloaded" });
-  await waitForPathname(page, "/config/defaults");
-  await waitForText(page, "#runtime-defaults-title", "New session defaults");
-  await waitForSelectOption(page, "#runtime-default-provider", PRIMARY_PROVIDER);
-  await setSelectValue(page, "#runtime-default-provider", PRIMARY_PROVIDER);
-  await waitForSelectOption(page, "#runtime-default-model", PRIMARY_MODEL);
-  await setSelectValue(page, "#runtime-default-model", PRIMARY_MODEL);
-  await waitForText(page, '[aria-label="Explicit MCP defaults"]', "git");
-  await setExplicitMcpDefault(page, "git", true);
-  await submitForm(page, 'section[aria-labelledby="runtime-defaults-title"] form');
-  await waitForText(page, 'section[aria-labelledby="runtime-defaults-title"]', "Clear defaults");
-}
-
-async function createProvider(page, name, model, reasoningEfforts = "") {
-  await page.goto(`${baseUrl}/config/provider`, { waitUntil: "domcontentloaded" });
-  await waitForPathname(page, "/config/provider");
-  await waitForText(page, '[aria-label="Provider actions"]', "Create");
-  await page.locator('[aria-label="Provider actions"] button').click();
-  await waitForText(page, 'form[aria-label="Create provider"]', "Name");
-  await setInputValue(page, 'form[aria-label="Create provider"] input[name="name"]', "");
-  await typeAndKeepFocus(page, 'form[aria-label="Create provider"] input[name="name"]', name);
-  await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAi");
-  await setInputValue(page, 'form[aria-label="Create provider"] input[name="url"]', "");
-  await typeAndKeepFocus(
-    page,
-    'form[aria-label="Create provider"] input[name="url"]',
-    "https://example.invalid/v1",
-  );
-
-  const modelsSelector = `[aria-label="Models for ${name}"]`;
-  await page.locator(`${modelsSelector} [aria-label="Model actions"] button`).click();
-  await waitForPathname(page, "/config/provider/create/models/create");
-  await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="key"]', model);
-  await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="name"]', model);
-  await page.locator('form[aria-label="Create model"] select[name="kind"]').selectOption("llm");
-  if (reasoningEfforts) {
-    await setInputValue(
-      page,
-      'form[aria-label="Create model"] input[name="reasoningEfforts"]',
-      reasoningEfforts,
-    );
-  }
-  await submitForm(page, 'form[aria-label="Create model"]');
-  await waitForPathname(page, "/config/provider/create");
-  await waitForText(page, 'form[aria-label="Create provider"]', "Save");
-  await waitForText(page, modelsSelector, model);
-  await submitForm(page, 'form[aria-label="Create provider"]');
-  await waitForText(page, '[aria-label="Provider list"]', name);
 }
 
 async function waitForSelectEnabled(page, selector) {
@@ -223,14 +159,6 @@ async function waitForLabeledSelectValue(page, labelText, expectedValue) {
   throw new Error(`Timed out waiting for ${labelText} to equal ${expectedValue}; saw ${value}`);
 }
 
-async function createMcpServer(page, name) {
-  await page.locator('[aria-label="MCP server actions"] button').click();
-  await typeAndKeepFocus(page, 'form[aria-label="Create MCP server"] input[name="name"]', name);
-  await setInputValue(page, 'form[aria-label="Create MCP server"] input[name="command"]', `${name}-mcp`);
-  await submitForm(page, 'form[aria-label="Create MCP server"]');
-  await waitForText(page, ".config__list", name);
-}
-
 async function toggleMcpRuntime(page, server) {
   await page.evaluate((serverName) => {
     const labels = Array.from(document.querySelectorAll(".sessions__runtime-option"));
@@ -245,19 +173,6 @@ async function toggleMcpRuntime(page, server) {
   }, server);
 }
 
-async function setInputValue(page, selector, value) {
-  await page.evaluate(({ selector, value }) => {
-    const input = document.querySelector(selector);
-
-    if (!(input instanceof HTMLInputElement)) {
-      throw new Error(`Input not found: ${selector}`);
-    }
-
-    input.value = value;
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
-  }, { selector, value });
-}
-
 async function setSelectValue(page, selector, value) {
   await page.evaluate(({ selector, value }) => {
     const select = document.querySelector(selector);
@@ -269,33 +184,6 @@ async function setSelectValue(page, selector, value) {
     select.value = value;
     select.dispatchEvent(new Event("change", { bubbles: true }));
   }, { selector, value });
-}
-
-async function setExplicitMcpDefault(page, server, checked) {
-  await page.evaluate(({ server, checked }) => {
-    const labels = Array.from(document.querySelectorAll('[aria-label="Explicit MCP defaults"] label'));
-    const label = labels.find((candidate) => candidate.textContent?.includes(server));
-    const input = label?.querySelector('input[type="checkbox"]');
-
-    if (!(input instanceof HTMLInputElement)) {
-      throw new Error(`MCP default checkbox not found: ${server}`);
-    }
-
-    input.checked = checked;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  }, { server, checked });
-}
-
-async function submitForm(page, selector) {
-  await page.evaluate((formSelector) => {
-    const form = document.querySelector(formSelector);
-
-    if (!(form instanceof HTMLFormElement)) {
-      throw new Error(`Form not found: ${formSelector}`);
-    }
-
-    form.requestSubmit();
-  }, selector);
 }
 
 async function clickButtonByLabel(page, label) {
