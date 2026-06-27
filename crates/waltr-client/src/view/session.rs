@@ -53,6 +53,8 @@ pub struct SessionProviderRuntimeView {
     pub url: String,
     /// Exact provider model id selected when runtime config was stored.
     pub model_id: String,
+    /// Per-session reasoning effort, when configured.
+    pub reasoning_effort: Option<String>,
     /// Whether the stored provider/model still matches current config.
     pub match_status: RuntimeConfigMatchView,
 }
@@ -331,6 +333,7 @@ impl From<SessionProviderRuntime> for SessionProviderRuntimeView {
             kind: provider.r#type.into(),
             url: provider.url,
             model_id: provider.model_id,
+            reasoning_effort: provider.reasoning_effort,
             match_status: provider.r#match.into(),
         }
     }

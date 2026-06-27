@@ -1,9 +1,9 @@
 #![allow(clippy::future_not_send)]
 
-use waltr_client::{ClientCommand, ClientRuntime, SessionPhaseView};
+use waltr_client::{ClientCommand, ClientOperationView, ClientRuntime, SessionPhaseView};
 
 use crate::support::{
-    server::server_endpoint,
+    server::{server_endpoint, server_endpoint_with_runtime_config},
     snapshots::{dispatch_stream_command, next_snapshot_until, no_sleep},
 };
 
@@ -114,6 +114,68 @@ async fn two_session_watch_streams_stay_in_sync_across_create_and_delete() {
     })
     .await;
     assert_eq!(first_empty.sessions.watch.error, None);
+}
+
+#[tokio::test]
+async fn session_runtime_update_preserves_reasoning_effort_in_client_state() {
+    let endpoint = server_endpoint_with_runtime_config()
+        .await
+        .expect("runtime-configured server should start");
+    let mut stream = ClientRuntime::for_endpoint(endpoint).into_state_stream(no_sleep);
+
+    wait_for_system_ready(&mut stream).await;
+    open_session_watch(&mut stream).await;
+
+    dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
+        .await
+        .expect("session create should succeed");
+    let created = next_snapshot_until(&mut stream, |snapshot| {
+        snapshot.sessions.watch.status == "received" && snapshot.sessions.current.len() == 1
+    })
+    .await;
+    let session_id = created.sessions.current[0].id.clone();
+
+    let started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::UpdateSessionRuntimeConfig {
+            id: session_id.clone(),
+            provider_key: "openai".to_owned(),
+            model_id: "gpt".to_owned(),
+            enabled_mcp_server_keys: Vec::new(),
+            reasoning_effort: Some("high".to_owned()),
+        },
+    )
+    .await
+    .expect("runtime update should succeed");
+    let operation_key = started
+        .sessions
+        .runtime_config_update
+        .key
+        .clone()
+        .expect("runtime update should expose operation key");
+
+    let updated = next_snapshot_until(&mut stream, |snapshot| {
+        matches!(
+            snapshot.operations.current.get(&operation_key),
+            Some(ClientOperationView::SessionRuntimeConfigUpdate {
+                status: "ready",
+                ..
+            })
+        )
+    })
+    .await;
+    let runtime = updated
+        .sessions
+        .current
+        .iter()
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.runtime_config.as_ref())
+        .expect("updated session should retain runtime config");
+    let provider = runtime.provider.as_ref().expect("provider should be set");
+
+    assert_eq!(provider.key, "openai");
+    assert_eq!(provider.model_id, "gpt");
+    assert_eq!(provider.reasoning_effort.as_deref(), Some("high"));
 }
 
 async fn wait_for_system_ready(stream: &mut waltr_client::ClientStateStream) {

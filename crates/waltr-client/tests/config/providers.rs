@@ -21,13 +21,15 @@ async fn stream_dispatches_config_provider_commands() {
         .config
         .current
         .expect("config snapshot should include config");
-    assert!(initial_config.providers.is_empty());
+    assert!(initial_config.providers.contains_key("anthropic"));
+    assert!(initial_config.providers.contains_key("openai"));
+    assert!(initial_config.providers.contains_key("openai-codex"));
     assert!(!initial_config.etag.is_empty());
 
     let patch_started = dispatch_stream_command(
         &mut stream,
         ClientCommand::AddProvider {
-            provider: provider_view("anthropic"),
+            provider: provider_view("custom-anthropic"),
         },
     )
     .await
@@ -73,14 +75,17 @@ async fn stream_dispatches_config_provider_commands() {
         panic!("patch operation should include patched config result");
     };
     assert_eq!(operation_config, &patched_config);
-    assert_eq!(patched_config.providers.len(), 1);
-    assert!(patched_config.providers.contains_key("anthropic"));
+    assert_eq!(
+        patched_config.providers.len(),
+        initial_config.providers.len() + 1
+    );
+    assert!(patched_config.providers.contains_key("custom-anthropic"));
     assert_ne!(patched_config.etag, initial_config.etag);
 
     let duplicate_error = dispatch_stream_command(
         &mut stream,
         ClientCommand::AddProvider {
-            provider: provider_view("anthropic"),
+            provider: provider_view("custom-anthropic"),
         },
     )
     .await

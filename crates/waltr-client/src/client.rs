@@ -589,11 +589,30 @@ impl Client {
                 "runtime default model id cannot be empty when provider is set",
             ));
         }
-        if !provider.models.contains_key(&defaults.model_key) {
-            return Err(ClientError::new(format!(
+        let model = provider.models.get(&defaults.model_key).ok_or_else(|| {
+            ClientError::new(format!(
                 "runtime default model '{}' not found in provider '{}'",
                 defaults.model_key, defaults.provider_key
-            )));
+            ))
+        })?;
+        if let Some(effort) = defaults
+            .reasoning_effort
+            .as_ref()
+            .map(|effort| effort.trim())
+            .filter(|effort| !effort.is_empty())
+        {
+            let supported = model.options.as_ref().is_some_and(|options| {
+                options
+                    .reasoning_efforts
+                    .iter()
+                    .any(|value| value == effort)
+            });
+            if !supported {
+                return Err(ClientError::new(format!(
+                    "runtime default reasoning effort '{effort}' not found in model '{}' for provider '{}'",
+                    defaults.model_key, defaults.provider_key
+                )));
+            }
         }
         for key in &defaults.enabled_mcp_server_keys {
             if !config.mcp_servers.contains_key(key) {

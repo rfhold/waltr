@@ -8,7 +8,9 @@ async fn grpc_executor_rejects_stale_etag() {
 
     let initial = client.load_config().await.expect("config should load");
     let initial_etag = initial.etag.clone();
-    assert!(initial.providers.is_empty());
+    assert!(initial.providers.contains_key("anthropic"));
+    assert!(initial.providers.contains_key("openai"));
+    assert!(initial.providers.contains_key("openai-codex"));
     assert!(!initial.etag.is_empty());
 
     let patch = config_with_provider("anthropic");

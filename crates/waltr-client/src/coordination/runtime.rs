@@ -96,6 +96,9 @@ pub enum ClientCommand {
         /// MCP server keys enabled for subsequent prompts.
         #[serde(rename = "enabledMcpServerKeys")]
         enabled_mcp_server_keys: Vec<String>,
+        /// Optional per-session reasoning effort.
+        #[serde(rename = "reasoningEffort")]
+        reasoning_effort: Option<String>,
     },
     /// Register current interest in session watch updates.
     RegisterSessionWatchInterest,
@@ -1022,12 +1025,14 @@ impl ClientStateStream {
                 provider_key,
                 model_id,
                 enabled_mcp_server_keys,
+                reasoning_effort,
             } => self.runtime.reducer.update_session_runtime_config(
                 id,
                 SessionRuntimeConfigRequest {
                     provider_key,
                     model_id,
                     enabled_mcp_server_keys,
+                    reasoning_effort,
                 },
             ),
             ClientCommand::RegisterSessionWatchInterest => {
