@@ -93,6 +93,9 @@ fn response_create_payload(
     if let Some(reasoning) = reasoning {
         create["reasoning"] = openai_reasoning(reasoning);
     }
+    if let Some(system_prompt) = request.system_prompt {
+        create["instructions"] = json!(system_prompt);
+    }
     create
 }
 
@@ -142,8 +145,6 @@ impl LlmStream for OpenAiResponsesWebSocket {
                 Some(tls_connector()?),
             )
             .await?;
-            // The projected turn payload; connection negotiation stays out of
-            // the projection.
             let create = response_create_payload(&self.model, self.reasoning.as_ref(), &request);
             websocket
                 .send(Message::Text(create.to_string().into()))
@@ -204,5 +205,24 @@ impl LlmStream for OpenAiResponsesWebSocket {
                 },
             )) as BoxCompletionStream)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::stream::CompletionRequest;
+
+    use super::response_create_payload;
+
+    #[test]
+    fn response_create_payload_uses_instructions_for_system_prompt() {
+        let mut request = CompletionRequest::new("hello");
+        request.system_prompt = Some("system text");
+
+        let payload = response_create_payload("gpt-test", None, &request);
+
+        assert_eq!(payload["instructions"], "system text");
+        assert_eq!(payload["input"][0]["role"], "user");
+        assert_eq!(payload["input"].as_array().expect("input array").len(), 1);
     }
 }

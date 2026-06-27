@@ -25,8 +25,8 @@ pub(super) async fn send_request(
             provider.thinking.as_ref(),
             &request,
         ));
-    if !provider.api_key.is_empty() {
-        request_builder = request_builder.header("x-api-key", &provider.api_key);
+    for (name, value) in &provider.headers {
+        request_builder = request_builder.header(*name, value);
     }
     let response = request_builder.send().await?;
 

@@ -6,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
+
 use crate::Result;
 
 use super::{
@@ -92,7 +95,8 @@ impl FilesystemConfig {
 
     fn glob_path(input: &GlobInput, base: &Path) -> Result<String> {
         let mut matches = Vec::new();
-        Self::collect_glob_matches(base, base, &input.pattern, &mut matches)?;
+        let pattern = glob_pattern(&input.pattern)?;
+        Self::collect_glob_matches(base, &pattern, &mut matches)?;
         matches.sort();
         if matches.is_empty() {
             return Ok("No files found".to_owned());
@@ -122,10 +126,11 @@ impl FilesystemConfig {
 
     fn grep_path(input: &GrepInput, base: &Path) -> Result<String> {
         let mut matches = Vec::new();
+        let include = input.include.as_deref().map(glob_pattern).transpose()?;
         let search = GrepSearch {
             base,
             pattern: &input.pattern,
-            include: input.include.as_deref(),
+            include: include.as_ref(),
         };
         Self::collect_grep_matches(base, &search, &mut matches)?;
         matches.sort_by(|left, right| {
@@ -255,24 +260,25 @@ impl FilesystemConfig {
     }
 
     fn collect_glob_matches(
-        directory: &Path,
         base: &Path,
-        pattern: &str,
+        pattern: &GlobSet,
         matches: &mut Vec<PathBuf>,
     ) -> Result<()> {
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                Self::collect_glob_matches(&path, base, pattern, matches)?;
+        for entry in WalkBuilder::new(base).standard_filters(true).build() {
+            let entry = entry.map_err(|error| filesystem_error(error.to_string()))?;
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
                 continue;
             }
 
+            let path = entry.path();
             let relative = path
                 .strip_prefix(base)
                 .map_err(|error| filesystem_error(error.to_string()))?;
-            if glob_matches(pattern, relative) {
-                matches.push(path);
+            if pattern.is_match(relative) {
+                matches.push(path.to_path_buf());
             }
         }
 
@@ -289,14 +295,15 @@ impl FilesystemConfig {
             return Ok(());
         }
 
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                Self::collect_grep_matches(&path, search, matches)?;
+        for entry in WalkBuilder::new(directory).standard_filters(true).build() {
+            let entry = entry.map_err(|error| filesystem_error(error.to_string()))?;
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
                 continue;
             }
-            Self::collect_file_grep_matches(&path, search, matches)?;
+            Self::collect_file_grep_matches(entry.path(), search, matches)?;
         }
 
         Ok(())
@@ -313,7 +320,7 @@ impl FilesystemConfig {
         let relative = include_relative_path(path, search.base)?;
         if search
             .include
-            .is_some_and(|include| !glob_matches(include, relative))
+            .is_some_and(|include| !include.is_match(relative))
         {
             return Ok(());
         }
@@ -330,60 +337,12 @@ impl FilesystemConfig {
     }
 }
 
-pub(super) fn glob_matches(pattern: &str, path: &Path) -> bool {
-    let pattern = pattern.replace('\\', "/");
-    let path = path.to_string_lossy().replace('\\', "/");
-    glob_segments_match(
-        &pattern.split('/').collect::<Vec<_>>(),
-        &path.split('/').collect::<Vec<_>>(),
-    )
-}
-
-fn glob_segments_match(pattern: &[&str], path: &[&str]) -> bool {
-    match (pattern.split_first(), path.split_first()) {
-        (None, None) => true,
-        (Some((&"**", remaining_pattern)), _) => {
-            glob_segments_match(remaining_pattern, path)
-                || path
-                    .split_first()
-                    .is_some_and(|(_, remaining_path)| glob_segments_match(pattern, remaining_path))
-        }
-        (Some((pattern_segment, remaining_pattern)), Some((path_segment, remaining_path))) => {
-            glob_segment_match(pattern_segment, path_segment)
-                && glob_segments_match(remaining_pattern, remaining_path)
-        }
-        (None, Some(_)) | (Some(_), None) => false,
-    }
-}
-
-fn glob_segment_match(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let mut remaining = value;
-    let mut parts = pattern.split('*').peekable();
-    let Some(first) = parts.next() else {
-        return value.is_empty();
-    };
-
-    if !remaining.starts_with(first) {
-        return false;
-    }
-    remaining = &remaining[first.len()..];
-
-    while let Some(part) = parts.next() {
-        if part.is_empty() {
-            continue;
-        }
-        let Some(index) = remaining.find(part) else {
-            return false;
-        };
-        remaining = &remaining[index + part.len()..];
-        if parts.peek().is_none() && !pattern.ends_with('*') && !remaining.is_empty() {
-            return false;
-        }
-    }
-
-    pattern.ends_with('*') || remaining.is_empty()
+fn glob_pattern(pattern: &str) -> Result<GlobSet> {
+    let glob = Glob::new(&pattern.replace('\\', "/"))
+        .map_err(|error| filesystem_error(error.to_string()))?;
+    let mut builder = GlobSetBuilder::new();
+    builder.add(glob);
+    builder
+        .build()
+        .map_err(|error| filesystem_error(error.to_string()))
 }

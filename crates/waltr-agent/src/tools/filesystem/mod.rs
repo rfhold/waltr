@@ -260,6 +260,23 @@ mod tests {
     }
 
     #[test]
+    fn glob_ignores_gitignored_files() {
+        let temp = TempRoot::new();
+        temp.write(".git/HEAD", "ref: refs/heads/main\n");
+        temp.write(".gitignore", "ignored/\n");
+        temp.write("visible.txt", "");
+        temp.write("ignored/hidden.txt", "");
+        let config = FilesystemConfig::new(temp.path());
+
+        assert_eq!(
+            config
+                .glob(&GlobInput::new("**/*.txt"))
+                .expect("glob files"),
+            temp.path().join("visible.txt").display().to_string()
+        );
+    }
+
+    #[test]
     fn grep_returns_opencode_match_output() {
         let temp = TempRoot::new();
         temp.write("a.txt", "alpha\nbeta\n");
@@ -272,6 +289,43 @@ mod tests {
                 "Found 2 matches\n{}:\n  Line 1: alpha\n{}:\n  Line 2: alpha beta",
                 temp.path().join("a.txt").display(),
                 temp.path().join("nested/b.txt").display()
+            )
+        );
+    }
+
+    #[test]
+    fn grep_ignores_gitignored_files() {
+        let temp = TempRoot::new();
+        temp.write(".git/HEAD", "ref: refs/heads/main\n");
+        temp.write(".gitignore", "ignored/\n");
+        temp.write("visible.txt", "alpha\n");
+        temp.write("ignored/hidden.txt", "alpha\n");
+        let config = FilesystemConfig::new(temp.path());
+
+        assert_eq!(
+            config.grep(&GrepInput::new("alpha")).expect("grep files"),
+            format!(
+                "Found 1 matches\n{}:\n  Line 1: alpha",
+                temp.path().join("visible.txt").display()
+            )
+        );
+    }
+
+    #[test]
+    fn grep_searches_explicit_gitignored_file() {
+        let temp = TempRoot::new();
+        temp.write(".git/HEAD", "ref: refs/heads/main\n");
+        temp.write(".gitignore", "ignored/\n");
+        temp.write("ignored/hidden.txt", "alpha\n");
+        let config = FilesystemConfig::new(temp.path());
+
+        assert_eq!(
+            config
+                .grep(&GrepInput::new("alpha").with_path("ignored/hidden.txt"))
+                .expect("grep explicit ignored file"),
+            format!(
+                "Found 1 matches\n{}:\n  Line 1: alpha",
+                temp.path().join("ignored/hidden.txt").display()
             )
         );
     }
