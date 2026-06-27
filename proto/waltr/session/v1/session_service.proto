@@ -240,6 +240,7 @@ message SessionRuntimeConfigRequest {
   string provider_key = 1;
   string model_id = 2;
   repeated string enabled_mcp_server_keys = 3;
+  optional string reasoning_effort = 4;
 }
 
 message SessionProviderRuntime {
@@ -248,6 +249,7 @@ message SessionProviderRuntime {
   string url = 3;
   string model_id = 4;
   RuntimeConfigMatch match = 5;
+  optional string reasoning_effort = 6;
 }
 
 message SessionMcpServerRuntime {

@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package waltr.catalog.v1;
+
+import "waltr/config/v1/config_service.proto";
+
+service CatalogService {
+  rpc SearchCatalogModels(SearchCatalogModelsRequest) returns (SearchCatalogModelsResponse);
+  rpc SuggestCatalogMatches(SuggestCatalogMatchesRequest) returns (SuggestCatalogMatchesResponse);
+  rpc GetModelCatalogDrift(GetModelCatalogDriftRequest) returns (GetModelCatalogDriftResponse);
+  rpc SetModelCatalogMatch(SetModelCatalogMatchRequest) returns (SetModelCatalogMatchResponse);
+  rpc ApplyCatalogModelDefaults(ApplyCatalogModelDefaultsRequest) returns (ApplyCatalogModelDefaultsResponse);
+}
+
+message CatalogModelRef {
+  string provider_id = 1;
+  string model_id = 2;
+}
+
+message CatalogModelSummary {
+  CatalogModelRef model = 1;
+  string provider_name = 2;
+  string model_name = 3;
+  optional string family = 4;
+  optional string status = 5;
+  CatalogModelLimitsSummary limits = 6;
+  CatalogModelCostSummary cost = 7;
+  CatalogModelCapabilitySummary capabilities = 8;
+  CatalogModelReasoningSummary reasoning = 9;
+}
+
+message CatalogModelLimitsSummary {
+  optional uint32 context = 1;
+  optional uint32 output = 2;
+}
+
+message CatalogModelCostSummary {
+  optional double input_per_million_tokens = 1;
+  optional double output_per_million_tokens = 2;
+  string currency = 3;
+}
+
+message CatalogModelCapabilitySummary {
+  bool tools = 1;
+  bool image = 2;
+  bool audio = 3;
+}
+
+message CatalogModelReasoningSummary {
+  bool supported = 1;
+  optional string effort = 2;
+  repeated string efforts = 3;
+}
+
+message CatalogMatch {
+  CatalogModelRef model = 1;
+  string provider_name = 2;
+  string model_name = 3;
+  CatalogMatchConfidence confidence = 4;
+  repeated string reasons = 5;
+  CatalogModelRef upstream_model = 6;
+}
+
+enum CatalogMatchConfidence {
+  CATALOG_MATCH_CONFIDENCE_UNSPECIFIED = 0;
+  CATALOG_MATCH_CONFIDENCE_EXACT = 1;
+  CATALOG_MATCH_CONFIDENCE_HIGH = 2;
+  CATALOG_MATCH_CONFIDENCE_SUGGESTED = 3;
+}
+
+message CatalogDriftField {
+  string field = 1;
+  string configured = 2;
+  string catalog = 3;
+  CatalogDriftSeverity severity = 4;
+}
+
+enum CatalogDriftSeverity {
+  CATALOG_DRIFT_SEVERITY_UNSPECIFIED = 0;
+  CATALOG_DRIFT_SEVERITY_INFO = 1;
+  CATALOG_DRIFT_SEVERITY_WARNING = 2;
+  CATALOG_DRIFT_SEVERITY_ACTIONABLE = 3;
+}
+
+enum CatalogDefaultField {
+  CATALOG_DEFAULT_FIELD_UNSPECIFIED = 0;
+  CATALOG_DEFAULT_FIELD_NAME = 1;
+  CATALOG_DEFAULT_FIELD_TYPE = 2;
+  CATALOG_DEFAULT_FIELD_LIMITS = 3;
+  CATALOG_DEFAULT_FIELD_CAPABILITIES = 4;
+}
+
+message SearchCatalogModelsRequest {
+  string query = 1;
+  string provider_id = 2;
+  uint32 limit = 3;
+}
+
+message SearchCatalogModelsResponse {
+  repeated CatalogModelSummary models = 1;
+  bool stale = 2;
+}
+
+message SuggestCatalogMatchesRequest {
+  string provider_key = 1;
+  string model_key = 2;
+  uint32 limit = 3;
+}
+
+message SuggestCatalogMatchesResponse {
+  repeated CatalogMatch matches = 1;
+  bool stale = 2;
+}
+
+message GetModelCatalogDriftRequest {
+  string provider_key = 1;
+  string model_key = 2;
+}
+
+message GetModelCatalogDriftResponse {
+  repeated CatalogDriftField fields = 1;
+  bool stale = 2;
+  waltr.config.v1.ModelCatalogMatch catalog_match = 3;
+}
+
+message SetModelCatalogMatchRequest {
+  string expected_etag = 1;
+  string provider_key = 2;
+  string model_key = 3;
+  waltr.config.v1.ModelCatalogMatch catalog_match = 4;
+  bool clear_match = 5;
+}
+
+message SetModelCatalogMatchResponse {
+  waltr.config.v1.Configuration config = 1;
+}
+
+message ApplyCatalogModelDefaultsRequest {
+  string expected_etag = 1;
+  string provider_key = 2;
+  string model_key = 3;
+  waltr.config.v1.ModelCatalogMatch catalog_match = 4;
+  repeated CatalogDefaultField fields = 5;
+}
+
+message ApplyCatalogModelDefaultsResponse {
+  waltr.config.v1.Configuration config = 1;
+}

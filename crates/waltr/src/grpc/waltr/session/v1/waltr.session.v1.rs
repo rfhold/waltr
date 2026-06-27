@@ -276,6 +276,8 @@ pub struct SessionRuntimeConfigRequest {
     pub model_id: ::prost::alloc::string::String,
     #[prost(string, repeated, tag="3")]
     pub enabled_mcp_server_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub reasoning_effort: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionProviderRuntime {
@@ -289,6 +291,8 @@ pub struct SessionProviderRuntime {
     pub model_id: ::prost::alloc::string::String,
     #[prost(enumeration="RuntimeConfigMatch", tag="5")]
     pub r#match: i32,
+    #[prost(string, optional, tag="6")]
+    pub reasoning_effort: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionMcpServerRuntime {
