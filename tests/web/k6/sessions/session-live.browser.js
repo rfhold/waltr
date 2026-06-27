@@ -1,7 +1,7 @@
 import { check, sleep } from "k6";
 
 import { baseUrl, options as browserOptions, withPage } from "../support/browser.js";
-import { typeAndKeepFocus, waitForPathname, waitForText } from "../support/checks.js";
+import { typeAndKeepFocus, waitForPathname, waitForSelectOption, waitForText } from "../support/checks.js";
 import { includesText, normalizeWhitespace } from "../support/text.js";
 
 export const options = browserOptions;
@@ -62,14 +62,18 @@ async function seedGatewayProvider(page) {
 
   await page.locator('a[href="/config/defaults"]').click();
   await waitForText(page, "#runtime-defaults-title", "New session defaults");
+  await waitForSelectOption(page, "#runtime-default-provider", "gateway-openai");
   await setSelectValue(page, "#runtime-default-provider", "gateway-openai");
+  await waitForSelectOption(page, "#runtime-default-model", GATEWAY_MODEL);
   await setSelectValue(page, "#runtime-default-model", GATEWAY_MODEL);
   await submitForm(page, 'section[aria-labelledby="runtime-defaults-title"] form');
   await waitForText(page, 'section[aria-labelledby="runtime-defaults-title"]', "Clear defaults");
 }
 
 async function createProvider(page, name, model) {
-  await page.locator(".config__actions button").click();
+  await page.goto(`${baseUrl}/config/provider`, { waitUntil: "domcontentloaded" });
+  await waitForPathname(page, "/config/provider");
+  await page.locator('[aria-label="Provider actions"] button').click();
   await typeAndKeepFocus(page, 'form[aria-label="Create provider"] input[name="name"]', name);
   await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAi");
   await setInputValue(page, 'form[aria-label="Create provider"] input[name="url"]', GATEWAY_BASE_URL);

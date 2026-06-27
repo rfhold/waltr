@@ -1,10 +1,13 @@
 import { check } from "k6";
 
 import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
-import { typeAndKeepFocus, waitForPathname, waitForText } from "../support/checks.js";
+import { typeAndKeepFocus, waitForPathname, waitForSelectOption, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
 export const options = browserOptions;
+
+const PROVIDER = "defaults-openai";
+const MODEL = "gpt-5-nano";
 
 export default async function () {
   await withPage(async (page) => {
@@ -13,21 +16,21 @@ export default async function () {
 
     await page.locator('a[href="/config/provider"]').click();
     await waitForText(page, "#config-title", "Settings");
-    await page.locator(".config__actions button").click();
-    await typeAndKeepFocus(page, 'form[aria-label="Create provider"] input[name="name"]', "openai");
+    await page.locator('[aria-label="Provider actions"] button').click();
+    await typeAndKeepFocus(page, 'form[aria-label="Create provider"] input[name="name"]', PROVIDER);
     await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAi");
     await setInputValue(page, 'form[aria-label="Create provider"] input[name="url"]', "https://api.openai.com");
 
-    const modelsSelector = '[aria-label="Models for openai"]';
+    const modelsSelector = `[aria-label="Models for ${PROVIDER}"]`;
     await page.locator(`${modelsSelector} [aria-label="Model actions"] button`).click();
     await waitForPathname(page, "/config/provider/create/models/create");
-    await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="key"]', "gpt4o");
-    await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="name"]', "GPT-4o");
+    await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="key"]', MODEL);
+    await typeAndKeepFocus(page, 'form[aria-label="Create model"] input[name="name"]', "GPT-5 Nano");
     await page.locator('form[aria-label="Create model"] select[name="kind"]').selectOption("llm");
     await submitForm(page, 'form[aria-label="Create model"]');
-    await waitForText(page, modelsSelector, "GPT-4o");
+    await waitForText(page, modelsSelector, "GPT-5 Nano");
     await submitForm(page, 'form[aria-label="Create provider"]');
-    await waitForText(page, '[aria-label="Provider list"]', "openai");
+    await waitForText(page, '[aria-label="Provider list"]', PROVIDER);
 
     await page.locator('a[href="/config/mcp"]').click();
     await waitForPathname(page, "/config/mcp");
@@ -40,8 +43,11 @@ export default async function () {
     await page.locator('a[href="/config/defaults"]').click();
     const defaultsRoute = await waitForPathname(page, "/config/defaults");
     await waitForText(page, "#runtime-defaults-title", "New session defaults");
-    await setSelectValue(page, "#runtime-default-provider", "openai");
-    await setSelectValue(page, "#runtime-default-model", "gpt4o");
+    await waitForSelectOption(page, "#runtime-default-provider", PROVIDER);
+    await setSelectValue(page, "#runtime-default-provider", PROVIDER);
+    await waitForSelectOption(page, "#runtime-default-model", MODEL);
+    await setSelectValue(page, "#runtime-default-model", MODEL);
+    await waitForText(page, '[aria-label="Explicit MCP defaults"]', "localstdio");
     await setExplicitMcpDefault(page, "localstdio", true);
     const explicitDefaults = await waitForText(page, '[aria-label="Explicit MCP defaults"]', "localstdio");
     await screenshot(page, "config-defaults-explicit-mcp");

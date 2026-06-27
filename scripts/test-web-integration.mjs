@@ -18,6 +18,7 @@ const webPort = await getFreePort();
 const serverUrl = `http://127.0.0.1:${serverPort}`;
 const webUrl = `http://127.0.0.1:${webPort}`;
 const dockerWebUrl = `http://${getHostAddress()}:${webPort}`;
+const modelsDevFixture = `${repoRoot}/tests/web/k6/support/models-dev-api.fixture.json`;
 const screenshotsEnabled = process.env.WALTR_WEB_SCREENSHOTS === "1";
 const screenshotsUpdate = process.env.WALTR_WEB_UPDATE_SCREENSHOTS === "1";
 const liveEnabled = process.env.WALTR_WEB_LIVE === "1";
@@ -60,7 +61,10 @@ try {
 
   startLogged("server", `${repoRoot}/target/debug/waltr-server`, [], {
     cwd: serverRoot,
-    env: { WALTR_SERVER_ADDR: `127.0.0.1:${serverPort}` },
+    env: {
+      WALTR_SERVER_ADDR: `127.0.0.1:${serverPort}`,
+      WALTR_MODELS_DEV_PATH: modelsDevFixture,
+    },
   });
   await waitForHttp(`${serverUrl}/health`, "server");
 

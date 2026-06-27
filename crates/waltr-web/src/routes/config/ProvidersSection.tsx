@@ -16,11 +16,13 @@ import { ActionList, ActionRow, ConfirmAction, Dialog, Field, InlineAlert } from
 import type {
   ClientCommand,
   ConfigView,
+  ModelCatalogMatchView,
   ModelTypeView,
   ModelView,
   ProviderKindView,
   ProviderView,
 } from "../../generated/waltr-client";
+import type { CatalogMatch, CatalogModelSummary } from "../../wasm/client";
 
 type FormMode = "create" | "edit";
 
@@ -31,6 +33,8 @@ type ProviderForm = {
   kind: ProviderKindView;
   url: string;
   headers: ProviderView["headers"];
+  oauthCompatible: boolean;
+  oauthSettings: ProviderView["oauthSettings"];
   models: ProviderView["models"];
 };
 
@@ -54,10 +58,12 @@ type ModelForm = {
   minP: string;
   presencePenalty: string;
   repetitionPenalty: string;
+  reasoningEfforts: string;
   context: string;
   output: string;
   tools: boolean;
   image: boolean;
+  catalogMatch: ModelView["catalogMatch"];
 };
 
 type ProvidersSectionState = {
@@ -313,6 +319,7 @@ export function ConfigModelCreateRoute() {
       {(_draft) => (
         <ModelFormPanel
           form={{ mode: "create" }}
+          providerKey={providerKeyForDraft(_draft)}
           onCancel={section.closeModelForm}
           onSubmit={async (form) => section.stageModelSave(form)}
           pending={section.operationPending()}
@@ -342,6 +349,7 @@ export function ConfigModelEditRoute() {
       {(modelForm) => (
         <ModelFormPanel
           form={modelForm}
+          providerKey={providerKeyForDraft(section.currentProviderDraft())}
           onCancel={section.closeModelForm}
           onSubmit={async (form) => section.stageModelSave(form)}
           pending={section.operationPending()}
@@ -482,17 +490,53 @@ function ProviderFormPanel(props: {
 
 function ModelFormPanel(props: {
   form: ModelActiveForm;
+  providerKey: string;
   onCancel: () => void;
   onSubmit: (form: ModelForm) => Promise<void>;
   pending: boolean;
 }) {
+  const app = useAppState();
   const [form, setForm] = createSignal(initialModelForm(props.form));
+  const [catalogQuery, setCatalogQuery] = createSignal("");
+  const [catalogStale, setCatalogStale] = createSignal(false);
+  const [catalogError, setCatalogError] = createSignal<string>();
+  const [catalogMatches, setCatalogMatches] = createSignal<CatalogMatch[]>([]);
+  const [catalogResults, setCatalogResults] = createSignal<CatalogModelSummary[]>([]);
   const update = (patch: Partial<ModelForm>) => setForm({ ...form(), ...patch });
   const title = () => form().mode === "create" ? "Create model" : "Edit model";
   const typeMissing = createMemo(() => {
     const kind = form().kind;
     return kind === "" || kind === "unspecified";
   });
+  const currentCatalogMatch = createMemo(() => form().catalogMatch);
+  const suggestCatalogMatches = async () => {
+    setCatalogError(undefined);
+    const response = await app.suggestCatalogMatches({ providerKey: props.providerKey, modelKey: form().key });
+    setCatalogStale(response.stale);
+    setCatalogMatches(response.matches);
+  };
+  const searchCatalog = async () => {
+    setCatalogError(undefined);
+    const response = await app.searchCatalogModels({ query: catalogQuery() });
+    setCatalogStale(response.stale);
+    setCatalogResults(response.models);
+  };
+  const runCatalogAction = (action: () => Promise<void>) => {
+    action().catch((error) => setCatalogError(errorMessage(error)));
+  };
+  const clearCatalogResults = () => {
+    setCatalogMatches([]);
+    setCatalogResults([]);
+  };
+  const applySuggestedMatch = (match: CatalogMatch) => {
+    update({ catalogMatch: catalogMatchFromMatch(match, "manual") });
+    clearCatalogResults();
+  };
+  const applyCatalogModel = (model: CatalogModelSummary) => {
+    update(modelFormWithCatalogModel(form(), model));
+    setCatalogQuery("");
+    clearCatalogResults();
+  };
 
   return (
     <Dialog title={title()} onClose={props.onCancel} class="panel config__form config__model-dialog">
@@ -528,38 +572,115 @@ function ModelFormPanel(props: {
             </select>
           )}
         </Field>
-        <Field id="model-temperature" label="Temperature">
-          {(field) => <input name="temperature" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().temperature} onInput={(event) => update({ temperature: event.currentTarget.value })} />}
-        </Field>
-        <Field id="model-top-p" label="Top P">
-          {(field) => <input name="topP" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().topP} onInput={(event) => update({ topP: event.currentTarget.value })} />}
-        </Field>
-        <Field id="model-top-k" label="Top K">
-          {(field) => <input name="topK" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().topK} onInput={(event) => update({ topK: event.currentTarget.value })} />}
-        </Field>
-        <Field id="model-min-p" label="Min P">
-          {(field) => <input name="minP" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().minP} onInput={(event) => update({ minP: event.currentTarget.value })} />}
-        </Field>
-        <Field id="model-presence-penalty" label="Presence penalty">
-          {(field) => <input name="presencePenalty" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().presencePenalty} onInput={(event) => update({ presencePenalty: event.currentTarget.value })} />}
-        </Field>
-        <Field id="model-repetition-penalty" label="Repetition penalty">
-          {(field) => <input name="repetitionPenalty" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().repetitionPenalty} onInput={(event) => update({ repetitionPenalty: event.currentTarget.value })} />}
-        </Field>
-        <Field id="model-context" label="Context limit">
-          {(field) => <input name="context" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().context} onInput={(event) => update({ context: event.currentTarget.value })} />}
-        </Field>
-        <Field id="model-output" label="Output limit">
-          {(field) => <input name="output" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().output} onInput={(event) => update({ output: event.currentTarget.value })} />}
-        </Field>
-        <label class="config__form-checkbox">
-          <input name="tools" type="checkbox" checked={form().tools} onChange={(event) => update({ tools: event.currentTarget.checked })} />
-          <span>Supports tools</span>
-        </label>
-        <label class="config__form-checkbox">
-          <input name="image" type="checkbox" checked={form().image} onChange={(event) => update({ image: event.currentTarget.checked })} />
-          <span>Supports image input</span>
-        </label>
+        <section class="catalog-panel" aria-label="Model catalog">
+          <header class="catalog-panel__header">
+            <div>
+              <h3>Catalog match</h3>
+              <p>Use catalog facts to fill limits, reasoning, and capabilities.</p>
+            </div>
+            <button type="button" onClick={() => runCatalogAction(suggestCatalogMatches)}>Suggest</button>
+          </header>
+          <div class="catalog-panel__current" aria-label="Current catalog match">
+            <span class="catalog-panel__current-label">Current</span>
+            <Show when={currentCatalogMatch()} fallback={<span class="catalog-panel__chip catalog-panel__chip--empty">No match</span>}>
+              {(match) => (
+                <span class="catalog-panel__match">
+                  <code>{match().providerId}/{match().modelId}</code>
+                  <Show when={match().upstreamProviderId && match().upstreamModelId}>
+                    <span class="catalog-panel__match-upstream">
+                      upstream <code>{match().upstreamProviderId}/{match().upstreamModelId}</code>
+                    </span>
+                  </Show>
+                </span>
+              )}
+            </Show>
+            <Show when={currentCatalogMatch()}>
+              <button type="button" class="catalog-panel__clear" onClick={() => update({ catalogMatch: null })}>Clear</button>
+            </Show>
+          </div>
+          <Show when={catalogStale()}>
+            <p class="catalog-panel__notice">Catalog data is from a stale cache.</p>
+          </Show>
+          <Show when={catalogError()}>
+            {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
+          </Show>
+          <Show when={catalogMatches().length > 0}>
+            <div class="catalog-panel__results-group">
+              <p>Suggested matches</p>
+              <div class="catalog-panel__results" aria-label="Suggested catalog matches">
+                <For each={catalogMatches()}>
+                  {(match) => (
+                    <button type="button" class="catalog-panel__result" onClick={() => applySuggestedMatch(match)}>
+                      <strong>{match.modelName || match.model!.modelId}</strong>
+                      <code>{match.model!.providerId}/{match.model!.modelId}</code>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </div>
+          </Show>
+          <div class="catalog-panel__search">
+            <Field id="model-catalog-search" label="Search catalog">
+              {(field) => <input name="catalogSearch" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} value={catalogQuery()} onInput={(event) => setCatalogQuery(event.currentTarget.value)} />}
+            </Field>
+            <button type="button" onClick={() => runCatalogAction(searchCatalog)}>Search</button>
+          </div>
+          <Show when={catalogResults().length > 0}>
+            <div class="catalog-panel__results-group">
+              <p>Search results</p>
+              <div class="catalog-panel__results" aria-label="Catalog search results">
+                <For each={catalogResults()}>
+                  {(model) => (
+                    <button type="button" class="catalog-panel__result" onClick={() => applyCatalogModel(model)}>
+                      <strong>{model.modelName || model.model!.modelId}</strong>
+                      <code>{model.model!.providerId}/{model.model!.modelId}</code>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </div>
+          </Show>
+        </section>
+        <details class="config__advanced">
+          <summary>Advanced model options</summary>
+          <div class="config__advanced-grid">
+            <Field id="model-temperature" label="Temperature">
+              {(field) => <input name="temperature" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().temperature} onInput={(event) => update({ temperature: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-top-p" label="Top P">
+              {(field) => <input name="topP" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().topP} onInput={(event) => update({ topP: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-top-k" label="Top K">
+              {(field) => <input name="topK" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().topK} onInput={(event) => update({ topK: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-min-p" label="Min P">
+              {(field) => <input name="minP" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().minP} onInput={(event) => update({ minP: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-presence-penalty" label="Presence penalty">
+              {(field) => <input name="presencePenalty" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().presencePenalty} onInput={(event) => update({ presencePenalty: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-repetition-penalty" label="Repetition penalty">
+              {(field) => <input name="repetitionPenalty" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().repetitionPenalty} onInput={(event) => update({ repetitionPenalty: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-reasoning-efforts" label="Reasoning efforts" hint="Comma-separated levels available for per-session thinking, for example low, medium, high.">
+              {(field) => <input name="reasoningEfforts" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} value={form().reasoningEfforts} onInput={(event) => update({ reasoningEfforts: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-context" label="Context limit">
+              {(field) => <input name="context" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().context} onInput={(event) => update({ context: event.currentTarget.value })} />}
+            </Field>
+            <Field id="model-output" label="Output limit">
+              {(field) => <input name="output" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="number" step="any" value={form().output} onInput={(event) => update({ output: event.currentTarget.value })} />}
+            </Field>
+            <label class="config__form-checkbox">
+              <input name="tools" type="checkbox" checked={form().tools} onChange={(event) => update({ tools: event.currentTarget.checked })} />
+              <span>Supports tools</span>
+            </label>
+            <label class="config__form-checkbox">
+              <input name="image" type="checkbox" checked={form().image} onChange={(event) => update({ image: event.currentTarget.checked })} />
+              <span>Supports image input</span>
+            </label>
+          </div>
+        </details>
         <div class="config__form-actions">
           <button type="submit" disabled={props.pending || typeMissing()}>Save</button>
           <button type="button" disabled={props.pending} onClick={props.onCancel}>Cancel</button>
@@ -571,7 +692,7 @@ function ModelFormPanel(props: {
 
 function initialProviderForm(form: ActiveForm): ProviderForm {
   if (form.mode === "create") {
-    return { mode: "create", name: "", kind: "anthropic", url: "", headers: {}, models: {} };
+    return { mode: "create", name: "", kind: "anthropic", url: "", headers: {}, oauthCompatible: false, oauthSettings: null, models: {} };
   }
 
   return providerToForm(form.providerName, form.provider);
@@ -585,6 +706,8 @@ function providerToForm(providerName: string, provider: ProviderView): ProviderF
     kind: provider.kind,
     url: provider.url,
     headers: provider.headers,
+    oauthCompatible: provider.oauthCompatible,
+    oauthSettings: provider.oauthSettings,
     models: provider.models ?? {},
   };
 }
@@ -661,6 +784,8 @@ function formToProvider(form: ProviderForm): ProviderView {
     name: form.name,
     url: form.url,
     headers: form.headers,
+    oauthCompatible: form.oauthCompatible,
+    oauthSettings: form.oauthSettings,
     models: form.models ?? {},
   };
 }
@@ -681,6 +806,10 @@ function providerFormBasePath(form: ProviderForm | undefined) {
   }
 
   return `/config/provider/edit/${encodeURIComponent(form.originalName ?? form.name)}`;
+}
+
+function providerKeyForDraft(form: ProviderForm | undefined) {
+  return form?.originalName ?? form?.name ?? "";
 }
 
 function providerFormWithModel(providerForm: ProviderForm, modelForm: ModelForm): ProviderForm {
@@ -705,10 +834,12 @@ function initialModelForm(form: ModelActiveForm): ModelForm {
       minP: "",
       presencePenalty: "",
       repetitionPenalty: "",
+      reasoningEfforts: "",
       context: "",
       output: "",
       tools: false,
       image: false,
+      catalogMatch: null,
     };
   }
 
@@ -725,10 +856,12 @@ function initialModelForm(form: ModelActiveForm): ModelForm {
     minP: numberToInput(model.options.minP),
     presencePenalty: numberToInput(model.options.presencePenalty),
     repetitionPenalty: numberToInput(model.options.repetitionPenalty),
+    reasoningEfforts: model.options.reasoningEfforts.join(", "),
     context: numberToInput(model.limits.context),
     output: numberToInput(model.limits.output),
     tools: model.capabilities.tools,
     image: model.capabilities.image,
+    catalogMatch: model.catalogMatch,
   };
 }
 
@@ -756,6 +889,7 @@ function formToModel(form: ModelForm): ModelView {
       minP: inputToNumber(form.minP),
       presencePenalty: inputToNumber(form.presencePenalty),
       repetitionPenalty: inputToNumber(form.repetitionPenalty),
+      reasoningEfforts: splitReasoningEfforts(form.reasoningEfforts),
     },
     limits: {
       context: inputToNumber(form.context),
@@ -765,7 +899,76 @@ function formToModel(form: ModelForm): ModelView {
       tools: form.tools,
       image: form.image,
     },
+    catalogMatch: form.catalogMatch,
   };
+}
+
+function splitReasoningEfforts(value: string): string[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function catalogMatchFromMatch(match: CatalogMatch, source: ModelCatalogMatchView["source"]): ModelCatalogMatchView {
+  return {
+    providerId: match.model!.providerId,
+    modelId: match.model!.modelId,
+    upstreamProviderId: match.upstreamModel?.providerId ?? null,
+    upstreamModelId: match.upstreamModel?.modelId ?? null,
+    source,
+  };
+}
+
+function catalogMatchFromSummary(model: CatalogModelSummary, source: ModelCatalogMatchView["source"]): ModelCatalogMatchView {
+  const upstream = upstreamModelFromCatalogModel(model);
+  return {
+    providerId: model.model!.providerId,
+    modelId: model.model!.modelId,
+    upstreamProviderId: upstream?.providerId ?? null,
+    upstreamModelId: upstream?.modelId ?? null,
+    source,
+  };
+}
+
+function upstreamModelFromCatalogModel(model: CatalogModelSummary) {
+  const slash = model.model!.modelId.indexOf("/");
+  if (slash <= 0 || slash === model.model!.modelId.length - 1) {
+    return undefined;
+  }
+
+  return {
+    providerId: model.model!.modelId.slice(0, slash),
+    modelId: model.model!.modelId.slice(slash + 1),
+  };
+}
+
+function modelFormWithCatalogModel(form: ModelForm, model: CatalogModelSummary): Partial<ModelForm> {
+  const patch: Partial<ModelForm> = {
+    catalogMatch: catalogMatchFromSummary(model, "applied"),
+  };
+
+  if (!form.name.trim()) {
+    patch.name = model.modelName;
+  }
+  if (form.kind === "" || form.kind === "unspecified") {
+    patch.kind = "llm";
+  }
+  if (!form.context.trim() && model.limits?.context !== null && model.limits?.context !== undefined) {
+    patch.context = String(model.limits.context);
+  }
+  if (!form.output.trim() && model.limits?.output !== null && model.limits?.output !== undefined) {
+    patch.output = String(model.limits.output);
+  }
+  if (!form.reasoningEfforts.trim() && model.reasoning?.efforts.length) {
+    patch.reasoningEfforts = model.reasoning.efforts.join(", ");
+  }
+  if (form.mode === "create") {
+    patch.tools = Boolean(model.capabilities?.tools);
+    patch.image = Boolean(model.capabilities?.image);
+  }
+
+  return patch;
 }
 
 function errorMessage(error: unknown) {

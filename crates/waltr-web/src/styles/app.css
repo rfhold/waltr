@@ -509,7 +509,8 @@
 }
 
 .sessions__timeline-item {
-  max-width: min(48rem, 100%);
+  width: 100%;
+  max-width: 100%;
   border-left: 3px solid transparent;
   padding-left: 0.85rem;
   color: var(--color-text);
@@ -547,13 +548,30 @@
   color: var(--color-text);
 }
 
+.sessions__markdown--thinking {
+  color: var(--color-text-subtle);
+}
+
+.sessions__markdown--thinking .sessions__markdown-strong--primary {
+  color: rgb(214, 158, 46);
+}
+
+.sessions__markdown--thinking .sessions__markdown-strong--secondary {
+  margin-inline: 0.12em;
+  color: rgb(88, 207, 151);
+}
+
+.sessions__markdown--thinking .sessions__inline-code {
+  color: currentColor;
+}
+
 .sessions__markdown :where(p, blockquote, ul, ol, h1, h2, h3, h4, h5, h6, table, pre),
 .sessions__code-block {
   margin: 0;
 }
 
 .sessions__markdown :where(h1, h2, h3, h4, h5, h6) {
-  color: var(--color-text);
+  color: currentColor;
   line-height: 1.2;
 }
 
@@ -654,7 +672,10 @@
 
 .sessions__shell-command .sessions__code-block-body,
 .sessions__shell-command .sessions__code-block-highlight pre {
+  overflow-x: visible;
   padding: 0.25rem 0 0.25rem var(--space-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .sessions__timeline-tool-loading {
@@ -1142,6 +1163,25 @@
   margin-left: auto;
 }
 
+.sessions__detail-status-select select {
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  padding: 0.2rem 1.6rem 0.2rem 0.45rem;
+  color: var(--color-text);
+  background: var(--color-input-bg);
+  font: inherit;
+  font-size: 0.78rem;
+}
+
+.sessions__detail-status-select select:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.sessions__detail-status-error {
+  color: var(--color-danger-text);
+}
+
 .sessions__detail-status .session-delete-button,
 .sessions__detail-status .ui-confirm button {
   border: 1px solid var(--border-accent);
@@ -1455,7 +1495,8 @@
 }
 
 .config__form input,
-.config__form select {
+.config__form select,
+.config__form textarea {
   border: 1px solid var(--border-control);
   border-radius: var(--radius-sm);
   padding: 0.7rem 0.8rem;
@@ -1464,14 +1505,39 @@
   font: inherit;
 }
 
+.config__form textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.config__form-fieldset {
+  display: grid;
+  gap: 1rem;
+  margin: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 1rem;
+}
+
+.config__form-fieldset legend {
+  padding: 0 0.35rem;
+  color: var(--color-text);
+  font-weight: 700;
+}
+
+.config__form-hint {
+  margin: 0;
+  color: var(--color-text-muted);
+}
+
 .config__model-dialog {
-  width: min(30rem, calc(100vw - 2.5rem));
+  width: min(44rem, calc(100vw - 2.5rem));
 }
 
 .config__model-dialog .config__form-actions {
-  position: sticky;
-  bottom: 0;
-  padding-top: var(--space-3);
+  margin-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
 }
 
 .config__form-actions button {
@@ -1548,6 +1614,161 @@
 
 .config__form-checkbox input {
   width: auto;
+}
+
+.config__advanced {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-surface-soft) 54%, transparent);
+}
+
+.config__advanced summary {
+  cursor: pointer;
+  padding: var(--space-4);
+  color: var(--color-text);
+  font-weight: 700;
+}
+
+.config__advanced-grid {
+  display: grid;
+  gap: 1rem;
+  border-top: 1px solid var(--border-subtle);
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+.catalog-panel {
+  display: grid;
+  gap: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  background: color-mix(in srgb, var(--color-surface-soft) 72%, transparent);
+}
+
+.catalog-panel__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.catalog-panel__header h3,
+.catalog-panel__header p,
+.catalog-panel__results-group p,
+.catalog-panel__notice {
+  margin: 0;
+}
+
+.catalog-panel__header h3 {
+  font-size: 1rem;
+}
+
+.catalog-panel__header p,
+.catalog-panel__results-group p,
+.catalog-panel__notice {
+  color: var(--color-text-muted);
+}
+
+.catalog-panel__header button {
+  flex: 0 0 auto;
+}
+
+.catalog-panel__current {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.8rem;
+  background: color-mix(in srgb, var(--color-bg) 54%, transparent);
+}
+
+.catalog-panel__current-label {
+  color: var(--color-text-muted);
+}
+
+.catalog-panel__chip,
+.catalog-panel__match code {
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  padding: 0.18rem 0.5rem;
+  background: var(--color-surface-soft);
+}
+
+.catalog-panel__chip--empty {
+  color: var(--color-text-muted);
+}
+
+.catalog-panel__match {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.catalog-panel__match-upstream {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  color: var(--color-text-subtle);
+}
+
+.config .catalog-panel__clear {
+  margin-left: auto;
+  border-color: var(--border-subtle);
+  background: transparent;
+}
+
+.catalog-panel__search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 0.75rem;
+}
+
+.catalog-panel__results-group {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.catalog-panel__results {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.config .catalog-panel__result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.25rem 0.75rem;
+  width: 100%;
+  border-color: var(--border-subtle);
+  background: color-mix(in srgb, var(--color-bg) 48%, transparent);
+  text-align: left;
+}
+
+.config .catalog-panel__result:not(:disabled):hover {
+  border-color: var(--border-accent);
+  background: var(--color-accent-soft);
+}
+
+.catalog-panel__result strong,
+.catalog-panel__result code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-panel__result span,
+.catalog-panel__result small {
+  color: var(--color-text-subtle);
+}
+
+.catalog-panel__result code {
+  grid-column: 1 / -1;
+  color: var(--color-text-muted);
 }
 
 .config__form label.runtime-defaults__all-mcp,
@@ -1641,6 +1862,18 @@
 
   .provider-row code {
     max-width: 100%;
+  }
+
+  .catalog-panel__header,
+  .catalog-panel__search {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .catalog-panel__header button,
+  .catalog-panel__search button {
+    width: 100%;
   }
 
   .sessions__header,

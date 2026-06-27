@@ -32,7 +32,10 @@ const markdownProcessor = unified()
   });
 
 export function MarkdownMessage(props: { text: string; tone: "user" | "assistant" | "thinking" }) {
-  const tree = createMemo(() => markdownProcessor.runSync(markdownProcessor.parse(props.text)) as HastNode);
+  const tree = createMemo(() => {
+    const parsed = markdownProcessor.runSync(markdownProcessor.parse(props.text)) as HastNode;
+    return props.tone === "thinking" ? annotateThinkingStrong(parsed) : parsed;
+  });
 
   return (
     <div class={`sessions__markdown sessions__markdown--${props.tone}`}>
@@ -91,7 +94,7 @@ function renderNode(node: HastNode): JSX.Element {
     case "p":
       return <p>{children()}</p>;
     case "strong":
-      return <strong>{children()}</strong>;
+      return <strong class={classProperty(node)}>{children()}</strong>;
     case "table":
       return <div class="sessions__markdown-table"><table>{children()}</table></div>;
     case "tbody":
@@ -109,6 +112,61 @@ function renderNode(node: HastNode): JSX.Element {
     default:
       return <Show when={(node.children ?? []).length > 0}>{children()}</Show>;
   }
+}
+
+function annotateThinkingStrong(tree: HastNode) {
+  const visit = (node: HastNode) => {
+    if (isStrongScope(node)) {
+      annotateStrongScope(node);
+      return;
+    }
+
+    for (const child of node.children ?? []) {
+      visit(child);
+    }
+  };
+
+  visit(tree);
+  return tree;
+}
+
+function annotateStrongScope(node: HastNode) {
+  let strongIndex = 0;
+
+  const visit = (current: HastNode) => {
+    if (current !== node && isStrongScope(current)) {
+      annotateStrongScope(current);
+      return;
+    }
+
+    if (current.type === "element" && current.tagName === "strong") {
+      addClass(current, strongIndex === 0 ? "sessions__markdown-strong--primary" : "sessions__markdown-strong--secondary");
+      strongIndex += 1;
+    }
+
+    for (const child of current.children ?? []) {
+      visit(child);
+    }
+  };
+
+  for (const child of node.children ?? []) {
+    visit(child);
+  }
+}
+
+function isStrongScope(node: HastNode) {
+  if (node.type !== "element") {
+    return false;
+  }
+
+  return ["p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "td", "th"].includes(node.tagName ?? "");
+}
+
+function addClass(node: HastNode, className: string) {
+  const properties = node.properties ?? {};
+  const current = properties.className;
+  const classes = Array.isArray(current) ? current : typeof current === "string" ? [current] : [];
+  node.properties = { ...properties, className: [...classes, className] };
 }
 
 function codeChild(node: HastNode) {
@@ -137,5 +195,14 @@ function nodeText(node: HastNode): string {
 
 function stringProperty(node: HastNode, key: string) {
   const value = node.properties?.[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function classProperty(node: HastNode) {
+  const value = node.properties?.className;
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is string => typeof entry === "string").join(" ");
+  }
+
   return typeof value === "string" ? value : undefined;
 }

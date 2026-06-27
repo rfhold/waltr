@@ -11,6 +11,8 @@ import { AppStateContextProvider, type AppPhase } from "./context";
 import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../generated/waltr-client";
 import {
   loadWasmClient,
+  type CatalogSearchRequest,
+  type CatalogSuggestRequest,
   type WasmClientLoader,
 } from "../wasm/client";
 
@@ -92,6 +94,12 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
   };
 
+  const searchCatalogModels = async (request: CatalogSearchRequest) =>
+    getLoadedClient(wasmClient()).searchCatalogModels(request);
+
+  const suggestCatalogMatches = async (request: CatalogSuggestRequest) =>
+    getLoadedClient(wasmClient()).suggestCatalogMatches(request);
+
   const dispatchDeleteSession = async (id: string) => {
     return dispatchAndWaitForOperation({
       command: { type: "deleteSession", id },
@@ -150,6 +158,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         systemReady,
         dispatch,
         dispatchConfigPatch,
+        searchCatalogModels,
+        suggestCatalogMatches,
         dispatchCreateSession,
         dispatchDeleteSession,
       }}

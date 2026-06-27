@@ -500,6 +500,45 @@ describe("sessions route", () => {
     expect(timelineRegion.querySelectorAll(".sessions__code-block")[1]?.textContent).toContain("const label = 'ok';");
   });
 
+  test("session detail renders thinking markdown", () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-thinking-markdown"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [
+      timelineEvent({
+        cursor: 1n,
+        sessionId: "session-thinking-markdown",
+        itemId: "thinking-item",
+        channel: "thinking",
+        content: {
+          kind: "textSnapshot",
+          text: "**FOO** check `status` then **bar**\n\n**BAZ** inspect **qux**\n\n```bash\ngit status\n```",
+        },
+      }),
+    ];
+    snapshot.sessions.timelines["session-thinking-markdown"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-thinking-markdown",
+      snapshot,
+    });
+
+    const timelineRegion = screen.getByLabelText("Session timeline");
+    const strongTokens = timelineRegion.querySelectorAll(".sessions__markdown--thinking strong");
+    expect(strongTokens).toHaveLength(4);
+    expect(strongTokens[0]?.textContent).toBe("FOO");
+    expect(strongTokens[0]?.classList.contains("sessions__markdown-strong--primary")).toBe(true);
+    expect(strongTokens[1]?.textContent).toBe("bar");
+    expect(strongTokens[1]?.classList.contains("sessions__markdown-strong--secondary")).toBe(true);
+    expect(strongTokens[2]?.textContent).toBe("BAZ");
+    expect(strongTokens[2]?.classList.contains("sessions__markdown-strong--primary")).toBe(true);
+    expect(strongTokens[3]?.textContent).toBe("qux");
+    expect(strongTokens[3]?.classList.contains("sessions__markdown-strong--secondary")).toBe(true);
+    expect(timelineRegion.querySelector(".sessions__markdown--thinking")?.textContent).toContain("check status");
+    expect(timelineRegion.querySelector(".sessions__code-block")?.textContent).toContain("git status");
+  });
+
   test("session detail sanitizes assistant markdown html", () => {
     const snapshot = snapshotWithSessions([
       sessionWithRuntime("session-sanitized"),
@@ -864,6 +903,33 @@ describe("sessions route", () => {
       id: "runtime-session",
       providerKey: "anthropic",
       modelId: "claude-4",
+      reasoningEffort: null,
+      enabledMcpServerKeys: ["git"],
+    }));
+  });
+
+  test("bottom bar thinking dropdown dispatches session runtime metadata update", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithConfig({
+      ...emptyConfig("v1"),
+      providers: { openai: provider("OpenAI", ["gpt-4o"], ["low", "high"]) },
+    });
+    snapshot.sessions.current = [sessionWithRuntime("thinking-runtime-session")];
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/thinking-runtime-session",
+      snapshot,
+    });
+
+    fireEvent.change(screen.getByLabelText("Session thinking level"), { target: { value: "high" } });
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "updateSessionRuntimeConfig",
+      id: "thinking-runtime-session",
+      providerKey: "openai",
+      modelId: "gpt-4o",
+      reasoningEffort: "high",
       enabledMcpServerKeys: ["git"],
     }));
   });
@@ -895,6 +961,7 @@ describe("sessions route", () => {
       id: "runtime-session",
       providerKey: "openai",
       modelId: "gpt-4o",
+      reasoningEffort: null,
       enabledMcpServerKeys: ["git", "files"],
     }));
   });
@@ -967,18 +1034,21 @@ async function waitForTimelineScroll() {
   await Promise.resolve();
 }
 
-function provider(name: string, modelIds: string[]) {
+function provider(name: string, modelIds: string[], reasoningEfforts: string[] = []) {
   return {
     kind: "openAi" as const,
     name,
     url: "https://example.invalid/v1",
     headers: {},
+    oauthCompatible: false,
+    oauthSettings: null,
     models: Object.fromEntries(modelIds.map((id) => [id, {
       name: id,
       kind: "llm" as const,
-      options: { temperature: null, topP: null, topK: null, minP: null, presencePenalty: null, repetitionPenalty: null },
+      options: { temperature: null, topP: null, topK: null, minP: null, presencePenalty: null, repetitionPenalty: null, reasoningEfforts },
       limits: { context: null, output: null },
       capabilities: { tools: true, image: false },
+      catalogMatch: null,
     }])),
   };
 }
@@ -993,6 +1063,7 @@ function sessionWithRuntime(id: string, status: SessionStatusView = { phase: "id
         kind: "openAi",
         url: "https://example.invalid/v1",
         modelId: "gpt-4o",
+        reasoningEffort: null,
         matchStatus: "configured",
       },
       mcpServers: [{

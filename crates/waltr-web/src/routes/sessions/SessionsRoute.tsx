@@ -818,14 +818,7 @@ function TimelineItem(props: {
 }
 
 function TextTimelineItemView(props: { item: Extract<TimelineItemModel, { kind: "user" | "assistant" | "thinking" }> }) {
-  return (
-    <Show
-      when={props.item.kind !== "thinking"}
-      fallback={<p class="sessions__timeline-text sessions__timeline-text--thinking">{props.item.text}</p>}
-    >
-      <MarkdownMessage text={props.item.text} tone={props.item.kind} />
-    </Show>
-  );
+  return <MarkdownMessage text={props.item.text} tone={props.item.kind} />;
 }
 
 function ToolTimelineItemView(props: {
@@ -1608,6 +1601,42 @@ function SessionDetailStatusBar(props: {
   onEditProvider: () => void;
   onEditMcp: () => void;
 }) {
+  const app = useAppState();
+  const [reasoningEffort, setReasoningEffort] = createSignal(props.session.runtimeConfig?.provider?.reasoningEffort ?? "");
+  const [savingReasoningEffort, setSavingReasoningEffort] = createSignal(false);
+  const [reasoningEffortError, setReasoningEffortError] = createSignal<string>();
+  const config = createMemo(() => app.snapshot()?.config.current ?? undefined);
+  const reasoningEfforts = createMemo(() => currentReasoningEfforts(config(), props.session));
+
+  createEffect(() => {
+    const current = props.session.runtimeConfig?.provider?.reasoningEffort ?? "";
+    props.session.id;
+    props.session.runtimeConfig?.provider?.key;
+    props.session.runtimeConfig?.provider?.modelId;
+    if (!untrack(savingReasoningEffort)) {
+      setReasoningEffort(current);
+    }
+  });
+
+  const updateReasoningEffort = async (effort: string) => {
+    const provider = props.session.runtimeConfig?.provider;
+    if (!provider) {
+      setReasoningEffortError("Choose a provider before setting thinking.");
+      return;
+    }
+
+    setReasoningEffort(effort);
+    await updateRuntimeConfig(app.dispatch, props.session, {
+      providerKey: provider.key,
+      modelId: provider.modelId,
+      reasoningEffort: effort || null,
+      enabledMcpServerKeys: props.session.runtimeConfig?.mcpServers.map((server) => server.key) ?? [],
+      setSaving: setSavingReasoningEffort,
+      setError: setReasoningEffortError,
+      onClose: () => undefined,
+    });
+  };
+
   return (
     <footer class="sessions__detail-status" aria-label="Session status summary">
       <span class="sessions__detail-status-item">
@@ -1621,6 +1650,23 @@ function SessionDetailStatusBar(props: {
           Edit
         </button>
       </span>
+      <label class="sessions__detail-status-item sessions__detail-status-select">
+        <strong>Thinking</strong>
+        <select
+          aria-label="Session thinking level"
+          value={reasoningEffort()}
+          disabled={reasoningEfforts().length === 0 || savingReasoningEffort()}
+          onChange={(event) => void updateReasoningEffort(event.currentTarget.value)}
+        >
+          <option value="">None</option>
+          <For each={reasoningEfforts()}>
+            {(effort) => <option value={effort}>{effort}</option>}
+          </For>
+        </select>
+      </label>
+      <Show when={reasoningEffortError()}>
+        {(message) => <span class="sessions__detail-status-error">{message()}</span>}
+      </Show>
       <span class="sessions__detail-status-item">
         <strong>MCP</strong> {formatRuntimeMcpServers(props.session)}
         <button
@@ -1637,22 +1683,41 @@ function SessionDetailStatusBar(props: {
   );
 }
 
+function currentReasoningEfforts(config: ConfigView | undefined, session: SessionView) {
+  const provider = session.runtimeConfig?.provider;
+  if (!provider) {
+    return [];
+  }
+
+  return config?.providers[provider.key]?.models[provider.modelId]?.options.reasoningEfforts ?? [];
+}
+
 function SessionProviderDialog(props: { session: SessionView; onClose: () => void }) {
   const app = useAppState();
   const [query, setQuery] = createSignal("");
   const [providerKey, setProviderKey] = createSignal(props.session.runtimeConfig?.provider?.key ?? "");
   const [modelId, setModelId] = createSignal(props.session.runtimeConfig?.provider?.modelId ?? "");
+  const [reasoningEffort, setReasoningEffort] = createSignal(props.session.runtimeConfig?.provider?.reasoningEffort ?? "");
   const [error, setError] = createSignal<string>();
   const [saving, setSaving] = createSignal(false);
   const config = createMemo(() => app.snapshot()?.config.current ?? undefined);
   const providers = createMemo(() => providerEntries(config(), query()));
   const selectedProvider = createMemo(() => config()?.providers[providerKey()]);
+  const selectedModel = createMemo(() => selectedProvider()?.models[modelId()]);
   const models = createMemo(() => Object.entries(selectedProvider()?.models ?? {}));
+  const reasoningEfforts = createMemo(() => selectedModel()?.options.reasoningEfforts ?? []);
 
   createEffect(() => {
     const provider = selectedProvider();
     if (provider && !provider.models[modelId()]) {
       setModelId(Object.keys(provider.models)[0] ?? "");
+    }
+  });
+
+  createEffect(() => {
+    const effort = reasoningEffort();
+    if (effort !== "" && !reasoningEfforts().includes(effort)) {
+      setReasoningEffort("");
     }
   });
 
@@ -1666,6 +1731,7 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
     await updateRuntimeConfig(app.dispatch, props.session, {
       providerKey: provider,
       modelId: model,
+      reasoningEffort: reasoningEffort() || null,
       enabledMcpServerKeys: props.session.runtimeConfig?.mcpServers.map((server) => server.key) ?? [],
       setSaving,
       setError,
@@ -1709,6 +1775,15 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
             </For>
           </select>
         </label>
+        <label class="sessions__runtime-search">
+          Thinking level
+          <select value={reasoningEffort()} onChange={(event) => setReasoningEffort(event.currentTarget.value)} disabled={reasoningEfforts().length === 0}>
+            <option value="">None</option>
+            <For each={reasoningEfforts()}>
+              {(effort) => <option value={effort}>{effort}</option>}
+            </For>
+          </select>
+        </label>
         <div class="sessions__runtime-actions">
           <button type="button" onClick={props.onClose}>Cancel</button>
           <button type="button" onClick={() => void save()} disabled={saving()}>
@@ -1745,6 +1820,7 @@ function SessionMcpDialog(props: { session: SessionView; onClose: () => void }) 
     await updateRuntimeConfig(app.dispatch, props.session, {
       providerKey: props.session.runtimeConfig?.provider?.key ?? "",
       modelId: props.session.runtimeConfig?.provider?.modelId ?? "",
+      reasoningEffort: props.session.runtimeConfig?.provider?.reasoningEffort ?? null,
       enabledMcpServerKeys: Array.from(selected()),
       setSaving,
       setError,
@@ -1797,7 +1873,7 @@ function formatRuntimeProvider(session: SessionView) {
     return "none";
   }
 
-  return `${provider.key}/${provider.modelId}`;
+  return provider.reasoningEffort ? `${provider.key}/${provider.modelId} (${provider.reasoningEffort})` : `${provider.key}/${provider.modelId}`;
 }
 
 function formatRuntimeMcpServers(session: SessionView) {
@@ -1874,6 +1950,7 @@ async function updateRuntimeConfig(
   options: {
     providerKey: string;
     modelId: string;
+    reasoningEffort: string | null;
     enabledMcpServerKeys: string[];
     setSaving: (saving: boolean) => void;
     setError: (message: string | undefined) => void;
@@ -1889,6 +1966,7 @@ async function updateRuntimeConfig(
       id: session.id,
       providerKey: options.providerKey,
       modelId: options.modelId,
+      reasoningEffort: options.reasoningEffort,
       enabledMcpServerKeys: options.enabledMcpServerKeys,
     });
     options.onClose();
