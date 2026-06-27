@@ -12,7 +12,13 @@ use futures_util::{
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::{ClientCommand, ClientCommandRequest, ClientRuntime, ClientStateStreamEvent};
+use waltr::grpc::waltr::catalog::v1 as catalog_proto;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    ClientCommand, ClientCommandRequest, ClientRuntime, ClientStateStreamEvent, WaltrTransport,
+    transport::DefaultGrpcTransport,
+};
 
 #[wasm_bindgen(
     inline_js = "export function sleepMs(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }"
@@ -101,6 +107,46 @@ impl WaltrClient {
         serde_json::to_string(&snapshot).map_err(js_error)
     }
 
+    /// Search the models.dev catalog and return a JSON response.
+    #[wasm_bindgen(js_name = searchCatalogModelsJson)]
+    pub async fn search_catalog_models_json(
+        &self,
+        request_json: String,
+    ) -> Result<String, JsValue> {
+        let request: CatalogSearchRequest =
+            serde_json::from_str(&request_json).map_err(js_error)?;
+        let response = DefaultGrpcTransport::new(self.endpoint.clone())
+            .search_catalog_models(catalog_proto::SearchCatalogModelsRequest {
+                query: request.query,
+                provider_id: request.provider_id.unwrap_or_default(),
+                limit: request.limit.unwrap_or(10),
+            })
+            .await
+            .map_err(js_error)?;
+
+        serde_json::to_string(&CatalogSearchResponse::from(response)).map_err(js_error)
+    }
+
+    /// Suggest models.dev catalog matches and return a JSON response.
+    #[wasm_bindgen(js_name = suggestCatalogMatchesJson)]
+    pub async fn suggest_catalog_matches_json(
+        &self,
+        request_json: String,
+    ) -> Result<String, JsValue> {
+        let request: CatalogSuggestRequest =
+            serde_json::from_str(&request_json).map_err(js_error)?;
+        let response = DefaultGrpcTransport::new(self.endpoint.clone())
+            .suggest_catalog_matches(catalog_proto::SuggestCatalogMatchesRequest {
+                provider_key: request.provider_key,
+                model_key: request.model_key,
+                limit: request.limit.unwrap_or(5),
+            })
+            .await
+            .map_err(js_error)?;
+
+        serde_json::to_string(&CatalogSuggestResponse::from(response)).map_err(js_error)
+    }
+
     /// Advance the shared state stream and return the next JSON snapshot.
     #[wasm_bindgen(js_name = nextStateJson)]
     pub async fn next_state_json(&self) -> Result<String, JsValue> {
@@ -169,6 +215,218 @@ fn normalize_endpoint(endpoint: Option<String>) -> String {
 
 fn js_error(error: impl ToString) -> JsValue {
     JsValue::from_str(&error.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogSearchRequest {
+    query: String,
+    provider_id: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogSuggestRequest {
+    provider_key: String,
+    model_key: String,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogSearchResponse {
+    models: Vec<CatalogModelSummary>,
+    stale: bool,
+}
+
+impl From<catalog_proto::SearchCatalogModelsResponse> for CatalogSearchResponse {
+    fn from(response: catalog_proto::SearchCatalogModelsResponse) -> Self {
+        Self {
+            models: response
+                .models
+                .into_iter()
+                .map(CatalogModelSummary::from)
+                .collect(),
+            stale: response.stale,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogSuggestResponse {
+    matches: Vec<CatalogMatch>,
+    stale: bool,
+}
+
+impl From<catalog_proto::SuggestCatalogMatchesResponse> for CatalogSuggestResponse {
+    fn from(response: catalog_proto::SuggestCatalogMatchesResponse) -> Self {
+        Self {
+            matches: response
+                .matches
+                .into_iter()
+                .map(CatalogMatch::from)
+                .collect(),
+            stale: response.stale,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CatalogModelRef {
+    provider_id: String,
+    model_id: String,
+}
+
+impl From<catalog_proto::CatalogModelRef> for CatalogModelRef {
+    fn from(model: catalog_proto::CatalogModelRef) -> Self {
+        Self {
+            provider_id: model.provider_id,
+            model_id: model.model_id,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CatalogModelSummary {
+    model: Option<CatalogModelRef>,
+    provider_name: String,
+    model_name: String,
+    family: Option<String>,
+    status: Option<String>,
+    limits: Option<CatalogModelLimitsSummary>,
+    cost: Option<CatalogModelCostSummary>,
+    capabilities: Option<CatalogModelCapabilitySummary>,
+    reasoning: Option<CatalogModelReasoningSummary>,
+}
+
+impl From<catalog_proto::CatalogModelSummary> for CatalogModelSummary {
+    fn from(summary: catalog_proto::CatalogModelSummary) -> Self {
+        Self {
+            model: summary.model.map(CatalogModelRef::from),
+            provider_name: summary.provider_name,
+            model_name: summary.model_name,
+            family: summary.family,
+            status: summary.status,
+            limits: summary.limits.map(CatalogModelLimitsSummary::from),
+            cost: summary.cost.map(CatalogModelCostSummary::from),
+            capabilities: summary
+                .capabilities
+                .map(CatalogModelCapabilitySummary::from),
+            reasoning: summary.reasoning.map(CatalogModelReasoningSummary::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CatalogModelLimitsSummary {
+    context: Option<u32>,
+    output: Option<u32>,
+}
+
+impl From<catalog_proto::CatalogModelLimitsSummary> for CatalogModelLimitsSummary {
+    fn from(limits: catalog_proto::CatalogModelLimitsSummary) -> Self {
+        Self {
+            context: limits.context,
+            output: limits.output,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CatalogModelCostSummary {
+    input_per_million_tokens: Option<f64>,
+    output_per_million_tokens: Option<f64>,
+    currency: String,
+}
+
+impl From<catalog_proto::CatalogModelCostSummary> for CatalogModelCostSummary {
+    fn from(cost: catalog_proto::CatalogModelCostSummary) -> Self {
+        Self {
+            input_per_million_tokens: cost.input_per_million_tokens,
+            output_per_million_tokens: cost.output_per_million_tokens,
+            currency: cost.currency,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CatalogModelCapabilitySummary {
+    tools: bool,
+    image: bool,
+    audio: bool,
+}
+
+impl From<catalog_proto::CatalogModelCapabilitySummary> for CatalogModelCapabilitySummary {
+    fn from(capabilities: catalog_proto::CatalogModelCapabilitySummary) -> Self {
+        Self {
+            tools: capabilities.tools,
+            image: capabilities.image,
+            audio: capabilities.audio,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CatalogModelReasoningSummary {
+    supported: bool,
+    effort: Option<String>,
+    efforts: Vec<String>,
+}
+
+impl From<catalog_proto::CatalogModelReasoningSummary> for CatalogModelReasoningSummary {
+    fn from(reasoning: catalog_proto::CatalogModelReasoningSummary) -> Self {
+        Self {
+            supported: reasoning.supported,
+            effort: reasoning.effort,
+            efforts: reasoning.efforts,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogMatch {
+    model: Option<CatalogModelRef>,
+    provider_name: String,
+    model_name: String,
+    confidence: String,
+    reasons: Vec<String>,
+    upstream_model: Option<CatalogModelRef>,
+}
+
+impl From<catalog_proto::CatalogMatch> for CatalogMatch {
+    fn from(catalog_match: catalog_proto::CatalogMatch) -> Self {
+        Self {
+            model: catalog_match.model.map(CatalogModelRef::from),
+            provider_name: catalog_match.provider_name,
+            model_name: catalog_match.model_name,
+            confidence: catalog_proto::CatalogMatchConfidence::try_from(catalog_match.confidence)
+                .map(catalog_match_confidence_name)
+                .unwrap_or("unknown")
+                .to_owned(),
+            reasons: catalog_match.reasons,
+            upstream_model: catalog_match.upstream_model.map(CatalogModelRef::from),
+        }
+    }
+}
+
+fn catalog_match_confidence_name(
+    confidence: catalog_proto::CatalogMatchConfidence,
+) -> &'static str {
+    match confidence {
+        catalog_proto::CatalogMatchConfidence::Unspecified => "unspecified",
+        catalog_proto::CatalogMatchConfidence::Exact => "exact",
+        catalog_proto::CatalogMatchConfidence::High => "high",
+        catalog_proto::CatalogMatchConfidence::Suggested => "suggested",
+    }
 }
 
 #[cfg(test)]

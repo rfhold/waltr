@@ -41,7 +41,7 @@ async fn shared_state_stream_keeps_watch_streams_open_until_final_release() {
     dispatch_stream_command(
         &mut stream,
         ClientCommand::AddProvider {
-            provider: provider_view("anthropic"),
+            provider: provider_view("custom-anthropic"),
         },
     )
     .await

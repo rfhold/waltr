@@ -4,9 +4,10 @@ mod config;
 mod session;
 
 pub use config::{
-    ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelLimitsView,
-    ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
-    RuntimeDefaultsView,
+    CatalogMatchSourceView, ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
+    ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
+    OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView, OAuthTokenRequestStyleView,
+    OAuthUrlParamView, ProviderKindView, ProviderView, RuntimeDefaultsView,
 };
 pub use session::{
     ExternalRequestView, RuntimeConfigMatchView, SessionMcpServerRuntimeView, SessionPhaseView,
@@ -22,9 +23,10 @@ mod tests {
     use ts_rs::TS as _;
 
     use crate::{
-        ClientCommand, ClientOperationView, ClientSnapshot, ClientTimelineDirection,
-        ConfigSnapshot, Configuration, OperationCollectionSnapshot, OperationSnapshot, Provider,
-        ProviderType, SessionSnapshot, StatusSnapshot,
+        CatalogMatchSource, ClientCommand, ClientOperationView, ClientSnapshot,
+        ClientTimelineDirection, ConfigSnapshot, Configuration, Model, ModelCapabilities,
+        ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
+        OperationSnapshot, Provider, ProviderType, SessionSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -39,6 +41,8 @@ mod tests {
                     name: "anthropic".to_owned(),
                     url: "https://api.anthropic.com".to_owned(),
                     headers: HashMap::from([("x-test".to_owned(), "true".to_owned())]),
+                    oauth_compatible: true,
+                    oauth_settings: None,
                     models: HashMap::new(),
                 },
             )]),
@@ -68,14 +72,79 @@ mod tests {
     }
 
     #[test]
+    fn config_view_round_trips_model_catalog_match() {
+        let model = Model {
+            name: "gpt-5".to_owned(),
+            r#type: ModelType::Llm as i32,
+            options: Some(ModelOptions::default()),
+            limits: Some(ModelLimits::default()),
+            capabilities: Some(ModelCapabilities::default()),
+            catalog_match: Some(ModelCatalogMatch {
+                provider_id: "openai".to_owned(),
+                model_id: "gpt-5".to_owned(),
+                upstream_provider_id: Some("openai".to_owned()),
+                upstream_model_id: Some("gpt-5-2025-08-07".to_owned()),
+                source: CatalogMatchSource::Applied as i32,
+            }),
+            ..Model::default()
+        };
+
+        let view = ModelView::from(model.clone());
+        assert_eq!(
+            view.catalog_match
+                .as_ref()
+                .map(|match_view| match_view.source),
+            Some(CatalogMatchSourceView::Applied)
+        );
+
+        assert_eq!(Model::from(view), model);
+    }
+
+    #[test]
+    fn config_view_round_trips_absent_upstream_catalog_identity() {
+        let model = Model {
+            name: "gpt-5".to_owned(),
+            r#type: ModelType::Llm as i32,
+            options: Some(ModelOptions::default()),
+            limits: Some(ModelLimits::default()),
+            capabilities: Some(ModelCapabilities::default()),
+            catalog_match: Some(ModelCatalogMatch {
+                provider_id: "openai".to_owned(),
+                model_id: "gpt-5".to_owned(),
+                upstream_provider_id: None,
+                upstream_model_id: None,
+                source: CatalogMatchSource::Manual as i32,
+            }),
+            ..Model::default()
+        };
+
+        let view = ModelView::from(model.clone());
+        let catalog_match = view
+            .catalog_match
+            .as_ref()
+            .expect("catalog match should be exposed");
+        assert_eq!(catalog_match.upstream_provider_id, None);
+        assert_eq!(catalog_match.upstream_model_id, None);
+
+        assert_eq!(Model::from(view), model);
+    }
+
+    #[test]
     fn exports_web_typescript_bindings() {
         let bindings = [
             ProviderKindView::decl(),
             ModelTypeView::decl(),
+            CatalogMatchSourceView::decl(),
             ModelOptionsView::decl(),
             ModelLimitsView::decl(),
             ModelCapabilitiesView::decl(),
+            ModelCatalogMatchView::decl(),
             ModelView::decl(),
+            OAuthTokenRequestStyleView::decl(),
+            OAuthUrlParamView::decl(),
+            OAuthTokenFieldView::decl(),
+            OAuthJwtMetadataView::decl(),
+            OAuthProviderView::decl(),
             McpServerTypeView::decl(),
             McpServerView::decl(),
             RuntimeDefaultsView::decl(),

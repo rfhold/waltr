@@ -1,11 +1,19 @@
 //! Transport boundary for HTTP, browser, embedded, and test clients.
 
+mod auth;
+mod catalog;
 mod config;
 mod session;
 mod status;
 
 pub use config::ConfigWatchStream;
 pub use waltr::config::ConfigWatchUpdate;
+use waltr::grpc::waltr::catalog::v1::{
+    ApplyCatalogModelDefaultsRequest, GetModelCatalogDriftRequest, GetModelCatalogDriftResponse,
+    SearchCatalogModelsRequest, SearchCatalogModelsResponse, SetModelCatalogMatchRequest,
+    SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
+    catalog_service_client::CatalogServiceClient,
+};
 use waltr::grpc::waltr::config::v1::config_service_client::ConfigServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
@@ -46,8 +54,68 @@ pub trait WaltrTransport {
     /// Subscribe to future configuration changes.
     fn watch_config(&self) -> impl Future<Output = Result<Self::ConfigWatchStream, ClientError>>;
 
+    /// Search the models.dev catalog.
+    fn search_catalog_models(
+        &self,
+        request: SearchCatalogModelsRequest,
+    ) -> impl Future<Output = Result<SearchCatalogModelsResponse, ClientError>>;
+
+    /// Suggest catalog matches for a configured model.
+    fn suggest_catalog_matches(
+        &self,
+        request: SuggestCatalogMatchesRequest,
+    ) -> impl Future<Output = Result<SuggestCatalogMatchesResponse, ClientError>>;
+
+    /// Compare a configured model against its catalog match.
+    fn get_model_catalog_drift(
+        &self,
+        request: GetModelCatalogDriftRequest,
+    ) -> impl Future<Output = Result<GetModelCatalogDriftResponse, ClientError>>;
+
+    /// Set or clear catalog linkage for a configured model.
+    fn set_model_catalog_match(
+        &self,
+        request: SetModelCatalogMatchRequest,
+    ) -> impl Future<Output = Result<Configuration, ClientError>>;
+
+    /// Apply catalog-derived model defaults to configuration.
+    fn apply_catalog_model_defaults(
+        &self,
+        request: ApplyCatalogModelDefaultsRequest,
+    ) -> impl Future<Output = Result<Configuration, ClientError>>;
+
     /// Subscribe to future system status changes.
     fn watch_status(&self) -> impl Future<Output = Result<StatusWatchStream, ClientError>>;
+
+    /// List secret-safe provider auth statuses.
+    fn list_provider_auth_statuses(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ProviderAuthStatus>, ClientError>>;
+
+    /// Begin a manual provider OAuth attempt.
+    fn begin_provider_auth(
+        &self,
+        provider_key: String,
+    ) -> impl Future<Output = Result<AuthAttempt, ClientError>>;
+
+    /// Complete a manual provider OAuth attempt.
+    fn complete_provider_auth(
+        &self,
+        attempt_id: String,
+        input: String,
+    ) -> impl Future<Output = Result<ProviderAuthStatus, ClientError>>;
+
+    /// Cancel a provider OAuth attempt.
+    fn cancel_provider_auth(
+        &self,
+        attempt_id: String,
+    ) -> impl Future<Output = Result<(), ClientError>>;
+
+    /// Logout a provider by deleting its stored credential.
+    fn logout_provider(
+        &self,
+        provider_key: String,
+    ) -> impl Future<Output = Result<ProviderAuthStatus, ClientError>>;
 
     /// Create a new server-side session.
     fn create_session(&self) -> impl Future<Output = Result<SessionSummary, ClientError>>;
@@ -113,6 +181,14 @@ trait RemoteTransport {
         &self,
     ) -> impl Future<Output = Result<ConfigServiceClient<Self::Inner>, ClientError>>;
 
+    fn auth_client(
+        &self,
+    ) -> impl Future<Output = Result<AuthServiceClient<Self::Inner>, ClientError>>;
+
+    fn catalog_client(
+        &self,
+    ) -> impl Future<Output = Result<CatalogServiceClient<Self::Inner>, ClientError>>;
+
     fn status_client(
         &self,
     ) -> impl Future<Output = Result<StatusServiceClient<Self::Inner>, ClientError>>;
@@ -150,8 +226,70 @@ where
         config::watch_config(self).await
     }
 
+    async fn search_catalog_models(
+        &self,
+        request: SearchCatalogModelsRequest,
+    ) -> Result<SearchCatalogModelsResponse, ClientError> {
+        catalog::search_catalog_models(self, request).await
+    }
+
+    async fn suggest_catalog_matches(
+        &self,
+        request: SuggestCatalogMatchesRequest,
+    ) -> Result<SuggestCatalogMatchesResponse, ClientError> {
+        catalog::suggest_catalog_matches(self, request).await
+    }
+
+    async fn get_model_catalog_drift(
+        &self,
+        request: GetModelCatalogDriftRequest,
+    ) -> Result<GetModelCatalogDriftResponse, ClientError> {
+        catalog::get_model_catalog_drift(self, request).await
+    }
+
+    async fn set_model_catalog_match(
+        &self,
+        request: SetModelCatalogMatchRequest,
+    ) -> Result<Configuration, ClientError> {
+        catalog::set_model_catalog_match(self, request).await
+    }
+
+    async fn apply_catalog_model_defaults(
+        &self,
+        request: ApplyCatalogModelDefaultsRequest,
+    ) -> Result<Configuration, ClientError> {
+        catalog::apply_catalog_model_defaults(self, request).await
+    }
+
     async fn watch_status(&self) -> Result<StatusWatchStream, ClientError> {
         status::watch_status(self).await
+    }
+
+    async fn list_provider_auth_statuses(&self) -> Result<Vec<ProviderAuthStatus>, ClientError> {
+        auth::list_provider_auth_statuses(self).await
+    }
+
+    async fn begin_provider_auth(&self, provider_key: String) -> Result<AuthAttempt, ClientError> {
+        auth::begin_provider_auth(self, provider_key).await
+    }
+
+    async fn complete_provider_auth(
+        &self,
+        attempt_id: String,
+        input: String,
+    ) -> Result<ProviderAuthStatus, ClientError> {
+        auth::complete_provider_auth(self, attempt_id, input).await
+    }
+
+    async fn cancel_provider_auth(&self, attempt_id: String) -> Result<(), ClientError> {
+        auth::cancel_provider_auth(self, attempt_id).await
+    }
+
+    async fn logout_provider(
+        &self,
+        provider_key: String,
+    ) -> Result<ProviderAuthStatus, ClientError> {
+        auth::logout_provider(self, provider_key).await
     }
 
     async fn create_session(&self) -> Result<SessionSummary, ClientError> {
@@ -249,6 +387,24 @@ impl RemoteTransport for NativeGrpcTransport {
         Ok(ConfigServiceClient::new(channel))
     }
 
+    async fn auth_client(&self) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
+        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|error| ClientError::new(error.to_string()))?
+            .connect()
+            .await
+            .map_err(|error| ClientError::new(error.to_string()))?;
+        Ok(AuthServiceClient::new(channel))
+    }
+
+    async fn catalog_client(&self) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
+        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|error| ClientError::new(error.to_string()))?
+            .connect()
+            .await
+            .map_err(|error| ClientError::new(error.to_string()))?;
+        Ok(CatalogServiceClient::new(channel))
+    }
+
     async fn status_client(&self) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
         let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
             .map_err(|error| ClientError::new(error.to_string()))?
@@ -295,6 +451,16 @@ impl RemoteTransport for WasmGrpcTransport {
         Ok(ConfigServiceClient::new(transport))
     }
 
+    async fn auth_client(&self) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
+        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        Ok(AuthServiceClient::new(transport))
+    }
+
+    async fn catalog_client(&self) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
+        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        Ok(CatalogServiceClient::new(transport))
+    }
+
     async fn status_client(&self) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(StatusServiceClient::new(transport))
@@ -335,3 +501,5 @@ const fn status_code_name(code: Code) -> &'static str {
         Code::Unauthenticated => "unauthenticated",
     }
 }
+pub use auth::{AuthAttempt, ProviderAuthStatus};
+use waltr::grpc::waltr::auth::v1::auth_service_client::AuthServiceClient;

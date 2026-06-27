@@ -31,9 +31,20 @@ pub use error::ClientError;
 pub use executor::{
     ConfigChange, ConfigChangeStream, GrpcEffectExecutor, SessionChangeStream, StatusChangeStream,
 };
+pub use waltr::grpc::waltr::catalog::v1::{
+    ApplyCatalogModelDefaultsRequest, ApplyCatalogModelDefaultsResponse, CatalogDefaultField,
+    CatalogDriftField, CatalogDriftSeverity, CatalogMatch, CatalogMatchConfidence,
+    CatalogModelCapabilitySummary, CatalogModelCostSummary, CatalogModelLimitsSummary,
+    CatalogModelReasoningSummary, CatalogModelRef, CatalogModelSummary,
+    GetModelCatalogDriftRequest, GetModelCatalogDriftResponse, SearchCatalogModelsRequest,
+    SearchCatalogModelsResponse, SetModelCatalogMatchRequest, SetModelCatalogMatchResponse,
+    SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
+};
 pub use waltr::grpc::waltr::config::v1::{
-    Configuration, McpServer, McpServerType, Model, ModelCapabilities, ModelLimits, ModelOptions,
-    ModelType, Provider, ProviderType, RuntimeDefaults,
+    CatalogMatchSource, Configuration, McpServer, McpServerType, Model, ModelCapabilities,
+    ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OAuthProvider, OauthJwtMetadata,
+    OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider, ProviderType,
+    RuntimeDefaults,
 };
 pub use waltr::grpc::waltr::session::v1::{
     ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RuntimeConfigMatch,
@@ -45,8 +56,10 @@ pub use waltr::grpc::waltr::session::v1::{
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchEvent, SessionWatchUpdate};
 pub use view::{
-    ConfigView, ExternalRequestView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
+    CatalogMatchSourceView, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView,
+    ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
     RuntimeConfigMatchView, RuntimeDefaultsView, SessionMcpServerRuntimeView, SessionPhaseView,
     SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionTimelineView,
     SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
