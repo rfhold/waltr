@@ -318,7 +318,33 @@ where
             event: None,
         })];
 
-        if let Some(limit) = request.initial_limit {
+        if request.after_cursor.is_some() {
+            loop {
+                let after_cursor = highest_cursor.load(Ordering::Relaxed);
+                let catchup = self
+                    .sessions
+                    .timeline(
+                        &session_id,
+                        catchup_query(Some(after_cursor), 1000, &channels),
+                    )
+                    .instrument(tracing::info_span!(
+                        "server.watch.timeline_query",
+                        session_id = %session_id.as_str(),
+                        query_kind = "catchup",
+                        after_cursor,
+                        limit = 1000_u64,
+                    ))
+                    .await
+                    .map_err(agent_error_to_status)?;
+                let event_count = catchup.len();
+                tracing::debug!(session_id = %session_id.as_str(), event_count, "watch timeline catchup query completed");
+                push_history(&mut historical, &highest_cursor, catchup);
+
+                if event_count < 1000 {
+                    break;
+                }
+            }
+        } else if let Some(limit) = request.initial_limit {
             let events = self
                 .sessions
                 .timeline(&session_id, initial_query(limit, &channels))
@@ -334,23 +360,22 @@ where
             push_history(&mut historical, &highest_cursor, events);
         }
 
-        let catchup = self
-            .sessions
-            .timeline(
-                &session_id,
-                catchup_query(request.after_cursor, 1000, &channels),
-            )
-            .instrument(tracing::info_span!(
-                "server.watch.timeline_query",
-                session_id = %session_id.as_str(),
-                query_kind = "catchup",
-                after_cursor = request.after_cursor.unwrap_or(0),
-                limit = 1000_u64,
-            ))
-            .await
-            .map_err(agent_error_to_status)?;
-        tracing::debug!(session_id = %session_id.as_str(), event_count = catchup.len(), "watch timeline catchup query completed");
-        push_history(&mut historical, &highest_cursor, catchup);
+        if request.after_cursor.is_none() {
+            let catchup = self
+                .sessions
+                .timeline(&session_id, catchup_query(None, 1000, &channels))
+                .instrument(tracing::info_span!(
+                    "server.watch.timeline_query",
+                    session_id = %session_id.as_str(),
+                    query_kind = "catchup",
+                    after_cursor = 0_u64,
+                    limit = 1000_u64,
+                ))
+                .await
+                .map_err(agent_error_to_status)?;
+            tracing::debug!(session_id = %session_id.as_str(), event_count = catchup.len(), "watch timeline catchup query completed");
+            push_history(&mut historical, &highest_cursor, catchup);
+        }
 
         let highest_cursor_for_live = highest_cursor.clone();
         let live_channels = channels.clone();
