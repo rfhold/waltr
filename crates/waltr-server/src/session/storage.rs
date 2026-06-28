@@ -13,24 +13,41 @@ pub(super) enum SessionStorageConfig {
 
 impl SessionStorageConfig {
     pub(super) fn from_env() -> Result<Self, SessionStorageConfigError> {
-        let store = env::var(ENV_SESSION_STORE).unwrap_or_else(|_| "memory".to_owned());
-        Self::from_values(&store, env::var(ENV_FILESYSTEM_ROOT).ok())
+        let store = env::var(ENV_SESSION_STORE).unwrap_or_default();
+        Self::from_values(
+            &store,
+            env::var(ENV_FILESYSTEM_ROOT).ok(),
+            default_filesystem_root(),
+        )
     }
 
     fn from_values(
         store: &str,
         filesystem_root: Option<String>,
+        default_filesystem_root: PathBuf,
     ) -> Result<Self, SessionStorageConfigError> {
         match store {
-            "" | "memory" => Ok(Self::Memory),
-            "filesystem" => filesystem_root
-                .filter(|root| !root.is_empty())
-                .map(PathBuf::from)
-                .map(|root| Self::Filesystem { root })
-                .ok_or(SessionStorageConfigError::MissingFilesystemRoot),
+            "" => Ok(Self::Filesystem {
+                root: filesystem_root
+                    .filter(|root| !root.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or(default_filesystem_root),
+            }),
+            "memory" => Ok(Self::Memory),
+            "filesystem" => Ok(Self::Filesystem {
+                root: filesystem_root
+                    .filter(|root| !root.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or(default_filesystem_root),
+            }),
             other => Err(SessionStorageConfigError::UnknownStore(other.to_owned())),
         }
     }
+}
+
+fn default_filesystem_root() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+    PathBuf::from(home).join(".local/share/waltr/sessions")
 }
 
 /// Session storage configuration failure.
@@ -38,8 +55,6 @@ impl SessionStorageConfig {
 pub enum SessionStorageConfigError {
     /// `WALTR_SESSION_STORE` has an unsupported value.
     UnknownStore(String),
-    /// Filesystem storage was requested without `WALTR_SESSION_FILESYSTEM_ROOT`.
-    MissingFilesystemRoot,
 }
 
 impl fmt::Display for SessionStorageConfigError {
@@ -48,10 +63,6 @@ impl fmt::Display for SessionStorageConfigError {
             Self::UnknownStore(store) => write!(
                 formatter,
                 "unknown session store `{store}`; expected `memory` or `filesystem`"
-            ),
-            Self::MissingFilesystemRoot => write!(
-                formatter,
-                "{ENV_FILESYSTEM_ROOT} must be set when {ENV_SESSION_STORE}=filesystem"
             ),
         }
     }
@@ -63,35 +74,47 @@ impl Error for SessionStorageConfigError {}
 mod tests {
     use super::*;
 
+    fn default_root() -> PathBuf {
+        PathBuf::from("/home/test/.local/share/waltr/sessions")
+    }
+
     #[test]
-    fn unset_store_selects_default() {
+    fn unset_store_selects_filesystem_default() {
         assert_eq!(
-            SessionStorageConfig::from_values("", None).unwrap(),
-            SessionStorageConfig::Memory
+            SessionStorageConfig::from_values("", None, default_root()).unwrap(),
+            SessionStorageConfig::Filesystem {
+                root: default_root()
+            }
         );
     }
 
     #[test]
     fn memory_store_selects_default() {
         assert_eq!(
-            SessionStorageConfig::from_values("memory", None).unwrap(),
+            SessionStorageConfig::from_values("memory", None, default_root()).unwrap(),
             SessionStorageConfig::Memory
         );
     }
 
     #[test]
-    fn filesystem_store_requires_root() {
+    fn filesystem_store_uses_default_root() {
         assert_eq!(
-            SessionStorageConfig::from_values("filesystem", None).unwrap_err(),
-            SessionStorageConfigError::MissingFilesystemRoot
+            SessionStorageConfig::from_values("filesystem", None, default_root()).unwrap(),
+            SessionStorageConfig::Filesystem {
+                root: default_root()
+            }
         );
     }
 
     #[test]
     fn filesystem_store_accepts_root() {
         assert_eq!(
-            SessionStorageConfig::from_values("filesystem", Some("/tmp/sessions".to_owned()))
-                .unwrap(),
+            SessionStorageConfig::from_values(
+                "filesystem",
+                Some("/tmp/sessions".to_owned()),
+                default_root()
+            )
+            .unwrap(),
             SessionStorageConfig::Filesystem {
                 root: PathBuf::from("/tmp/sessions")
             }
@@ -101,7 +124,7 @@ mod tests {
     #[test]
     fn unknown_store_is_rejected() {
         assert_eq!(
-            SessionStorageConfig::from_values("postgresql", None).unwrap_err(),
+            SessionStorageConfig::from_values("postgresql", None, default_root()).unwrap_err(),
             SessionStorageConfigError::UnknownStore("postgresql".to_owned())
         );
     }

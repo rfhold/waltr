@@ -19,6 +19,7 @@ async fn server_process_boots_and_serves_health() -> Result<(), Box<dyn std::err
 
     let mut server = Command::new(env!("CARGO_BIN_EXE_waltr-server"))
         .env("WALTR_SERVER_ADDR", addr.to_string())
+        .env("WALTR_SESSION_STORE", "memory")
         .env_remove("WALTR_OTEL_EXPORT")
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
         .current_dir(&root)

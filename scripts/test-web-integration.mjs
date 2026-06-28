@@ -65,7 +65,10 @@ try {
     cwd: serverRoot,
     env: {
       WALTR_SERVER_ADDR: `127.0.0.1:${serverPort}`,
+      WALTR_AUTH_PATH: `${serverRoot}/auth.json`,
       WALTR_MODELS_DEV_PATH: modelsDevFixture,
+      WALTR_SESSION_FILESYSTEM_ROOT: `${serverRoot}/sessions`,
+      WALTR_SESSION_STORE: "filesystem",
     },
   });
   await waitForHttp(`${serverUrl}/health`, "server");

@@ -134,7 +134,10 @@ await run("pnpm", ["--filter", "@rfhold/waltr-web", "wasm:build"]);
 console.log(`web/server logs: ${launchLogDir}`);
 
 startLogged("server", "cargo", ["run", "-p", "waltr-server"], {
-  env: { WALTR_SERVER_ADDR: "127.0.0.1:8080" },
+  env: {
+    WALTR_SERVER_ADDR: "127.0.0.1:8080",
+    WALTR_SESSION_STORE: "filesystem",
+  },
 });
 startLogged("web", "pnpm", ["--filter", "@rfhold/waltr-web", "dev:vite"]);
 
