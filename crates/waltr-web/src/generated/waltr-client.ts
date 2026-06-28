@@ -56,6 +56,36 @@ tools: boolean,
  */
 image: boolean, };
 
+export type ModelCostView = { 
+/**
+ * Input token price per million tokens.
+ */
+inputPerMillionTokens: number | null, 
+/**
+ * Output token price per million tokens.
+ */
+outputPerMillionTokens: number | null, 
+/**
+ * Cache-read token price per million tokens.
+ */
+cacheReadPerMillionTokens: number | null, 
+/**
+ * Cache-write token price per million tokens.
+ */
+cacheWritePerMillionTokens: number | null, 
+/**
+ * Image input token price per million tokens.
+ */
+imageInputPerMillionTokens: number | null, 
+/**
+ * Image input price per image.
+ */
+imageInputPerImage: number | null, 
+/**
+ * Currency code for configured rates.
+ */
+currency: string, };
+
 export type ModelCatalogMatchView = { 
 /**
  * Matched models.dev serving provider id.
@@ -102,7 +132,11 @@ capabilities: ModelCapabilitiesView,
 /**
  * Optional models.dev catalog linkage.
  */
-catalogMatch: ModelCatalogMatchView | null, };
+catalogMatch: ModelCatalogMatchView | null, 
+/**
+ * Optional model pricing used for session cost tracking.
+ */
+cost: ModelCostView | null, };
 
 export type OAuthTokenRequestStyleView = "unspecified" | "json" | "formUrlencoded" | "unknown";
 
@@ -350,6 +384,44 @@ provider: SessionProviderRuntimeView | null,
  */
 mcpServers: Array<SessionMcpServerRuntimeView>, };
 
+export type SessionMetricsView = { 
+/**
+ * Input/prompt tokens consumed by provider requests.
+ */
+inputTokens: bigint, 
+/**
+ * Output/completion tokens produced by provider responses.
+ */
+outputTokens: bigint, 
+/**
+ * Input tokens served from provider cache.
+ */
+cacheReadTokens: bigint, 
+/**
+ * Input tokens written to provider cache.
+ */
+cacheWriteTokens: bigint, 
+/**
+ * Image input tokens consumed by provider requests.
+ */
+imageInputTokens: bigint, 
+/**
+ * Image count consumed by provider requests.
+ */
+imageInputCount: bigint, 
+/**
+ * Total billable/token-counted input and output tokens.
+ */
+totalTokens: bigint, 
+/**
+ * Currency for total cost, or `mixed` when journaled turns differ.
+ */
+costCurrency: string | null, 
+/**
+ * Total cost in currency micro-units.
+ */
+totalCostMicros: bigint, };
+
 export type SessionView = { 
 /**
  * Server-assigned session id.
@@ -382,7 +454,11 @@ lastActivityAt: TimestampView | null,
 /**
  * Runtime configuration snapshot stored with the session.
  */
-runtimeConfig: SessionRuntimeConfigView | null, };
+runtimeConfig: SessionRuntimeConfigView | null, 
+/**
+ * Aggregate usage and cost derived from journaled provider turns.
+ */
+metrics: SessionMetricsView, };
 
 export type TimelineEventKindView = "unspecified" | "itemStarted" | "contentDelta" | "itemUpdated" | "itemFinished" | "externalRequestOpened" | "externalRequestResolved" | "sessionStatusChanged" | "unknown";
 

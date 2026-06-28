@@ -168,7 +168,10 @@ async fn provider_builder(
             }
             provider = apply_config_headers(provider, &provider_config.headers);
             let model = ModelRef::new(ProviderId::Anthropic, model_id, ModelApi::AnthropicMessages);
-            Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
+            Ok(builder_with_model_cost(
+                AgentRuntimeBuilder::new(model, Arc::new(provider)),
+                model_config.cost.clone(),
+            ))
         }
         ProviderType::OpenaiChatCompletions => {
             ensure_no_reasoning_effort(runtime_config, "OpenAI Chat Completions")?;
@@ -183,7 +186,10 @@ async fn provider_builder(
                 model_id,
                 ModelApi::OpenAiChatCompletions,
             );
-            Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
+            Ok(builder_with_model_cost(
+                AgentRuntimeBuilder::new(model, Arc::new(provider)),
+                model_config.cost.clone(),
+            ))
         }
         ProviderType::OpenaiResponses => {
             let mut provider = apply_openai_auth(
@@ -199,7 +205,10 @@ async fn provider_builder(
                 provider = provider.with_url(endpoint_url);
             }
             let model = ModelRef::new(ProviderId::OpenAi, model_id, ModelApi::OpenAiResponses);
-            Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
+            Ok(builder_with_model_cost(
+                AgentRuntimeBuilder::new(model, Arc::new(provider)),
+                model_config.cost.clone(),
+            ))
         }
         ProviderType::OpenaiResponsesWebsocket => {
             let mut provider = apply_openai_auth(
@@ -219,12 +228,31 @@ async fn provider_builder(
                 model_id,
                 ModelApi::OpenAiResponsesWebSocket,
             );
-            Ok(AgentRuntimeBuilder::new(model, Arc::new(provider)))
+            Ok(builder_with_model_cost(
+                AgentRuntimeBuilder::new(model, Arc::new(provider)),
+                model_config.cost.clone(),
+            ))
         }
         ProviderType::Unspecified => {
             Err(Status::failed_precondition("provider type is unspecified"))
         }
     }
+}
+
+fn builder_with_model_cost(
+    builder: AgentRuntimeBuilder,
+    cost: Option<waltr::grpc::waltr::config::v1::ModelCost>,
+) -> AgentRuntimeBuilder {
+    let Some(cost) = cost else { return builder };
+    builder.with_model_cost(waltr_agent::ModelCost {
+        input_per_million_tokens: cost.input_per_million_tokens,
+        output_per_million_tokens: cost.output_per_million_tokens,
+        cache_read_per_million_tokens: cost.cache_read_per_million_tokens,
+        cache_write_per_million_tokens: cost.cache_write_per_million_tokens,
+        image_input_per_million_tokens: cost.image_input_per_million_tokens,
+        image_input_per_image: cost.image_input_per_image,
+        currency: cost.currency,
+    })
 }
 
 fn anthropic_oauth_provider(oauth: ResolvedOAuth, model_id: String) -> AnthropicMessages {
