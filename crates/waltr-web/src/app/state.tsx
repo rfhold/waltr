@@ -117,6 +117,46 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
   };
 
+  const dispatchUpdateSessionRuntimeConfig = async (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => {
+    return dispatchAndWaitForOperation({
+      command,
+      key: (snapshot) => snapshot.sessions.runtimeConfigUpdate.key,
+      kind: "sessionRuntimeConfigUpdate",
+      missingKeyMessage: "session runtime config update command did not produce an operation key",
+      failureMessage: "session runtime config update failed",
+    });
+  };
+
+  const dispatchSubmitUserMessage = async (sessionId: string, text: string) => {
+    return dispatchAndWaitForOperation({
+      command: { type: "submitUserMessage", sessionId, text },
+      key: (snapshot) => snapshot.sessions.submitUserMessage.key,
+      kind: "sessionSubmitUserMessage",
+      missingKeyMessage: "submit user message command did not produce an operation key",
+      failureMessage: "submit user message failed",
+    });
+  };
+
+  const dispatchRespondExternalRequest = async (sessionId: string, requestId: string, responseJson: string) => {
+    return dispatchAndWaitForOperation({
+      command: { type: "respondExternalRequest", sessionId, requestId, responseJson },
+      key: (snapshot) => snapshot.sessions.respondExternalRequest.key,
+      kind: "sessionRespondExternalRequest",
+      missingKeyMessage: "respond external request command did not produce an operation key",
+      failureMessage: "respond external request failed",
+    });
+  };
+
+  const dispatchInterruptSession = async (sessionId: string) => {
+    return dispatchAndWaitForOperation({
+      command: { type: "interruptSession", sessionId },
+      key: (snapshot) => snapshot.sessions.interrupt.key,
+      kind: "sessionInterrupt",
+      missingKeyMessage: "interrupt session command did not produce an operation key",
+      failureMessage: "interrupt session failed",
+    });
+  };
+
   async function dispatchAndWaitForOperation(options: {
     command: ClientCommand;
     key: (snapshot: ClientSnapshot) => string | null;
@@ -169,6 +209,10 @@ export function AppStateProvider(props: AppStateProviderProps) {
         suggestCatalogMatches,
         dispatchCreateSession,
         dispatchDeleteSession,
+        dispatchUpdateSessionRuntimeConfig,
+        dispatchSubmitUserMessage,
+        dispatchRespondExternalRequest,
+        dispatchInterruptSession,
       }}
     >
       {props.children}

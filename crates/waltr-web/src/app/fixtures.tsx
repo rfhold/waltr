@@ -32,6 +32,10 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
     suggestCatalogMatches: async () => ({ matches: [], stale: false }),
     dispatchCreateSession: async () => props.snapshot,
     dispatchDeleteSession: async (_id: string) => props.snapshot,
+    dispatchUpdateSessionRuntimeConfig: async (_command) => props.snapshot,
+    dispatchSubmitUserMessage: async (_sessionId: string, _text: string) => props.snapshot,
+    dispatchRespondExternalRequest: async (_sessionId: string, _requestId: string, _responseJson: string) => props.snapshot,
+    dispatchInterruptSession: async (_sessionId: string) => props.snapshot,
   };
 
   return <AppStateContextProvider value={state}>{props.children}</AppStateContextProvider>;
