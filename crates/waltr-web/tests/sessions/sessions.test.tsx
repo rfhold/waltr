@@ -140,6 +140,26 @@ describe("sessions route", () => {
     }));
   });
 
+  test("session detail composer keeps draft and shows operation failures", async () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-compose-fail"),
+    ]);
+    snapshot.sessions.timelines["session-compose-fail"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-compose-fail",
+      snapshot,
+      submitUserMessageError: "submit rejected",
+    });
+
+    const input = screen.getByLabelText("Session message") as HTMLTextAreaElement;
+    fireEvent.input(input, { target: { value: "keep me" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(screen.getByText("submit rejected")).toBeTruthy());
+    expect(input.value).toBe("keep me");
+  });
+
   test("session detail shows assistant pending state while active", () => {
     const snapshot = snapshotWithSessions([
       sessionWithRuntime("session-active", { phase: "streamingProvider", failedMessage: "" }),
@@ -891,6 +911,50 @@ describe("sessions route", () => {
     }));
   });
 
+  test("session detail shows external response operation failures", async () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-permission-fail"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [externalRequestOpenEvent({
+      sessionId: "session-permission-fail",
+      requestId: "permission-1",
+      kind: 1,
+      payload: {
+        tool_call: { name: "read", arguments: { filePath: "README.md" } },
+        patterns: [],
+      },
+    })];
+    snapshot.sessions.timelines["session-permission-fail"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-permission-fail",
+      snapshot,
+      respondExternalRequestError: "response rejected",
+    });
+
+    fireEvent.click(within(screen.getByLabelText("Permission prompt")).getByText("Allow once"));
+
+    await waitFor(() => expect(screen.getByText("response rejected")).toBeTruthy());
+  });
+
+  test("session detail shows interrupt operation failures", async () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-interrupt-fail", { phase: "streamingProvider", failedMessage: "" }),
+    ]);
+    snapshot.sessions.timelines["session-interrupt-fail"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-interrupt-fail",
+      snapshot,
+      interruptSessionError: "interrupt rejected",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+
+    await waitFor(() => expect(screen.getByText("interrupt rejected")).toBeTruthy());
+  });
+
   test("session detail renders unresolved question prompts and submits answers", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
@@ -1021,6 +1085,30 @@ describe("sessions route", () => {
       reasoningEffort: null,
       enabledMcpServerKeys: ["git"],
     }));
+  });
+
+  test("provider editor keeps dialog open and shows runtime update failures", async () => {
+    const snapshot = snapshotWithConfig({
+      ...emptyConfig("v1"),
+      providers: {
+        openai: provider("OpenAI", ["gpt-4o"]),
+        anthropic: provider("Anthropic", ["claude-4"]),
+      },
+    });
+    snapshot.sessions.current = [sessionWithRuntime("runtime-session-fail")];
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/runtime-session-fail",
+      snapshot,
+      sessionRuntimeConfigUpdateError: "runtime update rejected",
+    });
+
+    fireEvent.click(screen.getByLabelText("Edit provider/model"));
+    fireEvent.click(screen.getByText("anthropic"));
+    fireEvent.click(screen.getByText("Save runtime"));
+
+    await waitFor(() => expect(screen.getByText("runtime update rejected")).toBeTruthy());
+    expect(screen.getByRole("dialog", { name: "Edit provider/model dialog" })).toBeTruthy();
   });
 
   test("bottom bar thinking dropdown dispatches session runtime metadata update", async () => {

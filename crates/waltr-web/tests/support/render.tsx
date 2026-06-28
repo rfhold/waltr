@@ -3,7 +3,7 @@ import { createMemo, createSignal, type JSX } from "solid-js";
 import { afterEach } from "vitest";
 
 import { AppStateContextProvider } from "../../src/app/context";
-import type { ClientCommand, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
+import type { ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
 import type { CatalogSearchResponse, CatalogSuggestResponse } from "../../src/wasm/client";
 import { resetTestHistory } from "./routes";
 import { emptyConfig, snapshotWithConfig } from "./snapshots";
@@ -25,6 +25,10 @@ export function renderWithAppState(
     configPatchError?: string;
     sessionCreateError?: string;
     sessionDeleteError?: string;
+    sessionRuntimeConfigUpdateError?: string;
+    submitUserMessageError?: string;
+    respondExternalRequestError?: string;
+    interruptSessionError?: string;
     searchCatalogModels?: (request: { query: string; providerId?: string; limit?: number }) => Promise<CatalogSearchResponse>;
     suggestCatalogMatches?: (request: { providerKey: string; modelKey: string; limit?: number }) => Promise<CatalogSuggestResponse>;
     onSnapshotSetter?: (setSnapshot: (snapshot: ClientSnapshot) => void) => void;
@@ -234,6 +238,104 @@ export function renderWithAppState(
       return ready;
     };
 
+    const dispatchUpdateSessionRuntimeConfig = async (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => {
+      return dispatchSessionOperation({
+        command,
+        operationName: "runtimeConfigUpdate",
+        kind: "sessionRuntimeConfigUpdate",
+        error: options.sessionRuntimeConfigUpdateError,
+        loadingOperation: { kind: "sessionRuntimeConfigUpdate", status: "loading", error: null, session: null },
+        readyOperation: (current) => ({ kind: "sessionRuntimeConfigUpdate", status: "ready", error: null, session: current.sessions.current.find((session) => session.id === command.id) ?? null }),
+        failedOperation: (error) => ({ kind: "sessionRuntimeConfigUpdate", status: "failed", error, session: null }),
+      });
+    };
+
+    const dispatchSubmitUserMessage = async (sessionId: string, text: string) => {
+      return dispatchSessionOperation({
+        command: { type: "submitUserMessage", sessionId, text },
+        operationName: "submitUserMessage",
+        kind: "sessionSubmitUserMessage",
+        error: options.submitUserMessageError,
+        loadingOperation: { kind: "sessionSubmitUserMessage", status: "loading", error: null, sessionId },
+        readyOperation: () => ({ kind: "sessionSubmitUserMessage", status: "ready", error: null, sessionId }),
+        failedOperation: (error) => ({ kind: "sessionSubmitUserMessage", status: "failed", error, sessionId }),
+      });
+    };
+
+    const dispatchRespondExternalRequest = async (sessionId: string, requestId: string, responseJson: string) => {
+      return dispatchSessionOperation({
+        command: { type: "respondExternalRequest", sessionId, requestId, responseJson },
+        operationName: "respondExternalRequest",
+        kind: "sessionRespondExternalRequest",
+        error: options.respondExternalRequestError,
+        loadingOperation: { kind: "sessionRespondExternalRequest", status: "loading", error: null, sessionId, requestId },
+        readyOperation: () => ({ kind: "sessionRespondExternalRequest", status: "ready", error: null, sessionId, requestId }),
+        failedOperation: (error) => ({ kind: "sessionRespondExternalRequest", status: "failed", error, sessionId, requestId }),
+      });
+    };
+
+    const dispatchInterruptSession = async (sessionId: string) => {
+      return dispatchSessionOperation({
+        command: { type: "interruptSession", sessionId },
+        operationName: "interrupt",
+        kind: "sessionInterrupt",
+        error: options.interruptSessionError,
+        loadingOperation: { kind: "sessionInterrupt", status: "loading", error: null, sessionId },
+        readyOperation: () => ({ kind: "sessionInterrupt", status: "ready", error: null, sessionId }),
+        failedOperation: (error) => ({ kind: "sessionInterrupt", status: "failed", error, sessionId }),
+      });
+    };
+
+    const dispatchSessionOperation = async (operation: {
+      command: ClientCommand;
+      operationName: "runtimeConfigUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt";
+      kind: ClientOperationView["kind"];
+      error?: string;
+      loadingOperation: ClientOperationView;
+      readyOperation: (snapshot: ClientSnapshot) => ClientOperationView;
+      failedOperation: (error: string) => ClientOperationView;
+    }) => {
+      commands.push(operation.command);
+      const key = `op-${nextOperationId++}`;
+      const current = snapshot() ?? snapshotWithConfig(emptyConfig(""));
+      const loading: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current, [key]: operation.loadingOperation } },
+        sessions: {
+          ...current.sessions,
+          [operation.operationName]: { status: "loading", error: null, key },
+        },
+      };
+      setSnapshot(loading);
+
+      await Promise.resolve();
+
+      if (operation.error) {
+        const failed: ClientSnapshot = {
+          ...current,
+          operations: { current: { ...current.operations.current, [key]: operation.failedOperation(operation.error) } },
+          sessions: {
+            ...current.sessions,
+            [operation.operationName]: { status: "failed", error: operation.error, key },
+          },
+        };
+        setSnapshot(failed);
+        throw new Error(operation.error);
+      }
+
+      const ready: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current, [key]: operation.readyOperation(current) } },
+        sessions: {
+          ...current.sessions,
+          [operation.operationName]: { status: "ready", error: null, key },
+        },
+      };
+      setSnapshot(ready);
+
+      return ready;
+    };
+
     return (
       <AppStateContextProvider
         value={{
@@ -250,6 +352,10 @@ export function renderWithAppState(
           suggestCatalogMatches: options.suggestCatalogMatches ?? (async () => ({ matches: [], stale: false })),
           dispatchCreateSession,
           dispatchDeleteSession,
+          dispatchUpdateSessionRuntimeConfig,
+          dispatchSubmitUserMessage,
+          dispatchRespondExternalRequest,
+          dispatchInterruptSession,
         }}
       >
         {ui()}

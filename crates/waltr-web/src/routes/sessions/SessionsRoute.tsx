@@ -588,7 +588,7 @@ function SessionDetail(props: { session: SessionView }) {
 
     setCommandError(undefined);
     try {
-      await app.dispatch({ type: "submitUserMessage", sessionId: props.session.id, text });
+      await app.dispatchSubmitUserMessage(props.session.id, text);
       setDraft("");
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : "Unable to send message.");
@@ -598,7 +598,7 @@ function SessionDetail(props: { session: SessionView }) {
   const interrupt = async () => {
     setCommandError(undefined);
     try {
-      await app.dispatch({ type: "interruptSession", sessionId: props.session.id });
+      await app.dispatchInterruptSession(props.session.id);
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : "Unable to stop session.");
     }
@@ -607,12 +607,7 @@ function SessionDetail(props: { session: SessionView }) {
   const respond = async (requestId: string, response: unknown) => {
     setCommandError(undefined);
     try {
-      await app.dispatch({
-        type: "respondExternalRequest",
-        sessionId: props.session.id,
-        requestId,
-        responseJson: JSON.stringify(response),
-      });
+      await app.dispatchRespondExternalRequest(props.session.id, requestId, JSON.stringify(response));
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : "Unable to answer prompt.");
     }
@@ -1773,7 +1768,7 @@ function SessionDetailStatusBar(props: {
     }
 
     setReasoningEffort(effort);
-    await updateRuntimeConfig(app.dispatch, props.session, {
+    await updateRuntimeConfig(app.dispatchUpdateSessionRuntimeConfig, props.session, {
       providerKey: provider.key,
       modelId: provider.modelId,
       reasoningEffort: effort || null,
@@ -1905,7 +1900,7 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
       setError("Choose a provider and model.");
       return;
     }
-    await updateRuntimeConfig(app.dispatch, props.session, {
+    await updateRuntimeConfig(app.dispatchUpdateSessionRuntimeConfig, props.session, {
       providerKey: provider,
       modelId: model,
       reasoningEffort: reasoningEffort() || null,
@@ -1994,7 +1989,7 @@ function SessionMcpDialog(props: { session: SessionView; onClose: () => void }) 
   };
 
   const save = async () => {
-    await updateRuntimeConfig(app.dispatch, props.session, {
+    await updateRuntimeConfig(app.dispatchUpdateSessionRuntimeConfig, props.session, {
       providerKey: props.session.runtimeConfig?.provider?.key ?? "",
       modelId: props.session.runtimeConfig?.provider?.modelId ?? "",
       reasoningEffort: props.session.runtimeConfig?.provider?.reasoningEffort ?? null,
@@ -2122,7 +2117,7 @@ function searchable(value: string, query: string) {
 }
 
 async function updateRuntimeConfig(
-  dispatch: (command: ClientCommand) => Promise<unknown>,
+  dispatchUpdateSessionRuntimeConfig: (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => Promise<unknown>,
   session: SessionView,
   options: {
     providerKey: string;
@@ -2138,7 +2133,7 @@ async function updateRuntimeConfig(
   options.setError(undefined);
 
   try {
-    await dispatch({
+    await dispatchUpdateSessionRuntimeConfig({
       type: "updateSessionRuntimeConfig",
       id: session.id,
       providerKey: options.providerKey,
