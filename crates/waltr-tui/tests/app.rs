@@ -332,9 +332,12 @@ fn sessions_create_dispatches_and_completion_opens_detail() {
 
     assert_eq!(app.sessions_section().detail_session_id(), Some("created"));
     let rendered = render_app(&app);
-    assert!(
-        rendered.contains("status idle  provider none (p)  mcp none (m)  delete Backspace/Delete")
-    );
+    assert!(rendered.contains("status idle"));
+    assert!(rendered.contains("provider none (p)"));
+    assert!(rendered.contains("mcp none (m)"));
+    assert!(rendered.contains("tokens 0"));
+    assert!(rendered.contains("cache R 0%/W 0%"));
+    assert!(rendered.contains("cost -"));
 }
 
 #[test]
@@ -1629,6 +1632,7 @@ fn open_config_app_with_model() -> App {
                     tools: false,
                     image: false,
                 },
+                cost: None,
                 catalog_match: Some(ModelCatalogMatchView {
                     provider_id: "anthropic".to_owned(),
                     model_id: "claude-sonnet-4-5".to_owned(),
@@ -1810,6 +1814,7 @@ fn session_view(id: &str, seconds: i64) -> SessionView {
         updated_at: Some(TimestampView { seconds, nanos: 0 }),
         last_activity_at: None,
         runtime_config: None,
+        metrics: Default::default(),
     }
 }
 

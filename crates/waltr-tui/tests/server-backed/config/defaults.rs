@@ -125,6 +125,7 @@ fn model(name: &str) -> ModelView {
             tools: true,
             image: false,
         },
+        cost: None,
         catalog_match: None,
     }
 }
