@@ -6,19 +6,24 @@ use std::future::Future;
 use std::rc::Rc;
 
 use futures_channel::oneshot;
-use futures_util::{StreamExt, future::Either, future::LocalBoxFuture, future::select, pin_mut};
+use futures_util::{
+    FutureExt, StreamExt,
+    future::{Either, LocalBoxFuture, select, select_all},
+    pin_mut,
+};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::executor::{
     ConfigWatchUpdateStream, SessionTimelineWatchUpdateStream, SessionWatchUpdateStream,
 };
+use crate::transport::SessionTimelineWatchUpdate;
 use crate::{
     Client, ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate,
     ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey,
     OperationStatus, ProviderView, RuntimeDefaultsView, SessionEffect, SessionEvent,
     SessionRuntimeConfigRequest, SessionTimelineView, SessionView, StatusChangeStream,
-    StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
+    StatusEffect, StatusEvent, TimelineDirection, TimelineQuery, TimelineWatchKey,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -346,7 +351,26 @@ pub struct ClientRuntime {
     status_watch: Option<StatusChangeStream>,
     config_watch: Option<ConfigWatchUpdateStream>,
     session_watch: Option<SessionWatchUpdateStream>,
-    timeline_watches: BTreeMap<String, SessionTimelineWatchUpdateStream>,
+    timeline_watches: BTreeMap<TimelineWatchKey, SessionTimelineWatchUpdateStream>,
+    watch_poll_offset: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WatchCandidate {
+    Status,
+    Config,
+    Session,
+    Timeline(TimelineWatchKey),
+}
+
+enum WatchResult {
+    Status(Option<Result<crate::SystemStatus, ClientError>>),
+    Config(Option<Result<crate::ConfigWatchUpdate, ClientError>>),
+    Session(Option<Result<crate::SessionWatchUpdate, ClientError>>),
+    Timeline(
+        TimelineWatchKey,
+        Option<Result<SessionTimelineWatchUpdate, ClientError>>,
+    ),
 }
 
 /// Command sent to a shared client state stream loop.
@@ -413,6 +437,7 @@ impl ClientRuntime {
             config_watch: None,
             session_watch: None,
             timeline_watches: BTreeMap::new(),
+            watch_poll_offset: 0,
         }
     }
 
@@ -467,30 +492,25 @@ impl ClientRuntime {
                     Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
                 }
             }
-            ClientEffect::Session(SessionEffect::WatchTimeline {
-                session_id,
-                after_cursor,
-                channels,
-                initial_limit,
-            }) => {
+            ClientEffect::Session(SessionEffect::WatchTimeline { key }) => {
                 match self
                     .executor
                     .watch_session_timeline_updates(
-                        session_id.clone(),
-                        after_cursor,
-                        channels,
-                        initial_limit,
+                        key.session_id.clone(),
+                        key.after_cursor,
+                        key.channels.clone(),
+                        key.initial_limit,
                     )
                     .await
                 {
                     Ok(stream) => {
-                        self.timeline_watches.insert(session_id.clone(), stream);
+                        self.timeline_watches.insert(key.clone(), stream);
                         vec![ClientEvent::Session(SessionEvent::TimelineWatchStarted {
-                            session_id,
+                            key,
                         })]
                     }
                     Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineWatchFailed {
-                        session_id,
+                        key,
                         error,
                     })],
                 }
@@ -499,297 +519,179 @@ impl ClientRuntime {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn next_watch_event(&mut self) -> ClientEvent {
-        let timeline_session_id = self
-            .reducer
-            .state()
-            .timeline_watch_session_ids()
-            .into_iter()
-            .find(|session_id| self.timeline_watches.contains_key(session_id));
-
-        if self.reducer.state().sessions.watch.interests > 0 {
-            if let Some(session_id) = timeline_session_id.clone() {
-                if let (Some(session), Some(status), Some(timeline)) = (
-                    &mut self.session_watch,
-                    &mut self.status_watch,
-                    self.timeline_watches.get_mut(&session_id),
-                ) {
-                    let timeline_next = timeline.next();
-                    let session_next = session.next();
-                    let status_next = status.next();
-                    pin_mut!(timeline_next);
-                    pin_mut!(session_next);
-                    pin_mut!(status_next);
-
-                    let session_status_next = select(session_next, status_next);
-                    pin_mut!(session_status_next);
-
-                    return match select(timeline_next, session_status_next).await {
-                        Either::Left((Some(Ok(update)), _)) => {
-                            ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
-                        }
-                        Either::Left((Some(Err(error)), _)) => {
-                            self.timeline_watches.remove(&session_id);
-                            ClientEvent::Session(SessionEvent::TimelineWatchFailed {
-                                session_id,
-                                error,
-                            })
-                        }
-                        Either::Left((None, _)) => {
-                            self.timeline_watches.remove(&session_id);
-                            ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
-                        }
-                        Either::Right((Either::Left((Some(Ok(update)), _)), _)) => {
-                            ClientEvent::Session(SessionEvent::WatchChanged(update))
-                        }
-                        Either::Right((Either::Left((Some(Err(error)), _)), _)) => {
-                            self.session_watch = None;
-                            ClientEvent::Session(SessionEvent::WatchFailed(error))
-                        }
-                        Either::Right((Either::Left((None, _)), _)) => {
-                            self.session_watch = None;
-                            ClientEvent::Session(SessionEvent::WatchEnded)
-                        }
-                        Either::Right((Either::Right((Some(Ok(status)), _)), _)) => {
-                            ClientEvent::Status(StatusEvent::WatchChanged(status))
-                        }
-                        Either::Right((Either::Right((Some(Err(error)), _)), _)) => {
-                            self.status_watch = None;
-                            ClientEvent::Status(StatusEvent::WatchFailed(error))
-                        }
-                        Either::Right((Either::Right((None, _)), _)) => {
-                            self.status_watch = None;
-                            ClientEvent::Status(StatusEvent::WatchEnded)
-                        }
-                    };
-                }
-
-                if let (Some(session), Some(timeline)) = (
-                    &mut self.session_watch,
-                    self.timeline_watches.get_mut(&session_id),
-                ) {
-                    let timeline_next = timeline.next();
-                    let session_next = session.next();
-                    pin_mut!(timeline_next);
-                    pin_mut!(session_next);
-
-                    return match select(timeline_next, session_next).await {
-                        Either::Left((Some(Ok(update)), _)) => {
-                            ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
-                        }
-                        Either::Left((Some(Err(error)), _)) => {
-                            self.timeline_watches.remove(&session_id);
-                            ClientEvent::Session(SessionEvent::TimelineWatchFailed {
-                                session_id,
-                                error,
-                            })
-                        }
-                        Either::Left((None, _)) => {
-                            self.timeline_watches.remove(&session_id);
-                            ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
-                        }
-                        Either::Right((Some(Ok(update)), _)) => {
-                            ClientEvent::Session(SessionEvent::WatchChanged(update))
-                        }
-                        Either::Right((Some(Err(error)), _)) => {
-                            self.session_watch = None;
-                            ClientEvent::Session(SessionEvent::WatchFailed(error))
-                        }
-                        Either::Right((None, _)) => {
-                            self.session_watch = None;
-                            ClientEvent::Session(SessionEvent::WatchEnded)
-                        }
-                    };
-                }
-            }
-
-            if let (Some(session), Some(config), Some(status)) = (
-                &mut self.session_watch,
-                &mut self.config_watch,
-                &mut self.status_watch,
-            ) {
-                let session_next = session.next();
-                let config_next = config.next();
-                let status_next = status.next();
-                pin_mut!(session_next);
-                pin_mut!(config_next);
-                pin_mut!(status_next);
-
-                let data_next = select(session_next, config_next);
-                pin_mut!(data_next);
-
-                return match select(data_next, status_next).await {
-                    Either::Left((Either::Left((Some(Ok(update)), _)), _)) => {
-                        ClientEvent::Session(SessionEvent::WatchChanged(update))
-                    }
-                    Either::Left((Either::Left((Some(Err(error)), _)), _)) => {
-                        self.session_watch = None;
-                        ClientEvent::Session(SessionEvent::WatchFailed(error))
-                    }
-                    Either::Left((Either::Left((None, _)), _)) => {
-                        self.session_watch = None;
-                        ClientEvent::Session(SessionEvent::WatchEnded)
-                    }
-                    Either::Left((Either::Right((Some(Ok(update)), _)), _)) => {
-                        ClientEvent::Config(ConfigEvent::WatchChanged(update))
-                    }
-                    Either::Left((Either::Right((Some(Err(error)), _)), _)) => {
-                        self.config_watch = None;
-                        ClientEvent::Config(ConfigEvent::WatchFailed(error))
-                    }
-                    Either::Left((Either::Right((None, _)), _)) => {
-                        self.config_watch = None;
-                        ClientEvent::Config(ConfigEvent::WatchEnded)
-                    }
-                    Either::Right((Some(Ok(status)), _)) => {
-                        ClientEvent::Status(StatusEvent::WatchChanged(status))
-                    }
-                    Either::Right((Some(Err(error)), _)) => {
-                        self.status_watch = None;
-                        ClientEvent::Status(StatusEvent::WatchFailed(error))
-                    }
-                    Either::Right((None, _)) => {
-                        self.status_watch = None;
-                        ClientEvent::Status(StatusEvent::WatchEnded)
-                    }
-                };
-            }
-
-            if let (Some(session), Some(status)) = (&mut self.session_watch, &mut self.status_watch)
-            {
-                let session_next = session.next();
-                let status_next = status.next();
-                pin_mut!(session_next);
-                pin_mut!(status_next);
-
-                return match select(session_next, status_next).await {
-                    Either::Left((Some(Ok(update)), _)) => {
-                        ClientEvent::Session(SessionEvent::WatchChanged(update))
-                    }
-                    Either::Left((Some(Err(error)), _)) => {
-                        self.session_watch = None;
-                        ClientEvent::Session(SessionEvent::WatchFailed(error))
-                    }
-                    Either::Left((None, _)) => {
-                        self.session_watch = None;
-                        ClientEvent::Session(SessionEvent::WatchEnded)
-                    }
-                    Either::Right((Some(Ok(status)), _)) => {
-                        ClientEvent::Status(StatusEvent::WatchChanged(status))
-                    }
-                    Either::Right((Some(Err(error)), _)) => {
-                        self.status_watch = None;
-                        ClientEvent::Status(StatusEvent::WatchFailed(error))
-                    }
-                    Either::Right((None, _)) => {
-                        self.status_watch = None;
-                        ClientEvent::Status(StatusEvent::WatchEnded)
-                    }
-                };
-            }
-
-            if let Some(stream) = &mut self.session_watch {
-                return match stream.next().await {
-                    Some(Ok(update)) => ClientEvent::Session(SessionEvent::WatchChanged(update)),
-                    Some(Err(error)) => {
-                        self.session_watch = None;
-                        ClientEvent::Session(SessionEvent::WatchFailed(error))
-                    }
-                    None => {
-                        self.session_watch = None;
-                        ClientEvent::Session(SessionEvent::WatchEnded)
-                    }
-                };
-            }
+        if let Some(result) = self.try_ready_watch_result() {
+            return self.watch_result_event(result);
         }
 
-        if let Some(session_id) = self
-            .reducer
-            .state()
-            .timeline_watch_session_ids()
-            .into_iter()
-            .find(|session_id| self.timeline_watches.contains_key(session_id))
-            && let Some(stream) = self.timeline_watches.get_mut(&session_id)
-        {
-            return match stream.next().await {
-                Some(Ok(update)) => {
-                    ClientEvent::Session(SessionEvent::TimelineWatchChanged(update))
-                }
-                Some(Err(error)) => {
-                    self.timeline_watches.remove(&session_id);
-                    ClientEvent::Session(SessionEvent::TimelineWatchFailed { session_id, error })
-                }
-                None => {
-                    self.timeline_watches.remove(&session_id);
-                    ClientEvent::Session(SessionEvent::TimelineWatchEnded { session_id })
-                }
+        let result = self.next_pending_watch_result().await;
+        self.watch_result_event(result)
+    }
+
+    fn active_watch_candidates(&self) -> Vec<WatchCandidate> {
+        let mut candidates = Vec::new();
+
+        if self.status_watch.is_some() {
+            candidates.push(WatchCandidate::Status);
+        }
+
+        if self.reducer.state().config.watch.interests > 0 && self.config_watch.is_some() {
+            candidates.push(WatchCandidate::Config);
+        }
+
+        if self.reducer.state().sessions.watch.interests > 0 && self.session_watch.is_some() {
+            candidates.push(WatchCandidate::Session);
+        }
+
+        candidates.extend(
+            self.reducer
+                .state()
+                .timeline_watch_keys()
+                .into_iter()
+                .filter(|key| self.timeline_watches.contains_key(key))
+                .map(WatchCandidate::Timeline),
+        );
+
+        if !candidates.is_empty() {
+            let offset = self.watch_poll_offset % candidates.len();
+            candidates.rotate_left(offset);
+        }
+
+        candidates
+    }
+
+    fn try_ready_watch_result(&mut self) -> Option<WatchResult> {
+        for candidate in self.active_watch_candidates() {
+            let result = match candidate {
+                WatchCandidate::Status => self
+                    .status_watch
+                    .as_mut()
+                    .and_then(|stream| stream.next().now_or_never())
+                    .map(WatchResult::Status),
+                WatchCandidate::Config => self
+                    .config_watch
+                    .as_mut()
+                    .and_then(|stream| stream.next().now_or_never())
+                    .map(WatchResult::Config),
+                WatchCandidate::Session => self
+                    .session_watch
+                    .as_mut()
+                    .and_then(|stream| stream.next().now_or_never())
+                    .map(WatchResult::Session),
+                WatchCandidate::Timeline(key) => self
+                    .timeline_watches
+                    .get_mut(&key)
+                    .and_then(|stream| stream.next().now_or_never())
+                    .map(|result| WatchResult::Timeline(key, result)),
             };
-        }
 
-        if self.reducer.state().config.watch.interests > 0 {
-            if let (Some(config), Some(status)) = (&mut self.config_watch, &mut self.status_watch) {
-                let config_next = config.next();
-                let status_next = status.next();
-                pin_mut!(config_next);
-                pin_mut!(status_next);
-
-                return match select(config_next, status_next).await {
-                    Either::Left((Some(Ok(update)), _)) => {
-                        ClientEvent::Config(ConfigEvent::WatchChanged(update))
-                    }
-                    Either::Left((Some(Err(error)), _)) => {
-                        self.config_watch = None;
-                        ClientEvent::Config(ConfigEvent::WatchFailed(error))
-                    }
-                    Either::Left((None, _)) => {
-                        self.config_watch = None;
-                        ClientEvent::Config(ConfigEvent::WatchEnded)
-                    }
-                    Either::Right((Some(Ok(status)), _)) => {
-                        ClientEvent::Status(StatusEvent::WatchChanged(status))
-                    }
-                    Either::Right((Some(Err(error)), _)) => {
-                        self.status_watch = None;
-                        ClientEvent::Status(StatusEvent::WatchFailed(error))
-                    }
-                    Either::Right((None, _)) => {
-                        self.status_watch = None;
-                        ClientEvent::Status(StatusEvent::WatchEnded)
-                    }
-                };
-            }
-
-            if let Some(stream) = &mut self.config_watch {
-                return match stream.next().await {
-                    Some(Ok(update)) => ClientEvent::Config(ConfigEvent::WatchChanged(update)),
-                    Some(Err(error)) => {
-                        self.config_watch = None;
-                        ClientEvent::Config(ConfigEvent::WatchFailed(error))
-                    }
-                    None => {
-                        self.config_watch = None;
-                        ClientEvent::Config(ConfigEvent::WatchEnded)
-                    }
-                };
+            if result.is_some() {
+                self.watch_poll_offset = self.watch_poll_offset.saturating_add(1);
+                return result;
             }
         }
+
+        None
+    }
+
+    async fn next_pending_watch_result(&mut self) -> WatchResult {
+        let mut futures: Vec<LocalBoxFuture<'_, WatchResult>> = Vec::new();
 
         if let Some(stream) = &mut self.status_watch {
-            return match stream.next().await {
-                Some(Ok(status)) => ClientEvent::Status(StatusEvent::WatchChanged(status)),
-                Some(Err(error)) => {
-                    self.status_watch = None;
-                    ClientEvent::Status(StatusEvent::WatchFailed(error))
-                }
-                None => {
-                    self.status_watch = None;
-                    ClientEvent::Status(StatusEvent::WatchEnded)
-                }
-            };
+            futures.push(Box::pin(
+                async move { WatchResult::Status(stream.next().await) },
+            ));
         }
 
-        ClientEvent::Status(StatusEvent::ReconnectReady)
+        if self.reducer.state().config.watch.interests > 0
+            && let Some(stream) = &mut self.config_watch
+        {
+            futures.push(Box::pin(
+                async move { WatchResult::Config(stream.next().await) },
+            ));
+        }
+
+        if self.reducer.state().sessions.watch.interests > 0
+            && let Some(stream) = &mut self.session_watch
+        {
+            futures.push(Box::pin(async move {
+                WatchResult::Session(stream.next().await)
+            }));
+        }
+
+        let active_timeline_keys = self
+            .reducer
+            .state()
+            .timeline_watch_keys()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for (key, stream) in self
+            .timeline_watches
+            .iter_mut()
+            .filter(|(key, _)| active_timeline_keys.contains(*key))
+        {
+            let key = key.clone();
+            futures.push(Box::pin(async move {
+                WatchResult::Timeline(key, stream.next().await)
+            }));
+        }
+
+        if futures.is_empty() {
+            return WatchResult::Status(Some(Ok(crate::SystemStatus::default())));
+        }
+
+        let (result, index, _) = select_all(futures).await;
+        self.watch_poll_offset = self.watch_poll_offset.saturating_add(index + 1);
+        result
+    }
+
+    fn watch_result_event(&mut self, result: WatchResult) -> ClientEvent {
+        match result {
+            WatchResult::Status(Some(Ok(status))) => {
+                ClientEvent::Status(StatusEvent::WatchChanged(status))
+            }
+            WatchResult::Status(Some(Err(error))) => {
+                self.status_watch = None;
+                ClientEvent::Status(StatusEvent::WatchFailed(error))
+            }
+            WatchResult::Status(None) => {
+                self.status_watch = None;
+                ClientEvent::Status(StatusEvent::WatchEnded)
+            }
+            WatchResult::Config(Some(Ok(update))) => {
+                ClientEvent::Config(ConfigEvent::WatchChanged(update))
+            }
+            WatchResult::Config(Some(Err(error))) => {
+                self.config_watch = None;
+                ClientEvent::Config(ConfigEvent::WatchFailed(error))
+            }
+            WatchResult::Config(None) => {
+                self.config_watch = None;
+                ClientEvent::Config(ConfigEvent::WatchEnded)
+            }
+            WatchResult::Session(Some(Ok(update))) => {
+                ClientEvent::Session(SessionEvent::WatchChanged(update))
+            }
+            WatchResult::Session(Some(Err(error))) => {
+                self.session_watch = None;
+                ClientEvent::Session(SessionEvent::WatchFailed(error))
+            }
+            WatchResult::Session(None) => {
+                self.session_watch = None;
+                ClientEvent::Session(SessionEvent::WatchEnded)
+            }
+            WatchResult::Timeline(key, Some(Ok(update))) => {
+                ClientEvent::Session(SessionEvent::TimelineWatchChanged { key, update })
+            }
+            WatchResult::Timeline(key, Some(Err(error))) => {
+                self.timeline_watches.remove(&key);
+                ClientEvent::Session(SessionEvent::TimelineWatchFailed { key, error })
+            }
+            WatchResult::Timeline(key, None) => {
+                self.timeline_watches.remove(&key);
+                ClientEvent::Session(SessionEvent::TimelineWatchEnded { key })
+            }
+        }
     }
 }
 
@@ -863,7 +765,7 @@ impl ClientStateStream {
                             .runtime
                             .reducer
                             .state()
-                            .timeline_watch_session_ids()
+                            .timeline_watch_keys()
                             .is_empty()
                     {
                         (self.sleep)(READY_IDLE_DELAY_MS).await;
@@ -1109,7 +1011,9 @@ impl ClientStateStream {
                     .get(&session_id)
                     .is_some_and(|timeline| timeline.watch.interests > 0);
                 if !active {
-                    self.runtime.timeline_watches.remove(&session_id);
+                    self.runtime
+                        .timeline_watches
+                        .retain(|key, _| key.session_id != session_id);
                 }
                 update
             }
@@ -1336,7 +1240,8 @@ mod tests {
     use futures_util::stream;
     use waltr::grpc::waltr::status::v1::SystemStatus;
 
-    use crate::transport::ConfigWatchUpdate;
+    use crate::TimelineEvent;
+    use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate};
 
     #[tokio::test]
     async fn state_stream_yields_status_loading_before_transport_work() {
@@ -1393,6 +1298,102 @@ mod tests {
                 delay_ms: 500,
             })]
         ));
+    }
+
+    #[tokio::test]
+    async fn busy_timeline_watch_does_not_starve_status_watch_failures() {
+        let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
+        let key = TimelineWatchKey::new("session".to_owned(), Some(0), Vec::new(), None);
+        runtime
+            .reducer
+            .apply(ClientEvent::Status(StatusEvent::WatchChanged(
+                SystemStatus { ready: true },
+            )));
+        runtime.reducer.apply(ClientEvent::Session(
+            SessionEvent::TimelineWatchInterestRegistered {
+                session_id: key.session_id.clone(),
+                after_cursor: key.after_cursor,
+                channels: key.channels.clone(),
+                initial_limit: key.initial_limit,
+            },
+        ));
+        runtime
+            .reducer
+            .apply(ClientEvent::Session(SessionEvent::TimelineWatchStarted {
+                key: key.clone(),
+            }));
+        runtime.status_watch = Some(Box::pin(stream::once(async {
+            Err(ClientError::new("status transport lost"))
+        })));
+        runtime.timeline_watches.insert(
+            key,
+            Box::pin(stream::iter((1..=16).map(|cursor| {
+                Ok(SessionTimelineWatchUpdate {
+                    sequence: cursor,
+                    event: timeline_event("session", cursor),
+                })
+            }))),
+        );
+
+        let event = runtime.next_watch_event().await;
+        let update = runtime.reducer.apply(event);
+        let snapshot = runtime.snapshot();
+
+        assert_eq!(snapshot.status.watch.status, "failed");
+        assert!(!snapshot.status.ready);
+        assert!(matches!(
+            update.effects(),
+            [ClientEffect::Status(StatusEffect::SleepReconnect { .. })]
+        ));
+    }
+
+    #[tokio::test]
+    async fn multiple_ready_timeline_watches_are_polled_fairly() {
+        let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
+        runtime
+            .reducer
+            .apply(ClientEvent::Status(StatusEvent::WatchChanged(
+                SystemStatus { ready: true },
+            )));
+        let first =
+            TimelineWatchKey::new("session".to_owned(), Some(0), vec!["a".to_owned()], None);
+        let second =
+            TimelineWatchKey::new("session".to_owned(), Some(0), vec!["b".to_owned()], None);
+        register_timeline_watch(&mut runtime, &first);
+        register_timeline_watch(&mut runtime, &second);
+        runtime.timeline_watches.insert(
+            first,
+            Box::pin(stream::iter((1..=16).map(|cursor| {
+                Ok(SessionTimelineWatchUpdate {
+                    sequence: cursor,
+                    event: timeline_event("session", cursor),
+                })
+            }))),
+        );
+        runtime.timeline_watches.insert(
+            second,
+            Box::pin(stream::once(async {
+                Ok(SessionTimelineWatchUpdate {
+                    sequence: 100,
+                    event: timeline_event("session", 100),
+                })
+            })),
+        );
+
+        let first_event = runtime.next_watch_event().await;
+        runtime.reducer.apply(first_event);
+        let second_event = runtime.next_watch_event().await;
+        runtime.reducer.apply(second_event);
+        let timeline = runtime
+            .reducer
+            .state()
+            .sessions
+            .timelines
+            .get("session")
+            .expect("timeline should exist");
+
+        assert!(timeline.events.contains_key(&1));
+        assert!(timeline.events.contains_key(&100));
     }
 
     #[tokio::test]
@@ -1483,4 +1484,29 @@ mod tests {
     }
 
     async fn no_sleep(_: u64) {}
+
+    fn register_timeline_watch(runtime: &mut ClientRuntime, key: &TimelineWatchKey) {
+        runtime.reducer.apply(ClientEvent::Session(
+            SessionEvent::TimelineWatchInterestRegistered {
+                session_id: key.session_id.clone(),
+                after_cursor: key.after_cursor,
+                channels: key.channels.clone(),
+                initial_limit: key.initial_limit,
+            },
+        ));
+        runtime
+            .reducer
+            .apply(ClientEvent::Session(SessionEvent::TimelineWatchStarted {
+                key: key.clone(),
+            }));
+    }
+
+    fn timeline_event(session_id: &str, cursor: u64) -> TimelineEvent {
+        TimelineEvent {
+            session_id: session_id.to_owned(),
+            cursor,
+            item_id: format!("item-{cursor}"),
+            ..TimelineEvent::default()
+        }
+    }
 }

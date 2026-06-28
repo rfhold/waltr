@@ -110,6 +110,78 @@ async fn timeline_watch_replays_seeded_events_through_client_state() {
 }
 
 #[tokio::test]
+async fn timeline_watch_keeps_distinct_request_params_active() {
+    let (endpoint, session_id) = server_endpoint_with_seeded_timeline(true)
+        .await
+        .expect("seeded server should start");
+    let mut stream = ClientRuntime::for_endpoint(endpoint).into_state_stream(no_sleep);
+
+    wait_for_system_ready(&mut stream).await;
+    dispatch_stream_command(
+        &mut stream,
+        ClientCommand::RegisterSessionTimelineWatchInterest {
+            session_id: session_id.clone(),
+            after_cursor: Some(0),
+            channels: vec!["assistant_text".to_owned()],
+            initial_limit: None,
+        },
+    )
+    .await
+    .expect("assistant timeline watch interest should dispatch");
+    next_snapshot_until(&mut stream, |snapshot| {
+        snapshot
+            .sessions
+            .timelines
+            .get(&session_id)
+            .is_some_and(|timeline| {
+                timeline
+                    .events
+                    .iter()
+                    .any(|event| event.item_id == "assistant-1")
+            })
+    })
+    .await;
+
+    dispatch_stream_command(
+        &mut stream,
+        ClientCommand::RegisterSessionTimelineWatchInterest {
+            session_id: session_id.clone(),
+            after_cursor: Some(0),
+            channels: vec!["user_text".to_owned()],
+            initial_limit: Some(1),
+        },
+    )
+    .await
+    .expect("user timeline watch interest should dispatch");
+
+    let snapshot = next_snapshot_until(&mut stream, |snapshot| {
+        snapshot
+            .sessions
+            .timelines
+            .get(&session_id)
+            .is_some_and(|timeline| {
+                timeline
+                    .events
+                    .iter()
+                    .any(|event| event.item_id == "assistant-1")
+                    && timeline
+                        .events
+                        .iter()
+                        .any(|event| event.item_id == "user-1")
+            })
+    })
+    .await;
+    let timeline = snapshot
+        .sessions
+        .timelines
+        .get(&session_id)
+        .expect("timeline should be present");
+
+    assert_eq!(timeline.events.len(), 2);
+    assert_eq!(timeline.watch.error, None);
+}
+
+#[tokio::test]
 async fn submit_user_message_failure_is_reported_as_client_operation() {
     let (endpoint, session_id) = server_endpoint_with_seeded_timeline(false)
         .await

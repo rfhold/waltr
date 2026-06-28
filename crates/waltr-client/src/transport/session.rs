@@ -69,7 +69,11 @@ where
         .map_err(|error| status_error(&error))?
         .into_inner();
 
-    Ok(response.session.unwrap_or_default())
+    response.session.ok_or_else(|| {
+        status_error(&tonic::Status::data_loss(
+            "create session response missing session",
+        ))
+    })
 }
 
 pub(super) async fn list_sessions<T>(transport: &T) -> Result<Vec<SessionSummary>, ClientError>
@@ -138,7 +142,11 @@ where
         .map_err(|error| status_error(&error))?
         .into_inner();
 
-    Ok(response.session.unwrap_or_default())
+    response.session.ok_or_else(|| {
+        status_error(&tonic::Status::data_loss(
+            "update session runtime config response missing session",
+        ))
+    })
 }
 
 pub(super) async fn watch_sessions<T>(transport: &T) -> Result<SessionWatchStream, ClientError>
