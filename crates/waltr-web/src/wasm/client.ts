@@ -20,7 +20,15 @@ export type CatalogModelSummary = {
   family: string | null;
   status: string | null;
   limits: { context: number | null; output: number | null } | null;
-  cost: { inputPerMillionTokens: number | null; outputPerMillionTokens: number | null; currency: string } | null;
+  cost: {
+    inputPerMillionTokens: number | null;
+    outputPerMillionTokens: number | null;
+    cacheReadPerMillionTokens: number | null;
+    cacheWritePerMillionTokens: number | null;
+    imageInputPerMillionTokens: number | null;
+    imageInputPerImage: number | null;
+    currency: string;
+  } | null;
   capabilities: { tools: boolean; image: boolean; audio: boolean } | null;
   reasoning: { supported: boolean; effort: string | null; efforts: string[] } | null;
 };

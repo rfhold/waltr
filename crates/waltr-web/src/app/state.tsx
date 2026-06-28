@@ -15,12 +15,19 @@ import {
   type CatalogSuggestRequest,
   type WasmClientLoader,
 } from "../wasm/client";
+import { FixtureAppStateProvider, fixtureSnapshotForPath } from "./fixtures";
 
 type AppStateProviderProps = ParentProps<{
   loadWasmClient?: WasmClientLoader;
 }>;
 
 export function AppStateProvider(props: AppStateProviderProps) {
+  const fixtureSnapshot = typeof window === "undefined" ? undefined : fixtureSnapshotForPath(window.location.pathname);
+
+  if (fixtureSnapshot) {
+    return <FixtureAppStateProvider snapshot={fixtureSnapshot}>{props.children}</FixtureAppStateProvider>;
+  }
+
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
   const operationWaiters = new Set<OperationWaiter>();

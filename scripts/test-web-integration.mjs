@@ -32,6 +32,7 @@ const browserScripts = liveEnabled
   : [
     "tests/web/k6/status/landing.browser.js",
     "tests/web/k6/sessions/sessions.browser.js",
+    "tests/web/k6/sessions/prompts.browser.js",
     "tests/web/k6/config/watch.browser.js",
     "tests/web/k6/config/providers.browser.js",
     "tests/web/k6/config/mcp.browser.js",

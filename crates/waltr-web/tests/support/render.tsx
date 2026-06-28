@@ -103,6 +103,17 @@ export function renderWithAppState(
         updatedAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         lastActivityAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         runtimeConfig: null,
+        metrics: {
+          inputTokens: 0n,
+          outputTokens: 0n,
+          cacheReadTokens: 0n,
+          cacheWriteTokens: 0n,
+          imageInputTokens: 0n,
+          imageInputCount: 0n,
+          totalTokens: 0n,
+          costCurrency: null,
+          totalCostMicros: 0n,
+        },
       };
       const loading: ClientSnapshot = {
         ...current,

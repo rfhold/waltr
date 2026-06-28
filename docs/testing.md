@@ -69,9 +69,9 @@ Run web server-backed k6 tests and validate screenshot snapshots:
 
 `pnpm test:web:screenshots`
 
-Actual screenshot PNGs are written under `.dev/web-screenshots/current/`, which is ignored by git, and compared against static snapshots under `tests/web/k6/snapshots/screenshots/`.
+Actual screenshot PNGs are written under `.dev/web-screenshots/current/`, which is ignored by git, and compared against local snapshot baselines under ignored `tests/web/k6/snapshots/screenshots/`.
 
-Update the static screenshot snapshots after an intentional visual change:
+Update the local screenshot snapshots after an intentional visual change:
 
 `pnpm test:web:screenshots:update`
 

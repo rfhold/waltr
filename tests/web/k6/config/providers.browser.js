@@ -32,7 +32,7 @@ export default async function () {
     );
     await page
       .locator('form[aria-label="Create provider"] select[name="kind"]')
-      .selectOption("openAi");
+      .selectOption("openAiResponses");
     await typeAndKeepFocus(
       page,
       'form[aria-label="Create provider"] input[name="url"]',
@@ -137,7 +137,7 @@ export default async function () {
 
     await page.locator(`button[aria-label="Edit ${PROVIDER}"]`).click();
     const persistedDeletedModel = await waitForMissingText(page, modelsSelector, EDITED_MODEL_NAME);
-    await page.locator('form[aria-label="Edit provider"] select[name="kind"]').selectOption("anthropic");
+    await page.locator('form[aria-label="Edit provider"] select[name="kind"]').selectOption("anthropicMessages");
     await page.locator('form[aria-label="Edit provider"] button[type="submit"]').click();
     await waitForPathname(page, "/config/provider");
     const editedProvider = await waitForText(page, '[aria-label="Provider list"]', "anthropic");

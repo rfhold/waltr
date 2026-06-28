@@ -44,6 +44,7 @@ const TIMELINE_CHANNELS = [
   "tool_progress_error",
   "tool_result",
   "external_request",
+  "metrics",
 ];
 const TIMELINE_PAGE_SIZE = 64;
 const TIMELINE_TOP_LOAD_THRESHOLD_PX = 320;
@@ -347,6 +348,7 @@ function SessionDetail(props: { session: SessionView }) {
   const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[props.session.id]);
   const active = createMemo(() => sessionActive(props.session));
   const items = createMemo(() => timelineItems(timeline()));
+  const latestMetrics = createMemo(() => latestTurnMetrics(items()));
   const testKeepMountedIndexes = createMemo(() => import.meta.env.MODE === "test" ? items().map((_, index) => index) : undefined);
   const working = createMemo(() => active() && !hasOpenExternalPrompt(items()));
   const importantStatus = createMemo(() => sessionImportantStatus(props.session, working(), timeline()?.watch.error));
@@ -726,6 +728,7 @@ function SessionDetail(props: { session: SessionView }) {
       </form>
       <SessionDetailStatusBar
         session={props.session}
+        contextTokens={latestContextTokens(latestMetrics())}
         onEditProvider={() => setEditingRuntime("provider")}
         onEditMcp={() => setEditingRuntime("mcp")}
       />
@@ -742,6 +745,7 @@ function SessionDetail(props: { session: SessionView }) {
 type TimelineItemModel =
   | { id: string; kind: "user" | "assistant" | "thinking"; text: string }
   | ToolTimelineItem
+  | TurnMetricsTimelineItem
   | { id: string; kind: "permission" | "question" | "prompt"; request: ExternalRequestView; resolved: boolean };
 
 type ToolInputEntry = { key: string; value: string };
@@ -756,6 +760,23 @@ type ToolTimelineItem = {
   resultContent: string;
   progressInfo: string;
   progressError: string;
+};
+
+type TurnMetricsTimelineItem = {
+  id: string;
+  kind: "metrics";
+  inputTokens: bigint;
+  outputTokens: bigint;
+  cacheReadTokens: bigint;
+  cacheWriteTokens: bigint;
+  imageInputTokens: bigint;
+  imageInputCount: bigint;
+  totalTokens: bigint;
+  costCurrency: string | null;
+  totalCostMicros: bigint;
+  addedInputTokens: bigint | null;
+  addedInputCacheReadTokens: bigint | null;
+  addedInputBaseTokens: bigint | null;
 };
 
 function TimelineVirtualizerList(props: CustomContainerComponentProps) {
@@ -804,6 +825,9 @@ function TimelineItem(props: {
           />
         )}
       </Match>
+      <Match when={metricsTimelineItem(item())}>
+        {(metricsItem) => <TurnMetricsTimelineItemView item={metricsItem()} />}
+      </Match>
       <Match when={permissionTimelineItem(item())}>
         {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
       </Match>
@@ -814,6 +838,17 @@ function TimelineItem(props: {
         {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
       </Match>
     </Switch>
+  );
+}
+
+function TurnMetricsTimelineItemView(props: { item: TurnMetricsTimelineItem }) {
+  return (
+    <article class="sessions__timeline-metrics" aria-label="Turn token metrics">
+      <span title={`Input ${formatTokenCount(props.item.inputTokens)} / output ${formatTokenCount(props.item.outputTokens)}`}>{formatTokenCount(props.item.totalTokens)} tok</span>
+      <span title="Added input on the next request">+{props.item.addedInputTokens === null ? "-" : formatTokenCount(props.item.addedInputTokens)} in</span>
+      <span title="Cache-hit rate on the next request">{props.item.addedInputBaseTokens === null || props.item.addedInputCacheReadTokens === null ? "-" : formatCacheRate(props.item.addedInputCacheReadTokens, props.item.addedInputBaseTokens)} hit</span>
+      <span>{formatCostMicros(props.item.totalCostMicros, props.item.costCurrency)}</span>
+    </article>
   );
 }
 
@@ -1016,6 +1051,25 @@ function externalTimelineItem(item: TimelineItemModel) {
   return item.kind === "prompt" ? item : undefined;
 }
 
+function metricsTimelineItem(item: TimelineItemModel) {
+  return item.kind === "metrics" ? item : undefined;
+}
+
+function latestTurnMetrics(items: TimelineItemModel[]) {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = metricsTimelineItem(items[index]!);
+    if (item) {
+      return item;
+    }
+  }
+
+  return undefined;
+}
+
+function latestContextTokens(item: TurnMetricsTimelineItem | undefined) {
+  return item ? item.inputTokens + item.outputTokens : 0n;
+}
+
 function ExternalRequestTimelineItem(props: {
   item: Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
@@ -1055,6 +1109,8 @@ function PermissionPrompt(props: {
   const [confirmingAlways, setConfirmingAlways] = createSignal(false);
   const payload = createMemo(() => parseJsonRecord(props.request.payloadJson));
   const toolCall = createMemo(() => asRecord(payload().tool_call));
+  const toolName = createMemo(() => String(toolCall()?.name ?? "Tool call"));
+  const toolArguments = createMemo(() => JSON.stringify(toolCall()?.arguments ?? {}, null, 2));
   const patterns = createMemo(() => permissionPatterns(payload()));
   const patternLabel = createMemo(() => JSON.stringify(patterns(), null, 2));
 
@@ -1066,33 +1122,46 @@ function PermissionPrompt(props: {
 
   return (
     <section class="sessions__prompt sessions__prompt--permission" aria-label="Permission prompt">
-      <p class="sessions__prompt-kicker">Permission required</p>
-      <h2>{props.request.id}</h2>
-      <p>{String(toolCall()?.name ?? "Tool call")}</p>
-      <pre>{JSON.stringify(toolCall()?.arguments ?? {}, null, 2)}</pre>
-      <Show when={patterns().length > 0}>
-        <details open={confirmingAlways()}>
-          <summary>Always approval pattern</summary>
-          <pre>{patternLabel()}</pre>
+      <header class="sessions__prompt-header">
+        <div>
+          <p class="sessions__prompt-kicker">Permission required</p>
+          <h2>Permission request</h2>
+          <p class="sessions__prompt-subtitle">The session wants to run a tool before it continues.</p>
+        </div>
+        <code class="sessions__prompt-id">{props.request.id}</code>
+      </header>
+
+      <div class="sessions__prompt-detail-card">
+        <div class="sessions__prompt-detail-row">
+          <span>Tool</span>
+          <strong>{toolName()}</strong>
+        </div>
+        <details>
+          <summary>Tool arguments</summary>
+          <pre>{toolArguments()}</pre>
         </details>
-      </Show>
-      <label class="sessions__prompt-field">
-        Denial message
-        <textarea value={message()} onInput={(event) => setMessage(event.currentTarget.value)} />
-      </label>
-      <div class="sessions__prompt-actions">
-        <button type="button" onClick={() => void props.onRespond(props.request.id, { decision: "allow_once" })}>
+        <Show when={patterns().length > 0}>
+          <details open={confirmingAlways()}>
+            <summary>Always approval pattern</summary>
+            <pre>{patternLabel()}</pre>
+          </details>
+        </Show>
+      </div>
+
+      <div class="sessions__prompt-actions sessions__prompt-actions--primary">
+        <button class="sessions__prompt-button--primary" type="button" onClick={() => void props.onRespond(props.request.id, { decision: "allow_once" })}>
           Allow once
         </button>
         <Show
           when={confirmingAlways()}
           fallback={
-            <button type="button" disabled={patterns().length === 0} onClick={() => setConfirmingAlways(true)}>
+            <button class="sessions__prompt-button--secondary" type="button" disabled={patterns().length === 0} onClick={() => setConfirmingAlways(true)}>
               Allow always
             </button>
           }
         >
           <button
+            class="sessions__prompt-button--primary"
             type="button"
             disabled={patterns().length === 0}
             onClick={() => void props.onRespond(props.request.id, { decision: "allow_always", patterns: patterns() })}
@@ -1100,17 +1169,27 @@ function PermissionPrompt(props: {
             Confirm always
           </button>
         </Show>
-        <button type="button" onClick={() => void props.onRespond(props.request.id, deny("return_tool_result"))}>
-          Deny and resume
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            void props.onRespond(props.request.id, deny("cancel_work")).then(() => props.onInterrupt());
-          }}
-        >
-          Deny with interrupt
-        </button>
+      </div>
+
+      <div class="sessions__prompt-deny">
+        <label class="sessions__prompt-field sessions__prompt-field--stacked">
+          <span>Denial message</span>
+          <textarea value={message()} onInput={(event) => setMessage(event.currentTarget.value)} />
+        </label>
+        <div class="sessions__prompt-actions">
+          <button class="sessions__prompt-button--danger" type="button" onClick={() => void props.onRespond(props.request.id, deny("return_tool_result"))}>
+            Deny and resume
+          </button>
+          <button
+            class="sessions__prompt-button--danger"
+            type="button"
+            onClick={() => {
+              void props.onRespond(props.request.id, deny("cancel_work")).then(() => props.onInterrupt());
+            }}
+          >
+            Deny with interrupt
+          </button>
+        </div>
       </div>
     </section>
   );
@@ -1158,29 +1237,38 @@ function QuestionPrompt(props: {
 
   return (
     <section class="sessions__prompt sessions__prompt--question" aria-label="Question prompt">
-      <p class="sessions__prompt-kicker">Question</p>
+      <header class="sessions__prompt-header">
+        <div>
+          <p class="sessions__prompt-kicker">Question</p>
+          <h2>Answer required</h2>
+          <p class="sessions__prompt-subtitle">The session is waiting for your input before it resumes.</p>
+        </div>
+        <code class="sessions__prompt-id">{props.request.id}</code>
+      </header>
       <For each={questions()}>
         {(question) => (
           <fieldset class="sessions__question">
             <legend>{question.header}</legend>
             <p>{question.question}</p>
-            <For each={question.options}>
-              {(option) => (
-                <label>
-                  <input
-                    type={question.multiple ? "checkbox" : "radio"}
-                    name={`${props.request.id}-${question.header}`}
-                    checked={answerFor(question.header).selections.includes(option.label)}
-                    onChange={(event) => setSelection(question.header, option.label, question.multiple, event.currentTarget.checked)}
-                  />
-                  <span>{option.label}</span>
-                  <small>{option.description}</small>
-                </label>
-              )}
-            </For>
+            <div class="sessions__question-options">
+              <For each={question.options}>
+                {(option) => (
+                  <label class="sessions__question-option">
+                    <input
+                      type={question.multiple ? "checkbox" : "radio"}
+                      name={`${props.request.id}-${question.header}`}
+                      checked={answerFor(question.header).selections.includes(option.label)}
+                      onChange={(event) => setSelection(question.header, option.label, question.multiple, event.currentTarget.checked)}
+                    />
+                    <span>{option.label}</span>
+                    <small>{option.description}</small>
+                  </label>
+                )}
+              </For>
+            </div>
             <Show when={question.custom}>
-              <label class="sessions__prompt-field">
-                Custom answer
+              <label class="sessions__prompt-field sessions__prompt-field--stacked">
+                <span>Custom answer</span>
                 <textarea
                   value={answerFor(question.header).custom}
                   onInput={(event) => setCustom(question.header, event.currentTarget.value)}
@@ -1190,8 +1278,8 @@ function QuestionPrompt(props: {
           </fieldset>
         )}
       </For>
-      <div class="sessions__prompt-actions">
-        <button type="button" onClick={() => void props.onRespond(props.request.id, submit())}>
+      <div class="sessions__prompt-actions sessions__prompt-actions--primary">
+        <button class="sessions__prompt-button--primary" type="button" onClick={() => void props.onRespond(props.request.id, submit())}>
           Resume session
         </button>
       </div>
@@ -1214,6 +1302,7 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
   const toolById = new Map<string, ToolTimelineItem>();
   const toolIdByItemId = new Map<string, string>();
   const externalById = new Map<string, Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>>();
+  const metricItems: TurnMetricsTimelineItem[] = [];
 
   for (const event of timeline?.events ?? []) {
     const channel = event.channel ?? "";
@@ -1265,12 +1354,56 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
         upsertExternalRequestItem(items, externalById, event.itemId, request, event.kind === "externalRequestResolved" || event.status === "resolved");
         break;
       }
+      case "json": {
+        if (channel === "metrics") {
+          const item = turnMetricsItem(event.itemId, event.content.value_json);
+          if (item) {
+            metricItems.push(item);
+            items.push(item);
+          }
+        }
+        break;
+      }
       default:
         break;
     }
   }
 
+  for (let index = 0; index < metricItems.length - 1; index += 1) {
+    const current = metricItems[index]!;
+    const next = metricItems[index + 1]!;
+    current.addedInputTokens = next.inputTokens > current.inputTokens ? next.inputTokens - current.inputTokens : 0n;
+    current.addedInputCacheReadTokens = next.cacheReadTokens;
+    current.addedInputBaseTokens = next.inputTokens;
+  }
+
   return items;
+}
+
+function turnMetricsItem(id: string, valueJson: string): TurnMetricsTimelineItem | undefined {
+  const payload = parseJsonRecord(valueJson);
+  if (payload.kind !== "turn_metrics") {
+    return undefined;
+  }
+
+  const usage = asRecord(payload.usage) ?? {};
+  const cost = asRecord(payload.cost);
+  return {
+    id,
+    kind: "metrics",
+    inputTokens: asBigInt(usage.inputTokens),
+    outputTokens: asBigInt(usage.outputTokens),
+    cacheReadTokens: asBigInt(usage.cacheReadTokens),
+    cacheWriteTokens: asBigInt(usage.cacheWriteTokens),
+    imageInputTokens: asBigInt(usage.imageInputTokens),
+    imageInputCount: asBigInt(usage.imageInputCount),
+    totalTokens: asBigInt(usage.totalTokens),
+    costCurrency: typeof cost?.currency === "string" ? cost.currency : null,
+    totalCostMicros: asBigInt(cost?.totalMicros),
+    addedInputTokens: null,
+    addedInputCacheReadTokens: null,
+    addedInputBaseTokens: null,
+  };
 }
 
 function upsertToolItem(
@@ -1561,6 +1694,19 @@ function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+function asBigInt(value: unknown): bigint {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return BigInt(Math.trunc(value));
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    return BigInt(value);
+  }
+  return 0n;
+}
+
 function permissionPatterns(payload: Record<string, unknown>) {
   const patterns = asArray(payload.patterns);
   if (patterns.length > 0) {
@@ -1598,6 +1744,7 @@ function normalizeQuestion(value: unknown): QuestionModel {
 
 function SessionDetailStatusBar(props: {
   session: SessionView;
+  contextTokens: bigint;
   onEditProvider: () => void;
   onEditMcp: () => void;
 }) {
@@ -1678,9 +1825,39 @@ function SessionDetailStatusBar(props: {
           Edit
         </button>
       </span>
+      <span class="sessions__detail-metrics" aria-label="Session token and cost totals">
+        <span class="sessions__detail-status-item" title="Latest reported input + output tokens">
+          <strong>Ctx</strong> {formatTokenCount(props.contextTokens)}
+        </span>
+        <span class="sessions__detail-status-item">
+          <strong>Cache</strong> {formatCacheRate(props.session.metrics.cacheReadTokens, props.session.metrics.inputTokens)} / {formatCacheRate(props.session.metrics.cacheWriteTokens, props.session.metrics.inputTokens)}
+        </span>
+        <span class="sessions__detail-status-item">
+          <strong>Cost</strong> {formatCostMicros(props.session.metrics.totalCostMicros, props.session.metrics.costCurrency)}
+        </span>
+      </span>
       <SessionDeleteAction session={props.session} compact />
     </footer>
   );
+}
+
+function formatTokenCount(value: bigint) {
+  return new Intl.NumberFormat().format(Number(value));
+}
+
+function formatCacheRate(part: bigint, total: bigint) {
+  if (total === 0n) {
+    return "0%";
+  }
+  return `${((Number(part) / Number(total)) * 100).toFixed(1)}%`;
+}
+
+function formatCostMicros(micros: bigint, currency: string | null) {
+  if (micros === 0n) {
+    return "-";
+  }
+  const amount = Number(micros) / 1_000_000;
+  return `${currency ?? "USD"} ${amount.toFixed(6)}`;
 }
 
 function currentReasoningEfforts(config: ConfigView | undefined, session: SessionView) {

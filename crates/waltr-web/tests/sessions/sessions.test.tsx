@@ -847,6 +847,121 @@ describe("sessions route", () => {
     expect(screen.queryByLabelText("Permission prompt")).toBeNull();
   });
 
+  test("session detail renders unresolved permission prompts and submits decisions", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-permission"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [externalRequestOpenEvent({
+      sessionId: "session-permission",
+      requestId: "permission-1",
+      kind: 1,
+      payload: {
+        tool_call: { name: "read", arguments: { filePath: "../outside/file.txt" } },
+        patterns: [{ tool: "read", arguments: { filePath: "../outside/**" } }],
+      },
+    })];
+    snapshot.sessions.timelines["session-permission"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-permission",
+      snapshot,
+    });
+
+    const prompt = screen.getByLabelText("Permission prompt");
+    expect(within(prompt).getByText("Permission required")).toBeTruthy();
+    expect(within(prompt).getByText("permission-1")).toBeTruthy();
+    expect(within(prompt).getByText("read")).toBeTruthy();
+    expect(prompt.textContent).toContain("../outside/file.txt");
+    expect(within(prompt).getByText("Always approval pattern")).toBeTruthy();
+    expect(within(prompt).getByText("Allow once")).toBeTruthy();
+    expect(within(prompt).getByText("Allow always")).toBeTruthy();
+    expect(within(prompt).getByText("Deny and resume")).toBeTruthy();
+    expect(within(prompt).getByText("Deny with interrupt")).toBeTruthy();
+
+    fireEvent.click(within(prompt).getByText("Allow once"));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "respondExternalRequest",
+      sessionId: "session-permission",
+      requestId: "permission-1",
+      responseJson: JSON.stringify({ decision: "allow_once" }),
+    }));
+  });
+
+  test("session detail renders unresolved question prompts and submits answers", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-question"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [externalRequestOpenEvent({
+      sessionId: "session-question",
+      requestId: "question-1",
+      kind: 2,
+      payload: {
+        questions: [
+          {
+            header: "Direction",
+            question: "Which visual direction should the prompt take?",
+            multiple: false,
+            custom: true,
+            options: [
+              { label: "Compact", description: "Keep the prompt dense and fast." },
+              { label: "Guided", description: "Use more explanatory copy." },
+            ],
+          },
+          {
+            header: "Details",
+            question: "What should stay visible while answering?",
+            multiple: true,
+            custom: false,
+            options: [
+              { label: "Tool name", description: "Show the requested action." },
+              { label: "Payload", description: "Show the full request payload." },
+            ],
+          },
+        ],
+      },
+    })];
+    snapshot.sessions.timelines["session-question"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-question",
+      snapshot,
+    });
+
+    const prompt = screen.getByLabelText("Question prompt");
+    expect(within(prompt).getByText("Question")).toBeTruthy();
+    expect(within(prompt).getByText("Direction")).toBeTruthy();
+    expect(within(prompt).getByText("Which visual direction should the prompt take?")).toBeTruthy();
+    expect(within(prompt).getByText("Compact")).toBeTruthy();
+    expect(within(prompt).getByText("Keep the prompt dense and fast.")).toBeTruthy();
+    expect(within(prompt).getByText("Details")).toBeTruthy();
+    expect(within(prompt).getByText("Payload")).toBeTruthy();
+    expect(within(prompt).getByText("Custom answer")).toBeTruthy();
+
+    fireEvent.click(inputForOption(prompt, "Compact"));
+    fireEvent.click(inputForOption(prompt, "Payload"));
+    fireEvent.input(within(prompt).getByLabelText("Custom answer"), { target: { value: "Make it calmer." } });
+    fireEvent.click(within(prompt).getByText("Resume session"));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "respondExternalRequest",
+      sessionId: "session-question",
+      requestId: "question-1",
+      responseJson: JSON.stringify({
+        answers: [
+          { header: "Direction", selections: ["Compact"], custom: "Make it calmer." },
+          { header: "Details", selections: ["Payload"] },
+        ],
+      }),
+    }));
+  });
+
   test("delete failure keeps the session visible and shows the error", async () => {
     renderWithAppState(() => <SessionsRouteWithRouter />, {
       routePath: "/sessions",
@@ -1049,6 +1164,7 @@ function provider(name: string, modelIds: string[], reasoningEfforts: string[] =
       limits: { context: null, output: null },
       capabilities: { tools: true, image: false },
       catalogMatch: null,
+      cost: null,
     }])),
   };
 }
@@ -1091,4 +1207,37 @@ function timelineEvent(overrides: Partial<TimelineEventView> = {}): TimelineEven
     metadataJson: "{}",
     ...overrides,
   };
+}
+
+function externalRequestOpenEvent(options: {
+  sessionId: string;
+  requestId: string;
+  kind: 1 | 2;
+  payload: unknown;
+}): TimelineEventView {
+  return timelineEvent({
+    sessionId: options.sessionId,
+    itemId: `external-request:${options.requestId}`,
+    kind: "externalRequestOpened",
+    channel: "external_request",
+    content: {
+      kind: "externalRequest",
+      request: {
+        id: options.requestId,
+        kind: options.kind,
+        payloadJson: JSON.stringify(options.payload),
+      },
+    },
+    status: "awaitingExternalInput",
+  });
+}
+
+function inputForOption(root: HTMLElement, text: string) {
+  const label = within(root).getByText(text).closest("label");
+  const input = label?.querySelector("input");
+  if (!input) {
+    throw new Error(`missing input for option ${text}`);
+  }
+
+  return input;
 }
