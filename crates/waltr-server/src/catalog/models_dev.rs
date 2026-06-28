@@ -336,6 +336,32 @@ impl CatalogModel {
                 .as_ref()
                 .and_then(|provider| provider.shape.as_ref()),
         );
+        if let Some(cost) = &configured.cost {
+            compare_present(
+                &mut drifts,
+                CatalogDriftField::CostInput,
+                cost.input.as_ref(),
+                self.cost.input.as_ref(),
+            );
+            compare_present(
+                &mut drifts,
+                CatalogDriftField::CostOutput,
+                cost.output.as_ref(),
+                self.cost.output.as_ref(),
+            );
+            compare_present(
+                &mut drifts,
+                CatalogDriftField::CostCacheRead,
+                cost.cache_read.as_ref(),
+                self.cost.cache_read.as_ref(),
+            );
+            compare_present(
+                &mut drifts,
+                CatalogDriftField::CostCacheWrite,
+                cost.cache_write.as_ref(),
+                self.cost.cache_write.as_ref(),
+            );
+        }
 
         compare_modalities(
             &mut drifts,
@@ -726,6 +752,8 @@ pub struct ConfiguredModelFacts {
     pub reasoning_options: Option<Vec<CatalogReasoningOption>>,
     /// Configured provider request shape.
     pub provider_shape: Option<String>,
+    /// Configured model pricing.
+    pub cost: Option<CatalogCost>,
 }
 
 /// Configured-model modality facts.
@@ -767,6 +795,14 @@ pub enum CatalogDriftField {
     ReasoningOptions,
     /// Provider shape drift.
     ProviderShape,
+    /// Input cost drift.
+    CostInput,
+    /// Output cost drift.
+    CostOutput,
+    /// Cache-read cost drift.
+    CostCacheRead,
+    /// Cache-write cost drift.
+    CostCacheWrite,
 }
 
 /// One configured fact that differs from the catalog.
@@ -1389,6 +1425,7 @@ mod tests {
                 ]),
                 output: Some(vec!["audio".to_owned(), "text".to_owned()]),
             },
+            cost: None,
             reasoning_options: None,
             provider_shape: None,
         };

@@ -281,7 +281,7 @@ pub enum ModelFormMode {
 /// Models are a keyed collection inside a provider. Saving rides inside an
 /// [`ClientCommand::UpdateProvider`] carrying the whole provider; there are no
 /// model-level commands.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelForm {
     /// Form mode.
     pub mode: ModelFormMode,
@@ -309,6 +309,8 @@ pub struct ModelForm {
     pub image: bool,
     /// Catalog linkage preserved while editing model fields.
     pub catalog_match: Option<ModelCatalogMatchView>,
+    /// Pricing preserved while editing model fields.
+    pub cost: Option<waltr_client::ModelCostView>,
 }
 
 const MODEL_FIELD_COUNT: usize = 8;
@@ -329,6 +331,7 @@ impl ModelForm {
             tools: false,
             image: false,
             catalog_match: None,
+            cost: None,
         }
     }
 
@@ -356,6 +359,7 @@ impl ModelForm {
             tools: model.capabilities.tools,
             image: model.capabilities.image,
             catalog_match: model.catalog_match.clone(),
+            cost: model.cost.clone(),
         }
     }
 
@@ -434,6 +438,7 @@ impl ModelForm {
                 image: self.image,
             },
             catalog_match: self.catalog_match.clone(),
+            cost: self.cost.clone(),
         }
     }
 }

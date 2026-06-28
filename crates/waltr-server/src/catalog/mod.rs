@@ -483,6 +483,7 @@ struct RequestedDefaultFields {
     model_type: bool,
     limits: bool,
     capabilities: bool,
+    cost: bool,
 }
 
 impl RequestedDefaultFields {
@@ -493,6 +494,7 @@ impl RequestedDefaultFields {
                 model_type: true,
                 limits: true,
                 capabilities: true,
+                cost: true,
             };
         }
 
@@ -501,6 +503,7 @@ impl RequestedDefaultFields {
             model_type: false,
             limits: false,
             capabilities: false,
+            cost: false,
         };
         for field in fields {
             match catalog_proto::CatalogDefaultField::try_from(*field).ok() {
@@ -510,6 +513,7 @@ impl RequestedDefaultFields {
                 Some(catalog_proto::CatalogDefaultField::Capabilities) => {
                     requested.capabilities = true;
                 }
+                Some(catalog_proto::CatalogDefaultField::Cost) => requested.cost = true,
                 Some(catalog_proto::CatalogDefaultField::Unspecified) | None => {}
             }
         }
@@ -550,6 +554,10 @@ fn apply_defaults(
             tools: catalog_model.capabilities.tool_call.unwrap_or(false),
             image: catalog_supports_image(catalog_model),
         });
+    }
+
+    if fields.cost {
+        model.cost = Some(model_cost_from_catalog(catalog_model));
     }
 
     let reasoning_efforts = catalog_reasoning_efforts(catalog_model);
@@ -714,7 +722,26 @@ fn configured_facts(model: &config_proto::Model) -> models_dev::ConfiguredModelF
             structured_output: None,
             temperature: None,
         },
+        cost: model.cost.as_ref().map(|cost| models_dev::CatalogCost {
+            input: cost.input_per_million_tokens,
+            output: cost.output_per_million_tokens,
+            cache_read: cost.cache_read_per_million_tokens,
+            cache_write: cost.cache_write_per_million_tokens,
+            ..models_dev::CatalogCost::default()
+        }),
         ..models_dev::ConfiguredModelFacts::default()
+    }
+}
+
+fn model_cost_from_catalog(catalog_model: &models_dev::CatalogModel) -> config_proto::ModelCost {
+    config_proto::ModelCost {
+        input_per_million_tokens: catalog_model.cost.input,
+        output_per_million_tokens: catalog_model.cost.output,
+        cache_read_per_million_tokens: catalog_model.cost.cache_read,
+        cache_write_per_million_tokens: catalog_model.cost.cache_write,
+        image_input_per_million_tokens: None,
+        image_input_per_image: None,
+        currency: "USD".to_owned(),
     }
 }
 
@@ -741,6 +768,10 @@ fn catalog_summary(
             input_per_million_tokens: model.cost.input,
             output_per_million_tokens: model.cost.output,
             currency: "USD".to_owned(),
+            cache_read_per_million_tokens: model.cost.cache_read,
+            cache_write_per_million_tokens: model.cost.cache_write,
+            image_input_per_million_tokens: None,
+            image_input_per_image: None,
         }),
         capabilities: Some(catalog_proto::CatalogModelCapabilitySummary {
             tools: model.capabilities.tool_call.unwrap_or(false),
@@ -840,6 +871,10 @@ fn drift_field_name(field: models_dev::CatalogDriftField) -> &'static str {
         models_dev::CatalogDriftField::ModalityOutput => "modality_output",
         models_dev::CatalogDriftField::ReasoningOptions => "reasoning_options",
         models_dev::CatalogDriftField::ProviderShape => "provider_shape",
+        models_dev::CatalogDriftField::CostInput => "cost_input",
+        models_dev::CatalogDriftField::CostOutput => "cost_output",
+        models_dev::CatalogDriftField::CostCacheRead => "cost_cache_read",
+        models_dev::CatalogDriftField::CostCacheWrite => "cost_cache_write",
     }
 }
 
@@ -857,7 +892,11 @@ fn drift_severity(field: models_dev::CatalogDriftField) -> catalog_proto::Catalo
         }
         models_dev::CatalogDriftField::Status
         | models_dev::CatalogDriftField::ReasoningOptions
-        | models_dev::CatalogDriftField::ProviderShape => {
+        | models_dev::CatalogDriftField::ProviderShape
+        | models_dev::CatalogDriftField::CostInput
+        | models_dev::CatalogDriftField::CostOutput
+        | models_dev::CatalogDriftField::CostCacheRead
+        | models_dev::CatalogDriftField::CostCacheWrite => {
             catalog_proto::CatalogDriftSeverity::Warning
         }
         models_dev::CatalogDriftField::ModalityInput

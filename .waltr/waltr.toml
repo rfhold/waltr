@@ -160,6 +160,38 @@ reasoning_efforts = []
 tools = true
 image = false
 
+[providers.openai-codex.models."gpt-5.3-codex-spark"]
+name = "GPT 5.3 Codex Spark"
+type = 1
+
+[providers.openai-codex.models."gpt-5.3-codex-spark".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai-codex.models."gpt-5.3-codex-spark".limits]
+context = 128000
+output = 32000
+
+[providers.openai-codex.models."gpt-5.3-codex-spark".capabilities]
+tools = true
+image = true
+
+[providers.openai-codex.models."gpt-5.3-codex-spark".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.3-codex-spark"
+source = 3
+
+[providers.openai-codex.models."gpt-5.3-codex-spark".cost]
+input_per_million_tokens = 1.75
+output_per_million_tokens = 14.0
+cache_read_per_million_tokens = 0.175
+currency = "USD"
+
 [providers.openai-codex.models."gpt-5.5"]
 name = "GPT 5.5"
 type = 1
@@ -185,6 +217,12 @@ image = true
 provider_id = "openai"
 model_id = "gpt-5.5"
 source = 3
+
+[providers.openai-codex.models."gpt-5.5".cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 30.0
+cache_read_per_million_tokens = 0.5
+currency = "USD"
 
 [providers.openai-codex.oauth_settings]
 name = "OpenAI Codex"

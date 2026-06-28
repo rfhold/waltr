@@ -5,9 +5,9 @@ use ts_rs::TS;
 
 use crate::{
     CatalogMatchSource, Configuration, McpServer, McpServerType, Model, ModelCapabilities,
-    ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OAuthProvider, OauthJwtMetadata,
-    OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider, ProviderType,
-    RuntimeDefaults,
+    ModelCatalogMatch, ModelCost, ModelLimits, ModelOptions, ModelType, OAuthProvider,
+    OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider,
+    ProviderType, RuntimeDefaults,
 };
 
 /// Stable configuration view shared by Waltr shells.
@@ -214,6 +214,26 @@ pub struct ModelCapabilitiesView {
     pub image: bool,
 }
 
+/// Stable model pricing view shared by Waltr shells.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCostView {
+    /// Input token price per million tokens.
+    pub input_per_million_tokens: Option<f64>,
+    /// Output token price per million tokens.
+    pub output_per_million_tokens: Option<f64>,
+    /// Cache-read token price per million tokens.
+    pub cache_read_per_million_tokens: Option<f64>,
+    /// Cache-write token price per million tokens.
+    pub cache_write_per_million_tokens: Option<f64>,
+    /// Image input token price per million tokens.
+    pub image_input_per_million_tokens: Option<f64>,
+    /// Image input price per image.
+    pub image_input_per_image: Option<f64>,
+    /// Currency code for configured rates.
+    pub currency: String,
+}
+
 /// Stable catalog match source view shared by Waltr shells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -262,6 +282,8 @@ pub struct ModelView {
     pub capabilities: ModelCapabilitiesView,
     /// Optional models.dev catalog linkage.
     pub catalog_match: Option<ModelCatalogMatchView>,
+    /// Optional model pricing used for session cost tracking.
+    pub cost: Option<ModelCostView>,
 }
 
 /// Stable MCP server type view shared by Waltr shells.
@@ -696,6 +718,34 @@ impl From<ModelCapabilitiesView> for ModelCapabilities {
     }
 }
 
+impl From<ModelCost> for ModelCostView {
+    fn from(cost: ModelCost) -> Self {
+        Self {
+            input_per_million_tokens: cost.input_per_million_tokens,
+            output_per_million_tokens: cost.output_per_million_tokens,
+            cache_read_per_million_tokens: cost.cache_read_per_million_tokens,
+            cache_write_per_million_tokens: cost.cache_write_per_million_tokens,
+            image_input_per_million_tokens: cost.image_input_per_million_tokens,
+            image_input_per_image: cost.image_input_per_image,
+            currency: cost.currency,
+        }
+    }
+}
+
+impl From<ModelCostView> for ModelCost {
+    fn from(view: ModelCostView) -> Self {
+        Self {
+            input_per_million_tokens: view.input_per_million_tokens,
+            output_per_million_tokens: view.output_per_million_tokens,
+            cache_read_per_million_tokens: view.cache_read_per_million_tokens,
+            cache_write_per_million_tokens: view.cache_write_per_million_tokens,
+            image_input_per_million_tokens: view.image_input_per_million_tokens,
+            image_input_per_image: view.image_input_per_image,
+            currency: view.currency,
+        }
+    }
+}
+
 impl From<ModelCatalogMatch> for ModelCatalogMatchView {
     fn from(catalog_match: ModelCatalogMatch) -> Self {
         Self {
@@ -729,6 +779,7 @@ impl From<Model> for ModelView {
             limits: model.limits.unwrap_or_default().into(),
             capabilities: model.capabilities.unwrap_or_default().into(),
             catalog_match: model.catalog_match.map(ModelCatalogMatchView::from),
+            cost: model.cost.map(ModelCostView::from),
         }
     }
 }
@@ -742,6 +793,7 @@ impl From<ModelView> for Model {
             limits: Some(view.limits.into()),
             capabilities: Some(view.capabilities.into()),
             catalog_match: view.catalog_match.map(ModelCatalogMatch::from),
+            cost: view.cost.map(ModelCost::from),
         }
     }
 }
