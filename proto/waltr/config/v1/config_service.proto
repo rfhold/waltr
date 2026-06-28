@@ -86,6 +86,17 @@ message Model {
   ModelLimits limits = 4;
   ModelCapabilities capabilities = 5;
   ModelCatalogMatch catalog_match = 6;
+  ModelCost cost = 7;
+}
+
+message ModelCost {
+  optional double input_per_million_tokens = 1;
+  optional double output_per_million_tokens = 2;
+  optional double cache_read_per_million_tokens = 3;
+  optional double cache_write_per_million_tokens = 4;
+  optional double image_input_per_million_tokens = 5;
+  optional double image_input_per_image = 6;
+  string currency = 7;
 }
 
 message ModelCatalogMatch {

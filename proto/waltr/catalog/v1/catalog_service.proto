@@ -38,6 +38,10 @@ message CatalogModelCostSummary {
   optional double input_per_million_tokens = 1;
   optional double output_per_million_tokens = 2;
   string currency = 3;
+  optional double cache_read_per_million_tokens = 4;
+  optional double cache_write_per_million_tokens = 5;
+  optional double image_input_per_million_tokens = 6;
+  optional double image_input_per_image = 7;
 }
 
 message CatalogModelCapabilitySummary {
@@ -88,6 +92,7 @@ enum CatalogDefaultField {
   CATALOG_DEFAULT_FIELD_TYPE = 2;
   CATALOG_DEFAULT_FIELD_LIMITS = 3;
   CATALOG_DEFAULT_FIELD_CAPABILITIES = 4;
+  CATALOG_DEFAULT_FIELD_COST = 5;
 }
 
 message SearchCatalogModelsRequest {
