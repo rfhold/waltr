@@ -94,8 +94,14 @@ where
         .layer(GrpcWebLayer::new())
         .service(grpc_routes);
 
-    Router::new()
-        .route("/health", get(health))
+    let router = Router::new().route("/health", get(health));
+    #[cfg(feature = "web")]
+    let router = router.route("/", get(crate::web_assets::serve_root)).route(
+        "/{*path}",
+        get(crate::web_assets::serve_path).fallback_service(grpc.clone()),
+    );
+
+    router
         .fallback_service(grpc)
         .layer(TraceLayer::new_for_http())
 }

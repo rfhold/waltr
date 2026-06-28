@@ -8,6 +8,7 @@ version.workspace = true
 default = ["shell"]
 shell = ["waltr-agent/shell"]
 test = []
+web = []
 
 [dependencies]
 axum.workspace = true
