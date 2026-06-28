@@ -72,6 +72,13 @@ async fn run_with_events(
                     return Ok(());
                 }
             }
+            AppAction::ClientCommands(client_commands) => {
+                for command in client_commands {
+                    if commands.send(command).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         let _ = terminal.draw(|frame| app.draw(frame))?;

@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use waltr_client::{
     ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, ProviderView,
-    RuntimeConfigMatchView, SessionPhaseView, SessionRuntimeConfigView, SessionView,
+    RuntimeConfigMatchView, SessionPhaseView, SessionRuntimeConfigView, SessionTimelineView,
+    SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
 };
 use ratatui::{
     Frame,
@@ -207,6 +208,14 @@ impl SessionsSection {
         self.detail_session_id.take().is_some()
     }
 
+    /// Clear the active detail route when a top-level route change leaves sessions.
+    pub fn clear_detail_route(&mut self) -> Option<String> {
+        self.runtime_editor = None;
+        self.pending_runtime_editor = None;
+        self.delete_session_id = None;
+        self.detail_session_id.take()
+    }
+
     /// Start creating a session.
     pub fn create_session(&mut self) -> SectionAction {
         if self.create.is_pending() || self.delete.is_pending() || self.runtime_update.is_pending()
@@ -270,7 +279,14 @@ impl SessionsSection {
             }
             KeyCode::Right | KeyCode::Enter => {
                 if let Some(session) = sessions.get(self.selected_session) {
+                    if self.detail_session_id.as_deref() == Some(session.id.as_str()) {
+                        return SectionAction::Continue;
+                    }
+
                     self.detail_session_id = Some(session.id.clone());
+                    return SectionAction::ClientCommand(register_timeline_watch_command(
+                        session.id.clone(),
+                    ));
                 }
                 SectionAction::Continue
             }
@@ -950,6 +966,7 @@ fn is_pending(snapshot: Option<&ClientSnapshot>) -> bool {
 fn status_height(snapshot: Option<&ClientSnapshot>, section: &SessionsSection) -> u16 {
     u16::from(
         session_error(snapshot).is_some()
+            || detail_error(snapshot, section).is_some()
             || section.create.error().is_some()
             || section.delete.error().is_some(),
     )
@@ -963,6 +980,22 @@ fn session_error(snapshot: Option<&ClientSnapshot>) -> Option<&str> {
             .error
             .as_deref()
             .or(snapshot.sessions.list.error.as_deref())
+    })
+}
+
+fn detail_error<'a>(
+    snapshot: Option<&'a ClientSnapshot>,
+    section: &SessionsSection,
+) -> Option<&'a str> {
+    let id = section.detail_session_id()?;
+    snapshot.and_then(|snapshot| {
+        snapshot.sessions.timelines.get(id).and_then(|timeline| {
+            timeline
+                .watch
+                .error
+                .as_deref()
+                .or(timeline.load.error.as_deref())
+        })
     })
 }
 
@@ -1046,6 +1079,121 @@ fn session_line(section: &SessionsSection, session: &SessionView, selected: bool
     ])
 }
 
+fn timeline_lines(timeline: Option<&SessionTimelineView>) -> Vec<Line<'static>> {
+    let Some(timeline) = timeline else {
+        return vec![ui::loading_line("Loading timeline...")];
+    };
+
+    if timeline.events.is_empty() {
+        let label = if matches!(timeline.watch.status, "opened" | "received") {
+            "No timeline events yet."
+        } else {
+            "Loading timeline..."
+        };
+        return vec![
+            ui::loading_line(label),
+            Line::from(vec![
+                Span::styled("watch ", THEME.muted_text_style()),
+                Span::styled(timeline.watch.status.to_owned(), THEME.focus_style()),
+            ]),
+        ];
+    }
+
+    timeline.events.iter().map(timeline_event_line).collect()
+}
+
+fn timeline_event_line(event: &TimelineEventView) -> Line<'static> {
+    let label = event_label(event);
+    let text = event_text(event);
+    let status = event
+        .status
+        .map(|status| format!("  {}", status_name(status)))
+        .unwrap_or_default();
+
+    Line::from(vec![
+        Span::styled(format!("#{:>3} ", event.cursor), THEME.muted_text_style()),
+        Span::styled(label, THEME.focus_style()),
+        Span::raw(" "),
+        Span::raw(text),
+        Span::raw(status),
+    ])
+}
+
+fn event_label(event: &TimelineEventView) -> &'static str {
+    match event.channel.as_deref() {
+        Some("user_text") => "user",
+        Some("assistant_text") => "assistant",
+        Some("thinking") => "thinking",
+        Some("tool_call") => "tool call",
+        Some("tool_progress_info") => "tool info",
+        Some("tool_progress_error") => "tool error",
+        Some("tool_result") => "tool result",
+        Some("external_request") => "external",
+        Some("metrics") => "metrics",
+        _ => match event.kind {
+            TimelineEventKindView::ExternalRequestOpened => "external opened",
+            TimelineEventKindView::ExternalRequestResolved => "external resolved",
+            TimelineEventKindView::SessionStatusChanged => "status",
+            TimelineEventKindView::ContentDelta => "delta",
+            TimelineEventKindView::ItemStarted => "started",
+            TimelineEventKindView::ItemUpdated => "updated",
+            TimelineEventKindView::ItemFinished => "finished",
+            TimelineEventKindView::Unspecified | TimelineEventKindView::Unknown => "event",
+        },
+    }
+}
+
+fn event_text(event: &TimelineEventView) -> String {
+    match &event.content {
+        TimelineContentView::Empty => String::new(),
+        TimelineContentView::TextDelta { delta } => delta.clone(),
+        TimelineContentView::TextSnapshot { text } => text.clone(),
+        TimelineContentView::ToolCall {
+            id,
+            name,
+            arguments_json,
+        } => format!("{name} {id} {arguments_json}"),
+        TimelineContentView::ToolResult {
+            id,
+            name,
+            content,
+            error,
+        } => {
+            let prefix = if *error { "error" } else { "ok" };
+            format!("{name} {id} {prefix}: {content}")
+        }
+        TimelineContentView::ExternalRequest { request } => request.as_ref().map_or_else(
+            || "request pending".to_owned(),
+            |request| format!("request {} kind {}", request.id, request.kind),
+        ),
+        TimelineContentView::ContentRef { content_id, bytes } => {
+            format!("content {content_id} ({bytes} bytes)")
+        }
+        TimelineContentView::Json { value_json } => value_json.clone(),
+        TimelineContentView::Unknown => "unknown content".to_owned(),
+    }
+}
+
+const fn status_name(status: TimelineStatusView) -> &'static str {
+    match status {
+        TimelineStatusView::Unspecified => "unspecified",
+        TimelineStatusView::Idle => "idle",
+        TimelineStatusView::BuildingRequest => "building request",
+        TimelineStatusView::StreamingProvider => "streaming provider",
+        TimelineStatusView::EvaluatingToolCall => "evaluating tool call",
+        TimelineStatusView::RunningTool => "running tool",
+        TimelineStatusView::Pending => "pending",
+        TimelineStatusView::AwaitingToolResults => "awaiting tool results",
+        TimelineStatusView::AwaitingExternalInput => "awaiting external input",
+        TimelineStatusView::Interrupted => "interrupted",
+        TimelineStatusView::Resolved => "resolved",
+        TimelineStatusView::Finished => "finished",
+        TimelineStatusView::Failed => "failed",
+        TimelineStatusView::Canceled => "canceled",
+        TimelineStatusView::Unknown => "unknown",
+    }
+}
+
 fn detail_widget(
     section: &SessionsSection,
     snapshot: Option<&ClientSnapshot>,
@@ -1059,7 +1207,7 @@ fn detail_widget(
         .into_iter()
         .find(|session| session.id == id);
 
-    let Some(_session) = session else {
+    let Some(session) = session else {
         return Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("Sessions", THEME.muted_text_style()),
@@ -1071,7 +1219,23 @@ fn detail_widget(
         .style(THEME.text_style());
     };
 
-    Paragraph::new(Vec::<Line<'static>>::new())
+    let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(id));
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Session ", THEME.muted_text_style()),
+        Span::raw(session.id),
+        Span::raw("  "),
+        Span::styled("status ", THEME.muted_text_style()),
+        phase_span(session.status.phase),
+    ])];
+
+    if !session.status.failed_message.is_empty() {
+        lines.push(ui::error_line(&session.status.failed_message));
+    }
+
+    lines.push(Line::raw(""));
+    lines.extend(timeline_lines(timeline));
+
+    Paragraph::new(lines)
         .style(THEME.text_style())
         .wrap(Wrap { trim: false })
 }
@@ -1249,6 +1413,7 @@ fn status_widget(
         .create
         .error()
         .or_else(|| section.delete.error())
+        .or_else(|| detail_error(snapshot, section))
         .or_else(|| session_error(snapshot));
 
     let lines = error.map_or_else(Vec::new, |error| vec![ui::error_line(error)]);
@@ -1300,4 +1465,23 @@ fn format_optional_timestamp(timestamp: Option<&waltr_client::TimestampView>) ->
         || "No updates".to_owned(),
         |timestamp| format!("{}s", timestamp.seconds),
     )
+}
+
+fn register_timeline_watch_command(session_id: String) -> ClientCommand {
+    ClientCommand::RegisterSessionTimelineWatchInterest {
+        session_id,
+        after_cursor: None,
+        channels: vec![
+            "user_text".to_owned(),
+            "assistant_text".to_owned(),
+            "thinking".to_owned(),
+            "tool_call".to_owned(),
+            "tool_progress_info".to_owned(),
+            "tool_progress_error".to_owned(),
+            "tool_result".to_owned(),
+            "external_request".to_owned(),
+            "metrics".to_owned(),
+        ],
+        initial_limit: Some(64),
+    }
 }
