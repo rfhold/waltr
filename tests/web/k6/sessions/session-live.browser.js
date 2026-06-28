@@ -75,7 +75,7 @@ async function createProvider(page, name, model) {
   await waitForPathname(page, "/config/provider");
   await page.locator('[aria-label="Provider actions"] button').click();
   await typeAndKeepFocus(page, 'form[aria-label="Create provider"] input[name="name"]', name);
-  await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAi");
+  await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAiResponses");
   await setInputValue(page, 'form[aria-label="Create provider"] input[name="url"]', GATEWAY_BASE_URL);
 
   const modelsSelector = `[aria-label="Models for ${name}"]`;

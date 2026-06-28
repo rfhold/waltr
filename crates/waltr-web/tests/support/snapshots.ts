@@ -91,7 +91,22 @@ export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
     updatedAt: timestamp(1_700_000_000),
     lastActivityAt: timestamp(1_700_000_000),
     runtimeConfig: null,
+    metrics: sessionMetricsView(),
     ...overrides,
+  };
+}
+
+export function sessionMetricsView() {
+  return {
+    inputTokens: 0n,
+    outputTokens: 0n,
+    cacheReadTokens: 0n,
+    cacheWriteTokens: 0n,
+    imageInputTokens: 0n,
+    imageInputCount: 0n,
+    totalTokens: 0n,
+    costCurrency: null,
+    totalCostMicros: 0n,
   };
 }
 
@@ -115,6 +130,7 @@ export function modelView(overrides: Partial<ModelView> = {}): ModelView {
     limits: { context: null, output: null },
     capabilities: { tools: false, image: false },
     catalogMatch: null,
+    cost: null,
     ...overrides,
   };
 }

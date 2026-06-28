@@ -14,6 +14,8 @@ import {
 import { LandingRoute } from "./landing/LandingRoute";
 import { SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "./sessions/SessionsRoute";
 
+const fixtureRoutesEnabled = import.meta.env.DEV || import.meta.env.MODE === "test";
+
 export function AppRouter() {
   return (
     <Router root={AppLayout}>
@@ -23,6 +25,11 @@ export function AppRouter() {
           <Route path="/" component={SessionsListRoute} />
           <Route path="/:sessionId" component={SessionsDetailRoute} />
         </Route>
+        {fixtureRoutesEnabled && (
+          <Route path="/__fixtures__/sessions" component={SessionsRoute}>
+            <Route path="/:sessionId" component={SessionsDetailRoute} />
+          </Route>
+        )}
         <Route path="/config" component={ConfigRoute}>
           <Route path="/" component={() => <Navigate href="/config/provider" />} />
           <Route path="/provider/create/models/create" component={ConfigModelCreateRoute} />

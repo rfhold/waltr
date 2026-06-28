@@ -22,3 +22,5 @@ Web tests should mirror non-server-backed TUI test intent for shared user-facing
 # Hints
 
 Use the test-modification skill when modifying tests.
+
+Use `tests/web/k6/` for server-backed browser flows. Screenshot actuals are written under ignored `.dev/web-screenshots/current/`; refresh local snapshot baselines under ignored `tests/web/k6/snapshots/screenshots/` with `pnpm test:web:screenshots:update` after intentional visual changes.

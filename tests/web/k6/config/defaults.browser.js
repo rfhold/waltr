@@ -18,7 +18,7 @@ export default async function () {
     await waitForText(page, "#config-title", "Settings");
     await page.locator('[aria-label="Provider actions"] button').click();
     await typeAndKeepFocus(page, 'form[aria-label="Create provider"] input[name="name"]', PROVIDER);
-    await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAi");
+    await page.locator('form[aria-label="Create provider"] select[name="kind"]').selectOption("openAiResponses");
     await setInputValue(page, 'form[aria-label="Create provider"] input[name="url"]', "https://api.openai.com/v1/chat/completions");
 
     const modelsSelector = `[aria-label="Models for ${PROVIDER}"]`;
