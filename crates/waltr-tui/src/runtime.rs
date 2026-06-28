@@ -14,8 +14,15 @@ use crate::{
 
 const EVENT_BUFFER: usize = 256;
 const TICK_INTERVAL: Duration = Duration::from_millis(50);
-const DEFAULT_CLIENT_ENDPOINT: &str = "http://127.0.0.1:8080";
+const DEFAULT_CLIENT_ENDPOINT: &str = "http://127.0.0.1:14333";
 const CLIENT_ENDPOINT_ENV: &str = "WALTR_SERVER_ENDPOINT";
+
+/// Runtime launch options for the terminal UI.
+#[derive(Debug, Default)]
+pub struct RuntimeOptions {
+    /// Explicit client endpoint for this process.
+    pub client_endpoint: Option<String>,
+}
 
 /// Run the terminal UI until the app exits.
 ///
@@ -23,9 +30,21 @@ const CLIENT_ENDPOINT_ENV: &str = "WALTR_SERVER_ENDPOINT";
 ///
 /// Returns an error if terminal drawing, input polling, or Ctrl-C handling fails.
 pub async fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    run_with_options(terminal, RuntimeOptions::default()).await
+}
+
+/// Run the terminal UI with explicit launch options until the app exits.
+///
+/// # Errors
+///
+/// Returns an error if terminal drawing, input polling, or Ctrl-C handling fails.
+pub async fn run_with_options(
+    terminal: &mut DefaultTerminal,
+    options: RuntimeOptions,
+) -> io::Result<()> {
     tokio::task::LocalSet::new()
         .run_until(async {
-            let (events, commands, runtime) = RuntimeEvents::start();
+            let (events, commands, runtime) = RuntimeEvents::start(options.client_endpoint);
             let result = run_with_events(terminal, App::new(), events, commands).await;
             runtime.abort();
             result
@@ -67,7 +86,9 @@ struct RuntimeEvents {
 }
 
 impl RuntimeEvents {
-    fn start() -> (
+    fn start(
+        client_endpoint: Option<String>,
+    ) -> (
         mpsc::Receiver<io::Result<AppEvent>>,
         mpsc::Sender<ClientCommand>,
         Self,
@@ -78,7 +99,7 @@ impl RuntimeEvents {
             spawn_tick_events(events.clone()),
             spawn_input_events(events.clone()),
             spawn_ctrl_c_events(events.clone()),
-            spawn_client_events(events, command_receiver),
+            spawn_client_events(events, command_receiver, client_endpoint),
         ];
 
         (receiver, commands, Self { tasks })
@@ -155,10 +176,11 @@ fn spawn_ctrl_c_events(events: mpsc::Sender<io::Result<AppEvent>>) -> tokio::tas
 fn spawn_client_events(
     events: mpsc::Sender<io::Result<AppEvent>>,
     mut commands: mpsc::Receiver<ClientCommand>,
+    client_endpoint: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let mut client =
-            ClientRuntime::for_endpoint(client_endpoint()).into_state_stream(sleep_millis);
+        let mut client = ClientRuntime::for_endpoint(client_endpoint_or_default(client_endpoint))
+            .into_state_stream(sleep_millis);
 
         loop {
             let event = match client
@@ -180,6 +202,8 @@ async fn sleep_millis(milliseconds: u64) {
     time::sleep(Duration::from_millis(milliseconds)).await;
 }
 
-fn client_endpoint() -> String {
-    env::var(CLIENT_ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_CLIENT_ENDPOINT.to_owned())
+fn client_endpoint_or_default(client_endpoint: Option<String>) -> String {
+    client_endpoint
+        .or_else(|| env::var(CLIENT_ENDPOINT_ENV).ok())
+        .unwrap_or_else(|| DEFAULT_CLIENT_ENDPOINT.to_owned())
 }

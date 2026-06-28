@@ -2930,11 +2930,13 @@ dependencies = [
 name = "waltr-tui"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "insta",
  "waltr-client",
  "waltr-server",
  "ratatui",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

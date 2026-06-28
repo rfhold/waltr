@@ -4,10 +4,24 @@ edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "waltr"
+path = "src/main.rs"
+
+[features]
+default = []
+server = ["dep:axum", "dep:waltr-server", "dep:tracing"]
+web = ["server", "waltr-server/web"]
+default-server = ["server"]
+bundled = ["web", "default-server"]
+
 [dependencies]
+axum = { workspace = true, optional = true }
 waltr-client.workspace = true
+waltr-server = { workspace = true, optional = true }
 ratatui = { workspace = true, features = ["palette", "scrolling-regions"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 insta.workspace = true
