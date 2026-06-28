@@ -4,6 +4,7 @@ use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWat
 use crate::{
     ClientError, Configuration, OperationKey, Provider, RuntimeDefaults,
     SessionRuntimeConfigRequest, SessionSummary, SystemStatus, TimelineEvent, TimelineQuery,
+    TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -191,27 +192,32 @@ pub enum SessionEvent {
     },
     /// A session timeline watch stream opened.
     TimelineWatchStarted {
-        /// Session id whose timeline watch opened.
-        session_id: String,
+        /// Timeline watch identity that opened.
+        key: TimelineWatchKey,
     },
     /// A session timeline watch stream produced an update.
-    TimelineWatchChanged(SessionTimelineWatchUpdate),
+    TimelineWatchChanged {
+        /// Timeline watch identity that produced the update.
+        key: TimelineWatchKey,
+        /// Timeline update returned by the transport.
+        update: SessionTimelineWatchUpdate,
+    },
     /// A session timeline watch stream failed.
     TimelineWatchFailed {
-        /// Session id whose watch failed.
-        session_id: String,
+        /// Timeline watch identity that failed.
+        key: TimelineWatchKey,
         /// Failure returned by the watch stream.
         error: ClientError,
     },
     /// A session timeline watch stream ended.
     TimelineWatchEnded {
-        /// Session id whose watch ended.
-        session_id: String,
+        /// Timeline watch identity that ended.
+        key: TimelineWatchKey,
     },
     /// A timeline watch retry delay elapsed.
     TimelineReconnectReady {
-        /// Session id whose watch can reconnect.
-        session_id: String,
+        /// Timeline watch identity that can reconnect.
+        key: TimelineWatchKey,
     },
     /// A caller requested a user message submission.
     UserMessageSubmitRequested {
@@ -388,14 +394,8 @@ pub enum SessionEffect {
     Watch,
     /// Open or continue one session timeline watch stream.
     WatchTimeline {
-        /// Session id whose timeline should be watched.
-        session_id: String,
-        /// Optional cursor boundary for the watch.
-        after_cursor: Option<u64>,
-        /// Optional display-channel filter.
-        channels: Vec<String>,
-        /// Optional initial history batch size.
-        initial_limit: Option<u32>,
+        /// Timeline watch identity to open.
+        key: TimelineWatchKey,
     },
     /// Submit a user message to a session.
     SubmitUserMessage {
@@ -431,8 +431,8 @@ pub enum SessionEffect {
     },
     /// Sleep before attempting a timeline watch reconnect.
     SleepTimelineReconnect {
-        /// Session id whose watch should reconnect.
-        session_id: String,
+        /// Timeline watch identity that should reconnect.
+        key: TimelineWatchKey,
         /// Delay duration in milliseconds.
         delay_ms: u64,
     },

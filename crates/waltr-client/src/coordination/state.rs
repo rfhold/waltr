@@ -7,7 +7,43 @@ use crate::{Configuration, SessionSummary, StreamId, SystemStatus, TimelineEvent
 /// Runtime-local operation identifier used by shells to track command results.
 pub type OperationKey = String;
 
-type TimelineWatchRequest = (Option<u64>, Vec<String>, Option<u32>);
+/// Lifecycle-defining request parameters for one timeline watch.
+pub type TimelineWatchRequest = (Option<u64>, Vec<String>, Option<u32>);
+
+/// Stable identity for one timeline watch stream.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TimelineWatchKey {
+    /// Session id whose timeline is watched.
+    pub session_id: String,
+    /// Optional exclusive cursor for historical catch-up.
+    pub after_cursor: Option<u64>,
+    /// Display-channel filter.
+    pub channels: Vec<String>,
+    /// Optional initial history batch size.
+    pub initial_limit: Option<u32>,
+}
+
+impl TimelineWatchKey {
+    /// Create a watch key from request parameters.
+    pub fn new(
+        session_id: String,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+    ) -> Self {
+        Self {
+            session_id,
+            after_cursor,
+            channels,
+            initial_limit,
+        }
+    }
+
+    /// Return the request parameters represented by this key.
+    pub fn request(&self) -> TimelineWatchRequest {
+        (self.after_cursor, self.channels.clone(), self.initial_limit)
+    }
+}
 
 /// Return the capped watch reconnect delay for a retry attempt.
 #[must_use]
@@ -91,9 +127,7 @@ pub struct SessionTimelineState {
     /// Timeline watch operation state.
     pub watch: WatchState,
     pub(crate) last_sequence: u64,
-    pub(crate) watch_after_cursor: Option<u64>,
-    pub(crate) watch_channels: Vec<String>,
-    pub(crate) watch_initial_limit: Option<u32>,
+    pub(crate) watches: BTreeMap<TimelineWatchKey, WatchState>,
 }
 
 /// Stream coordination state.
@@ -544,51 +578,58 @@ impl ClientState {
         timeline.load.error = Some(message);
     }
 
-    pub(crate) fn configure_session_timeline_watch(
+    pub(crate) fn configure_session_timeline_watch(&mut self, key: TimelineWatchKey) {
+        let timeline = self.session_timeline_mut(&key.session_id);
+        timeline.watch.interests = timeline.watch.interests.saturating_add(1);
+        let watch = timeline.watches.entry(key).or_default();
+        watch.interests = watch.interests.saturating_add(1);
+    }
+
+    pub(crate) fn remove_session_timeline_watch_interest(
         &mut self,
         session_id: &str,
-        after_cursor: Option<u64>,
-        channels: Vec<String>,
-        initial_limit: Option<u32>,
-    ) {
+    ) -> Vec<TimelineWatchKey> {
         let timeline = self.session_timeline_mut(session_id);
-        timeline.watch.interests = timeline.watch.interests.saturating_add(1);
-        timeline.watch_after_cursor = after_cursor;
-        timeline.watch_channels = channels;
-        timeline.watch_initial_limit = initial_limit;
+        let keys = timeline.watches.keys().cloned().collect::<Vec<_>>();
+        timeline.watches.clear();
+        timeline.watch.interests = 0;
+        timeline.watch.status = OperationStatus::Idle;
+        timeline.watch.error = None;
+        timeline.watch.retry_attempt = 0;
+        keys
     }
 
-    pub(crate) fn remove_session_timeline_watch_interest(&mut self, session_id: &str) -> usize {
-        let timeline = self.session_timeline_mut(session_id);
-        timeline.watch.interests = timeline.watch.interests.saturating_sub(1);
-
-        if timeline.watch.interests == 0 {
-            timeline.watch.status = OperationStatus::Idle;
-            timeline.watch.error = None;
-            timeline.watch.retry_attempt = 0;
+    pub(crate) fn set_session_timeline_watch_loading(&mut self, key: &TimelineWatchKey) {
+        let timeline = self.session_timeline_mut(&key.session_id);
+        if let Some(watch) = timeline.watches.get_mut(key) {
+            watch.status = OperationStatus::Loading;
+            watch.error = None;
         }
-
-        timeline.watch.interests
-    }
-
-    pub(crate) fn set_session_timeline_watch_loading(&mut self, session_id: &str) {
-        let timeline = self.session_timeline_mut(session_id);
         timeline.watch.status = OperationStatus::Loading;
         timeline.watch.error = None;
     }
 
-    pub(crate) fn set_session_timeline_watch_opened(&mut self, session_id: &str) {
-        let timeline = self.session_timeline_mut(session_id);
+    pub(crate) fn set_session_timeline_watch_opened(&mut self, key: &TimelineWatchKey) {
+        let timeline = self.session_timeline_mut(&key.session_id);
+        if let Some(watch) = timeline.watches.get_mut(key) {
+            watch.status = OperationStatus::Opened;
+            watch.error = None;
+        }
         timeline.watch.status = OperationStatus::Opened;
         timeline.watch.error = None;
     }
 
-    pub(crate) fn set_session_timeline_watch_waiting(&mut self, session_id: &str) {
-        self.session_timeline_mut(session_id).watch.status = OperationStatus::Waiting;
+    pub(crate) fn set_session_timeline_watch_waiting(&mut self, key: &TimelineWatchKey) {
+        let timeline = self.session_timeline_mut(&key.session_id);
+        if let Some(watch) = timeline.watches.get_mut(key) {
+            watch.status = OperationStatus::Waiting;
+        }
+        timeline.watch.status = OperationStatus::Waiting;
     }
 
     pub(crate) fn set_session_timeline_watch_changed(
         &mut self,
+        key: &TimelineWatchKey,
         sequence: u64,
         event: TimelineEvent,
     ) {
@@ -596,6 +637,11 @@ impl ClientState {
         let timeline = self.session_timeline_mut(&session_id);
         timeline.last_sequence = sequence;
         timeline.events.insert(event.cursor, event);
+        if let Some(watch) = timeline.watches.get_mut(key) {
+            watch.status = OperationStatus::Received;
+            watch.error = None;
+            watch.retry_attempt = 0;
+        }
         timeline.watch.status = OperationStatus::Received;
         timeline.watch.error = None;
         timeline.watch.retry_attempt = 0;
@@ -603,38 +649,52 @@ impl ClientState {
 
     pub(crate) fn set_session_timeline_watch_failed(
         &mut self,
-        session_id: &str,
+        key: &TimelineWatchKey,
         message: String,
     ) -> u64 {
-        let timeline = self.session_timeline_mut(session_id);
+        let timeline = self.session_timeline_mut(&key.session_id);
+        let watch = timeline.watches.entry(key.clone()).or_default();
+        watch.status = OperationStatus::Failed;
+        watch.error = Some(message.clone());
+
+        let delay = watch_reconnect_delay_ms(watch.retry_attempt);
+        watch.retry_attempt = watch.retry_attempt.saturating_add(1);
+
         timeline.watch.status = OperationStatus::Failed;
         timeline.watch.error = Some(message);
-
-        let delay = watch_reconnect_delay_ms(timeline.watch.retry_attempt);
-        timeline.watch.retry_attempt = timeline.watch.retry_attempt.saturating_add(1);
         delay
     }
 
     pub(crate) fn session_timeline_watch_request(
         &self,
-        session_id: &str,
+        key: &TimelineWatchKey,
     ) -> Option<TimelineWatchRequest> {
-        self.sessions.timelines.get(session_id).map(|timeline| {
-            (
-                timeline.watch_after_cursor,
-                timeline.watch_channels.clone(),
-                timeline.watch_initial_limit,
-            )
-        })
-    }
-
-    pub(crate) fn timeline_watch_session_ids(&self) -> Vec<String> {
         self.sessions
             .timelines
-            .iter()
-            .filter(|(_, timeline)| timeline.watch.interests > 0)
-            .map(|(session_id, _)| session_id.clone())
+            .get(&key.session_id)
+            .and_then(|timeline| timeline.watches.get(key).map(|_| key.request()))
+    }
+
+    pub(crate) fn timeline_watch_keys(&self) -> Vec<TimelineWatchKey> {
+        self.sessions
+            .timelines
+            .values()
+            .flat_map(|timeline| {
+                timeline
+                    .watches
+                    .iter()
+                    .filter(|(_, watch)| watch.interests > 0)
+                    .map(|(key, _)| key.clone())
+            })
             .collect()
+    }
+
+    pub(crate) fn session_timeline_watch_is_active(&self, key: &TimelineWatchKey) -> bool {
+        self.sessions
+            .timelines
+            .get(&key.session_id)
+            .and_then(|timeline| timeline.watches.get(key))
+            .is_some_and(|watch| watch.interests > 0)
     }
 
     pub(crate) fn set_session_submit_user_message_loading(

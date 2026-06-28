@@ -25,7 +25,7 @@ pub use coordination::runtime::{
 pub use coordination::state::{
     ClientOperationState, ClientState, ConfigClientState, OperationKey, OperationState,
     OperationStatus, SessionClientState, StatusClientState, StreamClientState, StreamState,
-    StreamStatus, WatchState, watch_reconnect_delay_ms,
+    StreamStatus, TimelineWatchKey, WatchState, watch_reconnect_delay_ms,
 };
 pub use error::ClientError;
 pub use executor::{

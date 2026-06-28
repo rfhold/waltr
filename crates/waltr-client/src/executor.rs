@@ -288,22 +288,22 @@ impl GrpcEffectExecutor {
                     Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
                 }
             }
-            ClientEffect::Session(SessionEffect::WatchTimeline {
-                session_id,
-                after_cursor,
-                channels,
-                initial_limit,
-            }) => {
+            ClientEffect::Session(SessionEffect::WatchTimeline { key }) => {
                 match self
                     .transport
-                    .watch_timeline(session_id.clone(), after_cursor, channels, initial_limit)
+                    .watch_timeline(
+                        key.session_id.clone(),
+                        key.after_cursor,
+                        key.channels.clone(),
+                        key.initial_limit,
+                    )
                     .await
                 {
                     Ok(_) => vec![ClientEvent::Session(SessionEvent::TimelineWatchStarted {
-                        session_id,
+                        key,
                     })],
                     Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineWatchFailed {
-                        session_id,
+                        key,
                         error,
                     })],
                 }
@@ -367,13 +367,10 @@ impl GrpcEffectExecutor {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Session(SessionEvent::ReconnectReady)]
             }
-            ClientEffect::Session(SessionEffect::SleepTimelineReconnect {
-                session_id,
-                delay_ms,
-            }) => {
+            ClientEffect::Session(SessionEffect::SleepTimelineReconnect { key, delay_ms }) => {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Session(SessionEvent::TimelineReconnectReady {
-                    session_id,
+                    key,
                 })]
             }
         }

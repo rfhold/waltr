@@ -3,6 +3,7 @@
 use crate::transport::{SessionWatchEvent, SessionWatchUpdate};
 use crate::{
     ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect, SessionEvent,
+    TimelineWatchKey,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -122,35 +123,29 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             channels,
             initial_limit,
         } => {
-            state.configure_session_timeline_watch(
-                &session_id,
-                after_cursor,
-                channels,
-                initial_limit,
-            );
-            maintain_timeline_watch(state, &session_id)
+            let key = TimelineWatchKey::new(session_id, after_cursor, channels, initial_limit);
+            state.configure_session_timeline_watch(key.clone());
+            maintain_timeline_watch(state, &key)
         }
         SessionEvent::TimelineWatchInterestReleased { session_id } => {
             state.remove_session_timeline_watch_interest(&session_id);
             ClientUpdate::default()
         }
-        SessionEvent::TimelineWatchStarted { session_id } => {
-            state.set_session_timeline_watch_opened(&session_id);
+        SessionEvent::TimelineWatchStarted { key } => {
+            state.set_session_timeline_watch_opened(&key);
             ClientUpdate::default()
         }
-        SessionEvent::TimelineWatchChanged(update) => {
-            state.set_session_timeline_watch_changed(update.sequence, update.event);
+        SessionEvent::TimelineWatchChanged { key, update } => {
+            state.set_session_timeline_watch_changed(&key, update.sequence, update.event);
             ClientUpdate::default()
         }
-        SessionEvent::TimelineWatchFailed { session_id, error } => {
-            timeline_watch_failed(state, &session_id, error.to_string())
+        SessionEvent::TimelineWatchFailed { key, error } => {
+            timeline_watch_failed(state, &key, error.to_string())
         }
-        SessionEvent::TimelineWatchEnded { session_id } => {
-            timeline_watch_failed(state, &session_id, "timeline watch ended".to_owned())
+        SessionEvent::TimelineWatchEnded { key } => {
+            timeline_watch_failed(state, &key, "timeline watch ended".to_owned())
         }
-        SessionEvent::TimelineReconnectReady { session_id } => {
-            maintain_timeline_watch(state, &session_id)
-        }
+        SessionEvent::TimelineReconnectReady { key } => maintain_timeline_watch(state, &key),
         SessionEvent::UserMessageSubmitRequested {
             operation_key,
             session_id,
@@ -266,39 +261,44 @@ pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
     ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Watch))
 }
 
-pub fn maintain_timeline_watch(state: &mut ClientState, session_id: &str) -> ClientUpdate {
-    let Some(timeline) = state.sessions.timelines.get(session_id) else {
-        return ClientUpdate::default();
-    };
-
-    if timeline.watch.interests == 0 {
+pub fn maintain_timeline_watch(state: &mut ClientState, key: &TimelineWatchKey) -> ClientUpdate {
+    if !state.session_timeline_watch_is_active(key) {
         return ClientUpdate::default();
     }
 
+    let Some(timeline) = state.sessions.timelines.get(&key.session_id) else {
+        return ClientUpdate::default();
+    };
+
+    let Some(watch) = timeline.watches.get(key) else {
+        return ClientUpdate::default();
+    };
+
     if matches!(
-        timeline.watch.status,
+        watch.status,
         OperationStatus::Loading | OperationStatus::Opened | OperationStatus::Received
     ) {
         return ClientUpdate::default();
     }
 
     if !state.permits_watch_maintenance() {
-        state.set_session_timeline_watch_waiting(session_id);
+        state.set_session_timeline_watch_waiting(key);
         return ClientUpdate::default();
     }
 
-    let Some((after_cursor, channels, initial_limit)) =
-        state.session_timeline_watch_request(session_id)
+    let Some((after_cursor, channels, initial_limit)) = state.session_timeline_watch_request(key)
     else {
         return ClientUpdate::default();
     };
 
-    state.set_session_timeline_watch_loading(session_id);
+    state.set_session_timeline_watch_loading(key);
     ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::WatchTimeline {
-        session_id: session_id.to_owned(),
-        after_cursor,
-        channels,
-        initial_limit,
+        key: TimelineWatchKey::new(
+            key.session_id.clone(),
+            after_cursor,
+            channels,
+            initial_limit,
+        ),
     }))
 }
 
@@ -319,28 +319,24 @@ fn apply_watch_update(state: &mut ClientState, update: SessionWatchUpdate) -> Cl
 
 fn timeline_watch_failed(
     state: &mut ClientState,
-    session_id: &str,
+    key: &TimelineWatchKey,
     message: String,
 ) -> ClientUpdate {
-    let Some(timeline) = state.sessions.timelines.get(session_id) else {
-        return ClientUpdate::default();
-    };
-
-    if timeline.watch.interests == 0 {
+    if !state.session_timeline_watch_is_active(key) {
         return ClientUpdate::default();
     }
 
-    let delay_ms = state.set_session_timeline_watch_failed(session_id, message);
+    let delay_ms = state.set_session_timeline_watch_failed(key, message);
 
     if state.permits_watch_maintenance() {
         ClientUpdate::with_effect(ClientEffect::Session(
             SessionEffect::SleepTimelineReconnect {
-                session_id: session_id.to_owned(),
+                key: key.clone(),
                 delay_ms,
             },
         ))
     } else {
-        state.set_session_timeline_watch_waiting(session_id);
+        state.set_session_timeline_watch_waiting(key);
         ClientUpdate::default()
     }
 }

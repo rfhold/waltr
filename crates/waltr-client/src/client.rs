@@ -219,8 +219,8 @@ impl Client {
             }
         }
 
-        for session_id in self.state.timeline_watch_session_ids() {
-            let update = session::maintain_timeline_watch(&mut self.state, &session_id);
+        for key in self.state.timeline_watch_keys() {
+            let update = session::maintain_timeline_watch(&mut self.state, &key);
             if !update.is_empty() {
                 return update;
             }
@@ -1066,12 +1066,13 @@ mod tests {
     fn session_timeline_page_loads_merge_by_cursor() {
         let mut client = Client::new();
 
-        client.apply(ClientEvent::Session(SessionEvent::TimelineWatchChanged(
-            SessionTimelineWatchUpdate {
+        client.apply(ClientEvent::Session(SessionEvent::TimelineWatchChanged {
+            key: crate::TimelineWatchKey::new("session".to_owned(), Some(0), Vec::new(), None),
+            update: SessionTimelineWatchUpdate {
                 sequence: 1,
                 event: timeline_event(10),
             },
-        )));
+        }));
         client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
             session_id: "session".to_owned(),
             events: vec![timeline_event(8), timeline_event(9)],
