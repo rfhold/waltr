@@ -2,7 +2,9 @@
 
 use serde_json::{Value, json};
 
-use crate::stream::{CompletionRequest, ToolCall, ToolDefinition, ToolResult, TurnItem};
+use crate::stream::{
+    CompletionReplayItem, CompletionRequest, ToolCall, ToolDefinition, ToolResult, TurnItem,
+};
 
 pub(super) fn chat_body(model: &str, request: &CompletionRequest<'_>) -> Value {
     json!({
@@ -20,19 +22,23 @@ pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     if let Some(system_prompt) = request.system_prompt {
         messages.push(json!({ "role": "system", "content": system_prompt }));
     }
-    messages.push(json!({ "role": "user", "content": request.prompt }));
-
     let mut pending_text = String::new();
     let mut pending_calls: Vec<Value> = Vec::new();
-    for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
+    for item in request.replay_items() {
         match item {
-            TurnItem::AssistantText(text) => pending_text.push_str(text),
-            TurnItem::Thinking(_) => {}
-            TurnItem::ToolCall(call) => pending_calls.push(chat_tool_call(call)),
-            TurnItem::ToolResult(result) => {
+            CompletionReplayItem::Prompt(prompt) => {
                 flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
-                messages.push(chat_tool_result(result));
+                messages.push(json!({ "role": "user", "content": prompt }));
             }
+            CompletionReplayItem::Turn(item) => match item {
+                TurnItem::AssistantText(text) => pending_text.push_str(text),
+                TurnItem::Thinking(_) => {}
+                TurnItem::ToolCall(call) => pending_calls.push(chat_tool_call(call)),
+                TurnItem::ToolResult(result) => {
+                    flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
+                    messages.push(chat_tool_result(result));
+                }
+            },
         }
     }
     flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
@@ -93,7 +99,7 @@ pub(super) fn chat_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 mod tests {
     use serde_json::json;
 
-    use crate::{CompletionRequest, CompletionTurn, ToolCall, ToolResult, TurnItem};
+    use crate::{CompletionRequest, CompletionTurn, PromptTurn, ToolCall, ToolResult, TurnItem};
 
     use super::chat_messages;
 
@@ -112,7 +118,17 @@ mod tests {
 
     #[test]
     fn chat_messages_replay_turns_as_alternating_assistant_and_tool_messages() {
-        let mut request = CompletionRequest::new("hello");
+        let mut request = CompletionRequest::new("follow up");
+        request.prompt_turns = vec![
+            PromptTurn {
+                turn: 0,
+                prompt: "hello".to_owned(),
+            },
+            PromptTurn {
+                turn: 2,
+                prompt: "follow up".to_owned(),
+            },
+        ];
         request.turns = vec![
             CompletionTurn {
                 turn: 0,
@@ -136,7 +152,9 @@ mod tests {
 
         let messages = chat_messages(&request);
 
-        assert_eq!(messages.len(), 5);
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
         assert_eq!(messages[1]["role"], "assistant");
         assert_eq!(messages[1]["content"], "first answer");
         assert_eq!(messages[1]["tool_calls"][0]["id"], "call-0");
@@ -147,5 +165,7 @@ mod tests {
         assert_eq!(messages[3]["tool_calls"][0]["id"], "call-1");
         assert_eq!(messages[4]["role"], "tool");
         assert_eq!(messages[4]["tool_call_id"], "call-1");
+        assert_eq!(messages[5]["role"], "user");
+        assert_eq!(messages[5]["content"], "follow up");
     }
 }

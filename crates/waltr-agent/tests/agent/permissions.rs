@@ -255,6 +255,108 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
 }
 
 #[tokio::test]
+async fn permission_resume_preserves_remaining_provider_tool_calls() -> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let provider = Arc::new(ScriptedProvider::new(
+        "permission_multi_tool_resume_provider",
+        |request| {
+            let completed = request
+                .tool_results()
+                .map(|result| result.call_id.as_str())
+                .collect::<Vec<_>>();
+            if completed.contains(&"call_first") && completed.contains(&"call_second") {
+                vec![
+                    Ok(CompletionEvent::Delta("all-tools-complete".to_owned())),
+                    Ok(CompletionEvent::Finished),
+                ]
+            } else {
+                vec![
+                    Ok(CompletionEvent::ToolCall(read_call(
+                        "call_first",
+                        "../outside/external.txt",
+                    ))),
+                    Ok(CompletionEvent::ToolCall(read_call(
+                        "call_second",
+                        "../outside/nested/another.txt",
+                    ))),
+                ]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_permission_policy(PermissionPolicy::filesystem_external(
+            fixture.root.path(),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(
+            FilesystemConfig::new(fixture.root.path())
+                .with_profile(FilesystemToolProfile::StructuredPatch),
+        )
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = AgentSessions::new(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+
+    let request_id = first_permission_request_id(
+        sessions
+            .prompt(
+                &agent,
+                session_id.clone(),
+                "read two external files in one turn",
+            )
+            .stream(),
+    )
+    .await?;
+    let suspended = store.load(&session_id).await.expect("stored session");
+    let suspended_snapshot = suspended.snapshot();
+    assert_eq!(
+        suspended_snapshot
+            .pending_work
+            .iter()
+            .filter(|work| matches!(work.status, PendingWorkStatus::Pending))
+            .map(|work| work.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["call_first", "call_second"]
+    );
+
+    let mut resumed = sessions
+        .resume(
+            &agent,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id,
+                response: ExternalResponse::new(json!(PermissionResponse::AllowAlways {
+                    patterns: vec![PermissionPattern::filesystem_prefix(
+                        PermissionOperation::Read,
+                        fixture.outside.path(),
+                    )],
+                })),
+            },
+        )
+        .stream();
+    let mut text = String::new();
+    let mut tool_results = Vec::new();
+    while let Some(event) = resumed.next().await {
+        let event = event?;
+        if let TimelineContent::TextDelta { delta } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT)
+        {
+            text.push_str(delta);
+        }
+        if let TimelineContent::ToolResult { result } = &event.content
+            && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)
+        {
+            tool_results.push(result.call_id.clone());
+        }
+    }
+
+    assert_eq!(tool_results, vec!["call_first", "call_second"]);
+    assert_eq!(text, "all-tools-complete");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
     let provider = Arc::new(ScriptedProvider::new(

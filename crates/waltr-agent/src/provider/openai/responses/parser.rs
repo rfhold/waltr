@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use crate::stream::{CompletionEvent, ThinkingBlock, ThinkingBlockKind, ThinkingDelta};
 use crate::{ProviderTurnMetadata, Result, TokenUsage};
 
-use crate::provider::openai::shared::{PartialToolCall, RESPONSES_NAME, api_error};
+use crate::provider::openai::shared::{
+    PartialToolCall, RESPONSES_NAME, api_error, chargeable_input_tokens,
+};
 
 #[derive(Debug)]
 pub(in crate::provider::openai) struct ResponsesParser {
@@ -163,12 +165,16 @@ impl ResponsesParser {
         let usage = response
             .get("usage")
             .filter(|usage| usage.is_object())
-            .map(|usage| TokenUsage {
-                input_tokens: usage["input_tokens"].as_u64(),
-                output_tokens: usage["output_tokens"].as_u64(),
-                cache_read_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64(),
-                image_input_tokens: usage["input_tokens_details"]["image_tokens"].as_u64(),
-                ..Default::default()
+            .map(|usage| {
+                let input_tokens = usage["input_tokens"].as_u64();
+                let cache_read_tokens = usage["input_tokens_details"]["cached_tokens"].as_u64();
+                TokenUsage {
+                    input_tokens: chargeable_input_tokens(input_tokens, cache_read_tokens),
+                    output_tokens: usage["output_tokens"].as_u64(),
+                    cache_read_tokens,
+                    image_input_tokens: usage["input_tokens_details"]["image_tokens"].as_u64(),
+                    ..Default::default()
+                }
             });
         vec![
             CompletionEvent::ProviderMetadata(ProviderTurnMetadata {
@@ -278,6 +284,27 @@ mod tests {
                 CompletionEvent::Finished,
             ]
         );
+    }
+
+    #[test]
+    fn response_completed_reports_cached_tokens_separately_from_chargeable_input() {
+        let mut parser = ResponsesParser::new(
+            RESPONSES_NAME,
+            "https://example.test/v1/responses",
+            "gpt-test",
+        );
+
+        let events = parser
+            .parse_event(
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":12,"output_tokens":2,"input_tokens_details":{"cached_tokens":5}}}}"#,
+            )
+            .expect("completed event parses");
+
+        let CompletionEvent::ProviderMetadata(metadata) = &events[0] else {
+            panic!("expected provider metadata, got {events:?}");
+        };
+        assert_eq!(metadata.usage.expect("usage").input_tokens, Some(7));
+        assert_eq!(metadata.usage.expect("usage").cache_read_tokens, Some(5));
     }
 
     #[test]

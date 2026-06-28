@@ -13,6 +13,17 @@ pub(super) const CHAT_COMPLETIONS_NAME: &str = "openai_chat_completions";
 pub(super) const RESPONSES_NAME: &str = "openai_responses";
 pub(super) const RESPONSES_WEBSOCKET_NAME: &str = "openai_responses_websocket";
 
+pub(super) fn chargeable_input_tokens(
+    input_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+) -> Option<u64> {
+    match (input_tokens, cached_tokens) {
+        (Some(input), Some(cached)) => Some(input.saturating_sub(cached)),
+        (input, None) => input,
+        (None, Some(_)) => None,
+    }
+}
+
 pub(super) async fn stream_openai_http(
     provider: &'static str,
     url: &str,

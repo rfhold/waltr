@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 
 use crate::provider::openai::reasoning::{OpenAiReasoningConfig, openai_reasoning};
 use crate::stream::{
-    CompletionRequest, ThinkingBlockKind, ToolCall, ToolDefinition, ToolResult, TurnItem,
+    CompletionReplayItem, CompletionRequest, ThinkingBlockKind, ToolCall, ToolDefinition,
+    ToolResult, TurnItem,
 };
 
 pub(in crate::provider::openai) fn responses_body(
@@ -34,24 +35,26 @@ pub(in crate::provider::openai) fn responses_body(
 
 pub(super) fn responses_input(request: &CompletionRequest<'_>) -> Value {
     let mut input = Vec::new();
-    input.push(json!({
-        "type": "message",
-        "role": "user",
-        "content": [{ "type": "input_text", "text": request.prompt }]
-    }));
 
-    for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
+    for item in request.replay_items() {
         match item {
-            TurnItem::AssistantText(text) => input.push(responses_assistant_text(text)),
-            TurnItem::Thinking(block)
-                if block.kind == ThinkingBlockKind::OpenAiResponses
-                    && has_encrypted_content(&block.payload) =>
-            {
-                input.push(block.payload.clone());
-            }
-            TurnItem::Thinking(_) => {}
-            TurnItem::ToolCall(call) => input.push(responses_tool_call(call)),
-            TurnItem::ToolResult(result) => input.push(responses_tool_result(result)),
+            CompletionReplayItem::Prompt(prompt) => input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": prompt }]
+            })),
+            CompletionReplayItem::Turn(item) => match item {
+                TurnItem::AssistantText(text) => input.push(responses_assistant_text(text)),
+                TurnItem::Thinking(block)
+                    if block.kind == ThinkingBlockKind::OpenAiResponses
+                        && has_encrypted_content(&block.payload) =>
+                {
+                    input.push(block.payload.clone());
+                }
+                TurnItem::Thinking(_) => {}
+                TurnItem::ToolCall(call) => input.push(responses_tool_call(call)),
+                TurnItem::ToolResult(result) => input.push(responses_tool_result(result)),
+            },
         }
     }
     Value::Array(input)
@@ -110,7 +113,10 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::{CompletionTurn, ThinkingBlock, ThinkingBlockKind, ToolCall, ToolResult, TurnItem};
+    use crate::{
+        CompletionTurn, PromptTurn, ThinkingBlock, ThinkingBlockKind, ToolCall, ToolResult,
+        TurnItem,
+    };
 
     use super::{responses_body, responses_input};
     use crate::provider::openai::{
@@ -171,6 +177,8 @@ mod tests {
 
         let input = responses_input(&request);
 
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["role"], "assistant");
         assert_eq!(input[1]["content"][0]["type"], "output_text");
@@ -197,6 +205,7 @@ mod tests {
 
         let input = responses_input(&request);
 
+        assert_eq!(input[0]["role"], "user");
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input.as_array().expect("input array").len(), 3);
@@ -204,7 +213,17 @@ mod tests {
 
     #[test]
     fn responses_input_replays_turn_items_in_emission_order() {
-        let mut request = CompletionRequest::new("hello");
+        let mut request = CompletionRequest::new("follow up");
+        request.prompt_turns = vec![
+            PromptTurn {
+                turn: 0,
+                prompt: "hello".to_owned(),
+            },
+            PromptTurn {
+                turn: 2,
+                prompt: "follow up".to_owned(),
+            },
+        ];
         request.turns = vec![
             CompletionTurn {
                 turn: 0,
@@ -249,6 +268,8 @@ mod tests {
 
         let input = responses_input(&request);
 
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[1]["id"], "rs_1");
         assert_eq!(input[2]["type"], "function_call");
@@ -261,6 +282,8 @@ mod tests {
         assert_eq!(input[5]["call_id"], "call_2");
         assert_eq!(input[6]["type"], "function_call_output");
         assert_eq!(input[6]["call_id"], "call_2");
-        assert_eq!(input.as_array().expect("input array").len(), 7);
+        assert_eq!(input[7]["role"], "user");
+        assert_eq!(input[7]["content"][0]["text"], "follow up");
+        assert_eq!(input.as_array().expect("input array").len(), 8);
     }
 }

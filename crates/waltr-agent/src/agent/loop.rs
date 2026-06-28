@@ -14,7 +14,7 @@ use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
     ModelRef, PendingTimelineEvent, PermissionClaim, PermissionLevel, PermissionOperation,
     PermissionPattern, PermissionPolicy, PermissionResource, PermissionResourcePattern,
-    PermissionResponse, Result, TimelineChannel, TimelineContent, TimelineEventKind,
+    PermissionResponse, PromptTurn, Result, TimelineChannel, TimelineContent, TimelineEventKind,
     TimelineItemId, ToolCall, ToolDefinition, ToolExecutionContext, ToolProgressSink, ToolResult,
     TurnItem,
     middleware::{
@@ -37,8 +37,8 @@ use super::{
     AgentTool,
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
-        ExternalRequestKind, ExternalRequestStatus, ExternalResponse, RequestId, RequestRecord,
-        ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent,
+        ExternalRequestKind, ExternalRequestStatus, ExternalResponse, PendingWorkStatus, RequestId,
+        RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent,
         SessionListBroadcaster, SessionListEvent, SessionRecord, SessionSnapshot, SessionStore,
         SessionStoreError, SessionTimelineBroadcaster, Suspension as SessionSuspension,
     },
@@ -52,6 +52,7 @@ where
     model: ModelRef,
     model_cost: Option<crate::ModelCost>,
     prompt: String,
+    prompt_turns: Vec<PromptTurn>,
     input: Option<ResumeInput>,
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
@@ -124,6 +125,7 @@ where
             model: run.model,
             model_cost: run.model_cost,
             prompt,
+            prompt_turns: Vec::new(),
             input: Some(run.input),
             tools: run.tools,
             middleware_chain: run.middleware_chain,
@@ -455,6 +457,7 @@ where
     }
 
     async fn build_provider_request(&mut self) -> Result<ModelRequestDraft> {
+        let prompt_turns = self.prompt_turns();
         let mut ctx = RequestContext {
             middleware_state: &mut self.middleware_state,
             system_prompt_override: &mut self.system_prompt_override,
@@ -477,6 +480,7 @@ where
             prompt: self.prompt.clone(),
             system_prompt: join_system_prompt(&prompt),
             tools: tools.tools,
+            prompt_turns,
             turns: self.turns.clone(),
         };
 
@@ -879,7 +883,11 @@ where
                 request_id,
                 response,
             } => {
-                let retry = permission_retry_tool_call(&record.snapshot(), &request_id, &response)?;
+                let retry = pending_tool_batch_for_permission_retry(
+                    &record.snapshot(),
+                    &request_id,
+                    &response,
+                )?;
                 let cancel = permission_cancel_response(&record.snapshot(), &request_id, &response);
                 let record = match self
                     .session_runtime()
@@ -895,9 +903,9 @@ where
                     RuntimeResumeOutput::Resumed { record }
                     | RuntimeResumeOutput::Suspended { record, .. } => record,
                 };
-                if let Some(call) = retry {
+                if !retry.is_empty() {
                     self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
-                        calls: VecDeque::from([call]),
+                        calls: retry.into(),
                     });
                     continue_start_turn = false;
                 } else if cancel {
@@ -926,9 +934,21 @@ where
         let snapshot = record.snapshot();
         self.middleware_state = MiddlewareStateLog::from_snapshot(&snapshot);
         self.prompt = snapshot.current_prompt.unwrap_or_default();
+        self.prompt_turns = snapshot.prompt_turns;
         self.turns = snapshot.turns;
         self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
+    }
+
+    fn prompt_turns(&self) -> Vec<PromptTurn> {
+        if self.prompt_turns.is_empty() && !self.prompt.is_empty() {
+            vec![PromptTurn {
+                turn: self.turn as u64,
+                prompt: self.prompt.clone(),
+            }]
+        } else {
+            self.prompt_turns.clone()
+        }
     }
 
     async fn append_journal_event(&mut self, event: SessionJournalEvent) -> Result<()> {
@@ -1340,9 +1360,17 @@ fn external_request_from_draft(request: &middleware::ExternalRequestDraft) -> Ex
 fn canonical_request_json(draft: &ModelRequestDraft) -> Value {
     json!({
         "prompt": draft.prompt,
+        "prompt_turns": draft.prompt_turns.iter().map(prompt_turn_json).collect::<Vec<_>>(),
         "system_prompt": draft.system_prompt,
         "tools": draft.tools.iter().map(tool_json).collect::<Vec<_>>(),
         "turns": draft.turns.iter().map(turn_json).collect::<Vec<_>>(),
+    })
+}
+
+fn prompt_turn_json(prompt_turn: &PromptTurn) -> Value {
+    json!({
+        "turn": prompt_turn.turn,
+        "prompt": prompt_turn.prompt,
     })
 }
 
@@ -1502,46 +1530,50 @@ fn permission_pattern(claim: &PermissionClaim) -> PermissionPattern {
     }
 }
 
-fn permission_retry_tool_call(
+fn pending_tool_batch_for_permission_retry(
     snapshot: &SessionSnapshot,
     request_id: &ExternalRequestId,
     response: &ExternalResponse,
-) -> Result<Option<ToolCall>> {
+) -> Result<Vec<ToolCall>> {
     let Some(request) = snapshot
         .external_requests
         .iter()
         .rev()
         .find(|request| request.id == *request_id)
     else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     if request.kind != ExternalRequestKind::Permission {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let response = PermissionResponse::from_value(response.payload.clone())?;
     if !matches!(
         response,
         PermissionResponse::AllowOnce | PermissionResponse::AllowAlways { .. }
     ) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let Some(tool_call_id) = request.tool_call_id.as_deref() else {
         return Err(session_store_error(
             "permission request missing tool call id",
         ));
     };
-    snapshot
+    if !snapshot
         .pending_work
         .iter()
-        .rev()
-        .find(|work| work.id == tool_call_id)
-        .and_then(|work| work.tool_call.clone())
-        .map(Some)
-        .ok_or_else(|| {
-            session_store_error(format!(
-                "pending permission work not found for tool call: {tool_call_id}"
-            ))
-        })
+        .any(|work| work.id == tool_call_id && work.tool_call.is_some())
+    {
+        return Err(session_store_error(format!(
+            "pending permission work not found for tool call: {tool_call_id}"
+        )));
+    }
+
+    Ok(snapshot
+        .pending_work
+        .iter()
+        .filter(|work| matches!(work.status, PendingWorkStatus::Pending))
+        .filter_map(|work| work.tool_call.clone())
+        .collect())
 }
 
 fn permission_cancel_response(
@@ -1591,6 +1623,7 @@ fn completion_request_from_draft(draft: &ModelRequestDraft) -> CompletionRequest
         prompt: &draft.prompt,
         system_prompt: draft.system_prompt.as_deref(),
         tools: draft.tools.clone(),
+        prompt_turns: draft.prompt_turns.clone(),
         turns: draft.turns.clone(),
     }
 }
