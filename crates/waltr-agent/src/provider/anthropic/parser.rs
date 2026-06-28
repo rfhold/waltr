@@ -138,7 +138,11 @@ impl AnthropicParser {
                     usage: Some(TokenUsage {
                         input_tokens: self.input_tokens.take(),
                         output_tokens: value["usage"]["output_tokens"].as_u64(),
+                        cache_read_tokens: value["usage"]["cache_read_input_tokens"].as_u64(),
+                        cache_write_tokens: value["usage"]["cache_creation_input_tokens"].as_u64(),
+                        ..Default::default()
                     }),
+                    cost: None,
                     resume: json!({ "message_id": self.message_id.take() }),
                 },
             ))),
@@ -233,8 +237,10 @@ mod tests {
             Some(TokenUsage {
                 input_tokens: Some(7),
                 output_tokens: Some(9),
+                ..Default::default()
             })
         );
+        assert_eq!(metadata.cost, None);
         assert_eq!(metadata.resume, json!({ "message_id": "msg_123" }));
     }
 

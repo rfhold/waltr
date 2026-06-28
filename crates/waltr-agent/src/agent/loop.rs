@@ -26,7 +26,7 @@ use crate::{
         },
         tools::tool_is_visible,
     },
-    timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, TimelineStatus},
+    timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS, TimelineStatus},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +50,7 @@ where
 {
     provider: Arc<dyn LlmStream>,
     model: ModelRef,
+    model_cost: Option<crate::ModelCost>,
     prompt: String,
     input: Option<ResumeInput>,
     tools: Vec<AgentTool>,
@@ -121,6 +122,7 @@ where
         Self {
             provider: run.provider,
             model: run.model,
+            model_cost: run.model_cost,
             prompt,
             input: Some(run.input),
             tools: run.tools,
@@ -268,7 +270,17 @@ where
                         }
                         self.phase = AgentLoopPhase::Streaming(streaming);
                     }
-                    Some(Ok(CompletionEvent::ProviderMetadata(metadata))) => {
+                    Some(Ok(CompletionEvent::ProviderMetadata(mut metadata))) => {
+                        if metadata.cost.is_none() {
+                            metadata.cost = metadata
+                                .usage
+                                .and_then(|usage| self.model_cost.as_ref()?.cost_for_usage(usage));
+                        }
+                        let event = provider_metrics_timeline_event(
+                            &self.session_id,
+                            self.turn as u64,
+                            &metadata,
+                        );
                         CompletionTurn::entry(&mut self.turns, self.turn as u64).metadata =
                             Some(metadata.clone());
                         if let Err(error) = self
@@ -282,7 +294,12 @@ where
                         {
                             return Some((Err(error), self));
                         }
+                        let event = match self.append_timeline_event(event).await {
+                            Ok(event) => event,
+                            Err(error) => return Some((Err(error), self)),
+                        };
                         self.phase = AgentLoopPhase::Streaming(streaming);
+                        return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::ToolCall(call))) => {
                         self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "tool call requested"));
@@ -1234,6 +1251,47 @@ fn user_prompt_timeline_event(
         turn,
         user_text_item_id(turn),
         prompt,
+    )
+}
+
+fn provider_metrics_timeline_event(
+    session_id: &SessionId,
+    turn: u64,
+    metadata: &crate::ProviderTurnMetadata,
+) -> PendingTimelineEvent {
+    let usage = metadata.usage.unwrap_or_default();
+    let cost = metadata.cost.as_ref();
+    PendingTimelineEvent::new(
+        session_id.clone(),
+        turn,
+        format!("metrics:{turn}"),
+        TimelineEventKind::ItemFinished,
+        Some(TimelineChannel::from(CHANNEL_METRICS)),
+        TimelineContent::Json {
+            value: json!({
+                "kind": "turn_metrics",
+                "provider": metadata.provider,
+                "model": metadata.model,
+                "usage": {
+                    "inputTokens": usage.input_tokens.unwrap_or_default(),
+                    "outputTokens": usage.output_tokens.unwrap_or_default(),
+                    "cacheReadTokens": usage.cache_read_tokens.unwrap_or_default(),
+                    "cacheWriteTokens": usage.cache_write_tokens.unwrap_or_default(),
+                    "imageInputTokens": usage.image_input_tokens.unwrap_or_default(),
+                    "imageInputCount": usage.image_input_count.unwrap_or_default(),
+                    "totalTokens": usage.total_tokens(),
+                },
+                "cost": cost.map(|cost| json!({
+                    "currency": cost.currency,
+                    "inputMicros": cost.input_micros,
+                    "outputMicros": cost.output_micros,
+                    "cacheReadMicros": cost.cache_read_micros,
+                    "cacheWriteMicros": cost.cache_write_micros,
+                    "imageInputMicros": cost.image_input_micros,
+                    "totalMicros": cost.total_micros,
+                })),
+            }),
+        },
     )
 }
 

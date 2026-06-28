@@ -67,7 +67,11 @@ fn parse_chat_event(
                 usage: Some(TokenUsage {
                     input_tokens: usage["prompt_tokens"].as_u64(),
                     output_tokens: usage["completion_tokens"].as_u64(),
+                    cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
+                    image_input_tokens: usage["prompt_tokens_details"]["image_tokens"].as_u64(),
+                    ..Default::default()
                 }),
+                cost: None,
                 resume: json!({ "completion_id": value["id"] }),
             },
         )]);
@@ -157,7 +161,9 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: Some(11),
                     output_tokens: Some(3),
+                    ..Default::default()
                 }),
+                cost: None,
                 resume: json!({ "completion_id": "chatcmpl-1" }),
             })]
         );

@@ -2,7 +2,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::{LlmStream, ModelRef, PermissionPolicy, middleware::chain::MiddlewareChain};
+use crate::{LlmStream, ModelCost, ModelRef, PermissionPolicy, middleware::chain::MiddlewareChain};
 
 mod builder;
 mod event;
@@ -20,8 +20,8 @@ pub use session::{
     FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
     S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListEvent,
-    SessionListSubscription, SessionListUpdate, SessionRecord, SessionSnapshot, SessionStatus,
-    SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
+    SessionListSubscription, SessionListUpdate, SessionMetrics, SessionRecord, SessionSnapshot,
+    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
     SessionTimelineSubscription, SessionTimelineUpdate, Suspension,
     opendal_postgresql_session_store, run_postgresql_migrations,
 };
@@ -32,6 +32,7 @@ pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 pub struct AgentRuntime {
     pub(super) provider: Arc<dyn LlmStream>,
     pub(super) model: ModelRef,
+    pub(super) model_cost: Option<ModelCost>,
     pub(super) tools: Vec<AgentTool>,
     pub(super) middleware_chain: MiddlewareChain,
     pub(super) permission_policy: PermissionPolicy,
@@ -53,6 +54,12 @@ impl AgentRuntime {
         &self.model
     }
 
+    /// Return pricing configured for this runtime, when available.
+    #[must_use]
+    pub const fn model_cost(&self) -> Option<&ModelCost> {
+        self.model_cost.as_ref()
+    }
+
     /// Start building an agent loop request.
     pub fn prompt(&self, prompt: impl Into<String>) -> AgentRunBuilder {
         AgentRunBuilder::new(self, prompt.into())
@@ -71,6 +78,7 @@ impl fmt::Debug for AgentRuntime {
             .debug_struct("AgentRuntime")
             .field("provider", &self.provider.name())
             .field("model", &self.model)
+            .field("model_cost", &self.model_cost)
             .field("tools", &self.tools)
             .field("middleware_chain_len", &self.middleware_chain.len())
             .field("permission_policy", &self.permission_policy)

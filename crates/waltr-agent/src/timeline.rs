@@ -27,6 +27,8 @@ pub const CHANNEL_TOOL_PROGRESS_ERROR: &str = "tool_progress_error";
 pub const CHANNEL_TOOL_RESULT: &str = "tool_result";
 /// External request display channel.
 pub const CHANNEL_EXTERNAL_REQUEST: &str = "external_request";
+/// Provider usage and cost metrics display channel.
+pub const CHANNEL_METRICS: &str = "metrics";
 
 /// Monotonic timeline cursor within one session.
 #[derive(

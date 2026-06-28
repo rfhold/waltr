@@ -46,6 +46,9 @@ pub struct ProviderTurnMetadata {
     pub model: String,
     /// Token usage reported by the provider, when available.
     pub usage: Option<TokenUsage>,
+    /// Cost computed from the usage and model pricing active for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<TokenCost>,
     /// Opaque provider-native resume payload (response identifiers, etc.).
     pub resume: Value,
 }
@@ -57,6 +60,124 @@ pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     /// Output/completion tokens produced by the response.
     pub output_tokens: Option<u64>,
+    /// Input tokens served from provider cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Input tokens written to provider cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Image input tokens consumed by the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input_tokens: Option<u64>,
+    /// Image input count consumed by the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input_count: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Total non-cache input and output tokens reported by the provider.
+    #[must_use]
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens.unwrap_or_default()
+            + self.output_tokens.unwrap_or_default()
+            + self.image_input_tokens.unwrap_or_default()
+    }
+}
+
+/// Model pricing used to compute durable per-turn cost.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelCost {
+    /// Input token price per million tokens in `currency`.
+    pub input_per_million_tokens: Option<f64>,
+    /// Output token price per million tokens in `currency`.
+    pub output_per_million_tokens: Option<f64>,
+    /// Cache-read token price per million tokens in `currency`.
+    pub cache_read_per_million_tokens: Option<f64>,
+    /// Cache-write token price per million tokens in `currency`.
+    pub cache_write_per_million_tokens: Option<f64>,
+    /// Image input token price per million tokens in `currency`.
+    pub image_input_per_million_tokens: Option<f64>,
+    /// Image input price per image in `currency`.
+    pub image_input_per_image: Option<f64>,
+    /// ISO-ish currency code for the configured rates.
+    pub currency: String,
+}
+
+impl ModelCost {
+    /// Compute deterministic micro-unit cost for one provider usage report.
+    #[must_use]
+    pub fn cost_for_usage(&self, usage: TokenUsage) -> Option<TokenCost> {
+        let input_micros = rate_cost_micros(usage.input_tokens, self.input_per_million_tokens);
+        let output_micros = rate_cost_micros(usage.output_tokens, self.output_per_million_tokens);
+        let cache_read_micros =
+            rate_cost_micros(usage.cache_read_tokens, self.cache_read_per_million_tokens);
+        let cache_write_micros = rate_cost_micros(
+            usage.cache_write_tokens,
+            self.cache_write_per_million_tokens,
+        );
+        let image_input_micros =
+            rate_cost_micros(
+                usage.image_input_tokens,
+                self.image_input_per_million_tokens,
+            ) + image_cost_micros(usage.image_input_count, self.image_input_per_image);
+        let total_micros = input_micros
+            + output_micros
+            + cache_read_micros
+            + cache_write_micros
+            + image_input_micros;
+        (total_micros > 0).then(|| TokenCost {
+            currency: if self.currency.is_empty() {
+                "USD".to_owned()
+            } else {
+                self.currency.clone()
+            },
+            input_micros,
+            output_micros,
+            cache_read_micros,
+            cache_write_micros,
+            image_input_micros,
+            total_micros,
+        })
+    }
+}
+
+fn rate_cost_micros(tokens: Option<u64>, per_million_tokens: Option<f64>) -> u64 {
+    let Some(tokens) = tokens else { return 0 };
+    let Some(rate) = per_million_tokens else {
+        return 0;
+    };
+    if !rate.is_finite() || rate <= 0.0 {
+        return 0;
+    }
+    ((tokens as f64) * rate).round() as u64
+}
+
+fn image_cost_micros(images: Option<u64>, per_image: Option<f64>) -> u64 {
+    let Some(images) = images else { return 0 };
+    let Some(rate) = per_image else { return 0 };
+    if !rate.is_finite() || rate <= 0.0 {
+        return 0;
+    }
+    ((images as f64) * rate * 1_000_000.0).round() as u64
+}
+
+/// Cost computed for a provider turn, stored in currency micro-units.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenCost {
+    /// Currency code for all micro-unit fields.
+    pub currency: String,
+    /// Input token cost in micro-units.
+    pub input_micros: u64,
+    /// Output token cost in micro-units.
+    pub output_micros: u64,
+    /// Cache-read token cost in micro-units.
+    pub cache_read_micros: u64,
+    /// Cache-write token cost in micro-units.
+    pub cache_write_micros: u64,
+    /// Image input cost in micro-units.
+    pub image_input_micros: u64,
+    /// Total turn cost in micro-units.
+    pub total_micros: u64,
 }
 
 /// Provider-neutral completion request.
@@ -552,6 +673,7 @@ mod tests {
                 url: url.to_owned(),
                 model: model.to_owned(),
                 usage: None,
+                cost: None,
                 resume: json!({ "id": "resume-1" }),
             }),
         }];

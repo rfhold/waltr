@@ -174,6 +174,7 @@ where
         let AgentRuntime {
             provider,
             model,
+            model_cost,
             tools,
             middleware_chain: default_chain,
             permission_policy,
@@ -192,6 +193,7 @@ where
         EphemeralSessionRun {
             provider,
             model,
+            model_cost,
             input: self.input,
             system_prompt_override: (!system_prompt.is_empty()).then_some(system_prompt),
             tools,
