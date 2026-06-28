@@ -64,6 +64,7 @@ type ModelForm = {
   tools: boolean;
   image: boolean;
   catalogMatch: ModelView["catalogMatch"];
+  cost: ModelView["cost"];
 };
 
 type ProvidersSectionState = {
@@ -842,6 +843,7 @@ function initialModelForm(form: ModelActiveForm): ModelForm {
       tools: false,
       image: false,
       catalogMatch: null,
+      cost: null,
     };
   }
 
@@ -864,6 +866,7 @@ function initialModelForm(form: ModelActiveForm): ModelForm {
     tools: model.capabilities.tools,
     image: model.capabilities.image,
     catalogMatch: model.catalogMatch,
+    cost: model.cost,
   };
 }
 
@@ -902,6 +905,7 @@ function formToModel(form: ModelForm): ModelView {
       image: form.image,
     },
     catalogMatch: form.catalogMatch,
+    cost: form.cost,
   };
 }
 
@@ -948,6 +952,15 @@ function upstreamModelFromCatalogModel(model: CatalogModelSummary) {
 function modelFormWithCatalogModel(form: ModelForm, model: CatalogModelSummary): Partial<ModelForm> {
   const patch: Partial<ModelForm> = {
     catalogMatch: catalogMatchFromSummary(model, "applied"),
+    cost: model.cost ? {
+      inputPerMillionTokens: model.cost.inputPerMillionTokens,
+      outputPerMillionTokens: model.cost.outputPerMillionTokens,
+      cacheReadPerMillionTokens: model.cost.cacheReadPerMillionTokens,
+      cacheWritePerMillionTokens: model.cost.cacheWritePerMillionTokens,
+      imageInputPerMillionTokens: model.cost.imageInputPerMillionTokens,
+      imageInputPerImage: model.cost.imageInputPerImage,
+      currency: model.cost.currency,
+    } : null,
   };
 
   if (!form.name.trim()) {

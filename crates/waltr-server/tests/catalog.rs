@@ -494,6 +494,7 @@ fn blank_model() -> Model {
         }),
         capabilities: None,
         catalog_match: None,
+        cost: None,
     }
 }
 

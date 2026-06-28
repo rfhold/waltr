@@ -342,6 +342,10 @@ impl From<catalog_proto::CatalogModelLimitsSummary> for CatalogModelLimitsSummar
 struct CatalogModelCostSummary {
     input_per_million_tokens: Option<f64>,
     output_per_million_tokens: Option<f64>,
+    cache_read_per_million_tokens: Option<f64>,
+    cache_write_per_million_tokens: Option<f64>,
+    image_input_per_million_tokens: Option<f64>,
+    image_input_per_image: Option<f64>,
     currency: String,
 }
 
@@ -350,6 +354,10 @@ impl From<catalog_proto::CatalogModelCostSummary> for CatalogModelCostSummary {
         Self {
             input_per_million_tokens: cost.input_per_million_tokens,
             output_per_million_tokens: cost.output_per_million_tokens,
+            cache_read_per_million_tokens: cost.cache_read_per_million_tokens,
+            cache_write_per_million_tokens: cost.cache_write_per_million_tokens,
+            image_input_per_million_tokens: cost.image_input_per_million_tokens,
+            image_input_per_image: cost.image_input_per_image,
             currency: cost.currency,
         }
     }
