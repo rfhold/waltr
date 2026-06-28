@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::{LlmStream, ModelRef, PermissionPolicy};
+use crate::{LlmStream, ModelCost, ModelRef, PermissionPolicy};
 use tokio_util::sync::CancellationToken;
 
 use super::watch::{SessionListBroadcaster, SessionTimelineBroadcaster};
@@ -17,6 +17,7 @@ where
 {
     pub provider: Arc<dyn LlmStream>,
     pub model: ModelRef,
+    pub model_cost: Option<ModelCost>,
     pub input: ResumeInput,
     pub system_prompt_override: Option<SystemPromptOverride>,
     pub tools: Vec<AgentTool>,

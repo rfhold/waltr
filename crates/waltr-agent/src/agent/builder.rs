@@ -5,7 +5,7 @@ use std::{fmt, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    LlmStream, ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
+    LlmStream, ModelCost, ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
     mcp::McpConfig,
     middleware::{
         AgentMiddleware, agents::AgentsInstructionsMiddleware, chain::MiddlewareChain,
@@ -32,6 +32,7 @@ use super::{AgentRuntime, AgentTool};
 pub struct AgentRuntimeBuilder {
     provider: Arc<dyn LlmStream>,
     model: ModelRef,
+    model_cost: Option<ModelCost>,
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
     system_prompt: SystemPromptBuilder,
@@ -53,6 +54,7 @@ impl AgentRuntimeBuilder {
         Self {
             provider,
             model,
+            model_cost: None,
             tools: Vec::new(),
             middleware_chain: MiddlewareChain::new(),
             system_prompt: SystemPromptBuilder::new(),
@@ -63,6 +65,13 @@ impl AgentRuntimeBuilder {
             permission_policy: PermissionPolicy::default(),
             explicit_permission_policy: false,
         }
+    }
+
+    /// Set model pricing used to journal per-turn cost.
+    #[must_use]
+    pub fn with_model_cost(mut self, cost: ModelCost) -> Self {
+        self.model_cost = Some(cost);
+        self
     }
 
     /// Opt into filesystem tools as generic host tools.
@@ -256,6 +265,7 @@ impl AgentRuntimeBuilder {
         AgentRuntime {
             provider: self.provider,
             model: self.model,
+            model_cost: self.model_cost,
             tools: self.tools,
             middleware_chain,
             permission_policy: self.permission_policy,
@@ -269,6 +279,7 @@ impl fmt::Debug for AgentRuntimeBuilder {
             .debug_struct("AgentRuntimeBuilder")
             .field("provider", &self.provider.name())
             .field("model", &self.model)
+            .field("model_cost", &self.model_cost)
             .field("tools", &self.tools)
             .field("middleware_chain_len", &self.middleware_chain.len())
             .field("system_prompt", &self.system_prompt)

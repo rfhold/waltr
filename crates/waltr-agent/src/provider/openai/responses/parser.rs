@@ -166,6 +166,9 @@ impl ResponsesParser {
             .map(|usage| TokenUsage {
                 input_tokens: usage["input_tokens"].as_u64(),
                 output_tokens: usage["output_tokens"].as_u64(),
+                cache_read_tokens: usage["input_tokens_details"]["cached_tokens"].as_u64(),
+                image_input_tokens: usage["input_tokens_details"]["image_tokens"].as_u64(),
+                ..Default::default()
             });
         vec![
             CompletionEvent::ProviderMetadata(ProviderTurnMetadata {
@@ -173,6 +176,7 @@ impl ResponsesParser {
                 url: self.url.clone(),
                 model: self.model.clone(),
                 usage,
+                cost: None,
                 resume: json!({ "response_id": response["id"] }),
             }),
             CompletionEvent::Finished,
@@ -266,7 +270,9 @@ mod tests {
                     usage: Some(TokenUsage {
                         input_tokens: Some(5),
                         output_tokens: Some(2),
+                        ..Default::default()
                     }),
+                    cost: None,
                     resume: json!({ "response_id": "resp_1" }),
                 }),
                 CompletionEvent::Finished,

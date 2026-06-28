@@ -1241,7 +1241,9 @@ fn expected_turn_metadata() -> ProviderTurnMetadata {
         usage: Some(TokenUsage {
             input_tokens: Some(11),
             output_tokens: Some(3),
+            ..Default::default()
         }),
+        cost: None,
         resume: json!({ "response_id": "resp-1" }),
     }
 }

@@ -223,9 +223,57 @@ pub struct SessionSummary {
     pub updated_at: SystemTime,
     /// Time the session last had user-visible activity.
     pub last_activity_at: SystemTime,
+    /// Durable usage and cost totals derived from journaled provider turns.
+    #[serde(default)]
+    pub metrics: SessionMetrics,
     /// Host-defined durable metadata values.
     #[serde(default)]
     pub metadata_values: BTreeMap<String, Value>,
+}
+
+/// Durable usage and cost totals for a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetrics {
+    /// Input/prompt tokens consumed by provider requests.
+    pub input_tokens: u64,
+    /// Output/completion tokens produced by provider responses.
+    pub output_tokens: u64,
+    /// Input tokens served from provider cache.
+    pub cache_read_tokens: u64,
+    /// Input tokens written to provider cache.
+    pub cache_write_tokens: u64,
+    /// Image input tokens consumed by provider requests.
+    pub image_input_tokens: u64,
+    /// Image count consumed by provider requests.
+    pub image_input_count: u64,
+    /// Total billable/token-counted input and output tokens.
+    pub total_tokens: u64,
+    /// Currency for total cost, or `mixed` when journaled turns differ.
+    pub cost_currency: Option<String>,
+    /// Total cost in currency micro-units.
+    pub total_cost_micros: u64,
+}
+
+impl SessionMetrics {
+    fn add_turn_metadata(&mut self, metadata: &ProviderTurnMetadata) {
+        if let Some(usage) = metadata.usage {
+            self.input_tokens += usage.input_tokens.unwrap_or_default();
+            self.output_tokens += usage.output_tokens.unwrap_or_default();
+            self.cache_read_tokens += usage.cache_read_tokens.unwrap_or_default();
+            self.cache_write_tokens += usage.cache_write_tokens.unwrap_or_default();
+            self.image_input_tokens += usage.image_input_tokens.unwrap_or_default();
+            self.image_input_count += usage.image_input_count.unwrap_or_default();
+            self.total_tokens += usage.total_tokens();
+        }
+        if let Some(cost) = &metadata.cost {
+            self.total_cost_micros += cost.total_micros;
+            match &self.cost_currency {
+                None => self.cost_currency = Some(cost.currency.clone()),
+                Some(currency) if currency == &cost.currency => {}
+                Some(_) => self.cost_currency = Some("mixed".to_owned()),
+            }
+        }
+    }
 }
 
 impl SessionRecord {
@@ -287,6 +335,7 @@ impl SessionRecord {
     #[must_use]
     pub fn summary(&self) -> SessionSummary {
         let snapshot = self.snapshot();
+        let metrics = snapshot.metrics();
         SessionSummary {
             id: self.id.clone(),
             revision: self.revision,
@@ -295,6 +344,7 @@ impl SessionRecord {
             created_at: self.metadata.created_at,
             updated_at: self.metadata.updated_at,
             last_activity_at: self.metadata.last_activity_at,
+            metrics,
             metadata_values: self.metadata.values.clone(),
         }
     }
@@ -437,6 +487,16 @@ impl SessionSnapshot {
     /// Thinking blocks accumulated across all turns, in emission order.
     pub fn thinking_blocks(&self) -> impl Iterator<Item = &ThinkingBlock> {
         self.turns.iter().flat_map(CompletionTurn::thinking_blocks)
+    }
+
+    /// Aggregate usage and cost from journaled provider turn metadata.
+    #[must_use]
+    pub fn metrics(&self) -> SessionMetrics {
+        let mut metrics = SessionMetrics::default();
+        for metadata in self.turns.iter().filter_map(|turn| turn.metadata.as_ref()) {
+            metrics.add_turn_metadata(metadata);
+        }
+        metrics
     }
 
     /// Apply one durable journal event to this snapshot.
@@ -943,7 +1003,9 @@ mod tests {
             usage: Some(crate::TokenUsage {
                 input_tokens: Some(5),
                 output_tokens: Some(2),
+                ..Default::default()
             }),
+            cost: None,
             resume: json!({ "response_id": "resp-1" }),
         }
     }
