@@ -122,6 +122,7 @@ fn embedded_server_addr() -> io::Result<SocketAddr> {
     }
 }
 
+#[cfg(feature = "server")]
 fn client_addr_for_server(addr: SocketAddr) -> SocketAddr {
     if addr.ip().is_unspecified() {
         SocketAddr::new(

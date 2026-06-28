@@ -76,18 +76,10 @@ pub async fn dispatch_app_command(
     app: &mut App,
     action: AppAction,
 ) -> ClientSnapshot {
-    let AppAction::ClientCommand(command) = action else {
-        panic!("expected app to emit client command, saw {action:?}");
-    };
+    let command = first_client_command(action);
 
     let snapshot = dispatch_client_command(stream, command).await;
-    assert_eq!(
-        app.handle_event(
-            &AppEvent::Client(Box::new(snapshot.clone())),
-            std::time::Instant::now()
-        ),
-        AppAction::Continue
-    );
+    apply_snapshot(stream, app, snapshot.clone()).await;
 
     if let Some(key) = snapshot.config.patch.key.clone()
         && snapshot.config.patch.status == "loading"
@@ -183,13 +175,7 @@ pub async fn next_snapshot_until(
             .await
             .expect("client stream should produce snapshots");
 
-        assert_eq!(
-            app.handle_event(
-                &AppEvent::Client(Box::new(snapshot.clone())),
-                std::time::Instant::now()
-            ),
-            AppAction::Continue
-        );
+        apply_snapshot(stream, app, snapshot.clone()).await;
 
         if matches(&snapshot) {
             return snapshot;
@@ -199,6 +185,39 @@ pub async fn next_snapshot_until(
     }
 
     panic!("TUI stream did not reach expected snapshot; last snapshot: {last_snapshot:?}");
+}
+
+async fn apply_snapshot(stream: &mut ClientStateStream, app: &mut App, snapshot: ClientSnapshot) {
+    let action = app.handle_event(
+        &AppEvent::Client(Box::new(snapshot)),
+        std::time::Instant::now(),
+    );
+
+    let commands = match action {
+        AppAction::ClientCommand(command) => vec![command],
+        AppAction::ClientCommands(commands) => commands,
+        AppAction::Continue => Vec::new(),
+        AppAction::Exit => panic!("unexpected exit while applying snapshot"),
+    };
+
+    for command in commands {
+        let followup = dispatch_client_command(stream, command).await;
+        assert_eq!(
+            app.handle_event(
+                &AppEvent::Client(Box::new(followup)),
+                std::time::Instant::now()
+            ),
+            AppAction::Continue
+        );
+    }
+}
+
+fn first_client_command(action: AppAction) -> ClientCommand {
+    match action {
+        AppAction::ClientCommand(command) => command,
+        AppAction::ClientCommands(mut commands) if !commands.is_empty() => commands.remove(0),
+        _ => panic!("expected app to emit client command, saw {action:?}"),
+    }
 }
 
 pub fn unused_addr() -> std::net::SocketAddr {

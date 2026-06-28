@@ -34,6 +34,8 @@ pub enum AppAction {
     Exit,
     /// Dispatch a shared client command.
     ClientCommand(ClientCommand),
+    /// Dispatch shared client commands in order.
+    ClientCommands(Vec<ClientCommand>),
 }
 
 /// The currently armed close confirmation, if any.
@@ -119,8 +121,7 @@ impl App {
         match event {
             AppEvent::Tick(_) | AppEvent::Stream(_) => AppAction::Continue,
             AppEvent::Client(snapshot) => {
-                self.handle_client_snapshot(snapshot.as_ref().clone());
-                AppAction::Continue
+                AppAction::from_commands(self.handle_client_snapshot(snapshot.as_ref().clone()))
             }
             AppEvent::Input(input) => self.handle_input_event(*input, now),
         }
@@ -244,7 +245,17 @@ impl App {
                 AppAction::ClientCommand(ClientCommand::ReleaseConfigWatchInterest)
             }
             KeyCommand::Escape if self.screen == AppScreen::Sessions => {
+                let detail_session_id =
+                    self.sessions_section.detail_session_id().map(str::to_owned);
                 if self.sessions_section.dismiss_route_or_overlay() {
+                    if let Some(session_id) = detail_session_id
+                        && self.sessions_section.detail_session_id().is_none()
+                    {
+                        return AppAction::ClientCommand(
+                            ClientCommand::ReleaseSessionTimelineWatchInterest { session_id },
+                        );
+                    }
+
                     return AppAction::Continue;
                 }
 
@@ -275,8 +286,22 @@ impl App {
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.status.ready)
                 {
+                    let detail_session_id = (self.screen == AppScreen::Sessions)
+                        .then(|| self.sessions_section.clear_detail_route())
+                        .flatten();
                     self.screen = AppScreen::Config;
-                    return AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest);
+                    return AppAction::from_commands(
+                        detail_session_id
+                            .map(|session_id| {
+                                vec![
+                                    ClientCommand::ReleaseSessionTimelineWatchInterest {
+                                        session_id,
+                                    },
+                                    ClientCommand::RegisterConfigWatchInterest,
+                                ]
+                            })
+                            .unwrap_or_else(|| vec![ClientCommand::RegisterConfigWatchInterest]),
+                    );
                 }
 
                 AppAction::Continue
@@ -318,7 +343,9 @@ impl App {
         }
     }
 
-    fn handle_client_snapshot(&mut self, snapshot: ClientSnapshot) {
+    fn handle_client_snapshot(&mut self, snapshot: ClientSnapshot) -> Vec<ClientCommand> {
+        let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
+
         if snapshot.status.ready && self.screen == AppScreen::Waiting {
             self.screen = AppScreen::Landing;
         }
@@ -347,7 +374,25 @@ impl App {
         self.sessions_section
             .sync_selection(snapshot.sessions.current.len());
 
+        let detail_after = self.sessions_section.detail_session_id().map(str::to_owned);
+
         self.client_snapshot = Some(snapshot);
+
+        match (detail_before, detail_after) {
+            (None, Some(session_id)) => vec![register_session_timeline_watch_command(session_id)],
+            (Some(session_id), None) => {
+                vec![ClientCommand::ReleaseSessionTimelineWatchInterest { session_id }]
+            }
+            (Some(old_session_id), Some(new_session_id)) if old_session_id != new_session_id => {
+                vec![
+                    ClientCommand::ReleaseSessionTimelineWatchInterest {
+                        session_id: old_session_id,
+                    },
+                    register_session_timeline_watch_command(new_session_id),
+                ]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn active_section_has_overlay(&self) -> bool {
@@ -403,13 +448,58 @@ impl App {
             return self.handle_key_command(command, now);
         }
 
+        let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
         match self
             .sessions_section
             .handle_key(key, self.client_snapshot.as_ref())
         {
-            SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+            SectionAction::ClientCommand(command) => {
+                let detail_after = self.sessions_section.detail_session_id().map(str::to_owned);
+                match (detail_before, detail_after) {
+                    (Some(old_session_id), Some(new_session_id))
+                        if old_session_id != new_session_id =>
+                    {
+                        AppAction::ClientCommands(vec![
+                            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                                session_id: old_session_id,
+                            },
+                            command,
+                        ])
+                    }
+                    _ => AppAction::ClientCommand(command),
+                }
+            }
             SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
         }
+    }
+}
+
+impl AppAction {
+    fn from_commands(commands: Vec<ClientCommand>) -> Self {
+        match commands.len() {
+            0 => Self::Continue,
+            1 => Self::ClientCommand(commands.into_iter().next().expect("one command")),
+            _ => Self::ClientCommands(commands),
+        }
+    }
+}
+
+fn register_session_timeline_watch_command(session_id: String) -> ClientCommand {
+    ClientCommand::RegisterSessionTimelineWatchInterest {
+        session_id,
+        after_cursor: None,
+        channels: vec![
+            "user_text".to_owned(),
+            "assistant_text".to_owned(),
+            "thinking".to_owned(),
+            "tool_call".to_owned(),
+            "tool_progress_info".to_owned(),
+            "tool_progress_error".to_owned(),
+            "tool_result".to_owned(),
+            "external_request".to_owned(),
+            "metrics".to_owned(),
+        ],
+        initial_limit: Some(64),
     }
 }
 

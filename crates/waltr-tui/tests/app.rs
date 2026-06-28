@@ -10,7 +10,8 @@ use waltr_client::{
     ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
     OperationSnapshot, ProviderKindView, ProviderView, SessionPhaseView, SessionSnapshot,
-    SessionStatusView, SessionView, StatusSnapshot, TimestampView,
+    SessionStatusView, SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView,
+    TimelineEventKindView, TimelineEventView, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -327,7 +328,7 @@ fn sessions_create_dispatches_and_completion_opens_detail() {
             ))),
             now,
         ),
-        AppAction::Continue
+        expected_register_timeline_command("created")
     );
 
     assert_eq!(app.sessions_section().detail_session_id(), Some("created"));
@@ -346,7 +347,10 @@ fn sessions_detail_delete_dispatches_and_returns_to_list() {
         open_sessions_app_with(watched_sessions_snapshot(vec![session_view("doomed", 1)]));
     let now = Instant::now();
 
-    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("doomed")
+    );
     assert_eq!(app.sessions_section().detail_session_id(), Some("doomed"));
     assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
 
@@ -377,11 +381,138 @@ fn sessions_detail_delete_dispatches_and_returns_to_list() {
             ))),
             now,
         ),
-        AppAction::Continue
+        AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
+            session_id: "doomed".to_owned(),
+        })
     );
 
     assert_eq!(app.sessions_section().detail_session_id(), None);
     assert!(render_app(&app).contains("Recent sessions"));
+}
+
+#[test]
+fn sessions_detail_escape_releases_timeline_watch_interest() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(vec![session_view("one", 1)]));
+    let now = Instant::now();
+
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("one")
+    );
+    assert_eq!(app.sessions_section().detail_session_id(), Some("one"));
+    assert_eq!(
+        app.handle_event(&escape_press(), now),
+        AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
+            session_id: "one".to_owned(),
+        })
+    );
+    assert_eq!(app.sessions_section().detail_session_id(), None);
+    assert_eq!(app.screen(), AppScreen::Sessions);
+}
+
+#[test]
+fn sessions_detail_repeated_enter_does_not_register_again() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(vec![session_view("one", 1)]));
+    let now = Instant::now();
+
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("one")
+    );
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+    assert_eq!(app.sessions_section().detail_session_id(), Some("one"));
+}
+
+#[test]
+fn sessions_detail_switch_releases_old_before_registering_new() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(vec![
+        session_view("one", 2),
+        session_view("two", 1),
+    ]));
+    let now = Instant::now();
+
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("one")
+    );
+    assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        expected_switch_timeline_command("one", "two")
+    );
+    assert_eq!(app.sessions_section().detail_session_id(), Some("two"));
+}
+
+#[test]
+fn sessions_detail_leader_c_releases_timeline_before_config_watch() {
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(vec![session_view("one", 1)]));
+    let now = Instant::now();
+
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("one")
+    );
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&char_press('c'), now),
+        AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                session_id: "one".to_owned(),
+            },
+            ClientCommand::RegisterConfigWatchInterest,
+        ])
+    );
+    assert_eq!(app.screen(), AppScreen::Config);
+}
+
+#[test]
+fn sessions_detail_renders_timeline_from_snapshot() {
+    let mut snapshot = watched_sessions_snapshot(vec![session_view("chat", 1)]);
+    snapshot.sessions.timelines.insert(
+        "chat".to_owned(),
+        SessionTimelineView {
+            events: vec![
+                timeline_text_event(1, "chat", "user_text", "hello"),
+                timeline_text_event(2, "chat", "assistant_text", "hi there"),
+                TimelineEventView {
+                    cursor: 3,
+                    session_id: "chat".to_owned(),
+                    turn: 1,
+                    item_id: "tool-1".to_owned(),
+                    parent_id: None,
+                    kind: TimelineEventKindView::ItemFinished,
+                    channel: Some("tool_result".to_owned()),
+                    content: TimelineContentView::ToolResult {
+                        id: "call-1".to_owned(),
+                        name: "shell".to_owned(),
+                        content: "done".to_owned(),
+                        error: false,
+                    },
+                    status: None,
+                    metadata_json: "{}".to_owned(),
+                },
+            ],
+            load: idle_operation(),
+            watch: OperationSnapshot {
+                status: "received",
+                error: None,
+                key: None,
+            },
+        },
+    );
+    let mut app = open_sessions_app_with(snapshot);
+
+    assert_eq!(
+        app.handle_event(&right_press(), Instant::now()),
+        expected_register_timeline_command("chat")
+    );
+
+    let rendered = render_app(&app);
+    assert!(rendered.contains("status idle"));
+    assert!(rendered.contains("user hello"));
+    assert!(rendered.contains("assistant hi there"));
+    assert!(rendered.contains("tool result shell call-1 ok: done"));
 }
 
 #[test]
@@ -1580,6 +1711,14 @@ const fn right_press() -> AppEvent {
     )))
 }
 
+const fn down_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Down,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
 fn open_config_app() -> App {
     open_config_app_with(watched_config_snapshot())
 }
@@ -1714,6 +1853,67 @@ fn watched_sessions_snapshot(sessions: Vec<SessionView>) -> ClientSnapshot {
     snapshot.sessions.list.status = "ready";
     snapshot.sessions.watch.status = "received";
     snapshot
+}
+
+fn expected_register_timeline_command(session_id: &str) -> AppAction {
+    AppAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest {
+        session_id: session_id.to_owned(),
+        after_cursor: None,
+        channels: vec![
+            "user_text".to_owned(),
+            "assistant_text".to_owned(),
+            "thinking".to_owned(),
+            "tool_call".to_owned(),
+            "tool_progress_info".to_owned(),
+            "tool_progress_error".to_owned(),
+            "tool_result".to_owned(),
+            "external_request".to_owned(),
+            "metrics".to_owned(),
+        ],
+        initial_limit: Some(64),
+    })
+}
+
+fn expected_switch_timeline_command(from_session_id: &str, to_session_id: &str) -> AppAction {
+    AppAction::ClientCommands(vec![
+        ClientCommand::ReleaseSessionTimelineWatchInterest {
+            session_id: from_session_id.to_owned(),
+        },
+        match expected_register_timeline_command(to_session_id) {
+            AppAction::ClientCommand(command) => command,
+            action => panic!("expected single register command, saw {action:?}"),
+        },
+    ])
+}
+
+fn timeline_text_event(
+    cursor: u64,
+    session_id: &str,
+    channel: &str,
+    text: &str,
+) -> TimelineEventView {
+    TimelineEventView {
+        cursor,
+        session_id: session_id.to_owned(),
+        turn: 1,
+        item_id: format!("item-{cursor}"),
+        parent_id: None,
+        kind: TimelineEventKindView::ItemFinished,
+        channel: Some(channel.to_owned()),
+        content: TimelineContentView::TextSnapshot {
+            text: text.to_owned(),
+        },
+        status: None,
+        metadata_json: "{}".to_owned(),
+    }
+}
+
+const fn idle_operation() -> OperationSnapshot {
+    OperationSnapshot {
+        status: "idle",
+        error: None,
+        key: None,
+    }
 }
 
 fn session_create_snapshot(
