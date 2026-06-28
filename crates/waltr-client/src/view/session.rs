@@ -4,9 +4,9 @@ use ts_rs::TS;
 use waltr::grpc::waltr::session::v1::timeline_content;
 
 use crate::{
-    McpServerTypeView, ProviderKindView, RuntimeConfigMatch, SessionMcpServerRuntime, SessionPhase,
-    SessionProviderRuntime, SessionRuntimeConfig, SessionStatus, SessionSummary, TimelineContent,
-    TimelineEvent, TimelineEventKind, TimelineStatus,
+    McpServerTypeView, ProviderKindView, RuntimeConfigMatch, SessionMcpServerRuntime,
+    SessionMetrics, SessionPhase, SessionProviderRuntime, SessionRuntimeConfig, SessionStatus,
+    SessionSummary, TimelineContent, TimelineEvent, TimelineEventKind, TimelineStatus,
 };
 
 /// Stable session summary view shared by Waltr shells.
@@ -29,6 +29,32 @@ pub struct SessionView {
     pub last_activity_at: Option<TimestampView>,
     /// Runtime configuration snapshot stored with the session.
     pub runtime_config: Option<SessionRuntimeConfigView>,
+    /// Aggregate usage and cost derived from journaled provider turns.
+    pub metrics: SessionMetricsView,
+}
+
+/// Stable aggregate session metrics view shared by Waltr shells.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMetricsView {
+    /// Input/prompt tokens consumed by provider requests.
+    pub input_tokens: u64,
+    /// Output/completion tokens produced by provider responses.
+    pub output_tokens: u64,
+    /// Input tokens served from provider cache.
+    pub cache_read_tokens: u64,
+    /// Input tokens written to provider cache.
+    pub cache_write_tokens: u64,
+    /// Image input tokens consumed by provider requests.
+    pub image_input_tokens: u64,
+    /// Image count consumed by provider requests.
+    pub image_input_count: u64,
+    /// Total billable/token-counted input and output tokens.
+    pub total_tokens: u64,
+    /// Currency for total cost, or `mixed` when journaled turns differ.
+    pub cost_currency: Option<String>,
+    /// Total cost in currency micro-units.
+    pub total_cost_micros: u64,
 }
 
 /// Stable session runtime config snapshot view shared by Waltr shells.
@@ -272,6 +298,25 @@ impl From<SessionSummary> for SessionView {
             updated_at: session.updated_at.map(Into::into),
             last_activity_at: session.last_activity_at.map(Into::into),
             runtime_config: session.runtime_config.map(Into::into),
+            metrics: session
+                .metrics
+                .map_or_else(SessionMetricsView::default, Into::into),
+        }
+    }
+}
+
+impl From<SessionMetrics> for SessionMetricsView {
+    fn from(metrics: SessionMetrics) -> Self {
+        Self {
+            input_tokens: metrics.input_tokens,
+            output_tokens: metrics.output_tokens,
+            cache_read_tokens: metrics.cache_read_tokens,
+            cache_write_tokens: metrics.cache_write_tokens,
+            image_input_tokens: metrics.image_input_tokens,
+            image_input_count: metrics.image_input_count,
+            total_tokens: metrics.total_tokens,
+            cost_currency: metrics.cost_currency,
+            total_cost_micros: metrics.total_cost_micros,
         }
     }
 }

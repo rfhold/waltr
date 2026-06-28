@@ -42,26 +42,26 @@ pub use waltr::grpc::waltr::catalog::v1::{
 };
 pub use waltr::grpc::waltr::config::v1::{
     CatalogMatchSource, Configuration, McpServer, McpServerType, Model, ModelCapabilities,
-    ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OAuthProvider, OauthJwtMetadata,
-    OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider, ProviderType,
-    RuntimeDefaults,
+    ModelCatalogMatch, ModelCost, ModelLimits, ModelOptions, ModelType, OAuthProvider,
+    OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider,
+    ProviderType, RuntimeDefaults,
 };
 pub use waltr::grpc::waltr::session::v1::{
     ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RuntimeConfigMatch,
-    SessionMcpServerRuntime, SessionPhase, SessionProviderRuntime, SessionRuntimeConfig,
-    SessionRuntimeConfigRequest, SessionStatus, SessionSummary, Suspension, SuspensionKind,
-    TimelineContent, TimelineDirection, TimelineEvent, TimelineEventKind, TimelineQuery,
-    TimelineStatus,
+    SessionMcpServerRuntime, SessionMetrics, SessionPhase, SessionProviderRuntime,
+    SessionRuntimeConfig, SessionRuntimeConfigRequest, SessionStatus, SessionSummary, Suspension,
+    SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent, TimelineEventKind,
+    TimelineQuery, TimelineStatus,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchEvent, SessionWatchUpdate};
 pub use view::{
     CatalogMatchSourceView, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,
-    ModelCapabilitiesView, ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView,
-    ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
+    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
-    RuntimeConfigMatchView, RuntimeDefaultsView, SessionMcpServerRuntimeView, SessionPhaseView,
-    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionTimelineView,
-    SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
-    TimestampView,
+    RuntimeConfigMatchView, RuntimeDefaultsView, SessionMcpServerRuntimeView, SessionMetricsView,
+    SessionPhaseView, SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView,
+    SessionTimelineView, SessionView, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelineStatusView, TimestampView,
 };

@@ -5,15 +5,16 @@ mod session;
 
 pub use config::{
     CatalogMatchSourceView, ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
-    OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView, OAuthTokenRequestStyleView,
-    OAuthUrlParamView, ProviderKindView, ProviderView, RuntimeDefaultsView,
+    ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView, ModelTypeView,
+    ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
+    RuntimeDefaultsView,
 };
 pub use session::{
-    ExternalRequestView, RuntimeConfigMatchView, SessionMcpServerRuntimeView, SessionPhaseView,
-    SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView, SessionTimelineView,
-    SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
-    TimestampView,
+    ExternalRequestView, RuntimeConfigMatchView, SessionMcpServerRuntimeView, SessionMetricsView,
+    SessionPhaseView, SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView,
+    SessionTimelineView, SessionView, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelineStatusView, TimestampView,
 };
 
 #[cfg(test)]
@@ -138,6 +139,7 @@ mod tests {
             ModelOptionsView::decl(),
             ModelLimitsView::decl(),
             ModelCapabilitiesView::decl(),
+            ModelCostView::decl(),
             ModelCatalogMatchView::decl(),
             ModelView::decl(),
             OAuthTokenRequestStyleView::decl(),
@@ -157,6 +159,7 @@ mod tests {
             SessionProviderRuntimeView::decl(),
             SessionMcpServerRuntimeView::decl(),
             SessionRuntimeConfigView::decl(),
+            SessionMetricsView::decl(),
             SessionView::decl(),
             TimelineEventKindView::decl(),
             TimelineStatusView::decl(),

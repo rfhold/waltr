@@ -6,9 +6,9 @@ use waltr::grpc::waltr::{
     session::v1::{
         ExternalRequest as ProtoExternalRequest, ExternalRequestKind as ProtoExternalRequestKind,
         PendingWork as ProtoPendingWork, PendingWorkStatus as ProtoPendingWorkStatus,
-        SessionPhase as ProtoSessionPhase, SessionStatus as ProtoSessionStatus,
-        SessionSummary as ProtoSessionSummary, Suspension as ProtoSuspension,
-        SuspensionKind as ProtoSuspensionKind,
+        SessionMetrics as ProtoSessionMetrics, SessionPhase as ProtoSessionPhase,
+        SessionStatus as ProtoSessionStatus, SessionSummary as ProtoSessionSummary,
+        Suspension as ProtoSuspension, SuspensionKind as ProtoSuspensionKind,
     },
 };
 use waltr_agent::{
@@ -31,6 +31,21 @@ pub(super) fn session_summary_to_proto(
         updated_at: Some(timestamp_to_proto(summary.updated_at)),
         last_activity_at: Some(timestamp_to_proto(summary.last_activity_at)),
         runtime_config,
+        metrics: Some(session_metrics_to_proto(summary.metrics)),
+    }
+}
+
+fn session_metrics_to_proto(metrics: waltr_agent::SessionMetrics) -> ProtoSessionMetrics {
+    ProtoSessionMetrics {
+        input_tokens: metrics.input_tokens,
+        output_tokens: metrics.output_tokens,
+        cache_read_tokens: metrics.cache_read_tokens,
+        cache_write_tokens: metrics.cache_write_tokens,
+        image_input_tokens: metrics.image_input_tokens,
+        image_input_count: metrics.image_input_count,
+        total_tokens: metrics.total_tokens,
+        cost_currency: metrics.cost_currency,
+        total_cost_micros: metrics.total_cost_micros,
     }
 }
 
