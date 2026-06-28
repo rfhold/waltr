@@ -1116,6 +1116,28 @@ fn detail_status_widget(
         Span::raw(" "),
         Span::styled("(m)", THEME.focus_style()),
         Span::raw("  "),
+        Span::styled("tokens ", THEME.muted_text_style()),
+        Span::raw(format_count(session.metrics.total_tokens)),
+        Span::raw("  "),
+        Span::styled("cache ", THEME.muted_text_style()),
+        Span::raw(format!(
+            "R {}/W {}",
+            cache_rate(
+                session.metrics.cache_read_tokens,
+                session.metrics.input_tokens
+            ),
+            cache_rate(
+                session.metrics.cache_write_tokens,
+                session.metrics.input_tokens
+            )
+        )),
+        Span::raw("  "),
+        Span::styled("cost ", THEME.muted_text_style()),
+        Span::raw(format_cost(
+            session.metrics.total_cost_micros,
+            session.metrics.cost_currency.as_deref(),
+        )),
+        Span::raw("  "),
         delete_status_span(section, &session),
     ]))
     .style(THEME.text_style())
@@ -1132,6 +1154,28 @@ fn delete_status_span(section: &SessionsSection, session: &SessionView) -> Span<
     Span::styled(
         "delete Backspace/Delete",
         THEME.danger_style().add_modifier(Modifier::BOLD),
+    )
+}
+
+fn format_count(value: u64) -> String {
+    value.to_string()
+}
+
+fn cache_rate(part: u64, total: u64) -> String {
+    if total == 0 {
+        return "0%".to_owned();
+    }
+    format!("{:.1}%", (part as f64 / total as f64) * 100.0)
+}
+
+fn format_cost(micros: u64, currency: Option<&str>) -> String {
+    if micros == 0 {
+        return "-".to_owned();
+    }
+    format!(
+        "{} {:.6}",
+        currency.unwrap_or("USD"),
+        micros as f64 / 1_000_000.0
     )
 }
 
