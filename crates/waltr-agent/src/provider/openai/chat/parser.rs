@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 use crate::stream::CompletionEvent;
 use crate::{ProviderTurnMetadata, Result, TokenUsage};
 
-use super::super::shared::{CHAT_COMPLETIONS_NAME, PartialToolCall, api_error};
+use super::super::shared::{
+    CHAT_COMPLETIONS_NAME, PartialToolCall, api_error, chargeable_input_tokens,
+};
 
 #[derive(Debug)]
 pub(super) struct ChatParser {
@@ -64,12 +66,17 @@ fn parse_chat_event(
                 provider: provider.to_owned(),
                 url: url.to_owned(),
                 model: model.to_owned(),
-                usage: Some(TokenUsage {
-                    input_tokens: usage["prompt_tokens"].as_u64(),
-                    output_tokens: usage["completion_tokens"].as_u64(),
-                    cache_read_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64(),
-                    image_input_tokens: usage["prompt_tokens_details"]["image_tokens"].as_u64(),
-                    ..Default::default()
+                usage: Some({
+                    let input_tokens = usage["prompt_tokens"].as_u64();
+                    let cache_read_tokens =
+                        usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+                    TokenUsage {
+                        input_tokens: chargeable_input_tokens(input_tokens, cache_read_tokens),
+                        output_tokens: usage["completion_tokens"].as_u64(),
+                        cache_read_tokens,
+                        image_input_tokens: usage["prompt_tokens_details"]["image_tokens"].as_u64(),
+                        ..Default::default()
+                    }
                 }),
                 cost: None,
                 resume: json!({ "completion_id": value["id"] }),
@@ -170,5 +177,26 @@ mod tests {
 
         let done = parser.parse_event("[DONE]").expect("done parses");
         assert_eq!(done, vec![CompletionEvent::Finished]);
+    }
+
+    #[test]
+    fn usage_chunk_reports_cached_tokens_separately_from_chargeable_input() {
+        let mut parser = ChatParser::new(
+            CHAT_COMPLETIONS_NAME,
+            "https://example.test/v1/chat/completions",
+            "gpt-test",
+        );
+
+        let events = parser
+            .parse_event(
+                r#"{"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":7}}}"#,
+            )
+            .expect("usage chunk parses");
+
+        let CompletionEvent::ProviderMetadata(metadata) = &events[0] else {
+            panic!("expected provider metadata, got {events:?}");
+        };
+        assert_eq!(metadata.usage.expect("usage").input_tokens, Some(4));
+        assert_eq!(metadata.usage.expect("usage").cache_read_tokens, Some(7));
     }
 }

@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::{CompletionRequest, ThinkingBlockKind, ToolDefinition, TurnItem};
+use crate::{CompletionReplayItem, CompletionRequest, ThinkingBlockKind, ToolDefinition, TurnItem};
 
 use super::thinking::{AnthropicThinkingConfig, anthropic_thinking};
 
@@ -27,37 +27,48 @@ pub(super) fn messages_request(
 }
 
 fn anthropic_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
-    let mut messages = vec![json!({ "role": "user", "content": request.prompt })];
+    let mut messages = Vec::new();
     let mut assistant_content: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
-    for item in request.turns.iter().flat_map(|turn| turn.items.iter()) {
+    for item in request.replay_items() {
         match item {
-            TurnItem::AssistantText(text) => {
-                flush_tool_results(&mut messages, &mut tool_results);
-                assistant_content.push(json!({ "type": "text", "text": text }));
-            }
-            TurnItem::Thinking(block) if block.kind == ThinkingBlockKind::Anthropic => {
-                flush_tool_results(&mut messages, &mut tool_results);
-                assistant_content.push(block.payload.clone());
-            }
-            TurnItem::Thinking(_) => {}
-            TurnItem::ToolCall(call) => {
-                flush_tool_results(&mut messages, &mut tool_results);
-                assistant_content.push(json!({
-                    "type": "tool_use",
-                    "id": call.id,
-                    "name": call.name,
-                    "input": call.arguments,
-                }));
-            }
-            TurnItem::ToolResult(result) => {
+            CompletionReplayItem::Prompt(prompt) => {
                 flush_assistant_content(&mut messages, &mut assistant_content);
-                tool_results.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": result.call_id,
-                    "content": result.content,
-                }));
+                if tool_results.is_empty() {
+                    messages.push(json!({ "role": "user", "content": prompt }));
+                } else {
+                    tool_results.push(json!({ "type": "text", "text": prompt }));
+                    flush_tool_results(&mut messages, &mut tool_results);
+                }
             }
+            CompletionReplayItem::Turn(item) => match item {
+                TurnItem::AssistantText(text) => {
+                    flush_tool_results(&mut messages, &mut tool_results);
+                    assistant_content.push(json!({ "type": "text", "text": text }));
+                }
+                TurnItem::Thinking(block) if block.kind == ThinkingBlockKind::Anthropic => {
+                    flush_tool_results(&mut messages, &mut tool_results);
+                    assistant_content.push(block.payload.clone());
+                }
+                TurnItem::Thinking(_) => {}
+                TurnItem::ToolCall(call) => {
+                    flush_tool_results(&mut messages, &mut tool_results);
+                    assistant_content.push(json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }));
+                }
+                TurnItem::ToolResult(result) => {
+                    flush_assistant_content(&mut messages, &mut assistant_content);
+                    tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id,
+                        "content": result.content,
+                    }));
+                }
+            },
         }
     }
     flush_assistant_content(&mut messages, &mut assistant_content);
@@ -95,8 +106,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        CompletionRequest, CompletionTurn, ThinkingBlock, ThinkingBlockKind, ToolCall, ToolResult,
-        TurnItem,
+        CompletionRequest, CompletionTurn, PromptTurn, ThinkingBlock, ThinkingBlockKind, ToolCall,
+        ToolResult, TurnItem,
     };
 
     use super::{AnthropicThinkingConfig, messages_request};
@@ -135,7 +146,17 @@ mod tests {
 
     #[test]
     fn request_replays_turns_as_alternating_assistant_and_user_messages() {
-        let mut request = CompletionRequest::new("hello");
+        let mut request = CompletionRequest::new("follow up");
+        request.prompt_turns = vec![
+            PromptTurn {
+                turn: 0,
+                prompt: "hello".to_owned(),
+            },
+            PromptTurn {
+                turn: 2,
+                prompt: "follow up".to_owned(),
+            },
+        ];
         request.turns = vec![
             CompletionTurn {
                 turn: 0,
@@ -202,5 +223,7 @@ mod tests {
         assert_eq!(messages[3]["content"][2]["id"], "call-1");
         assert_eq!(messages[4]["role"], "user");
         assert_eq!(messages[4]["content"][0]["tool_use_id"], "call-1");
+        assert_eq!(messages[4]["content"][1]["type"], "text");
+        assert_eq!(messages[4]["content"][1]["text"], "follow up");
     }
 }

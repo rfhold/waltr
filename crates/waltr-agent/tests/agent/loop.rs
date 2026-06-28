@@ -16,12 +16,13 @@ use waltr_agent::{
     AGENTS_INSTRUCTION_FILE, AgentRuntime, AgentSessions, AgentTimelineEvent, AgentTool,
     AgentsPromptConfig, BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture,
     CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL,
-    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent, CompletionRequest,
-    ExternalRequestId, ExternalRequestKind, ExternalResponse, FilesystemPromptConfig, LlmError,
-    LlmStream, MemorySessionStore, ModelApi, ModelRef, ProviderId, ProviderTurnMetadata,
-    ResumeInput, SessionStore, SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta,
-    TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall,
-    ToolDefinition, tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
+    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent, CompletionReplayItem,
+    CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
+    FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef,
+    ProviderId, ProviderTurnMetadata, ResumeInput, SessionStore, SkillsConfig, ThinkingBlock,
+    ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind, TimelineQuery,
+    TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
+    tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
 use serde_json::json;
@@ -165,6 +166,53 @@ async fn provider_turn_metadata_is_forwarded_without_agent_filtering() {
             .stream(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn durable_multi_prompt_request_replays_user_prompts_in_order() {
+    let provider = Arc::new(ChronologyProvider::default());
+    let agent = AgentRuntime::builder(test_model(), provider.clone()).build();
+    let store = MemorySessionStore::new();
+    let sessions = AgentSessions::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    drain(
+        sessions
+            .prompt(&agent, session_id.clone(), "first prompt")
+            .stream(),
+    )
+    .await;
+    drain(
+        sessions
+            .prompt(&agent, session_id.clone(), "second prompt")
+            .stream(),
+    )
+    .await;
+
+    assert_eq!(
+        provider.replay_sequences(),
+        vec![
+            vec!["user:first prompt".to_owned()],
+            vec![
+                "user:first prompt".to_owned(),
+                "assistant:first answer".to_owned(),
+                "user:second prompt".to_owned(),
+            ],
+        ]
+    );
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert_eq!(
+        snapshot
+            .prompt_turns
+            .iter()
+            .map(|prompt| (prompt.turn, prompt.prompt.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "first prompt"), (1, "second prompt")]
+    );
 }
 
 #[tokio::test]
@@ -1174,6 +1222,61 @@ fn assert_tool_call_precedes_parented_result(events: &[AgentTimelineEvent], call
 struct DurableResumeProvider {
     requests: Mutex<usize>,
     saw_resumed_tool_result: Mutex<bool>,
+}
+
+#[derive(Default)]
+struct ChronologyProvider {
+    requests: Mutex<usize>,
+    replay_sequences: Mutex<Vec<Vec<String>>>,
+}
+
+impl ChronologyProvider {
+    fn replay_sequences(&self) -> Vec<Vec<String>> {
+        self.replay_sequences
+            .lock()
+            .expect("replay sequence lock")
+            .clone()
+    }
+}
+
+impl LlmStream for ChronologyProvider {
+    fn name(&self) -> &'static str {
+        "chronology_provider"
+    }
+
+    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        let sequence = request
+            .replay_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                CompletionReplayItem::Prompt(prompt) => Some(format!("user:{prompt}")),
+                CompletionReplayItem::Turn(TurnItem::AssistantText(text)) => {
+                    Some(format!("assistant:{text}"))
+                }
+                CompletionReplayItem::Turn(_) => None,
+            })
+            .collect::<Vec<_>>();
+        self.replay_sequences
+            .lock()
+            .expect("replay sequence lock")
+            .push(sequence);
+
+        let mut requests = self.requests.lock().expect("request lock");
+        let events = match *requests {
+            0 => vec![
+                Ok(CompletionEvent::Delta("first answer".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ],
+            1 => vec![
+                Ok(CompletionEvent::Delta("second answer".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ],
+            request => panic!("unexpected provider request {request}"),
+        };
+        *requests += 1;
+        drop(requests);
+        Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
+    }
 }
 
 impl DurableResumeProvider {

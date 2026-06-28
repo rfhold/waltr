@@ -189,8 +189,28 @@ pub struct CompletionRequest<'a> {
     pub system_prompt: Option<&'a str>,
     /// Tools made available to the model.
     pub tools: Vec<ToolDefinition>,
+    /// User prompts to replay with the provider turn they started.
+    pub prompt_turns: Vec<PromptTurn>,
     /// Completed agent loop turns to replay, in turn order.
     pub turns: Vec<CompletionTurn>,
+}
+
+/// A user prompt and the provider turn it started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptTurn {
+    /// Provider turn the prompt started.
+    pub turn: u64,
+    /// User prompt text.
+    pub prompt: String,
+}
+
+/// Provider-neutral chronological replay item for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionReplayItem<'a> {
+    /// A prior provider turn item.
+    Turn(&'a TurnItem),
+    /// The current user prompt that should follow prior replayed turns.
+    Prompt(&'a str),
 }
 
 impl<'a> CompletionRequest<'a> {
@@ -201,8 +221,38 @@ impl<'a> CompletionRequest<'a> {
             prompt,
             system_prompt: None,
             tools: Vec::new(),
+            prompt_turns: Vec::new(),
             turns: Vec::new(),
         }
+    }
+
+    /// Request conversation items in provider-neutral chronological order.
+    pub fn replay_items(&'a self) -> Vec<CompletionReplayItem<'a>> {
+        if self.prompt_turns.is_empty() {
+            return std::iter::once(CompletionReplayItem::Prompt(self.prompt))
+                .chain(
+                    self.turns
+                        .iter()
+                        .flat_map(|turn| turn.items.iter().map(CompletionReplayItem::Turn)),
+                )
+                .collect();
+        }
+
+        let mut items = Vec::new();
+        let mut prompts = self.prompt_turns.iter().peekable();
+        for turn in &self.turns {
+            while prompts
+                .peek()
+                .is_some_and(|prompt_turn| prompt_turn.turn <= turn.turn)
+            {
+                if let Some(prompt_turn) = prompts.next() {
+                    items.push(CompletionReplayItem::Prompt(&prompt_turn.prompt));
+                }
+            }
+            items.extend(turn.items.iter().map(CompletionReplayItem::Turn));
+        }
+        items.extend(prompts.map(|prompt_turn| CompletionReplayItem::Prompt(&prompt_turn.prompt)));
+        items
     }
 
     /// Tool calls across all replayed turns, in emission order.

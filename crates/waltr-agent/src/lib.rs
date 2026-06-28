@@ -40,10 +40,10 @@ pub use prompt::{
     FilesystemPromptConfig, SystemPromptBuilder,
 };
 pub use stream::{
-    BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
-    CompletionRequestBuilder, CompletionTurn, LlmStream, ModelCost, ProviderTurnMetadata,
-    ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TokenCost, TokenUsage, ToolCall,
-    ToolDefinition, ToolResult, TurnItem,
+    BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionReplayItem, CompletionRequest,
+    CompletionRequestBuilder, CompletionTurn, LlmStream, ModelCost, PromptTurn,
+    ProviderTurnMetadata, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TokenCost, TokenUsage,
+    ToolCall, ToolDefinition, ToolResult, TurnItem,
 };
 pub use timeline::{
     AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS,

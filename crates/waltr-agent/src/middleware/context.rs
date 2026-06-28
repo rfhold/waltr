@@ -6,7 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
-    CompletionTurn, PermissionClaim, Result, ToolCall, ToolDefinition, ToolResult,
+    CompletionTurn, PermissionClaim, PromptTurn, Result, ToolCall, ToolDefinition, ToolResult,
     agent::session::{SessionJournalEvent, SessionSnapshot},
 };
 
@@ -128,6 +128,8 @@ pub(crate) struct ModelRequestDraft {
     pub(crate) system_prompt: Option<String>,
     /// Tool definitions visible to the model.
     pub(crate) tools: Vec<ToolDefinition>,
+    /// User prompts included for chronological replay.
+    pub(crate) prompt_turns: Vec<PromptTurn>,
     /// Prior completed turns included for replay, in turn order.
     pub(crate) turns: Vec<CompletionTurn>,
 }

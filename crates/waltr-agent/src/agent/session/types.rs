@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CompletionTurn, ModelRef, ProviderTurnMetadata, ThinkingBlock, ToolCall, ToolResult, TurnItem,
+    CompletionTurn, ModelRef, PromptTurn, ProviderTurnMetadata, ThinkingBlock, ToolCall,
+    ToolResult, TurnItem,
     timeline::{
         AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, TimelineContent,
         TimelineEventKind, TimelineStatus,
@@ -426,6 +427,9 @@ pub struct SessionSnapshot {
     pub revision: Revision,
     /// User prompts or conversation inputs recorded for replay.
     pub prompts: Vec<String>,
+    /// User prompts with the provider turn they started.
+    #[serde(default)]
+    pub prompt_turns: Vec<PromptTurn>,
     /// Most recent user prompt or conversation input.
     pub current_prompt: Option<String>,
     /// Next provider turn number.
@@ -451,6 +455,7 @@ impl SessionSnapshot {
             id,
             revision: Revision::ZERO,
             prompts: Vec::new(),
+            prompt_turns: Vec::new(),
             current_prompt: None,
             turn: 0,
             turns: Vec::new(),
@@ -505,6 +510,10 @@ impl SessionSnapshot {
             SessionJournalEvent::Timeline(event) => self.apply_timeline_event(event),
             SessionJournalEvent::PromptAppended { prompt } => {
                 self.prompts.push(prompt.clone());
+                self.prompt_turns.push(PromptTurn {
+                    turn: self.turn,
+                    prompt: prompt.clone(),
+                });
                 self.current_prompt = Some(prompt.clone());
                 self.status = SessionStatus::BuildingRequest;
             }
