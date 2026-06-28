@@ -43,6 +43,14 @@ pub struct CatalogModelCostSummary {
     pub output_per_million_tokens: ::core::option::Option<f64>,
     #[prost(string, tag="3")]
     pub currency: ::prost::alloc::string::String,
+    #[prost(double, optional, tag="4")]
+    pub cache_read_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="5")]
+    pub cache_write_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="6")]
+    pub image_input_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="7")]
+    pub image_input_per_image: ::core::option::Option<f64>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CatalogModelCapabilitySummary {
@@ -244,6 +252,7 @@ pub enum CatalogDefaultField {
     Type = 2,
     Limits = 3,
     Capabilities = 4,
+    Cost = 5,
 }
 impl CatalogDefaultField {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -257,6 +266,7 @@ impl CatalogDefaultField {
             Self::Type => "CATALOG_DEFAULT_FIELD_TYPE",
             Self::Limits => "CATALOG_DEFAULT_FIELD_LIMITS",
             Self::Capabilities => "CATALOG_DEFAULT_FIELD_CAPABILITIES",
+            Self::Cost => "CATALOG_DEFAULT_FIELD_COST",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -267,6 +277,7 @@ impl CatalogDefaultField {
             "CATALOG_DEFAULT_FIELD_TYPE" => Some(Self::Type),
             "CATALOG_DEFAULT_FIELD_LIMITS" => Some(Self::Limits),
             "CATALOG_DEFAULT_FIELD_CAPABILITIES" => Some(Self::Capabilities),
+            "CATALOG_DEFAULT_FIELD_COST" => Some(Self::Cost),
             _ => None,
         }
     }

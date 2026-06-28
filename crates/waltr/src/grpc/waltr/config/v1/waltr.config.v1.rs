@@ -104,6 +104,26 @@ pub struct Model {
     pub capabilities: ::core::option::Option<ModelCapabilities>,
     #[prost(message, optional, tag="6")]
     pub catalog_match: ::core::option::Option<ModelCatalogMatch>,
+    #[prost(message, optional, tag="7")]
+    pub cost: ::core::option::Option<ModelCost>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ModelCost {
+    #[prost(double, optional, tag="1")]
+    pub input_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="2")]
+    pub output_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="3")]
+    pub cache_read_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="4")]
+    pub cache_write_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="5")]
+    pub image_input_per_million_tokens: ::core::option::Option<f64>,
+    #[prost(double, optional, tag="6")]
+    pub image_input_per_image: ::core::option::Option<f64>,
+    #[prost(string, tag="7")]
+    pub currency: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

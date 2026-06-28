@@ -260,6 +260,29 @@ pub struct SessionSummary {
     pub last_activity_at: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(message, optional, tag="8")]
     pub runtime_config: ::core::option::Option<SessionRuntimeConfig>,
+    #[prost(message, optional, tag="9")]
+    pub metrics: ::core::option::Option<SessionMetrics>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionMetrics {
+    #[prost(uint64, tag="1")]
+    pub input_tokens: u64,
+    #[prost(uint64, tag="2")]
+    pub output_tokens: u64,
+    #[prost(uint64, tag="3")]
+    pub cache_read_tokens: u64,
+    #[prost(uint64, tag="4")]
+    pub cache_write_tokens: u64,
+    #[prost(uint64, tag="5")]
+    pub image_input_tokens: u64,
+    #[prost(uint64, tag="6")]
+    pub image_input_count: u64,
+    #[prost(uint64, tag="7")]
+    pub total_tokens: u64,
+    #[prost(string, optional, tag="8")]
+    pub cost_currency: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag="9")]
+    pub total_cost_micros: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionRuntimeConfig {

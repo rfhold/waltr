@@ -229,6 +229,19 @@ message SessionSummary {
   google.protobuf.Timestamp updated_at = 6;
   google.protobuf.Timestamp last_activity_at = 7;
   SessionRuntimeConfig runtime_config = 8;
+  SessionMetrics metrics = 9;
+}
+
+message SessionMetrics {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 cache_read_tokens = 3;
+  uint64 cache_write_tokens = 4;
+  uint64 image_input_tokens = 5;
+  uint64 image_input_count = 6;
+  uint64 total_tokens = 7;
+  optional string cost_currency = 8;
+  uint64 total_cost_micros = 9;
 }
 
 message SessionRuntimeConfig {
