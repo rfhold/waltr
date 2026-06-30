@@ -476,12 +476,14 @@ mod tests {
         let config = store.load().await.expect("missing file should load");
 
         assert!(config.providers.contains_key("anthropic"));
+        assert!(config.providers.contains_key("claude-code"));
         assert!(config.providers.contains_key("openai"));
-        assert!(config.providers.contains_key("openai-codex"));
+        assert!(config.providers.contains_key("codex"));
         assert!(!config.etag.is_empty());
         assert!(root.join(CONFIG_DIR).join(CONFIG_FILE).exists());
+        assert!(config.providers["anthropic"].oauth_settings.is_none());
         assert!(
-            config.providers["anthropic"]
+            config.providers["claude-code"]
                 .oauth_settings
                 .as_ref()
                 .is_some_and(|settings| !settings.authorize_url.is_empty())

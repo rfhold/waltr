@@ -19,7 +19,7 @@ async fn grpc_executor_watches_config_changes() {
     let initial_etag = initial.etag.clone();
     assert!(initial.providers.contains_key("anthropic"));
     assert!(initial.providers.contains_key("openai"));
-    assert!(initial.providers.contains_key("openai-codex"));
+    assert!(initial.providers.contains_key("codex"));
     assert!(!initial.etag.is_empty());
 
     let mut watch = client

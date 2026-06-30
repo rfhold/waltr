@@ -18,9 +18,31 @@ pub fn default_configuration() -> Configuration {
                     "anthropic",
                     ProviderType::AnthropicMessages,
                     "https://api.anthropic.com/v1/messages",
+                    false,
+                    "claude-haiku-4-5",
+                    HashMap::from([(
+                        "x-api-key".to_owned(),
+                        "${env:ANTHROPIC_API_KEY}".to_owned(),
+                    )]),
+                    None,
+                ),
+            ),
+            (
+                "claude-code".to_owned(),
+                provider(
+                    "claude-code",
+                    ProviderType::AnthropicMessages,
+                    "https://api.anthropic.com/v1/messages?beta=true",
                     true,
                     "claude-haiku-4-5",
-                    HashMap::new(),
+                    HashMap::from([
+                        (
+                            "anthropic-beta".to_owned(),
+                            "claude-code-20250219,oauth-2025-04-20".to_owned(),
+                        ),
+                        ("user-agent".to_owned(), "claude-cli/2.1.75".to_owned()),
+                        ("x-app".to_owned(), "cli".to_owned()),
+                    ]),
                     Some(claude_code_oauth_settings()),
                 ),
             ),
@@ -32,14 +54,17 @@ pub fn default_configuration() -> Configuration {
                     "https://api.openai.com/v1/chat/completions",
                     false,
                     "gpt-5-nano",
-                    HashMap::new(),
+                    HashMap::from([(
+                        "Authorization".to_owned(),
+                        "Bearer ${env:OPENAI_API_KEY}".to_owned(),
+                    )]),
                     None,
                 ),
             ),
             (
-                "openai-codex".to_owned(),
+                "codex".to_owned(),
                 provider(
-                    "openai-codex",
+                    "codex",
                     ProviderType::OpenaiResponses,
                     "https://chatgpt.com/backend-api/codex/responses",
                     true,
@@ -157,5 +182,53 @@ pub(crate) fn openai_codex_oauth_settings() -> OAuthProvider {
             required: true,
         }],
         send_state_in_token_request: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use waltr::grpc::waltr::config::v1::ProviderType;
+
+    use super::default_configuration;
+
+    #[test]
+    fn defaults_split_api_key_and_oauth_providers() {
+        let config = default_configuration();
+
+        let anthropic = &config.providers["anthropic"];
+        assert_eq!(anthropic.r#type, ProviderType::AnthropicMessages as i32);
+        assert!(!anthropic.oauth_compatible);
+        assert!(anthropic.oauth_settings.is_none());
+        assert_eq!(anthropic.url, "https://api.anthropic.com/v1/messages");
+        assert_eq!(anthropic.headers["x-api-key"], "${env:ANTHROPIC_API_KEY}");
+
+        let claude_code = &config.providers["claude-code"];
+        assert_eq!(claude_code.r#type, ProviderType::AnthropicMessages as i32);
+        assert!(claude_code.oauth_compatible);
+        assert!(claude_code.oauth_settings.is_some());
+        assert_eq!(
+            claude_code.url,
+            "https://api.anthropic.com/v1/messages?beta=true"
+        );
+        assert_eq!(
+            claude_code.headers["anthropic-beta"],
+            "claude-code-20250219,oauth-2025-04-20"
+        );
+        assert_eq!(claude_code.headers["user-agent"], "claude-cli/2.1.75");
+        assert_eq!(claude_code.headers["x-app"], "cli");
+
+        let openai = &config.providers["openai"];
+        assert!(!openai.oauth_compatible);
+        assert!(openai.oauth_settings.is_none());
+        assert_eq!(
+            openai.headers["Authorization"],
+            "Bearer ${env:OPENAI_API_KEY}"
+        );
+
+        let codex = &config.providers["codex"];
+        assert_eq!(codex.r#type, ProviderType::OpenaiResponses as i32);
+        assert!(codex.oauth_compatible);
+        assert!(codex.oauth_settings.is_some());
+        assert!(!config.providers.contains_key("openai-codex"));
     }
 }

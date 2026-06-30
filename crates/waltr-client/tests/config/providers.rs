@@ -23,7 +23,7 @@ async fn stream_dispatches_config_provider_commands() {
         .expect("config snapshot should include config");
     assert!(initial_config.providers.contains_key("anthropic"));
     assert!(initial_config.providers.contains_key("openai"));
-    assert!(initial_config.providers.contains_key("openai-codex"));
+    assert!(initial_config.providers.contains_key("codex"));
     assert!(!initial_config.etag.is_empty());
 
     let patch_started = dispatch_stream_command(

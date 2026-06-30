@@ -18,6 +18,10 @@ use waltr_agent::{ShellPromptConfig, shell::ShellConfig};
 use tonic::Status;
 use tracing::Instrument as _;
 
+use crate::config::headers::{
+    configured_credential, is_credential_header, resolve_provider_headers,
+};
+
 use super::runtime_config::{StoredSessionRuntimeConfig, runtime_config_from_summary};
 
 #[derive(Debug, Clone)]
@@ -132,7 +136,8 @@ async fn provider_builder(
 
     let provider_type =
         ProviderType::try_from(runtime_config.provider.r#type).unwrap_or(ProviderType::Unspecified);
-    let configured_api_key = configured_api_key(&provider_config.headers);
+    let resolved_headers = resolve_provider_headers(&provider_config.headers);
+    let configured_api_key = configured_credential(&resolved_headers.headers);
     let oauth = if configured_api_key.is_empty() {
         let definition = oauth::provider_definition(&runtime_config.provider.key, provider_config);
         let oauth_configured = definition.is_some();
@@ -153,20 +158,16 @@ async fn provider_builder(
     match provider_type {
         ProviderType::AnthropicMessages => {
             ensure_no_reasoning_effort(runtime_config, "Anthropic Messages")?;
+            let oauth_active = oauth.is_some();
             let mut provider = if let Some(oauth) = oauth {
-                anthropic_oauth_provider(oauth, model_id.clone())
+                apply_oauth_auth(AnthropicMessages::new(model_id.clone()), Some(oauth))
             } else {
-                let provider = AnthropicMessages::new(model_id.clone());
-                if configured_api_key.is_empty() {
-                    provider
-                } else {
-                    provider.with_header("x-api-key", configured_api_key)
-                }
+                AnthropicMessages::new(model_id.clone())
             };
             if let Some(endpoint_url) = endpoint_url {
                 provider = provider.with_url(endpoint_url);
             }
-            provider = apply_config_headers(provider, &provider_config.headers);
+            provider = apply_config_headers(provider, &resolved_headers.headers, oauth_active);
             let model = ModelRef::new(ProviderId::Anthropic, model_id, ModelApi::AnthropicMessages);
             Ok(builder_with_model_cost(
                 AgentRuntimeBuilder::new(model, Arc::new(provider)),
@@ -175,9 +176,10 @@ async fn provider_builder(
         }
         ProviderType::OpenaiChatCompletions => {
             ensure_no_reasoning_effort(runtime_config, "OpenAI Chat Completions")?;
+            let oauth_active = oauth.is_some();
             let provider = OpenAiChatCompletions::new(model_id.clone());
-            let mut provider = apply_openai_auth(provider, oauth, &configured_api_key);
-            provider = apply_config_headers(provider, &provider_config.headers);
+            let mut provider = apply_oauth_auth(provider, oauth);
+            provider = apply_config_headers(provider, &resolved_headers.headers, oauth_active);
             if let Some(endpoint_url) = endpoint_url {
                 provider = provider.with_url(endpoint_url);
             }
@@ -192,12 +194,9 @@ async fn provider_builder(
             ))
         }
         ProviderType::OpenaiResponses => {
-            let mut provider = apply_openai_auth(
-                OpenAiResponses::new(model_id.clone()),
-                oauth,
-                &configured_api_key,
-            );
-            provider = apply_config_headers(provider, &provider_config.headers);
+            let oauth_active = oauth.is_some();
+            let mut provider = apply_oauth_auth(OpenAiResponses::new(model_id.clone()), oauth);
+            provider = apply_config_headers(provider, &resolved_headers.headers, oauth_active);
             if let Some(reasoning) = openai_reasoning_config(runtime_config)? {
                 provider = provider.with_reasoning(reasoning);
             }
@@ -211,12 +210,10 @@ async fn provider_builder(
             ))
         }
         ProviderType::OpenaiResponsesWebsocket => {
-            let mut provider = apply_openai_auth(
-                OpenAiResponsesWebSocket::new(model_id.clone()),
-                oauth,
-                &configured_api_key,
-            );
-            provider = apply_config_headers(provider, &provider_config.headers);
+            let oauth_active = oauth.is_some();
+            let mut provider =
+                apply_oauth_auth(OpenAiResponsesWebSocket::new(model_id.clone()), oauth);
+            provider = apply_config_headers(provider, &resolved_headers.headers, oauth_active);
             if let Some(reasoning) = openai_reasoning_config(runtime_config)? {
                 provider = provider.with_reasoning(reasoning);
             }
@@ -255,14 +252,6 @@ fn builder_with_model_cost(
     })
 }
 
-fn anthropic_oauth_provider(oauth: ResolvedOAuth, model_id: String) -> AnthropicMessages {
-    AnthropicMessages::new(model_id)
-        .with_header("Authorization", format!("Bearer {}", oauth.access))
-        .with_header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-        .with_header("user-agent", "claude-cli/2.1.75")
-        .with_header("x-app", "cli")
-}
-
 trait RuntimeHeaderProvider: Sized {
     fn with_runtime_header(self, name: impl Into<String>, value: impl Into<String>) -> Self;
 }
@@ -294,12 +283,13 @@ impl RuntimeHeaderProvider for OpenAiResponsesWebSocket {
 fn apply_config_headers<T>(
     mut provider: T,
     headers: &std::collections::HashMap<String, String>,
+    oauth_active: bool,
 ) -> T
 where
     T: RuntimeHeaderProvider,
 {
     for (name, value) in headers {
-        if is_credential_header(name) {
+        if oauth_active && is_credential_header(name) {
             continue;
         }
         provider = provider.with_runtime_header(name.clone(), value.clone());
@@ -307,11 +297,7 @@ where
     provider
 }
 
-fn apply_openai_auth<T>(
-    mut provider: T,
-    oauth: Option<ResolvedOAuth>,
-    configured_api_key: &str,
-) -> T
+fn apply_oauth_auth<T>(mut provider: T, oauth: Option<ResolvedOAuth>) -> T
 where
     T: RuntimeHeaderProvider,
 {
@@ -324,18 +310,9 @@ where
                 .with_runtime_header("User-Agent", format!("waltr/{}", env!("CARGO_PKG_VERSION")));
         }
         provider
-    } else if configured_api_key.is_empty() {
-        provider
     } else {
-        provider.with_runtime_header("Authorization", format!("Bearer {configured_api_key}"))
+        provider
     }
-}
-
-fn is_credential_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "api_key" | "x-api-key" | "authorization"
-    )
 }
 
 fn ensure_no_reasoning_effort(
@@ -419,22 +396,6 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
-}
-
-fn configured_api_key(headers: &std::collections::HashMap<String, String>) -> String {
-    for key in ["api_key", "x-api-key", "authorization"] {
-        if let Some(value) = headers
-            .get(key)
-            .or_else(|| headers.get(&key.to_ascii_uppercase()))
-        {
-            let trimmed = value.trim();
-            return trimmed
-                .strip_prefix("Bearer ")
-                .unwrap_or(trimmed)
-                .to_owned();
-        }
-    }
-    String::new()
 }
 
 fn mcp_config(

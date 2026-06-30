@@ -13,7 +13,7 @@ async fn grpc_executor_loads_and_reloads_config() {
     let initial_etag = initial.etag.clone();
     assert!(initial.providers.contains_key("anthropic"));
     assert!(initial.providers.contains_key("openai"));
-    assert!(initial.providers.contains_key("openai-codex"));
+    assert!(initial.providers.contains_key("codex"));
     assert!(!initial.etag.is_empty());
 
     let patch = config_with_provider("anthropic");

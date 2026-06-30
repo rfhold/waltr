@@ -35,7 +35,7 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     assert!(rendered.contains("Tab switch"));
     assert!(rendered.contains("> anthropic"));
     assert!(rendered.contains("openai"));
-    assert!(rendered.contains("openai-codex"));
+    assert!(rendered.contains("codex"));
     insta::assert_snapshot!("config_providers_empty_real_server", rendered);
 
     let now = Instant::now();
