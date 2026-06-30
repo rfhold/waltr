@@ -49,6 +49,7 @@ const SHELL_OUTPUT_RECENT_LINE_COUNT: usize = 15;
 const TIMELINE_TEXT_PREFIX: &str = "   ";
 const DETAIL_COMPOSER_MAX_INPUT_LINES: u16 = 20;
 const DETAIL_COMPOSER_BOTTOM_GAP: u16 = 1;
+const DETAIL_RESPONSE_TOP_GAP: u16 = 1;
 const DETAIL_TIMELINE_MIN_HEIGHT: u16 = 6;
 const DETAIL_SCROLL_WHEEL_LINES: usize = 3;
 const DETAIL_SCROLL_PAGE_LINES: usize = 12;
@@ -858,10 +859,16 @@ impl SessionsSection {
             .areas(area);
         let prompt = current_external_prompt(snapshot, Some(id));
         let response_height = self.detail_response_height(prompt.as_ref(), main_area.height);
-        let [timeline_area, _response_area, _composer_gap_area] = Layout::default()
+        let [
+            timeline_area,
+            _response_top_gap_area,
+            _response_area,
+            _composer_gap_area,
+        ] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
+                Constraint::Length(DETAIL_RESPONSE_TOP_GAP),
                 Constraint::Length(response_height),
                 Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
             ])
@@ -1029,10 +1036,16 @@ impl SessionsSection {
         let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(id));
         let prompt = current_external_prompt(snapshot, Some(id));
         let response_height = self.detail_response_height(prompt.as_ref(), main_area.height);
-        let [timeline_area, response_area, _composer_gap_area] = Layout::default()
+        let [
+            timeline_area,
+            _response_top_gap_area,
+            response_area,
+            _composer_gap_area,
+        ] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
+                Constraint::Length(DETAIL_RESPONSE_TOP_GAP),
                 Constraint::Length(response_height),
                 Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
             ])
