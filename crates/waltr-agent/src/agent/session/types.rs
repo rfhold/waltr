@@ -385,6 +385,7 @@ impl SessionRecord {
             | SessionJournalEvent::Suspended { .. }
             | SessionJournalEvent::WorkCanceled { .. }
             | SessionJournalEvent::Interrupted
+            | SessionJournalEvent::TurnInterrupted { .. }
             | SessionJournalEvent::TurnFinished { .. }
             | SessionJournalEvent::Finished
             | SessionJournalEvent::Failed { .. } => None,
@@ -411,6 +412,7 @@ impl SessionRecord {
             | SessionJournalEvent::Suspended { .. }
             | SessionJournalEvent::WorkCanceled { .. }
             | SessionJournalEvent::Interrupted
+            | SessionJournalEvent::TurnInterrupted { .. }
             | SessionJournalEvent::TurnFinished { .. }
             | SessionJournalEvent::Finished
             | SessionJournalEvent::Failed { .. } => None,
@@ -548,6 +550,12 @@ impl SessionSnapshot {
                 self.cancel_work(work_id, reason);
             }
             SessionJournalEvent::Interrupted => {
+                self.status = SessionStatus::Suspended(Suspension::Interrupted {
+                    work: self.pending_work.clone(),
+                });
+            }
+            SessionJournalEvent::TurnInterrupted { turn } => {
+                self.turn = self.turn.max(turn + 1);
                 self.status = SessionStatus::Suspended(Suspension::Interrupted {
                     work: self.pending_work.clone(),
                 });
@@ -808,6 +816,8 @@ pub enum SessionJournalEvent {
     },
     /// Runtime was interrupted.
     Interrupted,
+    /// Provider turn was interrupted before normal completion.
+    TurnInterrupted { turn: u64 },
     /// Provider turn finished.
     TurnFinished { turn: u64 },
     /// Session completed normally.

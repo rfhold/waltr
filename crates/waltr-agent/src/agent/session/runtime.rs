@@ -215,6 +215,11 @@ where
             });
         }
         journal.push(SessionJournalEvent::Interrupted);
+        if open_prompt_turn(&snapshot).is_some() {
+            journal.push(SessionJournalEvent::TurnInterrupted {
+                turn: snapshot.turn,
+            });
+        }
         status_timeline.push(interrupted_status_timeline_event(&record.id, snapshot.turn));
 
         let mut record = if cancellation_timeline.is_empty() {
@@ -264,9 +269,20 @@ where
                 reason: CancelReason::SupersededByUserPrompt,
             });
         }
+        let turn = if open_prompt_turn(&snapshot).is_some() {
+            journal.push(SessionJournalEvent::Interrupted);
+            journal.push(SessionJournalEvent::TurnInterrupted {
+                turn: snapshot.turn,
+            });
+            snapshot.turn + 1
+        } else {
+            snapshot.turn
+        };
+        let prompt_index = snapshot.prompts.len();
         prompt_timeline.push(user_prompt_timeline_event(
             &record.id,
-            snapshot.turn,
+            turn,
+            prompt_index,
             prompt.clone(),
         ));
         journal.push(SessionJournalEvent::PromptAppended { prompt });
@@ -580,14 +596,24 @@ fn tool_result_timeline_event(
 fn user_prompt_timeline_event(
     session_id: &SessionId,
     turn: u64,
+    prompt_index: usize,
     prompt: String,
 ) -> PendingTimelineEvent {
     PendingTimelineEvent::user_text_snapshot(
         session_id.clone(),
         turn,
-        TimelineItemId::new(format!("user-turn-{turn}")),
+        user_text_item_id(turn, prompt_index),
         prompt,
     )
+}
+
+fn user_text_item_id(turn: u64, prompt_index: usize) -> TimelineItemId {
+    TimelineItemId::new(format!("user-turn-{turn}-prompt-{prompt_index}"))
+}
+
+fn open_prompt_turn(snapshot: &SessionSnapshot) -> Option<u64> {
+    let prompt_turn = snapshot.prompt_turns.last()?;
+    (prompt_turn.turn == snapshot.turn).then_some(prompt_turn.turn)
 }
 
 fn external_request_timeline_event(
@@ -859,6 +885,7 @@ mod tests {
             snapshot.pending_work[0].status,
             PendingWorkStatus::Canceled(CancelReason::SessionInterrupted)
         );
+        assert_eq!(snapshot.turn, 1);
         let tool_results: Vec<_> = snapshot.tool_results().collect();
         assert_eq!(tool_results.len(), 1);
         assert_eq!(tool_results[0].call_id, "call-question");
@@ -869,6 +896,12 @@ mod tests {
                 .journal
                 .iter()
                 .any(|event| matches!(event, SessionJournalEvent::Interrupted))
+        );
+        assert!(
+            record
+                .journal
+                .iter()
+                .any(|event| matches!(event, SessionJournalEvent::TurnInterrupted { turn: 0 }))
         );
     }
 
@@ -887,6 +920,14 @@ mod tests {
                 .journal
                 .iter()
                 .filter(|event| matches!(event, SessionJournalEvent::Interrupted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            second
+                .journal
+                .iter()
+                .filter(|event| matches!(event, SessionJournalEvent::TurnInterrupted { .. }))
                 .count(),
             1
         );

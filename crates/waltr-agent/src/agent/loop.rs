@@ -839,12 +839,14 @@ where
             .create(self.session_id.clone())
             .await
             .map_err(session_store_error)?;
+        let prompt_index = self.prompt_turns.len();
         self.append_journal_event(SessionJournalEvent::PromptAppended { prompt })
             .await?;
         let event = self
             .append_timeline_event(user_prompt_timeline_event(
                 &self.session_id,
                 self.turn as u64,
+                prompt_index,
                 self.prompt.clone(),
             ))
             .await?;
@@ -1219,8 +1221,8 @@ fn assistant_text_item_id(turn: u64) -> TimelineItemId {
     TimelineItemId::new(format!("assistant-turn-{turn}"))
 }
 
-fn user_text_item_id(turn: u64) -> TimelineItemId {
-    TimelineItemId::new(format!("user-turn-{turn}"))
+fn user_text_item_id(turn: u64, prompt_index: usize) -> TimelineItemId {
+    TimelineItemId::new(format!("user-turn-{turn}-prompt-{prompt_index}"))
 }
 
 fn thinking_item_id(turn: u64) -> TimelineItemId {
@@ -1264,12 +1266,13 @@ fn tool_call_timeline_event(
 fn user_prompt_timeline_event(
     session_id: &SessionId,
     turn: u64,
+    prompt_index: usize,
     prompt: String,
 ) -> PendingTimelineEvent {
     PendingTimelineEvent::user_text_snapshot(
         session_id.clone(),
         turn,
-        user_text_item_id(turn),
+        user_text_item_id(turn, prompt_index),
         prompt,
     )
 }

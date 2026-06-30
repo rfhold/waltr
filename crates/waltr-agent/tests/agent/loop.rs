@@ -16,12 +16,12 @@ use waltr_agent::{
     AGENTS_INSTRUCTION_FILE, AgentRuntime, AgentSessions, AgentTimelineEvent, AgentTool,
     AgentsPromptConfig, BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture,
     CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL,
-    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent, CompletionReplayItem,
-    CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
-    FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef,
-    ProviderId, ProviderTurnMetadata, ResumeInput, SessionStore, SkillsConfig, ThinkingBlock,
-    ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind, TimelineQuery,
-    TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
+    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent,
+    CompletionReplayItem, CompletionRequest, ExternalRequestId, ExternalRequestKind,
+    ExternalResponse, FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi,
+    ModelRef, ProviderId, ProviderTurnMetadata, ResumeInput, SessionStore, SkillsConfig,
+    ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind,
+    TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
     tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
@@ -213,6 +213,76 @@ async fn durable_multi_prompt_request_replays_user_prompts_in_order() {
             .collect::<Vec<_>>(),
         vec![(0, "first prompt"), (1, "second prompt")]
     );
+}
+
+#[tokio::test]
+async fn superseded_prompt_closes_turn_and_keeps_distinct_user_timeline_items() {
+    let provider = Arc::new(PendingSupersedeProvider::default());
+    let agent = AgentRuntime::builder(test_model(), provider.clone()).build();
+    let store = MemorySessionStore::new();
+    let sessions = AgentSessions::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    let mut first = sessions
+        .prompt(&agent, session_id.clone(), "first prompt")
+        .stream();
+    while provider.replay_sequences().is_empty() {
+        first
+            .next()
+            .await
+            .expect("first prompt event")
+            .expect("first prompt event");
+    }
+
+    drain(
+        sessions
+            .prompt(&agent, session_id.clone(), "second prompt")
+            .stream(),
+    )
+    .await;
+    drop(first);
+
+    assert_eq!(
+        provider.replay_sequences(),
+        vec![
+            vec!["user:first prompt".to_owned()],
+            vec![
+                "user:first prompt".to_owned(),
+                "user:second prompt".to_owned(),
+            ],
+        ]
+    );
+
+    let record = store.load(&session_id).await.expect("stored session");
+    let snapshot = record.snapshot();
+    assert_eq!(
+        snapshot
+            .prompt_turns
+            .iter()
+            .map(|prompt| (prompt.turn, prompt.prompt.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "first prompt"), (1, "second prompt")]
+    );
+
+    let user_events = store
+        .timeline(&session_id, TimelineQuery::forward(None, 20))
+        .await
+        .expect("timeline events")
+        .into_iter()
+        .filter(|event| crate::session::channel_is(event, CHANNEL_USER_TEXT))
+        .collect::<Vec<_>>();
+    assert_eq!(user_events.len(), 2);
+    assert_eq!(user_events[0].turn, 0);
+    assert_eq!(user_events[1].turn, 1);
+    assert_ne!(user_events[0].item_id, user_events[1].item_id);
+    assert!(matches!(
+        &user_events[0].content,
+        TimelineContent::TextSnapshot { text } if text == "first prompt"
+    ));
+    assert!(matches!(
+        &user_events[1].content,
+        TimelineContent::TextSnapshot { text } if text == "second prompt"
+    ));
 }
 
 #[tokio::test]
@@ -573,7 +643,7 @@ async fn interrupting_multi_tool_turn_preserves_finished_results() {
         .await
         .expect("stored session")
         .snapshot();
-    assert_eq!(snapshot.turn, 0, "interrupted batch must not finish turn");
+    assert_eq!(snapshot.turn, 1, "interrupted batch must close turn");
     assert!(snapshot.pending_work.iter().any(|work| {
         work.id == "finished-call"
             && matches!(
@@ -1230,6 +1300,12 @@ struct ChronologyProvider {
     replay_sequences: Mutex<Vec<Vec<String>>>,
 }
 
+#[derive(Default)]
+struct PendingSupersedeProvider {
+    requests: Mutex<usize>,
+    replay_sequences: Mutex<Vec<Vec<String>>>,
+}
+
 impl ChronologyProvider {
     fn replay_sequences(&self) -> Vec<Vec<String>> {
         self.replay_sequences
@@ -1276,6 +1352,53 @@ impl LlmStream for ChronologyProvider {
         *requests += 1;
         drop(requests);
         Box::pin(async move { Ok(Box::pin(stream::iter(events)) as BoxCompletionStream) })
+    }
+}
+
+impl PendingSupersedeProvider {
+    fn replay_sequences(&self) -> Vec<Vec<String>> {
+        self.replay_sequences
+            .lock()
+            .expect("replay sequence lock")
+            .clone()
+    }
+}
+
+impl LlmStream for PendingSupersedeProvider {
+    fn name(&self) -> &'static str {
+        "pending_supersede_provider"
+    }
+
+    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        let sequence = request
+            .replay_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                CompletionReplayItem::Prompt(prompt) => Some(format!("user:{prompt}")),
+                CompletionReplayItem::Turn(_) => None,
+            })
+            .collect::<Vec<_>>();
+        self.replay_sequences
+            .lock()
+            .expect("replay sequence lock")
+            .push(sequence);
+
+        let mut requests = self.requests.lock().expect("request lock");
+        let request = *requests;
+        *requests += 1;
+        drop(requests);
+
+        Box::pin(async move {
+            match request {
+                0 => Ok(Box::pin(
+                    stream::iter(vec![Ok(CompletionEvent::Delta("partial".to_owned()))])
+                        .chain(stream::pending()),
+                ) as BoxCompletionStream),
+                1 => Ok(Box::pin(stream::iter(vec![Ok(CompletionEvent::Finished)]))
+                    as BoxCompletionStream),
+                request => panic!("unexpected provider request {request}"),
+            }
+        })
     }
 }
 
