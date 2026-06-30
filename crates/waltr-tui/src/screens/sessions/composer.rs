@@ -251,11 +251,11 @@ fn detail_metrics_line(session: &SessionView, context_tokens: u64) -> Line<'stat
                 "{}/{}",
                 cache_rate(
                     session.metrics.cache_read_tokens,
-                    session.metrics.input_tokens
+                    session.metrics.total_input_tokens
                 ),
                 cache_rate(
                     session.metrics.cache_write_tokens,
-                    session.metrics.input_tokens
+                    session.metrics.total_input_tokens
                 )
             ),
             panel_muted_style(),

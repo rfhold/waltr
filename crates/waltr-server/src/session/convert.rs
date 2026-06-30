@@ -44,6 +44,8 @@ fn session_metrics_to_proto(metrics: waltr_agent::SessionMetrics) -> ProtoSessio
         image_input_tokens: metrics.image_input_tokens,
         image_input_count: metrics.image_input_count,
         total_tokens: metrics.total_tokens,
+        total_input_tokens: metrics.total_input_tokens,
+        context_tokens: metrics.context_tokens,
         cost_currency: metrics.cost_currency,
         total_cost_micros: metrics.total_cost_micros,
     }

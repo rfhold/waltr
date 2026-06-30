@@ -274,6 +274,44 @@ pub(crate) fn timeline_metrics_event(
                 "usage": {
                     "inputTokens": input_tokens,
                     "outputTokens": output_tokens,
+                    "totalInputTokens": input_tokens,
+                    "contextTokens": input_tokens + output_tokens,
+                },
+            })
+            .to_string(),
+        },
+        status: None,
+        metadata_json: "{}".to_owned(),
+    }
+}
+
+pub(crate) fn timeline_cached_metrics_event(
+    cursor: u64,
+    session_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+) -> TimelineEventView {
+    let total_input_tokens = input_tokens + cache_read_tokens + cache_write_tokens;
+    TimelineEventView {
+        cursor,
+        session_id: session_id.to_owned(),
+        turn: cursor,
+        item_id: format!("metrics-{cursor}"),
+        parent_id: None,
+        kind: TimelineEventKindView::ItemFinished,
+        channel: Some("metrics".to_owned()),
+        content: TimelineContentView::Json {
+            value_json: json!({
+                "kind": "turn_metrics",
+                "usage": {
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "cacheReadTokens": cache_read_tokens,
+                    "cacheWriteTokens": cache_write_tokens,
+                    "totalInputTokens": total_input_tokens,
+                    "contextTokens": total_input_tokens + output_tokens,
                 },
             })
             .to_string(),

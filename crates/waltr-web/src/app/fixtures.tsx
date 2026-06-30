@@ -87,6 +87,8 @@ function sessionView(id: string): SessionView {
       imageInputTokens: 0n,
       imageInputCount: 0n,
       totalTokens: 0n,
+      totalInputTokens: 0n,
+      contextTokens: 0n,
       costCurrency: null,
       totalCostMicros: 0n,
     },

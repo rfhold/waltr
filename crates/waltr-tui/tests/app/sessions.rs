@@ -519,6 +519,31 @@ fn sessions_detail_composer_uses_latest_context_tokens() {
 }
 
 #[test]
+fn sessions_detail_composer_uses_cached_context_and_rates() {
+    let mut session = session_view("chat", 1);
+    session.metrics.input_tokens = 100;
+    session.metrics.output_tokens = 10;
+    session.metrics.cache_read_tokens = 100;
+    session.metrics.cache_write_tokens = 20;
+    session.metrics.total_tokens = 110;
+    session.metrics.total_input_tokens = 220;
+    session.metrics.context_tokens = 230;
+    let mut app = open_sessions_app_with(watched_session_with_timeline(
+        session,
+        vec![timeline_cached_metrics_event(1, "chat", 100, 10, 100, 20)],
+    ));
+
+    assert_eq!(
+        app.handle_event(&right_press(), Instant::now()),
+        expected_register_timeline_command("chat")
+    );
+
+    let rendered = render_app_with_size(&app, 120, 24);
+    assert!(rendered.contains("ctx 230"));
+    assert!(rendered.contains("c 45.5%/9.1%"));
+}
+
+#[test]
 fn sessions_detail_shell_prefers_progress_attached_by_parent_item_id() {
     let mut app = open_sessions_app_with(watched_session_with_timeline(
         session_view("chat", 1),

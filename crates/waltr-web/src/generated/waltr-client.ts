@@ -386,7 +386,7 @@ mcpServers: Array<SessionMcpServerRuntimeView>, };
 
 export type SessionMetricsView = { 
 /**
- * Input/prompt tokens consumed by provider requests.
+ * Non-cache/base-priced input tokens consumed by provider requests.
  */
 inputTokens: bigint, 
 /**
@@ -413,6 +413,14 @@ imageInputCount: bigint,
  * Total billable/token-counted input and output tokens.
  */
 totalTokens: bigint, 
+/**
+ * Full input tokens represented by provider usage reports, including cache reads and writes.
+ */
+totalInputTokens: bigint, 
+/**
+ * Full context tokens represented by provider usage reports, including cache reads, writes, and output.
+ */
+contextTokens: bigint, 
 /**
  * Currency for total cost, or `mixed` when journaled turns differ.
  */
