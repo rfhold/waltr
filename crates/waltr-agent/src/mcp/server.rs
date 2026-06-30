@@ -51,7 +51,8 @@ impl McpServer {
         if let Some(tools) = &state.tools {
             return Ok(tools.clone());
         }
-        let tools = self.fetch_tools(cancellation_token).await?;
+        let mut tools = self.fetch_tools(cancellation_token).await?;
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
         state.tools = Some(tools.clone());
         drop(state);
         Ok(tools)

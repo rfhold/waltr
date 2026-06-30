@@ -6,15 +6,29 @@ use crate::stream::{
     CompletionReplayItem, CompletionRequest, ToolCall, ToolDefinition, ToolResult, TurnItem,
 };
 
-pub(super) fn chat_body(model: &str, request: &CompletionRequest<'_>) -> Value {
-    json!({
+use super::super::cache::prompt_cache_key;
+
+pub(super) fn chat_body(
+    model: &str,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<&str>,
+    request: &CompletionRequest<'_>,
+) -> Value {
+    let mut body = json!({
         "model": model,
         "stream": true,
         "store": false,
         "stream_options": { "include_usage": true },
         "messages": chat_messages(request),
         "tools": chat_tools(&request.tools),
-    })
+    });
+    if prompt_cache {
+        body["prompt_cache_key"] = json!(prompt_cache_key(model, request));
+        if let Some(retention) = prompt_cache_retention {
+            body["prompt_cache_retention"] = json!(retention);
+        }
+    }
+    body
 }
 
 pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
@@ -101,7 +115,7 @@ mod tests {
 
     use crate::{CompletionRequest, CompletionTurn, PromptTurn, ToolCall, ToolResult, TurnItem};
 
-    use super::chat_messages;
+    use super::{chat_body, chat_messages};
 
     #[test]
     fn chat_messages_prepend_system_prompt() {
@@ -114,6 +128,30 @@ mod tests {
         assert_eq!(messages[0]["content"], "system text");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[1]["content"], "hello");
+    }
+
+    #[test]
+    fn chat_body_includes_prompt_cache_key_by_default() {
+        let request = CompletionRequest::new("hello");
+
+        let body = chat_body("gpt-test", true, Some("24h"), &request);
+
+        assert!(
+            body["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("waltr-"))
+        );
+        assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn chat_body_can_disable_prompt_cache_key() {
+        let request = CompletionRequest::new("hello");
+
+        let body = chat_body("gpt-test", false, Some("24h"), &request);
+
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]

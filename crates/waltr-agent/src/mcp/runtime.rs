@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -10,7 +10,7 @@ use super::{
 };
 
 pub(in crate::mcp) struct McpRuntime {
-    servers: HashMap<String, Arc<McpServer>>,
+    servers: Vec<Arc<McpServer>>,
 }
 
 impl McpRuntime {
@@ -18,10 +18,7 @@ impl McpRuntime {
         Self {
             servers: configs
                 .into_iter()
-                .map(|config| {
-                    let name = config.name.clone();
-                    (name, Arc::new(McpServer::new(config, timeout)))
-                })
+                .map(|config| Arc::new(McpServer::new(config, timeout)))
                 .collect(),
         }
     }
@@ -31,7 +28,7 @@ impl McpRuntime {
         cancellation_token: CancellationToken,
     ) -> Result<Vec<AgentTool>> {
         let mut tools = Vec::new();
-        for server in self.servers.values() {
+        for server in &self.servers {
             if cancellation_token.is_cancelled() {
                 return Err(protocol_error("MCP request canceled"));
             }
@@ -83,7 +80,8 @@ impl McpRuntime {
 
     fn server(&self, server_name: &str) -> Result<Arc<McpServer>> {
         self.servers
-            .get(server_name)
+            .iter()
+            .find(|server| server.name() == server_name)
             .cloned()
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))
     }

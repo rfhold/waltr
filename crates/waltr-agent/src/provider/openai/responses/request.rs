@@ -8,9 +8,13 @@ use crate::stream::{
     ToolResult, TurnItem,
 };
 
+use super::super::cache::prompt_cache_key;
+
 pub(in crate::provider::openai) fn responses_body(
     model: &str,
     reasoning: Option<&OpenAiReasoningConfig>,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<&str>,
     request: &CompletionRequest<'_>,
 ) -> Value {
     let mut body = json!({
@@ -29,6 +33,12 @@ pub(in crate::provider::openai) fn responses_body(
     }
     if let Some(system_prompt) = request.system_prompt {
         body["instructions"] = json!(system_prompt);
+    }
+    if prompt_cache {
+        body["prompt_cache_key"] = json!(prompt_cache_key(model, request));
+        if let Some(retention) = prompt_cache_retention {
+            body["prompt_cache_retention"] = json!(retention);
+        }
     }
     body
 }
@@ -128,7 +138,7 @@ mod tests {
         let mut request = CompletionRequest::new("hello");
         request.system_prompt = Some("system text");
 
-        let body = responses_body("gpt-test", None, &request);
+        let body = responses_body("gpt-test", None, true, None, &request);
         let input = &body["input"];
 
         assert_eq!(body["instructions"], "system text");
@@ -147,6 +157,8 @@ mod tests {
                 effort: OpenAiReasoningEffort::Low,
                 summary: Some(OpenAiReasoningSummary::Auto),
             }),
+            true,
+            None,
             &request,
         );
 
@@ -160,10 +172,34 @@ mod tests {
     fn responses_body_requests_encrypted_reasoning_without_reasoning_config() {
         let request = CompletionRequest::new("hello");
 
-        let body = responses_body("gpt-test", None, &request);
+        let body = responses_body("gpt-test", None, true, None, &request);
 
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn responses_body_includes_prompt_cache_key_by_default() {
+        let request = CompletionRequest::new("hello");
+
+        let body = responses_body("gpt-test", None, true, Some("24h"), &request);
+
+        assert!(
+            body["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("waltr-"))
+        );
+        assert_eq!(body["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn responses_body_can_disable_prompt_cache_key() {
+        let request = CompletionRequest::new("hello");
+
+        let body = responses_body("gpt-test", None, false, Some("24h"), &request);
+
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]

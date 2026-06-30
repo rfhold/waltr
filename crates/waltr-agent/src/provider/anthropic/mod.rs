@@ -24,6 +24,7 @@ pub struct AnthropicMessages {
     messages_url: String,
     max_tokens: u32,
     thinking: Option<AnthropicThinkingConfig>,
+    prompt_cache: bool,
     client: reqwest::Client,
 }
 
@@ -36,6 +37,7 @@ impl AnthropicMessages {
             messages_url: ANTHROPIC_MESSAGES_URL.to_owned(),
             max_tokens: DEFAULT_MAX_TOKENS,
             thinking: None,
+            prompt_cache: true,
             client: reqwest::Client::new(),
         }
     }
@@ -67,6 +69,13 @@ impl AnthropicMessages {
         self.thinking = Some(config);
         self
     }
+
+    /// Disable Anthropic prompt cache control on outgoing requests.
+    #[must_use]
+    pub const fn without_prompt_cache(mut self) -> Self {
+        self.prompt_cache = false;
+        self
+    }
 }
 
 impl LlmStream for AnthropicMessages {
@@ -81,6 +90,7 @@ impl LlmStream for AnthropicMessages {
             &self.model,
             self.max_tokens,
             self.thinking.as_ref(),
+            self.prompt_cache,
             &request,
         ))
     }

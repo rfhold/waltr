@@ -31,6 +31,8 @@ mod shell;
 #[path = "live/agent/timeline.rs"]
 mod timeline;
 
+#[path = "live/prompt_cache.rs"]
+mod prompt_cache;
 #[path = "live/streaming.rs"]
 mod streaming;
 #[path = "live/thinking.rs"]

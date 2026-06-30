@@ -1,5 +1,6 @@
 //! `OpenAI` streaming providers.
 
+mod cache;
 mod chat;
 mod reasoning;
 mod responses;

@@ -24,6 +24,7 @@ pub(super) async fn send_request(
             &provider.model,
             provider.max_tokens,
             provider.thinking.as_ref(),
+            provider.prompt_cache,
             &request,
         ));
     for (name, value) in &provider.headers {
