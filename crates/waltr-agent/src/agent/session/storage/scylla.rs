@@ -147,6 +147,17 @@ impl ScyllaSessionStore {
         self.save_record(&record).await?;
         Ok((revision, value))
     }
+
+    async fn update_metadata_record(
+        &self,
+        id: &SessionId,
+        update: impl FnOnce(&mut SessionRecord) + Send,
+    ) -> SessionStoreResult<SessionRecord> {
+        let mut record = self.load_record(id).await?;
+        update(&mut record);
+        self.save_record(&record).await?;
+        Ok(record)
+    }
 }
 
 impl SessionStore for ScyllaSessionStore {
@@ -269,14 +280,9 @@ impl SessionStore for ScyllaSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let revision = store.load_record(&id).await?.revision;
-            let (_, record) = store
-                .update_record(&id, revision, |record, _| {
-                    record.set_metadata_value(key, value);
-                    Ok(record.clone())
-                })
-                .await?;
-            Ok(record)
+            store
+                .update_metadata_record(&id, |record| record.set_metadata_value(key, value))
+                .await
         }
     }
 
@@ -288,14 +294,11 @@ impl SessionStore for ScyllaSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let revision = store.load_record(&id).await?.revision;
-            let (_, record) = store
-                .update_record(&id, revision, |record, _| {
+            store
+                .update_metadata_record(&id, |record| {
                     record.remove_metadata_value(&key);
-                    Ok(record.clone())
                 })
-                .await?;
-            Ok(record)
+                .await
         }
     }
 
