@@ -767,6 +767,8 @@ type TurnMetricsTimelineItem = {
   imageInputTokens: bigint;
   imageInputCount: bigint;
   totalTokens: bigint;
+  totalInputTokens: bigint;
+  contextTokens: bigint;
   costCurrency: string | null;
   totalCostMicros: bigint;
   addedInputTokens: bigint | null;
@@ -839,7 +841,7 @@ function TimelineItem(props: {
 function TurnMetricsTimelineItemView(props: { item: TurnMetricsTimelineItem }) {
   return (
     <article class="sessions__timeline-metrics" aria-label="Turn token metrics">
-      <span title={`Input ${formatTokenCount(props.item.inputTokens)} / output ${formatTokenCount(props.item.outputTokens)}`}>{formatTokenCount(props.item.totalTokens)} tok</span>
+      <span title={`Input ${formatTokenCount(props.item.totalInputTokens)} / output ${formatTokenCount(props.item.outputTokens)}`}>{formatTokenCount(props.item.contextTokens)} tok</span>
       <span title="Added input on the next request">+{props.item.addedInputTokens === null ? "-" : formatTokenCount(props.item.addedInputTokens)} in</span>
       <span title="Cache-hit rate on the next request">{props.item.addedInputBaseTokens === null || props.item.addedInputCacheReadTokens === null ? "-" : formatCacheRate(props.item.addedInputCacheReadTokens, props.item.addedInputBaseTokens)} hit</span>
       <span>{formatCostMicros(props.item.totalCostMicros, props.item.costCurrency)}</span>
@@ -1062,7 +1064,7 @@ function latestTurnMetrics(items: TimelineItemModel[]) {
 }
 
 function latestContextTokens(item: TurnMetricsTimelineItem | undefined) {
-  return item ? item.inputTokens + item.outputTokens : 0n;
+  return item ? item.contextTokens : 0n;
 }
 
 function ExternalRequestTimelineItem(props: {
@@ -1367,9 +1369,9 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
   for (let index = 0; index < metricItems.length - 1; index += 1) {
     const current = metricItems[index]!;
     const next = metricItems[index + 1]!;
-    current.addedInputTokens = next.inputTokens > current.inputTokens ? next.inputTokens - current.inputTokens : 0n;
+    current.addedInputTokens = next.totalInputTokens > current.totalInputTokens ? next.totalInputTokens - current.totalInputTokens : 0n;
     current.addedInputCacheReadTokens = next.cacheReadTokens;
-    current.addedInputBaseTokens = next.inputTokens;
+    current.addedInputBaseTokens = next.totalInputTokens;
   }
 
   return items;
@@ -1383,16 +1385,25 @@ function turnMetricsItem(id: string, valueJson: string): TurnMetricsTimelineItem
 
   const usage = asRecord(payload.usage) ?? {};
   const cost = asRecord(payload.cost);
+  const inputTokens = asBigInt(usage.inputTokens);
+  const outputTokens = asBigInt(usage.outputTokens);
+  const cacheReadTokens = asBigInt(usage.cacheReadTokens);
+  const cacheWriteTokens = asBigInt(usage.cacheWriteTokens);
+  const imageInputTokens = asBigInt(usage.imageInputTokens);
+  const totalInputTokens = asBigInt(usage.totalInputTokens) || inputTokens + cacheReadTokens + cacheWriteTokens + imageInputTokens;
+  const contextTokens = asBigInt(usage.contextTokens) || totalInputTokens + outputTokens;
   return {
     id,
     kind: "metrics",
-    inputTokens: asBigInt(usage.inputTokens),
-    outputTokens: asBigInt(usage.outputTokens),
-    cacheReadTokens: asBigInt(usage.cacheReadTokens),
-    cacheWriteTokens: asBigInt(usage.cacheWriteTokens),
-    imageInputTokens: asBigInt(usage.imageInputTokens),
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    imageInputTokens,
     imageInputCount: asBigInt(usage.imageInputCount),
     totalTokens: asBigInt(usage.totalTokens),
+    totalInputTokens,
+    contextTokens,
     costCurrency: typeof cost?.currency === "string" ? cost.currency : null,
     totalCostMicros: asBigInt(cost?.totalMicros),
     addedInputTokens: null,
@@ -1825,7 +1836,7 @@ function SessionDetailStatusBar(props: {
           <strong>Ctx</strong> {formatTokenCount(props.contextTokens)}
         </span>
         <span class="sessions__detail-status-item">
-          <strong>Cache</strong> {formatCacheRate(props.session.metrics.cacheReadTokens, props.session.metrics.inputTokens)} / {formatCacheRate(props.session.metrics.cacheWriteTokens, props.session.metrics.inputTokens)}
+          <strong>Cache</strong> {formatCacheRate(props.session.metrics.cacheReadTokens, props.session.metrics.totalInputTokens)} / {formatCacheRate(props.session.metrics.cacheWriteTokens, props.session.metrics.totalInputTokens)}
         </span>
         <span class="sessions__detail-status-item">
           <strong>Cost</strong> {formatCostMicros(props.session.metrics.totalCostMicros, props.session.metrics.costCurrency)}

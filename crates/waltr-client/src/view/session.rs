@@ -37,7 +37,7 @@ pub struct SessionView {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMetricsView {
-    /// Input/prompt tokens consumed by provider requests.
+    /// Non-cache/base-priced input tokens consumed by provider requests.
     pub input_tokens: u64,
     /// Output/completion tokens produced by provider responses.
     pub output_tokens: u64,
@@ -51,6 +51,10 @@ pub struct SessionMetricsView {
     pub image_input_count: u64,
     /// Total billable/token-counted input and output tokens.
     pub total_tokens: u64,
+    /// Full input tokens represented by provider usage reports, including cache reads and writes.
+    pub total_input_tokens: u64,
+    /// Full context tokens represented by provider usage reports, including cache reads, writes, and output.
+    pub context_tokens: u64,
     /// Currency for total cost, or `mixed` when journaled turns differ.
     pub cost_currency: Option<String>,
     /// Total cost in currency micro-units.
@@ -315,6 +319,8 @@ impl From<SessionMetrics> for SessionMetricsView {
             image_input_tokens: metrics.image_input_tokens,
             image_input_count: metrics.image_input_count,
             total_tokens: metrics.total_tokens,
+            total_input_tokens: metrics.total_input_tokens,
+            context_tokens: metrics.context_tokens,
             cost_currency: metrics.cost_currency,
             total_cost_micros: metrics.total_cost_micros,
         }

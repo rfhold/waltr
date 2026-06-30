@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import type { ClientCommand, ClientSnapshot, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, testHistory } from "../support/routes";
-import { emptyConfig, readySessionTimeline, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
+import { emptyConfig, readySessionTimeline, sessionMetricsView, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
 
 describe("sessions route", () => {
   test("lists sessions sorted by most recently updated", () => {
@@ -47,6 +47,55 @@ describe("sessions route", () => {
       "registerSessionWatchInterest",
       "registerSessionTimelineWatchInterest",
     ]);
+  });
+
+  test("session detail metrics use full context tokens with cache", () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-cache"),
+    ]);
+    snapshot.sessions.current[0]!.metrics = {
+      ...sessionMetricsView(),
+      inputTokens: 100n,
+      outputTokens: 10n,
+      cacheReadTokens: 100n,
+      cacheWriteTokens: 20n,
+      totalTokens: 110n,
+      totalInputTokens: 220n,
+      contextTokens: 230n,
+    };
+    snapshot.sessions.timelines["session-cache"] = readySessionTimeline();
+    snapshot.sessions.timelines["session-cache"].events = [
+      timelineEvent({
+        cursor: 1n,
+        sessionId: "session-cache",
+        itemId: "metrics:1",
+        channel: "metrics",
+        content: {
+          kind: "json",
+          value_json: JSON.stringify({
+            kind: "turn_metrics",
+            usage: {
+              inputTokens: 100,
+              outputTokens: 10,
+              cacheReadTokens: 100,
+              cacheWriteTokens: 20,
+              totalTokens: 110,
+              totalInputTokens: 220,
+              contextTokens: 230,
+            },
+          }),
+        },
+      }),
+    ];
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-cache",
+      snapshot,
+    });
+
+    expect(screen.getByLabelText("Session token and cost totals").textContent).toContain("Ctx 230");
+    expect(screen.getByLabelText("Session token and cost totals").textContent).toContain("Cache 45.5% / 9.1%");
+    expect(screen.getByLabelText("Turn token metrics").textContent).toContain("230 tok");
   });
 
   test("creating a session routes to the created session", async () => {

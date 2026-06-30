@@ -1303,6 +1303,8 @@ fn provider_metrics_timeline_event(
                     "imageInputTokens": usage.image_input_tokens.unwrap_or_default(),
                     "imageInputCount": usage.image_input_count.unwrap_or_default(),
                     "totalTokens": usage.total_tokens(),
+                    "totalInputTokens": usage.total_input_tokens(),
+                    "contextTokens": usage.context_tokens(),
                 },
                 "cost": cost.map(|cost| json!({
                     "currency": cost.currency,

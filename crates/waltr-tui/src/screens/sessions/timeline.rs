@@ -215,9 +215,13 @@ fn context_tokens_from_metrics_event(event: &TimelineEventView) -> Option<u64> {
         return None;
     }
 
-    let input = json_u64_path(&value, &["usage", "input_tokens"])
-        .or_else(|| json_u64_path(&value, &["usage", "inputTokens"]))
-        .unwrap_or_default();
+    if let Some(context) = json_u64_path(&value, &["usage", "context_tokens"])
+        .or_else(|| json_u64_path(&value, &["usage", "contextTokens"]))
+    {
+        return Some(context);
+    }
+
+    let input = usage_total_input_tokens(&value);
     let output = json_u64_path(&value, &["usage", "output_tokens"])
         .or_else(|| json_u64_path(&value, &["usage", "outputTokens"]))
         .unwrap_or_default();
@@ -1185,15 +1189,14 @@ fn metrics_line(event: &TimelineEventView) -> Option<String> {
         return None;
     }
 
-    let input = json_u64_path(&value, &["usage", "input_tokens"])
-        .or_else(|| json_u64_path(&value, &["usage", "inputTokens"]));
+    let input = usage_total_input_tokens(&value);
     let output = json_u64_path(&value, &["usage", "output_tokens"])
         .or_else(|| json_u64_path(&value, &["usage", "outputTokens"]));
     let cost = json_u64_path(&value, &["cost", "total_micros"])
         .or_else(|| json_u64_path(&value, &["cost", "totalMicros"]));
 
     let mut parts = Vec::new();
-    if let Some(input) = input {
+    if input > 0 {
         parts.push(format!("i{}", format_count(input)));
     }
     if let Some(output) = output {
@@ -1208,6 +1211,27 @@ fn metrics_line(event: &TimelineEventView) -> Option<String> {
     } else {
         Some(parts.join("  "))
     }
+}
+
+fn usage_total_input_tokens(value: &Value) -> u64 {
+    if let Some(total) = json_u64_path(value, &["usage", "total_input_tokens"])
+        .or_else(|| json_u64_path(value, &["usage", "totalInputTokens"]))
+    {
+        return total;
+    }
+
+    json_u64_path(value, &["usage", "input_tokens"])
+        .or_else(|| json_u64_path(value, &["usage", "inputTokens"]))
+        .unwrap_or_default()
+        + json_u64_path(value, &["usage", "cache_read_tokens"])
+            .or_else(|| json_u64_path(value, &["usage", "cacheReadTokens"]))
+            .unwrap_or_default()
+        + json_u64_path(value, &["usage", "cache_write_tokens"])
+            .or_else(|| json_u64_path(value, &["usage", "cacheWriteTokens"]))
+            .unwrap_or_default()
+        + json_u64_path(value, &["usage", "image_input_tokens"])
+            .or_else(|| json_u64_path(value, &["usage", "imageInputTokens"]))
+            .unwrap_or_default()
 }
 
 fn metrics_item_line(metrics: &str, width: Option<u16>) -> Line<'static> {

@@ -56,7 +56,7 @@ pub struct ProviderTurnMetadata {
 /// Typed token usage reported by a provider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
-    /// Input/prompt tokens consumed by the request.
+    /// Non-cache/base-priced input tokens consumed by the request.
     pub input_tokens: Option<u64>,
     /// Output/completion tokens produced by the response.
     pub output_tokens: Option<u64>,
@@ -75,7 +75,24 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Total non-cache input and output tokens reported by the provider.
+    /// Full input tokens represented by the provider usage report, including
+    /// cache reads and writes.
+    #[must_use]
+    pub fn total_input_tokens(self) -> u64 {
+        self.input_tokens.unwrap_or_default()
+            + self.cache_read_tokens.unwrap_or_default()
+            + self.cache_write_tokens.unwrap_or_default()
+            + self.image_input_tokens.unwrap_or_default()
+    }
+
+    /// Full context tokens represented by the provider usage report, including
+    /// cache reads, cache writes, non-cache input, image input, and output.
+    #[must_use]
+    pub fn context_tokens(self) -> u64 {
+        self.total_input_tokens() + self.output_tokens.unwrap_or_default()
+    }
+
+    /// Total non-cache input and output tokens used for base token accounting.
     #[must_use]
     pub fn total_tokens(self) -> u64 {
         self.input_tokens.unwrap_or_default()
@@ -612,7 +629,7 @@ mod tests {
 
     use super::{
         CompletionRequest, CompletionTurn, ProviderTurnMetadata, ThinkingBlock, ThinkingBlockKind,
-        TurnItem,
+        TokenUsage, TurnItem,
     };
 
     #[test]
@@ -620,6 +637,22 @@ mod tests {
         let request = CompletionRequest::new("hello");
 
         assert!(request.turns.is_empty());
+    }
+
+    #[test]
+    fn token_usage_separates_base_total_from_full_context() {
+        let usage = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            cache_read_tokens: Some(100),
+            cache_write_tokens: Some(20),
+            image_input_tokens: Some(3),
+            ..Default::default()
+        };
+
+        assert_eq!(usage.total_tokens(), 17);
+        assert_eq!(usage.total_input_tokens(), 133);
+        assert_eq!(usage.context_tokens(), 137);
     }
 
     #[test]

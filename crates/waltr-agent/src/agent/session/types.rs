@@ -235,7 +235,7 @@ pub struct SessionSummary {
 /// Durable usage and cost totals for a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetrics {
-    /// Input/prompt tokens consumed by provider requests.
+    /// Non-cache/base-priced input tokens consumed by provider requests.
     pub input_tokens: u64,
     /// Output/completion tokens produced by provider responses.
     pub output_tokens: u64,
@@ -249,6 +249,12 @@ pub struct SessionMetrics {
     pub image_input_count: u64,
     /// Total billable/token-counted input and output tokens.
     pub total_tokens: u64,
+    /// Full input tokens represented by provider usage reports, including cache reads and writes.
+    #[serde(default)]
+    pub total_input_tokens: u64,
+    /// Full context tokens represented by provider usage reports, including cache reads, writes, and output.
+    #[serde(default)]
+    pub context_tokens: u64,
     /// Currency for total cost, or `mixed` when journaled turns differ.
     pub cost_currency: Option<String>,
     /// Total cost in currency micro-units.
@@ -265,6 +271,8 @@ impl SessionMetrics {
             self.image_input_tokens += usage.image_input_tokens.unwrap_or_default();
             self.image_input_count += usage.image_input_count.unwrap_or_default();
             self.total_tokens += usage.total_tokens();
+            self.total_input_tokens += usage.total_input_tokens();
+            self.context_tokens += usage.context_tokens();
         }
         if let Some(cost) = &metadata.cost {
             self.total_cost_micros += cost.total_micros;
@@ -1022,6 +1030,8 @@ mod tests {
             usage: Some(crate::TokenUsage {
                 input_tokens: Some(5),
                 output_tokens: Some(2),
+                cache_read_tokens: Some(11),
+                cache_write_tokens: Some(7),
                 ..Default::default()
             }),
             cost: None,
@@ -1114,6 +1124,10 @@ mod tests {
         assert_eq!(snapshot.assistant_texts().collect::<Vec<_>>(), ["hello"]);
         assert_eq!(snapshot.tool_calls().collect::<Vec<_>>(), [&call]);
         assert_eq!(snapshot.tool_results().collect::<Vec<_>>(), [&result]);
+        let metrics = snapshot.metrics();
+        assert_eq!(metrics.total_tokens, 7);
+        assert_eq!(metrics.total_input_tokens, 23);
+        assert_eq!(metrics.context_tokens, 25);
         assert_eq!(snapshot.turn, 1);
         assert_eq!(snapshot.status, SessionStatus::Finished);
         assert_eq!(

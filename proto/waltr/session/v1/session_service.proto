@@ -233,6 +233,7 @@ message SessionSummary {
 }
 
 message SessionMetrics {
+  // Non-cache/base-priced input tokens consumed by provider requests.
   uint64 input_tokens = 1;
   uint64 output_tokens = 2;
   uint64 cache_read_tokens = 3;
@@ -242,6 +243,8 @@ message SessionMetrics {
   uint64 total_tokens = 7;
   optional string cost_currency = 8;
   uint64 total_cost_micros = 9;
+  uint64 total_input_tokens = 10;
+  uint64 context_tokens = 11;
 }
 
 message SessionRuntimeConfig {

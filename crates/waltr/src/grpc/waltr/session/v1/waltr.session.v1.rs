@@ -265,6 +265,7 @@ pub struct SessionSummary {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionMetrics {
+    /// Non-cache/base-priced input tokens consumed by provider requests.
     #[prost(uint64, tag="1")]
     pub input_tokens: u64,
     #[prost(uint64, tag="2")]
@@ -283,6 +284,10 @@ pub struct SessionMetrics {
     pub cost_currency: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, tag="9")]
     pub total_cost_micros: u64,
+    #[prost(uint64, tag="10")]
+    pub total_input_tokens: u64,
+    #[prost(uint64, tag="11")]
+    pub context_tokens: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionRuntimeConfig {
