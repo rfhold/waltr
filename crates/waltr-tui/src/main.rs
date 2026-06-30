@@ -3,6 +3,13 @@
 use std::{env, io, net::SocketAddr};
 
 use waltr_tui::runtime;
+use ratatui::crossterm::{
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+    execute,
+};
 
 const DEFAULT_EMBEDDED_SERVER_ADDR: &str = "127.0.0.1:14333";
 const SERVER_ADDR_ENV: &str = "WALTR_SERVER_ADDR";
@@ -19,9 +26,85 @@ async fn main() -> io::Result<()> {
     let runtime_options = runtime_options(&options).await?;
 
     let mut terminal = ratatui::init();
+    let mut terminal_modes = TerminalModeGuard::new();
+    terminal_modes.enable_mouse_capture()?;
+    terminal_modes.enable_enhanced_keyboard();
     let result = runtime::run_with_options(&mut terminal, runtime_options).await;
-    ratatui::restore();
-    result
+    let restore_result = terminal_modes.restore();
+
+    result.and(restore_result)
+}
+
+fn enable_enhanced_keyboard() -> io::Result<()> {
+    execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )
+}
+
+#[derive(Debug, Default)]
+struct TerminalModeGuard {
+    mouse_capture: bool,
+    enhanced_keyboard: bool,
+    restored: bool,
+}
+
+impl TerminalModeGuard {
+    const fn new() -> Self {
+        Self {
+            mouse_capture: false,
+            enhanced_keyboard: false,
+            restored: false,
+        }
+    }
+
+    fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnableMouseCapture)?;
+        self.mouse_capture = true;
+        Ok(())
+    }
+
+    fn enable_enhanced_keyboard(&mut self) {
+        self.enhanced_keyboard = enable_enhanced_keyboard().is_ok();
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let mut error = None;
+
+        if self.enhanced_keyboard {
+            if let Err(restore_error) = execute!(io::stdout(), PopKeyboardEnhancementFlags) {
+                if error.is_none() {
+                    error = Some(restore_error);
+                }
+            }
+            self.enhanced_keyboard = false;
+        }
+
+        if self.mouse_capture {
+            if let Err(restore_error) = execute!(io::stdout(), DisableMouseCapture) {
+                if error.is_none() {
+                    error = Some(restore_error);
+                }
+            }
+            self.mouse_capture = false;
+        }
+
+        ratatui::restore();
+        self.restored = true;
+
+        error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if !self.restored {
+            drop(self.restore());
+        }
+    }
 }
 
 impl CliOptions {

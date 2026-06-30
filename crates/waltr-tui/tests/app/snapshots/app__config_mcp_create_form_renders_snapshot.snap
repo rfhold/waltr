@@ -1,6 +1,5 @@
 ---
-source: crates/waltr-tui/tests/app.rs
-assertion_line: 22
+source: crates/waltr-tui/tests/app/config.rs
 expression: render_app(&app)
 ---
 "                                                                                "
@@ -11,19 +10,19 @@ expression: render_app(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                     W     W    A    L      TTTTTTT RRRRR                       "
-"                     W     W   A A   L         T    R    R                      "
-"                     W     W  A   A  L         T    R    R                      "
-"                     W  W  W AAAAAAA L         T    RRRRR                       "
-"                     W W W W A     A L         T    R  R                        "
-"                     WW   WW A     A L         T    R   R                       "
-"                     W     W A     A LLLLLLL   T    R    R                      "
+"                Create MCP server                                               "
 "                                                                                "
-"                          waiting for server status...                          "
+"               * name                                                           "
+"                 type  stdio                                                    "
+"                 command                                                        "
+"               command required before saving                                   "
 "                                                                                "
+"                Tab field  Left/Right type  Enter save  Esc cancel              "
 "                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "
 "                                                                                "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
 "                                                                                "

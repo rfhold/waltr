@@ -9,6 +9,14 @@ pub const fn ctrl_x_press() -> AppEvent {
     )))
 }
 
+pub const fn ctrl_t_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Press,
+    )))
+}
+
 pub const fn char_press(character: char) -> AppEvent {
     AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
         KeyCode::Char(character),
@@ -29,6 +37,14 @@ pub const fn enter_press() -> AppEvent {
     AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
         KeyCode::Enter,
         KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
+pub const fn shift_enter_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Enter,
+        KeyModifiers::SHIFT,
         KeyEventKind::Press,
     )))
 }
@@ -57,10 +73,74 @@ pub const fn tab_press() -> AppEvent {
     )))
 }
 
+pub const fn back_tab_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::BackTab,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
+pub const fn home_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Home,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
+pub const fn end_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::End,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
 pub const fn right_press() -> AppEvent {
     AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
         KeyCode::Right,
         KeyModifiers::NONE,
         KeyEventKind::Press,
     )))
+}
+
+pub const fn left_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Left,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
+pub const fn down_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Down,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
+pub const fn page_up_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::PageUp,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
+pub const fn page_down_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::PageDown,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
+pub const fn scroll_up() -> AppEvent {
+    AppEvent::Input(InputEvent::Scroll(1))
+}
+
+pub const fn scroll_down() -> AppEvent {
+    AppEvent::Input(InputEvent::Scroll(-1))
 }

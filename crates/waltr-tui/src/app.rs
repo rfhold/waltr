@@ -4,7 +4,11 @@ use std::time::{Duration, Instant};
 
 use waltr_client::{ClientCommand, ClientSnapshot};
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::{
+    event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind},
+    terminal,
+};
+use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::{
     event::AppEvent,
@@ -12,7 +16,7 @@ use crate::{
     keys::{KeyCommand, LeaderCommand, key_command},
     screens::{
         ConfigTab, McpSection, ProviderSection, RuntimeDefaultsSection, SectionAction,
-        SessionsSection,
+        SessionsSection, register_timeline_watch_command,
     },
     ui,
     ui::Notice,
@@ -74,6 +78,7 @@ impl CloseIntent {
 #[derive(Debug, Default)]
 pub struct App {
     armed_close: Option<ArmedClose>,
+    armed_session_interrupt: Option<Instant>,
     active_config_tab: ConfigTab,
     provider_section: ProviderSection,
     mcp_section: McpSection,
@@ -91,6 +96,7 @@ impl App {
     pub const fn new() -> Self {
         Self {
             armed_close: None,
+            armed_session_interrupt: None,
             active_config_tab: ConfigTab::Providers,
             provider_section: ProviderSection::new(),
             mcp_section: McpSection::new(),
@@ -136,9 +142,17 @@ impl App {
             InputEvent::Key(key) if self.screen == AppScreen::Sessions => {
                 self.handle_sessions_key(key, now)
             }
+            InputEvent::Scroll(delta) if self.screen == AppScreen::Sessions => {
+                self.handle_sessions_scroll(delta)
+            }
+            InputEvent::Mouse(mouse) if self.screen == AppScreen::Sessions => {
+                self.handle_sessions_mouse(mouse)
+            }
             InputEvent::Key(key) => {
                 self.handle_key_command(key_command(key, self.leader_armed), now)
             }
+            InputEvent::Scroll(_) => AppAction::Continue,
+            InputEvent::Mouse(_) => AppAction::Continue,
         }
     }
 
@@ -149,6 +163,13 @@ impl App {
             .is_some_and(|armed_close| now >= armed_close.expires_at)
         {
             self.armed_close = None;
+        }
+
+        if self
+            .armed_session_interrupt
+            .is_some_and(|expires_at| now >= expires_at)
+        {
+            self.armed_session_interrupt = None;
         }
 
         if self
@@ -213,6 +234,12 @@ impl App {
         &self.sessions_section
     }
 
+    /// Whether Escape has armed interruption for the active session.
+    #[must_use]
+    pub const fn session_interrupt_armed(&self) -> bool {
+        self.armed_session_interrupt.is_some()
+    }
+
     fn handle_close_intent(&mut self, intent: CloseIntent, now: Instant) -> AppAction {
         self.leader_armed = false;
 
@@ -245,6 +272,43 @@ impl App {
                 AppAction::ClientCommand(ClientCommand::ReleaseConfigWatchInterest)
             }
             KeyCommand::Escape if self.screen == AppScreen::Sessions => {
+                self.leader_armed = false;
+                if self.sessions_section.dismiss_overlay() {
+                    self.armed_session_interrupt = None;
+                    return AppAction::Continue;
+                }
+
+                if self
+                    .sessions_section
+                    .detail_footer_status(self.client_snapshot.as_ref())
+                    .is_some_and(|status| status.interruptible)
+                {
+                    if self
+                        .armed_session_interrupt
+                        .is_some_and(|expires_at| now < expires_at)
+                    {
+                        self.armed_session_interrupt = None;
+                        return match self
+                            .sessions_section
+                            .interrupt_current_session(self.client_snapshot.as_ref())
+                        {
+                            SectionAction::ClientCommand(command) => {
+                                AppAction::ClientCommand(command)
+                            }
+                            SectionAction::ClientCommands(commands) => {
+                                AppAction::ClientCommands(commands)
+                            }
+                            SectionAction::Continue | SectionAction::Unhandled => {
+                                AppAction::Continue
+                            }
+                        };
+                    }
+
+                    self.armed_session_interrupt = Some(now + EXIT_ARM_DURATION);
+                    return AppAction::Continue;
+                }
+
+                self.armed_session_interrupt = None;
                 let detail_session_id =
                     self.sessions_section.detail_session_id().map(str::to_owned);
                 if self.sessions_section.dismiss_route_or_overlay() {
@@ -286,22 +350,22 @@ impl App {
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.status.ready)
                 {
-                    let detail_session_id = (self.screen == AppScreen::Sessions)
+                    let leaving_sessions = self.screen == AppScreen::Sessions;
+                    let detail_session_id = leaving_sessions
                         .then(|| self.sessions_section.clear_detail_route())
                         .flatten();
                     self.screen = AppScreen::Config;
-                    return AppAction::from_commands(
-                        detail_session_id
-                            .map(|session_id| {
-                                vec![
-                                    ClientCommand::ReleaseSessionTimelineWatchInterest {
-                                        session_id,
-                                    },
-                                    ClientCommand::RegisterConfigWatchInterest,
-                                ]
-                            })
-                            .unwrap_or_else(|| vec![ClientCommand::RegisterConfigWatchInterest]),
-                    );
+                    let mut commands = Vec::new();
+                    if let Some(session_id) = detail_session_id {
+                        commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
+                            session_id,
+                        });
+                    }
+                    if leaving_sessions {
+                        commands.push(ClientCommand::ReleaseSessionWatchInterest);
+                    }
+                    commands.push(ClientCommand::RegisterConfigWatchInterest);
+                    return AppAction::from_commands(commands);
                 }
 
                 AppAction::Continue
@@ -310,8 +374,28 @@ impl App {
                 self.leader_armed = false;
 
                 if self.screen == AppScreen::Sessions {
+                    if self.sessions_section.in_detail() {
+                        return match self
+                            .sessions_section
+                            .interrupt_current_session(self.client_snapshot.as_ref())
+                        {
+                            SectionAction::ClientCommand(command) => {
+                                AppAction::ClientCommand(command)
+                            }
+                            SectionAction::ClientCommands(commands) => {
+                                AppAction::ClientCommands(commands)
+                            }
+                            SectionAction::Continue | SectionAction::Unhandled => {
+                                AppAction::Continue
+                            }
+                        };
+                    }
+
                     return match self.sessions_section.create_session() {
                         SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                        SectionAction::ClientCommands(commands) => {
+                            AppAction::ClientCommands(commands)
+                        }
                         SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
                     };
                 }
@@ -321,15 +405,68 @@ impl App {
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.status.ready)
                 {
+                    let leaving_config = self.screen == AppScreen::Config;
                     self.screen = AppScreen::Sessions;
-                    return AppAction::ClientCommand(ClientCommand::RegisterSessionWatchInterest);
+                    return AppAction::from_commands(if leaving_config {
+                        vec![
+                            ClientCommand::ReleaseConfigWatchInterest,
+                            ClientCommand::RegisterSessionWatchInterest,
+                        ]
+                    } else {
+                        vec![ClientCommand::RegisterSessionWatchInterest]
+                    });
                 }
 
+                AppAction::Continue
+            }
+            KeyCommand::LeaderCommand(LeaderCommand::Provider) => {
+                self.leader_armed = false;
+                if self.screen == AppScreen::Sessions {
+                    return match self
+                        .sessions_section
+                        .open_provider_runtime_editor(self.client_snapshot.as_ref())
+                    {
+                        SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                        SectionAction::ClientCommands(commands) => {
+                            AppAction::ClientCommands(commands)
+                        }
+                        SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+                    };
+                }
+                AppAction::Continue
+            }
+            KeyCommand::LeaderCommand(LeaderCommand::Mcp) => {
+                self.leader_armed = false;
+                if self.screen == AppScreen::Sessions {
+                    return match self
+                        .sessions_section
+                        .open_mcp_runtime_editor(self.client_snapshot.as_ref())
+                    {
+                        SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                        SectionAction::ClientCommands(commands) => {
+                            AppAction::ClientCommands(commands)
+                        }
+                        SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+                    };
+                }
                 AppAction::Continue
             }
             KeyCommand::LeaderCommand(LeaderCommand::Quit) => {
                 self.leader_armed = false;
                 AppAction::Exit
+            }
+            KeyCommand::LeaderCommand(LeaderCommand::Delete) => {
+                self.leader_armed = false;
+                if self.screen == AppScreen::Sessions {
+                    self.sessions_section
+                        .arm_delete(self.client_snapshot.as_ref());
+                } else {
+                    self.notice = Some(TransientNotice {
+                        text: "unrecognized command: d".to_owned(),
+                        expires_at: now + NOTICE_DURATION,
+                    });
+                }
+                AppAction::Continue
             }
             KeyCommand::LeaderCommand(LeaderCommand::Unknown(command)) => {
                 self.leader_armed = false;
@@ -379,7 +516,7 @@ impl App {
         self.client_snapshot = Some(snapshot);
 
         match (detail_before, detail_after) {
-            (None, Some(session_id)) => vec![register_session_timeline_watch_command(session_id)],
+            (None, Some(session_id)) => vec![register_timeline_watch_command(session_id)],
             (Some(session_id), None) => {
                 vec![ClientCommand::ReleaseSessionTimelineWatchInterest { session_id }]
             }
@@ -388,7 +525,7 @@ impl App {
                     ClientCommand::ReleaseSessionTimelineWatchInterest {
                         session_id: old_session_id,
                     },
-                    register_session_timeline_watch_command(new_session_id),
+                    register_timeline_watch_command(new_session_id),
                 ]
             }
             _ => Vec::new(),
@@ -438,6 +575,7 @@ impl App {
         };
         match action {
             SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+            SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
             SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
         }
     }
@@ -449,9 +587,10 @@ impl App {
         }
 
         let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
+        let area = sessions_body_area();
         match self
             .sessions_section
-            .handle_key(key, self.client_snapshot.as_ref())
+            .handle_key(key, self.client_snapshot.as_ref(), Some(area))
         {
             SectionAction::ClientCommand(command) => {
                 let detail_after = self.sessions_section.detail_session_id().map(str::to_owned);
@@ -469,9 +608,47 @@ impl App {
                     _ => AppAction::ClientCommand(command),
                 }
             }
+            SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
             SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
         }
     }
+
+    fn handle_sessions_mouse(&mut self, mouse: MouseEvent) -> AppAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.handle_sessions_scroll(1),
+            MouseEventKind::ScrollDown => self.handle_sessions_scroll(-1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area = sessions_body_area();
+                self.sessions_section.handle_detail_click(
+                    self.client_snapshot.as_ref(),
+                    area,
+                    mouse.column,
+                    mouse.row,
+                );
+                AppAction::Continue
+            }
+            _ => AppAction::Continue,
+        }
+    }
+
+    fn handle_sessions_scroll(&mut self, delta: i32) -> AppAction {
+        let area = sessions_body_area();
+        match self
+            .sessions_section
+            .scroll_detail(self.client_snapshot.as_ref(), area, delta)
+        {
+            SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+            SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
+            SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+        }
+    }
+}
+
+fn sessions_body_area() -> Rect {
+    let (width, height) = terminal::size().unwrap_or((80, 24));
+    let area = ui::global_content_area(Rect::new(0, 0, width, height));
+    let [body, _footer] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    body
 }
 
 impl AppAction {
@@ -481,25 +658,6 @@ impl AppAction {
             1 => Self::ClientCommand(commands.into_iter().next().expect("one command")),
             _ => Self::ClientCommands(commands),
         }
-    }
-}
-
-fn register_session_timeline_watch_command(session_id: String) -> ClientCommand {
-    ClientCommand::RegisterSessionTimelineWatchInterest {
-        session_id,
-        after_cursor: None,
-        channels: vec![
-            "user_text".to_owned(),
-            "assistant_text".to_owned(),
-            "thinking".to_owned(),
-            "tool_call".to_owned(),
-            "tool_progress_info".to_owned(),
-            "tool_progress_error".to_owned(),
-            "tool_result".to_owned(),
-            "external_request".to_owned(),
-            "metrics".to_owned(),
-        ],
-        initial_limit: Some(64),
     }
 }
 

@@ -22,8 +22,14 @@ pub enum LeaderCommand {
     Config,
     /// Open the sessions screen.
     Sessions,
+    /// Open provider/model selection for the active session.
+    Provider,
+    /// Open MCP selection for the active session.
+    Mcp,
     /// Quit the app immediately.
     Quit,
+    /// Start deleting the current row/detail item.
+    Delete,
     /// Unknown leader command text for notices.
     Unknown(String),
 }
@@ -58,8 +64,20 @@ fn leader_command(key: KeyEvent) -> LeaderCommand {
         return LeaderCommand::Sessions;
     }
 
+    if matches!(key.code, KeyCode::Char('p')) {
+        return LeaderCommand::Provider;
+    }
+
+    if matches!(key.code, KeyCode::Char('m')) {
+        return LeaderCommand::Mcp;
+    }
+
     if matches!(key.code, KeyCode::Char('q')) {
         return LeaderCommand::Quit;
+    }
+
+    if matches!(key.code, KeyCode::Char('d')) {
+        return LeaderCommand::Delete;
     }
 
     LeaderCommand::Unknown(key_name(key))

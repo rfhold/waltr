@@ -21,21 +21,10 @@ use ratatui::{
 };
 
 use crate::{
-    screens::{OperationResult, OperationTracker},
+    screens::{OperationResult, OperationTracker, SectionAction},
     theme::THEME,
     ui,
 };
-
-/// Outcome of routing an input event into the provider section.
-#[derive(Clone, Debug, PartialEq)]
-pub enum SectionAction {
-    /// The section handled the event; keep running.
-    Continue,
-    /// The section did not handle the event; let the host handle it.
-    Unhandled,
-    /// Dispatch a shared client command.
-    ClientCommand(ClientCommand),
-}
 
 /// Provider form mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -751,7 +740,7 @@ impl ProviderSection {
 
         frame.render_widget(
             Paragraph::new(lines)
-                .style(THEME.text_style())
+                .style(THEME.panel_style())
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -760,18 +749,23 @@ impl ProviderSection {
     /// Render the create/edit form overlay, if active.
     pub fn render_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
         if let Some(form) = self.model_form() {
-            let form_area = ui::centered_percent_rect(area, 70, 11);
+            let form_area = ui::centered_percent_rect(area, 82, 16);
+            frame.render_widget(Clear, area);
             frame.render_widget(Clear, form_area);
-            frame.render_widget(model_form_widget(form), form_area);
+            render_model_form_widget(frame, form_area, form);
             return;
         }
 
         if let Some(form) = &self.config_form {
-            let form_area = ui::centered_percent_rect(area, 70, 15);
+            let form_area = ui::centered_percent_rect(area, 82, 15);
+            frame.render_widget(Clear, area);
             frame.render_widget(Clear, form_area);
-            frame.render_widget(
-                form_widget(form, self.patch.is_pending(), self.patch.error()),
+            render_form_widget(
+                frame,
                 form_area,
+                form,
+                self.patch.is_pending(),
+                self.patch.error(),
             );
         }
     }
@@ -853,26 +847,30 @@ fn provider_url(provider: &ProviderView) -> String {
     }
 }
 
-fn form_widget(
+fn render_form_widget(
+    frame: &mut Frame<'_>,
+    area: Rect,
     form: &ProviderForm,
     pending_patch: bool,
     patch_error: Option<&str>,
-) -> Paragraph<'static> {
+) {
     let title = match form.mode {
-        ProviderFormMode::Create => " Create provider ",
-        ProviderFormMode::Edit => " Edit provider ",
+        ProviderFormMode::Create => "Create provider",
+        ProviderFormMode::Edit => "Edit provider",
     };
 
-    Paragraph::new(form_lines(form, pending_patch, patch_error))
-        .block(
-            ui::modal_block(
-                title,
-                " Tab focus  Space/Left/Right toggle  C-x c model  Esc cancel ",
-            )
-            .style(THEME.text_style()),
-        )
-        .style(THEME.text_style())
-        .wrap(Wrap { trim: false })
+    let body_area = super::render_modal_frame(
+        frame,
+        area,
+        title,
+        "Tab focus  Space/arrows toggle  C-x c model  Esc cancel",
+    );
+    frame.render_widget(
+        Paragraph::new(form_lines(form, pending_patch, patch_error))
+            .style(THEME.panel_style())
+            .wrap(Wrap { trim: false }),
+        body_area,
+    );
 }
 
 fn form_lines(
@@ -967,22 +965,24 @@ fn model_line(key: &str, model: &ModelView, selected: bool, deleting: bool) -> L
     ])
 }
 
-fn model_form_widget(form: &ModelForm) -> Paragraph<'static> {
+fn render_model_form_widget(frame: &mut Frame<'_>, area: Rect, form: &ModelForm) {
     let title = match form.mode {
-        ModelFormMode::Create => " Create model ",
-        ModelFormMode::Edit => " Edit model ",
+        ModelFormMode::Create => "Create model",
+        ModelFormMode::Edit => "Edit model",
     };
 
-    Paragraph::new(model_form_lines(form))
-        .block(
-            ui::modal_block(
-                title,
-                " Tab field  Left/Right toggle  Enter save  Esc cancel ",
-            )
-            .style(THEME.text_style()),
-        )
-        .style(THEME.text_style())
-        .wrap(Wrap { trim: false })
+    let body_area = super::render_modal_frame(
+        frame,
+        area,
+        title,
+        "Tab field  Left/Right toggle  Enter save  Esc cancel",
+    );
+    frame.render_widget(
+        Paragraph::new(model_form_lines(form))
+            .style(THEME.panel_style())
+            .wrap(Wrap { trim: false }),
+        body_area,
+    );
 }
 
 fn model_form_lines(form: &ModelForm) -> Vec<Line<'static>> {

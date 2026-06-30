@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/basic.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"              Waltr                                                              "
+"                                                                                "
+"                             Ready to configure Waltr                            "
+"                                                                                "
+"                     Connect providers, tune local settings,                    "
+"                  and keep the runtime in sync from one shell.                  "
+"                                                                                "
+"              Ctrl-X c config  Ctrl-X s sessions  Ctrl-X q quit                 "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" Ctrl-X q  quit                                                     Waltr  ready "
+"                                                                                "

@@ -2,7 +2,22 @@
 
 use std::collections::BTreeMap;
 
-use waltr_client::{ClientOperationView, ClientSnapshot, OperationKey, OperationSnapshot};
+use waltr_client::{
+    ClientCommand, ClientOperationView, ClientSnapshot, OperationKey, OperationSnapshot,
+};
+
+/// Outcome of routing an input event into a screen section.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SectionAction {
+    /// The section handled the event; keep running.
+    Continue,
+    /// The section did not handle the event; let the host handle it.
+    Unhandled,
+    /// Dispatch a shared client command.
+    ClientCommand(ClientCommand),
+    /// Dispatch shared client commands in order.
+    ClientCommands(Vec<ClientCommand>),
+}
 
 /// Outcome extracted from a keyed client operation snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]

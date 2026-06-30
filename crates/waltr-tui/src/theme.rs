@@ -11,7 +11,10 @@ const TEXT: Color = Color::Rgb(246, 241, 255);
 const MUTED_TEXT: Color = Color::DarkGray;
 const SUCCESS: Color = Color::Green;
 const DANGER: Color = Color::Red;
-const SURFACE: Color = Color::Black;
+const CANVAS: Color = Color::Rgb(7, 5, 12);
+const SURFACE: Color = Color::Rgb(15, 12, 23);
+const PANEL: Color = Color::Rgb(24, 20, 34);
+const FOOTER: Color = Color::Rgb(30, 20, 46);
 const FOCUS: Color = Color::Cyan;
 
 /// Named status states that use semantic theme roles.
@@ -70,10 +73,28 @@ impl Theme {
         DANGER
     }
 
+    /// Base app canvas color.
+    #[must_use]
+    pub const fn canvas(self) -> Color {
+        CANVAS
+    }
+
     /// Base surface color.
     #[must_use]
     pub const fn surface(self) -> Color {
         SURFACE
+    }
+
+    /// Raised panel color.
+    #[must_use]
+    pub const fn panel(self) -> Color {
+        PANEL
+    }
+
+    /// Footer/status strip color.
+    #[must_use]
+    pub const fn footer(self) -> Color {
+        FOOTER
     }
 
     /// Focused control or actionable hint color.
@@ -124,10 +145,43 @@ impl Theme {
         Style::default().fg(self.danger())
     }
 
+    /// App canvas style.
+    #[must_use]
+    pub fn canvas_style(self) -> Style {
+        Style::default().fg(self.text()).bg(self.canvas()).not_dim()
+    }
+
     /// Surface style.
     #[must_use]
     pub fn surface_style(self) -> Style {
-        Style::default().bg(self.surface()).not_dim()
+        Style::default()
+            .fg(self.text())
+            .bg(self.surface())
+            .not_dim()
+    }
+
+    /// Raised panel style.
+    #[must_use]
+    pub fn panel_style(self) -> Style {
+        Style::default().fg(self.text()).bg(self.panel()).not_dim()
+    }
+
+    /// Muted text on raised panels.
+    #[must_use]
+    pub fn panel_muted_style(self) -> Style {
+        Style::default()
+            .fg(self.muted_text())
+            .bg(self.panel())
+            .not_dim()
+    }
+
+    /// Footer/status strip style.
+    #[must_use]
+    pub fn footer_style(self) -> Style {
+        Style::default()
+            .fg(self.muted_text())
+            .bg(self.footer())
+            .not_dim()
     }
 
     /// Focused control or actionable hint style.

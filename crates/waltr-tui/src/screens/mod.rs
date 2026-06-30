@@ -3,14 +3,16 @@
 mod config;
 mod landing;
 mod operation;
+mod runtime_selector;
 mod sessions;
 mod splash;
 
 pub use config::{
     ConfigTab, McpForm, McpFormMode, McpSection, ModelForm, ModelFormMode, ProviderForm,
-    ProviderFormMode, ProviderSection, RuntimeDefaultsSection, SectionAction, draw_config,
+    ProviderFormMode, ProviderSection, RuntimeDefaultsSection, draw_config,
 };
 pub use landing::draw_landing;
-pub use operation::{OperationResult, OperationTracker};
+pub use operation::{OperationResult, OperationTracker, SectionAction};
+pub(crate) use sessions::register_timeline_watch_command;
 pub use sessions::{SessionsSection, draw_sessions};
 pub use splash::draw_splash;

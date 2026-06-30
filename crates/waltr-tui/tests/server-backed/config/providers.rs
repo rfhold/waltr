@@ -29,7 +29,7 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     // The config surface presents a tab strip with the "Providers" tab active
     // and shows the providers section content for that tab.
     let rendered = render_app(&app);
-    assert!(rendered.contains("┌ Configuration"));
+    assert!(rendered.contains("Configuration"));
     assert!(rendered.contains("Providers"));
     assert!(rendered.contains("MCP Servers"));
     assert!(rendered.contains("Tab switch"));
@@ -46,7 +46,7 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     insta::assert_snapshot!("config_mcp_empty_real_server", switched);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let defaults = render_app(&app);
-    assert!(defaults.contains("Space all MCP"));
+    assert!(defaults.contains("Space MCP"));
     insta::assert_snapshot!("config_defaults_empty_real_server", defaults);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let switched_back = render_app(&app);

@@ -1,6 +1,5 @@
 ---
-source: crates/waltr-tui/tests/app.rs
-assertion_line: 35
+source: crates/waltr-tui/tests/app/config.rs
 expression: render_app(&app)
 ---
 "                                                                                "
@@ -9,21 +8,21 @@ expression: render_app(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
+"                Edit provider                                                   "
+"                                                                                "
+"               * name  anthropic                                                "
+"                 type  anthropic-messages                                       "
+"                 url  https://api.anthropic.com/v1/messages                     "
+"                 oauth  no-oauth                                                "
+"                                                                                "
+"               Models staged in this provider draft                             "
+"               No models configured.                                            "
+"               error: write failed                                              "
 "                                                                                "
 "                                                                                "
-"                     W     W    A    L      TTTTTTT RRRRR                       "
-"                     W     W   A A   L         T    R    R                      "
-"                     W     W  A   A  L         T    R    R                      "
-"                     W  W  W AAAAAAA L         T    RRRRR                       "
-"                     W W W W A     A L         T    R  R                        "
-"                     WW   WW A     A L         T    R   R                       "
-"                     W     W A     A LLLLLLL   T    R    R                      "
-"                                                                                "
-"                          waiting for server status...                          "
+"                Tab focus  Space/arrows toggle  C-x c model  Esc c              "
 "                                                                                "
 "                                                                                "
 "                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
 "                                                                                "
-"                                                                                "
-"                                                                                "
-"press Ctrl-C again to exit                                                      "

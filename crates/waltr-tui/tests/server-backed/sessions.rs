@@ -16,7 +16,7 @@ use waltr_server::{
 use waltr_tui::app::{App, AppAction};
 
 use crate::support::{
-    input::{char_press, ctrl_x_press, delete_press, enter_press},
+    input::{char_press, ctrl_t_press, ctrl_x_press, enter_press},
     render::render_app,
     server::{
         dispatch_app_command, drive_app_to_landing, next_snapshot_until, no_sleep,
@@ -38,7 +38,7 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     .await;
 
     let rendered = render_app(&app);
-    assert!(rendered.contains("┌ Sessions"));
+    assert!(rendered.contains("Sessions"));
     assert!(rendered.contains("No sessions yet."));
     insta::assert_snapshot!("sessions_empty_real_server", rendered);
 
@@ -74,13 +74,15 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     })
     .await;
     let rendered = render_app(&app);
-    assert!(rendered.contains("provider none (p)  mcp none (m)"));
+    assert!(rendered.contains("provider none (C-x p)"));
+    assert!(rendered.contains("ctx 0"));
     insta::assert_snapshot!(
         "sessions_detail_real_server",
         normalize_session_render(&rendered, &session_id)
     );
 
-    assert_eq!(app.handle_event(&delete_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press('d'), now), AppAction::Continue);
     let delete_action = app.handle_event(&enter_press(), now);
     let deleted = dispatch_app_command(&mut stream, &mut app, delete_action).await;
     let delete_key = deleted
@@ -110,7 +112,22 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
 }
 
 fn normalize_session_render(rendered: &str, session_id: &str) -> String {
-    rendered.replace(session_id, "[session-id]")
+    rendered
+        .replace(session_id, "[session-id]")
+        .lines()
+        .map(|line| {
+            let Some(index) = line.find("updated ") else {
+                return line.to_owned();
+            };
+            let prefix = &line[..index];
+            let rest = &line[index + "updated ".len()..];
+            rest.split_once(' ').map_or_else(
+                || line.to_owned(),
+                |(_timestamp, suffix)| format!("{prefix}updated [timestamp] {suffix}"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[tokio::test]
@@ -143,31 +160,40 @@ async fn session_detail_updates_runtime_config_with_real_server() {
 
     assert_runtime_provider(&created, &session_id, "openai", "gpt4o", None);
 
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     let open_provider = app.handle_event(&char_press('p'), now);
     dispatch_app_command(&mut stream, &mut app, open_provider).await;
     let provider_editor = render_app(&app);
-    assert!(provider_editor.contains("Edit provider/model"));
-    assert!(provider_editor.contains("thinking"));
-    assert!(provider_editor.contains("none"));
-    assert!(provider_editor.contains("low"));
-    assert!(provider_editor.contains("medium"));
-    assert!(provider_editor.contains("high"));
+    assert!(provider_editor.contains("Provider/model"));
+    assert!(provider_editor.contains("Search"));
+    assert!(provider_editor.contains("anthropic/claude"));
+    assert!(provider_editor.contains("openai/gpt4o"));
+    assert!(!provider_editor.contains("Ctrl-T"));
+    assert!(!provider_editor.contains("Thinking"));
 
-    for _ in 0..3 {
-        assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
-    }
     let provider_update = app.handle_event(&enter_press(), now);
     let updated_provider = dispatch_app_command(&mut stream, &mut app, provider_update).await;
-    assert_runtime_provider(
-        &updated_provider,
-        &session_id,
-        "anthropic",
-        "claude",
-        Some("high"),
-    );
+    assert_runtime_provider(&updated_provider, &session_id, "anthropic", "claude", None);
 
+    for expected_effort in ["low", "medium", "high"] {
+        let thinking_update = app.handle_event(&ctrl_t_press(), now);
+        let updated_thinking = dispatch_app_command(&mut stream, &mut app, thinking_update).await;
+        assert_runtime_provider(
+            &updated_thinking,
+            &session_id,
+            "anthropic",
+            "claude",
+            Some(expected_effort),
+        );
+    }
+
+    let rendered = render_app(&app);
+    assert!(rendered.contains("(Ctrl-T)"));
+    assert_runtime_provider(&updated_provider, &session_id, "anthropic", "claude", None);
+
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&char_press('m'), now), AppAction::Continue);
-    assert!(render_app(&app).contains("Edit MCP servers"));
+    assert!(render_app(&app).contains("MCP servers"));
     assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
     let mcp_update = app.handle_event(&enter_press(), now);
     let updated_mcp = dispatch_app_command(&mut stream, &mut app, mcp_update).await;

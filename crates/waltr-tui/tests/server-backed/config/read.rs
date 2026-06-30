@@ -31,7 +31,7 @@ async fn opening_config_before_watch_data_renders_waiting_state() {
     assert_eq!(app.screen(), AppScreen::Config);
 
     let rendered = render_app(&app);
-    assert!(rendered.contains("┌ Configuration"));
+    assert!(rendered.contains("Configuration"));
     assert!(!rendered.contains("Waltr / Configuration"));
     // Before any watch data arrives the surface shows the intermediary loading
     // indicator with the current watch status in place of section content.
