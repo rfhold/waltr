@@ -437,6 +437,82 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_update_preserves_surrounding_lines() {
+        let temp = TempRoot::new();
+        temp.write("updated.txt", "before\nold\nafter\n");
+        let config = FilesystemConfig::new(temp.path());
+
+        config
+            .apply_patch(&ApplyPatchInput::new(
+                "*** Begin Patch\n*** Update File: updated.txt\n@@\n-old\n+new\n*** End Patch",
+            ))
+            .expect("apply update patch");
+
+        assert_eq!(temp.read("updated.txt"), "before\nnew\nafter\n");
+    }
+
+    #[test]
+    fn apply_patch_update_uses_context_lines() {
+        let temp = TempRoot::new();
+        temp.write("updated.txt", "one\ntarget\nthree\n");
+        let config = FilesystemConfig::new(temp.path());
+
+        config
+            .apply_patch(&ApplyPatchInput::new(
+                "*** Begin Patch\n*** Update File: updated.txt\n@@\n one\n-target\n+two\n three\n*** End Patch",
+            ))
+            .expect("apply context update patch");
+
+        assert_eq!(temp.read("updated.txt"), "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn apply_patch_update_applies_multiple_chunks() {
+        let temp = TempRoot::new();
+        temp.write("updated.txt", "alpha\nbeta\ngamma\ndelta\n");
+        let config = FilesystemConfig::new(temp.path());
+
+        config
+            .apply_patch(&ApplyPatchInput::new(
+                "*** Begin Patch\n*** Update File: updated.txt\n@@\n-alpha\n+ALPHA\n@@\n-gamma\n+GAMMA\n*** End Patch",
+            ))
+            .expect("apply multiple chunk patch");
+
+        assert_eq!(temp.read("updated.txt"), "ALPHA\nbeta\nGAMMA\ndelta\n");
+    }
+
+    #[test]
+    fn apply_patch_update_fails_without_expected_lines() {
+        let temp = TempRoot::new();
+        temp.write("updated.txt", "current\n");
+        let config = FilesystemConfig::new(temp.path());
+
+        let error = config
+            .apply_patch(&ApplyPatchInput::new(
+                "*** Begin Patch\n*** Update File: updated.txt\n@@\n-missing\n+new\n*** End Patch",
+            ))
+            .expect_err("missing old line should fail");
+
+        assert!(error.to_string().contains("failed to find expected lines"));
+        assert_eq!(temp.read("updated.txt"), "current\n");
+    }
+
+    #[test]
+    fn apply_patch_update_can_remove_only_line() {
+        let temp = TempRoot::new();
+        temp.write("updated.txt", "remove\n");
+        let config = FilesystemConfig::new(temp.path());
+
+        config
+            .apply_patch(&ApplyPatchInput::new(
+                "*** Begin Patch\n*** Update File: updated.txt\n@@\n-remove\n*** End Patch",
+            ))
+            .expect("apply removal patch");
+
+        assert_eq!(temp.read("updated.txt"), "");
+    }
+
+    #[test]
     fn apply_patch_deletes_files() {
         let temp = TempRoot::new();
         temp.write("deleted.txt", "remove me\n");
