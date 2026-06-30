@@ -11,7 +11,7 @@ async fn config_service_get_returns_default_config_with_etag()
 
     assert!(initial.providers.contains_key("anthropic"));
     assert!(initial.providers.contains_key("openai"));
-    assert!(initial.providers.contains_key("openai-codex"));
+    assert!(initial.providers.contains_key("codex"));
     assert!(!initial.etag.is_empty());
 
     Ok(())

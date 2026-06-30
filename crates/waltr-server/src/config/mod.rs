@@ -4,6 +4,7 @@ pub mod defaults;
 pub mod error;
 pub mod filesystem;
 pub mod handle;
+pub(crate) mod headers;
 pub mod traits;
 
 pub use defaults::default_configuration;

@@ -12,7 +12,10 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::config::ConfigStore;
+use crate::config::{
+    ConfigStore,
+    headers::{configured_credential, has_unresolved_credential, resolve_provider_headers},
+};
 
 use super::{FileCredentialStore, StoredCredential, oauth};
 
@@ -55,7 +58,8 @@ where
         let supported_methods = definition
             .as_ref()
             .map_or_else(Vec::new, |_| supported_methods());
-        if !configured_api_key(&provider.headers).is_empty() {
+        let resolved_headers = resolve_provider_headers(&provider.headers);
+        if !configured_credential(&resolved_headers.headers).is_empty() {
             return Ok(ProviderAuthStatus {
                 provider_key: provider_key.to_owned(),
                 kind: ProviderAuthStatusKind::ApiKeyConfigured as i32,
@@ -64,6 +68,14 @@ where
             });
         }
         let Some(_definition) = definition else {
+            if has_unresolved_credential(&resolved_headers) {
+                return Ok(ProviderAuthStatus {
+                    provider_key: provider_key.to_owned(),
+                    kind: ProviderAuthStatusKind::NotConfigured as i32,
+                    message: "credential environment variable is not set".to_owned(),
+                    ..ProviderAuthStatus::default()
+                });
+            }
             return Ok(ProviderAuthStatus {
                 provider_key: provider_key.to_owned(),
                 kind: ProviderAuthStatusKind::Unsupported as i32,
@@ -232,21 +244,4 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis() as i64)
-}
-
-fn configured_api_key(headers: &std::collections::HashMap<String, String>) -> String {
-    for key in ["api_key", "x-api-key", "authorization"] {
-        if let Some(value) = headers
-            .get(key)
-            .or_else(|| headers.get(&key.to_ascii_uppercase()))
-            .filter(|value| !value.trim().is_empty())
-        {
-            return value
-                .strip_prefix("Bearer ")
-                .unwrap_or(value.as_str())
-                .to_owned();
-        }
-    }
-
-    String::new()
 }
