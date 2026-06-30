@@ -42,7 +42,9 @@ async fn runtime_defaults_snapshot_and_save_use_real_server() {
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     insta::assert_snapshot!("config_defaults_seeded_real_server", render_app(&app));
 
-    assert_eq!(app.handle_event(&char_press('m'), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
     let action = app.handle_event(&enter_press(), now);
     let saved = dispatch_app_command(&mut stream, &mut app, action).await;
     let defaults = saved

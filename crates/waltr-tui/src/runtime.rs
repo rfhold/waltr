@@ -144,7 +144,7 @@ fn spawn_input_events(events: mpsc::Sender<io::Result<AppEvent>>) -> tokio::task
 
         loop {
             ticker.tick().await;
-            match input::drain_key_events() {
+            match input::drain_input_events() {
                 Ok(inputs) => {
                     for input in inputs {
                         if events.send(Ok(AppEvent::Input(input))).await.is_err() {

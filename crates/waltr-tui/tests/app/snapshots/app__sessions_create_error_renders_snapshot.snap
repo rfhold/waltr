@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/sessions.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"             Sessions                                                           "
+"                                                                                "
+"             Recent sessions  Create: C-x s                                     "
+"            No sessions yet.                                                    "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"            error: create failed                                                "
+"                                                                                "
+"             Esc back  C-x s create  Right/Enter detail  C-x d delete           "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/config.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"         Configuration                                                          "
+"                                                                                "
+"          Providers   MCP Servers   Defaults                                    "
+"                                                                                "
+"        > anthropic  Delete? Enter/y confirm, n/Esc cancel                      "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"         Esc back  Tab switch  C-x c create  Enter edit  Del delete             "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

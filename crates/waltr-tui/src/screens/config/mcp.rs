@@ -24,7 +24,7 @@ use crate::{
     ui,
 };
 
-use super::SectionAction;
+use crate::screens::SectionAction;
 
 /// MCP server form mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,7 +416,7 @@ impl McpSection {
 
         frame.render_widget(
             Paragraph::new(lines)
-                .style(THEME.text_style())
+                .style(THEME.panel_style())
                 .wrap(Wrap { trim: false }),
             area,
         );
@@ -425,11 +425,15 @@ impl McpSection {
     /// Render the create/edit form overlay, if active.
     pub fn render_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
         if let Some(form) = &self.config_form {
-            let form_area = ui::centered_percent_rect(area, 70, 10);
+            let form_area = ui::centered_percent_rect(area, 82, 10);
+            frame.render_widget(Clear, area);
             frame.render_widget(Clear, form_area);
-            frame.render_widget(
-                form_widget(form, self.patch.is_pending(), self.patch.error()),
+            render_form_widget(
+                frame,
                 form_area,
+                form,
+                self.patch.is_pending(),
+                self.patch.error(),
             );
         }
     }
@@ -531,26 +535,30 @@ fn server_target(server: &McpServerView) -> String {
     }
 }
 
-fn form_widget(
+fn render_form_widget(
+    frame: &mut Frame<'_>,
+    area: Rect,
     form: &McpForm,
     pending_patch: bool,
     patch_error: Option<&str>,
-) -> Paragraph<'static> {
+) {
     let title = match form.mode {
-        McpFormMode::Create => " Create MCP server ",
-        McpFormMode::Edit => " Edit MCP server ",
+        McpFormMode::Create => "Create MCP server",
+        McpFormMode::Edit => "Edit MCP server",
     };
 
-    Paragraph::new(form_lines(form, pending_patch, patch_error))
-        .block(
-            ui::modal_block(
-                title,
-                " Tab field  Left/Right type  Enter save  Esc cancel ",
-            )
-            .style(THEME.text_style()),
-        )
-        .style(THEME.text_style())
-        .wrap(Wrap { trim: false })
+    let body_area = super::render_modal_frame(
+        frame,
+        area,
+        title,
+        "Tab field  Left/Right type  Enter save  Esc cancel",
+    );
+    frame.render_widget(
+        Paragraph::new(form_lines(form, pending_patch, patch_error))
+            .style(THEME.panel_style())
+            .wrap(Wrap { trim: false }),
+        body_area,
+    );
 }
 
 fn form_lines(

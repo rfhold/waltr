@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/config.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                Create provider                                                 "
+"                                                                                "
+"               * name                                                           "
+"                 type  anthropic-messages                                       "
+"                 url                                                            "
+"                 oauth  no-oauth                                                "
+"                                                                                "
+"               Models staged in this provider draft                             "
+"               No models configured.                                            "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                Tab focus  Space/arrows toggle  C-x c model  Esc c              "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

@@ -19,7 +19,10 @@ bundled = ["web", "default-server"]
 axum = { workspace = true, optional = true }
 waltr-client.workspace = true
 waltr-server = { workspace = true, optional = true }
+pulldown-cmark.workspace = true
 ratatui = { workspace = true, features = ["palette", "scrolling-regions"] }
+serde_json.workspace = true
+syntect.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = { workspace = true, optional = true }
 

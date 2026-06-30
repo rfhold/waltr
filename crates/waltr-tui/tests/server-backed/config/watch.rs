@@ -60,7 +60,7 @@ async fn client_stream_renders_config_status_with_real_server() {
     .await;
 
     let rendered = render_app(&app);
-    assert!(rendered.contains("┌ Configuration"));
+    assert!(rendered.contains("Configuration"));
     assert!(!rendered.contains("Waltr / Configuration"));
     // The opened-but-no-data state is pending: the surface shows the loading
     // indicator carrying the current watch status in place of section content.

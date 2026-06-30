@@ -1,26 +1,70 @@
 //! Session list/detail surface: state, input, and rendering.
 
+mod composer;
+mod prompts;
+mod runtime_editor;
+mod timeline;
+
 use std::collections::BTreeSet;
 
 use waltr_client::{
-    ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, ProviderView,
-    RuntimeConfigMatchView, SessionPhaseView, SessionRuntimeConfigView, SessionTimelineView,
-    SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
+    ClientCommand, ClientOperationView, ClientSnapshot, ClientTimelineDirection,
+    RuntimeConfigMatchView, SessionPhaseView, SessionTimelineView, SessionView,
 };
 use ratatui::{
     Frame,
-    crossterm::event::{KeyCode, KeyEvent},
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::{Constraint, Direction, Layout, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph, Wrap},
+    widgets::{Block, Clear, Padding, Paragraph, Wrap},
 };
+use serde_json::{Value, json};
 
 use crate::{
     screens::{OperationResult, OperationTracker, SectionAction},
     theme::{StatusRole, THEME},
     ui,
 };
+
+use self::{
+    composer::{
+        composer_cursor_at_line_column, composer_cursor_line_column, composer_line_count,
+        composer_line_end, composer_line_start, composer_visible_input_line_count, render_composer,
+    },
+    prompts::{
+        ExternalPromptModel, PromptDraft, current_external_prompt, prompt_height, render_prompt,
+    },
+    runtime_editor::{RuntimeEditor, RuntimeEditorKind, render_runtime_editor},
+    timeline::{
+        latest_context_tokens, shell_tool_at_row, timeline_channels, timeline_lines,
+        timeline_rendered_line_count, timeline_widget,
+    },
+};
+
+pub(crate) use self::timeline::register_timeline_watch_command;
+
+const TIMELINE_PAGE_SIZE: u32 = 64;
+const SHELL_OUTPUT_RECENT_LINE_COUNT: usize = 15;
+const TIMELINE_TEXT_PREFIX: &str = "   ";
+const DETAIL_COMPOSER_MAX_INPUT_LINES: u16 = 20;
+const DETAIL_COMPOSER_BOTTOM_GAP: u16 = 1;
+const DETAIL_TIMELINE_MIN_HEIGHT: u16 = 6;
+const DETAIL_SCROLL_WHEEL_LINES: usize = 3;
+const DETAIL_SCROLL_PAGE_LINES: usize = 12;
+const PERMISSION_REQUEST_KIND: i32 = 1;
+const QUESTION_REQUEST_KIND: i32 = 2;
+const TIMELINE_CHANNELS: [&str; 9] = [
+    "user_text",
+    "assistant_text",
+    "thinking",
+    "tool_call",
+    "tool_progress_info",
+    "tool_progress_error",
+    "tool_result",
+    "external_request",
+    "metrics",
+];
 
 /// Self-contained sessions screen state and behavior.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -30,30 +74,28 @@ pub struct SessionsSection {
     delete_session_id: Option<String>,
     runtime_editor: Option<RuntimeEditor>,
     pending_runtime_editor: Option<RuntimeEditorKind>,
+    composer_draft: String,
+    composer_cursor: usize,
+    timeline_scroll_from_bottom: usize,
+    expanded_shell_tools: BTreeSet<String>,
+    prompt_draft: PromptDraft,
     create: OperationTracker,
     delete: OperationTracker,
     runtime_update: OperationTracker,
+    submit: OperationTracker,
+    respond: OperationTracker,
+    interrupt: OperationTracker,
 }
 
+/// Status surfaced from the active session detail route to the global shell footer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum RuntimeEditor {
-    Provider {
-        query: String,
-        selected_provider: usize,
-        selected_model: usize,
-        selected_reasoning: usize,
-    },
-    Mcp {
-        query: String,
-        selected: usize,
-        enabled: BTreeSet<String>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeEditorKind {
-    Provider,
-    Mcp,
+pub struct SessionDetailFooterStatus {
+    /// Status text to render in the footer.
+    pub text: String,
+    /// Whether the status represents an error.
+    pub error: bool,
+    /// Whether double-Escape can interrupt the session right now.
+    pub interruptible: bool,
 }
 
 impl SessionsSection {
@@ -66,9 +108,17 @@ impl SessionsSection {
             delete_session_id: None,
             runtime_editor: None,
             pending_runtime_editor: None,
+            composer_draft: String::new(),
+            composer_cursor: 0,
+            timeline_scroll_from_bottom: 0,
+            expanded_shell_tools: BTreeSet::new(),
+            prompt_draft: PromptDraft::new(),
             create: OperationTracker::new(),
             delete: OperationTracker::new(),
             runtime_update: OperationTracker::new(),
+            submit: OperationTracker::new(),
+            respond: OperationTracker::new(),
+            interrupt: OperationTracker::new(),
         }
     }
 
@@ -88,6 +138,31 @@ impl SessionsSection {
     #[must_use]
     pub const fn in_detail(&self) -> bool {
         self.detail_session_id.is_some()
+    }
+
+    /// Return the active detail status that should override the global shell footer.
+    #[must_use]
+    pub fn detail_footer_status(
+        &self,
+        snapshot: Option<&ClientSnapshot>,
+    ) -> Option<SessionDetailFooterStatus> {
+        let session = self.current_detail_session(snapshot)?;
+        let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(&session.id));
+        let prompt = current_external_prompt(snapshot, Some(session.id.as_str()));
+
+        if let Some(status) = session_important_status(&session, timeline, prompt.as_ref()) {
+            let error = timeline
+                .and_then(|timeline| timeline.watch.error.as_ref())
+                .is_some()
+                || session.status.phase == SessionPhaseView::Failed;
+            return Some(SessionDetailFooterStatus {
+                text: status,
+                error,
+                interruptible: session_active(session.status.phase) && prompt.is_none(),
+            });
+        }
+
+        None
     }
 
     /// Reconcile submitted create/delete operations against shared reducer state.
@@ -113,6 +188,7 @@ impl SessionsSection {
                 _ => None,
             },
         ) {
+            self.reset_detail_ui();
             self.detail_session_id = Some(session.id.clone());
             self.select_session_by_id(&snapshot.sessions.current, &session.id);
         }
@@ -137,6 +213,7 @@ impl SessionsSection {
             self.delete_session_id = None;
             if self.detail_session_id.as_deref() == Some(id.as_str()) {
                 self.detail_session_id = None;
+                self.reset_detail_ui();
             }
         }
 
@@ -164,6 +241,81 @@ impl SessionsSection {
             self.runtime_editor = None;
         }
 
+        if let Some(Ok(_session_id)) = self.submit.reconcile(
+            &snapshot.sessions.submit_user_message,
+            snapshot,
+            |operation| match operation {
+                ClientOperationView::SessionSubmitUserMessage {
+                    status,
+                    error,
+                    session_id,
+                } => Some(match *status {
+                    "ready" => OperationResult::Ready(session_id.clone()),
+                    "failed" => OperationResult::Failed(
+                        error
+                            .as_deref()
+                            .unwrap_or("session message submit failed")
+                            .to_owned(),
+                    ),
+                    _ => OperationResult::Pending,
+                }),
+                _ => None,
+            },
+        ) {
+            self.composer_draft.clear();
+            self.composer_cursor = 0;
+        }
+
+        if let Some(Ok(_request_id)) = self.respond.reconcile(
+            &snapshot.sessions.respond_external_request,
+            snapshot,
+            |operation| match operation {
+                ClientOperationView::SessionRespondExternalRequest {
+                    status,
+                    error,
+                    request_id,
+                    ..
+                } => Some(match *status {
+                    "ready" => OperationResult::Ready(request_id.clone()),
+                    "failed" => OperationResult::Failed(
+                        error
+                            .as_deref()
+                            .unwrap_or("external request response failed")
+                            .to_owned(),
+                    ),
+                    _ => OperationResult::Pending,
+                }),
+                _ => None,
+            },
+        ) {
+            self.prompt_draft.clear();
+        }
+
+        drop(
+            self.interrupt
+                .reconcile(
+                    &snapshot.sessions.interrupt,
+                    snapshot,
+                    |operation| match operation {
+                        ClientOperationView::SessionInterrupt {
+                            status,
+                            error,
+                            session_id,
+                        } => Some(match *status {
+                            "ready" => OperationResult::Ready(session_id.clone()),
+                            "failed" => OperationResult::Failed(
+                                error
+                                    .as_deref()
+                                    .unwrap_or("session interrupt failed")
+                                    .to_owned(),
+                            ),
+                            _ => OperationResult::Pending,
+                        }),
+                        _ => None,
+                    },
+                ),
+        );
+
         if let Some(kind) = self.pending_runtime_editor.take() {
             match kind {
                 RuntimeEditorKind::Provider => self.open_provider_editor(Some(snapshot)),
@@ -185,9 +337,9 @@ impl SessionsSection {
         }
     }
 
-    /// Dismiss the active detail route or delete confirmation. Returns true when handled.
-    pub fn dismiss_route_or_overlay(&mut self) -> bool {
-        if self.delete.is_pending() || self.create.is_pending() {
+    /// Dismiss the active transient overlay. Returns true when handled.
+    pub fn dismiss_overlay(&mut self) -> bool {
+        if self.has_pending_operation() {
             return true;
         }
 
@@ -205,7 +357,20 @@ impl SessionsSection {
             return true;
         }
 
-        self.detail_session_id.take().is_some()
+        false
+    }
+
+    /// Dismiss the active detail route or transient overlay. Returns true when handled.
+    pub fn dismiss_route_or_overlay(&mut self) -> bool {
+        if self.dismiss_overlay() {
+            return true;
+        }
+
+        let dismissed = self.detail_session_id.take().is_some();
+        if dismissed {
+            self.reset_detail_ui();
+        }
+        dismissed
     }
 
     /// Clear the active detail route when a top-level route change leaves sessions.
@@ -213,13 +378,14 @@ impl SessionsSection {
         self.runtime_editor = None;
         self.pending_runtime_editor = None;
         self.delete_session_id = None;
-        self.detail_session_id.take()
+        let detail_session_id = self.detail_session_id.take();
+        self.reset_detail_ui();
+        detail_session_id
     }
 
     /// Start creating a session.
     pub fn create_session(&mut self) -> SectionAction {
-        if self.create.is_pending() || self.delete.is_pending() || self.runtime_update.is_pending()
-        {
+        if self.has_pending_operation() {
             return SectionAction::Continue;
         }
 
@@ -232,9 +398,9 @@ impl SessionsSection {
         &mut self,
         key: KeyEvent,
         snapshot: Option<&ClientSnapshot>,
+        area: Option<Rect>,
     ) -> SectionAction {
-        if self.create.is_pending() || self.delete.is_pending() || self.runtime_update.is_pending()
-        {
+        if self.has_pending_operation() {
             return SectionAction::Continue;
         }
 
@@ -255,15 +421,7 @@ impl SessionsSection {
         }
 
         if self.detail_session_id.is_some() {
-            match key.code {
-                KeyCode::Char('p') => {
-                    return self.open_runtime_editor(RuntimeEditorKind::Provider, snapshot);
-                }
-                KeyCode::Char('m') => {
-                    return self.open_runtime_editor(RuntimeEditorKind::Mcp, snapshot);
-                }
-                _ => {}
-            }
+            return self.handle_detail_key(key, snapshot, area);
         }
 
         let sessions = snapshot.map_or_else(Vec::new, sorted_sessions);
@@ -290,257 +448,460 @@ impl SessionsSection {
                 }
                 SectionAction::Continue
             }
-            KeyCode::Backspace | KeyCode::Delete => {
-                self.arm_delete(snapshot);
-                SectionAction::Continue
-            }
             _ => SectionAction::Unhandled,
         }
     }
 
-    fn open_runtime_editor(
+    fn handle_detail_key(
         &mut self,
-        kind: RuntimeEditorKind,
+        key: KeyEvent,
         snapshot: Option<&ClientSnapshot>,
+        area: Option<Rect>,
     ) -> SectionAction {
-        if config(snapshot).is_none() {
-            self.pending_runtime_editor = Some(kind);
-            return SectionAction::ClientCommand(ClientCommand::RequestConfig);
+        if current_external_prompt(snapshot, self.detail_session_id()).is_some() {
+            return self.handle_prompt_key(key, snapshot);
         }
 
-        match kind {
-            RuntimeEditorKind::Provider => self.open_provider_editor(snapshot),
-            RuntimeEditorKind::Mcp => self.open_mcp_editor(snapshot),
+        match key.code {
+            KeyCode::PageUp => self.page_detail_up(snapshot, area),
+            KeyCode::PageDown => self.page_detail_down(snapshot, area),
+            KeyCode::End => {
+                self.timeline_scroll_from_bottom = 0;
+                SectionAction::Continue
+            }
+            _ => self.handle_composer_key(key, snapshot),
+        }
+    }
+
+    fn handle_composer_key(
+        &mut self,
+        key: KeyEvent,
+        snapshot: Option<&ClientSnapshot>,
+    ) -> SectionAction {
+        match key.code {
+            KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_runtime_reasoning(snapshot)
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.insert_composer_char('\n');
+                SectionAction::Continue
+            }
+            KeyCode::Enter => self.submit_message(snapshot),
+            KeyCode::Backspace => {
+                self.delete_composer_char_before_cursor();
+                SectionAction::Continue
+            }
+            KeyCode::Delete => {
+                self.delete_composer_char_at_cursor();
+                SectionAction::Continue
+            }
+            KeyCode::Left => {
+                self.move_composer_cursor_left();
+                SectionAction::Continue
+            }
+            KeyCode::Right => {
+                self.move_composer_cursor_right();
+                SectionAction::Continue
+            }
+            KeyCode::Up => {
+                self.move_composer_cursor_vertical(-1);
+                SectionAction::Continue
+            }
+            KeyCode::Down => {
+                self.move_composer_cursor_vertical(1);
+                SectionAction::Continue
+            }
+            KeyCode::Home => {
+                self.composer_cursor =
+                    composer_line_start(&self.composer_draft, self.composer_cursor);
+                SectionAction::Continue
+            }
+            KeyCode::End => {
+                self.composer_cursor =
+                    composer_line_end(&self.composer_draft, self.composer_cursor);
+                SectionAction::Continue
+            }
+            KeyCode::Char(character) => {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.insert_composer_char(character);
+                }
+                SectionAction::Continue
+            }
+            _ => SectionAction::Continue,
+        }
+    }
+
+    fn submit_message(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        let text = self.composer_draft.trim().to_owned();
+        let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
+            return SectionAction::Continue;
+        };
+        if text.is_empty() || !timeline_ready(snapshot, &session_id) {
+            return SectionAction::Continue;
+        }
+
+        self.submit.begin();
+        SectionAction::ClientCommand(ClientCommand::SubmitUserMessage { session_id, text })
+    }
+
+    fn insert_composer_char(&mut self, character: char) {
+        self.composer_cursor = self.composer_cursor.min(self.composer_draft.len());
+        self.composer_draft.insert(self.composer_cursor, character);
+        self.composer_cursor += character.len_utf8();
+    }
+
+    fn delete_composer_char_before_cursor(&mut self) {
+        if self.composer_cursor == 0 {
+            return;
+        }
+        let Some((previous, _)) = self.composer_draft[..self.composer_cursor]
+            .char_indices()
+            .last()
+        else {
+            return;
+        };
+        self.composer_draft.drain(previous..self.composer_cursor);
+        self.composer_cursor = previous;
+    }
+
+    fn delete_composer_char_at_cursor(&mut self) {
+        if self.composer_cursor >= self.composer_draft.len() {
+            return;
+        }
+        let end = self.composer_draft[self.composer_cursor..]
+            .chars()
+            .next()
+            .map_or(self.composer_cursor, |character| {
+                self.composer_cursor + character.len_utf8()
+            });
+        self.composer_draft.drain(self.composer_cursor..end);
+    }
+
+    fn move_composer_cursor_left(&mut self) {
+        if self.composer_cursor == 0 {
+            return;
+        }
+        if let Some((previous, _)) = self.composer_draft[..self.composer_cursor]
+            .char_indices()
+            .last()
+        {
+            self.composer_cursor = previous;
+        }
+    }
+
+    fn move_composer_cursor_right(&mut self) {
+        if self.composer_cursor >= self.composer_draft.len() {
+            return;
+        }
+        if let Some(character) = self.composer_draft[self.composer_cursor..].chars().next() {
+            self.composer_cursor += character.len_utf8();
+        }
+    }
+
+    fn move_composer_cursor_vertical(&mut self, direction: i8) {
+        let (line, column) =
+            composer_cursor_line_column(&self.composer_draft, self.composer_cursor);
+        let target_line = if direction < 0 {
+            line.saturating_sub(1)
+        } else {
+            (line + 1).min(composer_line_count(&self.composer_draft).saturating_sub(1))
+        };
+        if target_line == line {
+            return;
+        }
+        self.composer_cursor =
+            composer_cursor_at_line_column(&self.composer_draft, target_line, column);
+    }
+
+    fn interrupt_session(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        let Some(session) = self.current_detail_session(snapshot) else {
+            return SectionAction::Continue;
+        };
+        if !session_active(session.status.phase) {
+            return SectionAction::Continue;
+        }
+
+        self.interrupt.begin();
+        SectionAction::ClientCommand(ClientCommand::InterruptSession {
+            session_id: session.id,
+        })
+    }
+
+    fn respond_external_request(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        response: Value,
+    ) -> SectionAction {
+        self.respond.begin();
+        SectionAction::ClientCommand(ClientCommand::RespondExternalRequest {
+            session_id: session_id.to_owned(),
+            request_id: request_id.to_owned(),
+            response_json: response.to_string(),
+        })
+    }
+
+    fn deny_permission_and_interrupt(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        message: Value,
+    ) -> SectionAction {
+        self.respond.begin();
+        self.interrupt.begin();
+        SectionAction::ClientCommands(vec![
+            ClientCommand::RespondExternalRequest {
+                session_id: session_id.to_owned(),
+                request_id: request_id.to_owned(),
+                response_json: json!({
+                    "decision": "deny",
+                    "message": message,
+                    "mode": "cancel_work"
+                })
+                .to_string(),
+            },
+            ClientCommand::InterruptSession {
+                session_id: session_id.to_owned(),
+            },
+        ])
+    }
+
+    fn page_detail_up(
+        &mut self,
+        snapshot: Option<&ClientSnapshot>,
+        area: Option<Rect>,
+    ) -> SectionAction {
+        let max_scroll = self.detail_timeline_max_scroll(snapshot, area);
+        let current = self.timeline_scroll_from_bottom.min(max_scroll);
+        if current >= max_scroll {
+            self.timeline_scroll_from_bottom = max_scroll;
+            return self.request_older_timeline(snapshot);
+        }
+
+        self.timeline_scroll_from_bottom = current
+            .saturating_add(DETAIL_SCROLL_PAGE_LINES)
+            .min(max_scroll);
+        SectionAction::Continue
+    }
+
+    fn page_detail_down(
+        &mut self,
+        snapshot: Option<&ClientSnapshot>,
+        area: Option<Rect>,
+    ) -> SectionAction {
+        let max_scroll = self.detail_timeline_max_scroll(snapshot, area);
+        let current = self.timeline_scroll_from_bottom.min(max_scroll);
+        self.timeline_scroll_from_bottom = current.saturating_sub(DETAIL_SCROLL_PAGE_LINES);
+        SectionAction::Continue
+    }
+
+    /// Scroll the current detail timeline toward earlier content.
+    pub fn scroll_detail_up(
+        &mut self,
+        snapshot: Option<&ClientSnapshot>,
+        area: Rect,
+    ) -> SectionAction {
+        self.scroll_detail(snapshot, area, 1)
+    }
+
+    /// Scroll the current detail timeline toward later content.
+    pub fn scroll_detail_down(
+        &mut self,
+        snapshot: Option<&ClientSnapshot>,
+        area: Rect,
+    ) -> SectionAction {
+        self.scroll_detail(snapshot, area, -1)
+    }
+
+    /// Apply net wheel movement to the current detail timeline.
+    pub fn scroll_detail(
+        &mut self,
+        snapshot: Option<&ClientSnapshot>,
+        area: Rect,
+        delta: i32,
+    ) -> SectionAction {
+        if self.detail_session_id.is_none() || delta == 0 {
+            return SectionAction::Continue;
+        }
+
+        let max_scroll = self.detail_timeline_max_scroll(snapshot, Some(area));
+        let current = self.timeline_scroll_from_bottom.min(max_scroll);
+        let lines = DETAIL_SCROLL_WHEEL_LINES.saturating_mul(delta.unsigned_abs() as usize);
+        if delta.is_positive() {
+            if current >= max_scroll {
+                self.timeline_scroll_from_bottom = max_scroll;
+                return self.request_older_timeline(snapshot);
+            }
+
+            let next = current.saturating_add(lines);
+            self.timeline_scroll_from_bottom = next.min(max_scroll);
+            if next >= max_scroll {
+                return self.request_older_timeline(snapshot);
+            }
+        } else {
+            self.timeline_scroll_from_bottom = current.saturating_sub(lines);
         }
 
         SectionAction::Continue
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn handle_runtime_editor_key(
+    /// Toggle a shell tool panel when the current detail timeline is clicked.
+    pub fn handle_detail_click(
         &mut self,
-        key: KeyEvent,
         snapshot: Option<&ClientSnapshot>,
-    ) -> SectionAction {
-        let detail_session = self.current_detail_session(snapshot);
-        let Some(editor) = &mut self.runtime_editor else {
-            return SectionAction::Unhandled;
+        area: Rect,
+        column: u16,
+        row: u16,
+    ) -> bool {
+        let Some(timeline_area) = self.detail_timeline_area(snapshot, area) else {
+            return false;
+        };
+        if column < timeline_area.x
+            || column >= timeline_area.x.saturating_add(timeline_area.width)
+            || row < timeline_area.y
+            || row >= timeline_area.y.saturating_add(timeline_area.height)
+        {
+            return false;
+        }
+
+        let Some(session_id) = self.detail_session_id() else {
+            return false;
+        };
+        let Some(timeline) =
+            snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(session_id))
+        else {
+            return false;
+        };
+        let visible_row = usize::from(row.saturating_sub(timeline_area.y));
+        let timeline_row = self
+            .detail_timeline_top_scroll(Some(timeline), timeline_area)
+            .saturating_add(visible_row);
+        let Some(tool_id) = shell_tool_at_row(
+            timeline,
+            timeline_area.width,
+            timeline_row,
+            &self.expanded_shell_tools,
+        ) else {
+            return false;
         };
 
-        match editor {
-            RuntimeEditor::Provider {
-                query,
-                selected_provider,
-                selected_model,
-                selected_reasoning,
-            } => match key.code {
-                KeyCode::Esc => {
-                    self.runtime_editor = None;
-                    SectionAction::Continue
-                }
-                KeyCode::Up => {
-                    *selected_provider = selected_provider.saturating_sub(1);
-                    *selected_model = 0;
-                    *selected_reasoning = 0;
-                    SectionAction::Continue
-                }
-                KeyCode::Down => {
-                    let max = provider_entries(snapshot).len().saturating_sub(1);
-                    *selected_provider = (*selected_provider + 1).min(max);
-                    *selected_model = 0;
-                    *selected_reasoning = 0;
-                    SectionAction::Continue
-                }
-                KeyCode::Left => {
-                    *selected_model = selected_model.saturating_sub(1);
-                    *selected_reasoning = 0;
-                    SectionAction::Continue
-                }
-                KeyCode::Right => {
-                    let max = provider_entries(snapshot)
-                        .get(*selected_provider)
-                        .map_or(0, |(_, provider)| provider.models.len().saturating_sub(1));
-                    *selected_model = (*selected_model + 1).min(max);
-                    *selected_reasoning = 0;
-                    SectionAction::Continue
-                }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    let len =
-                        selected_reasoning_efforts(snapshot, *selected_provider, *selected_model)
-                            .len();
-                    if len > 0 {
-                        *selected_reasoning = (*selected_reasoning + 1) % len;
-                    }
-                    SectionAction::Continue
-                }
-                KeyCode::Enter => self.save_provider_runtime(snapshot),
-                KeyCode::Backspace => {
-                    query.pop();
-                    *selected_provider = 0;
-                    *selected_model = 0;
-                    *selected_reasoning = 0;
-                    SectionAction::Continue
-                }
-                KeyCode::Char(character) => {
-                    query.push(character);
-                    *selected_provider = 0;
-                    *selected_model = 0;
-                    *selected_reasoning = 0;
-                    SectionAction::Continue
-                }
-                _ => SectionAction::Continue,
-            },
-            RuntimeEditor::Mcp {
-                query,
-                selected,
-                enabled,
-            } => match key.code {
-                KeyCode::Esc => {
-                    self.runtime_editor = None;
-                    SectionAction::Continue
-                }
-                KeyCode::Up => {
-                    *selected = selected.saturating_sub(1);
-                    SectionAction::Continue
-                }
-                KeyCode::Down => {
-                    let max = mcp_entries(snapshot, detail_session.as_ref())
-                        .len()
-                        .saturating_sub(1);
-                    *selected = (*selected + 1).min(max);
-                    SectionAction::Continue
-                }
-                KeyCode::Char(' ') => {
-                    if let Some(item) =
-                        mcp_entries(snapshot, detail_session.as_ref()).get(*selected)
-                        && item.configured
-                    {
-                        if enabled.contains(&item.key) {
-                            enabled.remove(&item.key);
-                        } else {
-                            enabled.insert(item.key.clone());
-                        }
-                    }
-                    SectionAction::Continue
-                }
-                KeyCode::Enter => self.save_mcp_runtime(snapshot),
-                KeyCode::Backspace => {
-                    query.pop();
-                    *selected = 0;
-                    SectionAction::Continue
-                }
-                KeyCode::Char(character) => {
-                    query.push(character);
-                    *selected = 0;
-                    SectionAction::Continue
-                }
-                _ => SectionAction::Continue,
-            },
+        if !self.expanded_shell_tools.insert(tool_id.clone()) {
+            self.expanded_shell_tools.remove(&tool_id);
         }
+        true
     }
 
-    fn open_provider_editor(&mut self, snapshot: Option<&ClientSnapshot>) {
-        if provider_entries(snapshot).is_empty() {
-            return;
-        }
-        self.runtime_update.clear_error();
-        self.runtime_editor = Some(RuntimeEditor::Provider {
-            query: String::new(),
-            selected_provider: 0,
-            selected_model: 0,
-            selected_reasoning: 0,
-        });
-    }
-
-    fn open_mcp_editor(&mut self, snapshot: Option<&ClientSnapshot>) {
-        let enabled = self
-            .current_detail_session(snapshot)
-            .and_then(|session| session.runtime_config)
-            .map_or_else(BTreeSet::new, |runtime| {
-                runtime
-                    .mcp_servers
-                    .into_iter()
-                    .map(|server| server.key)
-                    .collect()
-            });
-        self.runtime_update.clear_error();
-        self.runtime_editor = Some(RuntimeEditor::Mcp {
-            query: String::new(),
-            selected: 0,
-            enabled,
-        });
-    }
-
-    fn save_provider_runtime(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
-        let Some(session) = self.current_detail_session(snapshot) else {
+    fn request_older_timeline(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
             return SectionAction::Continue;
         };
-        let Some(RuntimeEditor::Provider {
-            selected_provider,
-            selected_model,
-            selected_reasoning,
-            ..
-        }) = &self.runtime_editor
+        let Some(timeline) =
+            snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(&session_id))
         else {
             return SectionAction::Continue;
         };
-        let Some((provider_key, provider)) =
-            provider_entries(snapshot).get(*selected_provider).cloned()
-        else {
+        if timeline.load.status == "loading" {
+            return SectionAction::Continue;
+        }
+        let Some(cursor) = timeline.events.first().map(|event| event.cursor) else {
             return SectionAction::Continue;
         };
-        let Some(model_id) = sorted_model_keys(&provider).get(*selected_model).cloned() else {
-            return SectionAction::Continue;
-        };
-        let reasoning_effort =
-            selected_reasoning_efforts(snapshot, *selected_provider, *selected_model)
-                .get(*selected_reasoning)
-                .and_then(|value| (!value.is_empty()).then(|| value.clone()));
-        let enabled_mcp_server_keys =
-            session
-                .runtime_config
-                .as_ref()
-                .map_or_else(Vec::new, |runtime| {
-                    runtime
-                        .mcp_servers
-                        .iter()
-                        .map(|server| server.key.clone())
-                        .collect()
-                });
 
-        self.runtime_update.begin();
-        SectionAction::ClientCommand(ClientCommand::UpdateSessionRuntimeConfig {
-            id: session.id,
-            provider_key,
-            model_id,
-            reasoning_effort,
-            enabled_mcp_server_keys,
+        SectionAction::ClientCommand(ClientCommand::RequestSessionTimeline {
+            session_id,
+            direction: ClientTimelineDirection::Backward,
+            cursor: Some(cursor),
+            limit: TIMELINE_PAGE_SIZE,
+            channels: timeline_channels(),
         })
     }
 
-    fn save_mcp_runtime(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
-        let Some(session) = self.current_detail_session(snapshot) else {
-            return SectionAction::Continue;
-        };
-        let Some(provider) = session
-            .runtime_config
-            .as_ref()
-            .and_then(|runtime| runtime.provider.as_ref())
-        else {
-            return SectionAction::Continue;
-        };
-        let Some(RuntimeEditor::Mcp { enabled, .. }) = &self.runtime_editor else {
-            return SectionAction::Continue;
-        };
+    fn has_pending_operation(&self) -> bool {
+        self.create.is_pending()
+            || self.delete.is_pending()
+            || self.runtime_update.is_pending()
+            || self.submit.is_pending()
+            || self.respond.is_pending()
+            || self.interrupt.is_pending()
+    }
 
-        self.runtime_update.begin();
-        SectionAction::ClientCommand(ClientCommand::UpdateSessionRuntimeConfig {
-            id: session.id,
-            provider_key: provider.key.clone(),
-            model_id: provider.model_id.clone(),
-            reasoning_effort: provider.reasoning_effort.clone(),
-            enabled_mcp_server_keys: enabled.iter().cloned().collect(),
-        })
+    fn reset_detail_ui(&mut self) {
+        self.runtime_editor = None;
+        self.pending_runtime_editor = None;
+        self.delete_session_id = None;
+        self.composer_draft.clear();
+        self.composer_cursor = 0;
+        self.timeline_scroll_from_bottom = 0;
+        self.expanded_shell_tools.clear();
+        self.prompt_draft.clear();
+        self.submit.clear();
+        self.respond.clear();
+        self.interrupt.clear();
+    }
+
+    fn detail_timeline_area(&self, snapshot: Option<&ClientSnapshot>, area: Rect) -> Option<Rect> {
+        let id = self.detail_session_id()?;
+        snapshot?
+            .sessions
+            .current
+            .iter()
+            .find(|session| session.id == id)?;
+        let [main_area, _error_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(status_height(snapshot, self)),
+            ])
+            .areas(area);
+        let prompt = current_external_prompt(snapshot, Some(id));
+        let response_height = self.detail_response_height(prompt.as_ref(), main_area.height);
+        let [timeline_area, _response_area, _composer_gap_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(response_height),
+                Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
+            ])
+            .areas(main_area);
+
+        Some(timeline_area)
+    }
+
+    fn detail_timeline_max_scroll(
+        &self,
+        snapshot: Option<&ClientSnapshot>,
+        area: Option<Rect>,
+    ) -> usize {
+        let Some(timeline_area) = area.and_then(|area| self.detail_timeline_area(snapshot, area))
+        else {
+            return 0;
+        };
+        let timeline = self
+            .detail_session_id()
+            .and_then(|id| snapshot?.sessions.timelines.get(id));
+        self.timeline_max_scroll(timeline, timeline_area)
+    }
+
+    fn detail_timeline_top_scroll(
+        &self,
+        timeline: Option<&SessionTimelineView>,
+        timeline_area: Rect,
+    ) -> usize {
+        let max_scroll = self.timeline_max_scroll(timeline, timeline_area);
+        max_scroll.saturating_sub(self.timeline_scroll_from_bottom.min(max_scroll))
+    }
+
+    fn timeline_max_scroll(
+        &self,
+        timeline: Option<&SessionTimelineView>,
+        timeline_area: Rect,
+    ) -> usize {
+        let line_count =
+            timeline_rendered_line_count(timeline, timeline_area.width, &self.expanded_shell_tools);
+        line_count.saturating_sub(usize::from(timeline_area.height))
     }
 
     fn current_detail_session(&self, snapshot: Option<&ClientSnapshot>) -> Option<SessionView> {
@@ -550,7 +911,8 @@ impl SessionsSection {
             .find(|session| session.id == id)
     }
 
-    fn arm_delete(&mut self, snapshot: Option<&ClientSnapshot>) {
+    /// Arm deletion for the selected session or active detail session.
+    pub fn arm_delete(&mut self, snapshot: Option<&ClientSnapshot>) {
         self.delete.clear_error();
         self.delete_session_id = if let Some(id) = &self.detail_session_id {
             Some(id.clone())
@@ -586,22 +948,29 @@ impl SessionsSection {
         let modal_area = ui::centered_percent_rect(area, 82, 18);
         frame.render_widget(Clear, modal_area);
 
-        let block = ui::modal_block(
-            " Sessions ",
-            " Esc back  C-x s create  Right/Enter detail  Backspace/Delete delete ",
-        )
-        .border_style(THEME.accent_style());
+        let block = sessions_modal_block();
         let inner = block.inner(modal_area);
         frame.render_widget(block, modal_area);
+
+        let [title_area, title_gap, body_area, footer_gap, footer_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        render_sessions_modal_title(frame, title_area);
+        render_gap(frame, title_gap);
 
         let [header_area, content_area, status_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(status_height(snapshot, self)),
             ])
-            .areas(inner);
+            .areas(body_area);
 
         frame.render_widget(header_widget(self), header_area);
 
@@ -610,41 +979,113 @@ impl SessionsSection {
         } else if is_pending(snapshot) {
             frame.render_widget(loading_widget(snapshot), content_area);
         } else {
-            frame.render_widget(list_widget(self, snapshot), content_area);
+            frame.render_widget(
+                list_widget(self, snapshot, content_area.height),
+                content_area,
+            );
         }
 
         if status_height(snapshot, self) > 0 {
             frame.render_widget(status_widget(snapshot, self), status_area);
         }
+
+        render_gap(frame, footer_gap);
+        render_sessions_modal_footer(
+            frame,
+            footer_area,
+            " Esc back  C-x s create  Right/Enter detail  C-x d delete ",
+        );
     }
 
     fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, snapshot: Option<&ClientSnapshot>) {
         frame.render_widget(Clear, area);
 
-        let [content_area, status_area] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .areas(area);
-
-        let [detail_area, error_area] = Layout::default()
+        let [main_area, error_area] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
                 Constraint::Length(status_height(snapshot, self)),
             ])
-            .areas(content_area);
+            .areas(area);
 
-        frame.render_widget(detail_widget(self, snapshot), detail_area);
+        let Some(id) = self.detail_session_id() else {
+            frame.render_widget(detail_widget(self, snapshot), main_area);
+            return;
+        };
+
+        let session = snapshot
+            .map_or_else(Vec::new, sorted_sessions)
+            .into_iter()
+            .find(|session| session.id == id);
+
+        let Some(session) = session else {
+            frame.render_widget(detail_widget(self, snapshot), main_area);
+            if status_height(snapshot, self) > 0 {
+                frame.render_widget(status_widget(snapshot, self), error_area);
+            }
+            return;
+        };
+
+        let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(id));
+        let prompt = current_external_prompt(snapshot, Some(id));
+        let response_height = self.detail_response_height(prompt.as_ref(), main_area.height);
+        let [timeline_area, response_area, _composer_gap_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(response_height),
+                Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
+            ])
+            .areas(main_area);
+
+        frame.render_widget(
+            timeline_widget(
+                timeline,
+                self.detail_timeline_top_scroll(timeline, timeline_area),
+                timeline_area.width,
+                &self.expanded_shell_tools,
+            ),
+            timeline_area,
+        );
+
+        if let Some(prompt) = &prompt {
+            render_prompt(frame, response_area, prompt, &self.prompt_draft);
+        } else {
+            render_composer(
+                frame,
+                response_area,
+                self,
+                &session,
+                latest_context_tokens(timeline),
+            );
+        }
 
         if status_height(snapshot, self) > 0 {
             frame.render_widget(status_widget(snapshot, self), error_area);
         }
 
-        frame.render_widget(detail_status_widget(self, snapshot), status_area);
-
         if self.runtime_editor.is_some() {
             render_runtime_editor(frame, area, self, snapshot);
         }
+    }
+
+    fn detail_composer_height(&self) -> u16 {
+        composer_visible_input_line_count(&self.composer_draft) + 4
+    }
+
+    fn detail_response_height(
+        &self,
+        prompt: Option<&ExternalPromptModel>,
+        main_height: u16,
+    ) -> u16 {
+        let desired_height = prompt.map_or_else(
+            || self.detail_composer_height(),
+            |prompt| prompt_height(prompt, &self.prompt_draft),
+        );
+        let max_height = main_height
+            .saturating_sub(DETAIL_TIMELINE_MIN_HEIGHT)
+            .max(1);
+        desired_height.min(max_height)
     }
 }
 
@@ -658,164 +1099,6 @@ pub fn draw_sessions(
     section.render(frame, area, snapshot);
 }
 
-fn render_runtime_editor(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    section: &SessionsSection,
-    snapshot: Option<&ClientSnapshot>,
-) {
-    let modal_area = ui::centered_percent_rect(area, 62, 42);
-    frame.render_widget(Clear, modal_area);
-
-    let title = match section.runtime_editor {
-        Some(RuntimeEditor::Provider { .. }) => " Edit provider/model ",
-        Some(RuntimeEditor::Mcp { .. }) => " Edit MCP servers ",
-        None => return,
-    };
-    let footer = match section.runtime_editor {
-        Some(RuntimeEditor::Provider { .. }) => " Esc cancel  type search  r thinking  Enter save ",
-        Some(RuntimeEditor::Mcp { .. }) => " Esc cancel  type search  Enter save ",
-        None => return,
-    };
-    let block = ui::modal_block(title, footer).border_style(THEME.accent_style());
-    let inner = block.inner(modal_area);
-    frame.render_widget(block, modal_area);
-
-    let lines = match &section.runtime_editor {
-        Some(RuntimeEditor::Provider {
-            query,
-            selected_provider,
-            selected_model,
-            selected_reasoning,
-        }) => provider_editor_lines(
-            snapshot,
-            query,
-            *selected_provider,
-            *selected_model,
-            *selected_reasoning,
-        ),
-        Some(RuntimeEditor::Mcp {
-            query,
-            selected,
-            enabled,
-        }) => mcp_editor_lines(
-            snapshot,
-            section.current_detail_session(snapshot).as_ref(),
-            query,
-            *selected,
-            enabled,
-        ),
-        None => Vec::new(),
-    };
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(THEME.text_style())
-            .wrap(Wrap { trim: false }),
-        inner,
-    );
-}
-
-fn provider_editor_lines(
-    snapshot: Option<&ClientSnapshot>,
-    query: &str,
-    selected_provider: usize,
-    selected_model: usize,
-    selected_reasoning: usize,
-) -> Vec<Line<'static>> {
-    let entries = filtered_provider_entries(snapshot, query);
-    let mut lines = vec![
-        Line::from("Updates session metadata immediately; next prompt uses this runtime."),
-        Line::from(vec![
-            Span::styled("search ", THEME.muted_text_style()),
-            Span::raw(query.to_owned()),
-        ]),
-        Line::from(vec![Span::styled("providers", THEME.accent_bold())]),
-    ];
-
-    for (index, (key, provider)) in entries.iter().enumerate() {
-        lines.push(Line::from(vec![
-            ui::selection_marker(index == selected_provider),
-            Span::raw(" "),
-            ui::selected_title(key.clone()),
-            Span::raw("  "),
-            Span::styled(provider.name.clone(), THEME.muted_text_style()),
-        ]));
-    }
-
-    if let Some((_, provider)) = entries.get(selected_provider) {
-        lines.push(Line::from(vec![Span::styled(
-            "models",
-            THEME.accent_bold(),
-        )]));
-        for (index, model) in sorted_model_keys(provider).iter().enumerate() {
-            lines.push(Line::from(vec![
-                ui::selection_marker(index == selected_model),
-                Span::raw(" "),
-                Span::raw(model.clone()),
-            ]));
-        }
-
-        let efforts = reasoning_efforts_for_provider(provider, selected_model);
-        if !efforts.is_empty() {
-            lines.push(Line::from(vec![Span::styled(
-                "thinking",
-                THEME.accent_bold(),
-            )]));
-            for (index, effort) in efforts.iter().enumerate() {
-                let label = if effort.is_empty() {
-                    "none".to_owned()
-                } else {
-                    effort.clone()
-                };
-                lines.push(Line::from(vec![
-                    ui::selection_marker(index == selected_reasoning),
-                    Span::raw(" "),
-                    Span::raw(label),
-                ]));
-            }
-        }
-    }
-
-    lines
-}
-
-fn mcp_editor_lines(
-    snapshot: Option<&ClientSnapshot>,
-    session: Option<&SessionView>,
-    query: &str,
-    selected: usize,
-    enabled: &BTreeSet<String>,
-) -> Vec<Line<'static>> {
-    let entries = filtered_mcp_entries(snapshot, session, query);
-    let mut lines = vec![
-        Line::from("Space toggles configured servers. Missing servers are shown for drift."),
-        Line::from(vec![
-            Span::styled("search ", THEME.muted_text_style()),
-            Span::raw(query.to_owned()),
-        ]),
-    ];
-
-    for (index, entry) in entries.iter().enumerate() {
-        let marker = if enabled.contains(&entry.key) {
-            "[x]"
-        } else {
-            "[ ]"
-        };
-        lines.push(Line::from(vec![
-            ui::selection_marker(index == selected),
-            Span::raw(" "),
-            Span::raw(marker),
-            Span::raw(" "),
-            ui::selected_title(entry.key.clone()),
-            Span::raw("  "),
-            runtime_match_span(entry.state),
-        ]));
-    }
-
-    lines
-}
-
 fn sorted_sessions(snapshot: &ClientSnapshot) -> Vec<SessionView> {
     sorted_sessions_from_slice(&snapshot.sessions.current)
 }
@@ -824,122 +1107,6 @@ fn sorted_sessions_from_slice(sessions: &[SessionView]) -> Vec<SessionView> {
     let mut sessions = sessions.to_vec();
     sessions.sort_by_key(|session| std::cmp::Reverse(session_timestamp(session)));
     sessions
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct McpEntry {
-    key: String,
-    configured: bool,
-    state: RuntimeConfigMatchView,
-}
-
-fn config(snapshot: Option<&ClientSnapshot>) -> Option<&ConfigView> {
-    snapshot.and_then(|snapshot| snapshot.config.current.as_ref())
-}
-
-fn provider_entries(snapshot: Option<&ClientSnapshot>) -> Vec<(String, ProviderView)> {
-    filtered_provider_entries(snapshot, "")
-}
-
-fn filtered_provider_entries(
-    snapshot: Option<&ClientSnapshot>,
-    query: &str,
-) -> Vec<(String, ProviderView)> {
-    let needle = query.trim().to_lowercase();
-    let mut entries = config(snapshot).map_or_else(Vec::new, |config| {
-        config
-            .providers
-            .iter()
-            .filter(|(key, provider)| {
-                needle.is_empty()
-                    || key.to_lowercase().contains(&needle)
-                    || provider.name.to_lowercase().contains(&needle)
-            })
-            .map(|(key, provider)| (key.clone(), provider.clone()))
-            .collect::<Vec<_>>()
-    });
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    entries
-}
-
-fn mcp_entries(snapshot: Option<&ClientSnapshot>, session: Option<&SessionView>) -> Vec<McpEntry> {
-    filtered_mcp_entries(snapshot, session, "")
-}
-
-fn filtered_mcp_entries(
-    snapshot: Option<&ClientSnapshot>,
-    session: Option<&SessionView>,
-    query: &str,
-) -> Vec<McpEntry> {
-    let needle = query.trim().to_lowercase();
-    let mut entries = config(snapshot).map_or_else(Vec::new, |config| {
-        config
-            .mcp_servers
-            .keys()
-            .filter(|key| needle.is_empty() || key.to_lowercase().contains(&needle))
-            .map(|key| McpEntry {
-                key: key.clone(),
-                configured: true,
-                state: session
-                    .and_then(|session| session.runtime_config.as_ref())
-                    .and_then(|runtime| {
-                        runtime.mcp_servers.iter().find(|server| server.key == *key)
-                    })
-                    .map_or(RuntimeConfigMatchView::Configured, |server| {
-                        server.match_status
-                    }),
-            })
-            .collect::<Vec<_>>()
-    });
-
-    if let Some(runtime) = session.and_then(|session| session.runtime_config.as_ref()) {
-        for server in &runtime.mcp_servers {
-            if !entries.iter().any(|entry| entry.key == server.key)
-                && (needle.is_empty() || server.key.to_lowercase().contains(&needle))
-            {
-                entries.push(McpEntry {
-                    key: server.key.clone(),
-                    configured: false,
-                    state: server.match_status,
-                });
-            }
-        }
-    }
-
-    entries.sort_by(|left, right| left.key.cmp(&right.key));
-    entries
-}
-
-fn sorted_model_keys(provider: &ProviderView) -> Vec<String> {
-    let mut keys = provider.models.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-    keys
-}
-
-fn selected_reasoning_efforts(
-    snapshot: Option<&ClientSnapshot>,
-    selected_provider: usize,
-    selected_model: usize,
-) -> Vec<String> {
-    provider_entries(snapshot)
-        .get(selected_provider)
-        .map_or_else(Vec::new, |(_, provider)| {
-            reasoning_efforts_for_provider(provider, selected_model)
-        })
-}
-
-fn reasoning_efforts_for_provider(provider: &ProviderView, selected_model: usize) -> Vec<String> {
-    let model_keys = sorted_model_keys(provider);
-    let Some(model_id) = model_keys.get(selected_model) else {
-        return Vec::new();
-    };
-    let Some(model) = provider.models.get(model_id) else {
-        return Vec::new();
-    };
-
-    let mut efforts = vec![String::new()];
-    efforts.extend(model.options.reasoning_efforts.iter().cloned());
-    efforts
 }
 
 fn session_timestamp(session: &SessionView) -> i64 {
@@ -968,8 +1135,60 @@ fn status_height(snapshot: Option<&ClientSnapshot>, section: &SessionsSection) -
         session_error(snapshot).is_some()
             || detail_error(snapshot, section).is_some()
             || section.create.error().is_some()
-            || section.delete.error().is_some(),
+            || section.delete.error().is_some()
+            || section.runtime_update.error().is_some()
+            || section.submit.error().is_some()
+            || section.respond.error().is_some()
+            || section.interrupt.error().is_some(),
     )
+}
+
+fn panel_style() -> Style {
+    THEME.panel_style()
+}
+
+fn panel_muted_style() -> Style {
+    THEME.panel_muted_style()
+}
+
+fn sessions_modal_block() -> Block<'static> {
+    Block::default()
+        .style(THEME.panel_style())
+        .padding(Padding::new(3, 3, 1, 1))
+}
+
+fn render_sessions_modal_title(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(sessions_modal_title_line()).style(THEME.panel_style()),
+        area,
+    );
+}
+
+fn sessions_modal_title_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" ", THEME.panel_style()),
+        Span::styled("Sessions", THEME.accent_bold().bg(THEME.panel())),
+    ])
+    .style(THEME.panel_style())
+}
+
+fn render_sessions_modal_footer(frame: &mut Frame<'_>, area: Rect, footer_hint: &'static str) {
+    frame.render_widget(
+        Paragraph::new(sessions_modal_footer_line(footer_hint)).style(THEME.panel_style()),
+        area,
+    );
+}
+
+fn sessions_modal_footer_line(footer_hint: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" ", THEME.panel_style()),
+        Span::styled(footer_hint.trim().to_owned(), THEME.panel_muted_style()),
+    ])
+    .style(THEME.panel_style())
+}
+
+fn render_gap(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Block::default().style(THEME.panel_style()), area);
 }
 
 fn session_error(snapshot: Option<&ClientSnapshot>) -> Option<&str> {
@@ -1011,14 +1230,13 @@ fn header_widget(section: &SessionsSection) -> Paragraph<'static> {
         "Create: C-x s"
     };
 
-    Paragraph::new(vec![
-        Line::from(vec![Span::styled("Sessions", THEME.accent_bold())]),
-        Line::from(vec![
-            Span::styled(title, THEME.text_style()),
-            Span::raw("  "),
-            Span::styled(create, THEME.focus_style()),
-        ]),
-    ])
+    Paragraph::new(Line::from(vec![
+        Span::styled(" ", THEME.panel_style()),
+        Span::styled(title, THEME.text_style().bg(THEME.panel())),
+        Span::styled("  ", THEME.panel_style()),
+        Span::styled(create, THEME.focus_style().bg(THEME.panel())),
+    ]))
+    .style(THEME.panel_style())
 }
 
 fn loading_widget(snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
@@ -1031,10 +1249,14 @@ fn loading_widget(snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
             Span::styled(watch.to_owned(), THEME.focus_style()),
         ]),
     ])
-    .style(THEME.text_style())
+    .style(THEME.panel_style())
 }
 
-fn list_widget(section: &SessionsSection, snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
+fn list_widget(
+    section: &SessionsSection,
+    snapshot: Option<&ClientSnapshot>,
+    height: u16,
+) -> Paragraph<'static> {
     let sessions = snapshot.map_or_else(Vec::new, sorted_sessions);
     let lines = if sessions.is_empty() {
         vec![ui::loading_line("No sessions yet.")]
@@ -1048,150 +1270,57 @@ fn list_widget(section: &SessionsSection, snapshot: Option<&ClientSnapshot>) -> 
             .collect()
     };
 
+    let scroll_top = session_list_scroll_top(section.selected_session, sessions.len(), height);
+
     Paragraph::new(lines)
-        .style(THEME.text_style())
+        .style(THEME.panel_style())
+        .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false })
+}
+
+fn session_list_scroll_top(selected: usize, len: usize, height: u16) -> u16 {
+    if len == 0 || height == 0 {
+        return 0;
+    }
+
+    let height = usize::from(height);
+    let selected = selected.min(len.saturating_sub(1));
+    selected
+        .saturating_add(1)
+        .saturating_sub(height)
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
 fn session_line(section: &SessionsSection, session: &SessionView, selected: bool) -> Line<'static> {
     if section.delete_session_id.as_deref() == Some(session.id.as_str()) {
         return Line::from(vec![
-            ui::selection_marker(selected),
-            Span::raw(" "),
-            ui::selected_title(session.id.clone()),
-            Span::raw("  "),
-            ui::delete_prompt_span(ui::delete_prompt_text(
-                section.delete.is_pending(),
-                section.delete.error(),
-            )),
-        ]);
+            session_option_marker(selected),
+            Span::styled(" ", session_option_style(selected)),
+            session_option_title(session.id.clone(), selected),
+            Span::styled("  ", session_option_style(selected)),
+            session_delete_prompt_span(
+                ui::delete_prompt_text(section.delete.is_pending(), section.delete.error()),
+                selected,
+            ),
+        ])
+        .style(session_option_style(selected));
     }
 
     Line::from(vec![
-        ui::selection_marker(selected),
-        Span::raw(" "),
-        ui::selected_title(session.id.clone()),
-        Span::raw("  "),
-        phase_span(session.status.phase),
-        Span::raw("  "),
-        Span::styled(format_timestamp(session), THEME.muted_text_style()),
-        runtime_warning_span(session),
-    ])
-}
-
-fn timeline_lines(timeline: Option<&SessionTimelineView>) -> Vec<Line<'static>> {
-    let Some(timeline) = timeline else {
-        return vec![ui::loading_line("Loading timeline...")];
-    };
-
-    if timeline.events.is_empty() {
-        let label = if matches!(timeline.watch.status, "opened" | "received") {
-            "No timeline events yet."
-        } else {
-            "Loading timeline..."
-        };
-        return vec![
-            ui::loading_line(label),
-            Line::from(vec![
-                Span::styled("watch ", THEME.muted_text_style()),
-                Span::styled(timeline.watch.status.to_owned(), THEME.focus_style()),
-            ]),
-        ];
-    }
-
-    timeline.events.iter().map(timeline_event_line).collect()
-}
-
-fn timeline_event_line(event: &TimelineEventView) -> Line<'static> {
-    let label = event_label(event);
-    let text = event_text(event);
-    let status = event
-        .status
-        .map(|status| format!("  {}", status_name(status)))
-        .unwrap_or_default();
-
-    Line::from(vec![
-        Span::styled(format!("#{:>3} ", event.cursor), THEME.muted_text_style()),
-        Span::styled(label, THEME.focus_style()),
-        Span::raw(" "),
-        Span::raw(text),
-        Span::raw(status),
-    ])
-}
-
-fn event_label(event: &TimelineEventView) -> &'static str {
-    match event.channel.as_deref() {
-        Some("user_text") => "user",
-        Some("assistant_text") => "assistant",
-        Some("thinking") => "thinking",
-        Some("tool_call") => "tool call",
-        Some("tool_progress_info") => "tool info",
-        Some("tool_progress_error") => "tool error",
-        Some("tool_result") => "tool result",
-        Some("external_request") => "external",
-        Some("metrics") => "metrics",
-        _ => match event.kind {
-            TimelineEventKindView::ExternalRequestOpened => "external opened",
-            TimelineEventKindView::ExternalRequestResolved => "external resolved",
-            TimelineEventKindView::SessionStatusChanged => "status",
-            TimelineEventKindView::ContentDelta => "delta",
-            TimelineEventKindView::ItemStarted => "started",
-            TimelineEventKindView::ItemUpdated => "updated",
-            TimelineEventKindView::ItemFinished => "finished",
-            TimelineEventKindView::Unspecified | TimelineEventKindView::Unknown => "event",
-        },
-    }
-}
-
-fn event_text(event: &TimelineEventView) -> String {
-    match &event.content {
-        TimelineContentView::Empty => String::new(),
-        TimelineContentView::TextDelta { delta } => delta.clone(),
-        TimelineContentView::TextSnapshot { text } => text.clone(),
-        TimelineContentView::ToolCall {
-            id,
-            name,
-            arguments_json,
-        } => format!("{name} {id} {arguments_json}"),
-        TimelineContentView::ToolResult {
-            id,
-            name,
-            content,
-            error,
-        } => {
-            let prefix = if *error { "error" } else { "ok" };
-            format!("{name} {id} {prefix}: {content}")
-        }
-        TimelineContentView::ExternalRequest { request } => request.as_ref().map_or_else(
-            || "request pending".to_owned(),
-            |request| format!("request {} kind {}", request.id, request.kind),
+        session_option_marker(selected),
+        Span::styled(" ", session_option_style(selected)),
+        session_option_title(session.id.clone(), selected),
+        Span::styled("  ", session_option_style(selected)),
+        phase_span_with_bg(session.status.phase, selected),
+        Span::styled("  ", session_option_style(selected)),
+        Span::styled(
+            format_timestamp(session),
+            session_option_muted_style(selected),
         ),
-        TimelineContentView::ContentRef { content_id, bytes } => {
-            format!("content {content_id} ({bytes} bytes)")
-        }
-        TimelineContentView::Json { value_json } => value_json.clone(),
-        TimelineContentView::Unknown => "unknown content".to_owned(),
-    }
-}
-
-const fn status_name(status: TimelineStatusView) -> &'static str {
-    match status {
-        TimelineStatusView::Unspecified => "unspecified",
-        TimelineStatusView::Idle => "idle",
-        TimelineStatusView::BuildingRequest => "building request",
-        TimelineStatusView::StreamingProvider => "streaming provider",
-        TimelineStatusView::EvaluatingToolCall => "evaluating tool call",
-        TimelineStatusView::RunningTool => "running tool",
-        TimelineStatusView::Pending => "pending",
-        TimelineStatusView::AwaitingToolResults => "awaiting tool results",
-        TimelineStatusView::AwaitingExternalInput => "awaiting external input",
-        TimelineStatusView::Interrupted => "interrupted",
-        TimelineStatusView::Resolved => "resolved",
-        TimelineStatusView::Finished => "finished",
-        TimelineStatusView::Failed => "failed",
-        TimelineStatusView::Canceled => "canceled",
-        TimelineStatusView::Unknown => "unknown",
-    }
+        runtime_warning_span(session, selected),
+    ])
+    .style(session_option_style(selected))
 }
 
 fn detail_widget(
@@ -1233,96 +1362,33 @@ fn detail_widget(
     }
 
     lines.push(Line::raw(""));
-    lines.extend(timeline_lines(timeline));
+    lines.extend(timeline_lines(
+        timeline,
+        None,
+        &section.expanded_shell_tools,
+    ));
 
     Paragraph::new(lines)
         .style(THEME.text_style())
         .wrap(Wrap { trim: false })
 }
 
-fn detail_status_widget(
-    section: &SessionsSection,
-    snapshot: Option<&ClientSnapshot>,
-) -> Paragraph<'static> {
-    let Some(id) = section.detail_session_id() else {
-        return Paragraph::new(Line::from(Span::styled(
-            "status unknown  provider none  mcp none",
-            THEME.muted_text_style(),
-        )));
-    };
-
-    let session = snapshot
-        .map_or_else(Vec::new, sorted_sessions)
-        .into_iter()
-        .find(|session| session.id == id);
-
-    let Some(session) = session else {
-        return Paragraph::new(Line::from(vec![
-            Span::styled("status waiting", THEME.status_style(StatusRole::Loading)),
-            Span::raw("  "),
-            Span::styled("provider none", THEME.muted_text_style()),
-            Span::raw("  "),
-            Span::styled("mcp none", THEME.muted_text_style()),
-        ]));
-    };
-
-    Paragraph::new(Line::from(vec![
-        Span::styled("status ", THEME.muted_text_style()),
-        phase_span(session.status.phase),
-        Span::raw("  "),
-        Span::styled("provider ", THEME.muted_text_style()),
-        Span::raw(provider_status_text(session.runtime_config.as_ref())),
-        Span::raw(" "),
-        Span::styled("(p)", THEME.focus_style()),
-        Span::raw("  "),
-        Span::styled("mcp ", THEME.muted_text_style()),
-        Span::raw(mcp_status_text(session.runtime_config.as_ref())),
-        Span::raw(" "),
-        Span::styled("(m)", THEME.focus_style()),
-        Span::raw("  "),
-        Span::styled("tokens ", THEME.muted_text_style()),
-        Span::raw(format_count(session.metrics.total_tokens)),
-        Span::raw("  "),
-        Span::styled("cache ", THEME.muted_text_style()),
-        Span::raw(format!(
-            "R {}/W {}",
-            cache_rate(
-                session.metrics.cache_read_tokens,
-                session.metrics.input_tokens
-            ),
-            cache_rate(
-                session.metrics.cache_write_tokens,
-                session.metrics.input_tokens
-            )
-        )),
-        Span::raw("  "),
-        Span::styled("cost ", THEME.muted_text_style()),
-        Span::raw(format_cost(
-            session.metrics.total_cost_micros,
-            session.metrics.cost_currency.as_deref(),
-        )),
-        Span::raw("  "),
-        delete_status_span(section, &session),
-    ]))
-    .style(THEME.text_style())
-}
-
-fn delete_status_span(section: &SessionsSection, session: &SessionView) -> Span<'static> {
-    if section.delete_session_id.as_deref() == Some(session.id.as_str()) {
-        return ui::delete_prompt_span(ui::delete_prompt_text(
-            section.delete.is_pending(),
-            section.delete.error(),
-        ));
-    }
-
-    Span::styled(
-        "delete Backspace/Delete",
-        THEME.danger_style().add_modifier(Modifier::BOLD),
-    )
-}
-
 fn format_count(value: u64) -> String {
-    value.to_string()
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => format_suffix(value, 1_000, "k"),
+        _ => format_suffix(value, 1_000_000, "m"),
+    }
+}
+
+fn format_suffix(value: u64, divisor: u64, suffix: &str) -> String {
+    let scaled = value as f64 / divisor as f64;
+    let text = if scaled < 10.0 {
+        format!("{scaled:.1}")
+    } else {
+        format!("{scaled:.0}")
+    };
+    format!("{}{suffix}", text.trim_end_matches(".0"))
 }
 
 fn cache_rate(part: u64, total: u64) -> String {
@@ -1332,44 +1398,91 @@ fn cache_rate(part: u64, total: u64) -> String {
     format!("{:.1}%", (part as f64 / total as f64) * 100.0)
 }
 
-fn format_cost(micros: u64, currency: Option<&str>) -> String {
+fn format_compact_cost(micros: u64) -> String {
     if micros == 0 {
-        return "-".to_owned();
+        return "$-".to_owned();
     }
-    format!(
-        "{} {:.6}",
-        currency.unwrap_or("USD"),
-        micros as f64 / 1_000_000.0
+    format!("${:.6}", micros as f64 / 1_000_000.0)
+}
+
+fn format_compact_currency_cost(micros: u64, currency: Option<&str>) -> String {
+    if micros == 0 {
+        return "$-".to_owned();
+    }
+    let value = micros as f64 / 1_000_000.0;
+    match currency {
+        Some(currency) if currency != "USD" => format!("{currency} {value:.6}"),
+        _ => format!("${value:.6}"),
+    }
+}
+
+fn session_option_marker(selected: bool) -> Span<'static> {
+    Span::styled(
+        if selected { ">" } else { " " },
+        if selected {
+            session_option_focus_style(selected).add_modifier(Modifier::BOLD)
+        } else {
+            session_option_muted_style(selected)
+        },
     )
 }
 
-fn provider_status_text(runtime: Option<&SessionRuntimeConfigView>) -> String {
-    runtime
-        .and_then(|runtime| runtime.provider.as_ref())
-        .map_or_else(
-            || "none".to_owned(),
-            |provider| format!("{}/{}", provider.key, provider.model_id),
-        )
+fn session_option_title(text: impl Into<String>, selected: bool) -> Span<'static> {
+    Span::styled(text.into(), session_option_title_style(selected))
 }
 
-fn mcp_status_text(runtime: Option<&SessionRuntimeConfigView>) -> String {
-    let Some(runtime) = runtime else {
-        return "none".to_owned();
-    };
+fn session_delete_prompt_span(text: impl Into<String>, selected: bool) -> Span<'static> {
+    Span::styled(
+        text.into(),
+        THEME
+            .danger_style()
+            .bg(session_option_bg(selected))
+            .add_modifier(Modifier::BOLD),
+    )
+}
 
-    if runtime.mcp_servers.is_empty() {
-        return "none".to_owned();
+fn phase_span_with_bg(phase: SessionPhaseView, selected: bool) -> Span<'static> {
+    Span::styled(
+        phase_name(phase),
+        THEME
+            .status_style(phase_role(phase))
+            .bg(session_option_bg(selected))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn session_option_style(selected: bool) -> Style {
+    THEME.panel_style().bg(session_option_bg(selected))
+}
+
+fn session_option_title_style(selected: bool) -> Style {
+    if selected {
+        session_option_focus_style(selected).add_modifier(Modifier::BOLD)
+    } else {
+        THEME
+            .text_style()
+            .bg(session_option_bg(selected))
+            .add_modifier(Modifier::BOLD)
     }
-
-    runtime
-        .mcp_servers
-        .iter()
-        .map(|server| server.key.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
-fn runtime_warning_span(session: &SessionView) -> Span<'static> {
+fn session_option_muted_style(selected: bool) -> Style {
+    THEME.panel_muted_style().bg(session_option_bg(selected))
+}
+
+fn session_option_focus_style(selected: bool) -> Style {
+    THEME.focus_style().bg(session_option_bg(selected))
+}
+
+fn session_option_bg(selected: bool) -> ratatui::style::Color {
+    if selected {
+        THEME.dim_accent()
+    } else {
+        THEME.panel()
+    }
+}
+
+fn runtime_warning_span(session: &SessionView, selected: bool) -> Span<'static> {
     let Some(runtime) = &session.runtime_config else {
         return Span::raw("");
     };
@@ -1386,23 +1499,15 @@ fn runtime_warning_span(session: &SessionView) -> Span<'static> {
         )
     });
     if provider_mismatch || mcp_mismatch {
-        Span::styled("  runtime drift", THEME.status_style(StatusRole::Saving))
+        Span::styled(
+            "  runtime drift",
+            THEME
+                .status_style(StatusRole::Saving)
+                .bg(session_option_bg(selected)),
+        )
     } else {
         Span::raw("")
     }
-}
-
-fn runtime_match_span(state: RuntimeConfigMatchView) -> Span<'static> {
-    let (label, role) = match state {
-        RuntimeConfigMatchView::Configured => ("configured", StatusRole::Ready),
-        RuntimeConfigMatchView::Missing => ("missing", StatusRole::Error),
-        RuntimeConfigMatchView::Changed => ("changed", StatusRole::Saving),
-        RuntimeConfigMatchView::Unspecified | RuntimeConfigMatchView::Unknown => {
-            ("unknown", StatusRole::Loading)
-        }
-    };
-
-    Span::styled(label, THEME.status_style(role).add_modifier(Modifier::BOLD))
 }
 
 fn status_widget(
@@ -1413,26 +1518,34 @@ fn status_widget(
         .create
         .error()
         .or_else(|| section.delete.error())
+        .or_else(|| section.runtime_update.error())
+        .or_else(|| section.submit.error())
+        .or_else(|| section.respond.error())
+        .or_else(|| section.interrupt.error())
         .or_else(|| detail_error(snapshot, section))
         .or_else(|| session_error(snapshot));
 
     let lines = error.map_or_else(Vec::new, |error| vec![ui::error_line(error)]);
-    Paragraph::new(lines).style(THEME.text_style())
+    Paragraph::new(lines).style(THEME.panel_style())
 }
 
 fn phase_span(phase: SessionPhaseView) -> Span<'static> {
-    let role = match phase {
+    Span::styled(
+        phase_name(phase),
+        THEME
+            .status_style(phase_role(phase))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+const fn phase_role(phase: SessionPhaseView) -> StatusRole {
+    match phase {
         SessionPhaseView::Failed => StatusRole::Error,
         SessionPhaseView::Finished | SessionPhaseView::Idle | SessionPhaseView::Suspended => {
             StatusRole::Ready
         }
         _ => StatusRole::Loading,
-    };
-
-    Span::styled(
-        phase_name(phase),
-        THEME.status_style(role).add_modifier(Modifier::BOLD),
-    )
+    }
 }
 
 const fn phase_name(phase: SessionPhaseView) -> &'static str {
@@ -1467,21 +1580,48 @@ fn format_optional_timestamp(timestamp: Option<&waltr_client::TimestampView>) ->
     )
 }
 
-fn register_timeline_watch_command(session_id: String) -> ClientCommand {
-    ClientCommand::RegisterSessionTimelineWatchInterest {
-        session_id,
-        after_cursor: None,
-        channels: vec![
-            "user_text".to_owned(),
-            "assistant_text".to_owned(),
-            "thinking".to_owned(),
-            "tool_call".to_owned(),
-            "tool_progress_info".to_owned(),
-            "tool_progress_error".to_owned(),
-            "tool_result".to_owned(),
-            "external_request".to_owned(),
-            "metrics".to_owned(),
-        ],
-        initial_limit: Some(64),
+fn session_important_status(
+    session: &SessionView,
+    timeline: Option<&SessionTimelineView>,
+    prompt: Option<&ExternalPromptModel>,
+) -> Option<String> {
+    if let Some(error) = timeline.and_then(|timeline| timeline.watch.error.as_ref()) {
+        return Some(error.clone());
     }
+
+    if session.status.phase == SessionPhaseView::Failed {
+        return Some(if session.status.failed_message.is_empty() {
+            "Session failed.".to_owned()
+        } else {
+            session.status.failed_message.clone()
+        });
+    }
+
+    if session_active(session.status.phase) && prompt.is_none() {
+        return Some("Working...".to_owned());
+    }
+
+    None
+}
+
+const fn session_active(phase: SessionPhaseView) -> bool {
+    !matches!(
+        phase,
+        SessionPhaseView::Unspecified
+            | SessionPhaseView::Idle
+            | SessionPhaseView::Suspended
+            | SessionPhaseView::Finished
+            | SessionPhaseView::Failed
+            | SessionPhaseView::Unknown
+    )
+}
+
+fn timeline_ready(snapshot: Option<&ClientSnapshot>, session_id: &str) -> bool {
+    snapshot
+        .and_then(|snapshot| snapshot.sessions.timelines.get(session_id))
+        .is_some_and(|timeline| timeline_ready_view(Some(timeline)))
+}
+
+fn timeline_ready_view(timeline: Option<&SessionTimelineView>) -> bool {
+    timeline.is_some_and(|timeline| matches!(timeline.watch.status, "opened" | "received"))
 }

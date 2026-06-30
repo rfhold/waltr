@@ -11,14 +11,12 @@ mod providers;
 
 pub use defaults::RuntimeDefaultsSection;
 pub use mcp::{McpForm, McpFormMode, McpSection};
-pub use providers::{
-    ModelForm, ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection, SectionAction,
-};
+pub use providers::{ModelForm, ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection};
 
 use waltr_client::ClientSnapshot;
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     text::{Line, Span},
     widgets::{Clear, Paragraph},
 };
@@ -68,30 +66,28 @@ impl ConfigTab {
 
 /// Render the configuration surface.
 pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let modal_area = ui::centered_percent_rect(area, 82, 18);
+    let modal_area = ui::centered_percent_rect(area, 90, 20);
     frame.render_widget(Clear, modal_area);
-
-    let block = ui::modal_block(
-        " Configuration ",
-        " Esc back  Tab switch  C-x c create  Right/Enter edit  Backspace/Delete delete ",
-    )
-    .border_style(THEME.accent_style());
-    let inner = block.inner(modal_area);
-    frame.render_widget(block, modal_area);
 
     let snapshot = app.client_snapshot();
     let active_tab = app.active_config_tab();
+    let body_area = render_modal_frame(
+        frame,
+        modal_area,
+        "Configuration",
+        config_footer_hint(active_tab),
+    );
 
-    let [tabs_area, content_area, status_area] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(status_height(snapshot)),
-        ])
-        .areas(inner);
+    let [tabs_area, tabs_gap, content_area, status_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(status_height(snapshot)),
+    ])
+    .areas(body_area);
 
     frame.render_widget(tab_strip(active_tab), tabs_area);
+    ui::render_panel_gap(frame, tabs_gap);
 
     // Pending = no config data available, and no load or watch error has
     // occurred. While pending the surface replaces the active section content
@@ -114,23 +110,43 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if !pending {
                 section.render_content(frame, content_area, config, loaded);
             }
-            section.render_overlay(frame, area);
+            section.render_overlay(frame, modal_area);
         }
         ConfigTab::Mcp => {
             let section = app.mcp_section();
             if !pending {
                 section.render_content(frame, content_area, config, loaded);
             }
-            section.render_overlay(frame, area);
+            section.render_overlay(frame, modal_area);
         }
         ConfigTab::Defaults => {
             let section = app.runtime_defaults_section();
             if !pending {
                 section.render_content(frame, content_area, config, loaded);
             }
-            section.render_overlay(frame, area);
+            section.render_overlay(frame, modal_area, config);
         }
     }
+}
+
+fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
+    match active_tab {
+        ConfigTab::Providers | ConfigTab::Mcp => {
+            "Esc back  Tab switch  C-x c create  Enter edit  Del delete"
+        }
+        ConfigTab::Defaults => {
+            "Esc back  Tab switch  m model  Space MCP  r reason  Enter save  Del clear"
+        }
+    }
+}
+
+fn render_modal_frame(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    footer_hint: &'static str,
+) -> Rect {
+    ui::render_modal_frame(frame, area, title, footer_hint)
 }
 
 /// Whether the config surface is waiting for data: no configuration is
@@ -156,7 +172,7 @@ fn loading_widget(snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
         ]),
     ];
 
-    Paragraph::new(lines).style(THEME.text_style())
+    Paragraph::new(lines).style(THEME.panel_style())
 }
 
 /// Whether the config surface has a load or watch error to surface.
@@ -184,14 +200,10 @@ fn status_widget(snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
 
     let lines = error.map_or_else(Vec::new, |error| vec![ui::error_line(error)]);
 
-    Paragraph::new(lines).style(THEME.text_style())
+    Paragraph::new(lines).style(THEME.panel_style())
 }
 
-/// Render the tab strip as labeled segments above a full-width divider rule.
-///
-/// The active tab is bold/underlined in the accent color; inactive tabs are
-/// dim. A horizontal rule under the labels visually anchors the strip as a tab
-/// bar rather than a floating word.
+/// Render the tab strip as labeled segments on the modal surface.
 fn tab_strip(active: ConfigTab) -> Paragraph<'static> {
     let mut spans = Vec::new();
     spans.push(Span::raw(" "));
@@ -200,7 +212,5 @@ fn tab_strip(active: ConfigTab) -> Paragraph<'static> {
         spans.push(Span::raw(" "));
     }
 
-    let rule = Line::from(Span::styled("─".repeat(240), THEME.dim_accent_style()));
-
-    Paragraph::new(vec![Line::from(spans), rule]).style(THEME.text_style())
+    Paragraph::new(Line::from(spans)).style(THEME.panel_style())
 }

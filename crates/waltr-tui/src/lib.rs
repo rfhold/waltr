@@ -6,6 +6,7 @@ pub mod app;
 pub mod event;
 pub mod input;
 mod keys;
+mod markdown;
 pub mod runtime;
 pub mod screens;
 pub mod theme;
