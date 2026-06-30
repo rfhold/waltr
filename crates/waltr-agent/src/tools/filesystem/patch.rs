@@ -1,8 +1,18 @@
 //! Filesystem patch parsing and application.
 
+use std::{fs, path::Path};
+
 use crate::Result;
 
-use super::{ApplyPatchInput, DeleteInput, FilesystemConfig, WriteInput, filesystem_error};
+use super::{
+    ApplyPatchInput, DeleteInput, FilesystemConfig, WriteInput, filesystem_error, model_path,
+};
+
+#[derive(Debug, Default)]
+struct UpdateChunk {
+    old_lines: Vec<String>,
+    new_lines: Vec<String>,
+}
 
 impl FilesystemConfig {
     /// Apply a stripped-down patch envelope using opencode-compatible input and output.
@@ -102,57 +112,16 @@ impl FilesystemConfig {
                 }
                 _ if line.starts_with("*** Update File: ") => {
                     let path = line.trim_start_matches("*** Update File: ");
-                    let mut content = String::new();
-                    while index < lines.len() {
-                        let patch_line = lines[index];
-                        if patch_line.starts_with("*** ") {
-                            break;
-                        }
-                        index += 1;
-                        if patch_line.starts_with("@@") {
-                            continue;
-                        }
-                        if patch_line.starts_with('-') {
-                            continue;
-                        }
-                        let text = patch_line
-                            .strip_prefix('+')
-                            .or_else(|| patch_line.strip_prefix(' '))
-                            .ok_or_else(|| filesystem_error("invalid update patch line"))?;
-                        content.push_str(text);
-                        content.push('\n');
-                    }
-                    if unscoped {
-                        self.write_unscoped(&WriteInput::new(content, path))?;
-                    } else {
-                        self.write(&WriteInput::new(content, path))?;
-                    }
+                    let chunks = parse_update_chunks(&lines, &mut index)?;
+                    let content = self.apply_update_chunks(path, &chunks, unscoped)?;
+                    self.write_patch_update(path, content, unscoped)?;
                     summary.push(format!("M {path}"));
                 }
                 "*** Update File" => {
                     let path = patch_path(&lines, &mut index)?;
-                    let mut content = String::new();
-                    while index < lines.len() {
-                        let patch_line = lines[index];
-                        if patch_line.starts_with("*** ") {
-                            break;
-                        }
-                        index += 1;
-                        if patch_line.starts_with("@@") || patch_line.starts_with('-') {
-                            continue;
-                        }
-                        let text = patch_line
-                            .strip_prefix('+')
-                            .or_else(|| patch_line.strip_prefix(' '))
-                            .ok_or_else(|| filesystem_error("invalid update patch line"))?;
-                        content.push_str(text);
-                        content.push('\n');
-                    }
-                    if unscoped {
-                        self.write_unscoped(&WriteInput::new(content, &path))?;
-                    } else {
-                        self.write(&WriteInput::new(content, &path))?;
-                    }
+                    let chunks = parse_update_chunks(&lines, &mut index)?;
+                    let content = self.apply_update_chunks(&path, &chunks, unscoped)?;
+                    self.write_patch_update(&path, content, unscoped)?;
                     summary.push(format!("M {path}"));
                 }
                 _ => return Err(filesystem_error(format!("unsupported patch line: {line}"))),
@@ -161,6 +130,133 @@ impl FilesystemConfig {
 
         Err(filesystem_error("patch missing *** End Patch"))
     }
+
+    fn apply_update_chunks(
+        &self,
+        path: &str,
+        chunks: &[UpdateChunk],
+        unscoped: bool,
+    ) -> Result<String> {
+        let path = model_path(path);
+        let resolved = if unscoped {
+            self.resolved_existing_path(&path)?
+        } else {
+            self.scoped_existing_path(&path)?
+        };
+        let content = fs::read_to_string(&resolved)?;
+        apply_update_chunks_to_content(&resolved, &content, chunks)
+    }
+
+    fn write_patch_update(&self, path: &str, content: String, unscoped: bool) -> Result<()> {
+        if unscoped {
+            self.write_unscoped(&WriteInput::new(content, path))?;
+        } else {
+            self.write(&WriteInput::new(content, path))?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_update_chunks(lines: &[&str], index: &mut usize) -> Result<Vec<UpdateChunk>> {
+    let mut chunks = Vec::new();
+    let mut current = UpdateChunk::default();
+
+    while *index < lines.len() {
+        let line = lines[*index];
+        if line.starts_with("*** ") {
+            break;
+        }
+        *index += 1;
+
+        if line.starts_with("@@") {
+            if !current.old_lines.is_empty() || !current.new_lines.is_empty() {
+                chunks.push(current);
+                current = UpdateChunk::default();
+            }
+            let context = line.trim_start_matches("@@").trim();
+            if !context.is_empty() {
+                current.old_lines.push(context.to_owned());
+                current.new_lines.push(context.to_owned());
+            }
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix(' ') {
+            current.old_lines.push(text.to_owned());
+            current.new_lines.push(text.to_owned());
+        } else if let Some(text) = line.strip_prefix('-') {
+            current.old_lines.push(text.to_owned());
+        } else if let Some(text) = line.strip_prefix('+') {
+            current.new_lines.push(text.to_owned());
+        } else {
+            return Err(filesystem_error("invalid update patch line"));
+        }
+    }
+
+    if !current.old_lines.is_empty() || !current.new_lines.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        return Err(filesystem_error("update patch has no changes"));
+    }
+
+    Ok(chunks)
+}
+
+fn apply_update_chunks_to_content(
+    path: &Path,
+    content: &str,
+    chunks: &[UpdateChunk],
+) -> Result<String> {
+    let mut lines = split_patch_lines(content);
+    let had_trailing_newline = content.ends_with('\n');
+    let mut search_start = 0;
+
+    for chunk in chunks {
+        if chunk.old_lines.is_empty() {
+            let insert_at = search_start.min(lines.len());
+            lines.splice(insert_at..insert_at, chunk.new_lines.clone());
+            search_start = insert_at + chunk.new_lines.len();
+            continue;
+        }
+
+        let Some(start) = seek_lines(&lines, &chunk.old_lines, search_start) else {
+            return Err(filesystem_error(format!(
+                "failed to find expected lines in {}",
+                path.display()
+            )));
+        };
+        lines.splice(
+            start..start + chunk.old_lines.len(),
+            chunk.new_lines.clone(),
+        );
+        search_start = start + chunk.new_lines.len();
+    }
+
+    let mut updated = lines.join("\n");
+    if !updated.is_empty() && had_trailing_newline {
+        updated.push('\n');
+    }
+    Ok(updated)
+}
+
+fn split_patch_lines(content: &str) -> Vec<String> {
+    let mut lines = content
+        .split('\n')
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if content.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+}
+
+fn seek_lines(lines: &[String], pattern: &[String], start: usize) -> Option<usize> {
+    if pattern.is_empty() || pattern.len() > lines.len() {
+        return None;
+    }
+    (start..=lines.len() - pattern.len())
+        .find(|&index| lines[index..index + pattern.len()] == *pattern)
 }
 
 fn patch_success(summary: &[String]) -> String {
