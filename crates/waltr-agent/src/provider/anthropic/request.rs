@@ -8,17 +8,20 @@ pub(super) fn messages_request(
     model: &str,
     max_tokens: u32,
     thinking: Option<&AnthropicThinkingConfig>,
+    prompt_cache: bool,
     request: &CompletionRequest<'_>,
 ) -> Value {
+    let static_breakpoint =
+        prompt_cache && (!request.tools.is_empty() || request.system_prompt.is_some());
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
         "stream": true,
-        "messages": anthropic_messages(request),
-        "tools": anthropic_tools(&request.tools),
+        "messages": anthropic_messages(request, prompt_cache, static_breakpoint),
+        "tools": anthropic_tools(&request.tools, prompt_cache),
     });
     if let Some(system_prompt) = request.system_prompt {
-        body["system"] = json!(system_prompt);
+        body["system"] = anthropic_system(system_prompt, prompt_cache && request.tools.is_empty());
     }
     if let Some(thinking) = thinking {
         body["thinking"] = anthropic_thinking(thinking);
@@ -26,7 +29,11 @@ pub(super) fn messages_request(
     body
 }
 
-fn anthropic_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
+fn anthropic_messages(
+    request: &CompletionRequest<'_>,
+    prompt_cache: bool,
+    static_breakpoint: bool,
+) -> Vec<Value> {
     let mut messages = Vec::new();
     let mut assistant_content: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
@@ -73,7 +80,17 @@ fn anthropic_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     }
     flush_assistant_content(&mut messages, &mut assistant_content);
     flush_tool_results(&mut messages, &mut tool_results);
+    if prompt_cache {
+        add_rolling_cache_control(&mut messages, usize::from(static_breakpoint));
+    }
     messages
+}
+
+fn anthropic_system(system_prompt: &str, prompt_cache: bool) -> Value {
+    if prompt_cache {
+        return json!([{ "type": "text", "text": system_prompt, "cache_control": cache_control() }]);
+    }
+    json!(system_prompt)
 }
 
 fn flush_assistant_content(messages: &mut Vec<Value>, content: &mut Vec<Value>) {
@@ -88,17 +105,78 @@ fn flush_tool_results(messages: &mut Vec<Value>, results: &mut Vec<Value>) {
     }
 }
 
-fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+fn anthropic_tools(tools: &[ToolDefinition], prompt_cache: bool) -> Vec<Value> {
+    let last_tool = tools.len().saturating_sub(1);
     tools
         .iter()
-        .map(|tool| {
-            json!({
+        .enumerate()
+        .map(|(index, tool)| {
+            let mut definition = json!({
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.input_schema,
-            })
+            });
+            if prompt_cache && index == last_tool {
+                definition["cache_control"] = cache_control();
+            }
+            definition
         })
         .collect()
+}
+
+fn add_rolling_cache_control(messages: &mut [Value], static_breakpoints: usize) {
+    let mut remaining = 4usize.saturating_sub(static_breakpoints);
+    if remaining == 0 || messages.len() < 2 {
+        return;
+    }
+
+    let prior_message_count = messages.len() - 1;
+    for message in messages[..prior_message_count].iter_mut().rev() {
+        if add_cache_control_to_message(message) {
+            remaining -= 1;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+}
+
+fn add_cache_control_to_message(message: &mut Value) -> bool {
+    let Some(content) = message.get_mut("content") else {
+        return false;
+    };
+    if let Some(text) = content.as_str() {
+        if text.is_empty() {
+            return false;
+        }
+        *content = json!([{ "type": "text", "text": text, "cache_control": cache_control() }]);
+        return true;
+    }
+    let Some(blocks) = content.as_array_mut() else {
+        return false;
+    };
+    for block in blocks.iter_mut().rev() {
+        if is_cacheable_block(block) {
+            block["cache_control"] = cache_control();
+            return true;
+        }
+    }
+    false
+}
+
+fn is_cacheable_block(block: &Value) -> bool {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        Some("tool_use" | "tool_result") => true,
+        _ => false,
+    }
+}
+
+fn cache_control() -> Value {
+    json!({ "type": "ephemeral" })
 }
 
 #[cfg(test)]
@@ -118,11 +196,22 @@ mod tests {
         let mut request = CompletionRequest::new("hello");
         request.system_prompt = Some("system text");
 
-        let body = messages_request("claude-test", 256, None, &request);
+        let body = messages_request("claude-test", 256, None, true, &request);
 
-        assert_eq!(body["system"], "system text");
+        assert_eq!(body["system"][0]["text"], "system text");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn request_can_disable_prompt_cache() {
+        let mut request = CompletionRequest::new("hello");
+        request.system_prompt = Some("system text");
+
+        let body = messages_request("claude-test", 256, None, false, &request);
+
+        assert_eq!(body["system"], "system text");
     }
 
     #[test]
@@ -136,6 +225,7 @@ mod tests {
                 budget_tokens: 1024,
                 display: Some(AnthropicThinkingDisplay::Summarized),
             }),
+            true,
             &request,
         );
 
@@ -201,7 +291,7 @@ mod tests {
             },
         ];
 
-        let body = messages_request("claude-test", 256, None, &request);
+        let body = messages_request("claude-test", 256, None, false, &request);
         let messages = body["messages"].as_array().expect("messages array");
 
         assert_eq!(messages.len(), 5);
@@ -225,5 +315,50 @@ mod tests {
         assert_eq!(messages[4]["content"][0]["tool_use_id"], "call-1");
         assert_eq!(messages[4]["content"][1]["type"], "text");
         assert_eq!(messages[4]["content"][1]["text"], "follow up");
+    }
+
+    #[test]
+    fn request_marks_tool_and_rolling_messages_for_cache() {
+        let mut request = CompletionRequest::new("current");
+        request.tools = vec![crate::ToolDefinition::new(
+            "lookup",
+            "lookup",
+            json!({ "type": "object" }),
+        )];
+        request.prompt_turns = vec![
+            PromptTurn {
+                turn: 0,
+                prompt: "first".to_owned(),
+            },
+            PromptTurn {
+                turn: 1,
+                prompt: "current".to_owned(),
+            },
+        ];
+        request.turns = vec![CompletionTurn {
+            turn: 0,
+            metadata: None,
+            items: vec![TurnItem::AssistantText("answer".to_owned())],
+        }];
+
+        let body = messages_request("claude-test", 256, None, true, &request);
+
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        let cache_controlled_messages = body["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter(|message| message["content"].to_string().contains("cache_control"))
+            .count();
+        assert_eq!(cache_controlled_messages, 2);
+        assert!(
+            body["messages"][2]["content"]
+                .get("cache_control")
+                .is_none()
+        );
     }
 }

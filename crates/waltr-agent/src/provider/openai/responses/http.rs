@@ -20,6 +20,8 @@ impl LlmStream for OpenAiResponses {
         Some(responses_body(
             &self.model,
             self.reasoning.as_ref(),
+            self.prompt_cache,
+            self.prompt_cache_retention.as_deref(),
             &request,
         ))
     }
@@ -35,7 +37,13 @@ impl LlmStream for OpenAiResponses {
             stream_openai_http(
                 RESPONSES_NAME,
                 &self.responses_url,
-                responses_body(&self.model, self.reasoning.as_ref(), &request),
+                responses_body(
+                    &self.model,
+                    self.reasoning.as_ref(),
+                    self.prompt_cache,
+                    self.prompt_cache_retention.as_deref(),
+                    &request,
+                ),
                 self.headers.clone(),
                 move |data| parser.parse_event(data),
             )

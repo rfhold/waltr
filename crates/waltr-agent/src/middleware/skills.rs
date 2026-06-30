@@ -242,8 +242,9 @@ fn collect_reveals_for_tree(
     state: &mut SkillsState,
     reminders: &mut Vec<String>,
 ) -> Result<()> {
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
+    let mut entries = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
         let path = entry.path();
         if !path.is_dir() {
             continue;

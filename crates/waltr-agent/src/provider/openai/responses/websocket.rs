@@ -15,6 +15,7 @@ use crate::provider::openai::reasoning::{OpenAiReasoningConfig, openai_reasoning
 use crate::provider::openai::shared::RESPONSES_WEBSOCKET_NAME;
 use crate::stream::{BoxCompletionStream, CompletionEvent, CompletionRequest, LlmStream};
 
+use super::super::cache::prompt_cache_key;
 use super::parser::ResponsesParser;
 use super::request::{responses_input, responses_tools};
 
@@ -25,6 +26,8 @@ pub struct OpenAiResponsesWebSocket {
     model: String,
     responses_url: String,
     reasoning: Option<OpenAiReasoningConfig>,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<String>,
 }
 
 impl OpenAiResponsesWebSocket {
@@ -35,6 +38,8 @@ impl OpenAiResponsesWebSocket {
             model: model.into(),
             responses_url: "wss://api.openai.com/v1/responses".to_owned(),
             reasoning: None,
+            prompt_cache: true,
+            prompt_cache_retention: None,
         }
     }
 
@@ -56,6 +61,20 @@ impl OpenAiResponsesWebSocket {
     #[must_use]
     pub const fn with_reasoning(mut self, config: OpenAiReasoningConfig) -> Self {
         self.reasoning = Some(config);
+        self
+    }
+
+    /// Set the OpenAI prompt cache retention hint for outgoing requests.
+    #[must_use]
+    pub fn with_prompt_cache_retention(mut self, retention: impl Into<String>) -> Self {
+        self.prompt_cache_retention = Some(retention.into());
+        self
+    }
+
+    /// Disable OpenAI prompt cache routing hints on outgoing requests.
+    #[must_use]
+    pub const fn without_prompt_cache(mut self) -> Self {
+        self.prompt_cache = false;
         self
     }
 }
@@ -81,6 +100,8 @@ fn tls_connector() -> Result<Connector, LlmError> {
 fn response_create_payload(
     model: &str,
     reasoning: Option<&OpenAiReasoningConfig>,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<&str>,
     request: &CompletionRequest<'_>,
 ) -> Value {
     let mut create = json!({
@@ -100,6 +121,12 @@ fn response_create_payload(
     if let Some(system_prompt) = request.system_prompt {
         create["instructions"] = json!(system_prompt);
     }
+    if prompt_cache {
+        create["prompt_cache_key"] = json!(prompt_cache_key(model, request));
+        if let Some(retention) = prompt_cache_retention {
+            create["prompt_cache_retention"] = json!(retention);
+        }
+    }
     create
 }
 
@@ -117,6 +144,8 @@ impl LlmStream for OpenAiResponsesWebSocket {
         Some(response_create_payload(
             &self.model,
             self.reasoning.as_ref(),
+            self.prompt_cache,
+            self.prompt_cache_retention.as_deref(),
             &request,
         ))
     }
@@ -164,7 +193,13 @@ impl LlmStream for OpenAiResponsesWebSocket {
             connect_span.record("terminal_state", "connected");
             connect_span.in_scope(|| tracing::debug!("provider websocket connected"));
 
-            let create = response_create_payload(&self.model, self.reasoning.as_ref(), &request);
+            let create = response_create_payload(
+                &self.model,
+                self.reasoning.as_ref(),
+                self.prompt_cache,
+                self.prompt_cache_retention.as_deref(),
+                &request,
+            );
             let send_span = tracing::info_span!(
                 "websocket.client.send",
                 provider = RESPONSES_WEBSOCKET_NAME,
@@ -411,10 +446,26 @@ mod tests {
         let mut request = CompletionRequest::new("hello");
         request.system_prompt = Some("system text");
 
-        let payload = response_create_payload("gpt-test", None, &request);
+        let payload = response_create_payload("gpt-test", None, true, Some("24h"), &request);
 
         assert_eq!(payload["instructions"], "system text");
+        assert!(
+            payload["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("waltr-"))
+        );
+        assert_eq!(payload["prompt_cache_retention"], "24h");
         assert_eq!(payload["input"][0]["role"], "user");
         assert_eq!(payload["input"].as_array().expect("input array").len(), 1);
+    }
+
+    #[test]
+    fn response_create_payload_can_disable_prompt_cache_key() {
+        let request = CompletionRequest::new("hello");
+
+        let payload = response_create_payload("gpt-test", None, false, Some("24h"), &request);
+
+        assert!(payload.get("prompt_cache_key").is_none());
+        assert!(payload.get("prompt_cache_retention").is_none());
     }
 }

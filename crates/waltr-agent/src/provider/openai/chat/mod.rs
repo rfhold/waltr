@@ -17,6 +17,8 @@ pub struct OpenAiChatCompletions {
     headers: Vec<(String, String)>,
     model: String,
     completions_url: String,
+    prompt_cache: bool,
+    prompt_cache_retention: Option<String>,
 }
 
 impl OpenAiChatCompletions {
@@ -26,6 +28,8 @@ impl OpenAiChatCompletions {
             headers: Vec::new(),
             model: model.into(),
             completions_url: "https://api.openai.com/v1/chat/completions".to_owned(),
+            prompt_cache: true,
+            prompt_cache_retention: None,
         }
     }
 
@@ -42,6 +46,20 @@ impl OpenAiChatCompletions {
         self.headers.push((name.into(), value.into()));
         self
     }
+
+    /// Set the OpenAI prompt cache retention hint for outgoing requests.
+    #[must_use]
+    pub fn with_prompt_cache_retention(mut self, retention: impl Into<String>) -> Self {
+        self.prompt_cache_retention = Some(retention.into());
+        self
+    }
+
+    /// Disable OpenAI prompt cache routing hints on outgoing requests.
+    #[must_use]
+    pub const fn without_prompt_cache(mut self) -> Self {
+        self.prompt_cache = false;
+        self
+    }
 }
 
 impl LlmStream for OpenAiChatCompletions {
@@ -55,7 +73,12 @@ impl LlmStream for OpenAiChatCompletions {
             &self.completions_url,
             &self.model,
         );
-        Some(chat_body(&self.model, &request))
+        Some(chat_body(
+            &self.model,
+            self.prompt_cache,
+            self.prompt_cache_retention.as_deref(),
+            &request,
+        ))
     }
 
     fn stream_request<'a>(
@@ -68,7 +91,12 @@ impl LlmStream for OpenAiChatCompletions {
                 &self.completions_url,
                 &self.model,
             );
-            let body = chat_body(&self.model, &request);
+            let body = chat_body(
+                &self.model,
+                self.prompt_cache,
+                self.prompt_cache_retention.as_deref(),
+                &request,
+            );
             let mut parser =
                 ChatParser::new(CHAT_COMPLETIONS_NAME, &self.completions_url, &self.model);
 
