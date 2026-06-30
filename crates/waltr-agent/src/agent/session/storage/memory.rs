@@ -209,7 +209,6 @@ impl SessionStore for MemorySessionStore {
                 .get_mut(&id)
                 .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
             record.set_metadata_value(key, value);
-            record.revision = record.revision.next();
             let record = record.clone();
             drop(records);
             Ok(record)
@@ -232,7 +231,6 @@ impl SessionStore for MemorySessionStore {
                 .get_mut(&id)
                 .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
             record.remove_metadata_value(&key);
-            record.revision = record.revision.next();
             let record = record.clone();
             drop(records);
             Ok(record)
@@ -457,7 +455,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(updated.revision, Revision::new(1));
+        assert_eq!(updated.revision, Revision::ZERO);
         assert_eq!(
             updated.metadata_value("host.key"),
             Some(&json!({ "value": true }))
@@ -473,6 +471,55 @@ mod tests {
             summary.metadata_values.get("host.key"),
             Some(&json!({ "value": true }))
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_patch_does_not_stale_timeline_revision() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+
+        store
+            .set_metadata_value(&id, "runtime.thinking".to_owned(), json!("high"))
+            .await
+            .unwrap();
+
+        let assigned = store
+            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
+            .await
+            .unwrap();
+
+        let loaded = store.load(&id).await.unwrap();
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(loaded.revision, Revision::new(1));
+        assert_eq!(
+            loaded.metadata_value("runtime.thinking"),
+            Some(&json!("high"))
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_remove_does_not_stale_timeline_revision() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+
+        store
+            .set_metadata_value(&id, "runtime.thinking".to_owned(), json!("high"))
+            .await
+            .unwrap();
+        let removed = store
+            .remove_metadata_value(&id, "runtime.thinking".to_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(removed.revision, Revision::ZERO);
+        assert_eq!(removed.metadata_value("runtime.thinking"), None);
+
+        store
+            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

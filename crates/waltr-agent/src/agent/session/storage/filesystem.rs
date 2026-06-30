@@ -92,6 +92,17 @@ impl FilesystemSessionStore {
         self.save_sync(&record)?;
         Ok((revision, value))
     }
+
+    fn update_metadata_sync(
+        &self,
+        id: &SessionId,
+        update: impl FnOnce(&mut SessionRecord),
+    ) -> SessionStoreResult<SessionRecord> {
+        let mut record = self.load_sync(id)?;
+        update(&mut record);
+        self.save_sync(&record)?;
+        Ok(record)
+    }
 }
 
 impl SessionStore for FilesystemSessionStore {
@@ -201,14 +212,7 @@ impl SessionStore for FilesystemSessionStore {
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
-        async move {
-            let (_, record) =
-                store.update_sync(&id, store.load_sync(&id)?.revision, |record, _| {
-                    record.set_metadata_value(key, value);
-                    Ok(record.clone())
-                })?;
-            Ok(record)
-        }
+        async move { store.update_metadata_sync(&id, |record| record.set_metadata_value(key, value)) }
     }
 
     fn remove_metadata_value(
@@ -219,12 +223,9 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (_, record) =
-                store.update_sync(&id, store.load_sync(&id)?.revision, |record, _| {
-                    record.remove_metadata_value(&key);
-                    Ok(record.clone())
-                })?;
-            Ok(record)
+            store.update_metadata_sync(&id, |record| {
+                record.remove_metadata_value(&key);
+            })
         }
     }
 
