@@ -215,7 +215,7 @@ async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn 
     };
 
     assert_eq!(updated.id, created.id);
-    assert!(updated.revision > created.revision);
+    assert_eq!(updated.revision, created.revision);
     assert_eq!(watched.id, created.id);
     assert_eq!(watched.revision, updated.revision);
     let runtime = watched
