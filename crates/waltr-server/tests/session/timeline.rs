@@ -1,7 +1,7 @@
 use crate::support::grpc::session_client;
 use waltr::grpc::waltr::session::v1::{
     CreateSessionRequest, GetTimelineRequest, TimelineDirection, TimelineQuery,
-    WatchTimelineRequest, timeline_content,
+    WatchTimelineRequest, timeline_content, watch_timeline_response,
 };
 use waltr_agent::{PendingTimelineEvent, SessionId};
 use waltr_server::test_support::setup_server_with_sessions;
@@ -110,14 +110,14 @@ async fn watch_timeline_replays_history_then_live_events() -> Result<(), Box<dyn
                 .message()
                 .await?
                 .expect("watch stream should emit timeline event");
-            if update.event.is_some() {
-                return Ok::<_, tonic::Status>(update);
+            if let Some(watch_timeline_response::Update::Event(event)) = update.update {
+                return Ok::<_, tonic::Status>((update.sequence, event));
             }
         }
     })
     .await??;
-    assert!(update.sequence > 0);
-    let event = update.event.expect("timeline event should be present");
+    let (sequence, event) = update;
+    assert!(sequence > 0);
     assert_eq!(event.item_id, "assistant-1");
     assert_eq!(text_snapshot(&event), "hi there");
 
@@ -165,7 +165,7 @@ async fn watch_timeline_replays_after_cursor_before_initial_limit()
                 .message()
                 .await?
                 .expect("watch stream should emit timeline event");
-            if let Some(event) = update.event {
+            if let Some(watch_timeline_response::Update::Event(event)) = update.update {
                 events.push(event);
             }
         }
@@ -225,7 +225,7 @@ async fn watch_timeline_pages_large_after_cursor_catchup_without_initial_gap()
                 .message()
                 .await?
                 .expect("watch stream should emit timeline event");
-            if let Some(event) = update.event {
+            if let Some(watch_timeline_response::Update::Event(event)) = update.update {
                 events.push(event);
             }
         }

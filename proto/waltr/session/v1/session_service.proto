@@ -16,6 +16,8 @@ service SessionService {
   rpc SubmitUserMessage(SubmitUserMessageRequest) returns (SubmitUserMessageResponse);
   rpc RespondExternalRequest(RespondExternalRequestRequest) returns (RespondExternalRequestResponse);
   rpc InterruptSession(InterruptSessionRequest) returns (InterruptSessionResponse);
+  rpc RollbackSession(RollbackSessionRequest) returns (RollbackSessionResponse);
+  rpc ContinueSession(ContinueSessionRequest) returns (ContinueSessionResponse);
 }
 
 message CreateSessionRequest {
@@ -86,7 +88,15 @@ message WatchTimelineRequest {
 
 message WatchTimelineResponse {
   uint64 sequence = 1;
-  TimelineEvent event = 2;
+  oneof update {
+    TimelineEvent event = 2;
+    TimelineTruncation truncation = 3;
+  }
+}
+
+message TimelineTruncation {
+  string session_id = 1;
+  optional uint64 after_cursor = 2;
 }
 
 message SubmitUserMessageRequest {
@@ -111,6 +121,31 @@ message InterruptSessionRequest {
 }
 
 message InterruptSessionResponse {}
+
+message RollbackSessionRequest {
+  string session_id = 1;
+  RollbackTarget target = 2;
+}
+
+message RollbackSessionResponse {
+  SessionSummary session = 1;
+  TimelineTruncation truncation = 2;
+}
+
+message ContinueSessionRequest {
+  string session_id = 1;
+  RollbackTarget target = 2;
+}
+
+message ContinueSessionResponse {}
+
+message RollbackTarget {
+  oneof target {
+    uint64 turn = 1;
+    uint64 cursor = 2;
+    uint64 before_cursor = 3;
+  }
+}
 
 message TimelineQuery {
   TimelineDirection direction = 1;

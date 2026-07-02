@@ -95,8 +95,25 @@ pub struct WatchTimelineRequest {
 pub struct WatchTimelineResponse {
     #[prost(uint64, tag="1")]
     pub sequence: u64,
-    #[prost(message, optional, tag="2")]
-    pub event: ::core::option::Option<TimelineEvent>,
+    #[prost(oneof="watch_timeline_response::Update", tags="2, 3")]
+    pub update: ::core::option::Option<watch_timeline_response::Update>,
+}
+/// Nested message and enum types in `WatchTimelineResponse`.
+pub mod watch_timeline_response {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Update {
+        #[prost(message, tag="2")]
+        Event(super::TimelineEvent),
+        #[prost(message, tag="3")]
+        Truncation(super::TimelineTruncation),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimelineTruncation {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(uint64, optional, tag="2")]
+    pub after_cursor: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SubmitUserMessageRequest {
@@ -128,6 +145,47 @@ pub struct InterruptSessionRequest {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InterruptSessionResponse {
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RollbackSessionRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub target: ::core::option::Option<RollbackTarget>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollbackSessionResponse {
+    #[prost(message, optional, tag="1")]
+    pub session: ::core::option::Option<SessionSummary>,
+    #[prost(message, optional, tag="2")]
+    pub truncation: ::core::option::Option<TimelineTruncation>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContinueSessionRequest {
+    #[prost(string, tag="1")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub target: ::core::option::Option<RollbackTarget>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContinueSessionResponse {
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RollbackTarget {
+    #[prost(oneof="rollback_target::Target", tags="1, 2, 3")]
+    pub target: ::core::option::Option<rollback_target::Target>,
+}
+/// Nested message and enum types in `RollbackTarget`.
+pub mod rollback_target {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Target {
+        #[prost(uint64, tag="1")]
+        Turn(u64),
+        #[prost(uint64, tag="2")]
+        Cursor(u64),
+        #[prost(uint64, tag="3")]
+        BeforeCursor(u64),
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TimelineQuery {
