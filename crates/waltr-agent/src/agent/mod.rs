@@ -15,14 +15,20 @@ pub use builder::AgentRuntimeBuilder;
 pub use event::BoxAgentTimelineStream;
 pub use run::AgentRunBuilder;
 pub use session::{
-    AgentSession, AgentSessionRuntime, AgentSessions, CancelReason, ExternalRequest,
-    ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse,
-    FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
-    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
-    S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListEvent,
-    SessionListSubscription, SessionListUpdate, SessionMetrics, SessionRecord, SessionSnapshot,
+    AgentSession, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
+    AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
+    AgentSessionRuntime, AgentSessionRuntimeError, AgentSessionRuntimeFactory, CancelReason,
+    ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
+    ExternalResponse, FileCredentialStore, FilesystemSessionStore, MemorySessionStore,
+    OAuthCredential, OpenDalSessionStore, PendingWork, PendingWorkStatus, RequestId, RequestRecord,
+    ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
+    ScyllaSessionStore, SessionCoordinator, SessionId, SessionJournalEvent, SessionListEvent,
+    SessionListSubscription, SessionListUpdate, SessionMcpServerRuntimeKind,
+    SessionMcpServerRuntimeSettings, SessionMetrics, SessionOAuthProviderSettings,
+    SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
+    SessionProviderRuntimeSettings, SessionRecord, SessionRuntimeSettings, SessionSnapshot,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionTimelineSubscription, SessionTimelineUpdate, Suspension,
+    SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential, Suspension,
     opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
@@ -108,7 +114,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use std::sync::{Arc, Mutex};
 
-    use super::{AgentRuntime, AgentSessions};
+    use super::{AgentRuntime, SessionCoordinator};
 
     struct NoopMiddleware;
 
@@ -266,7 +272,7 @@ mod tests {
         let provider = Arc::new(TextOnlyProvider);
         let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
         let agent = AgentRuntime::builder(model, provider).build();
-        let sessions = AgentSessions::new(MemorySessionStore::new());
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let session_id = sessions
             .create()
             .await
@@ -322,7 +328,7 @@ mod tests {
             })
             .build();
         let store = MemorySessionStore::new();
-        let sessions = AgentSessions::new(store.clone());
+        let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -382,7 +388,7 @@ mod tests {
                 observed: Arc::clone(&writer_observed),
             })
             .build();
-        let sessions = AgentSessions::new(store.clone());
+        let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
             .create()
             .await
@@ -418,7 +424,7 @@ mod tests {
             })
             .build();
         drain(
-            AgentSessions::new(store.clone())
+            SessionCoordinator::new(store.clone())
                 .resume(
                     &reader_agent,
                     session_id,

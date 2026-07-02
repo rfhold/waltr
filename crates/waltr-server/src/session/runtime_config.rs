@@ -1,78 +1,23 @@
 use std::collections::BTreeMap;
 
+use crate::auth::oauth;
 use waltr::grpc::waltr::{
-    config::v1::{Configuration, McpServerType, ProviderType},
+    config::v1::{Configuration, McpServerType, OauthTokenRequestStyle, ProviderType},
     session::v1::{
         RuntimeConfigMatch, SessionMcpServerRuntime, SessionProviderRuntime,
         SessionRuntimeConfig as ProtoSessionRuntimeConfig,
         SessionRuntimeConfigRequest as ProtoSessionRuntimeConfigRequest,
     },
 };
-use waltr_agent::SessionSummary;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use waltr_agent::{
+    ModelApi, ModelCost, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
+    SessionOAuthProviderSettings, SessionOAuthTokenRequestStyle, SessionProviderRuntimeSettings,
+    SessionRuntimeSettings,
+};
 use tonic::Status;
 
-pub(super) const SESSION_RUNTIME_CONFIG_METADATA_KEY: &str = "waltr.runtime_config";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct StoredSessionRuntimeConfig {
-    pub provider: StoredSessionProviderRuntime,
-    pub mcp_servers: Vec<StoredSessionMcpServerRuntime>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct StoredSessionProviderRuntime {
-    pub key: String,
-    pub r#type: i32,
-    pub url: String,
-    pub model_id: String,
-    pub reasoning_effort: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct StoredSessionMcpServerRuntime {
-    pub key: String,
-    pub r#type: i32,
-    pub command: String,
-    pub url: String,
-}
-
-pub(super) fn runtime_config_from_summary(
-    summary: &SessionSummary,
-) -> Option<StoredSessionRuntimeConfig> {
-    summary
-        .metadata_values
-        .get(SESSION_RUNTIME_CONFIG_METADATA_KEY)
-        .and_then(|value| match serde_json::from_value(value.clone()) {
-            Ok(config) => Some(config),
-            Err(error) => {
-                tracing::warn!(%error, session_id = %summary.id.as_str(), "invalid session runtime metadata");
-                None
-            }
-        })
-}
-
-pub(super) fn runtime_config_to_metadata_value(
-    config: &StoredSessionRuntimeConfig,
-) -> Result<Value, Status> {
-    serde_json::to_value(config).map_err(|error| Status::internal(error.to_string()))
-}
-
-pub(super) fn runtime_metadata_values(
-    config: &StoredSessionRuntimeConfig,
-) -> Result<BTreeMap<String, Value>, Status> {
-    Ok(BTreeMap::from([(
-        SESSION_RUNTIME_CONFIG_METADATA_KEY.to_owned(),
-        runtime_config_to_metadata_value(config)?,
-    )]))
-}
-
 pub(super) fn runtime_config_to_proto(
-    config: StoredSessionRuntimeConfig,
+    config: SessionRuntimeSettings,
     current: &Configuration,
 ) -> ProtoSessionRuntimeConfig {
     ProtoSessionRuntimeConfig {
@@ -88,7 +33,7 @@ pub(super) fn runtime_config_to_proto(
 pub(super) fn resolve_runtime_config_for_create(
     requested: Option<ProtoSessionRuntimeConfigRequest>,
     config: &Configuration,
-) -> Result<Option<StoredSessionRuntimeConfig>, Status> {
+) -> Result<Option<SessionRuntimeSettings>, Status> {
     requested.map_or_else(
         || runtime_config_from_defaults(config),
         |requested| resolve_runtime_config(requested, config).map(Some),
@@ -98,7 +43,7 @@ pub(super) fn resolve_runtime_config_for_create(
 pub(super) fn resolve_runtime_config(
     request: ProtoSessionRuntimeConfigRequest,
     config: &Configuration,
-) -> Result<StoredSessionRuntimeConfig, Status> {
+) -> Result<SessionRuntimeSettings, Status> {
     if request.provider_key.trim().is_empty() {
         return Err(Status::invalid_argument("provider key must not be empty"));
     }
@@ -138,32 +83,36 @@ pub(super) fn resolve_runtime_config(
         }
     }
 
-    if !provider.models.contains_key(&request.model_id) {
-        return Err(Status::invalid_argument(format!(
-            "model '{}' does not exist in provider '{}'",
-            request.model_id, request.provider_key
-        )));
-    }
+    let provider_api = provider_api(provider.r#type)?;
+    let oauth = oauth::provider_definition(&request.provider_key, provider)
+        .map(|definition| oauth_settings(definition.definition));
 
     let mut mcp_servers = Vec::with_capacity(request.enabled_mcp_server_keys.len());
     for key in request.enabled_mcp_server_keys {
         let server = config.mcp_servers.get(&key).ok_or_else(|| {
             Status::invalid_argument(format!("mcp server '{key}' does not exist"))
         })?;
-        mcp_servers.push(StoredSessionMcpServerRuntime {
+        mcp_servers.push(SessionMcpServerRuntimeSettings {
             key,
-            r#type: server.r#type,
+            kind: mcp_server_kind(server.r#type)?,
             command: server.command.clone(),
             url: server.url.clone(),
         });
     }
 
-    Ok(StoredSessionRuntimeConfig {
-        provider: StoredSessionProviderRuntime {
+    Ok(SessionRuntimeSettings {
+        provider: SessionProviderRuntimeSettings {
             key: request.provider_key,
-            r#type: provider.r#type,
+            api: provider_api,
             url: provider.url.clone(),
             model_id: request.model_id,
+            model_cost: model.cost.clone().map(model_cost),
+            headers: provider
+                .headers
+                .clone()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            oauth,
             reasoning_effort,
         },
         mcp_servers,
@@ -172,7 +121,7 @@ pub(super) fn resolve_runtime_config(
 
 fn runtime_config_from_defaults(
     config: &Configuration,
-) -> Result<Option<StoredSessionRuntimeConfig>, Status> {
+) -> Result<Option<SessionRuntimeSettings>, Status> {
     let Some(defaults) = config.runtime_defaults.as_ref() else {
         return Ok(None);
     };
@@ -206,9 +155,10 @@ fn runtime_config_from_defaults(
 }
 
 fn provider_to_proto(
-    provider: StoredSessionProviderRuntime,
+    provider: SessionProviderRuntimeSettings,
     current: &Configuration,
 ) -> SessionProviderRuntime {
+    let stored_type = provider_type(provider.api) as i32;
     let r#match =
         current
             .providers
@@ -216,7 +166,7 @@ fn provider_to_proto(
             .map_or(RuntimeConfigMatch::Missing, |current| {
                 if !current.models.contains_key(&provider.model_id) {
                     RuntimeConfigMatch::Missing
-                } else if current.r#type == provider.r#type && current.url == provider.url {
+                } else if current.r#type == stored_type && current.url == provider.url {
                     RuntimeConfigMatch::Configured
                 } else {
                     RuntimeConfigMatch::Changed
@@ -225,7 +175,7 @@ fn provider_to_proto(
 
     SessionProviderRuntime {
         key: provider.key,
-        r#type: provider_type(provider.r#type) as i32,
+        r#type: stored_type,
         url: provider.url,
         model_id: provider.model_id,
         reasoning_effort: provider.reasoning_effort,
@@ -234,15 +184,16 @@ fn provider_to_proto(
 }
 
 fn mcp_server_to_proto(
-    server: StoredSessionMcpServerRuntime,
+    server: SessionMcpServerRuntimeSettings,
     current: &Configuration,
 ) -> SessionMcpServerRuntime {
+    let stored_type = mcp_server_type(server.kind) as i32;
     let r#match =
         current
             .mcp_servers
             .get(&server.key)
             .map_or(RuntimeConfigMatch::Missing, |current| {
-                if current.r#type == server.r#type
+                if current.r#type == stored_type
                     && current.command == server.command
                     && current.url == server.url
                 {
@@ -254,17 +205,78 @@ fn mcp_server_to_proto(
 
     SessionMcpServerRuntime {
         key: server.key,
-        r#type: mcp_server_type(server.r#type) as i32,
+        r#type: stored_type,
         command: server.command,
         url: server.url,
         r#match: r#match as i32,
     }
 }
 
-fn provider_type(value: i32) -> ProviderType {
-    ProviderType::try_from(value).unwrap_or(ProviderType::Unspecified)
+fn provider_api(value: i32) -> Result<ModelApi, Status> {
+    match ProviderType::try_from(value).unwrap_or(ProviderType::Unspecified) {
+        ProviderType::AnthropicMessages => Ok(ModelApi::AnthropicMessages),
+        ProviderType::OpenaiChatCompletions => Ok(ModelApi::OpenAiChatCompletions),
+        ProviderType::OpenaiResponses => Ok(ModelApi::OpenAiResponses),
+        ProviderType::OpenaiResponsesWebsocket => Ok(ModelApi::OpenAiResponsesWebSocket),
+        ProviderType::Unspecified => Err(Status::invalid_argument("provider type is unspecified")),
+    }
 }
 
-fn mcp_server_type(value: i32) -> McpServerType {
-    McpServerType::try_from(value).unwrap_or(McpServerType::Unspecified)
+fn provider_type(api: ModelApi) -> ProviderType {
+    match api {
+        ModelApi::AnthropicMessages => ProviderType::AnthropicMessages,
+        ModelApi::OpenAiChatCompletions => ProviderType::OpenaiChatCompletions,
+        ModelApi::OpenAiResponses => ProviderType::OpenaiResponses,
+        ModelApi::OpenAiResponsesWebSocket => ProviderType::OpenaiResponsesWebsocket,
+    }
+}
+
+fn mcp_server_kind(value: i32) -> Result<SessionMcpServerRuntimeKind, Status> {
+    match McpServerType::try_from(value).unwrap_or(McpServerType::Unspecified) {
+        McpServerType::Stdio => Ok(SessionMcpServerRuntimeKind::Stdio),
+        McpServerType::Sse => Ok(SessionMcpServerRuntimeKind::StreamableHttp),
+        McpServerType::Unspecified => {
+            Err(Status::invalid_argument("mcp server type is unspecified"))
+        }
+    }
+}
+
+fn mcp_server_type(kind: SessionMcpServerRuntimeKind) -> McpServerType {
+    match kind {
+        SessionMcpServerRuntimeKind::Stdio => McpServerType::Stdio,
+        SessionMcpServerRuntimeKind::StreamableHttp => McpServerType::Sse,
+    }
+}
+
+fn oauth_settings(
+    definition: waltr::grpc::waltr::config::v1::OAuthProvider,
+) -> SessionOAuthProviderSettings {
+    let token_request_style = match OauthTokenRequestStyle::try_from(definition.token_request_style)
+        .unwrap_or(OauthTokenRequestStyle::Unspecified)
+    {
+        OauthTokenRequestStyle::FormUrlencoded => SessionOAuthTokenRequestStyle::FormUrlencoded,
+        OauthTokenRequestStyle::Json | OauthTokenRequestStyle::Unspecified => {
+            SessionOAuthTokenRequestStyle::Json
+        }
+    };
+
+    SessionOAuthProviderSettings {
+        token_url: definition.token_url,
+        client_id: definition.client_id,
+        redirect_uri: definition.redirect_uri,
+        token_request_style,
+        token_fields: Vec::new(),
+    }
+}
+
+fn model_cost(cost: waltr::grpc::waltr::config::v1::ModelCost) -> ModelCost {
+    ModelCost {
+        input_per_million_tokens: cost.input_per_million_tokens,
+        output_per_million_tokens: cost.output_per_million_tokens,
+        cache_read_per_million_tokens: cost.cache_read_per_million_tokens,
+        cache_write_per_million_tokens: cost.cache_write_per_million_tokens,
+        image_input_per_million_tokens: cost.image_input_per_million_tokens,
+        image_input_per_image: cost.image_input_per_image,
+        currency: cost.currency,
+    }
 }

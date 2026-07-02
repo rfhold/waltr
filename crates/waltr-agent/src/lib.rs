@@ -13,16 +13,23 @@ pub mod timeline;
 pub mod tools;
 
 pub use agent::{
-    AgentRunBuilder, AgentRuntime, AgentRuntimeBuilder, AgentSession, AgentSessionRuntime,
-    AgentSessions, AgentTool, BoxAgentTimelineStream, CancelReason, ExternalRequest,
-    ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse,
-    FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, PendingWork,
-    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, RuntimeResumeOutput,
-    S3SessionStore, ScyllaSessionStore, SessionId, SessionJournalEvent, SessionListEvent,
-    SessionListSubscription, SessionListUpdate, SessionMetrics, SessionRecord, SessionSnapshot,
+    AgentRunBuilder, AgentRuntime, AgentRuntimeBuilder, AgentSession, AgentSessionActiveRunState,
+    AgentSessionRunDisposition, AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput,
+    AgentSessionRunOutcome, AgentSessionRunSubmission, AgentSessionRuntime,
+    AgentSessionRuntimeError, AgentSessionRuntimeFactory, AgentTool, BoxAgentTimelineStream,
+    CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
+    ExternalResponse, FileCredentialStore, FilesystemSessionStore, MemorySessionStore,
+    OAuthCredential, OpenDalSessionStore, PendingWork, PendingWorkStatus, RequestId, RequestRecord,
+    ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
+    ScyllaSessionStore, SessionCoordinator, SessionId, SessionJournalEvent, SessionListEvent,
+    SessionListSubscription, SessionListUpdate, SessionMcpServerRuntimeKind,
+    SessionMcpServerRuntimeSettings, SessionMetrics, SessionOAuthProviderSettings,
+    SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
+    SessionProviderRuntimeSettings, SessionRecord, SessionRuntimeSettings, SessionSnapshot,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionTimelineSubscription, SessionTimelineUpdate, Suspension, ToolExecutionContext,
-    ToolProgressSink, opendal_postgresql_session_store, run_postgresql_migrations,
+    SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential, Suspension,
+    ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
+    run_postgresql_migrations,
 };
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
@@ -55,6 +62,7 @@ pub use timeline::{
 pub use tools::filesystem;
 pub use tools::question;
 pub use tools::skills::{SkillDefinition, SkillsConfig};
+pub use tools::task;
 
 #[cfg(feature = "shell")]
 pub use tools::shell;

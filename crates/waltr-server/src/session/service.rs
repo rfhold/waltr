@@ -1,34 +1,34 @@
 //! Implementation of the generated `SessionService`.
 
-use std::{collections::BTreeMap, path::PathBuf, pin::Pin, sync::Arc};
+use std::{path::PathBuf, pin::Pin, sync::Arc};
 
-use crate::{auth::FileCredentialStore, config::ConfigHandle};
+use crate::config::ConfigHandle;
 
 use super::{
     convert::session_summary_to_proto,
-    error::agent_error_to_status,
-    run_manager::{SessionRunManager, SessionRunRequest},
-    runtime::ServerRuntimeFactory,
-    runtime_config::{
-        SESSION_RUNTIME_CONFIG_METADATA_KEY, resolve_runtime_config,
-        resolve_runtime_config_for_create, runtime_config_to_metadata_value,
-        runtime_metadata_values,
-    },
+    error::{agent_error_to_status, session_run_error_to_status},
+    runtime_config::{resolve_runtime_config, resolve_runtime_config_for_create},
     timeline_convert::{
         catchup_query, channel_matches, initial_query, query_from_proto, timeline_event_to_proto,
     },
 };
-use waltr::grpc::waltr::session::v1::{
-    CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
-    GetTimelineRequest, GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
-    ListSessionsRequest, ListSessionsResponse, RespondExternalRequestRequest,
-    RespondExternalRequestResponse, SessionListSnapshot, SubmitUserMessageRequest,
-    SubmitUserMessageResponse, UpdateSessionRuntimeConfigRequest,
-    UpdateSessionRuntimeConfigResponse, WatchSessionsRequest, WatchSessionsResponse,
-    WatchTimelineRequest, WatchTimelineResponse,
-    session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
+use waltr::grpc::waltr::{
+    config::v1::Configuration,
+    session::v1::{
+        CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
+        GetTimelineRequest, GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
+        ListSessionsRequest, ListSessionsResponse, RespondExternalRequestRequest,
+        RespondExternalRequestResponse, SessionListSnapshot, SubmitUserMessageRequest,
+        SubmitUserMessageResponse, UpdateSessionRuntimeConfigRequest,
+        UpdateSessionRuntimeConfigResponse, WatchSessionsRequest, WatchSessionsResponse,
+        WatchTimelineRequest, WatchTimelineResponse,
+        session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
+    },
 };
-use waltr_agent::{AgentSessions, ExternalRequestId, SessionId, SessionListEvent, SessionStore};
+use waltr_agent::{
+    AgentSessionRuntimeFactory, ExternalRequestId, FileCredentialStore, RunConflictPolicy,
+    SessionCoordinator, SessionId, SessionListEvent, SessionStore,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
@@ -40,10 +40,8 @@ pub struct SessionService<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    sessions: AgentSessions<S>,
+    sessions: SessionCoordinator<S>,
     config: ConfigHandle,
-    runtime_factory: ServerRuntimeFactory,
-    runs: SessionRunManager,
 }
 
 impl<S> SessionService<S>
@@ -53,19 +51,19 @@ where
     /// Create a session service from a store.
     #[must_use]
     pub fn new(store: S) -> Arc<Self> {
-        Self::from_sessions(AgentSessions::new(store))
+        Self::from_sessions(SessionCoordinator::new(store))
     }
 
     /// Create a session service from an existing session coordinator.
     #[must_use]
-    pub fn from_sessions(sessions: AgentSessions<S>) -> Arc<Self> {
+    pub fn from_sessions(sessions: SessionCoordinator<S>) -> Arc<Self> {
         let credential_store = FileCredentialStore::from_env();
-        Arc::new(Self {
-            sessions,
-            config: ConfigHandle::default(),
-            runtime_factory: ServerRuntimeFactory::new(default_root(), credential_store),
-            runs: SessionRunManager::new(),
-        })
+        let config = ConfigHandle::default();
+        let sessions = sessions.with_runtime_factory(AgentSessionRuntimeFactory::new(
+            default_root(),
+            credential_store,
+        ));
+        Arc::new(Self { sessions, config })
     }
 }
 
@@ -80,25 +78,24 @@ where
         config: ConfigHandle,
         credential_store: FileCredentialStore,
     ) -> Arc<Self> {
-        Self::from_sessions_with_config(AgentSessions::new(store), config, credential_store)
+        Self::from_sessions_with_config(SessionCoordinator::new(store), config, credential_store)
     }
 
     /// Create a session service from an existing session coordinator and config handle.
     #[must_use]
     pub fn from_sessions_with_config(
-        sessions: AgentSessions<S>,
+        sessions: SessionCoordinator<S>,
         config: ConfigHandle,
         credential_store: FileCredentialStore,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            sessions,
-            config,
-            runtime_factory: ServerRuntimeFactory::new(default_root(), credential_store.clone()),
-            runs: SessionRunManager::new(),
-        })
+        let sessions = sessions.with_runtime_factory(AgentSessionRuntimeFactory::new(
+            default_root(),
+            credential_store,
+        ));
+        Arc::new(Self { sessions, config })
     }
 
-    async fn load_config(&self) -> waltr::grpc::waltr::config::v1::Configuration {
+    async fn load_config(&self) -> Configuration {
         self.config.load().await
     }
 }
@@ -126,14 +123,9 @@ where
         tracing::info!("session create accepted");
         let config = self.load_config().await;
         let runtime_config = resolve_runtime_config_for_create(request.runtime_config, &config)?;
-        let metadata_values = runtime_config
-            .as_ref()
-            .map(runtime_metadata_values)
-            .transpose()?
-            .unwrap_or_else(BTreeMap::new);
         let session = self
             .sessions
-            .create_with_metadata_values(metadata_values)
+            .create_with_runtime_settings(runtime_config, Default::default())
             .await
             .map_err(agent_error_to_status)?;
         tracing::Span::current().record("session_id", session.record.id.as_str());
@@ -208,14 +200,9 @@ where
             .ok_or_else(|| Status::invalid_argument("runtime config is required"))?;
         let config = self.load_config().await;
         let runtime_config = resolve_runtime_config(runtime_config, &config)?;
-        let metadata_value = runtime_config_to_metadata_value(&runtime_config)?;
         let session = self
             .sessions
-            .set_metadata_value(
-                &SessionId::new(request.id),
-                SESSION_RUNTIME_CONFIG_METADATA_KEY,
-                metadata_value,
-            )
+            .set_runtime_settings(&SessionId::new(request.id), Some(runtime_config))
             .await
             .map_err(agent_error_to_status)?;
         tracing::info!("session runtime config update completed");
@@ -424,18 +411,14 @@ where
         }
         tracing::Span::current().record("session_id", session_id.as_str());
         tracing::info!("session prompt accepted");
-        let config = self.load_config().await;
-        self.runs
-            .submit_user_message(
-                SessionRunRequest {
-                    sessions: self.sessions.clone(),
-                    runtime_factory: self.runtime_factory.clone(),
-                    config,
-                    session_id,
-                },
-                request.text,
-            )
-            .await?;
+        self.sessions
+            .load(&session_id)
+            .await
+            .map_err(agent_error_to_status)?;
+        self.sessions
+            .submit_prompt(session_id, request.text, RunConflictPolicy::QueueIfActive)
+            .await
+            .map_err(session_run_error_to_status)?;
         tracing::info!("session prompt dispatched");
 
         Ok(Response::new(SubmitUserMessageResponse {}))
@@ -464,19 +447,19 @@ where
         tracing::info!("external request response accepted");
         let response = serde_json::from_str(&request.response_json)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let config = self.load_config().await;
-        self.runs
-            .respond_external_request(
-                SessionRunRequest {
-                    sessions: self.sessions.clone(),
-                    runtime_factory: self.runtime_factory.clone(),
-                    config,
-                    session_id,
-                },
+        self.sessions
+            .load(&session_id)
+            .await
+            .map_err(agent_error_to_status)?;
+        self.sessions
+            .resume_external_response(
+                session_id,
                 ExternalRequestId::new(request.request_id),
                 response,
+                RunConflictPolicy::RejectIfActive,
             )
-            .await?;
+            .await
+            .map_err(session_run_error_to_status)?;
         tracing::info!("external request response dispatched");
 
         Ok(Response::new(RespondExternalRequestResponse {}))
@@ -495,7 +478,10 @@ where
         let session_id = required_session_id(&request.session_id)?;
         tracing::Span::current().record("session_id", session_id.as_str());
         tracing::info!("session interrupt accepted");
-        self.runs.interrupt(&self.sessions, &session_id).await?;
+        self.sessions
+            .interrupt(&session_id)
+            .await
+            .map_err(agent_error_to_status)?;
         tracing::info!("session interrupt completed");
         Ok(Response::new(InterruptSessionResponse {}))
     }

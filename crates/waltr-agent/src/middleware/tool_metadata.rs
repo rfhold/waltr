@@ -60,6 +60,7 @@ mod tests {
         let mut system_prompt_override = None;
         let mut ctx = RequestContext {
             middleware_state: &mut middleware_state,
+            session_metadata_values: std::collections::BTreeMap::new(),
             system_prompt_override: &mut system_prompt_override,
         };
         let mut draft = ToolDraft::default();

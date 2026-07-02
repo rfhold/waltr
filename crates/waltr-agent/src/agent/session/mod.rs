@@ -2,16 +2,32 @@
 
 mod compat;
 mod compression;
-mod factory;
+mod coordinator;
+mod run;
 mod runtime;
+mod runtime_factory;
+mod settings;
 mod storage;
 mod title;
 mod types;
 mod watch;
 
 pub use compat::EphemeralSessionRun;
-pub use factory::AgentSessions;
+pub use coordinator::SessionCoordinator;
+pub use run::{
+    AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
+    AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
+    AgentSessionRuntimeError, RunConflictPolicy,
+};
+pub(super) use run::{RunOutcomeSender, RunResult};
 pub use runtime::{AgentSessionRuntime, RuntimeResumeOutput};
+pub use runtime_factory::AgentSessionRuntimeFactory;
+pub use settings::{
+    FileCredentialStore, OAuthCredential, SessionMcpServerRuntimeKind,
+    SessionMcpServerRuntimeSettings, SessionOAuthProviderSettings, SessionOAuthTokenField,
+    SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle, SessionProviderRuntimeSettings,
+    SessionRuntimeSettings, StoredCredential,
+};
 pub use storage::{
     FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, S3SessionStore,
     ScyllaSessionStore, SessionStore, SessionStoreError, SessionStoreResult,

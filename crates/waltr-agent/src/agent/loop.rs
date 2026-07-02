@@ -1,7 +1,7 @@
 //! Internal agent loop.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -67,6 +67,7 @@ where
     session_broadcaster: Option<SessionListBroadcaster>,
     timeline_broadcaster: Option<SessionTimelineBroadcaster>,
     session_initialized: bool,
+    session_metadata_values: BTreeMap<String, Value>,
     middleware_state: MiddlewareStateLog,
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
     cancellation_token: CancellationToken,
@@ -116,6 +117,7 @@ where
     pub(super) fn from_ephemeral_session(run: EphemeralSessionRun<S>) -> Self {
         let prompt = match &run.input {
             ResumeInput::Prompt(prompt) => prompt,
+            ResumeInput::Prompts(prompts) => prompts.last().map_or("", String::as_str),
             ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => "",
         }
         .to_owned();
@@ -140,6 +142,7 @@ where
             session_broadcaster: run.session_broadcaster,
             timeline_broadcaster: run.timeline_broadcaster,
             session_initialized: false,
+            session_metadata_values: BTreeMap::new(),
             middleware_state: MiddlewareStateLog::default(),
             system_prompt_override: run.system_prompt_override,
             cancellation_token: run.cancellation_token,
@@ -460,6 +463,7 @@ where
         let prompt_turns = self.prompt_turns();
         let mut ctx = RequestContext {
             middleware_state: &mut self.middleware_state,
+            session_metadata_values: self.session_metadata_values.clone(),
             system_prompt_override: &mut self.system_prompt_override,
         };
 
@@ -605,12 +609,14 @@ where
                 Ok(())
             },
         );
-        let result =
-            self.tools[tool_index].call(ToolExecutionContext::with_progress_and_cancellation(
+        let result = self.tools[tool_index].call(
+            ToolExecutionContext::with_progress_and_cancellation(
                 call.clone(),
                 progress,
                 self.cancellation_token.clone(),
-            ));
+            )
+            .with_session_context(self.session_id.clone(), self.turn as u64),
+        );
         let result = self.instrument_tool_future(&call, result);
         Ok(ToolExecution::Running(RunningTool {
             call,
@@ -829,28 +835,53 @@ where
         let Some(input) = self.input.take() else {
             return Err(session_store_error("missing session input"));
         };
-        let ResumeInput::Prompt(prompt) = input else {
-            return Err(session_store_error(
-                "cannot resume missing session without a prompt input",
-            ));
+        let prompts = match input {
+            ResumeInput::Prompt(prompt) => vec![prompt],
+            ResumeInput::Prompts(prompts) if !prompts.is_empty() => prompts,
+            ResumeInput::Prompts(_) => {
+                return Err(session_store_error("prompt batch must not be empty"));
+            }
+            ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => {
+                return Err(session_store_error(
+                    "cannot resume missing session without a prompt input",
+                ));
+            }
         };
-        self.prompt.clone_from(&prompt);
-        self.session_store
+        self.prompt = prompts.last().cloned().unwrap_or_default();
+        let record = self
+            .session_store
             .create(self.session_id.clone())
             .await
             .map_err(session_store_error)?;
-        let prompt_index = self.prompt_turns.len();
-        self.append_journal_event(SessionJournalEvent::PromptAppended { prompt })
+        self.session_metadata_values = record.metadata.values;
+        let turn = self.turn as u64;
+        self.prompt_turns = prompts
+            .iter()
+            .map(|prompt| PromptTurn {
+                turn,
+                prompt: prompt.clone(),
+            })
+            .collect();
+        self.append_journal_events(
+            prompts
+                .iter()
+                .cloned()
+                .map(|prompt| SessionJournalEvent::PromptAppended { prompt })
+                .collect(),
+        )
+        .await?;
+        let events = self
+            .append_timeline_events(
+                prompts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(prompt_index, prompt)| {
+                        user_prompt_timeline_event(&self.session_id, turn, prompt_index, prompt)
+                    })
+                    .collect(),
+            )
             .await?;
-        let event = self
-            .append_timeline_event(user_prompt_timeline_event(
-                &self.session_id,
-                self.turn as u64,
-                prompt_index,
-                self.prompt.clone(),
-            ))
-            .await?;
-        self.pending.push_back(Ok(event));
+        self.pending.extend(events.into_iter().map(Ok));
         self.session_initialized = true;
         Ok(true)
     }
@@ -879,6 +910,16 @@ where
                         RuntimeResumeOutput::Resumed { record }
                         | RuntimeResumeOutput::Suspended { record, .. } => record,
                     }
+                }
+            }
+            ResumeInput::Prompts(prompts) => {
+                match self
+                    .session_runtime()
+                    .resume(&self.session_id, ResumeInput::Prompts(prompts))
+                    .await?
+                {
+                    RuntimeResumeOutput::Resumed { record }
+                    | RuntimeResumeOutput::Suspended { record, .. } => record,
                 }
             }
             ResumeInput::ExternalResponse {
@@ -935,6 +976,7 @@ where
     fn hydrate_from_record(&mut self, record: &SessionRecord) {
         let snapshot = record.snapshot();
         self.middleware_state = MiddlewareStateLog::from_snapshot(&snapshot);
+        self.session_metadata_values = record.metadata.values.clone();
         self.prompt = snapshot.current_prompt.unwrap_or_default();
         self.prompt_turns = snapshot.prompt_turns;
         self.turns = snapshot.turns;

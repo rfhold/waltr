@@ -16,6 +16,8 @@ use crate::{
     },
 };
 
+use super::SessionRuntimeSettings;
+
 /// Durable session identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(String);
@@ -139,7 +141,7 @@ impl From<String> for ExternalRequestId {
 }
 
 /// In-memory view of a durable agent session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSession {
     /// Complete persisted session record.
     pub record: SessionRecord,
@@ -166,7 +168,7 @@ impl AgentSession {
 }
 
 /// Complete stored session record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     /// Session identity.
     pub id: SessionId,
@@ -175,6 +177,9 @@ pub struct SessionRecord {
     /// Durable metadata used by hosts to list and order sessions.
     #[serde(default = "SessionMetadata::now")]
     pub metadata: SessionMetadata,
+    /// Runtime settings used to execute the session.
+    #[serde(default)]
+    pub runtime_settings: Option<SessionRuntimeSettings>,
     /// Ordered durable journal, including cursor-assigned timeline events.
     pub journal: Vec<SessionJournalEvent>,
 }
@@ -208,7 +213,7 @@ impl SessionMetadata {
 }
 
 /// Compact session row for listing durable sessions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     /// Session identity.
     pub id: SessionId,
@@ -227,6 +232,9 @@ pub struct SessionSummary {
     /// Durable usage and cost totals derived from journaled provider turns.
     #[serde(default)]
     pub metrics: SessionMetrics,
+    /// Runtime settings used to execute the session.
+    #[serde(default)]
+    pub runtime_settings: Option<SessionRuntimeSettings>,
     /// Host-defined durable metadata values.
     #[serde(default)]
     pub metadata_values: BTreeMap<String, Value>,
@@ -292,6 +300,7 @@ impl SessionRecord {
             id: id.into(),
             revision: Revision::ZERO,
             metadata: SessionMetadata::now(),
+            runtime_settings: None,
             journal: Vec::new(),
         }
     }
@@ -304,6 +313,23 @@ impl SessionRecord {
         let mut record = Self::new(id);
         record.metadata.values = metadata_values;
         record
+    }
+
+    /// Create a session record with initial runtime settings and metadata values.
+    pub fn with_runtime_settings_and_metadata_values(
+        id: impl Into<SessionId>,
+        runtime_settings: Option<SessionRuntimeSettings>,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> Self {
+        let mut record = Self::with_metadata_values(id, metadata_values);
+        record.runtime_settings = runtime_settings;
+        record
+    }
+
+    /// Set session runtime settings and mark metadata as updated.
+    pub fn set_runtime_settings(&mut self, runtime_settings: Option<SessionRuntimeSettings>) {
+        self.runtime_settings = runtime_settings;
+        self.touch_metadata();
     }
 
     /// Borrow a host-defined metadata value.
@@ -354,6 +380,7 @@ impl SessionRecord {
             updated_at: self.metadata.updated_at,
             last_activity_at: self.metadata.last_activity_at,
             metrics,
+            runtime_settings: self.runtime_settings.clone(),
             metadata_values: self.metadata.values.clone(),
         }
     }
@@ -839,6 +866,8 @@ pub enum SessionJournalEvent {
 pub enum ResumeInput {
     /// Resume with a new user prompt.
     Prompt(String),
+    /// Resume with multiple adjacent user prompts.
+    Prompts(Vec<String>),
     /// Resume with externally completed tool results.
     ToolResults(Vec<ToolResult>),
     /// Resume with an answer to a pending external request.

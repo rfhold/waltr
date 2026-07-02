@@ -139,6 +139,8 @@ pub(crate) struct ModelRequestDraft {
 pub(crate) struct RequestContext<'a> {
     /// Durable middleware state for this run.
     pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+    /// Host-defined durable metadata values for the current session.
+    pub(crate) session_metadata_values: BTreeMap<String, Value>,
     /// Pending per-run system prompt override, consumed by the system prompt middleware.
     pub(crate) system_prompt_override: &'a mut Option<SystemPromptOverride>,
 }

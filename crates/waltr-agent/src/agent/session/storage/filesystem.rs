@@ -7,7 +7,10 @@ use super::{
     sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
-    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
+    agent::session::{
+        Revision, SessionId, SessionJournalEvent, SessionRecord, SessionRuntimeSettings,
+        SessionSummary,
+    },
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -137,6 +140,27 @@ impl SessionStore for FilesystemSessionStore {
         }
     }
 
+    fn create_with_runtime_settings(
+        &self,
+        id: SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        async move {
+            let record = SessionRecord::with_runtime_settings_and_metadata_values(
+                id,
+                runtime_settings,
+                metadata_values,
+            );
+            if store.path(&record.id).exists() {
+                return Err(SessionStoreError::AlreadyExists { id: record.id });
+            }
+            store.save_sync(&record)?;
+            Ok(record)
+        }
+    }
+
     fn load(
         &self,
         id: &SessionId,
@@ -225,6 +249,20 @@ impl SessionStore for FilesystemSessionStore {
         async move {
             store.update_metadata_sync(&id, |record| {
                 record.remove_metadata_value(&key);
+            })
+        }
+    }
+
+    fn set_runtime_settings(
+        &self,
+        id: &SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            store.update_metadata_sync(&id, |record| {
+                record.set_runtime_settings(runtime_settings);
             })
         }
     }

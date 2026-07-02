@@ -3,7 +3,7 @@
 use crate::{
     build_app_with_catalog_loader, catalog::CatalogLoader, config_service::ConfigService, session,
 };
-use waltr_agent::{AgentSessions, MemorySessionStore};
+use waltr_agent::{MemorySessionStore, SessionCoordinator};
 use std::{
     net::{SocketAddr, TcpListener},
     path::PathBuf,
@@ -69,9 +69,10 @@ pub fn setup_server_with_catalog_loader(catalog_loader: CatalogLoader) -> &'stat
 
 /// Start an isolated integration test server with an explicit session coordinator.
 #[must_use]
-pub fn setup_server_with_sessions() -> (&'static TestServer, AgentSessions<MemorySessionStore>) {
+pub fn setup_server_with_sessions() -> (&'static TestServer, SessionCoordinator<MemorySessionStore>)
+{
     let config_service = ConfigService::new(temp_root()).expect("config service should start");
-    let sessions = AgentSessions::new(MemorySessionStore::new());
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
     let server =
         setup_server_with_listener_and_sessions(config_service, listener, sessions.clone());
@@ -81,7 +82,7 @@ pub fn setup_server_with_sessions() -> (&'static TestServer, AgentSessions<Memor
 /// Start an isolated integration test server with a caller-seeded session coordinator.
 #[must_use]
 pub fn setup_server_with_seeded_sessions(
-    sessions: AgentSessions<MemorySessionStore>,
+    sessions: SessionCoordinator<MemorySessionStore>,
 ) -> &'static TestServer {
     let config_service = ConfigService::new(temp_root()).expect("config service should start");
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
@@ -95,7 +96,7 @@ fn setup_server_with_listener(
     setup_server_with_listener_and_sessions(
         config_service,
         listener,
-        AgentSessions::new(MemorySessionStore::new()),
+        SessionCoordinator::new(MemorySessionStore::new()),
     )
 }
 
@@ -107,7 +108,7 @@ fn setup_server_with_listener_and_catalog_loader(
     setup_server_with_listener_sessions_and_catalog_loader(
         config_service,
         listener,
-        AgentSessions::new(MemorySessionStore::new()),
+        SessionCoordinator::new(MemorySessionStore::new()),
         catalog_loader,
     )
 }
@@ -115,7 +116,7 @@ fn setup_server_with_listener_and_catalog_loader(
 fn setup_server_with_listener_and_sessions(
     config_service: std::sync::Arc<ConfigService>,
     listener: TcpListener,
-    sessions: AgentSessions<MemorySessionStore>,
+    sessions: SessionCoordinator<MemorySessionStore>,
 ) -> &'static TestServer {
     setup_server_with_listener_sessions_and_catalog_loader(
         config_service,
@@ -128,7 +129,7 @@ fn setup_server_with_listener_and_sessions(
 fn setup_server_with_listener_sessions_and_catalog_loader(
     config_service: std::sync::Arc<ConfigService>,
     listener: TcpListener,
-    sessions: AgentSessions<MemorySessionStore>,
+    sessions: SessionCoordinator<MemorySessionStore>,
     catalog_loader: CatalogLoader,
 ) -> &'static TestServer {
     listener

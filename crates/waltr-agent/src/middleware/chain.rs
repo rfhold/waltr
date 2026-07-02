@@ -312,6 +312,7 @@ mod tests {
     ) -> RequestContext<'a> {
         RequestContext {
             middleware_state,
+            session_metadata_values: std::collections::BTreeMap::new(),
             system_prompt_override,
         }
     }

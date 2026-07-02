@@ -16,7 +16,7 @@ http.workspace = true
 ignore.workspace = true
 opendal.workspace = true
 refinery = { workspace = true, features = ["tokio-postgres"] }
-reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
+reqwest = { workspace = true, features = ["form", "json", "rustls", "stream"] }
 rmcp = { version = "1.7.0", default-features = false, features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
 rustls.workspace = true
 scylla.workspace = true
