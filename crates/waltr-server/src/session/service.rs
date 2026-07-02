@@ -15,19 +15,22 @@ use super::{
 use waltr::grpc::waltr::{
     config::v1::Configuration,
     session::v1::{
-        CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
-        GetTimelineRequest, GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
+        ContinueSessionRequest, ContinueSessionResponse, CreateSessionRequest,
+        CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse, GetTimelineRequest,
+        GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
         ListSessionsRequest, ListSessionsResponse, RespondExternalRequestRequest,
-        RespondExternalRequestResponse, SessionListSnapshot, SubmitUserMessageRequest,
-        SubmitUserMessageResponse, UpdateSessionRuntimeConfigRequest,
-        UpdateSessionRuntimeConfigResponse, WatchSessionsRequest, WatchSessionsResponse,
-        WatchTimelineRequest, WatchTimelineResponse,
-        session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
+        RespondExternalRequestResponse, RollbackSessionRequest, RollbackSessionResponse,
+        SessionListSnapshot, SubmitUserMessageRequest, SubmitUserMessageResponse,
+        TimelineTruncation, UpdateSessionRuntimeConfigRequest, UpdateSessionRuntimeConfigResponse,
+        WatchSessionsRequest, WatchSessionsResponse, WatchTimelineRequest, WatchTimelineResponse,
+        rollback_target, session_service_server::SessionService as GeneratedSessionService,
+        watch_sessions_response, watch_timeline_response,
     },
 };
 use waltr_agent::{
     AgentSessionRuntimeFactory, ExternalRequestId, FileCredentialStore, RunConflictPolicy,
-    SessionCoordinator, SessionId, SessionListEvent, SessionStore,
+    SessionCoordinator, SessionId, SessionListEvent, SessionStore, SessionTimelineEvent,
+    TimelineCursor,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -302,7 +305,7 @@ where
         let highest_cursor = Arc::new(AtomicU64::new(request.after_cursor.unwrap_or(0)));
         let mut historical = vec![Ok(WatchTimelineResponse {
             sequence: initial_sequence,
-            event: None,
+            update: None,
         })];
 
         if request.after_cursor.is_some() {
@@ -369,25 +372,45 @@ where
         let live = subscription.filter_map(move |update| {
             let highest_cursor = highest_cursor_for_live.clone();
             let channels = live_channels.clone();
-            let cursor = update.event.cursor.get();
-            if cursor <= highest_cursor.load(Ordering::Relaxed)
-                || !channel_matches(&update.event, &channels)
-            {
-                return None;
+            match update.event {
+                SessionTimelineEvent::Event(event) => {
+                    let cursor = event.cursor.get();
+                    if cursor <= highest_cursor.load(Ordering::Relaxed)
+                        || !channel_matches(&event, &channels)
+                    {
+                        return None;
+                    }
+                    highest_cursor.fetch_max(cursor, Ordering::Relaxed);
+                    tracing::trace!(
+                        sequence = update.sequence,
+                        cursor,
+                        kind = ?event.kind,
+                        "watch timeline live event delivered"
+                    );
+                    Some(
+                        timeline_event_to_proto(event).map(|event| WatchTimelineResponse {
+                            sequence: update.sequence,
+                            update: Some(watch_timeline_response::Update::Event(event)),
+                        }),
+                    )
+                }
+                SessionTimelineEvent::Truncated {
+                    session_id,
+                    after_cursor,
+                } => {
+                    let cursor = after_cursor.map_or(0, TimelineCursor::get);
+                    highest_cursor.store(cursor, Ordering::Relaxed);
+                    Some(Ok(WatchTimelineResponse {
+                        sequence: update.sequence,
+                        update: Some(watch_timeline_response::Update::Truncation(
+                            TimelineTruncation {
+                                session_id: session_id.as_str().to_owned(),
+                                after_cursor: after_cursor.map(TimelineCursor::get),
+                            },
+                        )),
+                    }))
+                }
             }
-            highest_cursor.fetch_max(cursor, Ordering::Relaxed);
-            tracing::trace!(
-                sequence = update.sequence,
-                cursor,
-                kind = ?update.event.kind,
-                "watch timeline live event delivered"
-            );
-            Some(
-                timeline_event_to_proto(update.event).map(|event| WatchTimelineResponse {
-                    sequence: update.sequence,
-                    event: Some(event),
-                }),
-            )
         });
         let stream = tokio_stream::iter(historical).chain(live);
 
@@ -485,6 +508,89 @@ where
         tracing::info!("session interrupt completed");
         Ok(Response::new(InterruptSessionResponse {}))
     }
+
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "rollback_session", session_id)
+    )]
+    async fn rollback_session(
+        &self,
+        request: Request<RollbackSessionRequest>,
+    ) -> Result<Response<RollbackSessionResponse>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.session_id)?;
+        tracing::Span::current().record("session_id", session_id.as_str());
+        tracing::info!("session rollback accepted");
+        let session = match required_rollback_target(request.target)? {
+            rollback_target::Target::Turn(turn) => {
+                self.sessions
+                    .rollback_to_turn(session_id.clone(), turn)
+                    .await
+            }
+            rollback_target::Target::Cursor(cursor) => {
+                self.sessions
+                    .rollback_to_cursor(session_id.clone(), TimelineCursor::new(cursor))
+                    .await
+            }
+            rollback_target::Target::BeforeCursor(cursor) => {
+                self.sessions
+                    .rollback_before_cursor(session_id.clone(), TimelineCursor::new(cursor))
+                    .await
+            }
+        }
+        .map_err(agent_error_to_status)?;
+        let after_cursor = session
+            .record
+            .timeline_events()
+            .last()
+            .map(|event| event.cursor.get());
+        let config = self.load_config().await;
+        tracing::info!("session rollback completed");
+        Ok(Response::new(RollbackSessionResponse {
+            session: Some(session_summary_to_proto(session.record.summary(), &config)),
+            truncation: Some(TimelineTruncation {
+                session_id: session_id.as_str().to_owned(),
+                after_cursor,
+            }),
+        }))
+    }
+
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "continue_session", session_id)
+    )]
+    async fn continue_session(
+        &self,
+        request: Request<ContinueSessionRequest>,
+    ) -> Result<Response<ContinueSessionResponse>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.session_id)?;
+        tracing::Span::current().record("session_id", session_id.as_str());
+        tracing::info!("session continue accepted");
+        match required_rollback_target(request.target)? {
+            rollback_target::Target::Turn(turn) => {
+                self.sessions
+                    .continue_from_turn(session_id, turn)
+                    .await
+                    .map_err(session_run_error_to_status)?;
+            }
+            rollback_target::Target::Cursor(cursor) => {
+                self.sessions
+                    .continue_from_cursor(session_id, TimelineCursor::new(cursor))
+                    .await
+                    .map_err(session_run_error_to_status)?;
+            }
+            rollback_target::Target::BeforeCursor(_) => {
+                return Err(Status::invalid_argument(
+                    "continue target must be turn or cursor",
+                ));
+            }
+        }
+        tracing::info!("session continue dispatched");
+        Ok(Response::new(ContinueSessionResponse {}))
+    }
 }
 
 fn required_session_id(value: &str) -> Result<SessionId, Status> {
@@ -493,6 +599,14 @@ fn required_session_id(value: &str) -> Result<SessionId, Status> {
     } else {
         Ok(SessionId::new(value.to_owned()))
     }
+}
+
+fn required_rollback_target(
+    target: Option<waltr::grpc::waltr::session::v1::RollbackTarget>,
+) -> Result<rollback_target::Target, Status> {
+    target
+        .and_then(|target| target.target)
+        .ok_or_else(|| Status::invalid_argument("rollback target is required"))
 }
 
 fn push_history(
@@ -509,7 +623,7 @@ fn push_history(
         output.push(
             timeline_event_to_proto(event).map(|event| WatchTimelineResponse {
                 sequence: 0,
-                event: Some(event),
+                update: Some(watch_timeline_response::Update::Event(event)),
             }),
         );
     }
