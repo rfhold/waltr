@@ -246,6 +246,8 @@ pub enum TimelineStatus {
     BuildingRequest,
     /// Provider streaming is in progress.
     StreamingProvider,
+    /// Provider retry backoff is in progress.
+    RetryingProvider,
     /// Tool call middleware is being evaluated.
     EvaluatingToolCall,
     /// A local tool executor is running.
@@ -274,6 +276,7 @@ impl From<&SessionStatus> for TimelineStatus {
             SessionStatus::Idle => Self::Idle,
             SessionStatus::BuildingRequest => Self::BuildingRequest,
             SessionStatus::StreamingProvider => Self::StreamingProvider,
+            SessionStatus::RetryingProvider { .. } => Self::RetryingProvider,
             SessionStatus::EvaluatingToolCall => Self::EvaluatingToolCall,
             SessionStatus::RunningTool => Self::RunningTool,
             SessionStatus::Suspended(Suspension::AwaitingToolResults { .. }) => {

@@ -83,6 +83,7 @@ pub(super) fn status_label(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::BuildingRequest
         | SessionStatus::StreamingProvider
+        | SessionStatus::RetryingProvider { .. }
         | SessionStatus::EvaluatingToolCall
         | SessionStatus::RunningTool => "running",
     }

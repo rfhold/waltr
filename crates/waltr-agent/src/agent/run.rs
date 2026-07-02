@@ -180,6 +180,7 @@ where
             tools,
             middleware_chain: default_chain,
             permission_policy,
+            retry_config,
         } = self.runtime;
         let system_prompt = self.system_prompt;
 
@@ -201,6 +202,7 @@ where
             tools,
             middleware_chain,
             permission_policy,
+            retry_config,
             session_id: self.session_id,
             session_store: self.session_store,
             session_broadcaster: self.session_broadcaster,

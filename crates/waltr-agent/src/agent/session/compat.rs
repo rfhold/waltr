@@ -9,7 +9,7 @@ use super::watch::{SessionListBroadcaster, SessionTimelineBroadcaster};
 use super::{ResumeInput, SessionId, SessionStore};
 use crate::middleware::{chain::MiddlewareChain, prompt::SystemPromptOverride};
 
-use super::super::AgentTool;
+use super::super::{AgentTool, ProviderRetryConfig};
 
 pub struct EphemeralSessionRun<S>
 where
@@ -23,6 +23,7 @@ where
     pub tools: Vec<AgentTool>,
     pub middleware_chain: MiddlewareChain,
     pub permission_policy: PermissionPolicy,
+    pub retry_config: ProviderRetryConfig,
     pub session_id: SessionId,
     pub session_store: S,
     pub session_broadcaster: Option<SessionListBroadcaster>,

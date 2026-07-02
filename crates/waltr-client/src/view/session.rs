@@ -143,6 +143,8 @@ pub enum SessionPhaseView {
     BuildingRequest,
     /// Session is streaming from a provider.
     StreamingProvider,
+    /// Session is waiting before retrying a provider request.
+    RetryingProvider,
     /// Session is evaluating a tool call.
     EvaluatingToolCall,
     /// Session is running a tool.
@@ -230,6 +232,7 @@ pub enum TimelineStatusView {
     Idle,
     BuildingRequest,
     StreamingProvider,
+    RetryingProvider,
     EvaluatingToolCall,
     RunningTool,
     Pending,
@@ -358,6 +361,7 @@ impl From<i32> for SessionPhaseView {
             Ok(SessionPhase::Idle) => Self::Idle,
             Ok(SessionPhase::BuildingRequest) => Self::BuildingRequest,
             Ok(SessionPhase::StreamingProvider) => Self::StreamingProvider,
+            Ok(SessionPhase::RetryingProvider) => Self::RetryingProvider,
             Ok(SessionPhase::EvaluatingToolCall) => Self::EvaluatingToolCall,
             Ok(SessionPhase::RunningTool) => Self::RunningTool,
             Ok(SessionPhase::Suspended) => Self::Suspended,
@@ -502,6 +506,7 @@ impl From<i32> for TimelineStatusView {
             Ok(TimelineStatus::Idle) => Self::Idle,
             Ok(TimelineStatus::BuildingRequest) => Self::BuildingRequest,
             Ok(TimelineStatus::StreamingProvider) => Self::StreamingProvider,
+            Ok(TimelineStatus::RetryingProvider) => Self::RetryingProvider,
             Ok(TimelineStatus::EvaluatingToolCall) => Self::EvaluatingToolCall,
             Ok(TimelineStatus::RunningTool) => Self::RunningTool,
             Ok(TimelineStatus::Pending) => Self::Pending,

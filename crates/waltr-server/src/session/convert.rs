@@ -57,6 +57,7 @@ fn session_status_to_proto(status: SessionStatus) -> ProtoSessionStatus {
         SessionStatus::Idle => proto_status(ProtoSessionPhase::Idle),
         SessionStatus::BuildingRequest => proto_status(ProtoSessionPhase::BuildingRequest),
         SessionStatus::StreamingProvider => proto_status(ProtoSessionPhase::StreamingProvider),
+        SessionStatus::RetryingProvider { .. } => proto_status(ProtoSessionPhase::RetryingProvider),
         SessionStatus::EvaluatingToolCall => proto_status(ProtoSessionPhase::EvaluatingToolCall),
         SessionStatus::RunningTool => proto_status(ProtoSessionPhase::RunningTool),
         SessionStatus::Suspended(suspension) => ProtoSessionStatus {

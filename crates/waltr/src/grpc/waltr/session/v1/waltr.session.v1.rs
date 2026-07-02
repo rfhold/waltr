@@ -526,6 +526,7 @@ pub enum TimelineStatus {
     Finished = 11,
     Failed = 12,
     Canceled = 13,
+    RetryingProvider = 14,
 }
 impl TimelineStatus {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -548,6 +549,7 @@ impl TimelineStatus {
             Self::Finished => "TIMELINE_STATUS_FINISHED",
             Self::Failed => "TIMELINE_STATUS_FAILED",
             Self::Canceled => "TIMELINE_STATUS_CANCELED",
+            Self::RetryingProvider => "TIMELINE_STATUS_RETRYING_PROVIDER",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -567,6 +569,7 @@ impl TimelineStatus {
             "TIMELINE_STATUS_FINISHED" => Some(Self::Finished),
             "TIMELINE_STATUS_FAILED" => Some(Self::Failed),
             "TIMELINE_STATUS_CANCELED" => Some(Self::Canceled),
+            "TIMELINE_STATUS_RETRYING_PROVIDER" => Some(Self::RetryingProvider),
             _ => None,
         }
     }
@@ -615,6 +618,7 @@ pub enum SessionPhase {
     Suspended = 6,
     Finished = 7,
     Failed = 8,
+    RetryingProvider = 9,
 }
 impl SessionPhase {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -632,6 +636,7 @@ impl SessionPhase {
             Self::Suspended => "SESSION_PHASE_SUSPENDED",
             Self::Finished => "SESSION_PHASE_FINISHED",
             Self::Failed => "SESSION_PHASE_FAILED",
+            Self::RetryingProvider => "SESSION_PHASE_RETRYING_PROVIDER",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -646,6 +651,7 @@ impl SessionPhase {
             "SESSION_PHASE_SUSPENDED" => Some(Self::Suspended),
             "SESSION_PHASE_FINISHED" => Some(Self::Finished),
             "SESSION_PHASE_FAILED" => Some(Self::Failed),
+            "SESSION_PHASE_RETRYING_PROVIDER" => Some(Self::RetryingProvider),
             _ => None,
         }
     }
