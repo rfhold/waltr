@@ -44,6 +44,7 @@ pub(super) async fn send_request(
     span.record("http_response_status_code", status.as_u16());
     if !status.is_success() {
         tracing::warn!(status = status.as_u16(), "provider http request failed");
+        let headers = response_headers(response.headers());
         let text = response
             .text()
             .await
@@ -51,6 +52,10 @@ pub(super) async fn send_request(
         return Err(LlmError::Api {
             provider: PROVIDER,
             message: format!("{status}: {text}"),
+            status: Some(status.as_u16()),
+            headers,
+            code: None,
+            body: Some(text),
         });
     }
     span.in_scope(|| tracing::debug!(status = status.as_u16(), "provider http stream opened"));
@@ -72,6 +77,18 @@ pub(super) async fn send_request(
         ),
         stream_span,
     ))
+}
+
+fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn completion_stream<S, B>(
