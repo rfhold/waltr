@@ -5,8 +5,8 @@ use std::{fs, net::SocketAddr, sync::Arc, time::Duration};
 use axum::Router;
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, AgentSessions, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, LlmError,
-    LlmStream, MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionStore, ToolCall,
+    AgentRuntime, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, LlmError, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionCoordinator, SessionStore, ToolCall,
     mcp::{McpConfig, McpServerConfig},
 };
 use rmcp::{
@@ -128,7 +128,7 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
         .await?
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let cancellation = CancellationToken::new();
     let mut stream = sessions

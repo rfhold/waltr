@@ -4,13 +4,14 @@ use std::{env, fs, path::PathBuf, sync::Arc};
 
 use futures_util::{Stream, StreamExt, stream};
 use waltr_agent::{
-    AgentRuntime, AgentSessionRuntime, AgentSessions, AgentTimelineEvent, BoxCompletionStream,
-    BoxStreamFuture, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT,
-    CancelReason, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
+    AgentRuntime, AgentSessionRuntime, AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture,
+    CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, CancelReason,
+    CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
     PendingWorkStatus, PermissionEffect, PermissionOperation, PermissionPattern, PermissionPolicy,
     PermissionResourcePattern, PermissionResponse, PermissionToolSelector, ProviderId, ResumeInput,
-    RuntimeResumeOutput, SessionStatus, SessionStore, TimelineContent, ToolCall,
+    RuntimeResumeOutput, SessionCoordinator, SessionStatus, SessionStore, TimelineContent,
+    ToolCall,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -167,7 +168,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         )
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions
@@ -294,7 +295,7 @@ async fn permission_resume_preserves_remaining_provider_tool_calls() -> waltr_ag
         )
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let request_id = first_permission_request_id(
@@ -389,7 +390,7 @@ async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_ag
         )
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let cancellation = CancellationToken::new();
 
@@ -485,7 +486,7 @@ async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> w
         )
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions
@@ -595,7 +596,7 @@ async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr
         )
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions
@@ -692,7 +693,7 @@ async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
         )
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let request_id = first_permission_request_id(
         sessions
@@ -764,7 +765,7 @@ async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
         )
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let request_id = first_permission_request_id(
         sessions
@@ -893,7 +894,7 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     let agent = agent.build();
 
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let mut stream = sessions
         .prompt(&agent, session_id.clone(), "patch denied")

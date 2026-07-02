@@ -22,7 +22,7 @@ pub async fn server_endpoint_with_runtime_config() -> Result<String, Box<dyn std
 pub async fn server_endpoint_with_seeded_timeline(
     seed_text: bool,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let sessions = waltr_agent::AgentSessions::new(waltr_agent::MemorySessionStore::new());
+    let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
     let session = sessions.create().await?;
     let session_id = session.id().clone();
     if seed_text {

@@ -13,13 +13,13 @@ use waltr_agent::PermissionPolicy;
 #[cfg(feature = "shell")]
 use waltr_agent::tools::shell::ShellConfig;
 use waltr_agent::{
-    AGENTS_INSTRUCTION_FILE, AgentRuntime, AgentSessions, AgentTimelineEvent, AgentTool,
-    AgentsPromptConfig, BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture,
-    CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL,
-    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent,
-    CompletionReplayItem, CompletionRequest, ExternalRequestId, ExternalRequestKind,
-    ExternalResponse, FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi,
-    ModelRef, ProviderId, ProviderTurnMetadata, ResumeInput, SessionStore, SkillsConfig,
+    AGENTS_INSTRUCTION_FILE, AgentRuntime, AgentTimelineEvent, AgentTool, AgentsPromptConfig,
+    BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
+    CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO,
+    CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent, CompletionReplayItem,
+    CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
+    FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef,
+    ProviderId, ProviderTurnMetadata, ResumeInput, SessionCoordinator, SessionStore, SkillsConfig,
     ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind,
     TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
     tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
@@ -37,7 +37,7 @@ async fn durable_session_resume_continues_same_agent_loop() {
         .with_question_tool(QuestionConfig::new())
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions
         .create()
         .await
@@ -107,7 +107,7 @@ async fn provider_projection_and_turn_metadata_are_journaled() {
     let agent =
         AgentRuntime::builder(test_model(), Arc::new(MetadataEmittingProvider::default())).build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     drain(
@@ -143,7 +143,7 @@ async fn provider_turn_metadata_is_forwarded_without_agent_filtering() {
     let agent =
         AgentRuntime::builder(test_model(), Arc::new(MetadataEmittingProvider::default())).build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     drain(
@@ -173,7 +173,7 @@ async fn durable_multi_prompt_request_replays_user_prompts_in_order() {
     let provider = Arc::new(ChronologyProvider::default());
     let agent = AgentRuntime::builder(test_model(), provider.clone()).build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     drain(
@@ -220,7 +220,7 @@ async fn superseded_prompt_closes_turn_and_keeps_distinct_user_timeline_items() 
     let provider = Arc::new(PendingSupersedeProvider::default());
     let agent = AgentRuntime::builder(test_model(), provider.clone()).build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     let mut first = sessions
@@ -290,7 +290,7 @@ async fn durable_session_timeline_ranges_preserve_cursor_order() {
     let agent =
         AgentRuntime::builder(test_model(), Arc::new(MetadataEmittingProvider::default())).build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     drain(
@@ -372,7 +372,7 @@ async fn assistant_and_thinking_deltas_use_stable_items_and_reconstruct_text() {
     );
     let agent = AgentRuntime::builder(test_model(), Arc::new(provider)).build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
 
     let events = sessions
@@ -613,7 +613,7 @@ async fn interrupting_multi_tool_turn_preserves_finished_results() {
         .with_tool(slow_tool)
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = create_session_id(&sessions).await;
     let cancellation = CancellationToken::new();
     let mut stream = sessions
@@ -690,7 +690,7 @@ async fn cancellation_token_stops_running_tool_without_finishing_result() {
         .with_tool(tool)
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions
         .create()
         .await
@@ -765,7 +765,7 @@ async fn shell_cancellation_kills_running_command() {
         .with_shell_tool(ShellConfig::new(temp.path()))
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions
         .create()
         .await
@@ -1216,7 +1216,7 @@ fn test_model() -> ModelRef {
     ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses)
 }
 
-async fn create_session_id<S>(sessions: &waltr_agent::AgentSessions<S>) -> waltr_agent::SessionId
+async fn create_session_id<S>(sessions: &waltr_agent::SessionCoordinator<S>) -> waltr_agent::SessionId
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {

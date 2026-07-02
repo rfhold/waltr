@@ -2,9 +2,9 @@
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, LlmError, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, SessionStore, TimelineContent, TimelineEventKind,
-    TimelineStatus,
+    AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, LlmError, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, SessionCoordinator, SessionStore, TimelineContent,
+    TimelineEventKind, TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
         OpenAiReasoningEffort, OpenAiReasoningSummary,
@@ -82,7 +82,7 @@ async fn assert_provider_thinking(
     let provider_name = provider.name();
     let agent = AgentRuntime::builder(model, std::sync::Arc::new(provider)).build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
     let mut stream = sessions
         .prompt(&agent, session_id.clone(),

@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CompletionEvent,
+    AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CompletionEvent,
     ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionStatus, SessionStore,
-    TimelineContent, ToolCall, ToolDefinition,
+    MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionCoordinator,
+    SessionStatus, SessionStore, TimelineContent, ToolCall, ToolDefinition,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 use serde_json::{Value, json};
@@ -69,7 +69,7 @@ async fn question_external_request_resumes_from_durable_session() -> waltr_agent
         .with_question_tool(QuestionConfig::new())
         .build();
     let store = MemorySessionStore::new();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions.create().await?.id().clone();
 
     let mut stream = sessions

@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use futures_util::StreamExt as _;
 use waltr_agent::{
-    AgentRunBuilder, AgentRuntime, AgentSessions, AgentTimelineEvent, CHANNEL_TOOL_CALL,
-    CHANNEL_TOOL_RESULT, LlmStream, MemorySessionStore, ModelRef, PermissionCommandPattern,
-    PermissionEffect, PermissionPolicy, PermissionToolSelector, SessionStatus, Suspension,
+    AgentRunBuilder, AgentRuntime, AgentTimelineEvent, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT,
+    LlmStream, MemorySessionStore, ModelRef, PermissionCommandPattern, PermissionEffect,
+    PermissionPolicy, PermissionToolSelector, SessionCoordinator, SessionStatus, Suspension,
     TimelineContent, tools::shell::ShellConfig,
 };
 use tokio::{sync::mpsc, time};
@@ -154,7 +154,7 @@ async fn assert_provider_handles_shell_tool_interrupts(
         .with_permission_policy(shell_interrupt_policy())
         .with_shell_tool(ShellConfig::new(root))
         .build();
-    let sessions = AgentSessions::new(MemorySessionStore::new());
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
     let session_id = sessions.create().await?.id().clone();
 
     let first_cancel = CancellationToken::new();

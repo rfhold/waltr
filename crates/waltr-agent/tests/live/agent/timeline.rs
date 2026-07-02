@@ -4,8 +4,9 @@ use std::{sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_USER_TEXT, LlmError, LlmStream,
-    MemorySessionStore, ModelRef, TimelineContent, TimelineEventKind, TimelineStatus,
+    AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_USER_TEXT, LlmError, LlmStream,
+    MemorySessionStore, ModelRef, SessionCoordinator, TimelineContent, TimelineEventKind,
+    TimelineStatus,
 };
 
 use crate::live_provider;
@@ -62,7 +63,7 @@ async fn assert_provider_streams_timeline_updates(
 ) -> waltr_agent::Result<()> {
     let provider_name = provider.name();
     let agent = AgentRuntime::builder(model, Arc::new(provider)).build();
-    let sessions = AgentSessions::new(MemorySessionStore::new());
+    let sessions = SessionCoordinator::new(MemorySessionStore::new());
     let session_id = sessions.create().await?.id().clone();
     let mut timeline = sessions.watch_timeline(session_id.clone());
 

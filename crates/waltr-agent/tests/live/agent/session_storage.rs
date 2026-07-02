@@ -9,9 +9,9 @@ use std::{
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST,
-    CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse,
-    FilesystemSessionStore, OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore,
+    AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_CALL,
+    CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse, FilesystemSessionStore,
+    OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore, SessionCoordinator,
     SessionStore, SessionStoreError, TimelineChannel, TimelineContent, TimelineEventKind,
     TimelineQuery, TimelineStatus, opendal_postgresql_session_store,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
@@ -115,7 +115,7 @@ where
         )
         .with_question_tool(QuestionConfig::new())
         .build();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session = sessions.create().await?;
     let session_id = session.id().clone();
 

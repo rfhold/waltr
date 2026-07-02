@@ -13,3 +13,5 @@ mod permissions;
 mod question;
 #[path = "agent/session.rs"]
 mod session;
+#[path = "agent/task.rs"]
+mod task;
