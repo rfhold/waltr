@@ -2890,6 +2890,7 @@ dependencies = [
  "futures-util",
  "globset",
  "http 1.4.1",
+ "httpdate",
  "ignore",
  "opendal",
  "refinery",

@@ -26,7 +26,7 @@ use crate::{
     middleware::claims::ShellClaimsMiddleware, prompt::ShellPromptConfig, tools::shell::ShellConfig,
 };
 
-use super::{AgentRuntime, AgentTool, SessionStore};
+use super::{AgentRuntime, AgentTool, ProviderRetryConfig, SessionStore};
 
 /// Builder for an agent runtime configuration.
 #[derive(Clone)]
@@ -43,6 +43,7 @@ pub struct AgentRuntimeBuilder {
     skills_reveal_roots: Vec<PathBuf>,
     permission_policy: PermissionPolicy,
     explicit_permission_policy: bool,
+    retry_config: ProviderRetryConfig,
 }
 
 impl AgentRuntimeBuilder {
@@ -65,6 +66,7 @@ impl AgentRuntimeBuilder {
             skills_reveal_roots: Vec::new(),
             permission_policy: PermissionPolicy::default(),
             explicit_permission_policy: false,
+            retry_config: ProviderRetryConfig::default(),
         }
     }
 
@@ -255,6 +257,13 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Set provider retry behavior for this agent runtime.
+    #[must_use]
+    pub fn with_provider_retry_config(mut self, config: ProviderRetryConfig) -> Self {
+        self.retry_config = config;
+        self
+    }
+
     /// Build the agent runtime configuration.
     ///
     /// Middleware assembly order is deterministic and affects provider request
@@ -282,6 +291,7 @@ impl AgentRuntimeBuilder {
             tools: self.tools,
             middleware_chain,
             permission_policy: self.permission_policy,
+            retry_config: self.retry_config,
         }
     }
 }
@@ -305,6 +315,7 @@ impl fmt::Debug for AgentRuntimeBuilder {
                 "explicit_permission_policy",
                 &self.explicit_permission_policy,
             )
+            .field("retry_config", &self.retry_config)
             .finish()
     }
 }

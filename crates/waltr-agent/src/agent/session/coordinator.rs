@@ -897,6 +897,7 @@ fn terminal_state(outcome: &RunResult) -> &'static str {
             SessionStatus::Idle
             | SessionStatus::BuildingRequest
             | SessionStatus::StreamingProvider
+            | SessionStatus::RetryingProvider { .. }
             | SessionStatus::EvaluatingToolCall
             | SessionStatus::RunningTool => "finished",
         },

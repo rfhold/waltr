@@ -3,7 +3,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     hash::{Hash, Hasher},
+    pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use futures_util::StreamExt;
@@ -28,21 +30,22 @@ use crate::{
     },
     timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS, TimelineStatus},
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, Span};
 
-use super::tool::ToolFuture;
 use super::{
     AgentTool,
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, ExternalResponse, PendingWorkStatus, RequestId,
         RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent,
-        SessionListBroadcaster, SessionListEvent, SessionRecord, SessionSnapshot, SessionStore,
-        SessionStoreError, SessionTimelineBroadcaster, Suspension as SessionSuspension,
+        SessionListBroadcaster, SessionListEvent, SessionRecord, SessionRollbackTarget,
+        SessionSnapshot, SessionStore, SessionStoreError, SessionTimelineBroadcaster,
+        Suspension as SessionSuspension,
     },
 };
+use super::{ProviderRetryConfig, tool::ToolFuture};
 
 pub(super) struct AgentLoopState<S>
 where
@@ -61,6 +64,9 @@ where
     phase: AgentLoopPhase,
     pending: VecDeque<Result<AgentTimelineEvent>>,
     permission_policy: PermissionPolicy,
+    retry_config: ProviderRetryConfig,
+    provider_attempt: u32,
+    retry_checkpoint: Option<RetryCheckpoint>,
     session_id: SessionId,
     session_revision: Revision,
     session_store: S,
@@ -74,9 +80,17 @@ where
     turn_span: Option<Span>,
 }
 
+#[derive(Debug, Clone)]
+struct RetryCheckpoint {
+    journal_len: u64,
+    after_cursor: Option<crate::timeline::TimelineCursor>,
+    turn: u64,
+}
+
 enum AgentLoopPhase {
     StartTurn,
     Streaming(StreamingTurn),
+    RetryDelay(Pin<Box<Sleep>>),
     ExecuteTools(ToolBatch),
     RunningTool(RunningTool, ToolBatch),
     Done,
@@ -137,6 +151,9 @@ where
             phase: AgentLoopPhase::StartTurn,
             pending: VecDeque::new(),
             permission_policy,
+            retry_config: run.retry_config,
+            provider_attempt: 1,
+            retry_checkpoint: None,
             session_id: run.session_id,
             session_revision: Revision::ZERO,
             session_store: run.session_store,
@@ -183,10 +200,21 @@ where
                     };
                     let request = completion_request_from_draft(&draft);
                     let projected = self.provider.project_request(&request);
+                    let retry_checkpoint = match Self::retry_checkpoint(
+                        self.session_store.clone(),
+                        self.session_id.clone(),
+                        self.turn as u64,
+                    )
+                    .await
+                    {
+                        Ok(checkpoint) => checkpoint,
+                        Err(error) => return Some((Err(error), self)),
+                    };
 
                     if let Err(error) = self.persist_provider_request(&draft, projected).await {
                         return Some((Err(error), self));
                     }
+                    self.retry_checkpoint = Some(retry_checkpoint);
                     let provider_span = {
                         let _guard = self.turn_span.as_ref().map(Span::enter);
                         tracing::info_span!(
@@ -224,8 +252,10 @@ where
                         }
                         Err(error) => {
                             self.in_turn_span(|| tracing::warn!(%error, "provider request failed"));
-                            self.pending_failed_session_event(&error).await;
-                            return Some((Err(error), self));
+                            if let Err(error) = self.retry_or_fail_provider_error(error).await {
+                                return Some((Err(error), self));
+                            }
+                            continue;
                         }
                     }
                 }
@@ -328,6 +358,8 @@ where
                         return Some((Ok(event), self));
                     }
                     Some(Ok(CompletionEvent::Finished)) | None => {
+                        self.provider_attempt = 1;
+                        self.retry_checkpoint = None;
                         if !streaming.tool_calls.is_empty() {
                             self.in_turn_span(|| {
                                 tracing::info!(
@@ -363,10 +395,28 @@ where
                     }
                     Some(Err(error)) => {
                         self.in_turn_span(|| tracing::warn!(%error, "provider stream failed"));
-                        self.pending_failed_session_event(&error).await;
-                        return Some((Err(error), self));
+                        if let Err(error) = self.retry_or_fail_provider_error(error).await {
+                            return Some((Err(error), self));
+                        }
+                        continue;
                     }
                 },
+                AgentLoopPhase::RetryDelay(mut sleep) => {
+                    tokio::select! {
+                        biased;
+
+                        () = self.cancellation_token.cancelled() => {
+                            if let Err(error) = self.record_interrupted().await {
+                                return Some((Err(error), self));
+                            }
+                            self.phase = AgentLoopPhase::Done;
+                            return None;
+                        }
+                        () = &mut sleep => {
+                            self.phase = AgentLoopPhase::StartTurn;
+                        }
+                    }
+                }
                 AgentLoopPhase::ExecuteTools(mut batch) => {
                     let Some(call) = batch.calls.pop_front() else {
                         if let Err(error) = self.finish_tool_batch().await {
@@ -1134,6 +1184,95 @@ where
             );
         }
         self.close_turn_span("error");
+    }
+
+    async fn retry_or_fail_provider_error(&mut self, error: LlmError) -> Result<()> {
+        let Some(decision) = self.retry_config.classify(&error, self.provider_attempt) else {
+            self.pending_failed_session_event(&error).await;
+            return Err(error);
+        };
+
+        let checkpoint = self.retry_checkpoint.clone().ok_or_else(|| {
+            session_store_error("provider retry requested without rollback checkpoint")
+        })?;
+        self.rollback_to_retry_checkpoint(checkpoint).await?;
+        let event = self
+            .append_retrying_status_event(
+                decision.attempt,
+                decision.max_attempts,
+                decision.delay,
+                decision.message,
+            )
+            .await?;
+        self.pending.push_back(Ok(event));
+        self.provider_attempt = self.provider_attempt.saturating_add(1);
+        self.phase = AgentLoopPhase::RetryDelay(Box::pin(tokio::time::sleep(decision.delay)));
+
+        Ok(())
+    }
+
+    async fn retry_checkpoint(
+        session_store: S,
+        session_id: SessionId,
+        turn: u64,
+    ) -> Result<RetryCheckpoint> {
+        let record = session_store
+            .load(&session_id)
+            .await
+            .map_err(session_store_error)?;
+        Ok(RetryCheckpoint {
+            journal_len: record.journal.len() as u64,
+            after_cursor: record.timeline_events().last().map(|event| event.cursor),
+            turn,
+        })
+    }
+
+    async fn rollback_to_retry_checkpoint(&mut self, checkpoint: RetryCheckpoint) -> Result<()> {
+        let target = SessionRollbackTarget {
+            journal_len: checkpoint.journal_len,
+            after_cursor: checkpoint.after_cursor,
+            next_turn: checkpoint.turn,
+            remove_prompt_index: None,
+        };
+        self.append_journal_event(SessionJournalEvent::Rollback { target })
+            .await?;
+        if let Some(timeline) = &self.timeline_broadcaster {
+            timeline.publish_truncation(self.session_id.clone(), checkpoint.after_cursor);
+        }
+        let record = self
+            .session_store
+            .load(&self.session_id)
+            .await
+            .map_err(session_store_error)?;
+        self.hydrate_from_record(&record);
+        Ok(())
+    }
+
+    async fn append_retrying_status_event(
+        &mut self,
+        attempt: u32,
+        max_attempts: u32,
+        delay: Duration,
+        message: String,
+    ) -> Result<AgentTimelineEvent> {
+        let delay_ms = delay.as_millis().min(u128::from(u64::MAX)) as u64;
+        let mut event = PendingTimelineEvent::new(
+            self.session_id.clone(),
+            self.turn as u64,
+            session_status_item_id(),
+            TimelineEventKind::SessionStatusChanged,
+            None,
+            TimelineContent::Json {
+                value: json!({
+                    "attempt": attempt,
+                    "maxAttempts": max_attempts,
+                    "delayMs": delay_ms,
+                    "message": message,
+                }),
+            },
+        );
+        event.status = Some(TimelineStatus::RetryingProvider);
+        self.append_timeline_event(event).await
     }
 
     fn ensure_turn_span(&mut self) {

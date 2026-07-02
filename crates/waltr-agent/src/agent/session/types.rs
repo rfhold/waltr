@@ -708,6 +708,7 @@ impl SessionSnapshot {
             TimelineStatus::Idle => SessionStatus::Idle,
             TimelineStatus::BuildingRequest => SessionStatus::BuildingRequest,
             TimelineStatus::StreamingProvider => SessionStatus::StreamingProvider,
+            TimelineStatus::RetryingProvider => retrying_provider_status(event),
             TimelineStatus::EvaluatingToolCall => SessionStatus::EvaluatingToolCall,
             TimelineStatus::RunningTool => SessionStatus::RunningTool,
             TimelineStatus::AwaitingToolResults => {
@@ -861,6 +862,17 @@ pub enum SessionStatus {
     BuildingRequest,
     /// Provider streaming is in progress.
     StreamingProvider,
+    /// Provider retry backoff is in progress.
+    RetryingProvider {
+        /// One-based attempt that failed.
+        attempt: u32,
+        /// Total configured attempts.
+        max_attempts: u32,
+        /// Delay before the next attempt, in milliseconds.
+        delay_ms: u64,
+        /// User-facing retry message.
+        message: String,
+    },
     /// Tool call middleware is being evaluated.
     EvaluatingToolCall,
     /// A local tool executor is running.
@@ -1109,6 +1121,38 @@ fn timeline_failure_message(event: &AgentTimelineEvent) -> String {
         | TimelineContent::ToolResult { .. }
         | TimelineContent::ExternalRequest { .. }
         | TimelineContent::ContentRef { .. } => "timeline status failed".to_owned(),
+    }
+}
+
+fn retrying_provider_status(event: &AgentTimelineEvent) -> SessionStatus {
+    let TimelineContent::Json { value } = &event.content else {
+        return SessionStatus::RetryingProvider {
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: 0,
+            message: String::new(),
+        };
+    };
+    SessionStatus::RetryingProvider {
+        attempt: value
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        max_attempts: value
+            .get("maxAttempts")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        delay_ms: value
+            .get("delayMs")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        message: value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
     }
 }
 

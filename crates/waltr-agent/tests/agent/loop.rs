@@ -19,11 +19,11 @@ use waltr_agent::{
     CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent, CompletionReplayItem,
     CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
     FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef,
-    ProviderId, ProviderTurnMetadata, ResumeInput, SessionCoordinator, SessionStore, SkillsConfig,
-    ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind,
-    TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
-    tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
-    tools::question::QuestionConfig,
+    ProviderId, ProviderRetryConfig, ProviderTurnMetadata, ResumeInput, SessionCoordinator,
+    SessionStatus, SessionStore, SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta,
+    TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall,
+    ToolDefinition, TurnItem, tools::filesystem::FilesystemConfig,
+    tools::question::QUESTION_TOOL_NAME, tools::question::QuestionConfig,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -166,6 +166,107 @@ async fn provider_turn_metadata_is_forwarded_without_agent_filtering() {
             .stream(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn provider_request_open_failure_retries_from_checkpoint() {
+    let provider = Arc::new(RequestOpenRetryProvider::default());
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
+        .with_provider_retry_config(test_retry_config(3))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    let events = collect_events(
+        sessions
+            .prompt(&agent, session_id.clone(), "retry request")
+            .stream(),
+    )
+    .await;
+
+    assert_eq!(provider.requests(), 2);
+    assert_eq!(assistant_text(&events), "request retry recovered");
+    assert!(events.iter().any(|event| {
+        event.kind == TimelineEventKind::SessionStatusChanged
+            && event.status == Some(TimelineStatus::RetryingProvider)
+    }));
+    let record = store.load(&session_id).await.expect("stored session");
+    assert_eq!(record.provider_requests().count(), 1);
+}
+
+#[tokio::test]
+async fn provider_stream_failure_rolls_back_partial_output_before_retry() {
+    let requests = Mutex::new(0);
+    let provider = Arc::new(ScriptedProvider::new("retry-stream", move |_| {
+        let mut requests = requests.lock().expect("request count");
+        let request = *requests;
+        *requests += 1;
+        drop(requests);
+        match request {
+            0 => vec![
+                Ok(CompletionEvent::Delta("partial".to_owned())),
+                Err(retryable_api_error("stream rate limited")),
+            ],
+            1 => vec![
+                Ok(CompletionEvent::Delta("final".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ],
+            _ => panic!("unexpected provider request {request}"),
+        }
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_provider_retry_config(test_retry_config(3))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    let events = collect_events(
+        sessions
+            .prompt(&agent, session_id.clone(), "retry stream")
+            .stream(),
+    )
+    .await;
+
+    assert_eq!(assistant_text(&events), "partialfinal");
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert_eq!(snapshot.assistant_texts().collect::<Vec<_>>(), ["final"]);
+    assert!(matches!(snapshot.status, SessionStatus::Finished));
+}
+
+#[tokio::test]
+async fn provider_retry_exhaustion_records_failed_status() {
+    let provider = Arc::new(AlwaysFailingProvider::default());
+    let agent = AgentRuntime::builder(test_model(), provider.clone())
+        .with_provider_retry_config(test_retry_config(2))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    let mut stream = sessions
+        .prompt(&agent, session_id.clone(), "retry exhausted")
+        .stream();
+    let mut final_error = None;
+    while let Some(event) = stream.next().await {
+        if let Err(error) = event {
+            final_error = Some(error);
+        }
+    }
+
+    assert!(final_error.is_some());
+    assert_eq!(provider.requests(), 2);
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert!(matches!(snapshot.status, SessionStatus::Failed { .. }));
 }
 
 #[tokio::test]
@@ -1234,6 +1335,109 @@ where
 {
     while let Some(event) = stream.next().await {
         event.expect("agent event");
+    }
+}
+
+async fn collect_events<S>(mut stream: S) -> Vec<AgentTimelineEvent>
+where
+    S: futures_util::Stream<Item = waltr_agent::Result<AgentTimelineEvent>> + Unpin,
+{
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("agent event"));
+    }
+    events
+}
+
+fn assistant_text(events: &[AgentTimelineEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| {
+            if crate::session::channel_is(event, CHANNEL_ASSISTANT_TEXT)
+                && let TimelineContent::TextDelta { delta } = &event.content
+            {
+                return Some(delta.as_str());
+            }
+            None
+        })
+        .collect()
+}
+
+fn test_retry_config(max_attempts: u32) -> ProviderRetryConfig {
+    ProviderRetryConfig {
+        max_attempts,
+        initial_delay: Duration::ZERO,
+        fallback_delay_cap: Duration::ZERO,
+        provider_delay_cap: Duration::ZERO,
+        ..ProviderRetryConfig::default()
+    }
+}
+
+fn retryable_api_error(message: &str) -> LlmError {
+    LlmError::Api {
+        provider: "test",
+        message: message.to_owned(),
+        status: Some(429),
+        headers: Vec::new(),
+        code: None,
+        body: None,
+    }
+}
+
+#[derive(Default)]
+struct RequestOpenRetryProvider {
+    requests: Mutex<u32>,
+}
+
+impl RequestOpenRetryProvider {
+    fn requests(&self) -> u32 {
+        *self.requests.lock().expect("request count")
+    }
+}
+
+impl LlmStream for RequestOpenRetryProvider {
+    fn name(&self) -> &'static str {
+        "request-open-retry"
+    }
+
+    fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        Box::pin(async move {
+            let mut requests = self.requests.lock().expect("request count");
+            let request = *requests;
+            *requests += 1;
+            drop(requests);
+            if request == 0 {
+                return Err(retryable_api_error("request rate limited"));
+            }
+            Ok(Box::pin(stream::iter([
+                Ok(CompletionEvent::Delta("request retry recovered".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ])) as BoxCompletionStream)
+        })
+    }
+}
+
+#[derive(Default)]
+struct AlwaysFailingProvider {
+    requests: Mutex<u32>,
+}
+
+impl AlwaysFailingProvider {
+    fn requests(&self) -> u32 {
+        *self.requests.lock().expect("request count")
+    }
+}
+
+impl LlmStream for AlwaysFailingProvider {
+    fn name(&self) -> &'static str {
+        "always-failing"
+    }
+
+    fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        Box::pin(async move {
+            *self.requests.lock().expect("request count") += 1;
+            Err(retryable_api_error("rate limited until exhausted"))
+        })
     }
 }
 

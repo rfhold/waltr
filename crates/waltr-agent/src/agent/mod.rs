@@ -7,12 +7,14 @@ use crate::{LlmStream, ModelCost, ModelRef, PermissionPolicy, middleware::chain:
 mod builder;
 mod event;
 mod r#loop;
+mod retry;
 mod run;
 pub mod session;
 mod tool;
 
 pub use builder::AgentRuntimeBuilder;
 pub use event::BoxAgentTimelineStream;
+pub use retry::ProviderRetryConfig;
 pub use run::AgentRunBuilder;
 pub use session::{
     AgentSession, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
@@ -42,6 +44,7 @@ pub struct AgentRuntime {
     pub(super) tools: Vec<AgentTool>,
     pub(super) middleware_chain: MiddlewareChain,
     pub(super) permission_policy: PermissionPolicy,
+    pub(super) retry_config: ProviderRetryConfig,
 }
 
 impl AgentRuntime {

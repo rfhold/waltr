@@ -153,6 +153,7 @@ const fn timeline_status_to_proto(status: TimelineStatus) -> ProtoTimelineStatus
         TimelineStatus::Idle => ProtoTimelineStatus::Idle,
         TimelineStatus::BuildingRequest => ProtoTimelineStatus::BuildingRequest,
         TimelineStatus::StreamingProvider => ProtoTimelineStatus::StreamingProvider,
+        TimelineStatus::RetryingProvider => ProtoTimelineStatus::RetryingProvider,
         TimelineStatus::EvaluatingToolCall => ProtoTimelineStatus::EvaluatingToolCall,
         TimelineStatus::RunningTool => ProtoTimelineStatus::RunningTool,
         TimelineStatus::Pending => ProtoTimelineStatus::Pending,
