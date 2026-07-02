@@ -35,6 +35,8 @@ pub struct ToolExecutionContext {
     call: ToolCall,
     progress: ToolProgressSink,
     cancellation_token: CancellationToken,
+    session_id: Option<SessionId>,
+    turn: Option<u64>,
 }
 
 impl ToolExecutionContext {
@@ -61,7 +63,17 @@ impl ToolExecutionContext {
             call,
             progress,
             cancellation_token,
+            session_id: None,
+            turn: None,
         }
+    }
+
+    /// Attach parent session metadata to this invocation.
+    #[must_use]
+    pub fn with_session_context(mut self, session_id: SessionId, turn: u64) -> Self {
+        self.session_id = Some(session_id);
+        self.turn = Some(turn);
+        self
     }
 
     /// Return the provider tool call.
@@ -80,6 +92,18 @@ impl ToolExecutionContext {
     #[must_use]
     pub const fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
+    }
+
+    /// Return the durable parent session id, when this tool runs inside one.
+    #[must_use]
+    pub const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
+    /// Return the parent provider turn, when this tool runs inside a session.
+    #[must_use]
+    pub const fn turn(&self) -> Option<u64> {
+        self.turn
     }
 
     /// Return whether this invocation has been canceled.

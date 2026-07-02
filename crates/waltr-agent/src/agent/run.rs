@@ -59,6 +59,7 @@ impl AgentRunBuilder {
     {
         let prompt = match &input {
             ResumeInput::Prompt(prompt) => prompt.clone(),
+            ResumeInput::Prompts(prompts) => prompts.last().cloned().unwrap_or_default(),
             ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => String::new(),
         };
         AgentRunBuilder {

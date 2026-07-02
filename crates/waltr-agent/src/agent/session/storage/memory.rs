@@ -10,7 +10,10 @@ use super::{
     sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
 };
 use crate::{
-    agent::session::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
+    agent::session::{
+        Revision, SessionId, SessionJournalEvent, SessionRecord, SessionRuntimeSettings,
+        SessionSummary,
+    },
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -92,6 +95,34 @@ impl SessionStore for MemorySessionStore {
         let store = self.clone();
         async move {
             let record = SessionRecord::with_metadata_values(id, metadata_values);
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+
+            if records.contains_key(&record.id) {
+                return Err(SessionStoreError::AlreadyExists { id: record.id });
+            }
+
+            records.insert(record.id.clone(), record.clone());
+            drop(records);
+            Ok(record)
+        }
+    }
+
+    fn create_with_runtime_settings(
+        &self,
+        id: SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        async move {
+            let record = SessionRecord::with_runtime_settings_and_metadata_values(
+                id,
+                runtime_settings,
+                metadata_values,
+            );
             let mut records = store
                 .records
                 .lock()
@@ -231,6 +262,28 @@ impl SessionStore for MemorySessionStore {
                 .get_mut(&id)
                 .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
             record.remove_metadata_value(&key);
+            let record = record.clone();
+            drop(records);
+            Ok(record)
+        }
+    }
+
+    fn set_runtime_settings(
+        &self,
+        id: &SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            let record = records
+                .get_mut(&id)
+                .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
+            record.set_runtime_settings(runtime_settings);
             let record = record.clone();
             drop(records);
             Ok(record)

@@ -20,8 +20,8 @@ use super::{SessionId, SessionSummary};
 const SESSION_LIST_CHANNEL_CAPACITY: usize = 128;
 const SESSION_TIMELINE_CHANNEL_CAPACITY: usize = 1024;
 
-/// Kind of session list change emitted by [`AgentSessions`](super::AgentSessions).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Kind of session list change emitted by [`SessionCoordinator`](super::SessionCoordinator).
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum SessionListEvent {
     /// A session was created or updated.
@@ -30,8 +30,8 @@ pub enum SessionListEvent {
     Deleted(SessionId),
 }
 
-/// A session list update emitted by [`AgentSessions`](super::AgentSessions).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A session list update emitted by [`SessionCoordinator`](super::SessionCoordinator).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SessionListUpdate {
     /// Monotonic sequence for detecting missed updates.
     pub sequence: u64,
@@ -76,7 +76,7 @@ pub(crate) struct SessionListBroadcaster {
     sender: broadcast::Sender<SessionListUpdate>,
 }
 
-/// A timeline update emitted by [`AgentSessions`](super::AgentSessions).
+/// A timeline update emitted by [`SessionCoordinator`](super::SessionCoordinator).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTimelineUpdate {
     /// Monotonic sequence for detecting missed live updates.

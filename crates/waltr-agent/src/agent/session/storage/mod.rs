@@ -24,7 +24,10 @@ use crate::timeline::{
 };
 use serde_json::Value;
 
-use super::types::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary};
+use super::{
+    SessionRuntimeSettings,
+    types::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
+};
 
 /// Result type returned by session stores.
 pub type SessionStoreResult<T> = Result<T, SessionStoreError>;
@@ -134,6 +137,14 @@ pub trait SessionStore: Send + Sync {
         metadata_values: BTreeMap<String, Value>,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
+    /// Create a new session record with initial runtime settings and metadata values.
+    fn create_with_runtime_settings(
+        &self,
+        id: SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
+
     /// Load a session record.
     fn load(
         &self,
@@ -175,6 +186,13 @@ pub trait SessionStore: Send + Sync {
         &self,
         id: &SessionId,
         key: String,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
+
+    /// Set runtime settings and return the updated record.
+    fn set_runtime_settings(
+        &self,
+        id: &SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
     /// Read timeline events using a bounded store-neutral query.

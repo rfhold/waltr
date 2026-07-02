@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use super::runtime_config::{runtime_config_from_summary, runtime_config_to_proto};
+use super::runtime_config::runtime_config_to_proto;
 use waltr::grpc::waltr::{
     config::v1::Configuration,
     session::v1::{
@@ -20,7 +20,8 @@ pub(super) fn session_summary_to_proto(
     summary: SessionSummary,
     config: &Configuration,
 ) -> ProtoSessionSummary {
-    let runtime_config = runtime_config_from_summary(&summary)
+    let runtime_config = summary
+        .runtime_settings
         .map(|runtime_config| runtime_config_to_proto(runtime_config, config));
     ProtoSessionSummary {
         id: summary.id.as_str().to_owned(),

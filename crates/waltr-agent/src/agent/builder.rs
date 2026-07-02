@@ -17,6 +17,7 @@ use crate::{
         filesystem::FilesystemConfig,
         question::QuestionConfig,
         skills::{SkillDefinition, SkillsConfig},
+        task::TaskConfig,
     },
 };
 
@@ -25,7 +26,7 @@ use crate::{
     middleware::claims::ShellClaimsMiddleware, prompt::ShellPromptConfig, tools::shell::ShellConfig,
 };
 
-use super::{AgentRuntime, AgentTool};
+use super::{AgentRuntime, AgentTool, SessionStore};
 
 /// Builder for an agent runtime configuration.
 #[derive(Clone)]
@@ -180,6 +181,18 @@ impl AgentRuntimeBuilder {
         self.tools.push(config.into_agent_tool());
         self.middleware_chain
             .push(crate::middleware::question_suspension::QuestionSuspensionMiddleware);
+        self
+    }
+
+    /// Opt into the subagent task tool.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn with_task_tool<S>(mut self, config: TaskConfig<S>) -> Self
+    where
+        S: SessionStore + Clone + Send + Sync + 'static,
+    {
+        self.middleware_chain.push(config.visibility_middleware());
+        self.tools.push(config.into_agent_tool());
         self
     }
 

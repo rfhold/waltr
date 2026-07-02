@@ -1,8 +1,11 @@
 //! Session service coordination.
 
-use crate::{auth::FileCredentialStore, config::ConfigHandle};
+use crate::config::ConfigHandle;
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
-use waltr_agent::{AgentSessions, FilesystemSessionStore, MemorySessionStore, SessionStore};
+use waltr_agent::{
+    FileCredentialStore, FilesystemSessionStore, MemorySessionStore, SessionCoordinator,
+    SessionStore,
+};
 use tonic::service::RoutesBuilder;
 
 pub mod service;
@@ -10,8 +13,6 @@ pub mod storage;
 
 mod convert;
 mod error;
-mod run_manager;
-mod runtime;
 mod runtime_config;
 mod timeline_convert;
 
@@ -67,7 +68,7 @@ pub fn add_memory_service(routes: &mut RoutesBuilder, config: ConfigHandle) {
 /// Add an in-memory session service using an existing session coordinator.
 pub fn add_sessions_service<S>(
     routes: &mut RoutesBuilder,
-    sessions: AgentSessions<S>,
+    sessions: SessionCoordinator<S>,
     config: ConfigHandle,
     credential_store: FileCredentialStore,
 ) where

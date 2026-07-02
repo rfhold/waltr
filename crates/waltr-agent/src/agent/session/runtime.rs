@@ -18,8 +18,9 @@ use serde_json::Value;
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
     ExternalResponse, PendingWork, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
-    SessionListBroadcaster, SessionListEvent, SessionRecord, SessionSnapshot, SessionStatus,
-    SessionStore, SessionSummary, SessionTimelineBroadcaster, Suspension,
+    SessionListBroadcaster, SessionListEvent, SessionRecord, SessionRuntimeSettings,
+    SessionSnapshot, SessionStatus, SessionStore, SessionSummary, SessionTimelineBroadcaster,
+    Suspension,
 };
 
 /// Runtime facade for durable session resume operations.
@@ -84,6 +85,23 @@ where
             .map_err(session_store_error)
     }
 
+    /// Create a new durable session record with runtime settings and metadata values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store rejects the new record.
+    pub async fn create_session_with_runtime_settings(
+        &self,
+        id: SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> Result<SessionRecord> {
+        self.store
+            .create_with_runtime_settings(id, runtime_settings, metadata_values)
+            .await
+            .map_err(session_store_error)
+    }
+
     /// Load a durable session record.
     ///
     /// # Errors
@@ -120,6 +138,7 @@ where
         let record = self.load_session(id).await?;
         match input {
             ResumeInput::Prompt(prompt) => self.resume_prompt(record, prompt).await,
+            ResumeInput::Prompts(prompts) => self.resume_prompts(record, prompts).await,
             ResumeInput::ExternalResponse {
                 request_id,
                 response,
@@ -170,6 +189,22 @@ where
     ) -> Result<SessionRecord> {
         self.store
             .remove_metadata_value(id, key)
+            .await
+            .map_err(session_store_error)
+    }
+
+    /// Set the first-class runtime settings for a durable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
+    pub async fn set_runtime_settings(
+        &self,
+        id: &SessionId,
+        runtime_settings: Option<SessionRuntimeSettings>,
+    ) -> Result<SessionRecord> {
+        self.store
+            .set_runtime_settings(id, runtime_settings)
             .await
             .map_err(session_store_error)
     }
@@ -240,6 +275,17 @@ where
         record: SessionRecord,
         prompt: String,
     ) -> Result<RuntimeResumeOutput> {
+        self.resume_prompts(record, vec![prompt]).await
+    }
+
+    async fn resume_prompts(
+        &self,
+        record: SessionRecord,
+        prompts: Vec<String>,
+    ) -> Result<RuntimeResumeOutput> {
+        if prompts.is_empty() {
+            return Err(session_store_error("prompt batch must not be empty"));
+        }
         let snapshot = record.snapshot();
         let mut journal = Vec::new();
         let mut cancellation_timeline = Vec::new();
@@ -278,14 +324,17 @@ where
         } else {
             snapshot.turn
         };
-        let prompt_index = snapshot.prompts.len();
-        prompt_timeline.push(user_prompt_timeline_event(
-            &record.id,
-            turn,
-            prompt_index,
-            prompt.clone(),
-        ));
-        journal.push(SessionJournalEvent::PromptAppended { prompt });
+        let mut prompt_index = snapshot.prompts.len();
+        for prompt in prompts {
+            prompt_timeline.push(user_prompt_timeline_event(
+                &record.id,
+                turn,
+                prompt_index,
+                prompt.clone(),
+            ));
+            journal.push(SessionJournalEvent::PromptAppended { prompt });
+            prompt_index += 1;
+        }
 
         let mut record = if cancellation_timeline.is_empty() {
             record
@@ -496,7 +545,7 @@ where
 }
 
 /// Result of applying a runtime resume operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeResumeOutput {
     /// Runtime accepted input and can continue building a provider request.
     Resumed { record: SessionRecord },

@@ -131,25 +131,6 @@ pub async fn complete_manual(
     .await
 }
 
-/// Refresh an OAuth credential with a provider definition.
-pub async fn refresh(
-    definition: &OAuthProvider,
-    credential: &OAuthCredential,
-) -> Result<OAuthCredential, Status> {
-    validate_definition(definition)?;
-    let mut next = request_token(
-        definition,
-        TokenRequest::Refresh {
-            refresh_token: &credential.refresh,
-        },
-    )
-    .await?;
-    if next.refresh.is_empty() {
-        next.refresh.clone_from(&credential.refresh);
-    }
-    Ok(next)
-}
-
 async fn exchange_code(
     definition: &OAuthProvider,
     code: &str,
@@ -172,9 +153,6 @@ enum TokenRequest<'a> {
         code: &'a str,
         verifier: &'a str,
         state: &'a str,
-    },
-    Refresh {
-        refresh_token: &'a str,
     },
 }
 
@@ -215,11 +193,6 @@ fn token_request_pairs<'a>(
             }
             pairs
         }
-        TokenRequest::Refresh { refresh_token } => vec![
-            ("grant_type", "refresh_token"),
-            ("client_id", definition.client_id.as_str()),
-            ("refresh_token", refresh_token),
-        ],
     }
 }
 
