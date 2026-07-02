@@ -157,6 +157,45 @@ async fn create_session_manual_runtime_config_wins_over_defaults()
 }
 
 #[tokio::test]
+async fn create_session_preserves_unresolved_header_templates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let mut config = config_with_defaults();
+    config
+        .providers
+        .get_mut("anthropic")
+        .expect("anthropic provider should exist")
+        .headers
+        .insert(
+            "Authorization".to_owned(),
+            "Bearer ${env:WALTR_SERVER_TEST_UNSET_PROVIDER_TOKEN}".to_owned(),
+        );
+    config_service
+        .store()
+        .save(config)
+        .await
+        .expect("config should save");
+    let server = setup_server_with_services(config_service);
+    wait_for_config_handle().await;
+    let mut client = session_client(server).await?;
+
+    let session = client
+        .create_session(CreateSessionRequest::default())
+        .await?
+        .into_inner()
+        .session
+        .expect("created session should be present");
+
+    assert_anthropic_runtime(
+        session
+            .runtime_config
+            .expect("runtime config should be set"),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn std::error::Error>>
 {
     let config_service = ConfigService::new(temp_root()).expect("config service should start");

@@ -28,6 +28,8 @@ mod session_storage;
 #[cfg(feature = "shell")]
 #[path = "live/agent/shell.rs"]
 mod shell;
+#[path = "live/agent/task.rs"]
+mod task;
 #[path = "live/agent/timeline.rs"]
 mod timeline;
 

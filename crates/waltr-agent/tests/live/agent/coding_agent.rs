@@ -4,10 +4,11 @@ use std::{env, fmt::Write, fs, path::PathBuf, sync::Arc};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, AgentSessions, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST,
-    CHANNEL_TOOL_RESULT, ExternalRequest, ExternalRequestKind, ExternalResponse, LlmError,
-    LlmStream, MemorySessionStore, ModelRef, PermissionEffect, PermissionPolicy, ResumeInput,
-    SessionId, SessionRecord, SessionStore, TimelineContent, TimelineEventKind, TimelineStatus,
+    AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT,
+    ExternalRequest, ExternalRequestKind, ExternalResponse, LlmError, LlmStream,
+    MemorySessionStore, ModelRef, PermissionEffect, PermissionPolicy, ResumeInput,
+    SessionCoordinator, SessionId, SessionRecord, SessionStore, TimelineContent, TimelineEventKind,
+    TimelineStatus,
     tools::{
         filesystem::{FilesystemConfig, FilesystemToolProfile},
         filesystem_skills::SkillsConfig,
@@ -56,7 +57,7 @@ async fn run_live_coding_agent(
         .with_skills(SkillsConfig::new(fixture.root.path()))
         .with_question_tool(QuestionConfig::new())
         .build();
-    let sessions = AgentSessions::new(store.clone());
+    let sessions = SessionCoordinator::new(store.clone());
     let session = sessions.create().await?;
     let session_id = session.id().clone();
     let prompt = format!(
@@ -162,7 +163,7 @@ struct DurableLiveSession {
 
 impl DurableLiveSession {
     async fn run_prompt<S>(
-        sessions: &waltr_agent::AgentSessions<S>,
+        sessions: &waltr_agent::SessionCoordinator<S>,
         agent: &AgentRuntime,
         session_id: &SessionId,
         prompt: &str,
@@ -178,7 +179,7 @@ impl DurableLiveSession {
     }
 
     async fn resume<S>(
-        sessions: &waltr_agent::AgentSessions<S>,
+        sessions: &waltr_agent::SessionCoordinator<S>,
         agent: &AgentRuntime,
         session_id: &SessionId,
         input: ResumeInput,
