@@ -62,6 +62,14 @@ Common test command:
 
 `pnpm --filter @rfhold/waltr-web test`
 
+Run the production server+web container locally:
+
+`docker compose up`
+
+Run browser-level server-backed web tests against the Compose image:
+
+`pnpm test:web:integration`
+
 For the full test matrix, see [docs/testing.md](docs/testing.md).
 
 # How It Is Organized

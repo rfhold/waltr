@@ -65,6 +65,12 @@ Run web server-backed k6 tests:
 
 `pnpm test:web:integration`
 
+This builds and runs the production server+web Docker image through `docker compose` by default. The Compose `test` profile runs the pinned k6 browser image against the `waltr` service over the Compose network. Fixture-only prompt screenshots are not part of the production-image path.
+
+Run the older local server plus Vite development path for debugging and fixture-only prompt checks:
+
+`pnpm test:web:integration:dev`
+
 Run web server-backed k6 tests and validate screenshot snapshots:
 
 `pnpm test:web:screenshots`

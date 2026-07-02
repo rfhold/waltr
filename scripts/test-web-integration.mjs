@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,8 @@ const logDir = fileURLToPath(new URL("../.dev/logs", import.meta.url));
 const launchLogDir = `${logDir}/web-integration-${new Date().toISOString().replaceAll(/[:.]/g, "-")}`;
 const serverRoot = mkdtempSync(join(tmpdir(), "waltr-web-integration-"));
 const children = new Set();
+const integrationMode = process.env.WALTR_WEB_INTEGRATION_MODE ?? "compose";
+const composeProjectName = `waltr-web-integration-${process.pid}-${Date.now()}`;
 let stopping = false;
 
 const serverPort = await getFreePort();
@@ -20,6 +22,8 @@ const webUrl = `http://127.0.0.1:${webPort}`;
 const dockerWebUrl = `http://${getHostAddress()}:${webPort}`;
 const modelsDevFixture = `${repoRoot}/tests/web/k6/support/models-dev-api.fixture.json`;
 const sessionsRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/sessions-runtime-config.fixture.toml`;
+const composeModelsDevFixture = "/data/support/models-dev-api.fixture.json";
+const composeEnvFile = `${serverRoot}/compose.env`;
 const screenshotsEnabled = process.env.WALTR_WEB_SCREENSHOTS === "1";
 const screenshotsUpdate = process.env.WALTR_WEB_UPDATE_SCREENSHOTS === "1";
 const liveEnabled = process.env.WALTR_WEB_LIVE === "1";
@@ -27,17 +31,7 @@ const screenshotsDir = screenshotsEnabled
   ? `${repoRoot}/.dev/web-screenshots/current`
   : null;
 const screenshotSnapshotDir = `${repoRoot}/tests/web/k6/snapshots/screenshots`;
-const browserScripts = liveEnabled
-  ? ["tests/web/k6/sessions/session-live.browser.js"]
-  : [
-    "tests/web/k6/status/landing.browser.js",
-    "tests/web/k6/sessions/sessions.browser.js",
-    "tests/web/k6/sessions/prompts.browser.js",
-    "tests/web/k6/config/watch.browser.js",
-    "tests/web/k6/config/providers.browser.js",
-    "tests/web/k6/config/mcp.browser.js",
-    "tests/web/k6/config/defaults.browser.js",
-  ];
+const browserScripts = browserScriptsForMode(integrationMode, liveEnabled);
 
 process.once("SIGINT", () => stop(130));
 process.once("SIGTERM", () => stop(143));
@@ -45,6 +39,7 @@ process.once("SIGTERM", () => stop(143));
 mkdirSync(launchLogDir, { recursive: true });
 console.log(`web integration logs: ${launchLogDir}`);
 console.log(`web integration server root: ${serverRoot}`);
+console.log(`web integration mode: ${integrationMode}`);
 if (screenshotsDir) {
   rmSync(screenshotsDir, { force: true, recursive: true });
   mkdirSync(screenshotsDir, { recursive: true });
@@ -58,6 +53,78 @@ if (liveEnabled && process.env.WALTR_AGENT_LIVE_GATEWAY !== "1") {
 }
 
 try {
+  if (integrationMode === "dev") {
+    await startDevStack();
+  } else if (integrationMode === "compose") {
+    await startComposeStack();
+  } else {
+    throw new Error(`unknown WALTR_WEB_INTEGRATION_MODE: ${integrationMode}`);
+  }
+
+  let k6ExitCode = 0;
+
+  for (const browserScript of browserScripts) {
+    seedConfigForBrowserScript(browserScript);
+
+    k6ExitCode = integrationMode === "dev"
+      ? await runDevK6(browserScript)
+      : await runComposeK6(browserScript);
+
+    if (screenshotsDir) {
+      await fixScreenshotPermissions(screenshotsDir);
+    }
+
+    if (k6ExitCode !== 0) {
+      break;
+    }
+  }
+
+  if (screenshotsDir && k6ExitCode === 0) {
+    validateScreenshots(screenshotsDir, screenshotSnapshotDir, { update: screenshotsUpdate });
+  }
+
+  stop(k6ExitCode);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  stop(1);
+}
+
+function seedConfigForBrowserScript(browserScript) {
+  const configDir = `${serverRoot}/.waltr`;
+  const configPath = `${configDir}/waltr.toml`;
+
+  mkdirSync(configDir, { recursive: true });
+
+  if (browserScript === "tests/web/k6/sessions/sessions.browser.js") {
+    copyFileSync(sessionsRuntimeConfigFixture, configPath);
+    return;
+  }
+
+  copyFileSync(`${repoRoot}/tests/web/k6/support/empty-config.fixture.toml`, configPath);
+}
+
+function browserScriptsForMode(mode, live) {
+  if (live) {
+    return ["tests/web/k6/sessions/session-live.browser.js"];
+  }
+
+  const scripts = [
+    "tests/web/k6/status/landing.browser.js",
+    "tests/web/k6/sessions/sessions.browser.js",
+    "tests/web/k6/config/watch.browser.js",
+    "tests/web/k6/config/providers.browser.js",
+    "tests/web/k6/config/mcp.browser.js",
+    "tests/web/k6/config/defaults.browser.js",
+  ];
+
+  if (mode === "dev") {
+    scripts.splice(2, 0, "tests/web/k6/sessions/prompts.browser.js");
+  }
+
+  return scripts;
+}
+
+async function startDevStack() {
   await run("pnpm", ["--filter", "@rfhold/waltr-web", "wasm:build"]);
   await run("cargo", ["build", "-p", "waltr-server"]);
 
@@ -91,78 +158,88 @@ try {
     },
   );
   await waitForHttp(webUrl, "web");
-
-  let k6ExitCode = 0;
-
-  for (const browserScript of browserScripts) {
-    seedConfigForBrowserScript(browserScript);
-
-    const dockerArgs = [
-      "run",
-      "--rm",
-      "-v",
-      `${repoRoot}:/workspace:ro`,
-    ];
-
-    if (screenshotsDir) {
-      dockerArgs.push("-v", `${screenshotsDir}:/screenshots:rw`);
-    }
-
-    dockerArgs.push(
-      "-w",
-      "/workspace",
-      "-e",
-      `K6_BROWSER_HEADLESS=${process.env.K6_BROWSER_HEADLESS ?? "true"}`,
-      "-e",
-      `WALTR_WEB_BASE_URL=${dockerWebUrl}`,
-      "-e",
-      `WALTR_WEB_SCREENSHOTS=${process.env.WALTR_WEB_SCREENSHOTS ?? "0"}`,
-      "-e",
-      "WALTR_WEB_SCREENSHOTS_DIR=/screenshots",
-      "-e",
-      `WALTR_AGENT_LIVE_GATEWAY=${process.env.WALTR_AGENT_LIVE_GATEWAY ?? "0"}`,
-      "grafana/k6:master-with-browser",
-      "run",
-      browserScript,
-    );
-
-    k6ExitCode = await runForeground("docker", dockerArgs, {
-      env: {
-        DOCKER_BUILDKIT: process.env.DOCKER_BUILDKIT ?? "1",
-      },
-    });
-
-    if (screenshotsDir) {
-      await fixScreenshotPermissions(screenshotsDir);
-    }
-
-    if (k6ExitCode !== 0) {
-      break;
-    }
-  }
-
-  if (screenshotsDir && k6ExitCode === 0) {
-    validateScreenshots(screenshotsDir, screenshotSnapshotDir, { update: screenshotsUpdate });
-  }
-
-  stop(k6ExitCode);
-} catch (error) {
-  console.error(error instanceof Error ? error.message : error);
-  stop(1);
 }
 
-function seedConfigForBrowserScript(browserScript) {
-  const configDir = `${serverRoot}/.waltr`;
-  const configPath = `${configDir}/waltr.toml`;
+async function startComposeStack() {
+  const supportDir = `${serverRoot}/support`;
+  mkdirSync(supportDir, { recursive: true });
+  copyFileSync(modelsDevFixture, `${supportDir}/models-dev-api.fixture.json`);
+  writeFileSync(composeEnvFile, `WALTR_MODELS_DEV_PATH=${composeModelsDevFixture}\n`);
 
-  mkdirSync(configDir, { recursive: true });
+  await runCompose(["--profile", "test", "build"]);
+  await runCompose(["--profile", "test", "up", "-d", "waltr"]);
+  await waitForHttp(`${serverUrl}/health`, "server container");
+}
 
-  if (browserScript === "tests/web/k6/sessions/sessions.browser.js") {
-    copyFileSync(sessionsRuntimeConfigFixture, configPath);
-    return;
+async function runDevK6(browserScript) {
+  const dockerArgs = [
+    "run",
+    "--rm",
+    "-v",
+    `${repoRoot}:/workspace:ro`,
+  ];
+
+  if (screenshotsDir) {
+    dockerArgs.push("-v", `${screenshotsDir}:/screenshots:rw`);
   }
 
-  copyFileSync(`${repoRoot}/tests/web/k6/support/empty-config.fixture.toml`, configPath);
+  dockerArgs.push(
+    "-w",
+    "/workspace",
+    "-e",
+    `K6_BROWSER_HEADLESS=${process.env.K6_BROWSER_HEADLESS ?? "true"}`,
+    "-e",
+    `WALTR_WEB_BASE_URL=${dockerWebUrl}`,
+    "-e",
+    `WALTR_WEB_SCREENSHOTS=${process.env.WALTR_WEB_SCREENSHOTS ?? "0"}`,
+    "-e",
+    "WALTR_WEB_SCREENSHOTS_DIR=/screenshots",
+    "-e",
+    `WALTR_AGENT_LIVE_GATEWAY=${process.env.WALTR_AGENT_LIVE_GATEWAY ?? "0"}`,
+    "grafana/k6:1.3.0-with-browser",
+    "run",
+    browserScript,
+  );
+
+  return runForeground("docker", dockerArgs, {
+    env: {
+      DOCKER_BUILDKIT: process.env.DOCKER_BUILDKIT ?? "1",
+    },
+  });
+}
+
+async function runComposeK6(browserScript) {
+  return runComposeForeground(["--profile", "test", "run", "--rm", "k6", "run", browserScript]);
+}
+
+function composeEnv() {
+  return {
+    COMPOSE_PROJECT_NAME: composeProjectName,
+    DOCKER_BUILDKIT: process.env.DOCKER_BUILDKIT ?? "1",
+    COMPOSE_DOCKER_CLI_BUILD: process.env.COMPOSE_DOCKER_CLI_BUILD ?? "1",
+    WALTR_DATA_ROOT: serverRoot,
+    WALTR_COMPOSE_ENV_FILE: composeEnvFile,
+    WALTR_SERVER_WEB_PORT: String(serverPort),
+    WALTR_AUTH_PATH: "/data/auth.json",
+    WALTR_SESSION_FILESYSTEM_ROOT: "/data/sessions",
+    WALTR_SESSION_STORE: "filesystem",
+    WALTR_WEB_SCREENSHOTS: process.env.WALTR_WEB_SCREENSHOTS ?? "0",
+    WALTR_WEB_SCREENSHOTS_HOST_DIR: screenshotsDir ?? `${serverRoot}/screenshots`,
+    K6_BROWSER_HEADLESS: process.env.K6_BROWSER_HEADLESS ?? "true",
+    WALTR_AGENT_LIVE_GATEWAY: process.env.WALTR_AGENT_LIVE_GATEWAY ?? "0",
+  };
+}
+
+function composeArgs(args) {
+  return ["compose", "-f", `${repoRoot}/compose.yml`, ...args];
+}
+
+function runCompose(args) {
+  return run("docker", composeArgs(args), { env: composeEnv() });
+}
+
+function runComposeForeground(args) {
+  return runForeground("docker", composeArgs(args), { env: composeEnv() });
 }
 
 function run(command, args, options = {}) {
@@ -262,6 +339,10 @@ function stop(exitCode = 0) {
 
   stopping = true;
 
+  if (integrationMode === "compose") {
+    stopCompose();
+  }
+
   for (const child of children) {
     if (child.killed) {
       continue;
@@ -290,6 +371,14 @@ function stop(exitCode = 0) {
     rmSync(serverRoot, { force: true, recursive: true });
     process.exit(exitCode);
   }, 2_000).unref();
+}
+
+function stopCompose() {
+  spawnSync("docker", composeArgs(["--profile", "test", "down", "--volumes", "--remove-orphans"]), {
+    cwd: repoRoot,
+    env: { ...process.env, ...composeEnv() },
+    stdio: "inherit",
+  });
 }
 
 function getFreePort() {
@@ -324,6 +413,29 @@ function getHostAddress() {
 }
 
 async function fixScreenshotPermissions(screenshotsDir) {
+  if (integrationMode === "compose") {
+    const exitCode = await runComposeForeground([
+      "--profile",
+      "test",
+      "run",
+      "--rm",
+      "--user",
+      "0:0",
+      "--entrypoint",
+      "chmod",
+      "k6",
+      "-R",
+      "a+rwX",
+      "/screenshots",
+    ]);
+
+    if (exitCode !== 0) {
+      throw new Error(`failed to repair screenshot permissions in ${screenshotsDir}`);
+    }
+
+    return;
+  }
+
   const exitCode = await runForeground("docker", [
     "run",
     "--rm",
@@ -333,7 +445,7 @@ async function fixScreenshotPermissions(screenshotsDir) {
     `${screenshotsDir}:/screenshots:rw`,
     "--entrypoint",
     "chmod",
-    "grafana/k6:master-with-browser",
+    "grafana/k6:1.3.0-with-browser",
     "-R",
     "a+rwX",
     "/screenshots",

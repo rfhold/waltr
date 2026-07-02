@@ -13,6 +13,7 @@ default = []
 server = ["dep:axum", "dep:waltr-server", "dep:tracing"]
 web = ["server", "waltr-server/web"]
 default-server = ["server"]
+bundled-server = ["server", "default-server"]
 bundled = ["web", "default-server"]
 
 [dependencies]
