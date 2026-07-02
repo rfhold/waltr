@@ -150,6 +150,10 @@ impl AnthropicParser {
             Some("error") => Err(LlmError::Api {
                 provider: PROVIDER,
                 message: anthropic_error_message(value),
+                status: None,
+                headers: Vec::new(),
+                code: anthropic_error_code(value),
+                body: Some(value.to_string()),
             }),
             _ => Ok(None),
         }
@@ -192,6 +196,14 @@ fn anthropic_error_message(value: &Value) -> String {
         (None, Some(message)) => message,
         _ => error.to_string(),
     }
+}
+
+fn anthropic_error_code(value: &Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

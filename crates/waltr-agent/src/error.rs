@@ -29,6 +29,14 @@ pub enum LlmError {
         provider: &'static str,
         /// Provider error message.
         message: String,
+        /// HTTP status code, when the error came from an HTTP response.
+        status: Option<u16>,
+        /// Response headers captured from the provider.
+        headers: Vec<(String, String)>,
+        /// Provider-specific machine-readable error code or type.
+        code: Option<String>,
+        /// Raw response body or event payload, when available.
+        body: Option<String>,
     },
     /// The provider returned an unsupported or unexpected event.
     Protocol {
@@ -48,7 +56,11 @@ impl fmt::Display for LlmError {
             Self::Request(error) => write!(formatter, "request error: {error}"),
             Self::Json(error) => write!(formatter, "json error: {error}"),
             Self::Io(error) => write!(formatter, "io error: {error}"),
-            Self::Api { provider, message } => write!(formatter, "{provider} api error: {message}"),
+            Self::Api {
+                provider, message, ..
+            } => {
+                write!(formatter, "{provider} api error: {message}")
+            }
             Self::Protocol { provider, message } => {
                 write!(formatter, "{provider} protocol error: {message}")
             }
@@ -65,6 +77,21 @@ impl Error for LlmError {
             Self::Json(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::MissingConfig { .. } | Self::Api { .. } | Self::Protocol { .. } => None,
+        }
+    }
+}
+
+impl LlmError {
+    /// Construct a provider API error without transport metadata.
+    #[must_use]
+    pub fn api(provider: &'static str, message: impl Into<String>) -> Self {
+        Self::Api {
+            provider,
+            message: message.into(),
+            status: None,
+            headers: Vec::new(),
+            code: None,
+            body: None,
         }
     }
 }

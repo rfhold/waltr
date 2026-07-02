@@ -50,9 +50,15 @@ pub(super) async fn stream_openai_http(
     span.record("http_response_status_code", status.as_u16());
     if !status.is_success() {
         tracing::warn!(status = status.as_u16(), "provider http request failed");
+        let headers = response_headers(response.headers());
+        let text = response.text().await?;
         return Err(LlmError::Api {
             provider,
-            message: response.text().await?,
+            message: text.clone(),
+            status: Some(status.as_u16()),
+            headers,
+            code: openai_error_code_from_text(&text),
+            body: Some(text),
         });
     }
     span.in_scope(|| tracing::debug!(status = status.as_u16(), "provider http stream opened"));
@@ -278,5 +284,34 @@ pub(super) fn api_error(provider: &'static str, value: &Value) -> LlmError {
         message: value["message"]
             .as_str()
             .map_or_else(|| value.to_string(), ToOwned::to_owned),
+        status: None,
+        headers: Vec::new(),
+        code: value["code"]
+            .as_str()
+            .or_else(|| value["type"].as_str())
+            .map(str::to_owned),
+        body: Some(value.to_string()),
     }
+}
+
+fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn openai_error_code_from_text(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text).ok().and_then(|value| {
+        let error = value.get("error").unwrap_or(&value);
+        error["code"]
+            .as_str()
+            .or_else(|| error["type"].as_str())
+            .map(str::to_owned)
+    })
 }
