@@ -27,8 +27,8 @@ pub use agent::{
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
     SessionProviderRuntimeSettings, SessionRecord, SessionRuntimeSettings, SessionSnapshot,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential, Suspension,
-    ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
+    SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential,
+    Suspension, ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
     run_postgresql_migrations,
 };
 pub use error::{LlmError, Result};

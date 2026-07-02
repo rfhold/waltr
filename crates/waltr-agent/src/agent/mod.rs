@@ -28,8 +28,8 @@ pub use session::{
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
     SessionProviderRuntimeSettings, SessionRecord, SessionRuntimeSettings, SessionSnapshot,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential, Suspension,
-    opendal_postgresql_session_store, run_postgresql_migrations,
+    SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential,
+    Suspension, opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 
@@ -100,7 +100,8 @@ mod tests {
         AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
         CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse,
         MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionJournalEvent,
-        SessionStore, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery, ToolCall,
+        SessionStore, SessionTimelineEvent, TimelineChannel, TimelineContent, TimelineEventKind,
+        TimelineQuery, ToolCall,
         middleware::{
             AgentMiddleware, HookOutcome,
             chain::MiddlewareChain,
@@ -294,7 +295,9 @@ mod tests {
                 .await
                 .expect("timeline update timeout")
                 .expect("timeline update");
-            watched.push(update.event);
+            if let SessionTimelineEvent::Event(event) = update.event {
+                watched.push(event);
+            }
         }
 
         assert!(watched.iter().any(|event| {

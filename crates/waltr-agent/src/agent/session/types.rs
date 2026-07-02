@@ -12,7 +12,7 @@ use crate::{
     ToolResult, TurnItem,
     timeline::{
         AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, TimelineContent,
-        TimelineEventKind, TimelineStatus,
+        TimelineCursor, TimelineEventKind, TimelineStatus,
     },
 };
 
@@ -408,6 +408,30 @@ impl SessionRecord {
 
     /// Timeline events stored in journal order.
     pub fn timeline_events(&self) -> impl Iterator<Item = &AgentTimelineEvent> {
+        self.effective_journal_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionJournalEvent::Timeline(event) => Some(event),
+                SessionJournalEvent::PromptAppended { .. }
+                | SessionJournalEvent::ProviderRequestRecorded { .. }
+                | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
+                | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
+                | SessionJournalEvent::MiddlewareStateUpdated { .. }
+                | SessionJournalEvent::ExternalRequestResponded { .. }
+                | SessionJournalEvent::ExternalRequestCanceled { .. }
+                | SessionJournalEvent::Suspended { .. }
+                | SessionJournalEvent::WorkCanceled { .. }
+                | SessionJournalEvent::Interrupted
+                | SessionJournalEvent::TurnInterrupted { .. }
+                | SessionJournalEvent::TurnFinished { .. }
+                | SessionJournalEvent::Rollback { .. }
+                | SessionJournalEvent::Finished
+                | SessionJournalEvent::Failed { .. } => None,
+            })
+    }
+
+    /// Physical timeline events stored in journal order, including rolled-back history.
+    pub fn all_timeline_events(&self) -> impl Iterator<Item = &AgentTimelineEvent> {
         self.journal.iter().filter_map(|event| match event {
             SessionJournalEvent::Timeline(event) => Some(event),
             SessionJournalEvent::PromptAppended { .. }
@@ -422,36 +446,58 @@ impl SessionRecord {
             | SessionJournalEvent::Interrupted
             | SessionJournalEvent::TurnInterrupted { .. }
             | SessionJournalEvent::TurnFinished { .. }
+            | SessionJournalEvent::Rollback { .. }
             | SessionJournalEvent::Finished
             | SessionJournalEvent::Failed { .. } => None,
         })
+    }
+
+    /// Journal events visible after applying append-only rollback barriers.
+    pub fn effective_journal_events(&self) -> Vec<&SessionJournalEvent> {
+        let mut events: Vec<(usize, &SessionJournalEvent)> = Vec::new();
+        for (index, event) in self.journal.iter().enumerate() {
+            match event {
+                SessionJournalEvent::Rollback { target } => {
+                    let keep = usize::try_from(target.journal_len).unwrap_or(usize::MAX);
+                    events.retain(|(event_index, _)| *event_index < keep);
+                    if let Some(prompt_index) = target.remove_prompt_index {
+                        remove_prompt_appended(&mut events, prompt_index);
+                    }
+                }
+                _ => events.push((index, event)),
+            }
+        }
+        events.into_iter().map(|(_, event)| event).collect()
     }
 
     /// Last assigned timeline cursor, if any.
     #[must_use]
     pub fn last_timeline_cursor(&self) -> Option<crate::timeline::TimelineCursor> {
-        self.timeline_events().last().map(|event| event.cursor)
+        self.all_timeline_events().last().map(|event| event.cursor)
     }
 
     /// Provider request records stored in journal order.
     pub fn provider_requests(&self) -> impl Iterator<Item = &RequestRecord> {
-        self.journal.iter().filter_map(|event| match event {
-            SessionJournalEvent::ProviderRequestRecorded { request } => Some(request),
-            SessionJournalEvent::Timeline(_)
-            | SessionJournalEvent::PromptAppended { .. }
-            | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
-            | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
-            | SessionJournalEvent::MiddlewareStateUpdated { .. }
-            | SessionJournalEvent::ExternalRequestResponded { .. }
-            | SessionJournalEvent::ExternalRequestCanceled { .. }
-            | SessionJournalEvent::Suspended { .. }
-            | SessionJournalEvent::WorkCanceled { .. }
-            | SessionJournalEvent::Interrupted
-            | SessionJournalEvent::TurnInterrupted { .. }
-            | SessionJournalEvent::TurnFinished { .. }
-            | SessionJournalEvent::Finished
-            | SessionJournalEvent::Failed { .. } => None,
-        })
+        self.effective_journal_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionJournalEvent::ProviderRequestRecorded { request } => Some(request),
+                SessionJournalEvent::Timeline(_)
+                | SessionJournalEvent::PromptAppended { .. }
+                | SessionJournalEvent::ProviderThinkingBlockRecorded { .. }
+                | SessionJournalEvent::ProviderTurnMetadataRecorded { .. }
+                | SessionJournalEvent::MiddlewareStateUpdated { .. }
+                | SessionJournalEvent::ExternalRequestResponded { .. }
+                | SessionJournalEvent::ExternalRequestCanceled { .. }
+                | SessionJournalEvent::Suspended { .. }
+                | SessionJournalEvent::WorkCanceled { .. }
+                | SessionJournalEvent::Interrupted
+                | SessionJournalEvent::TurnInterrupted { .. }
+                | SessionJournalEvent::TurnFinished { .. }
+                | SessionJournalEvent::Rollback { .. }
+                | SessionJournalEvent::Finished
+                | SessionJournalEvent::Failed { .. } => None,
+            })
     }
 }
 
@@ -507,7 +553,20 @@ impl SessionSnapshot {
     #[must_use]
     pub fn from_journal(id: SessionId, journal: &[SessionJournalEvent]) -> Self {
         let mut snapshot = Self::new(id);
-        snapshot.apply_events(journal);
+        let mut events: Vec<(usize, &SessionJournalEvent)> = Vec::new();
+        for (index, event) in journal.iter().enumerate() {
+            match event {
+                SessionJournalEvent::Rollback { target } => {
+                    let keep = usize::try_from(target.journal_len).unwrap_or(usize::MAX);
+                    events.retain(|(event_index, _)| *event_index < keep);
+                    if let Some(prompt_index) = target.remove_prompt_index {
+                        remove_prompt_appended(&mut events, prompt_index);
+                    }
+                }
+                _ => events.push((index, event)),
+            }
+        }
+        snapshot.apply_events(events.into_iter().map(|(_, event)| event));
         snapshot
     }
 
@@ -599,6 +658,7 @@ impl SessionSnapshot {
                 self.turn = self.turn.max(turn + 1);
                 self.status = SessionStatus::Idle;
             }
+            SessionJournalEvent::Rollback { .. } => {}
             SessionJournalEvent::Finished => {
                 self.status = SessionStatus::Finished;
             }
@@ -855,6 +915,8 @@ pub enum SessionJournalEvent {
     TurnInterrupted { turn: u64 },
     /// Provider turn finished.
     TurnFinished { turn: u64 },
+    /// Session state was logically rolled back to an earlier checkpoint.
+    Rollback { target: SessionRollbackTarget },
     /// Session completed normally.
     Finished,
     /// Session failed.
@@ -864,6 +926,8 @@ pub enum SessionJournalEvent {
 /// Input used to resume a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResumeInput {
+    /// Continue from the existing durable checkpoint without adding input.
+    Continue,
     /// Resume with a new user prompt.
     Prompt(String),
     /// Resume with multiple adjacent user prompts.
@@ -875,6 +939,36 @@ pub enum ResumeInput {
         request_id: ExternalRequestId,
         response: ExternalResponse,
     },
+}
+
+/// Durable rollback target stored as an append-only replay barrier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRollbackTarget {
+    /// Physical journal length to keep while replaying this rollback barrier.
+    pub journal_len: u64,
+    /// Last visible timeline cursor preserved by this rollback.
+    pub after_cursor: Option<TimelineCursor>,
+    /// Next provider turn after applying the rollback.
+    pub next_turn: u64,
+    /// Prompt index to remove from the replayed journal, used when editing a user prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_prompt_index: Option<u64>,
+}
+
+fn remove_prompt_appended(events: &mut Vec<(usize, &SessionJournalEvent)>, prompt_index: u64) {
+    let mut seen = 0_u64;
+    let Some(position) = events.iter().position(|(_, event)| {
+        if matches!(event, SessionJournalEvent::PromptAppended { .. }) {
+            let matches = seen == prompt_index;
+            seen += 1;
+            matches
+        } else {
+            false
+        }
+    }) else {
+        return;
+    };
+    events.remove(position);
 }
 
 /// Durable runtime suspension.

@@ -62,6 +62,8 @@ pub enum RunConflictPolicy {
 /// Input that can start or resume a durable session run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentSessionRunInput {
+    /// Continue from the existing durable checkpoint without adding input.
+    Continue,
     /// Start or resume with a new user prompt.
     Prompt(String),
     /// Start or resume with multiple adjacent user prompts.
@@ -80,6 +82,7 @@ pub enum AgentSessionRunInput {
 impl AgentSessionRunInput {
     pub(super) fn kind(&self) -> &'static str {
         match self {
+            Self::Continue => "continue",
             Self::Prompt(_) | Self::Prompts(_) => "prompt",
             Self::ExternalResponse { .. } => "external_response",
             Self::ToolResults(_) => "tool_results",
