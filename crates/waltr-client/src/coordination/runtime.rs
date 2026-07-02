@@ -424,6 +424,10 @@ pub struct SessionSnapshot {
     pub respond_external_request: OperationSnapshot,
     /// Session interrupt operation snapshot.
     pub interrupt: OperationSnapshot,
+    /// Session rollback operation snapshot.
+    pub rollback: OperationSnapshot,
+    /// Session continue operation snapshot.
+    pub continue_session: OperationSnapshot,
     /// Session watch operation snapshot.
     pub watch: OperationSnapshot,
     /// Session timelines by session id.
@@ -1254,6 +1258,8 @@ impl ClientSnapshot {
                     &state.sessions.respond_external_request,
                 ),
                 interrupt: OperationSnapshot::from_state(&state.sessions.interrupt),
+                rollback: OperationSnapshot::from_state(&state.sessions.rollback),
+                continue_session: OperationSnapshot::from_state(&state.sessions.continue_session),
                 watch: OperationSnapshot::from_parts(
                     state.sessions.watch.status,
                     state.sessions.watch.error.clone(),

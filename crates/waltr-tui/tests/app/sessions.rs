@@ -496,6 +496,180 @@ fn sessions_detail_renders_timeline_from_snapshot() {
 }
 
 #[test]
+fn sessions_detail_click_user_message_reruns_from_cursor() {
+    let snapshot = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![timeline_text_event(42, "chat", "user_text", "try this")],
+    );
+    let mut section = open_detail_section(&snapshot);
+    let area = Rect::new(0, 0, 100, 30);
+
+    assert_eq!(
+        section.handle_detail_click(Some(&snapshot), area, 1, 0),
+        SectionAction::Continue
+    );
+    let rendered = render_section(&section, &snapshot, area);
+    assert!(rendered.contains("Message actions"));
+    assert!(rendered.contains("Rerun"));
+    assert!(rendered.contains("Cancel"));
+
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Enter), Some(&snapshot), Some(area)),
+        SectionAction::ClientCommand(ClientCommand::ContinueSessionFromCursor {
+            session_id: "chat".to_owned(),
+            cursor: 42,
+        })
+    );
+}
+
+#[test]
+fn sessions_detail_click_user_message_edits_before_cursor() {
+    let snapshot = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![timeline_text_event(43, "chat", "user_text", "rewrite me")],
+    );
+    let mut section = open_detail_section(&snapshot);
+    let area = Rect::new(0, 0, 100, 30);
+
+    assert_eq!(
+        section.handle_detail_click(Some(&snapshot), area, 1, 0),
+        SectionAction::Continue
+    );
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Down), Some(&snapshot), Some(area)),
+        SectionAction::Continue
+    );
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Enter), Some(&snapshot), Some(area)),
+        SectionAction::ClientCommand(ClientCommand::RollbackSessionBeforeCursor {
+            session_id: "chat".to_owned(),
+            cursor: 43,
+        })
+    );
+
+    let rendered = render_section(&section, &snapshot, area);
+    assert!(rendered.contains("rewrite me"));
+}
+
+#[test]
+fn sessions_detail_click_resolved_external_request_reanswers_open_cursor() {
+    let snapshot = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![
+            external_request_event(7, "chat", "request-item", "request-1", 1, "{}"),
+            resolved_external_request_event(8, "chat", "request-item"),
+        ],
+    );
+    let mut section = open_detail_section(&snapshot);
+    let area = Rect::new(0, 0, 100, 30);
+
+    assert_eq!(
+        section.handle_detail_click(Some(&snapshot), area, 1, 0),
+        SectionAction::Continue
+    );
+    let rendered = render_section(&section, &snapshot, area);
+    assert!(rendered.contains("Prompt actions"));
+    assert!(rendered.contains("Re-answer"));
+
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Enter), Some(&snapshot), Some(area)),
+        SectionAction::ClientCommand(ClientCommand::RollbackSessionToCursor {
+            session_id: "chat".to_owned(),
+            cursor: 7,
+        })
+    );
+}
+
+#[test]
+fn sessions_detail_click_turn_item_can_rollback_or_continue() {
+    let snapshot = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![timeline_metrics_event(9, "chat", 10, 5)],
+    );
+    let mut section = open_detail_section(&snapshot);
+    let area = Rect::new(0, 0, 100, 30);
+
+    assert_eq!(
+        section.handle_detail_click(Some(&snapshot), area, 1, 0),
+        SectionAction::Continue
+    );
+    let rendered = render_section(&section, &snapshot, area);
+    assert!(rendered.contains("Turn actions"));
+    assert!(rendered.contains("Roll back"));
+    assert!(rendered.contains("Continue"));
+
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Enter), Some(&snapshot), Some(area)),
+        SectionAction::ClientCommand(ClientCommand::RollbackSessionToTurn {
+            session_id: "chat".to_owned(),
+            turn: 9,
+        })
+    );
+
+    let mut section = open_detail_section(&snapshot);
+    assert_eq!(
+        section.handle_detail_click(Some(&snapshot), area, 1, 0),
+        SectionAction::Continue
+    );
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Down), Some(&snapshot), Some(area)),
+        SectionAction::Continue
+    );
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Enter), Some(&snapshot), Some(area)),
+        SectionAction::ClientCommand(ClientCommand::ContinueSessionFromTurn {
+            session_id: "chat".to_owned(),
+            turn: 9,
+        })
+    );
+}
+
+fn open_detail_section(snapshot: &ClientSnapshot) -> SessionsSection {
+    let mut section = SessionsSection::new();
+    assert_eq!(
+        section.handle_key(
+            KeyEvent::from(KeyCode::Right),
+            Some(snapshot),
+            Some(Rect::new(0, 0, 100, 30)),
+        ),
+        SectionAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest {
+            session_id: "chat".to_owned(),
+            after_cursor: None,
+            channels: timeline_channels(),
+            initial_limit: Some(64),
+        })
+    );
+    section
+}
+
+fn render_section(section: &SessionsSection, snapshot: &ClientSnapshot, area: Rect) -> String {
+    let mut terminal = test_terminal_with_size(area.width, area.height);
+    terminal
+        .draw(|frame| draw_sessions(frame, area, section, Some(snapshot)))
+        .expect("section should render");
+    terminal.backend().to_string()
+}
+
+fn resolved_external_request_event(
+    cursor: u64,
+    session_id: &str,
+    item_id: &str,
+) -> TimelineEventView {
+    TimelineEventView {
+        cursor,
+        session_id: session_id.to_owned(),
+        turn: 1,
+        item_id: item_id.to_owned(),
+        parent_id: None,
+        kind: TimelineEventKindView::ExternalRequestResolved,
+        channel: Some("external_request".to_owned()),
+        content: TimelineContentView::ExternalRequest { request: None },
+        status: Some(TimelineStatusView::Resolved),
+        metadata_json: "{}".to_owned(),
+    }
+}
+
+#[test]
 fn sessions_detail_composer_uses_latest_context_tokens() {
     let mut session = session_view("chat", 1);
     session.metrics.total_tokens = 999;

@@ -19,8 +19,9 @@ use serde_json::json;
 #[allow(unused_imports)]
 pub(crate) use super::input::{
     back_tab_press, backspace_press, char_press, ctrl_t_press, ctrl_x_press, delete_press,
-    down_press, end_press, enter_press, escape_press, home_press, left_press, page_down_press,
-    page_up_press, right_press, scroll_down, scroll_up, shift_enter_press, tab_press,
+    down_press, end_press, enter_press, escape_press, home_press, left_click, left_press,
+    page_down_press, page_up_press, right_press, scroll_down, scroll_up, shift_enter_press,
+    tab_press,
 };
 
 pub(crate) fn render_app(app: &App) -> String {
@@ -646,6 +647,16 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 key: None,
             },
             interrupt: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            rollback: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            continue_session: OperationSnapshot {
                 status: "idle",
                 error: None,
                 key: None,

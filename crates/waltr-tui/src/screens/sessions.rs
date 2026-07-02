@@ -37,8 +37,9 @@ use self::{
     },
     runtime_editor::{RuntimeEditor, RuntimeEditorKind, render_runtime_editor},
     timeline::{
-        latest_context_tokens, shell_tool_at_row, timeline_channels, timeline_lines,
-        timeline_rendered_line_count, timeline_widget,
+        TimelineClickTarget, latest_context_tokens, shell_tool_at_row, timeline_channels,
+        timeline_click_target_at_row, timeline_lines, timeline_rendered_line_count,
+        timeline_widget,
     },
 };
 
@@ -86,6 +87,68 @@ pub struct SessionsSection {
     submit: OperationTracker,
     respond: OperationTracker,
     interrupt: OperationTracker,
+    rollback: OperationTracker,
+    continue_session: OperationTracker,
+    rollback_modal: Option<RollbackModal>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RollbackModal {
+    target: RollbackModalTarget,
+    selected: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RollbackModalTarget {
+    UserMessage { cursor: u64, text: String },
+    ExternalRequest { cursor: u64, label: String },
+    Turn { turn: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RollbackModalAction {
+    Rerun,
+    Edit,
+    ReAnswer,
+    RollBack,
+    Continue,
+    Cancel,
+}
+
+impl RollbackModal {
+    fn new(target: TimelineClickTarget) -> Self {
+        let target = match target {
+            TimelineClickTarget::UserMessage { cursor, text } => {
+                RollbackModalTarget::UserMessage { cursor, text }
+            }
+            TimelineClickTarget::ExternalRequest { cursor, label } => {
+                RollbackModalTarget::ExternalRequest { cursor, label }
+            }
+            TimelineClickTarget::Turn { turn } => RollbackModalTarget::Turn { turn },
+        };
+        Self {
+            target,
+            selected: 0,
+        }
+    }
+}
+
+fn rollback_modal_actions(target: &RollbackModalTarget) -> Vec<RollbackModalAction> {
+    match target {
+        RollbackModalTarget::UserMessage { .. } => vec![
+            RollbackModalAction::Rerun,
+            RollbackModalAction::Edit,
+            RollbackModalAction::Cancel,
+        ],
+        RollbackModalTarget::ExternalRequest { .. } => {
+            vec![RollbackModalAction::ReAnswer, RollbackModalAction::Cancel]
+        }
+        RollbackModalTarget::Turn { .. } => vec![
+            RollbackModalAction::RollBack,
+            RollbackModalAction::Continue,
+            RollbackModalAction::Cancel,
+        ],
+    }
 }
 
 /// Status surfaced from the active session detail route to the global shell footer.
@@ -120,6 +183,9 @@ impl SessionsSection {
             submit: OperationTracker::new(),
             respond: OperationTracker::new(),
             interrupt: OperationTracker::new(),
+            rollback: OperationTracker::new(),
+            continue_session: OperationTracker::new(),
+            rollback_modal: None,
         }
     }
 
@@ -317,6 +383,59 @@ impl SessionsSection {
                 ),
         );
 
+        if let Some(Ok(_session_id)) =
+            self.rollback
+                .reconcile(
+                    &snapshot.sessions.rollback,
+                    snapshot,
+                    |operation| match operation {
+                        ClientOperationView::SessionRollback {
+                            status,
+                            error,
+                            session_id,
+                            ..
+                        } => Some(match *status {
+                            "ready" => OperationResult::Ready(session_id.clone()),
+                            "failed" => OperationResult::Failed(
+                                error
+                                    .as_deref()
+                                    .unwrap_or("session rollback failed")
+                                    .to_owned(),
+                            ),
+                            _ => OperationResult::Pending,
+                        }),
+                        _ => None,
+                    },
+                )
+        {
+            self.rollback_modal = None;
+        }
+
+        if let Some(Ok(_session_id)) = self.continue_session.reconcile(
+            &snapshot.sessions.continue_session,
+            snapshot,
+            |operation| match operation {
+                ClientOperationView::SessionContinue {
+                    status,
+                    error,
+                    session_id,
+                    ..
+                } => Some(match *status {
+                    "ready" => OperationResult::Ready(session_id.clone()),
+                    "failed" => OperationResult::Failed(
+                        error
+                            .as_deref()
+                            .unwrap_or("session continue failed")
+                            .to_owned(),
+                    ),
+                    _ => OperationResult::Pending,
+                }),
+                _ => None,
+            },
+        ) {
+            self.rollback_modal = None;
+        }
+
         if let Some(kind) = self.pending_runtime_editor.take() {
             match kind {
                 RuntimeEditorKind::Provider => self.open_provider_editor(Some(snapshot)),
@@ -346,6 +465,12 @@ impl SessionsSection {
 
         if self.runtime_editor.take().is_some() {
             self.runtime_update.clear_error();
+            return true;
+        }
+
+        if self.rollback_modal.take().is_some() {
+            self.rollback.clear_error();
+            self.continue_session.clear_error();
             return true;
         }
 
@@ -409,6 +534,10 @@ impl SessionsSection {
             return self.handle_runtime_editor_key(key, snapshot);
         }
 
+        if self.rollback_modal.is_some() {
+            return self.handle_rollback_modal_key(key);
+        }
+
         if let Some(id) = self.delete_session_id.clone() {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.delete_selected(&id),
@@ -459,6 +588,10 @@ impl SessionsSection {
         snapshot: Option<&ClientSnapshot>,
         area: Option<Rect>,
     ) -> SectionAction {
+        if self.rollback_modal.is_some() {
+            return self.handle_rollback_modal_key(key);
+        }
+
         if current_external_prompt(snapshot, self.detail_session_id()).is_some() {
             return self.handle_prompt_key(key, snapshot);
         }
@@ -670,6 +803,106 @@ impl SessionsSection {
         ])
     }
 
+    fn handle_rollback_modal_key(&mut self, key: KeyEvent) -> SectionAction {
+        let Some(modal) = &mut self.rollback_modal else {
+            return SectionAction::Continue;
+        };
+
+        match key.code {
+            KeyCode::Up => {
+                modal.selected = modal.selected.saturating_sub(1);
+                SectionAction::Continue
+            }
+            KeyCode::Down => {
+                let max = rollback_modal_actions(&modal.target)
+                    .len()
+                    .saturating_sub(1);
+                modal.selected = (modal.selected + 1).min(max);
+                SectionAction::Continue
+            }
+            KeyCode::Esc => {
+                self.rollback_modal = None;
+                SectionAction::Continue
+            }
+            KeyCode::Enter => self.apply_selected_rollback_modal_action(),
+            _ => SectionAction::Continue,
+        }
+    }
+
+    fn apply_selected_rollback_modal_action(&mut self) -> SectionAction {
+        let Some(modal) = self.rollback_modal.clone() else {
+            return SectionAction::Continue;
+        };
+        let action = rollback_modal_actions(&modal.target)
+            .get(modal.selected)
+            .copied()
+            .unwrap_or(RollbackModalAction::Cancel);
+        self.apply_rollback_modal_action(&modal.target, action)
+    }
+
+    fn apply_rollback_modal_action(
+        &mut self,
+        target: &RollbackModalTarget,
+        action: RollbackModalAction,
+    ) -> SectionAction {
+        let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
+            self.rollback_modal = None;
+            return SectionAction::Continue;
+        };
+
+        match (target, action) {
+            (RollbackModalTarget::UserMessage { cursor, .. }, RollbackModalAction::Rerun) => {
+                self.continue_session.begin();
+                self.rollback_modal = None;
+                SectionAction::ClientCommand(ClientCommand::ContinueSessionFromCursor {
+                    session_id,
+                    cursor: *cursor,
+                })
+            }
+            (RollbackModalTarget::UserMessage { cursor, text }, RollbackModalAction::Edit) => {
+                self.rollback.begin();
+                self.composer_draft.clone_from(text);
+                self.composer_cursor = self.composer_draft.len();
+                self.rollback_modal = None;
+                SectionAction::ClientCommand(ClientCommand::RollbackSessionBeforeCursor {
+                    session_id,
+                    cursor: *cursor,
+                })
+            }
+            (
+                RollbackModalTarget::ExternalRequest { cursor, .. },
+                RollbackModalAction::ReAnswer,
+            ) => {
+                self.rollback.begin();
+                self.rollback_modal = None;
+                SectionAction::ClientCommand(ClientCommand::RollbackSessionToCursor {
+                    session_id,
+                    cursor: *cursor,
+                })
+            }
+            (RollbackModalTarget::Turn { turn }, RollbackModalAction::RollBack) => {
+                self.rollback.begin();
+                self.rollback_modal = None;
+                SectionAction::ClientCommand(ClientCommand::RollbackSessionToTurn {
+                    session_id,
+                    turn: *turn,
+                })
+            }
+            (RollbackModalTarget::Turn { turn }, RollbackModalAction::Continue) => {
+                self.continue_session.begin();
+                self.rollback_modal = None;
+                SectionAction::ClientCommand(ClientCommand::ContinueSessionFromTurn {
+                    session_id,
+                    turn: *turn,
+                })
+            }
+            (_, RollbackModalAction::Cancel) | _ => {
+                self.rollback_modal = None;
+                SectionAction::Continue
+            }
+        }
+    }
+
     fn page_detail_up(
         &mut self,
         snapshot: Option<&ClientSnapshot>,
@@ -756,43 +989,52 @@ impl SessionsSection {
         area: Rect,
         column: u16,
         row: u16,
-    ) -> bool {
+    ) -> SectionAction {
         let Some(timeline_area) = self.detail_timeline_area(snapshot, area) else {
-            return false;
+            return SectionAction::Continue;
         };
         if column < timeline_area.x
             || column >= timeline_area.x.saturating_add(timeline_area.width)
             || row < timeline_area.y
             || row >= timeline_area.y.saturating_add(timeline_area.height)
         {
-            return false;
+            return SectionAction::Continue;
         }
 
         let Some(session_id) = self.detail_session_id() else {
-            return false;
+            return SectionAction::Continue;
         };
         let Some(timeline) =
             snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(session_id))
         else {
-            return false;
+            return SectionAction::Continue;
         };
         let visible_row = usize::from(row.saturating_sub(timeline_area.y));
         let timeline_row = self
             .detail_timeline_top_scroll(Some(timeline), timeline_area)
             .saturating_add(visible_row);
-        let Some(tool_id) = shell_tool_at_row(
+        if let Some(tool_id) = shell_tool_at_row(
             timeline,
             timeline_area.width,
             timeline_row,
             &self.expanded_shell_tools,
-        ) else {
-            return false;
-        };
-
-        if !self.expanded_shell_tools.insert(tool_id.clone()) {
-            self.expanded_shell_tools.remove(&tool_id);
+        ) {
+            if !self.expanded_shell_tools.insert(tool_id.clone()) {
+                self.expanded_shell_tools.remove(&tool_id);
+            }
+            return SectionAction::Continue;
         }
-        true
+
+        if let Some(target) = timeline_click_target_at_row(
+            timeline,
+            timeline_area.width,
+            timeline_row,
+            &self.expanded_shell_tools,
+        ) {
+            self.rollback_modal = Some(RollbackModal::new(target));
+        }
+
+        SectionAction::Continue
     }
 
     fn request_older_timeline(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
@@ -827,6 +1069,8 @@ impl SessionsSection {
             || self.submit.is_pending()
             || self.respond.is_pending()
             || self.interrupt.is_pending()
+            || self.rollback.is_pending()
+            || self.continue_session.is_pending()
     }
 
     fn reset_detail_ui(&mut self) {
@@ -841,6 +1085,9 @@ impl SessionsSection {
         self.submit.clear();
         self.respond.clear();
         self.interrupt.clear();
+        self.rollback.clear();
+        self.continue_session.clear();
+        self.rollback_modal = None;
     }
 
     fn detail_timeline_area(&self, snapshot: Option<&ClientSnapshot>, area: Rect) -> Option<Rect> {
@@ -1080,6 +1327,10 @@ impl SessionsSection {
         if self.runtime_editor.is_some() {
             render_runtime_editor(frame, area, self, snapshot);
         }
+
+        if self.rollback_modal.is_some() {
+            render_rollback_modal(frame, area, self);
+        }
     }
 
     fn detail_composer_height(&self) -> u16 {
@@ -1152,7 +1403,9 @@ fn status_height(snapshot: Option<&ClientSnapshot>, section: &SessionsSection) -
             || section.runtime_update.error().is_some()
             || section.submit.error().is_some()
             || section.respond.error().is_some()
-            || section.interrupt.error().is_some(),
+            || section.interrupt.error().is_some()
+            || section.rollback.error().is_some()
+            || section.continue_session.error().is_some(),
     )
 }
 
@@ -1202,6 +1455,110 @@ fn sessions_modal_footer_line(footer_hint: &'static str) -> Line<'static> {
 
 fn render_gap(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Block::default().style(THEME.panel_style()), area);
+}
+
+fn render_rollback_modal(frame: &mut Frame<'_>, area: Rect, section: &SessionsSection) {
+    let Some(modal) = &section.rollback_modal else {
+        return;
+    };
+
+    let modal_area = ui::centered_rect(area, 52, rollback_modal_height(modal));
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .title(rollback_modal_title(&modal.target))
+        .style(THEME.panel_style())
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    frame.render_widget(
+        Paragraph::new(rollback_modal_lines(modal))
+            .style(THEME.panel_style())
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn rollback_modal_height(modal: &RollbackModal) -> u16 {
+    let action_count = rollback_modal_actions(&modal.target).len();
+    u16::try_from(action_count.saturating_add(5)).unwrap_or(8)
+}
+
+fn rollback_modal_title(target: &RollbackModalTarget) -> &'static str {
+    match target {
+        RollbackModalTarget::UserMessage { .. } => " Message actions ",
+        RollbackModalTarget::ExternalRequest { .. } => " Prompt actions ",
+        RollbackModalTarget::Turn { .. } => " Turn actions ",
+    }
+}
+
+fn rollback_modal_lines(modal: &RollbackModal) -> Vec<Line<'static>> {
+    let mut lines = vec![rollback_modal_summary_line(&modal.target), Line::raw("")];
+    lines.extend(
+        rollback_modal_actions(&modal.target)
+            .into_iter()
+            .enumerate()
+            .map(|(index, action)| rollback_modal_action_line(action, index == modal.selected)),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "Enter select  Esc cancel",
+        THEME.panel_muted_style(),
+    )]));
+    lines
+}
+
+fn rollback_modal_summary_line(target: &RollbackModalTarget) -> Line<'static> {
+    match target {
+        RollbackModalTarget::UserMessage { text, .. } => Line::from(vec![
+            Span::styled("User message: ", THEME.panel_muted_style()),
+            Span::styled(shorten_modal_text(text), THEME.text_style()),
+        ]),
+        RollbackModalTarget::ExternalRequest { label, .. } => Line::from(vec![
+            Span::styled("Answered prompt: ", THEME.panel_muted_style()),
+            Span::styled(label.clone(), THEME.text_style()),
+        ]),
+        RollbackModalTarget::Turn { turn } => Line::from(vec![
+            Span::styled("Turn ", THEME.panel_muted_style()),
+            Span::styled(turn.to_string(), THEME.text_style()),
+        ]),
+    }
+}
+
+fn rollback_modal_action_line(action: RollbackModalAction, selected: bool) -> Line<'static> {
+    let style = if selected {
+        THEME.focus_style().add_modifier(Modifier::BOLD)
+    } else {
+        THEME.text_style()
+    };
+    let marker = if selected { "> " } else { "  " };
+    Line::from(vec![
+        Span::styled(marker, style),
+        Span::styled(rollback_modal_action_label(action), style),
+    ])
+}
+
+fn rollback_modal_action_label(action: RollbackModalAction) -> &'static str {
+    match action {
+        RollbackModalAction::Rerun => "Rerun",
+        RollbackModalAction::Edit => "Edit",
+        RollbackModalAction::ReAnswer => "Re-answer",
+        RollbackModalAction::RollBack => "Roll back",
+        RollbackModalAction::Continue => "Continue",
+        RollbackModalAction::Cancel => "Cancel",
+    }
+}
+
+fn shorten_modal_text(text: &str) -> String {
+    const MAX: usize = 48;
+    let mut chars = text.chars();
+    let shortened: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
 }
 
 fn session_error(snapshot: Option<&ClientSnapshot>) -> Option<&str> {
@@ -1535,6 +1892,8 @@ fn status_widget(
         .or_else(|| section.submit.error())
         .or_else(|| section.respond.error())
         .or_else(|| section.interrupt.error())
+        .or_else(|| section.rollback.error())
+        .or_else(|| section.continue_session.error())
         .or_else(|| detail_error(snapshot, section))
         .or_else(|| session_error(snapshot));
 
@@ -1567,6 +1926,7 @@ const fn phase_name(phase: SessionPhaseView) -> &'static str {
         SessionPhaseView::Idle => "idle",
         SessionPhaseView::BuildingRequest => "building request",
         SessionPhaseView::StreamingProvider => "streaming provider",
+        SessionPhaseView::RetryingProvider => "retrying provider",
         SessionPhaseView::EvaluatingToolCall => "evaluating tool call",
         SessionPhaseView::RunningTool => "running tool",
         SessionPhaseView::Suspended => "suspended",

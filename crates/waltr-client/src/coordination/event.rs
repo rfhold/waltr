@@ -305,14 +305,14 @@ pub enum SessionEvent {
         /// Failure returned by the rollback effect.
         error: ClientError,
     },
-    /// A caller requested continuing a session from an earlier turn.
+    /// A caller requested continuing a session from an earlier target.
     ContinueRequested {
         /// Operation key allocated when the command was requested.
         operation_key: OperationKey,
         /// Session id to continue.
         session_id: String,
-        /// Turn to continue from.
-        turn: u64,
+        /// Rollback target to continue from.
+        target: RollbackTarget,
     },
     /// Session continue request was accepted.
     Continued {
@@ -477,14 +477,14 @@ pub enum SessionEffect {
         /// Rollback target.
         target: RollbackTarget,
     },
-    /// Roll back to a turn and continue from that checkpoint.
+    /// Roll back to a target and continue from that checkpoint.
     Continue {
         /// Operation key allocated when the command was requested.
         operation_key: OperationKey,
         /// Session id to continue.
         session_id: String,
-        /// Turn to continue from.
-        turn: u64,
+        /// Rollback target to continue from.
+        target: RollbackTarget,
     },
     /// Sleep before attempting a session watch reconnect.
     SleepReconnect {

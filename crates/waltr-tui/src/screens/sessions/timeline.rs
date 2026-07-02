@@ -28,12 +28,16 @@ use super::{
 enum TimelineItemModel {
     Text {
         item_id: String,
+        cursor: u64,
+        turn: u64,
         label: &'static str,
         text: String,
         status: Option<TimelineStatusView>,
     },
     Tool {
         id: String,
+        cursor: u64,
+        turn: u64,
         name: String,
         input: Value,
         input_entries: Vec<ToolInputEntry>,
@@ -44,15 +48,30 @@ enum TimelineItemModel {
     },
     External {
         item_id: String,
+        cursor: u64,
+        open_cursor: u64,
+        turn: u64,
         request: Option<ExternalRequestView>,
         resolved: bool,
     },
-    Metrics(String),
+    Metrics {
+        text: String,
+        turn: u64,
+    },
     Event {
+        cursor: u64,
+        turn: u64,
         label: &'static str,
         text: String,
         status: Option<TimelineStatusView>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum TimelineClickTarget {
+    UserMessage { cursor: u64, text: String },
+    ExternalRequest { cursor: u64, label: String },
+    Turn { turn: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +181,51 @@ pub(super) fn shell_tool_at_row(
     row: usize,
     expanded_shell_tools: &BTreeSet<String>,
 ) -> Option<String> {
+    timeline_item_at_row(timeline, width, row, expanded_shell_tools).and_then(|item| match item {
+        TimelineItemModel::Tool { id, name, .. } if name == "shell" => Some(id),
+        _ => None,
+    })
+}
+
+pub(super) fn timeline_click_target_at_row(
+    timeline: &SessionTimelineView,
+    width: u16,
+    row: usize,
+    expanded_shell_tools: &BTreeSet<String>,
+) -> Option<TimelineClickTarget> {
+    timeline_item_at_row(timeline, width, row, expanded_shell_tools).and_then(|item| match item {
+        TimelineItemModel::Text {
+            cursor,
+            text,
+            label: "user",
+            ..
+        } => Some(TimelineClickTarget::UserMessage { cursor, text }),
+        TimelineItemModel::External {
+            open_cursor,
+            request,
+            resolved: true,
+            ..
+        } => Some(TimelineClickTarget::ExternalRequest {
+            cursor: open_cursor,
+            label: request.as_ref().map_or_else(
+                || "external request".to_owned(),
+                |request| external_request_kind_label(request.kind).to_owned(),
+            ),
+        }),
+        TimelineItemModel::Text { turn, .. }
+        | TimelineItemModel::Tool { turn, .. }
+        | TimelineItemModel::External { turn, .. }
+        | TimelineItemModel::Metrics { turn, .. }
+        | TimelineItemModel::Event { turn, .. } => Some(TimelineClickTarget::Turn { turn }),
+    })
+}
+
+fn timeline_item_at_row(
+    timeline: &SessionTimelineView,
+    width: u16,
+    row: usize,
+    expanded_shell_tools: &BTreeSet<String>,
+) -> Option<TimelineItemModel> {
     let mut offset = 0usize;
     for item in timeline_items(&timeline.events) {
         if offset > 0 {
@@ -171,15 +235,16 @@ pub(super) fn shell_tool_at_row(
             offset = offset.saturating_add(1);
         }
 
-        let shell_id = match &item {
-            TimelineItemModel::Tool { id, name, .. } if name == "shell" => Some(id.clone()),
-            _ => None,
-        };
         let mut item_lines = Vec::new();
-        append_timeline_item_lines(&mut item_lines, item, Some(width), expanded_shell_tools);
+        append_timeline_item_lines(
+            &mut item_lines,
+            item.clone(),
+            Some(width),
+            expanded_shell_tools,
+        );
         let rendered_height = wrap_timeline_lines(item_lines, width).len();
         if row >= offset && row < offset.saturating_add(rendered_height) {
-            return shell_id;
+            return Some(item);
         }
         offset = offset.saturating_add(rendered_height);
     }
@@ -255,10 +320,15 @@ fn timeline_items(events: &[TimelineEventView]) -> Vec<TimelineItemModel> {
             }
             Some("metrics") => {
                 if let Some(metrics) = metrics_line(event) {
-                    items.push(TimelineItemModel::Metrics(metrics));
+                    items.push(TimelineItemModel::Metrics {
+                        text: metrics,
+                        turn: event.turn,
+                    });
                 }
             }
             _ => items.push(TimelineItemModel::Event {
+                cursor: event.cursor,
+                turn: event.turn,
                 label: event_label(event),
                 text: event_text(event),
                 status: event.status,
@@ -301,12 +371,20 @@ fn upsert_text_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEventVie
         _ => event_text(event),
     };
 
-    if let Some(TimelineItemModel::Text { text, status, .. }) = items.iter_mut().find(|item| {
+    if let Some(TimelineItemModel::Text {
+        cursor,
+        turn,
+        text,
+        status,
+        ..
+    }) = items.iter_mut().find(|item| {
         matches!(
             item,
             TimelineItemModel::Text { item_id, .. } if item_id == &event.item_id
         )
     }) {
+        *cursor = event.cursor;
+        *turn = event.turn;
         match &event.content {
             TimelineContentView::TextSnapshot { .. } => *text = content,
             _ => text.push_str(&content),
@@ -317,6 +395,8 @@ fn upsert_text_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEventVie
 
     items.push(TimelineItemModel::Text {
         item_id: event.item_id.clone(),
+        cursor: event.cursor,
+        turn: event.turn,
         label,
         text: content,
         status: event.status,
@@ -335,6 +415,8 @@ fn upsert_tool_call_item(
     } = &event.content
     else {
         items.push(TimelineItemModel::Event {
+            cursor: event.cursor,
+            turn: event.turn,
             label: event_label(event),
             text: event_text(event),
             status: event.status,
@@ -347,6 +429,8 @@ fn upsert_tool_call_item(
     let input_entries = top_level_input_entries(&input);
 
     if let Some(TimelineItemModel::Tool {
+        cursor,
+        turn,
         name: item_name,
         input: item_input,
         input_entries: item_input_entries,
@@ -354,6 +438,8 @@ fn upsert_tool_call_item(
         ..
     }) = find_tool_item_mut(items, &id)
     {
+        *cursor = event.cursor;
+        *turn = event.turn;
         if !name.is_empty() {
             *item_name = name.clone();
         }
@@ -365,6 +451,8 @@ fn upsert_tool_call_item(
 
     items.push(TimelineItemModel::Tool {
         id,
+        cursor: event.cursor,
+        turn: event.turn,
         name: name.clone(),
         input,
         input_entries,
@@ -388,6 +476,8 @@ fn upsert_tool_result_item(
     } = &event.content
     else {
         items.push(TimelineItemModel::Event {
+            cursor: event.cursor,
+            turn: event.turn,
             label: event_label(event),
             text: event_text(event),
             status: event.status,
@@ -406,12 +496,16 @@ fn upsert_tool_result_item(
     };
 
     if let Some(TimelineItemModel::Tool {
+        cursor,
+        turn,
         name: item_name,
         result_content,
         state,
         ..
     }) = find_tool_item_mut(items, &id)
     {
+        *cursor = event.cursor;
+        *turn = event.turn;
         if !name.is_empty() {
             *item_name = name.clone();
         }
@@ -426,6 +520,8 @@ fn upsert_tool_result_item(
 
     items.push(TimelineItemModel::Tool {
         id,
+        cursor: event.cursor,
+        turn: event.turn,
         name: name.clone(),
         input: empty_json_object(),
         input_entries: Vec::new(),
@@ -483,6 +579,9 @@ fn upsert_external_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEven
         || event.status == Some(TimelineStatusView::Resolved);
 
     if let Some(TimelineItemModel::External {
+        cursor,
+        open_cursor,
+        turn,
         request: item_request,
         resolved: item_resolved,
         ..
@@ -492,6 +591,11 @@ fn upsert_external_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEven
             TimelineItemModel::External { item_id, .. } if item_id == &event.item_id
         )
     }) {
+        *cursor = event.cursor;
+        *turn = event.turn;
+        if event.kind == TimelineEventKindView::ExternalRequestOpened {
+            *open_cursor = event.cursor;
+        }
         if request.is_some() {
             *item_request = request;
         }
@@ -501,6 +605,9 @@ fn upsert_external_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEven
 
     items.push(TimelineItemModel::External {
         item_id: event.item_id.clone(),
+        cursor: event.cursor,
+        open_cursor: event.cursor,
+        turn: event.turn,
         request,
         resolved,
     });
@@ -533,6 +640,8 @@ fn append_timeline_item_lines(
         } => append_text_item_lines(lines, label, &text, status, width),
         TimelineItemModel::Tool {
             id,
+            cursor: _,
+            turn: _,
             name,
             input,
             input_entries,
@@ -567,8 +676,10 @@ fn append_timeline_item_lines(
                 Span::styled(status, THEME.muted_text_style()),
             ]));
         }
-        TimelineItemModel::Metrics(metrics) => lines.push(metrics_item_line(&metrics, width)),
+        TimelineItemModel::Metrics { text, .. } => lines.push(metrics_item_line(&text, width)),
         TimelineItemModel::Event {
+            cursor: _,
+            turn: _,
             label,
             text,
             status,
@@ -1283,6 +1394,7 @@ const fn status_name(status: TimelineStatusView) -> &'static str {
         TimelineStatusView::Idle => "idle",
         TimelineStatusView::BuildingRequest => "building request",
         TimelineStatusView::StreamingProvider => "streaming provider",
+        TimelineStatusView::RetryingProvider => "retrying provider",
         TimelineStatusView::EvaluatingToolCall => "evaluating tool call",
         TimelineStatusView::RunningTool => "running tool",
         TimelineStatusView::Pending => "pending",
