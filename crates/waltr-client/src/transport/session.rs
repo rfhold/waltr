@@ -3,11 +3,12 @@ use std::pin::Pin;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use waltr::grpc::waltr::session::v1::{
-    CreateSessionRequest, DeleteSessionRequest, GetTimelineRequest, InterruptSessionRequest,
-    ListSessionsRequest, RespondExternalRequestRequest, SessionRuntimeConfigRequest,
-    SessionSummary, SubmitUserMessageRequest, TimelineEvent, TimelineQuery,
+    ContinueSessionRequest, CreateSessionRequest, DeleteSessionRequest, GetTimelineRequest,
+    InterruptSessionRequest, ListSessionsRequest, RespondExternalRequestRequest,
+    RollbackSessionRequest, RollbackTarget, SessionRuntimeConfigRequest, SessionSummary,
+    SubmitUserMessageRequest, TimelineEvent, TimelineQuery, TimelineTruncation,
     UpdateSessionRuntimeConfigRequest, WatchSessionsRequest, WatchSessionsResponse,
-    WatchTimelineRequest, WatchTimelineResponse, watch_sessions_response,
+    WatchTimelineRequest, WatchTimelineResponse, watch_sessions_response, watch_timeline_response,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
@@ -47,8 +48,18 @@ pub enum SessionWatchEvent {
 pub struct SessionTimelineWatchUpdate {
     /// Monotonic server-side watch sequence.
     pub sequence: u64,
+    /// Timeline watch update payload.
+    pub event: SessionTimelineWatchEvent,
+}
+
+/// Internal timeline watch event from the transport layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum SessionTimelineWatchEvent {
     /// Persisted timeline event.
-    pub event: TimelineEvent,
+    Event(TimelineEvent),
+    /// Visible timeline events after this cursor were removed.
+    Truncated(TimelineTruncation),
 }
 
 pub(super) async fn create_session<T>(transport: &T) -> Result<SessionSummary, ClientError>
@@ -230,7 +241,7 @@ where
         .into_inner()
         .filter_map(|response| async {
             match response {
-                Ok(response) if response.event.is_none() => None,
+                Ok(response) if response.update.is_none() => None,
                 Ok(response) => {
                     Some(timeline_watch_update(response).map_err(|error| status_error(&error)))
                 }
@@ -239,6 +250,65 @@ where
         });
 
     Ok(Box::pin(stream))
+}
+
+pub(super) async fn rollback_session<T>(
+    transport: &T,
+    session_id: String,
+    target: RollbackTarget,
+) -> Result<SessionSummary, ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    let response = transport
+        .session_client()
+        .await?
+        .rollback_session(RollbackSessionRequest {
+            session_id,
+            target: Some(target),
+        })
+        .await
+        .map_err(|error| status_error(&error))?
+        .into_inner();
+
+    response.session.ok_or_else(|| {
+        status_error(&tonic::Status::data_loss(
+            "rollback session response missing session",
+        ))
+    })
+}
+
+pub(super) async fn continue_session<T>(
+    transport: &T,
+    session_id: String,
+    target: RollbackTarget,
+) -> Result<(), ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    transport
+        .session_client()
+        .await?
+        .continue_session(ContinueSessionRequest {
+            session_id,
+            target: Some(target),
+        })
+        .await
+        .map_err(|error| status_error(&error))?;
+
+    Ok(())
 }
 
 pub(super) async fn submit_user_message<T>(
@@ -344,9 +414,19 @@ fn session_watch_update(
 fn timeline_watch_update(
     response: WatchTimelineResponse,
 ) -> Result<SessionTimelineWatchUpdate, tonic::Status> {
-    let event = response
-        .event
-        .ok_or_else(|| tonic::Status::data_loss("timeline watch response missing event"))?;
+    let event = match response.update {
+        Some(watch_timeline_response::Update::Event(event)) => {
+            SessionTimelineWatchEvent::Event(event)
+        }
+        Some(watch_timeline_response::Update::Truncation(truncation)) => {
+            SessionTimelineWatchEvent::Truncated(truncation)
+        }
+        None => {
+            return Err(tonic::Status::data_loss(
+                "timeline watch response missing update",
+            ));
+        }
+    };
 
     Ok(SessionTimelineWatchUpdate {
         sequence: response.sequence,

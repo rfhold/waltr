@@ -237,6 +237,63 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             state.set_session_interrupt_failed(operation_key, session_id, error.to_string());
             ClientUpdate::default()
         }
+        SessionEvent::RollbackRequested {
+            operation_key,
+            session_id,
+            target,
+        } => {
+            state.set_session_rollback_loading(operation_key.clone(), session_id.clone());
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Rollback {
+                operation_key,
+                session_id,
+                target,
+            }))
+        }
+        SessionEvent::RolledBack {
+            operation_key,
+            session,
+        } => {
+            let session_id = operation_session_id(state, &operation_key);
+            state.set_session_rollback_ready(operation_key, session_id, session);
+            ClientUpdate::default()
+        }
+        SessionEvent::RollbackFailed {
+            operation_key,
+            error,
+        } => {
+            let session_id = operation_session_id(state, &operation_key);
+            state.set_session_rollback_failed(operation_key, session_id, error.to_string());
+            ClientUpdate::default()
+        }
+        SessionEvent::ContinueRequested {
+            operation_key,
+            session_id,
+            target,
+        } => {
+            state.set_session_continue_loading(
+                operation_key.clone(),
+                session_id.clone(),
+                target.clone(),
+            );
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Continue {
+                operation_key,
+                session_id,
+                target,
+            }))
+        }
+        SessionEvent::Continued { operation_key } => {
+            let (session_id, target) = operation_session_and_target(state, &operation_key);
+            state.set_session_continue_ready(operation_key, session_id, target);
+            ClientUpdate::default()
+        }
+        SessionEvent::ContinueFailed {
+            operation_key,
+            error,
+        } => {
+            let (session_id, target) = operation_session_and_target(state, &operation_key);
+            state.set_session_continue_failed(operation_key, session_id, target, error.to_string());
+            ClientUpdate::default()
+        }
     }
 }
 
@@ -345,9 +402,22 @@ fn operation_session_id(state: &ClientState, operation_key: &str) -> String {
     match state.operations.get(operation_key) {
         Some(
             crate::ClientOperationState::SessionSubmitUserMessage { session_id, .. }
-            | crate::ClientOperationState::SessionInterrupt { session_id, .. },
+            | crate::ClientOperationState::SessionInterrupt { session_id, .. }
+            | crate::ClientOperationState::SessionRollback { session_id, .. },
         ) => session_id.clone(),
         _ => String::new(),
+    }
+}
+
+fn operation_session_and_target(
+    state: &ClientState,
+    operation_key: &str,
+) -> (String, crate::RollbackTarget) {
+    match state.operations.get(operation_key) {
+        Some(crate::ClientOperationState::SessionContinue {
+            session_id, target, ..
+        }) => (session_id.clone(), target.clone()),
+        _ => (String::new(), crate::RollbackTarget { target: None }),
     }
 }
 

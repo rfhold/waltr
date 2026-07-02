@@ -18,16 +18,16 @@ use waltr::grpc::waltr::config::v1::config_service_client::ConfigServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 pub use session::{
-    SessionTimelineWatchStream, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchStream,
-    SessionWatchUpdate,
+    SessionTimelineWatchEvent, SessionTimelineWatchStream, SessionTimelineWatchUpdate,
+    SessionWatchEvent, SessionWatchStream, SessionWatchUpdate,
 };
 pub use status::StatusWatchStream;
 use tonic::Code;
 use tonic::codegen::{Body, Bytes, StdError};
 
 use crate::{
-    ClientError, ConfigPatch, Configuration, SessionRuntimeConfigRequest, SessionSummary,
-    TimelineEvent, TimelineQuery,
+    ClientError, ConfigPatch, Configuration, RollbackTarget, SessionRuntimeConfigRequest,
+    SessionSummary, TimelineEvent, TimelineQuery,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -171,6 +171,20 @@ pub trait WaltrTransport {
     fn interrupt_session(
         &self,
         session_id: String,
+    ) -> impl Future<Output = Result<(), ClientError>>;
+
+    /// Roll back a session to a turn or cursor target.
+    fn rollback_session(
+        &self,
+        session_id: String,
+        target: RollbackTarget,
+    ) -> impl Future<Output = Result<SessionSummary, ClientError>>;
+
+    /// Roll back to a target and continue from that checkpoint.
+    fn continue_session(
+        &self,
+        session_id: String,
+        target: RollbackTarget,
     ) -> impl Future<Output = Result<(), ClientError>>;
 }
 
@@ -353,6 +367,22 @@ where
 
     async fn interrupt_session(&self, session_id: String) -> Result<(), ClientError> {
         session::interrupt_session(self, session_id).await
+    }
+
+    async fn rollback_session(
+        &self,
+        session_id: String,
+        target: RollbackTarget,
+    ) -> Result<SessionSummary, ClientError> {
+        session::rollback_session(self, session_id, target).await
+    }
+
+    async fn continue_session(
+        &self,
+        session_id: String,
+        target: RollbackTarget,
+    ) -> Result<(), ClientError> {
+        session::continue_session(self, session_id, target).await
     }
 }
 

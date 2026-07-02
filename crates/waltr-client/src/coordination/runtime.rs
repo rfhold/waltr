@@ -21,9 +21,10 @@ use crate::transport::SessionTimelineWatchUpdate;
 use crate::{
     Client, ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate,
     ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey,
-    OperationStatus, ProviderView, RuntimeDefaultsView, SessionEffect, SessionEvent,
-    SessionRuntimeConfigRequest, SessionTimelineView, SessionView, StatusChangeStream,
-    StatusEffect, StatusEvent, TimelineDirection, TimelineQuery, TimelineWatchKey,
+    OperationStatus, ProviderView, RollbackTarget, RuntimeDefaultsView, SessionEffect,
+    SessionEvent, SessionRuntimeConfigRequest, SessionTimelineView, SessionView,
+    StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
+    TimelineWatchKey, rollback_target,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -169,6 +170,46 @@ pub enum ClientCommand {
         #[serde(rename = "sessionId")]
         session_id: String,
     },
+    /// Roll back a session to the end of a turn.
+    RollbackSessionToTurn {
+        /// Session id to roll back.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Turn to preserve.
+        turn: u64,
+    },
+    /// Roll back a session to a timeline cursor.
+    RollbackSessionToCursor {
+        /// Session id to roll back.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Cursor to preserve.
+        cursor: u64,
+    },
+    /// Roll back a session to immediately before a timeline cursor.
+    RollbackSessionBeforeCursor {
+        /// Session id to roll back.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Cursor to remove.
+        cursor: u64,
+    },
+    /// Roll back to a turn and continue from that checkpoint.
+    ContinueSessionFromTurn {
+        /// Session id to continue.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Turn to continue from.
+        turn: u64,
+    },
+    /// Roll back to a timeline cursor and continue from that checkpoint.
+    ContinueSessionFromCursor {
+        /// Session id to continue.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Cursor to continue from.
+        cursor: u64,
+    },
     /// Process one status watch update.
     WatchStatus,
     /// Keep watching status until the reducer observes readiness.
@@ -280,6 +321,63 @@ pub enum ClientOperationView {
         #[serde(rename = "sessionId")]
         session_id: String,
     },
+    /// Session rollback command result.
+    SessionRollback {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id rolled back.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Updated session, when the operation completed successfully.
+        session: Option<SessionView>,
+    },
+    /// Session continue command result.
+    SessionContinue {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id continued.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Rollback target continued from.
+        target: RollbackTargetView,
+    },
+}
+
+/// Stable shell-facing rollback target view.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackTargetView {
+    /// Turn target, when continuing or rolling back by turn.
+    pub turn: Option<u64>,
+    /// Timeline cursor target, when continuing or rolling back by cursor.
+    pub cursor: Option<u64>,
+}
+
+impl From<&RollbackTarget> for RollbackTargetView {
+    fn from(target: &RollbackTarget) -> Self {
+        match target.target {
+            Some(rollback_target::Target::Turn(turn)) => Self {
+                turn: Some(turn),
+                cursor: None,
+            },
+            Some(rollback_target::Target::Cursor(cursor)) => Self {
+                turn: None,
+                cursor: Some(cursor),
+            },
+            Some(rollback_target::Target::BeforeCursor(cursor)) => Self {
+                turn: None,
+                cursor: Some(cursor),
+            },
+            None => Self {
+                turn: None,
+                cursor: None,
+            },
+        }
+    }
 }
 
 /// Stable snapshot of configuration coordination state.
@@ -854,7 +952,14 @@ impl ClientStateStream {
             | ClientCommand::ReleaseSessionWatchInterest
             | ClientCommand::SubmitUserMessage { .. }
             | ClientCommand::RespondExternalRequest { .. }
-            | ClientCommand::InterruptSession { .. } => self.begin_session_command(command),
+            | ClientCommand::InterruptSession { .. }
+            | ClientCommand::RollbackSessionToTurn { .. }
+            | ClientCommand::RollbackSessionToCursor { .. }
+            | ClientCommand::RollbackSessionBeforeCursor { .. }
+            | ClientCommand::ContinueSessionFromTurn { .. }
+            | ClientCommand::ContinueSessionFromCursor { .. } => {
+                self.begin_session_command(command)
+            }
             ClientCommand::RequestSessionTimeline { .. }
             | ClientCommand::RegisterSessionTimelineWatchInterest { .. }
             | ClientCommand::ReleaseSessionTimelineWatchInterest { .. } => {
@@ -961,6 +1066,46 @@ impl ClientStateStream {
             }
             ClientCommand::InterruptSession { session_id } => {
                 self.runtime.reducer.interrupt_session(session_id)
+            }
+            ClientCommand::RollbackSessionToTurn { session_id, turn } => {
+                self.runtime.reducer.rollback_session(
+                    session_id,
+                    RollbackTarget {
+                        target: Some(rollback_target::Target::Turn(turn)),
+                    },
+                )
+            }
+            ClientCommand::RollbackSessionToCursor { session_id, cursor } => {
+                self.runtime.reducer.rollback_session(
+                    session_id,
+                    RollbackTarget {
+                        target: Some(rollback_target::Target::Cursor(cursor)),
+                    },
+                )
+            }
+            ClientCommand::RollbackSessionBeforeCursor { session_id, cursor } => {
+                self.runtime.reducer.rollback_session(
+                    session_id,
+                    RollbackTarget {
+                        target: Some(rollback_target::Target::BeforeCursor(cursor)),
+                    },
+                )
+            }
+            ClientCommand::ContinueSessionFromTurn { session_id, turn } => {
+                self.runtime.reducer.continue_session(
+                    session_id,
+                    RollbackTarget {
+                        target: Some(rollback_target::Target::Turn(turn)),
+                    },
+                )
+            }
+            ClientCommand::ContinueSessionFromCursor { session_id, cursor } => {
+                self.runtime.reducer.continue_session(
+                    session_id,
+                    RollbackTarget {
+                        target: Some(rollback_target::Target::Cursor(cursor)),
+                    },
+                )
             }
             _ => unreachable!("non-session command routed to session handler"),
         }
@@ -1200,6 +1345,28 @@ impl From<ClientOperationState> for ClientOperationView {
                 error,
                 session_id,
             },
+            ClientOperationState::SessionRollback {
+                status,
+                error,
+                session_id,
+                session,
+            } => Self::SessionRollback {
+                status: operation_status_name(status),
+                error,
+                session_id,
+                session: session.map(SessionView::from),
+            },
+            ClientOperationState::SessionContinue {
+                status,
+                error,
+                session_id,
+                target,
+            } => Self::SessionContinue {
+                status: operation_status_name(status),
+                error,
+                session_id,
+                target: RollbackTargetView::from(&target),
+            },
         }
     }
 }
@@ -1241,7 +1408,9 @@ mod tests {
     use waltr::grpc::waltr::status::v1::SystemStatus;
 
     use crate::TimelineEvent;
-    use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate};
+    use crate::transport::{
+        ConfigWatchUpdate, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
+    };
 
     #[tokio::test]
     async fn state_stream_yields_status_loading_before_transport_work() {
@@ -1330,7 +1499,7 @@ mod tests {
             Box::pin(stream::iter((1..=16).map(|cursor| {
                 Ok(SessionTimelineWatchUpdate {
                     sequence: cursor,
-                    event: timeline_event("session", cursor),
+                    event: SessionTimelineWatchEvent::Event(timeline_event("session", cursor)),
                 })
             }))),
         );
@@ -1366,7 +1535,7 @@ mod tests {
             Box::pin(stream::iter((1..=16).map(|cursor| {
                 Ok(SessionTimelineWatchUpdate {
                     sequence: cursor,
-                    event: timeline_event("session", cursor),
+                    event: SessionTimelineWatchEvent::Event(timeline_event("session", cursor)),
                 })
             }))),
         );
@@ -1375,7 +1544,7 @@ mod tests {
             Box::pin(stream::once(async {
                 Ok(SessionTimelineWatchUpdate {
                     sequence: 100,
-                    event: timeline_event("session", 100),
+                    event: SessionTimelineWatchEvent::Event(timeline_event("session", 100)),
                 })
             })),
         );

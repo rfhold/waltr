@@ -33,6 +33,7 @@ tonic-web-wasm-client.workspace = true
 [dev-dependencies]
 waltr-agent.workspace = true
 waltr-server = { workspace = true, features = ["test"] }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 
 [lints]

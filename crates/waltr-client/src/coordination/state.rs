@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::transport::SessionTimelineWatchEvent;
 use crate::{Configuration, SessionSummary, StreamId, SystemStatus, TimelineEvent};
 
 /// Runtime-local operation identifier used by shells to track command results.
@@ -110,6 +111,10 @@ pub struct SessionClientState {
     pub respond_external_request: OperationState,
     /// Session interrupt operation state.
     pub interrupt: OperationState,
+    /// Session rollback operation state.
+    pub rollback: OperationState,
+    /// Session continue operation state.
+    pub continue_session: OperationState,
     /// Session watch operation state.
     pub watch: WatchState,
     /// Timeline state by session id.
@@ -216,6 +221,28 @@ pub enum ClientOperationState {
         error: Option<String>,
         /// Session id interrupted.
         session_id: String,
+    },
+    /// Session rollback command result.
+    SessionRollback {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id rolled back.
+        session_id: String,
+        /// Updated session, when the operation completed successfully.
+        session: Option<SessionSummary>,
+    },
+    /// Session continue command result.
+    SessionContinue {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Session id continued.
+        session_id: String,
+        /// Turn continued from.
+        turn: u64,
     },
 }
 
@@ -631,12 +658,23 @@ impl ClientState {
         &mut self,
         key: &TimelineWatchKey,
         sequence: u64,
-        event: TimelineEvent,
+        event: SessionTimelineWatchEvent,
     ) {
-        let session_id = event.session_id.clone();
+        let session_id = match &event {
+            SessionTimelineWatchEvent::Event(event) => event.session_id.clone(),
+            SessionTimelineWatchEvent::Truncated(truncation) => truncation.session_id.clone(),
+        };
         let timeline = self.session_timeline_mut(&session_id);
         timeline.last_sequence = sequence;
-        timeline.events.insert(event.cursor, event);
+        match event {
+            SessionTimelineWatchEvent::Event(event) => {
+                timeline.events.insert(event.cursor, event);
+            }
+            SessionTimelineWatchEvent::Truncated(truncation) => {
+                let after_cursor = truncation.after_cursor.unwrap_or(0);
+                timeline.events.retain(|cursor, _| *cursor <= after_cursor);
+            }
+        }
         if let Some(watch) = timeline.watches.get_mut(key) {
             watch.status = OperationStatus::Received;
             watch.error = None;
@@ -856,6 +894,123 @@ impl ClientState {
                 status: OperationStatus::Failed,
                 error: Some(message),
                 session_id,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_rollback_loading(&mut self, key: OperationKey, session_id: String) {
+        self.sessions.rollback.status = OperationStatus::Loading;
+        self.sessions.rollback.error = None;
+        self.sessions.rollback.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRollback {
+                status: OperationStatus::Loading,
+                error: None,
+                session_id,
+                session: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_rollback_ready(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        session: SessionSummary,
+    ) {
+        self.sessions.rollback.status = OperationStatus::Ready;
+        self.sessions.rollback.error = None;
+        self.sessions.rollback.key = Some(key.clone());
+        self.upsert_session(session.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRollback {
+                status: OperationStatus::Ready,
+                error: None,
+                session_id,
+                session: Some(session),
+            },
+        );
+    }
+
+    pub(crate) fn set_session_rollback_failed(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        message: String,
+    ) {
+        self.sessions.rollback.status = OperationStatus::Failed;
+        self.sessions.rollback.error = Some(message.clone());
+        self.sessions.rollback.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionRollback {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session_id,
+                session: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_continue_loading(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        turn: u64,
+    ) {
+        self.sessions.continue_session.status = OperationStatus::Loading;
+        self.sessions.continue_session.error = None;
+        self.sessions.continue_session.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionContinue {
+                status: OperationStatus::Loading,
+                error: None,
+                session_id,
+                turn,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_continue_ready(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        turn: u64,
+    ) {
+        self.sessions.continue_session.status = OperationStatus::Ready;
+        self.sessions.continue_session.error = None;
+        self.sessions.continue_session.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionContinue {
+                status: OperationStatus::Ready,
+                error: None,
+                session_id,
+                turn,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_continue_failed(
+        &mut self,
+        key: OperationKey,
+        session_id: String,
+        turn: u64,
+        message: String,
+    ) {
+        self.sessions.continue_session.status = OperationStatus::Failed;
+        self.sessions.continue_session.error = Some(message.clone());
+        self.sessions.continue_session.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionContinue {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session_id,
+                turn,
             },
         );
     }
