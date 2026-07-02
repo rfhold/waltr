@@ -532,6 +532,16 @@ load: OperationSnapshot,
  */
 watch: OperationSnapshot, };
 
+export type RollbackTargetView = { 
+/**
+ * Turn target, when continuing or rolling back by turn.
+ */
+turn: bigint | null, 
+/**
+ * Timeline cursor target, when continuing or rolling back by cursor.
+ */
+cursor: bigint | null, };
+
 export type ClientOperationView = { "kind": "configPatch", 
 /**
  * Stable operation status name.
@@ -620,7 +630,39 @@ error: string | null,
 /**
  * Session id interrupted.
  */
-sessionId: string, };
+sessionId: string, } | { "kind": "sessionRollback", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Session id rolled back.
+ */
+sessionId: string, 
+/**
+ * Updated session, when the operation completed successfully.
+ */
+session: SessionView | null, } | { "kind": "sessionContinue", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Session id continued.
+ */
+sessionId: string, 
+/**
+ * Rollback target continued from.
+ */
+target: RollbackTargetView, };
 
 export type OperationCollectionSnapshot = { 
 /**
@@ -856,4 +898,44 @@ responseJson: string, } | { "type": "interruptSession",
 /**
  * Session id to interrupt.
  */
-sessionId: string, } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };
+sessionId: string, } | { "type": "rollbackSessionToTurn", 
+/**
+ * Session id to roll back.
+ */
+sessionId: string, 
+/**
+ * Turn to preserve.
+ */
+turn: bigint, } | { "type": "rollbackSessionToCursor", 
+/**
+ * Session id to roll back.
+ */
+sessionId: string, 
+/**
+ * Cursor to preserve.
+ */
+cursor: bigint, } | { "type": "rollbackSessionBeforeCursor", 
+/**
+ * Session id to roll back.
+ */
+sessionId: string, 
+/**
+ * Cursor to remove.
+ */
+cursor: bigint, } | { "type": "continueSessionFromTurn", 
+/**
+ * Session id to continue.
+ */
+sessionId: string, 
+/**
+ * Turn to continue from.
+ */
+turn: bigint, } | { "type": "continueSessionFromCursor", 
+/**
+ * Session id to continue.
+ */
+sessionId: string, 
+/**
+ * Cursor to continue from.
+ */
+cursor: bigint, } | { "type": "watchStatus" } | { "type": "waitForSystemReady" };

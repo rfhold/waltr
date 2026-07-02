@@ -348,6 +348,14 @@ function SessionDetail(props: { session: SessionView }) {
   const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[props.session.id]);
   const active = createMemo(() => sessionActive(props.session));
   const items = createMemo(() => timelineItems(timeline()));
+  const lastTurn = createMemo(() => items().reduce<bigint | undefined>((last, item) => last === undefined || item.turn > last ? item.turn : last, undefined));
+  const turnFooterItemIds = createMemo(() => {
+    const lastByTurn = new Map<string, string>();
+    for (const item of items()) {
+      lastByTurn.set(item.turn.toString(), item.id);
+    }
+    return new Set(lastByTurn.values());
+  });
   const latestMetrics = createMemo(() => latestTurnMetrics(items()));
   const testKeepMountedIndexes = createMemo(() => import.meta.env.MODE === "test" ? items().map((_, index) => index) : undefined);
   const working = createMemo(() => active() && !hasOpenExternalPrompt(items()));
@@ -613,6 +621,52 @@ function SessionDetail(props: { session: SessionView }) {
     }
   };
 
+  const rollbackTurn = async (turn: bigint) => {
+    setCommandError(undefined);
+    try {
+      await app.dispatch({ type: "rollbackSessionToTurn", sessionId: props.session.id, turn });
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to roll back session.");
+    }
+  };
+
+  const rollbackCursor = async (cursor: bigint) => {
+    setCommandError(undefined);
+    try {
+      await app.dispatch({ type: "rollbackSessionToCursor", sessionId: props.session.id, cursor });
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to roll back response.");
+    }
+  };
+
+  const continueTurn = async (turn: bigint) => {
+    setCommandError(undefined);
+    try {
+      await app.dispatch({ type: "continueSessionFromTurn", sessionId: props.session.id, turn });
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to continue session.");
+    }
+  };
+
+  const continueCursor = async (cursor: bigint) => {
+    setCommandError(undefined);
+    try {
+      await app.dispatch({ type: "continueSessionFromCursor", sessionId: props.session.id, cursor });
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to rerun message.");
+    }
+  };
+
+  const editUserMessage = async (item: TextTimelineItem) => {
+    setCommandError(undefined);
+    try {
+      await app.dispatch({ type: "rollbackSessionBeforeCursor", sessionId: props.session.id, cursor: item.cursor });
+      setDraft(item.text);
+    } catch (error) {
+      setCommandError(error instanceof Error ? error.message : "Unable to edit message.");
+    }
+  };
+
   const scrollTimelineToBottom = (scroller: HTMLElement) => {
     const scrollSize = import.meta.env.MODE === "test" ? scroller.scrollHeight : timelineVirtualizer?.scrollSize ?? scroller.scrollHeight;
     timelineVirtualizer?.scrollTo(scrollSize);
@@ -666,6 +720,13 @@ function SessionDetail(props: { session: SessionView }) {
                   onSetShellOutputExpanded={(id, expanded) => setExpandedShellOutputs((current) => ({ ...current, [id]: expanded }))}
                   onRespond={respond}
                   onInterrupt={interrupt}
+                  showTurnActions={turnFooterItemIds().has(item.id)}
+                  canRollbackTurn={lastTurn() !== undefined && item.turn < lastTurn()!}
+                  onRollbackTurn={rollbackTurn}
+                  onContinueTurn={continueTurn}
+                  onContinueCursor={continueCursor}
+                  onRollbackCursor={rollbackCursor}
+                  onEditUserMessage={editUserMessage}
                 />
               </div>
             )}
@@ -738,15 +799,28 @@ function SessionDetail(props: { session: SessionView }) {
 }
 
 type TimelineItemModel =
-  | { id: string; kind: "user" | "assistant" | "thinking"; text: string }
+  | TextTimelineItem
   | ToolTimelineItem
   | TurnMetricsTimelineItem
-  | { id: string; kind: "permission" | "question" | "prompt"; request: ExternalRequestView; resolved: boolean };
+  | ExternalPromptTimelineItem;
+
+type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string };
+type ExternalPromptTimelineItem = {
+  id: string;
+  turn: bigint;
+  cursor: bigint;
+  openCursor: bigint;
+  kind: "permission" | "question" | "prompt";
+  request: ExternalRequestView;
+  resolved: boolean;
+};
 
 type ToolInputEntry = { key: string; value: string };
 type ToolState = "loading" | "complete" | "error";
 type ToolTimelineItem = {
   id: string;
+  turn: bigint;
+  cursor: bigint;
   kind: "tool";
   name: string;
   state: ToolState;
@@ -759,6 +833,8 @@ type ToolTimelineItem = {
 
 type TurnMetricsTimelineItem = {
   id: string;
+  turn: bigint;
+  cursor: bigint;
   kind: "metrics";
   inputTokens: bigint;
   outputTokens: bigint;
@@ -805,36 +881,103 @@ function TimelineItem(props: {
   onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
   onInterrupt: () => Promise<void>;
+  showTurnActions: boolean;
+  canRollbackTurn: boolean;
+  onRollbackTurn: (turn: bigint) => Promise<void>;
+  onContinueTurn: (turn: bigint) => Promise<void>;
+  onContinueCursor: (cursor: bigint) => Promise<void>;
+  onRollbackCursor: (cursor: bigint) => Promise<void>;
+  onEditUserMessage: (item: TextTimelineItem) => Promise<void>;
 }) {
   const item = () => props.item;
 
   return (
-    <Switch>
-      <Match when={textTimelineItem(item())}>
-        {(textItem) => <TextTimelineItemView item={textItem()} />}
-      </Match>
-      <Match when={toolTimelineItem(item())}>
-        {(toolItem) => (
-          <ToolTimelineItemView
-            item={toolItem()}
-            expandedShellOutputs={props.expandedShellOutputs}
-            onSetShellOutputExpanded={props.onSetShellOutputExpanded}
-          />
-        )}
-      </Match>
-      <Match when={metricsTimelineItem(item())}>
-        {(metricsItem) => <TurnMetricsTimelineItemView item={metricsItem()} />}
-      </Match>
-      <Match when={permissionTimelineItem(item())}>
-        {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
-      </Match>
-      <Match when={questionTimelineItem(item())}>
-        {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
-      </Match>
-      <Match when={externalTimelineItem(item())}>
-        {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
-      </Match>
-    </Switch>
+    <>
+      <Switch>
+        <Match when={textTimelineItem(item())}>
+          {(textItem) => <TextTimelineItemView item={textItem()} />}
+        </Match>
+        <Match when={toolTimelineItem(item())}>
+          {(toolItem) => (
+            <ToolTimelineItemView
+              item={toolItem()}
+              expandedShellOutputs={props.expandedShellOutputs}
+              onSetShellOutputExpanded={props.onSetShellOutputExpanded}
+            />
+          )}
+        </Match>
+        <Match when={metricsTimelineItem(item())}>
+          {(metricsItem) => <TurnMetricsTimelineItemView item={metricsItem()} />}
+        </Match>
+        <Match when={permissionTimelineItem(item())}>
+          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+        </Match>
+        <Match when={questionTimelineItem(item())}>
+          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+        </Match>
+        <Match when={externalTimelineItem(item())}>
+          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+        </Match>
+      </Switch>
+      <TimelineItemActions
+        item={item()}
+        showTurnActions={props.showTurnActions}
+        canRollbackTurn={props.canRollbackTurn}
+        onRollbackTurn={props.onRollbackTurn}
+        onContinueTurn={props.onContinueTurn}
+        onContinueCursor={props.onContinueCursor}
+        onRollbackCursor={props.onRollbackCursor}
+        onEditUserMessage={props.onEditUserMessage}
+      />
+    </>
+  );
+}
+
+function TimelineItemActions(props: {
+  item: TimelineItemModel;
+  showTurnActions: boolean;
+  canRollbackTurn: boolean;
+  onRollbackTurn: (turn: bigint) => Promise<void>;
+  onContinueTurn: (turn: bigint) => Promise<void>;
+  onContinueCursor: (cursor: bigint) => Promise<void>;
+  onRollbackCursor: (cursor: bigint) => Promise<void>;
+  onEditUserMessage: (item: TextTimelineItem) => Promise<void>;
+}) {
+  const canReAnswer = () => isExternalPromptItem(props.item) && props.item.resolved && (props.item.kind === "permission" || props.item.kind === "question");
+  const userItem = () => (props.item.kind === "user" ? props.item : undefined);
+
+  return (
+    <Show when={props.showTurnActions || canReAnswer() || userItem()}>
+      <footer class="sessions__timeline-actions">
+        <Show when={userItem()}>
+          {(item) => (
+            <>
+              <button type="button" onClick={() => void props.onContinueCursor(item().cursor)}>
+                Rerun
+              </button>
+              <button type="button" onClick={() => void props.onEditUserMessage(item())}>
+                Edit
+              </button>
+            </>
+          )}
+        </Show>
+        <Show when={canReAnswer()}>
+          <button type="button" onClick={() => void props.onRollbackCursor((props.item as ExternalPromptTimelineItem).openCursor)}>
+            Re-answer
+          </button>
+        </Show>
+        <Show when={props.showTurnActions && props.canRollbackTurn}>
+          <button type="button" onClick={() => void props.onRollbackTurn(props.item.turn)}>
+            Roll back
+          </button>
+        </Show>
+        <Show when={props.showTurnActions}>
+          <button type="button" onClick={() => void props.onContinueTurn(props.item.turn)}>
+            Continue
+          </button>
+        </Show>
+      </footer>
+    </Show>
   );
 }
 
@@ -1298,7 +1441,7 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
   const textByItem = new Map<string, Extract<TimelineItemModel, { kind: "user" | "assistant" | "thinking" }>>();
   const toolById = new Map<string, ToolTimelineItem>();
   const toolIdByItemId = new Map<string, string>();
-  const externalById = new Map<string, Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>>();
+  const externalById = new Map<string, ExternalPromptTimelineItem>();
   const metricItems: TurnMetricsTimelineItem[] = [];
 
   for (const event of timeline?.events ?? []) {
@@ -1318,8 +1461,9 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
           : `${existing?.text ?? ""}${event.content.delta}`;
         if (existing) {
           existing.text = text;
+          existing.cursor = event.cursor;
         } else {
-          const item = { id: event.itemId, kind, text };
+          const item = { id: event.itemId, turn: event.turn, cursor: event.cursor, kind, text };
           textByItem.set(event.itemId, item);
           items.push(item);
         }
@@ -1328,7 +1472,7 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
       case "toolCall": {
         const id = event.content.id || event.itemId;
         toolIdByItemId.set(event.itemId, id);
-        upsertToolItem(items, toolById, id, event.content.name, "loading", parseJsonRecord(event.content.arguments_json), undefined);
+        upsertToolItem(items, toolById, id, event.turn, event.cursor, event.content.name, "loading", parseJsonRecord(event.content.arguments_json), undefined);
         break;
       }
       case "toolResult":
@@ -1336,6 +1480,8 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
           items,
           toolById,
           event.content.id || event.itemId,
+          event.turn,
+          event.cursor,
           event.content.name,
           event.content.error ? "error" : "complete",
           undefined,
@@ -1348,12 +1494,21 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
           break;
         }
 
-        upsertExternalRequestItem(items, externalById, event.itemId, request, event.kind === "externalRequestResolved" || event.status === "resolved");
+        upsertExternalRequestItem(
+          items,
+          externalById,
+          event.itemId,
+          event.turn,
+          event.cursor,
+          request,
+          event.kind === "externalRequestOpened",
+          event.kind === "externalRequestResolved" || event.status === "resolved",
+        );
         break;
       }
       case "json": {
         if (channel === "metrics") {
-          const item = turnMetricsItem(event.itemId, event.content.value_json);
+          const item = turnMetricsItem(event.itemId, event.turn, event.cursor, event.content.value_json);
           if (item) {
             metricItems.push(item);
             items.push(item);
@@ -1377,7 +1532,7 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
   return items;
 }
 
-function turnMetricsItem(id: string, valueJson: string): TurnMetricsTimelineItem | undefined {
+function turnMetricsItem(id: string, turn: bigint, cursor: bigint, valueJson: string): TurnMetricsTimelineItem | undefined {
   const payload = parseJsonRecord(valueJson);
   if (payload.kind !== "turn_metrics") {
     return undefined;
@@ -1394,6 +1549,8 @@ function turnMetricsItem(id: string, valueJson: string): TurnMetricsTimelineItem
   const contextTokens = asBigInt(usage.contextTokens) || totalInputTokens + outputTokens;
   return {
     id,
+    turn,
+    cursor,
     kind: "metrics",
     inputTokens,
     outputTokens,
@@ -1416,6 +1573,8 @@ function upsertToolItem(
   items: TimelineItemModel[],
   toolById: Map<string, ToolTimelineItem>,
   id: string,
+  turn: bigint,
+  cursor: bigint,
   name: string,
   state: ToolState,
   input: Record<string, unknown> | undefined,
@@ -1423,6 +1582,8 @@ function upsertToolItem(
 ) {
   const existing = toolById.get(id);
   if (existing) {
+    existing.turn = turn;
+    existing.cursor = cursor;
     existing.name = name || existing.name;
     existing.state = state;
     existing.input = input ?? existing.input;
@@ -1433,6 +1594,8 @@ function upsertToolItem(
 
   const item = {
     id,
+    turn,
+    cursor,
     kind: "tool" as const,
     name,
     state,
@@ -1471,19 +1634,27 @@ function appendToolProgress(
 
 function upsertExternalRequestItem(
   items: TimelineItemModel[],
-  externalById: Map<string, Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>>,
+  externalById: Map<string, ExternalPromptTimelineItem>,
   id: string,
+  turn: bigint,
+  cursor: bigint,
   request: ExternalRequestView,
+  opened: boolean,
   resolved: boolean,
 ) {
   const existing = externalById.get(id);
   if (existing) {
+    existing.turn = turn;
+    existing.cursor = cursor;
+    if (opened) {
+      existing.openCursor = cursor;
+    }
     existing.request = request;
     existing.resolved = resolved;
     return;
   }
 
-  const item = { id, kind: requestKind(request), request, resolved };
+  const item = { id, turn, cursor, openCursor: cursor, kind: requestKind(request), request, resolved };
   externalById.set(id, item);
   items.push(item);
 }
