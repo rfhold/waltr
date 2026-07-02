@@ -11,7 +11,10 @@ use ratatui::crossterm::{
     execute,
 };
 
+#[cfg(feature = "web")]
 const DEFAULT_EMBEDDED_SERVER_ADDR: &str = "127.0.0.1:14333";
+#[cfg(not(feature = "web"))]
+const DEFAULT_EMBEDDED_SERVER_ADDR: &str = "127.0.0.1:14334";
 const SERVER_ADDR_ENV: &str = "WALTR_SERVER_ADDR";
 
 #[derive(Debug)]

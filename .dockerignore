@@ -1,0 +1,7 @@
+/.dev
+/.git
+/target
+/crates/waltr-web/dist
+/crates/waltr-web/generated
+/crates/waltr-web/node_modules
+/node_modules

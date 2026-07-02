@@ -1,0 +1,38 @@
+services:
+  waltr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${WALTR_SERVER_WEB_IMAGE:-waltr-server-web:local}
+    environment:
+      WALTR_SERVER_ADDR: 0.0.0.0:14333
+      WALTR_AUTH_PATH: ${WALTR_AUTH_PATH:-/data/auth.json}
+      WALTR_SESSION_FILESYSTEM_ROOT: ${WALTR_SESSION_FILESYSTEM_ROOT:-/data/sessions}
+      WALTR_SESSION_STORE: ${WALTR_SESSION_STORE:-filesystem}
+    env_file:
+      - path: ${WALTR_COMPOSE_ENV_FILE:-./.dev/compose.env}
+        required: false
+    ports:
+      - "${WALTR_SERVER_WEB_PORT:-14333}:14333"
+    volumes:
+      - ${WALTR_DATA_ROOT:-waltr-data}:/data
+
+  k6:
+    profiles:
+      - test
+    image: grafana/k6:1.3.0-with-browser
+    depends_on:
+      - waltr
+    working_dir: /workspace
+    environment:
+      K6_BROWSER_HEADLESS: ${K6_BROWSER_HEADLESS:-true}
+      WALTR_WEB_BASE_URL: http://waltr:14333
+      WALTR_WEB_SCREENSHOTS: ${WALTR_WEB_SCREENSHOTS:-0}
+      WALTR_WEB_SCREENSHOTS_DIR: /screenshots
+      WALTR_AGENT_LIVE_GATEWAY: ${WALTR_AGENT_LIVE_GATEWAY:-0}
+    volumes:
+      - .:/workspace:ro
+      - ${WALTR_WEB_SCREENSHOTS_HOST_DIR:-/tmp/waltr-web-screenshots}:/screenshots:rw
+
+volumes:
+  waltr-data:
