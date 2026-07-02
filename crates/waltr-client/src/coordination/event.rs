@@ -2,7 +2,7 @@
 
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
-    ClientError, Configuration, OperationKey, Provider, RuntimeDefaults,
+    ClientError, Configuration, OperationKey, Provider, RollbackTarget, RuntimeDefaults,
     SessionRuntimeConfigRequest, SessionSummary, SystemStatus, TimelineEvent, TimelineQuery,
     TimelineWatchKey,
 };
@@ -282,6 +282,50 @@ pub enum SessionEvent {
         /// Failure returned by the interrupt effect.
         error: ClientError,
     },
+    /// A caller requested session rollback.
+    RollbackRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to roll back.
+        session_id: String,
+        /// Rollback target.
+        target: RollbackTarget,
+    },
+    /// Session rollback completed successfully.
+    RolledBack {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Updated session returned by the server.
+        session: SessionSummary,
+    },
+    /// Session rollback failed.
+    RollbackFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the rollback effect.
+        error: ClientError,
+    },
+    /// A caller requested continuing a session from an earlier turn.
+    ContinueRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to continue.
+        session_id: String,
+        /// Turn to continue from.
+        turn: u64,
+    },
+    /// Session continue request was accepted.
+    Continued {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+    },
+    /// Session continue request failed.
+    ContinueFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the continue effect.
+        error: ClientError,
+    },
     /// A caller registered interest in session watch updates.
     WatchInterestRegistered,
     /// A caller released interest in session watch updates.
@@ -423,6 +467,24 @@ pub enum SessionEffect {
         operation_key: OperationKey,
         /// Session id to interrupt.
         session_id: String,
+    },
+    /// Roll back a session to a turn or cursor target.
+    Rollback {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to roll back.
+        session_id: String,
+        /// Rollback target.
+        target: RollbackTarget,
+    },
+    /// Roll back to a turn and continue from that checkpoint.
+    Continue {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Session id to continue.
+        session_id: String,
+        /// Turn to continue from.
+        turn: u64,
     },
     /// Sleep before attempting a session watch reconnect.
     SleepReconnect {

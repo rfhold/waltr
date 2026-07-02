@@ -193,6 +193,102 @@ impl Client {
         }))
     }
 
+    /// Request that a session be rolled back to the end of a turn.
+    pub fn rollback_session_to_turn(
+        &mut self,
+        session_id: impl Into<String>,
+        turn: u64,
+    ) -> ClientUpdate {
+        self.rollback_session(
+            session_id,
+            crate::RollbackTarget {
+                target: Some(crate::rollback_target::Target::Turn(turn)),
+            },
+        )
+    }
+
+    /// Request that a session be rolled back to a specific timeline cursor.
+    pub fn rollback_session_to_cursor(
+        &mut self,
+        session_id: impl Into<String>,
+        cursor: u64,
+    ) -> ClientUpdate {
+        self.rollback_session(
+            session_id,
+            crate::RollbackTarget {
+                target: Some(crate::rollback_target::Target::Cursor(cursor)),
+            },
+        )
+    }
+
+    /// Request that a session be rolled back to immediately before a timeline cursor.
+    pub fn rollback_session_before_cursor(
+        &mut self,
+        session_id: impl Into<String>,
+        cursor: u64,
+    ) -> ClientUpdate {
+        self.rollback_session(
+            session_id,
+            crate::RollbackTarget {
+                target: Some(crate::rollback_target::Target::BeforeCursor(cursor)),
+            },
+        )
+    }
+
+    pub(crate) fn rollback_session(
+        &mut self,
+        session_id: impl Into<String>,
+        target: crate::RollbackTarget,
+    ) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(SessionEvent::RollbackRequested {
+            operation_key,
+            session_id: session_id.into(),
+            target,
+        }))
+    }
+
+    /// Request that a session roll back to a turn and continue from there.
+    pub fn continue_session_from_turn(
+        &mut self,
+        session_id: impl Into<String>,
+        turn: u64,
+    ) -> ClientUpdate {
+        self.continue_session(
+            session_id,
+            crate::RollbackTarget {
+                target: Some(crate::rollback_target::Target::Turn(turn)),
+            },
+        )
+    }
+
+    /// Request that a session roll back to a cursor and continue from there.
+    pub fn continue_session_from_cursor(
+        &mut self,
+        session_id: impl Into<String>,
+        cursor: u64,
+    ) -> ClientUpdate {
+        self.continue_session(
+            session_id,
+            crate::RollbackTarget {
+                target: Some(crate::rollback_target::Target::Cursor(cursor)),
+            },
+        )
+    }
+
+    pub(crate) fn continue_session(
+        &mut self,
+        session_id: impl Into<String>,
+        target: crate::RollbackTarget,
+    ) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(SessionEvent::ContinueRequested {
+            operation_key,
+            session_id: session_id.into(),
+            target,
+        }))
+    }
+
     /// Request that system status changes be watched.
     pub fn request_status_watch(&mut self) -> ClientUpdate {
         self.apply(ClientEvent::Status(StatusEvent::WatchRequested))
@@ -690,7 +786,7 @@ impl ClientUpdate {
 mod tests {
     use super::*;
 
-    use crate::transport::SessionTimelineWatchUpdate;
+    use crate::transport::{SessionTimelineWatchEvent, SessionTimelineWatchUpdate};
     use crate::{
         ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary, SessionWatchEvent,
         SessionWatchUpdate, StatusEffect, StreamEvent, StreamStatus, SystemStatus, TimelineEvent,
@@ -1070,7 +1166,7 @@ mod tests {
             key: crate::TimelineWatchKey::new("session".to_owned(), Some(0), Vec::new(), None),
             update: SessionTimelineWatchUpdate {
                 sequence: 1,
-                event: timeline_event(10),
+                event: SessionTimelineWatchEvent::Event(timeline_event(10)),
             },
         }));
         client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
@@ -1090,6 +1186,56 @@ mod tests {
         );
         assert_eq!(timeline.load.status, OperationStatus::Ready);
         assert_eq!(timeline.watch.status, OperationStatus::Received);
+    }
+
+    #[test]
+    fn continue_session_from_cursor_emits_cursor_target() {
+        let mut client = Client::new();
+
+        let update = client.continue_session_from_cursor("session", 42);
+
+        assert_eq!(
+            client.state().sessions.continue_session.status,
+            OperationStatus::Loading
+        );
+        assert_eq!(update.effects().len(), 1);
+        match &update.effects()[0] {
+            ClientEffect::Session(SessionEffect::Continue {
+                session_id, target, ..
+            }) => {
+                assert_eq!(session_id, "session");
+                assert_eq!(
+                    target.target,
+                    Some(crate::rollback_target::Target::Cursor(42))
+                );
+            }
+            effect => panic!("unexpected effect: {effect:?}"),
+        }
+    }
+
+    #[test]
+    fn rollback_session_before_cursor_emits_before_cursor_target() {
+        let mut client = Client::new();
+
+        let update = client.rollback_session_before_cursor("session", 42);
+
+        assert_eq!(
+            client.state().sessions.rollback.status,
+            OperationStatus::Loading
+        );
+        assert_eq!(update.effects().len(), 1);
+        match &update.effects()[0] {
+            ClientEffect::Session(SessionEffect::Rollback {
+                session_id, target, ..
+            }) => {
+                assert_eq!(session_id, "session");
+                assert_eq!(
+                    target.target,
+                    Some(crate::rollback_target::Target::BeforeCursor(42))
+                );
+            }
+            effect => panic!("unexpected effect: {effect:?}"),
+        }
     }
 
     #[test]

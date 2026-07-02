@@ -20,7 +20,8 @@ pub use coordination::event::{
 pub use coordination::runtime::{
     ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
-    OperationCollectionSnapshot, OperationSnapshot, SessionSnapshot, StatusSnapshot,
+    OperationCollectionSnapshot, OperationSnapshot, RollbackTargetView, SessionSnapshot,
+    StatusSnapshot,
 };
 pub use coordination::state::{
     ClientOperationState, ClientState, ConfigClientState, OperationKey, OperationState,
@@ -47,14 +48,17 @@ pub use waltr::grpc::waltr::config::v1::{
     ProviderType, RuntimeDefaults,
 };
 pub use waltr::grpc::waltr::session::v1::{
-    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RuntimeConfigMatch,
-    SessionMcpServerRuntime, SessionMetrics, SessionPhase, SessionProviderRuntime,
-    SessionRuntimeConfig, SessionRuntimeConfigRequest, SessionStatus, SessionSummary, Suspension,
-    SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent, TimelineEventKind,
-    TimelineQuery, TimelineStatus,
+    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RollbackTarget,
+    RuntimeConfigMatch, SessionMcpServerRuntime, SessionMetrics, SessionPhase,
+    SessionProviderRuntime, SessionRuntimeConfig, SessionRuntimeConfigRequest, SessionStatus,
+    SessionSummary, Suspension, SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent,
+    TimelineEventKind, TimelineQuery, TimelineStatus, TimelineTruncation, rollback_target,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
-pub use transport::{ConfigWatchUpdate, WaltrTransport, SessionWatchEvent, SessionWatchUpdate};
+pub use transport::{
+    ConfigWatchUpdate, WaltrTransport, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
+    SessionWatchEvent, SessionWatchUpdate,
+};
 pub use view::{
     CatalogMatchSourceView, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,
     ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,

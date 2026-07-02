@@ -355,6 +355,33 @@ impl GrpcEffectExecutor {
                     error,
                 })],
             },
+            ClientEffect::Session(SessionEffect::Rollback {
+                operation_key,
+                session_id,
+                target,
+            }) => match self.transport.rollback_session(session_id, target).await {
+                Ok(session) => vec![ClientEvent::Session(SessionEvent::RolledBack {
+                    operation_key,
+                    session,
+                })],
+                Err(error) => vec![ClientEvent::Session(SessionEvent::RollbackFailed {
+                    operation_key,
+                    error,
+                })],
+            },
+            ClientEffect::Session(SessionEffect::Continue {
+                operation_key,
+                session_id,
+                target,
+            }) => match self.transport.continue_session(session_id, target).await {
+                Ok(()) => vec![ClientEvent::Session(SessionEvent::Continued {
+                    operation_key,
+                })],
+                Err(error) => vec![ClientEvent::Session(SessionEvent::ContinueFailed {
+                    operation_key,
+                    error,
+                })],
+            },
             ClientEffect::Config(ConfigEffect::SleepReconnect { delay_ms }) => {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Config(ConfigEvent::ReconnectReady)]

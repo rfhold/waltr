@@ -27,7 +27,8 @@ mod tests {
         CatalogMatchSource, ClientCommand, ClientOperationView, ClientSnapshot,
         ClientTimelineDirection, ConfigSnapshot, Configuration, Model, ModelCapabilities,
         ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
-        OperationSnapshot, Provider, ProviderType, SessionSnapshot, StatusSnapshot,
+        OperationSnapshot, Provider, ProviderType, RollbackTargetView, SessionSnapshot,
+        StatusSnapshot,
     };
 
     use super::*;
@@ -167,6 +168,7 @@ mod tests {
             TimelineContentView::decl(),
             TimelineEventView::decl(),
             SessionTimelineView::decl(),
+            RollbackTargetView::decl(),
             ClientOperationView::decl(),
             OperationCollectionSnapshot::decl(),
             OperationSnapshot::decl(),

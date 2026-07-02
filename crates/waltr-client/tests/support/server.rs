@@ -2,6 +2,11 @@
 
 use std::collections::HashMap;
 
+use waltr_agent::{
+    CHANNEL_EXTERNAL_REQUEST, ExternalRequest, ExternalRequestId, ExternalRequestKind,
+    ExternalRequestStatus, ExternalResponse, PendingTimelineEvent, SessionId, TimelineChannel,
+    TimelineContent, TimelineEventKind, TimelineStatus,
+};
 use waltr_client::{
     Configuration, McpServer, McpServerType, Model, ModelOptions, ModelType, Provider,
     ProviderType, RuntimeDefaults,
@@ -42,6 +47,61 @@ pub async fn server_endpoint_with_seeded_timeline(
         ];
         sessions.append_timeline(&session_id, events).await?;
     }
+
+    let server = waltr_server::test_support::setup_server_with_seeded_sessions(sessions);
+    Ok((server.base_url(), session_id.as_str().to_owned()))
+}
+
+pub async fn server_endpoint_with_rollback_timeline()
+-> Result<(String, String), Box<dyn std::error::Error>> {
+    let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
+    let session = sessions.create().await?;
+    let session_id = session.id().clone();
+    let events = vec![
+        waltr_agent::PendingTimelineEvent::user_text_snapshot(
+            session_id.clone(),
+            1,
+            "user-1",
+            "first prompt",
+        ),
+        waltr_agent::PendingTimelineEvent::user_text_snapshot(
+            session_id.clone(),
+            2,
+            "user-2",
+            "second prompt",
+        ),
+        waltr_agent::PendingTimelineEvent::assistant_text_snapshot(
+            session_id.clone(),
+            2,
+            "assistant-2",
+            "second answer",
+        ),
+    ];
+    sessions.append_timeline(&session_id, events).await?;
+
+    let server = waltr_server::test_support::setup_server_with_seeded_sessions(sessions);
+    Ok((server.base_url(), session_id.as_str().to_owned()))
+}
+
+pub async fn server_endpoint_with_resolved_external_request()
+-> Result<(String, String), Box<dyn std::error::Error>> {
+    let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
+    let session = sessions.create().await?;
+    let session_id = session.id().clone();
+    sessions
+        .append_timeline(
+            &session_id,
+            vec![
+                external_request_event(&session_id, ExternalRequestStatus::Pending),
+                external_request_event(
+                    &session_id,
+                    ExternalRequestStatus::Responded(ExternalResponse::new(
+                        serde_json::json!({ "answers": [{ "header": "Choice" }] }),
+                    )),
+                ),
+            ],
+        )
+        .await?;
 
     let server = waltr_server::test_support::setup_server_with_seeded_sessions(sessions);
     Ok((server.base_url(), session_id.as_str().to_owned()))
@@ -93,4 +153,43 @@ fn provider(name: &str, model_key: &str) -> Provider {
         )]),
         ..Provider::default()
     }
+}
+
+fn external_request_event(
+    session_id: &SessionId,
+    status: ExternalRequestStatus,
+) -> PendingTimelineEvent {
+    let kind = match status {
+        ExternalRequestStatus::Pending => TimelineEventKind::ExternalRequestOpened,
+        ExternalRequestStatus::Responded(_) | ExternalRequestStatus::Canceled(_) => {
+            TimelineEventKind::ExternalRequestResolved
+        }
+    };
+    let timeline_status = TimelineStatus::from(&status);
+    let mut event = PendingTimelineEvent::new(
+        session_id.clone(),
+        1,
+        "external-request:question-1",
+        kind,
+        Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
+        TimelineContent::ExternalRequest {
+            request: ExternalRequest {
+                id: ExternalRequestId::new("question-1"),
+                kind: ExternalRequestKind::Question,
+                tool_call_id: Some("call-question".to_owned()),
+                prompt: "Choose a path".to_owned(),
+                payload: serde_json::json!({
+                    "questions": [{
+                        "header": "Choice",
+                        "question": "Continue?",
+                        "multiple": false,
+                        "options": [{ "label": "Yes", "description": "Continue" }]
+                    }]
+                }),
+                status,
+            },
+        },
+    );
+    event.status = Some(timeline_status);
+    event
 }
