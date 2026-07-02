@@ -3,11 +3,11 @@
 #![allow(missing_docs)]
 
 use crate::{
-    LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
+    AgentTimelineEvent, LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
     permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
     timeline::{
         CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
-        TimelineEventKind, TimelineItemId,
+        TimelineCursor, TimelineEventKind, TimelineItemId,
     },
 };
 
@@ -18,9 +18,9 @@ use serde_json::Value;
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
     ExternalResponse, PendingWork, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
-    SessionListBroadcaster, SessionListEvent, SessionRecord, SessionRuntimeSettings,
-    SessionSnapshot, SessionStatus, SessionStore, SessionSummary, SessionTimelineBroadcaster,
-    Suspension,
+    SessionListBroadcaster, SessionListEvent, SessionRecord, SessionRollbackTarget,
+    SessionRuntimeSettings, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
+    SessionTimelineBroadcaster, Suspension,
 };
 
 /// Runtime facade for durable session resume operations.
@@ -137,6 +137,7 @@ where
     pub async fn resume(&self, id: &SessionId, input: ResumeInput) -> Result<RuntimeResumeOutput> {
         let record = self.load_session(id).await?;
         match input {
+            ResumeInput::Continue => Ok(RuntimeResumeOutput::Resumed { record }),
             ResumeInput::Prompt(prompt) => self.resume_prompt(record, prompt).await,
             ResumeInput::Prompts(prompts) => self.resume_prompts(record, prompts).await,
             ResumeInput::ExternalResponse {
@@ -158,6 +159,54 @@ where
     pub async fn interrupt(&self, id: &SessionId) -> Result<SessionRecord> {
         let record = self.load_session(id).await?;
         self.interrupt_record(record).await
+    }
+
+    /// Logically roll back a session so replay preserves only events through `turn`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session or turn does not exist, or when the store fails.
+    pub async fn rollback_to_turn(
+        &self,
+        id: &SessionId,
+        turn: u64,
+    ) -> Result<RuntimeRollbackOutput> {
+        let record = self.load_session(id).await?;
+        let target = rollback_target_for_turn(&record, turn)?;
+        self.rollback_record(record, target).await
+    }
+
+    /// Logically roll back a session so replay preserves timeline events through `cursor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session or cursor does not exist, or when the store fails.
+    pub async fn rollback_to_cursor(
+        &self,
+        id: &SessionId,
+        cursor: TimelineCursor,
+    ) -> Result<RuntimeRollbackOutput> {
+        let record = self.load_session(id).await?;
+        let target = rollback_target_for_cursor(&record, cursor)?;
+        self.rollback_record(record, target).await
+    }
+
+    /// Logically roll back a session so replay removes the event at `cursor`.
+    ///
+    /// If the cursor points at a user prompt timeline item, the matching prompt journal entry is
+    /// also removed so the edited prompt does not remain in hidden session state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session or cursor does not exist, or when the store fails.
+    pub async fn rollback_before_cursor(
+        &self,
+        id: &SessionId,
+        cursor: TimelineCursor,
+    ) -> Result<RuntimeRollbackOutput> {
+        let record = self.load_session(id).await?;
+        let target = rollback_target_before_cursor(&record, cursor)?;
+        self.rollback_record(record, target).await
     }
 
     /// Set a host-defined metadata value.
@@ -268,6 +317,21 @@ where
             .append_timeline_and_reload(record, status_timeline)
             .await?;
         Ok(record)
+    }
+
+    async fn rollback_record(
+        &self,
+        record: SessionRecord,
+        target: SessionRollbackTarget,
+    ) -> Result<RuntimeRollbackOutput> {
+        let after_cursor = target.after_cursor;
+        let record = self
+            .append_journal_and_reload(record, vec![SessionJournalEvent::Rollback { target }])
+            .await?;
+        Ok(RuntimeRollbackOutput {
+            record,
+            after_cursor,
+        })
     }
 
     async fn resume_prompt(
@@ -556,6 +620,205 @@ pub enum RuntimeResumeOutput {
     },
 }
 
+/// Result of applying a runtime rollback operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeRollbackOutput {
+    /// Record after appending the rollback barrier.
+    pub record: SessionRecord,
+    /// Last visible timeline cursor clients should preserve.
+    pub after_cursor: Option<TimelineCursor>,
+}
+
+fn rollback_target_for_turn(record: &SessionRecord, turn: u64) -> Result<SessionRollbackTarget> {
+    let indexed = effective_indexed_journal(record);
+    let mut seen_turn = false;
+    let mut cutoff = None;
+    let mut after_cursor = None;
+
+    for (index, event) in &indexed {
+        match event {
+            SessionJournalEvent::Timeline(event) if event.turn <= turn => {
+                if event.turn == turn {
+                    seen_turn = true;
+                }
+                after_cursor = Some(event.cursor);
+                cutoff = Some(index + 1);
+            }
+            SessionJournalEvent::ProviderRequestRecorded { request } if request.turn <= turn => {
+                if request.turn == turn {
+                    seen_turn = true;
+                }
+                cutoff = Some(index + 1);
+            }
+            SessionJournalEvent::ProviderThinkingBlockRecorded {
+                turn: event_turn, ..
+            }
+            | SessionJournalEvent::ProviderTurnMetadataRecorded {
+                turn: event_turn, ..
+            }
+            | SessionJournalEvent::TurnInterrupted { turn: event_turn }
+            | SessionJournalEvent::TurnFinished { turn: event_turn }
+                if *event_turn <= turn =>
+            {
+                if *event_turn == turn {
+                    seen_turn = true;
+                }
+                cutoff = Some(index + 1);
+            }
+            _ => {}
+        }
+    }
+
+    if !seen_turn {
+        return Err(runtime_error(format!("rollback turn not found: {turn}")));
+    }
+    rollback_target_from_cutoff(record, &indexed, cutoff.unwrap_or(0), after_cursor)
+}
+
+fn rollback_target_for_cursor(
+    record: &SessionRecord,
+    cursor: TimelineCursor,
+) -> Result<SessionRollbackTarget> {
+    let indexed = effective_indexed_journal(record);
+    let cutoff = indexed
+        .iter()
+        .find_map(|(index, event)| match event {
+            SessionJournalEvent::Timeline(event) if event.cursor == cursor => Some(index + 1),
+            _ => None,
+        })
+        .ok_or_else(|| runtime_error(format!("rollback cursor not found: {}", cursor.get())))?;
+    rollback_target_from_cutoff(record, &indexed, cutoff, Some(cursor))
+}
+
+fn rollback_target_before_cursor(
+    record: &SessionRecord,
+    cursor: TimelineCursor,
+) -> Result<SessionRollbackTarget> {
+    let indexed = effective_indexed_journal(record);
+    let mut cutoff = None;
+    let mut after_cursor = None;
+    let mut remove_prompt_index = None;
+
+    for (index, event) in &indexed {
+        match event {
+            SessionJournalEvent::Timeline(event) if event.cursor == cursor => {
+                cutoff = Some(*index);
+                remove_prompt_index = user_prompt_index(event);
+                break;
+            }
+            SessionJournalEvent::Timeline(event) => {
+                after_cursor = Some(event.cursor);
+            }
+            _ => {}
+        }
+    }
+
+    let cutoff = cutoff
+        .ok_or_else(|| runtime_error(format!("rollback cursor not found: {}", cursor.get())))?;
+    rollback_target_from_cutoff_with_prompt_removal(
+        record,
+        &indexed,
+        cutoff,
+        after_cursor,
+        remove_prompt_index,
+    )
+}
+
+fn rollback_target_from_cutoff(
+    record: &SessionRecord,
+    indexed: &[(usize, &SessionJournalEvent)],
+    cutoff: usize,
+    after_cursor: Option<TimelineCursor>,
+) -> Result<SessionRollbackTarget> {
+    rollback_target_from_cutoff_with_prompt_removal(record, indexed, cutoff, after_cursor, None)
+}
+
+fn rollback_target_from_cutoff_with_prompt_removal(
+    record: &SessionRecord,
+    indexed: &[(usize, &SessionJournalEvent)],
+    cutoff: usize,
+    after_cursor: Option<TimelineCursor>,
+    remove_prompt_index: Option<u64>,
+) -> Result<SessionRollbackTarget> {
+    let journal = indexed
+        .iter()
+        .filter(|(index, _)| *index < cutoff)
+        .map(|(_, event)| (*event).clone())
+        .collect::<Vec<_>>();
+    let mut journal = journal;
+    if let Some(prompt_index) = remove_prompt_index {
+        remove_prompt_appended_from_journal(&mut journal, prompt_index);
+    }
+    let snapshot = SessionSnapshot::from_journal(record.id.clone(), &journal);
+    Ok(SessionRollbackTarget {
+        journal_len: u64::try_from(cutoff)
+            .map_err(|_| runtime_error("rollback journal cutoff is too large"))?,
+        after_cursor,
+        next_turn: snapshot.turn,
+        remove_prompt_index,
+    })
+}
+
+fn effective_indexed_journal(record: &SessionRecord) -> Vec<(usize, &SessionJournalEvent)> {
+    let mut events = Vec::new();
+    for (index, event) in record.journal.iter().enumerate() {
+        match event {
+            SessionJournalEvent::Rollback { target } => {
+                let keep = usize::try_from(target.journal_len).unwrap_or(usize::MAX);
+                events.retain(|(event_index, _)| *event_index < keep);
+                if let Some(prompt_index) = target.remove_prompt_index {
+                    remove_prompt_appended(&mut events, prompt_index);
+                }
+            }
+            _ => events.push((index, event)),
+        }
+    }
+    events
+}
+
+fn user_prompt_index(event: &AgentTimelineEvent) -> Option<u64> {
+    event
+        .item_id
+        .as_str()
+        .strip_prefix("user-turn-")?
+        .rsplit_once("-prompt-")?
+        .1
+        .parse()
+        .ok()
+}
+
+fn remove_prompt_appended_from_journal(journal: &mut Vec<SessionJournalEvent>, prompt_index: u64) {
+    let mut seen = 0_u64;
+    let Some(position) = journal.iter().position(|event| {
+        if matches!(event, SessionJournalEvent::PromptAppended { .. }) {
+            let matches = seen == prompt_index;
+            seen += 1;
+            matches
+        } else {
+            false
+        }
+    }) else {
+        return;
+    };
+    journal.remove(position);
+}
+
+fn remove_prompt_appended(events: &mut Vec<(usize, &SessionJournalEvent)>, prompt_index: u64) {
+    let mut seen = 0_u64;
+    let Some(position) = events.iter().position(|(_, event)| {
+        if matches!(event, SessionJournalEvent::PromptAppended { .. }) {
+            let matches = seen == prompt_index;
+            seen += 1;
+            matches
+        } else {
+            false
+        }
+    }) else {
+        return;
+    };
+    events.remove(position);
+}
+
 fn validate_pending_external_response(
     snapshot: &SessionSnapshot,
     request_id: &ExternalRequestId,
@@ -811,6 +1074,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_to_cursor_preserves_user_prompt_at_cursor() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+        let revision = store
+            .append_journal(
+                &id,
+                Revision::ZERO,
+                vec![
+                    SessionJournalEvent::PromptAppended {
+                        prompt: "first".to_owned(),
+                    },
+                    SessionJournalEvent::PromptAppended {
+                        prompt: "second".to_owned(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .append_timeline(
+                &id,
+                revision,
+                vec![
+                    user_prompt_timeline_event(&id, 0, 0, "first".to_owned()),
+                    user_prompt_timeline_event(&id, 0, 1, "second".to_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let output = AgentSessionRuntime::new(&store)
+            .rollback_to_cursor(&id, TimelineCursor::new(2))
+            .await
+            .unwrap();
+        let snapshot = output.record.snapshot();
+
+        assert_eq!(output.after_cursor, Some(TimelineCursor::new(2)));
+        assert_eq!(snapshot.prompts, ["first", "second"]);
+        assert_eq!(
+            output
+                .record
+                .timeline_events()
+                .map(|event| event.cursor.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_before_cursor_removes_user_prompt_at_cursor() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+        let revision = store
+            .append_journal(
+                &id,
+                Revision::ZERO,
+                vec![
+                    SessionJournalEvent::PromptAppended {
+                        prompt: "first".to_owned(),
+                    },
+                    SessionJournalEvent::PromptAppended {
+                        prompt: "second".to_owned(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .append_timeline(
+                &id,
+                revision,
+                vec![
+                    user_prompt_timeline_event(&id, 0, 0, "first".to_owned()),
+                    user_prompt_timeline_event(&id, 0, 1, "second".to_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let output = AgentSessionRuntime::new(&store)
+            .rollback_before_cursor(&id, TimelineCursor::new(2))
+            .await
+            .unwrap();
+        let snapshot = output.record.snapshot();
+
+        assert_eq!(output.after_cursor, Some(TimelineCursor::new(1)));
+        assert_eq!(snapshot.prompts, ["first"]);
+        assert_eq!(
+            output
+                .record
+                .timeline_events()
+                .map(|event| event.cursor.get())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[tokio::test]
     async fn external_response_records_answer_and_tool_result() {
         let store = MemorySessionStore::new();
         let id = suspended_question_session(&store).await;
@@ -845,6 +1208,53 @@ mod tests {
         assert_eq!(
             snapshot.turn, 1,
             "answering the suspended call should finish the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_to_open_external_request_restores_pending_prompt() {
+        let store = MemorySessionStore::new();
+        let id = suspended_question_session(&store).await;
+        let runtime = AgentSessionRuntime::new(&store);
+        let open_cursor = store
+            .load(&id)
+            .await
+            .unwrap()
+            .timeline_events()
+            .find(|event| event.kind == TimelineEventKind::ExternalRequestOpened)
+            .expect("opened external request event")
+            .cursor;
+
+        runtime
+            .resume(
+                &id,
+                ResumeInput::ExternalResponse {
+                    request_id: ExternalRequestId::new("question-1"),
+                    response: ExternalResponse {
+                        payload: json!({ "answers": [{ "header": "Choice" }] }),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+
+        let output = runtime.rollback_to_cursor(&id, open_cursor).await.unwrap();
+        let snapshot = output.record.snapshot();
+
+        assert_eq!(output.after_cursor, Some(open_cursor));
+        assert!(matches!(
+            snapshot.external_requests[0].status,
+            ExternalRequestStatus::Pending
+        ));
+        assert!(matches!(
+            snapshot.status,
+            SessionStatus::Suspended(Suspension::AwaitingExternalInput { .. })
+        ));
+        assert!(
+            output
+                .record
+                .timeline_events()
+                .all(|event| event.cursor <= open_cursor)
         );
     }
 

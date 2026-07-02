@@ -116,6 +116,7 @@ where
 {
     pub(super) fn from_ephemeral_session(run: EphemeralSessionRun<S>) -> Self {
         let prompt = match &run.input {
+            ResumeInput::Continue => "",
             ResumeInput::Prompt(prompt) => prompt,
             ResumeInput::Prompts(prompts) => prompts.last().map_or("", String::as_str),
             ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => "",
@@ -841,7 +842,9 @@ where
             ResumeInput::Prompts(_) => {
                 return Err(session_store_error("prompt batch must not be empty"));
             }
-            ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => {
+            ResumeInput::Continue
+            | ResumeInput::ToolResults(_)
+            | ResumeInput::ExternalResponse { .. } => {
                 return Err(session_store_error(
                     "cannot resume missing session without a prompt input",
                 ));
@@ -894,6 +897,7 @@ where
 
         let mut continue_start_turn = true;
         let record = match input {
+            ResumeInput::Continue => record,
             ResumeInput::Prompt(prompt) => {
                 let snapshot = record.snapshot();
                 if snapshot.current_prompt.as_deref() == Some(prompt.as_str())

@@ -160,8 +160,9 @@ mod completion {
     use futures_util::StreamExt;
     use waltr_agent::{
         AgentRuntime, AgentTimelineEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi,
-        ModelRef, ProviderId, SessionCoordinator, SessionId, SessionListEvent, SessionStatus,
-        SessionStore, TimelineContent, TimelineEventKind, TimelineStatus, ToolCall, ToolDefinition,
+        ModelRef, PendingTimelineEvent, ProviderId, SessionCoordinator, SessionId,
+        SessionListEvent, SessionStatus, SessionStore, SessionTimelineEvent, TimelineContent,
+        TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall, ToolDefinition,
     };
     use serde_json::json;
     use tokio::time::{Duration, timeout};
@@ -274,6 +275,130 @@ mod completion {
         );
         assert!(listed.iter().any(|session| &session.id == first.id()));
         assert!(listed.iter().any(|session| &session.id == second.id()));
+    }
+
+    #[tokio::test]
+    async fn rollback_to_cursor_preserves_selected_timeline_event() {
+        let store = MemorySessionStore::new();
+        let sessions = SessionCoordinator::new(store);
+        let session = sessions.create().await.expect("created session");
+        let session_id = session.id().clone();
+        let seeded = sessions
+            .append_timeline(
+                &session_id,
+                vec![
+                    PendingTimelineEvent::user_text_snapshot(
+                        session_id.clone(),
+                        1,
+                        "user-1",
+                        "first prompt",
+                    ),
+                    PendingTimelineEvent::user_text_snapshot(
+                        session_id.clone(),
+                        2,
+                        "user-2",
+                        "second prompt",
+                    ),
+                ],
+            )
+            .await
+            .expect("seed timeline");
+
+        sessions
+            .rollback_to_cursor(session_id.clone(), seeded[1].cursor)
+            .await
+            .expect("rollback to cursor");
+        let events = sessions
+            .timeline(&session_id, TimelineQuery::forward(None, 10))
+            .await
+            .expect("timeline after rollback");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].item_id.as_str(), "user-1");
+        assert_eq!(events[1].item_id.as_str(), "user-2");
+    }
+
+    #[tokio::test]
+    async fn rollback_before_cursor_removes_selected_timeline_event_and_publishes_truncation() {
+        let store = MemorySessionStore::new();
+        let sessions = SessionCoordinator::new(store);
+        let session = sessions.create().await.expect("created session");
+        let session_id = session.id().clone();
+        let seeded = sessions
+            .append_timeline(
+                &session_id,
+                vec![
+                    PendingTimelineEvent::user_text_snapshot(
+                        session_id.clone(),
+                        1,
+                        "user-1",
+                        "first prompt",
+                    ),
+                    PendingTimelineEvent::user_text_snapshot(
+                        session_id.clone(),
+                        2,
+                        "user-2",
+                        "second prompt",
+                    ),
+                ],
+            )
+            .await
+            .expect("seed timeline");
+        let mut watch = sessions.watch_timeline(session_id.clone());
+
+        sessions
+            .rollback_before_cursor(session_id.clone(), seeded[1].cursor)
+            .await
+            .expect("rollback before cursor");
+        let update = timeout(Duration::from_secs(1), watch.next())
+            .await
+            .expect("timeline truncation update")
+            .expect("timeline truncation item");
+        let events = sessions
+            .timeline(&session_id, TimelineQuery::forward(None, 10))
+            .await
+            .expect("timeline after rollback");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].item_id.as_str(), "user-1");
+        assert!(matches!(
+            update.event,
+            SessionTimelineEvent::Truncated {
+                after_cursor: Some(cursor),
+                ..
+            } if cursor == seeded[0].cursor
+        ));
+    }
+
+    #[tokio::test]
+    async fn rollback_before_first_cursor_clears_visible_timeline() {
+        let store = MemorySessionStore::new();
+        let sessions = SessionCoordinator::new(store);
+        let session = sessions.create().await.expect("created session");
+        let session_id = session.id().clone();
+        let seeded = sessions
+            .append_timeline(
+                &session_id,
+                vec![PendingTimelineEvent::user_text_snapshot(
+                    session_id.clone(),
+                    1,
+                    "user-1",
+                    "first prompt",
+                )],
+            )
+            .await
+            .expect("seed timeline");
+
+        sessions
+            .rollback_before_cursor(session_id.clone(), seeded[0].cursor)
+            .await
+            .expect("rollback before first cursor");
+        let events = sessions
+            .timeline(&session_id, TimelineQuery::forward(None, 10))
+            .await
+            .expect("timeline after rollback");
+
+        assert!(events.is_empty());
     }
 
     #[tokio::test]

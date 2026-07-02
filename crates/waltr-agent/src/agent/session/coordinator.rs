@@ -442,6 +442,80 @@ where
         .await
     }
 
+    /// Roll back a session to the end of a visible provider turn.
+    pub async fn rollback_to_turn(&self, session_id: SessionId, turn: u64) -> Result<AgentSession> {
+        self.interrupt_active_run(&session_id).await;
+        let output = AgentSessionRuntime::new(&self.store)
+            .with_session_broadcaster(self.sessions.clone())
+            .rollback_to_turn(&session_id, turn)
+            .await?;
+        self.timeline
+            .publish_truncation(session_id.clone(), output.after_cursor);
+        Ok(AgentSession::new(output.record))
+    }
+
+    /// Roll back a session to a visible timeline cursor.
+    pub async fn rollback_to_cursor(
+        &self,
+        session_id: SessionId,
+        cursor: crate::timeline::TimelineCursor,
+    ) -> Result<AgentSession> {
+        self.interrupt_active_run(&session_id).await;
+        let output = AgentSessionRuntime::new(&self.store)
+            .with_session_broadcaster(self.sessions.clone())
+            .rollback_to_cursor(&session_id, cursor)
+            .await?;
+        self.timeline
+            .publish_truncation(session_id.clone(), output.after_cursor);
+        Ok(AgentSession::new(output.record))
+    }
+
+    /// Roll back a session to immediately before a visible timeline cursor.
+    pub async fn rollback_before_cursor(
+        &self,
+        session_id: SessionId,
+        cursor: crate::timeline::TimelineCursor,
+    ) -> Result<AgentSession> {
+        self.interrupt_active_run(&session_id).await;
+        let output = AgentSessionRuntime::new(&self.store)
+            .with_session_broadcaster(self.sessions.clone())
+            .rollback_before_cursor(&session_id, cursor)
+            .await?;
+        self.timeline
+            .publish_truncation(session_id.clone(), output.after_cursor);
+        Ok(AgentSession::new(output.record))
+    }
+
+    /// Roll back to the end of a turn and continue from that durable checkpoint.
+    pub async fn continue_from_turn(
+        &self,
+        session_id: SessionId,
+        turn: u64,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.rollback_to_turn(session_id.clone(), turn).await?;
+        self.submit(
+            session_id,
+            AgentSessionRunInput::Continue,
+            RunConflictPolicy::ReplaceActive,
+        )
+        .await
+    }
+
+    /// Roll back to a timeline cursor and continue from that durable checkpoint.
+    pub async fn continue_from_cursor(
+        &self,
+        session_id: SessionId,
+        cursor: crate::timeline::TimelineCursor,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.rollback_to_cursor(session_id.clone(), cursor).await?;
+        self.submit(
+            session_id,
+            AgentSessionRunInput::Continue,
+            RunConflictPolicy::ReplaceActive,
+        )
+        .await
+    }
+
     /// Submit a session run or resume input.
     pub async fn submit(
         &self,
@@ -716,6 +790,9 @@ where
         None => coordinator.resolve_runtime(&session_id).await?,
     };
     let mut stream = match input {
+        AgentSessionRunInput::Continue => {
+            coordinator.resume(&runtime, session_id.clone(), ResumeInput::Continue)
+        }
         AgentSessionRunInput::Prompt(prompt) => {
             coordinator.prompt(&runtime, session_id.clone(), prompt)
         }

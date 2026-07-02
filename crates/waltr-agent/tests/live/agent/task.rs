@@ -10,9 +10,9 @@ use std::{
 
 use waltr_agent::{
     AgentRuntime, AgentSessionRuntimeFactory, AgentTool, BoxStreamFuture, CompletionRequest,
-    FileCredentialStore, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef,
-    SessionCoordinator, SessionId, SessionProviderRuntimeSettings, SessionRuntimeSettings,
-    ToolDefinition, tools::task::TASK_TOOL_NAME,
+    FileCredentialStore, LlmError, LlmStream, MemorySessionStore, ModelRef, SessionCoordinator,
+    SessionId, SessionProviderRuntimeSettings, SessionRuntimeSettings, ToolDefinition,
+    tools::task::TASK_TOOL_NAME,
 };
 use serde_json::{Value, json};
 use tokio::time::timeout;

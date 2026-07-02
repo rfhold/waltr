@@ -58,6 +58,7 @@ impl AgentRunBuilder {
         S: SessionStore + Clone + Send + Sync + 'static,
     {
         let prompt = match &input {
+            ResumeInput::Continue => String::new(),
             ResumeInput::Prompt(prompt) => prompt.clone(),
             ResumeInput::Prompts(prompts) => prompts.last().cloned().unwrap_or_default(),
             ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => String::new(),

@@ -13,7 +13,7 @@ use futures_util::Stream;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
-use crate::timeline::AgentTimelineEvent;
+use crate::timeline::{AgentTimelineEvent, TimelineCursor};
 
 use super::{SessionId, SessionSummary};
 
@@ -81,8 +81,32 @@ pub(crate) struct SessionListBroadcaster {
 pub struct SessionTimelineUpdate {
     /// Monotonic sequence for detecting missed live updates.
     pub sequence: u64,
+    /// Timeline update payload.
+    pub event: SessionTimelineEvent,
+}
+
+/// Timeline watch payload emitted by [`SessionCoordinator`](super::SessionCoordinator).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum SessionTimelineEvent {
     /// Persisted timeline event with an assigned cursor.
-    pub event: AgentTimelineEvent,
+    Event(AgentTimelineEvent),
+    /// Timeline events after `after_cursor` were logically removed from the visible session.
+    Truncated {
+        /// Session that was truncated.
+        session_id: SessionId,
+        /// Last visible cursor that remains after truncation.
+        after_cursor: Option<TimelineCursor>,
+    },
+}
+
+impl SessionTimelineEvent {
+    fn session_id(&self) -> &SessionId {
+        match self {
+            Self::Event(event) => &event.session_id,
+            Self::Truncated { session_id, .. } => session_id,
+        }
+    }
 }
 
 /// Live stream of persisted timeline updates for one session.
@@ -107,7 +131,7 @@ impl Stream for SessionTimelineSubscription {
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
             match Pin::new(&mut self.inner).poll_next(context) {
-                Poll::Ready(Some(Ok(update))) if update.event.session_id == self.session_id => {
+                Poll::Ready(Some(Ok(update))) if update.event.session_id() == &self.session_id => {
                     return Poll::Ready(Some(update));
                 }
                 Poll::Ready(Some(Ok(_) | Err(BroadcastStreamRecvError::Lagged(_)))) => {}
@@ -143,6 +167,21 @@ impl SessionTimelineBroadcaster {
     }
 
     pub(crate) fn publish(&self, event: AgentTimelineEvent) {
+        self.publish_update(SessionTimelineEvent::Event(event));
+    }
+
+    pub(crate) fn publish_truncation(
+        &self,
+        session_id: SessionId,
+        after_cursor: Option<TimelineCursor>,
+    ) {
+        self.publish_update(SessionTimelineEvent::Truncated {
+            session_id,
+            after_cursor,
+        });
+    }
+
+    fn publish_update(&self, event: SessionTimelineEvent) {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
         drop(self.sender.send(SessionTimelineUpdate { sequence, event }));
     }

@@ -37,10 +37,12 @@ pub use types::{
     AgentSession, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, PendingWork, PendingWorkStatus, RequestId,
     RequestRecord, ResumeInput, Revision, SessionId, SessionJournalEvent, SessionMetrics,
-    SessionRecord, SessionSnapshot, SessionStatus, SessionSummary, Suspension,
+    SessionRecord, SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionSummary,
+    Suspension,
 };
 pub(super) use watch::{SessionListBroadcaster, SessionTimelineBroadcaster};
+#[allow(unused_imports)]
 pub use watch::{
-    SessionListEvent, SessionListSubscription, SessionListUpdate, SessionTimelineSubscription,
-    SessionTimelineUpdate,
+    SessionListEvent, SessionListSubscription, SessionListUpdate, SessionTimelineEvent,
+    SessionTimelineSubscription, SessionTimelineUpdate,
 };
