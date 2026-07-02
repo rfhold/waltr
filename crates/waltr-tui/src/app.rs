@@ -619,13 +619,16 @@ impl App {
             MouseEventKind::ScrollDown => self.handle_sessions_scroll(-1),
             MouseEventKind::Down(MouseButton::Left) => {
                 let area = sessions_body_area();
-                self.sessions_section.handle_detail_click(
+                match self.sessions_section.handle_detail_click(
                     self.client_snapshot.as_ref(),
                     area,
                     mouse.column,
                     mouse.row,
-                );
-                AppAction::Continue
+                ) {
+                    SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                    SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
+                    SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+                }
             }
             _ => AppAction::Continue,
         }

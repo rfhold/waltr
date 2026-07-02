@@ -8,7 +8,7 @@ use waltr_client::{
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationSnapshot,
     ProviderKindView, ProviderView, RuntimeConfigMatchView, SessionMcpServerRuntimeView,
     SessionPhaseView, SessionProviderRuntimeView, SessionRuntimeConfigView, SessionTimelineView,
-    TimelineEventView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -19,7 +19,7 @@ use waltr_tui::{
     ui,
 };
 use ratatui::{
-    crossterm::event::KeyEvent,
+    crossterm::event::{KeyCode, KeyEvent},
     layout::Rect,
     style::{Color, Modifier, Style},
 };

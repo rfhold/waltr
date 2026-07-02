@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::transport::SessionTimelineWatchEvent;
-use crate::{Configuration, SessionSummary, StreamId, SystemStatus, TimelineEvent};
+use crate::{Configuration, RollbackTarget, SessionSummary, StreamId, SystemStatus, TimelineEvent};
 
 /// Runtime-local operation identifier used by shells to track command results.
 pub type OperationKey = String;
@@ -241,8 +241,8 @@ pub enum ClientOperationState {
         error: Option<String>,
         /// Session id continued.
         session_id: String,
-        /// Turn continued from.
-        turn: u64,
+        /// Rollback target continued from.
+        target: RollbackTarget,
     },
 }
 
@@ -958,7 +958,7 @@ impl ClientState {
         &mut self,
         key: OperationKey,
         session_id: String,
-        turn: u64,
+        target: RollbackTarget,
     ) {
         self.sessions.continue_session.status = OperationStatus::Loading;
         self.sessions.continue_session.error = None;
@@ -969,7 +969,7 @@ impl ClientState {
                 status: OperationStatus::Loading,
                 error: None,
                 session_id,
-                turn,
+                target,
             },
         );
     }
@@ -978,7 +978,7 @@ impl ClientState {
         &mut self,
         key: OperationKey,
         session_id: String,
-        turn: u64,
+        target: RollbackTarget,
     ) {
         self.sessions.continue_session.status = OperationStatus::Ready;
         self.sessions.continue_session.error = None;
@@ -989,7 +989,7 @@ impl ClientState {
                 status: OperationStatus::Ready,
                 error: None,
                 session_id,
-                turn,
+                target,
             },
         );
     }
@@ -998,7 +998,7 @@ impl ClientState {
         &mut self,
         key: OperationKey,
         session_id: String,
-        turn: u64,
+        target: RollbackTarget,
         message: String,
     ) {
         self.sessions.continue_session.status = OperationStatus::Failed;
@@ -1010,7 +1010,7 @@ impl ClientState {
                 status: OperationStatus::Failed,
                 error: Some(message),
                 session_id,
-                turn,
+                target,
             },
         );
     }

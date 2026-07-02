@@ -1,5 +1,7 @@
 use waltr_tui::{event::AppEvent, input::InputEvent};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 pub const fn ctrl_x_press() -> AppEvent {
     AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
@@ -143,4 +145,13 @@ pub const fn scroll_up() -> AppEvent {
 
 pub const fn scroll_down() -> AppEvent {
     AppEvent::Input(InputEvent::Scroll(-1))
+}
+
+pub const fn left_click(column: u16, row: u16) -> AppEvent {
+    AppEvent::Input(InputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }))
 }
