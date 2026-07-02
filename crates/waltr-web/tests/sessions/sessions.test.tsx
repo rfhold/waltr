@@ -569,6 +569,76 @@ describe("sessions route", () => {
     expect(timelineRegion.querySelectorAll(".sessions__code-block")[1]?.textContent).toContain("const label = 'ok';");
   });
 
+  test("session detail edit user message rolls back before cursor and pre-fills composer", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-edit-user"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [
+      timelineEvent({
+        cursor: 7n,
+        sessionId: "session-edit-user",
+        itemId: "user-item",
+        channel: "user_text",
+        content: { kind: "textSnapshot", text: "old prompt" },
+      }),
+    ];
+    snapshot.sessions.timelines["session-edit-user"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-edit-user",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "rollbackSessionBeforeCursor",
+      sessionId: "session-edit-user",
+      cursor: 7n,
+    }));
+    expect((screen.getByLabelText("Session message") as HTMLTextAreaElement).value).toBe("old prompt");
+    expect(commands).not.toContainEqual({
+      type: "rollbackSessionToCursor",
+      sessionId: "session-edit-user",
+      cursor: 7n,
+    });
+  });
+
+  test("session detail rerun user message continues from cursor", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-rerun-user"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [
+      timelineEvent({
+        cursor: 9n,
+        sessionId: "session-rerun-user",
+        itemId: "user-item",
+        channel: "user_text",
+        content: { kind: "textSnapshot", text: "rerun prompt" },
+      }),
+    ];
+    snapshot.sessions.timelines["session-rerun-user"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-rerun-user",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Rerun" }));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "continueSessionFromCursor",
+      sessionId: "session-rerun-user",
+      cursor: 9n,
+    }));
+  });
+
   test("session detail renders thinking markdown", () => {
     const snapshot = snapshotWithSessions([
       sessionWithRuntime("session-thinking-markdown"),
@@ -914,6 +984,125 @@ describe("sessions route", () => {
 
     expect(screen.getByText("permission: answered")).toBeTruthy();
     expect(screen.queryByLabelText("Permission prompt")).toBeNull();
+  });
+
+  test("session detail re-answer permission rolls back to opened prompt cursor", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-permission-reanswer"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [
+      timelineEvent({
+        cursor: 3n,
+        sessionId: "session-permission-reanswer",
+        itemId: "external-request:permission-1",
+        kind: "externalRequestOpened",
+        content: {
+          kind: "externalRequest",
+          request: {
+            id: "permission-1",
+            kind: 1,
+            payloadJson: JSON.stringify({ tool_call: { name: "read", arguments: { filePath: "README.md" } } }),
+          },
+        },
+      }),
+      timelineEvent({
+        cursor: 4n,
+        sessionId: "session-permission-reanswer",
+        itemId: "external-request:permission-1",
+        kind: "externalRequestResolved",
+        status: "resolved",
+        content: {
+          kind: "externalRequest",
+          request: {
+            id: "permission-1",
+            kind: 1,
+            payloadJson: JSON.stringify({ tool_call: { name: "read", arguments: { filePath: "README.md" } } }),
+          },
+        },
+      }),
+    ];
+    snapshot.sessions.timelines["session-permission-reanswer"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-permission-reanswer",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Re-answer" }));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "rollbackSessionToCursor",
+      sessionId: "session-permission-reanswer",
+      cursor: 3n,
+    }));
+    expect(commands).not.toContainEqual({
+      type: "rollbackSessionToCursor",
+      sessionId: "session-permission-reanswer",
+      cursor: 4n,
+    });
+  });
+
+  test("session detail re-answer question rolls back to opened prompt cursor", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-question-reanswer"),
+    ]);
+    const timeline = readySessionTimeline();
+    const payload = {
+      questions: [{
+        header: "Direction",
+        question: "Which path?",
+        multiple: false,
+        custom: false,
+        options: [{ label: "A", description: "Path A" }],
+      }],
+    };
+    timeline.events = [
+      timelineEvent({
+        cursor: 5n,
+        sessionId: "session-question-reanswer",
+        itemId: "external-request:question-1",
+        kind: "externalRequestOpened",
+        content: {
+          kind: "externalRequest",
+          request: { id: "question-1", kind: 2, payloadJson: JSON.stringify(payload) },
+        },
+      }),
+      timelineEvent({
+        cursor: 6n,
+        sessionId: "session-question-reanswer",
+        itemId: "external-request:question-1",
+        kind: "externalRequestResolved",
+        status: "resolved",
+        content: {
+          kind: "externalRequest",
+          request: { id: "question-1", kind: 2, payloadJson: JSON.stringify(payload) },
+        },
+      }),
+    ];
+    snapshot.sessions.timelines["session-question-reanswer"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-question-reanswer",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Re-answer" }));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "rollbackSessionToCursor",
+      sessionId: "session-question-reanswer",
+      cursor: 5n,
+    }));
+    expect(commands).not.toContainEqual({
+      type: "rollbackSessionToCursor",
+      sessionId: "session-question-reanswer",
+      cursor: 6n,
+    });
   });
 
   test("session detail renders unresolved permission prompts and submits decisions", async () => {

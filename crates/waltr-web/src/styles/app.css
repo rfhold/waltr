@@ -560,6 +560,32 @@
   background: color-mix(in srgb, var(--color-surface-soft) 48%, transparent);
 }
 
+.sessions__timeline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  margin-top: 0.45rem;
+}
+
+.sessions__timeline-actions button {
+  border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
+  border-radius: 999px;
+  padding: 0.18rem 0.6rem;
+  background: color-mix(in srgb, var(--color-surface-soft) 72%, transparent);
+  color: var(--color-text-muted);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sessions__timeline-actions button:hover,
+.sessions__timeline-actions button:focus-visible {
+  border-color: var(--color-accent);
+  color: var(--color-text);
+}
+
 .sessions__markdown {
   display: grid;
   gap: var(--space-2);
