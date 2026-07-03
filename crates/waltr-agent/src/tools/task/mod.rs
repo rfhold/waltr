@@ -2,12 +2,14 @@
 
 use std::{collections::BTreeMap, fmt};
 
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::{
-    AgentSessionRunDisposition, AgentSessionRunHandle, AgentTool, LlmError, RunConflictPolicy,
-    SessionCoordinator, SessionId, SessionRuntimeSettings, SessionStore, ToolExecutionContext,
-    ToolResult,
+    AgentSessionRunDisposition, AgentSessionRunHandle, AgentTool, CHANNEL_METRICS,
+    CHANNEL_TOOL_PROGRESS_INFO, LlmError, RunConflictPolicy, SessionCoordinator, SessionId,
+    SessionRuntimeSettings, SessionStore, SessionTimelineEvent, TimelineChannel, TimelineContent,
+    TimelineStatus, ToolExecutionContext, ToolResult,
 };
 
 /// Provider-facing tool name for spawning subagent tasks.
@@ -118,20 +120,59 @@ where
         let policy = match mode {
             TaskMode::Sync | TaskMode::Async => RunConflictPolicy::QueueIfActive,
         };
+        let mut timeline = self.sessions.watch_timeline(task_id.clone());
         let submission = self
             .sessions
             .submit_prompt(task_id.clone(), prompt, policy)
             .await?;
+        let mut progress = TaskProgress::new(
+            &task_id,
+            mode,
+            input.description.as_deref(),
+            submission.run_id,
+            &submission.disposition,
+            self.sessions
+                .active_state(&task_id)
+                .await
+                .map_or(0, |state| state.queued_count),
+        );
+        progress.emit(&context)?;
 
         match mode {
             TaskMode::Sync => {
-                let outcome = tokio::select! {
-                    outcome = submission.handle.wait() => outcome?,
-                    () = context.cancellation_token().cancelled() => {
-                        self.sessions.interrupt(&task_id).await?;
-                        return Err(task_protocol_error("task was canceled"));
+                let wait = submission.handle.wait();
+                tokio::pin!(wait);
+                let outcome = loop {
+                    let next_timeline = timeline.next();
+                    tokio::pin!(next_timeline);
+                    let queued_count = self
+                        .sessions
+                        .active_state(&task_id)
+                        .await
+                        .map_or(0, |state| state.queued_count);
+                    progress.queued_count = queued_count;
+                    tokio::select! {
+                        outcome = &mut wait => break outcome?,
+                        update = &mut next_timeline => {
+                            if let Some(update) = update
+                                && progress.apply_child_timeline_event(&update.event)
+                            {
+                                progress.emit(&context)?;
+                            }
+                        }
+                        () = context.cancellation_token().cancelled() => {
+                            self.sessions.interrupt(&task_id).await?;
+                            return Err(task_protocol_error("task was canceled"));
+                        }
                     }
                 };
+                progress.status = status_label(&outcome.status).to_owned();
+                progress.queued_count = self
+                    .sessions
+                    .active_state(&task_id)
+                    .await
+                    .map_or(0, |state| state.queued_count);
+                progress.emit(&context)?;
                 let result = match outcome.assistant_text {
                     Some(text) => Some(text),
                     None => self
@@ -359,6 +400,112 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("TaskConfig").finish_non_exhaustive()
+    }
+}
+
+struct TaskProgress {
+    task_id: String,
+    mode: TaskMode,
+    description: Option<String>,
+    status: String,
+    run_id: u64,
+    disposition: String,
+    queued_count: usize,
+    metrics: Option<Value>,
+}
+
+impl TaskProgress {
+    fn new(
+        task_id: &SessionId,
+        mode: TaskMode,
+        description: Option<&str>,
+        run_id: u64,
+        disposition: &AgentSessionRunDisposition,
+        queued_count: usize,
+    ) -> Self {
+        Self {
+            task_id: task_id.as_str().to_owned(),
+            mode,
+            description: description.map(str::to_owned),
+            status: match disposition {
+                AgentSessionRunDisposition::Queued { .. } => "queued",
+                AgentSessionRunDisposition::Started
+                | AgentSessionRunDisposition::ReplacedActive => "running",
+            }
+            .to_owned(),
+            run_id,
+            disposition: disposition_label(disposition).to_owned(),
+            queued_count,
+            metrics: None,
+        }
+    }
+
+    fn emit(&self, context: &ToolExecutionContext) -> crate::Result<()> {
+        context.progress().event(
+            CHANNEL_TOOL_PROGRESS_INFO,
+            TimelineContent::Json {
+                value: json!({
+                    "kind": "task_progress",
+                    "version": 1,
+                    "description": self.description,
+                    "taskId": self.task_id,
+                    "mode": self.mode.label(),
+                    "status": self.status,
+                    "runId": self.run_id,
+                    "disposition": self.disposition,
+                    "queuedCount": self.queued_count,
+                    "metrics": self.metrics,
+                }),
+            },
+        )
+    }
+
+    fn apply_child_timeline_event(&mut self, event: &SessionTimelineEvent) -> bool {
+        let SessionTimelineEvent::Event(event) = event else {
+            return false;
+        };
+        if event.kind == crate::TimelineEventKind::SessionStatusChanged {
+            if let Some(status) = event.status {
+                self.status = timeline_status_label(status).to_owned();
+                return true;
+            }
+            return false;
+        }
+        if event.channel.as_ref().map(TimelineChannel::as_str) == Some(CHANNEL_METRICS)
+            && let TimelineContent::Json { value } = &event.content
+            && value.get("kind").and_then(Value::as_str) == Some("turn_metrics")
+        {
+            self.metrics = Some(value.clone());
+            return true;
+        }
+        false
+    }
+}
+
+impl TaskMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
+
+fn timeline_status_label(status: TimelineStatus) -> &'static str {
+    match status {
+        TimelineStatus::Idle => "idle",
+        TimelineStatus::BuildingRequest
+        | TimelineStatus::StreamingProvider
+        | TimelineStatus::RetryingProvider
+        | TimelineStatus::EvaluatingToolCall
+        | TimelineStatus::RunningTool => "running",
+        TimelineStatus::Pending => "queued",
+        TimelineStatus::AwaitingToolResults => "awaiting_tool_results",
+        TimelineStatus::AwaitingExternalInput => "awaiting_external_input",
+        TimelineStatus::Interrupted => "interrupted",
+        TimelineStatus::Resolved | TimelineStatus::Finished => "finished",
+        TimelineStatus::Failed => "failed",
+        TimelineStatus::Canceled => "canceled",
     }
 }
 
