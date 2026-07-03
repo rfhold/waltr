@@ -1,61 +1,104 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
-use tokio::{sync::Mutex, time::timeout};
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::Result;
 
 use super::{
+    capabilities::McpServerCapabilities,
     config::McpServerConfig,
-    protocol::{
-        MCP_PROTOCOL_VERSION, json_rpc_notification, json_rpc_request, next_id, protocol_error,
-    },
+    connection::{McpConnection, McpConnectionHandler, roots_response},
+    event::McpRuntimeEvent,
+    protocol::{JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION, protocol_error},
     tool::{McpToolDefinition, format_tool_result, parse_tool_definition},
-    transport::McpTransport,
 };
 
-pub(in crate::mcp) struct McpServer {
+#[derive(Debug, Clone, Default)]
+pub(in crate::mcp) struct McpToolRegistry {
+    pub(in crate::mcp) tools: BTreeMap<String, McpToolDefinition>,
+    pub(in crate::mcp) generation: u64,
+}
+
+pub(in crate::mcp) struct McpServerRuntime {
     name: String,
-    transport: McpTransport,
+    connection: Arc<McpConnection>,
     timeout: Duration,
+    #[allow(dead_code)]
+    root_uri: String,
+    events: broadcast::Sender<McpRuntimeEvent>,
     state: Mutex<McpServerState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct McpServerState {
     initialized: bool,
-    tools: Option<Vec<McpToolDefinition>>,
+    capabilities: McpServerCapabilities,
+    tools: McpToolRegistry,
+    last_sse_event_id: Option<String>,
 }
 
-impl McpServer {
-    pub(in crate::mcp) fn new(config: McpServerConfig, timeout: Duration) -> Self {
+impl Default for McpServerState {
+    fn default() -> Self {
         Self {
-            name: config.name,
-            transport: McpTransport::new(config.transport),
-            timeout,
-            state: Mutex::new(McpServerState::default()),
+            initialized: false,
+            capabilities: McpServerCapabilities::default(),
+            tools: McpToolRegistry::default(),
+            last_sse_event_id: None,
         }
+    }
+}
+
+struct ServerHandler {
+    name: String,
+    root_uri: String,
+    events: broadcast::Sender<McpRuntimeEvent>,
+    refresh: Mutex<Option<Arc<McpServerRuntime>>>,
+}
+
+impl McpServerRuntime {
+    pub(in crate::mcp) async fn start(
+        config: McpServerConfig,
+        timeout: Duration,
+        root_uri: String,
+        events: broadcast::Sender<McpRuntimeEvent>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Arc<Self>> {
+        let name = config.name.clone();
+        let handler = Arc::new(ServerHandler {
+            name: name.clone(),
+            root_uri: root_uri.clone(),
+            events: events.clone(),
+            refresh: Mutex::new(None),
+        });
+        let connection = McpConnection::start(config.transport, handler.clone()).await?;
+        let runtime = Arc::new(Self {
+            name,
+            connection,
+            timeout,
+            root_uri,
+            events,
+            state: Mutex::new(McpServerState::default()),
+        });
+        *handler.refresh.lock().await = Some(Arc::clone(&runtime));
+        runtime.ensure_initialized(cancellation_token).await?;
+        Ok(runtime)
     }
 
     pub(in crate::mcp) fn name(&self) -> &str {
         &self.name
     }
 
-    pub(in crate::mcp) async fn list_tools(
-        &self,
-        cancellation_token: CancellationToken,
-    ) -> Result<Vec<McpToolDefinition>> {
-        self.ensure_initialized(cancellation_token.clone()).await?;
-        let mut state = self.state.lock().await;
-        if let Some(tools) = &state.tools {
-            return Ok(tools.clone());
-        }
-        let mut tools = self.fetch_tools(cancellation_token).await?;
-        tools.sort_by(|left, right| left.name.cmp(&right.name));
-        state.tools = Some(tools.clone());
-        drop(state);
-        Ok(tools)
+    pub(in crate::mcp) async fn tools(&self) -> Vec<McpToolDefinition> {
+        self.state
+            .lock()
+            .await
+            .tools
+            .tools
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub(in crate::mcp) async fn call_tool(
@@ -65,38 +108,39 @@ impl McpServer {
         cancellation_token: CancellationToken,
     ) -> Result<String> {
         self.ensure_initialized(cancellation_token.clone()).await?;
+        let params = json!({
+            "name": tool,
+            "arguments": arguments,
+            "_meta": {
+                "progressToken": format!("{}:{tool}", self.name),
+            }
+        });
         let response = self
-            .request(
-                "tools/call",
-                Some(json!({
-                    "name": tool,
-                    "arguments": arguments,
-                })),
-                cancellation_token,
-            )
+            .connection
+            .request("tools/call", Some(params), self.timeout, cancellation_token)
             .await?;
         Ok(format_tool_result(&response))
     }
 
     async fn ensure_initialized(&self, cancellation_token: CancellationToken) -> Result<()> {
-        if cancellation_token.is_cancelled() {
-            return Err(protocol_error("MCP request canceled"));
-        }
         if self.state.lock().await.initialized {
             return Ok(());
         }
-
         let response = self
+            .connection
             .request(
                 "initialize",
                 Some(json!({
                     "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
+                    "capabilities": {
+                        "roots": { "listChanged": false }
+                    },
                     "clientInfo": {
                         "name": "waltr-agent",
                         "version": env!("CARGO_PKG_VERSION")
                     }
                 })),
+                self.timeout,
                 cancellation_token.clone(),
             )
             .await?;
@@ -109,25 +153,39 @@ impl McpServer {
                 "unsupported MCP protocol version `{protocol}`"
             )));
         }
-        self.notify("notifications/initialized", None, cancellation_token)
+        let capabilities = McpServerCapabilities::parse(response.get("capabilities"));
+        self.connection
+            .notify("notifications/initialized", None)
             .await?;
-        self.state.lock().await.initialized = true;
+        self.connection.mark_initialized().await;
+        {
+            let mut state = self.state.lock().await;
+            state.capabilities = capabilities;
+            state.initialized = true;
+        }
+        self.refresh_tools(cancellation_token).await?;
+        drop(self.events.send(McpRuntimeEvent::ServerInitialized {
+            server_key: self.name.clone(),
+        }));
         Ok(())
     }
 
-    async fn fetch_tools(
-        &self,
-        cancellation_token: CancellationToken,
-    ) -> Result<Vec<McpToolDefinition>> {
+    async fn refresh_tools(&self, cancellation_token: CancellationToken) -> Result<()> {
+        if self.state.lock().await.capabilities.tools.is_none() {
+            return Ok(());
+        }
         let mut cursor = None;
-        let mut tools = Vec::new();
+        let mut tools = BTreeMap::new();
         loop {
-            if cancellation_token.is_cancelled() {
-                return Err(protocol_error("MCP request canceled"));
-            }
             let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
             let response = self
-                .request("tools/list", params, cancellation_token.clone())
+                .connection
+                .request(
+                    "tools/list",
+                    params,
+                    self.timeout,
+                    cancellation_token.clone(),
+                )
                 .await?;
             for tool in response
                 .get("tools")
@@ -136,7 +194,7 @@ impl McpServer {
                 .flatten()
             {
                 if let Some(tool) = parse_tool_definition(tool) {
-                    tools.push(tool);
+                    tools.insert(tool.name.clone(), tool);
                 }
             }
             cursor = response
@@ -147,49 +205,110 @@ impl McpServer {
                 break;
             }
         }
-        Ok(tools)
-    }
-
-    async fn request(
-        &self,
-        method: &str,
-        params: Option<Value>,
-        cancellation_token: CancellationToken,
-    ) -> Result<Value> {
-        let id = next_id();
-        let request = json_rpc_request(id, method, params);
-        self.transport
-            .request(request, Some(id), self.timeout, cancellation_token)
-            .await
-            .map_err(|error| match error {
-                crate::LlmError::Protocol {
-                    provider: _,
-                    message,
-                } if message == "MCP request timed out" => protocol_error(format!(
-                    "MCP request `{method}` timed out after {:?}",
-                    self.timeout
-                )),
-                other => other,
-            })
-    }
-
-    async fn notify(
-        &self,
-        method: &str,
-        params: Option<Value>,
-        cancellation_token: CancellationToken,
-    ) -> Result<()> {
-        if cancellation_token.is_cancelled() {
-            return Err(protocol_error("MCP request canceled"));
-        }
-        let request = json_rpc_notification(method, params);
-        timeout(
-            self.timeout,
-            self.transport
-                .request(request, None, self.timeout, cancellation_token),
-        )
-        .await
-        .map_err(|_| protocol_error(format!("MCP notification `{method}` timed out")))??;
+        let generation = {
+            let mut state = self.state.lock().await;
+            state.tools.tools = tools;
+            state.tools.generation += 1;
+            state.tools.generation
+        };
+        drop(self.events.send(McpRuntimeEvent::ToolsChanged {
+            server_key: self.name.clone(),
+            generation,
+        }));
         Ok(())
+    }
+
+    pub(in crate::mcp) async fn shutdown(&self) {
+        self.connection.shutdown().await;
+    }
+}
+
+impl McpConnectionHandler for ServerHandler {
+    fn notification(&self, notification: JsonRpcNotification) {
+        match notification.method.as_str() {
+            "notifications/tools/list_changed" => {
+                let name = self.name.clone();
+                let events = self.events.clone();
+                let refresh = self
+                    .refresh
+                    .try_lock()
+                    .ok()
+                    .and_then(|runtime| runtime.clone());
+                if let Some(runtime) = refresh {
+                    tokio::spawn(async move {
+                        if let Err(error) = runtime.refresh_tools(CancellationToken::new()).await {
+                            tracing::warn!(server = %name, %error, "failed to refresh MCP tools");
+                        }
+                    });
+                } else {
+                    drop(events.send(McpRuntimeEvent::ToolsChanged {
+                        server_key: name,
+                        generation: 0,
+                    }));
+                }
+            }
+            "notifications/message" => {
+                let params = notification.params.unwrap_or(Value::Null);
+                let level = params
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let logger = params
+                    .get("logger")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let data = params.get("data").cloned().unwrap_or(Value::Null);
+                tracing::debug!(server = %self.name, ?level, ?logger, data = %data, "mcp log message");
+                drop(self.events.send(McpRuntimeEvent::LogMessage {
+                    server_key: self.name.clone(),
+                    level,
+                    logger,
+                    data,
+                }));
+            }
+            "notifications/progress" => {
+                let params = notification.params.unwrap_or(Value::Null);
+                let Some(token) = params.get("progressToken").cloned() else {
+                    return;
+                };
+                drop(
+                    self.events.send(McpRuntimeEvent::Progress {
+                        server_key: self.name.clone(),
+                        token,
+                        progress: params.get("progress").and_then(Value::as_f64),
+                        total: params.get("total").and_then(Value::as_f64),
+                        message: params
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn request(&self, request: JsonRpcRequest) -> Value {
+        roots_response(request, &self.root_uri)
+    }
+
+    fn disconnected(&self, error: String) {
+        drop(self.events.send(McpRuntimeEvent::ServerDisconnected {
+            server_key: self.name.clone(),
+            error,
+        }));
+    }
+
+    fn sse_event_id(&self, id: String) {
+        let refresh = self
+            .refresh
+            .try_lock()
+            .ok()
+            .and_then(|runtime| runtime.clone());
+        if let Some(runtime) = refresh {
+            tokio::spawn(async move {
+                runtime.state.lock().await.last_sse_event_id = Some(id);
+            });
+        }
     }
 }

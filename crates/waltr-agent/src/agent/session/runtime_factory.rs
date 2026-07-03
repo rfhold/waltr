@@ -4,7 +4,7 @@ use crate::{
     AgentRuntimeBuilder, AgentsPromptConfig, FilesystemPromptConfig, ModelApi, ModelCost, ModelRef,
     PermissionEffect, PermissionPolicy, ProviderId, SkillsConfig,
     filesystem::FilesystemConfig,
-    mcp::{McpConfig, McpServerConfig},
+    mcp::{McpClientRuntime, McpConfig, McpServerConfig},
     provider::{
         AnthropicMessages, OpenAiChatCompletions, OpenAiReasoningConfig, OpenAiReasoningEffort,
         OpenAiReasoningSummary, OpenAiResponses, OpenAiResponsesWebSocket,
@@ -125,30 +125,39 @@ impl AgentSessionRuntimeFactory {
                 .with_shell_system_prompt(ShellPromptConfig::new(self.root.clone()));
         }
 
-        builder = builder
-            .with_mcp_servers(mcp_config(settings)?)
-            .await
-            .map_err(|error| {
-                AgentSessionRuntimeError::FailedPrecondition(format!(
-                    "failed to initialize MCP tools: {error}"
-                ))
-            })?;
-
         Ok(builder)
     }
 
     /// Build a runtime builder with default session-backed tools.
-    pub async fn runtime_builder_for_sessions<S>(
+    pub(crate) async fn runtime_builder_for_sessions<S>(
         &self,
         settings: &SessionRuntimeSettings,
         sessions: SessionCoordinator<S>,
+        mcp_runtime: Option<Arc<McpClientRuntime>>,
     ) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError>
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        Ok(self.runtime_builder(settings).await?.with_task_tool(
+        let mut builder = self.runtime_builder(settings).await?.with_task_tool(
             TaskConfig::new(sessions).with_max_subagent_depth(self.task_max_subagent_depth),
-        ))
+        );
+        if let Some(mcp_runtime) = mcp_runtime {
+            for tool in mcp_runtime.agent_tools().await {
+                builder = builder.with_tool(tool);
+            }
+        }
+        Ok(builder)
+    }
+
+    pub(crate) fn mcp_config(
+        &self,
+        settings: &SessionRuntimeSettings,
+    ) -> Result<McpConfig, AgentSessionRuntimeError> {
+        mcp_config(settings)
+    }
+
+    pub(crate) fn mcp_root_uri(&self) -> String {
+        format!("file://{}", self.root.display())
     }
 
     async fn provider_builder(

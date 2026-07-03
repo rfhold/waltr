@@ -2,11 +2,8 @@
 
 use std::{fmt, path::PathBuf, sync::Arc};
 
-use tokio_util::sync::CancellationToken;
-
 use crate::{
-    LlmStream, ModelCost, ModelRef, PermissionPolicy, Result, SystemPromptBuilder,
-    mcp::McpConfig,
+    LlmStream, ModelCost, ModelRef, PermissionPolicy, SystemPromptBuilder,
     middleware::{
         AgentMiddleware, agents::AgentsInstructionsMiddleware, chain::MiddlewareChain,
         claims::FilesystemClaimsMiddleware, prompt::SystemPromptMiddleware,
@@ -144,36 +141,6 @@ impl AgentRuntimeBuilder {
             .get_or_insert_with(Vec::new)
             .extend(skills);
         self
-    }
-
-    /// Opt into configured MCP servers as host tools.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any MCP server cannot be initialized or its tools cannot be listed.
-    #[allow(clippy::needless_pass_by_value)]
-    pub async fn with_mcp_servers(mut self, config: McpConfig) -> Result<Self> {
-        self.tools.extend(config.into_agent_tools().await?);
-        Ok(self)
-    }
-
-    /// Opt into configured MCP servers as host tools with caller-controlled cancellation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any MCP server cannot be initialized or its tools cannot be listed.
-    #[allow(clippy::needless_pass_by_value)]
-    pub async fn with_mcp_servers_with_cancellation(
-        mut self,
-        config: McpConfig,
-        cancellation_token: CancellationToken,
-    ) -> Result<Self> {
-        self.tools.extend(
-            config
-                .into_agent_tools_with_cancellation(cancellation_token)
-                .await?,
-        );
-        Ok(self)
     }
 
     /// Opt into the structured user question tool.

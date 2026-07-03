@@ -4,9 +4,11 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::Router;
 use waltr_agent::{
-    AgentRuntime, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, LlmError, LlmStream, ModelRef,
-    TimelineContent,
-    mcp::{McpConfig, McpServerConfig},
+    AgentRuntime, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, FileCredentialStore, LlmError, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, RunConflictPolicy, SessionCoordinator,
+    SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
+    SessionRuntimeSettings, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
 };
 use rmcp::{
     ServerHandler,
@@ -43,17 +45,25 @@ async fn run_live_mcp(
     let http_server = HttpMcpTestServer::start().await?;
     let provider = Arc::new(CapturingProvider::new(provider));
 
-    let agent = AgentRuntime::builder(model, Arc::clone(&provider))
-        .with_mcp_servers(
-            McpConfig::new()
-                .with_server(stdio_server(&stdio_command))
-                .with_server(http_server.server_config()),
-        )
-        .await?
-        .build();
     let prompt = "Use the mcp_stdio_test_echo_marker tool exactly once with value stdio-mcp-tool-called-707. Use the mcp_http_test_echo_marker tool exactly once with value http-mcp-tool-called-707. After both tool calls return, report a concise final status containing stdio-mcp-tool-called-707, http-mcp-tool-called-707, and mcp-flow-complete.";
 
-    let session = AgentTestSession::run(&agent, &provider, prompt).await?;
+    let sessions = mcp_sessions(
+        Arc::clone(&provider),
+        model,
+        vec![
+            stdio_runtime_server(&stdio_command),
+            http_runtime_server(&http_server),
+        ],
+    );
+    let session = run_session_prompt(
+        &sessions,
+        prompt,
+        vec![
+            stdio_runtime_server(&stdio_command),
+            http_runtime_server(&http_server),
+        ],
+    )
+    .await?;
     crate::session::report_tool_errors(&provider, &session, "mcp live test");
     let context = format!(
         "{}\n{}",
@@ -91,10 +101,6 @@ async fn run_live_mcp(
     Ok(())
 }
 
-fn stdio_server(command: &str) -> McpServerConfig {
-    McpServerConfig::stdio("stdio_test", command, std::iter::empty::<&str>())
-}
-
 fn assert_tool_was_surfaced(provider: &CapturingProvider<impl LlmStream>, name: &str) {
     let tools = provider.all_tool_names();
     assert!(
@@ -124,6 +130,122 @@ fn test_stdio_server_command() -> String {
     }
     path.push("waltr-agent-test-mcp-server");
     path.display().to_string()
+}
+
+fn stdio_runtime_server(command: &str) -> SessionMcpServerRuntimeSettings {
+    SessionMcpServerRuntimeSettings {
+        key: "stdio_test".to_owned(),
+        kind: SessionMcpServerRuntimeKind::Stdio,
+        command: command.to_owned(),
+        url: String::new(),
+    }
+}
+
+fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSettings {
+    SessionMcpServerRuntimeSettings {
+        key: "http_test".to_owned(),
+        kind: SessionMcpServerRuntimeKind::StreamableHttp,
+        command: String::new(),
+        url: format!("http://{}/mcp", server.address),
+    }
+}
+
+fn mcp_sessions(
+    provider: Arc<impl LlmStream + 'static>,
+    model: ModelRef,
+    _mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+) -> SessionCoordinator<MemorySessionStore> {
+    let root = tempfile::tempdir().expect("tempdir").keep();
+    let credentials = FileCredentialStore::new(root.join("credentials.json"));
+    let factory = AgentSessionRuntimeFactory::new(root, credentials)
+        .with_runtime_builder(move |_| Ok(AgentRuntime::builder(model.clone(), provider.clone())));
+    SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory)
+}
+
+async fn run_session_prompt(
+    sessions: &SessionCoordinator<MemorySessionStore>,
+    prompt: &str,
+    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+) -> waltr_agent::Result<AgentTestSession> {
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(&session_id, Some(test_runtime_settings(mcp_servers)))
+        .await?;
+    let submission = sessions
+        .submit_prompt(session_id.clone(), prompt, RunConflictPolicy::ReplaceActive)
+        .await?;
+    submission.handle.wait().await?;
+    let events = sessions
+        .timeline(&session_id, TimelineQuery::forward(None, 500))
+        .await?;
+    Ok(test_session_from_timeline(events))
+}
+
+fn test_runtime_settings(
+    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+) -> SessionRuntimeSettings {
+    SessionRuntimeSettings {
+        provider: SessionProviderRuntimeSettings {
+            key: "test".to_owned(),
+            api: ModelApi::OpenAiResponses,
+            url: String::new(),
+            model_id: "live-model".to_owned(),
+            model_cost: None,
+            headers: Default::default(),
+            oauth: None,
+            reasoning_effort: None,
+        },
+        mcp_servers,
+    }
+}
+
+fn test_session_from_timeline(timeline: Vec<AgentTimelineEvent>) -> AgentTestSession {
+    let mut session = AgentTestSession::default();
+    let mut saw_tool_result = false;
+    for event in timeline {
+        match &event.content {
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                if saw_tool_result && !delta.is_empty() {
+                    session.saw_text_after_tool_result = true;
+                }
+                session.text.push_str(delta);
+            }
+            TimelineContent::ToolCall { call }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_CALL) =>
+            {
+                session.tool_calls.push(call.clone());
+            }
+            TimelineContent::ToolResult { result }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) =>
+            {
+                session.tool_results.push(result.clone());
+                saw_tool_result = true;
+                if result.content.starts_with("Tool error:") {
+                    session.tool_errors.push(result.clone());
+                }
+            }
+            TimelineContent::ExternalRequest { request } => {
+                session.external_requests.push(request.clone());
+            }
+            TimelineContent::Empty
+                if event.kind == TimelineEventKind::SessionStatusChanged
+                    && event.status == Some(TimelineStatus::Finished) =>
+            {
+                session.finished = true;
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. } => {}
+        }
+        session.timeline.push(event);
+    }
+    session
 }
 
 #[derive(Debug)]
@@ -156,10 +278,6 @@ impl HttpMcpTestServer {
             address,
             shutdown: Some(shutdown_sender),
         })
-    }
-
-    fn server_config(&self) -> McpServerConfig {
-        McpServerConfig::streamable_http("http_test", format!("http://{}/mcp", self.address))
     }
 }
 
