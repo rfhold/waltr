@@ -5,10 +5,11 @@ use std::sync::Arc;
 use futures_util::{StreamExt as _, stream};
 use waltr_agent::{
     AgentRuntime, AgentSessionRuntimeFactory, BoxCompletionStream, BoxStreamFuture,
-    CompletionEvent, CompletionReplayItem, CompletionRequest, FileCredentialStore, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, ProviderId, RunConflictPolicy, SessionCoordinator,
-    SessionId, SessionJournalEvent, SessionProviderRuntimeSettings, SessionRuntimeSettings,
-    ToolCall, tools::task::TASK_TOOL_NAME,
+    CHANNEL_TOOL_PROGRESS_INFO, CompletionEvent, CompletionReplayItem, CompletionRequest,
+    FileCredentialStore, LlmStream, MemorySessionStore, ModelApi, ModelRef, ProviderId,
+    RunConflictPolicy, SessionCoordinator, SessionId, SessionJournalEvent,
+    SessionProviderRuntimeSettings, SessionRuntimeSettings, TimelineChannel, TimelineContent,
+    TimelineQuery, ToolCall, tools::task::TASK_TOOL_NAME,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify};
@@ -85,6 +86,23 @@ async fn task_tool_sync_mode_returns_child_assistant_text() -> waltr_agent::Resu
         .load(&SessionId::new("task_ephemeral_0_task-call"))
         .await?;
     assert_eq!(child.record.metadata.values["waltr.task.depth"], json!(1));
+    let progress = task_progress_events(&runs, &SessionId::new("ephemeral")).await?;
+    assert!(
+        progress
+            .iter()
+            .any(|event| event["description"] == "child work"
+                && event["mode"] == "sync"
+                && event["status"] == "running"),
+        "progress events: {progress:#?}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|event| event["description"] == "child work"
+                && event["mode"] == "sync"
+                && event["status"] == "finished"),
+        "progress events: {progress:#?}"
+    );
 
     Ok(())
 }
@@ -287,6 +305,24 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
         runs.active_state(&second_task_id).await.is_some(),
         "second child task should still be running"
     );
+    let progress = task_progress_events(&runs, &parent_id).await?;
+    assert_eq!(progress.len(), 2, "progress events: {progress:#?}");
+    assert!(
+        progress
+            .iter()
+            .any(|event| event["taskId"] == "task_parent_0_task-1"
+                && event["mode"] == "async"
+                && event["status"] == "running"),
+        "progress events: {progress:#?}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|event| event["taskId"] == "task_parent_0_task-2"
+                && event["mode"] == "async"
+                && event["status"] == "running"),
+        "progress events: {progress:#?}"
+    );
 
     timeout(
         Duration::from_secs(2),
@@ -450,6 +486,30 @@ fn test_model() -> ModelRef {
 
 fn request_has_task(request: &CompletionRequest<'_>) -> bool {
     request.tools.iter().any(|tool| tool.name == TASK_TOOL_NAME)
+}
+
+async fn task_progress_events(
+    runs: &SessionCoordinator<MemorySessionStore>,
+    session_id: &SessionId,
+) -> waltr_agent::Result<Vec<Value>> {
+    let events = runs
+        .timeline(
+            session_id,
+            TimelineQuery::forward(None, 128)
+                .with_channels([TimelineChannel::from(CHANNEL_TOOL_PROGRESS_INFO)]),
+        )
+        .await?;
+    Ok(events
+        .into_iter()
+        .filter_map(|event| match event.content {
+            TimelineContent::Json { value }
+                if value.get("kind").and_then(Value::as_str) == Some("task_progress") =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect())
 }
 
 fn task_sessions<P>(
