@@ -5,9 +5,12 @@ use std::{fs, net::SocketAddr, sync::Arc, time::Duration};
 use axum::Router;
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, LlmError, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, ProviderId, SessionCoordinator, SessionStore, ToolCall,
-    mcp::{McpConfig, McpServerConfig},
+    AgentRuntime, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, FileCredentialStore, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus, ProviderId, SessionCoordinator,
+    SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
+    SessionRuntimeSettings, SessionStore, Suspension, TimelineContent, TimelineEventKind,
+    TimelineQuery, TimelineStatus, ToolCall,
 };
 use rmcp::{
     ServerHandler,
@@ -20,7 +23,6 @@ use rmcp::{
 };
 use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot};
-use tokio_util::sync::CancellationToken;
 
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
@@ -37,15 +39,16 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
         |request| direct_events(request.tool_results().count()),
     )));
 
-    let agent = AgentRuntime::builder(test_model(), provider.clone())
-        .with_mcp_servers(
-            McpConfig::new()
-                .with_server(stdio_server(&stdio_command))
-                .with_server(http_server.server_config()),
-        )
-        .await?
-        .build();
-    let session = AgentTestSession::run(&agent, &provider, "call direct MCP tools").await?;
+    let sessions = mcp_sessions(provider.clone());
+    let session = run_session_prompt(
+        &sessions,
+        "call direct MCP tools",
+        vec![
+            stdio_runtime_server(&stdio_command),
+            http_runtime_server(&http_server),
+        ],
+    )
+    .await?;
     session.require_tool_execution(provider.name())?;
     let context = format!(
         "{}\n{}",
@@ -75,36 +78,9 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
 }
 
 #[tokio::test]
-async fn mcp_tool_discovery_observes_cancellation() -> waltr_agent::Result<()> {
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-
-    let provider = Arc::new(ScriptedProvider::from_turns(
-        "unused_canceled_mcp_provider",
-        vec![vec![CompletionEvent::Finished]],
-    ));
-    let error = AgentRuntime::builder(test_model(), provider)
-        .with_mcp_servers_with_cancellation(
-            McpConfig::new().with_server(stdio_server("command-that-should-not-run")),
-            cancellation,
-        )
-        .await
-        .expect_err("canceled MCP discovery should fail");
-
-    assert!(matches!(
-        error,
-        LlmError::Protocol {
-            provider: "mcp",
-            message
-        } if message == "MCP request canceled"
-    ));
-
-    Ok(())
-}
-
-#[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
+async fn mcp_cancellation_cancels_tool_work_and_preserves_stdio_runtime() -> waltr_agent::Result<()>
+{
     let temp = tempfile::tempdir()?;
     let marker = temp.path().join("mcp-cancel-marker.txt");
     let stdio_command = test_stdio_server_command();
@@ -123,63 +99,78 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
             vec![CompletionEvent::Finished],
         ],
     ));
-    let agent = AgentRuntime::builder(test_model(), provider)
-        .with_mcp_servers(McpConfig::new().with_server(stdio_server(&stdio_command)))
-        .await?
-        .build();
     let store = MemorySessionStore::new();
-    let sessions = SessionCoordinator::new(store.clone());
+    let sessions = mcp_sessions_with_store(store.clone(), provider);
     let session_id = sessions.create().await?.id().clone();
-    let cancellation = CancellationToken::new();
-    let mut stream = sessions
-        .prompt(&agent, session_id.clone(), "run delayed MCP write")
-        .with_cancellation_token(cancellation.clone())
-        .stream();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![stdio_runtime_server(
+                &stdio_command,
+            )])),
+        )
+        .await?;
+    let submission = sessions
+        .submit_prompt(
+            session_id.clone(),
+            "run delayed MCP write",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?;
+    let mut stream = sessions.watch_timeline(session_id.clone());
 
-    let first = stream
-        .next()
-        .await
-        .expect("tool call event")
-        .expect("tool call event");
-    assert!(crate::session::channel_is(&first, CHANNEL_TOOL_CALL));
+    loop {
+        let update = stream.next().await.expect("tool call event");
+        let waltr_agent::SessionTimelineEvent::Event(event) = update.event else {
+            continue;
+        };
+        if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) {
+            panic!("MCP tool finished before cancellation: {event:#?}");
+        }
+        if crate::session::channel_is(&event, CHANNEL_TOOL_CALL) {
+            break;
+        }
+    }
 
     tokio::select! {
         event = stream.next() => panic!("MCP tool finished before cancellation: {event:#?}"),
-        () = tokio::time::sleep(Duration::from_secs(1)) => cancellation.cancel(),
+        () = tokio::time::sleep(Duration::from_secs(1)) => {}
     }
+    sessions.interrupt(&session_id).await?;
+    drop(submission.handle.wait().await);
 
-    let remaining = stream
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .map(|event| event.expect("agent event"))
-        .collect::<Vec<_>>();
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let remaining = sessions
+        .timeline(&session_id, TimelineQuery::forward(None, 100))
+        .await?;
 
     assert!(
-        remaining
-            .iter()
-            .all(|event| !crate::session::channel_is(event, CHANNEL_TOOL_RESULT)),
-        "canceled run should not finish the MCP tool: {remaining:#?}"
+        remaining.iter().any(|event| {
+            matches!(
+                &event.content,
+                TimelineContent::ToolResult { result }
+                    if crate::session::channel_is(event, CHANNEL_TOOL_RESULT)
+                        && result.content == "interrupted"
+            )
+        }),
+        "canceled run should persist an interrupted MCP tool result: {remaining:#?}"
     );
     assert!(
         !marker.exists() || fs::read_to_string(&marker)?.is_empty(),
-        "canceled MCP tool should not write marker"
+        "canceled MCP tool should not write marker before the server observes cancellation"
     );
     let record = store.load(&session_id).await.expect("stored session");
     assert!(record.snapshot().pending_work.iter().any(|work| {
         work.id == "mcp-cancel-call"
             && matches!(
                 work.status,
-                waltr_agent::PendingWorkStatus::Canceled(
-                    waltr_agent::CancelReason::SessionInterrupted
-                )
+                PendingWorkStatus::Canceled(waltr_agent::CancelReason::SessionInterrupted)
             )
     }));
     assert!(matches!(
         record.snapshot().status,
-        waltr_agent::SessionStatus::Suspended(waltr_agent::Suspension::Interrupted { .. })
+        waltr_agent::SessionStatus::Suspended(Suspension::Interrupted { .. })
     ));
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let recovery_provider = Arc::new(ScriptedProvider::from_turns(
         "mcp_recovery_provider",
@@ -192,12 +183,13 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
             vec![CompletionEvent::Finished],
         ],
     ));
-    let recovery_agent = AgentRuntime::builder(test_model(), recovery_provider.clone())
-        .with_mcp_servers(McpConfig::new().with_server(stdio_server(&stdio_command)))
-        .await?
-        .build();
-    let recovery =
-        AgentTestSession::run(&recovery_agent, &recovery_provider, "recover MCP stdio").await?;
+    let recovery_sessions = mcp_sessions(recovery_provider.clone());
+    let recovery = run_session_prompt(
+        &recovery_sessions,
+        "recover MCP stdio",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
     assert!(
         tool_result_text(&recovery).contains("stdio-after-cancel-909"),
         "{}",
@@ -207,8 +199,127 @@ async fn mcp_cancellation_kills_stdio_tool_work() -> waltr_agent::Result<()> {
     Ok(())
 }
 
-fn stdio_server(command: &str) -> McpServerConfig {
-    McpServerConfig::stdio("stdio_test", command, std::iter::empty::<&str>())
+fn stdio_runtime_server(command: &str) -> SessionMcpServerRuntimeSettings {
+    SessionMcpServerRuntimeSettings {
+        key: "stdio_test".to_owned(),
+        kind: SessionMcpServerRuntimeKind::Stdio,
+        command: command.to_owned(),
+        url: String::new(),
+    }
+}
+
+fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSettings {
+    SessionMcpServerRuntimeSettings {
+        key: "http_test".to_owned(),
+        kind: SessionMcpServerRuntimeKind::StreamableHttp,
+        command: String::new(),
+        url: format!("http://{}/mcp", server.address),
+    }
+}
+
+fn mcp_sessions(provider: Arc<impl LlmStream + 'static>) -> SessionCoordinator<MemorySessionStore> {
+    mcp_sessions_with_store(MemorySessionStore::new(), provider)
+}
+
+fn mcp_sessions_with_store(
+    store: MemorySessionStore,
+    provider: Arc<impl LlmStream + 'static>,
+) -> SessionCoordinator<MemorySessionStore> {
+    let root = tempfile::tempdir().expect("tempdir").keep();
+    let credentials = FileCredentialStore::new(root.join("credentials.json"));
+    let factory = AgentSessionRuntimeFactory::new(root, credentials)
+        .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
+    SessionCoordinator::new(store).with_runtime_factory(factory)
+}
+
+async fn run_session_prompt(
+    sessions: &SessionCoordinator<MemorySessionStore>,
+    prompt: &str,
+    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+) -> waltr_agent::Result<AgentTestSession> {
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(&session_id, Some(test_runtime_settings(mcp_servers)))
+        .await?;
+    let submission = sessions
+        .submit_prompt(
+            session_id.clone(),
+            prompt,
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?;
+    submission.handle.wait().await?;
+    let events = sessions
+        .timeline(&session_id, TimelineQuery::forward(None, 500))
+        .await?;
+    Ok(test_session_from_timeline(events))
+}
+
+fn test_runtime_settings(
+    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+) -> SessionRuntimeSettings {
+    SessionRuntimeSettings {
+        provider: SessionProviderRuntimeSettings {
+            key: "test".to_owned(),
+            api: ModelApi::OpenAiResponses,
+            url: String::new(),
+            model_id: OPENAI_TEST_MODEL.to_owned(),
+            model_cost: None,
+            headers: Default::default(),
+            oauth: None,
+            reasoning_effort: None,
+        },
+        mcp_servers,
+    }
+}
+
+fn test_session_from_timeline(timeline: Vec<AgentTimelineEvent>) -> AgentTestSession {
+    let mut session = AgentTestSession::default();
+    let mut saw_tool_result = false;
+    for event in timeline {
+        match &event.content {
+            TimelineContent::TextDelta { delta }
+                if crate::session::channel_is(&event, CHANNEL_ASSISTANT_TEXT) =>
+            {
+                if saw_tool_result && !delta.is_empty() {
+                    session.saw_text_after_tool_result = true;
+                }
+                session.text.push_str(delta);
+            }
+            TimelineContent::ToolCall { call }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_CALL) =>
+            {
+                session.tool_calls.push(call.clone());
+            }
+            TimelineContent::ToolResult { result }
+                if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) =>
+            {
+                session.tool_results.push(result.clone());
+                saw_tool_result = true;
+                if result.content.starts_with("Tool error:") {
+                    session.tool_errors.push(result.clone());
+                }
+            }
+            TimelineContent::ExternalRequest { request } => {
+                session.external_requests.push(request.clone());
+            }
+            TimelineContent::Empty
+                if event.kind == TimelineEventKind::SessionStatusChanged
+                    && event.status == Some(TimelineStatus::Finished) =>
+            {
+                session.finished = true;
+            }
+            TimelineContent::Empty
+            | TimelineContent::TextDelta { .. }
+            | TimelineContent::TextSnapshot { .. }
+            | TimelineContent::ContentRef { .. }
+            | TimelineContent::Json { .. }
+            | TimelineContent::ToolCall { .. }
+            | TimelineContent::ToolResult { .. } => {}
+        }
+        session.timeline.push(event);
+    }
+    session
 }
 
 fn direct_events(step: usize) -> Vec<waltr_agent::Result<CompletionEvent>> {
@@ -291,10 +402,6 @@ impl HttpMcpTestServer {
             address,
             shutdown: Some(shutdown_sender),
         })
-    }
-
-    fn server_config(&self) -> McpServerConfig {
-        McpServerConfig::streamable_http("http_test", format!("http://{}/mcp", self.address))
     }
 }
 

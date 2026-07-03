@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, LlmError, PendingTimelineEvent, Result,
-    TimelineContent, TimelineItemId, TimelineItemText, TimelineQuery,
+    TimelineContent, TimelineItemId, TimelineItemText, TimelineQuery, mcp::McpClientRuntime,
 };
 use futures_util::StreamExt as _;
 use serde_json::Value;
@@ -39,6 +39,7 @@ where
     sessions: SessionListBroadcaster,
     timeline: SessionTimelineBroadcaster,
     runtime_factory: Option<AgentSessionRuntimeFactory>,
+    mcp_sessions: Arc<Mutex<BTreeMap<SessionId, Arc<McpClientRuntime>>>>,
     active_runs: Arc<Mutex<BTreeMap<SessionId, ActiveSessionRun>>>,
     next_run_id: Arc<AtomicU64>,
 }
@@ -76,6 +77,7 @@ where
             sessions: SessionListBroadcaster::new(),
             timeline: SessionTimelineBroadcaster::new(),
             runtime_factory: None,
+            mcp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
             next_run_id: Arc::new(AtomicU64::new(0)),
         }
@@ -207,6 +209,9 @@ where
         AgentSessionRuntime::new(&self.store)
             .delete_session(id)
             .await?;
+        if let Some(runtime) = self.mcp_sessions.lock().await.remove(id) {
+            runtime.shutdown().await;
+        }
         self.sessions.publish(SessionListEvent::Deleted(id.clone()));
         Ok(())
     }
@@ -403,6 +408,9 @@ where
         let record = AgentSessionRuntime::new(&self.store)
             .set_runtime_settings(id, runtime_settings)
             .await?;
+        if let Some(runtime) = self.mcp_sessions.lock().await.remove(id) {
+            runtime.shutdown().await;
+        }
         self.sessions
             .publish(SessionListEvent::Upsert(record.summary()));
         Ok(AgentSession::new(record))
@@ -767,10 +775,37 @@ where
                 "session runtime factory is not configured".to_owned(),
             )
         })?;
+        let mcp_runtime = self
+            .ensure_mcp_runtime(session_id, settings, factory)
+            .await?;
         let builder = factory
-            .runtime_builder_for_sessions(settings, self.clone())
+            .runtime_builder_for_sessions(settings, self.clone(), mcp_runtime)
             .await?;
         Ok(builder.build())
+    }
+
+    async fn ensure_mcp_runtime(
+        &self,
+        session_id: &SessionId,
+        settings: &SessionRuntimeSettings,
+        factory: &AgentSessionRuntimeFactory,
+    ) -> std::result::Result<Option<Arc<McpClientRuntime>>, super::AgentSessionRuntimeError> {
+        if settings.mcp_servers.is_empty() {
+            return Ok(None);
+        }
+        if let Some(runtime) = self.mcp_sessions.lock().await.get(session_id).cloned() {
+            return Ok(Some(runtime));
+        }
+        let config = factory.mcp_config(settings)?;
+        let runtime =
+            McpClientRuntime::start(config, factory.mcp_root_uri(), CancellationToken::new())
+                .await
+                .map_err(super::AgentSessionRuntimeError::from)?;
+        self.mcp_sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&runtime));
+        Ok(Some(runtime))
     }
 }
 

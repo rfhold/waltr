@@ -1,103 +1,33 @@
-use std::{process::Stdio, time::Duration};
+use std::{process::Stdio, sync::Arc};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, Command},
     sync::Mutex,
-    time,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::Result;
 
-use super::super::protocol::{JsonRpcMessage, json_rpc_result, protocol_error};
+use super::{InboundSender, TransportInbound};
+use crate::mcp::protocol::{parse_json_rpc_str, protocol_error};
 
 pub(in crate::mcp) struct StdioTransport {
-    command: String,
-    args: Vec<String>,
-    connection: Mutex<Option<StdioConnection>>,
-}
-
-struct StdioConnection {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<ChildStdin>>,
 }
 
 impl StdioTransport {
-    pub(in crate::mcp) fn new(command: String, args: Vec<String>) -> Self {
-        Self {
-            command,
-            args,
-            connection: Mutex::new(None),
-        }
-    }
-
-    #[allow(clippy::significant_drop_tightening)]
-    pub(in crate::mcp) async fn request(
-        &self,
-        request: Value,
-        id: Option<u64>,
-        timeout: Duration,
-        cancellation_token: CancellationToken,
-    ) -> Result<Value> {
-        if cancellation_token.is_cancelled() {
-            return Err(protocol_error("MCP request canceled"));
-        }
-        let mut connection = self.connection.lock().await;
-        if cancellation_token.is_cancelled() {
-            return Err(protocol_error("MCP request canceled"));
-        }
-        if connection.is_none() {
-            *connection = Some(self.spawn()?);
-        }
-        if cancellation_token.is_cancelled() {
-            return Err(protocol_error("MCP request canceled"));
-        }
-        let line = serde_json::to_string(&request)?;
-        {
-            let active = connection.as_mut().expect("stdio connection initialized");
-            active.stdin.write_all(line.as_bytes()).await?;
-            active.stdin.write_all(b"\n").await?;
-            active.stdin.flush().await?;
-        }
-        let Some(id) = id else {
-            return Ok(json!(null));
-        };
-        let timeout = time::sleep(timeout);
-        tokio::pin!(timeout);
-        loop {
-            let line = tokio::select! {
-                biased;
-
-                () = cancellation_token.cancelled() => {
-                    reset_connection(&mut connection).await;
-                    return Err(protocol_error("MCP request canceled"));
-                }
-                () = &mut timeout => {
-                    reset_connection(&mut connection).await;
-                    return Err(protocol_error("MCP request timed out"));
-                }
-                line = connection.as_mut().expect("stdio connection initialized").stdout.next_line() => line?,
-            };
-            let Some(line) = line else {
-                reset_connection(&mut connection).await;
-                return Err(protocol_error("MCP stdio server closed stdout"));
-            };
-            let message: JsonRpcMessage = serde_json::from_str(&line)?;
-            if message.id == Some(id) {
-                return json_rpc_result(message);
-            }
-        }
-    }
-
-    fn spawn(&self) -> Result<StdioConnection> {
-        let mut child = Command::new(&self.command)
-            .args(&self.args)
+    pub(in crate::mcp) async fn start(
+        command: String,
+        args: Vec<String>,
+        inbound: InboundSender,
+    ) -> Result<Self> {
+        let mut child = Command::new(&command)
+            .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
         let stdin = child
             .stdin
@@ -107,17 +37,65 @@ impl StdioTransport {
             .stdout
             .take()
             .ok_or_else(|| protocol_error("missing stdout"))?;
-        Ok(StdioConnection {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout).lines(),
+        if let Some(stderr) = child.stderr.take() {
+            let command = command.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => tracing::debug!(server = %command, line, "mcp stderr"),
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::debug!(server = %command, %error, "mcp stderr closed");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => match parse_json_rpc_str(&line) {
+                        Ok(message) => drop(inbound.send(TransportInbound::Message(message))),
+                        Err(error) => drop(inbound.send(TransportInbound::Disconnected(format!(
+                            "invalid MCP stdio JSON-RPC message: {error}"
+                        )))),
+                    },
+                    Ok(None) => {
+                        drop(inbound.send(TransportInbound::Disconnected(
+                            "MCP stdio server closed stdout".to_owned(),
+                        )));
+                        break;
+                    }
+                    Err(error) => {
+                        drop(inbound.send(TransportInbound::Disconnected(format!(
+                            "failed to read MCP stdio stdout: {error}"
+                        ))));
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child: Arc::new(Mutex::new(child)),
+            stdin: Arc::new(Mutex::new(stdin)),
         })
     }
-}
 
-async fn reset_connection(connection: &mut Option<StdioConnection>) {
-    if let Some(mut connection) = connection.take() {
-        drop(connection.child.start_kill());
-        drop(connection.child.wait().await);
+    pub(in crate::mcp) async fn send(&self, message: Value) -> Result<()> {
+        let line = serde_json::to_string(&message)?;
+        let mut stdin = self.stdin.lock().await;
+        stdin.write_all(line.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+        Ok(())
+    }
+
+    pub(in crate::mcp) async fn shutdown(&self) {
+        let mut child = self.child.lock().await;
+        drop(child.start_kill());
+        drop(child.wait().await);
     }
 }

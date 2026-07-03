@@ -3,27 +3,44 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::mcp) struct McpToolDefinition {
     pub(in crate::mcp) name: String,
-    pub(in crate::mcp) description: String,
+    pub(in crate::mcp) title: Option<String>,
+    pub(in crate::mcp) description: Option<String>,
     pub(in crate::mcp) input_schema: Value,
+    pub(in crate::mcp) output_schema: Option<Value>,
+    pub(in crate::mcp) annotations: Option<Value>,
 }
 
 pub(in crate::mcp) fn parse_tool_definition(value: &Value) -> Option<McpToolDefinition> {
     let name = value.get("name")?.as_str()?.to_owned();
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let description = value
         .get("description")
-        .or_else(|| value.get("title"))
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
+        .map(ToOwned::to_owned);
     let input_schema = value
         .get("inputSchema")
         .cloned()
         .unwrap_or_else(empty_object_schema);
     Some(McpToolDefinition {
         name,
+        title,
         description,
         input_schema,
+        output_schema: value.get("outputSchema").cloned(),
+        annotations: value.get("annotations").cloned(),
     })
+}
+
+impl McpToolDefinition {
+    pub(in crate::mcp) fn description_text(&self) -> &str {
+        self.description
+            .as_deref()
+            .or(self.title.as_deref())
+            .unwrap_or("")
+    }
 }
 
 pub(in crate::mcp) fn format_tool_result(result: &Value) -> String {
