@@ -44,6 +44,7 @@ enum TimelineItemModel {
         result_content: String,
         progress_info: String,
         progress_error: String,
+        task_progress: Option<TaskProgressModel>,
         state: ToolState,
     },
     External {
@@ -78,6 +79,18 @@ pub(super) enum TimelineClickTarget {
 struct ToolInputEntry {
     key: String,
     value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaskProgressModel {
+    description: String,
+    task_id: String,
+    mode: String,
+    status: String,
+    run_id: Option<u64>,
+    disposition: String,
+    queued_count: u64,
+    metrics: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -459,6 +472,7 @@ fn upsert_tool_call_item(
         result_content: String::new(),
         progress_info: String::new(),
         progress_error: String::new(),
+        task_progress: None,
         state: ToolState::Loading,
     });
 }
@@ -528,6 +542,7 @@ fn upsert_tool_result_item(
         result_content: content.clone(),
         progress_info: String::new(),
         progress_error: String::new(),
+        task_progress: None,
         state: if *error {
             ToolState::Error
         } else {
@@ -542,6 +557,10 @@ fn append_tool_progress(
     event: &TimelineEventView,
     error: bool,
 ) {
+    if !error && append_task_progress(items, tool_id_by_item_id, event) {
+        return;
+    }
+
     let Some((progress, snapshot)) = tool_progress_content(event) else {
         return;
     };
@@ -568,6 +587,27 @@ fn append_tool_progress(
             target.push_str(&progress);
         }
     }
+}
+
+fn append_task_progress(
+    items: &mut Vec<TimelineItemModel>,
+    tool_id_by_item_id: &BTreeMap<String, String>,
+    event: &TimelineEventView,
+) -> bool {
+    let TimelineContentView::Json { value_json } = &event.content else {
+        return false;
+    };
+    let Some(progress) = task_progress_model(value_json) else {
+        return false;
+    };
+    let tool_item_id = event.parent_id.as_deref().unwrap_or(event.item_id.as_str());
+    let id = tool_id_by_item_id
+        .get(tool_item_id)
+        .map_or(tool_item_id, String::as_str);
+    if let Some(TimelineItemModel::Tool { task_progress, .. }) = find_tool_item_mut(items, id) {
+        *task_progress = Some(progress);
+    }
+    true
 }
 
 fn upsert_external_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEventView) {
@@ -648,6 +688,7 @@ fn append_timeline_item_lines(
             result_content,
             progress_info,
             progress_error,
+            task_progress,
             state,
         } => append_tool_lines(
             lines,
@@ -658,6 +699,7 @@ fn append_timeline_item_lines(
             &result_content,
             &progress_info,
             &progress_error,
+            task_progress.as_ref(),
             state,
             width,
             expanded_shell_tools,
@@ -922,6 +964,7 @@ fn append_tool_lines(
     result_content: &str,
     progress_info: &str,
     progress_error: &str,
+    task_progress: Option<&TaskProgressModel>,
     state: ToolState,
     width: Option<u16>,
     expanded_shell_tools: &BTreeSet<String>,
@@ -937,10 +980,54 @@ fn append_tool_lines(
             width,
             expanded_shell_tools.contains(id),
         ),
+        "task" => append_task_tool_lines(lines, input, result_content, task_progress, state, width),
         "edit" => append_edit_tool_lines(lines, input, state, width),
         "apply_patch" => append_patch_tool_lines(lines, input, result_content, state, width),
         _ => append_generic_tool_lines(lines, name, input_entries, state),
     }
+}
+
+fn append_task_tool_lines(
+    lines: &mut Vec<Line<'static>>,
+    input: &Value,
+    _result_content: &str,
+    progress: Option<&TaskProgressModel>,
+    state: ToolState,
+    width: Option<u16>,
+) {
+    let mut tool_lines = Vec::new();
+    let title = progress
+        .map(|progress| progress.description.clone())
+        .filter(|description| !description.is_empty())
+        .or_else(|| string_input(input, "description"))
+        .unwrap_or_else(|| "Task".to_owned());
+    let status = progress
+        .map(|progress| progress.status.clone())
+        .filter(|status| !status.is_empty())
+        .unwrap_or_else(|| match state {
+            ToolState::Loading => "running".to_owned(),
+            ToolState::Complete => "complete".to_owned(),
+            ToolState::Error => "error".to_owned(),
+        });
+    let mode = progress
+        .map(|progress| progress.mode.clone())
+        .filter(|mode| !mode.is_empty())
+        .or_else(|| string_input(input, "mode"))
+        .unwrap_or_else(|| "sync".to_owned());
+
+    let header = vec![
+        Span::styled("* ", THEME.muted_text_style()),
+        Span::styled(title, tool_header_style(state)),
+        Span::styled(" - ", THEME.muted_text_style()),
+        Span::styled(mode, THEME.focus_style()),
+    ];
+    tool_lines.push(Line::from(header));
+
+    let mut status_line = vec![Span::styled(status, THEME.muted_text_style())];
+    append_tool_state_spans(&mut status_line, state);
+    tool_lines.push(Line::from(status_line));
+
+    append_tool_panel_lines(lines, tool_lines, width);
 }
 
 fn append_generic_tool_lines(
@@ -1300,7 +1387,11 @@ fn metrics_line(event: &TimelineEventView) -> Option<String> {
         return None;
     }
 
-    let input = usage_total_input_tokens(&value);
+    metrics_text_from_value(&value, value_json)
+}
+
+fn metrics_text_from_value(value: &Value, fallback: &str) -> Option<String> {
+    let input = usage_total_input_tokens(value);
     let output = json_u64_path(&value, &["usage", "output_tokens"])
         .or_else(|| json_u64_path(&value, &["usage", "outputTokens"]));
     let cost = json_u64_path(&value, &["cost", "total_micros"])
@@ -1318,10 +1409,54 @@ fn metrics_line(event: &TimelineEventView) -> Option<String> {
     }
 
     if parts.is_empty() {
-        Some(value_json.clone())
+        Some(fallback.to_owned())
     } else {
         Some(parts.join("  "))
     }
+}
+
+fn task_progress_model(value_json: &str) -> Option<TaskProgressModel> {
+    let value = serde_json::from_str::<Value>(value_json).ok()?;
+    if value.get("kind").and_then(Value::as_str) != Some("task_progress") {
+        return None;
+    }
+    let metrics = value
+        .get("metrics")
+        .filter(|metrics| metrics.is_object())
+        .and_then(|metrics| metrics_text_from_value(metrics, &metrics.to_string()));
+    Some(TaskProgressModel {
+        description: value
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        task_id: value
+            .get("taskId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        mode: value
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        run_id: value.get("runId").and_then(Value::as_u64),
+        disposition: value
+            .get("disposition")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        queued_count: value
+            .get("queuedCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        metrics,
+    })
 }
 
 fn usage_total_input_tokens(value: &Value) -> u64 {
