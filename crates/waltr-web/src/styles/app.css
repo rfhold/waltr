@@ -777,6 +777,97 @@
   border-left-color: var(--border-danger);
 }
 
+.sessions__task-tool {
+  display: grid;
+  gap: 0.28rem;
+  max-width: min(38rem, 100%);
+  border: 1px solid color-mix(in srgb, var(--border-subtle) 78%, transparent);
+  border-radius: var(--radius-md);
+  padding: 0.55rem 0.7rem;
+  background: color-mix(in srgb, var(--color-surface-soft) 72%, transparent);
+  color: var(--color-text);
+}
+
+.sessions__task-tool-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+  font-size: 0.9rem;
+  line-height: 1.25;
+}
+
+.sessions__task-tool-header strong {
+  min-width: 0;
+  color: var(--color-text);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.sessions__task-tool-header strong::after {
+  content: " -";
+  color: var(--color-text-subtle);
+  font-weight: 400;
+}
+
+.sessions__task-tool-header span {
+  border: 1px solid color-mix(in srgb, var(--color-accent) 45%, transparent);
+  border-radius: 999px;
+  padding: 0.04rem 0.38rem;
+  background: color-mix(in srgb, var(--color-accent-soft) 46%, transparent);
+  color: var(--color-accent);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.sessions__task-tool--error {
+  border-color: color-mix(in srgb, var(--border-danger) 82%, transparent);
+  background: color-mix(in srgb, var(--color-surface-soft) 78%, var(--color-danger-soft));
+}
+
+.sessions__task-tool--error .sessions__task-tool-header strong {
+  color: var(--color-danger-text);
+}
+
+.sessions__task-tool--error .sessions__task-tool-header span {
+  border-color: color-mix(in srgb, var(--border-danger) 72%, transparent);
+  background: color-mix(in srgb, var(--color-danger-soft) 64%, transparent);
+  color: var(--color-danger-text);
+}
+
+.sessions__task-tool-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0;
+  color: var(--color-text-subtle);
+  font-size: 0.8rem;
+  line-height: 1.25;
+}
+
+.sessions__task-tool-status span:first-child {
+  color: var(--color-text-muted);
+}
+
+.sessions__task-tool-metrics {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.sessions__task-tool-metrics::before {
+  content: "·";
+  color: var(--color-text-subtle);
+}
+
+.sessions__task-tool-metrics span {
+  color: var(--color-text-subtle);
+}
+
 .sessions__shell-output {
   display: grid;
   min-width: 0;

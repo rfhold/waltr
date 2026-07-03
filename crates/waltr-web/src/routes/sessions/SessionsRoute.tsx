@@ -829,6 +829,27 @@ type ToolTimelineItem = {
   resultContent: string;
   progressInfo: string;
   progressError: string;
+  taskProgress?: TaskProgress;
+};
+
+type TaskProgress = {
+  description: string;
+  taskId: string;
+  mode: string;
+  status: string;
+  runId: bigint | null;
+  disposition: string;
+  queuedCount: bigint;
+  metrics?: TaskProgressMetrics;
+};
+
+type TaskProgressMetrics = {
+  contextTokens: bigint;
+  totalInputTokens: bigint;
+  outputTokens: bigint;
+  totalTokens: bigint;
+  costCurrency: string | null;
+  totalCostMicros: bigint;
 };
 
 type TurnMetricsTimelineItem = {
@@ -1010,6 +1031,9 @@ function ToolTimelineItemView(props: {
           onSetExpanded={(expanded) => props.onSetShellOutputExpanded(props.item.id, expanded)}
         />
       </Match>
+      <Match when={props.item.name === "task"}>
+        <TaskToolTimelineItem item={props.item} />
+      </Match>
       <Match when={props.item.name === "edit"}>
         <EditToolTimelineItem item={props.item} />
       </Match>
@@ -1078,6 +1102,34 @@ function ShellToolTimelineItem(props: { item: ToolTimelineItem; expanded: boolea
           <pre class="sessions__tool-terminal"><code>{visibleOutput()}</code></pre>
         </div>
       </Show>
+    </section>
+  );
+}
+
+function TaskToolTimelineItem(props: { item: ToolTimelineItem }) {
+  const progress = () => props.item.taskProgress;
+  const title = () => progress()?.description || stringInput(props.item.input.description) || "Task";
+  const status = () => progress()?.status || taskResultStatus(props.item.resultContent) || (props.item.state === "loading" ? "running" : props.item.state);
+  const mode = () => progress()?.mode || stringInput(props.item.input.mode) || "sync";
+  const metrics = () => progress()?.metrics;
+
+  return (
+    <section class={`sessions__task-tool sessions__task-tool--${props.item.state}`} aria-label="Task tool">
+      <div class="sessions__task-tool-header">
+        <strong>{title()}</strong>
+        <span>{mode()}</span>
+      </div>
+      <p class="sessions__task-tool-status">
+        <span>{status()}</span><ToolStateText state={props.item.state} />
+        <Show when={metrics()}>
+          {(taskMetrics) => (
+            <span class="sessions__task-tool-metrics" aria-label="Task token metrics">
+              <span title={`Input ${formatTokenCount(taskMetrics().totalInputTokens)} / output ${formatTokenCount(taskMetrics().outputTokens)}`}>{formatTokenCount(taskMetrics().contextTokens)} tok</span>
+              <span>{formatCostMicros(taskMetrics().totalCostMicros, taskMetrics().costCurrency)}</span>
+            </span>
+          )}
+        </Show>
+      </p>
     </section>
   );
 }
@@ -1513,6 +1565,8 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
             metricItems.push(item);
             items.push(item);
           }
+        } else if (channel === "tool_progress_info") {
+          appendTaskProgress(toolById, toolIdByItemId, event.itemId, event.parentId, event.content.value_json);
         }
         break;
       }
@@ -1607,6 +1661,73 @@ function upsertToolItem(
   };
   toolById.set(id, item);
   items.push(item);
+}
+
+function appendTaskProgress(
+  toolById: Map<string, ToolTimelineItem>,
+  toolIdByItemId: Map<string, string>,
+  itemId: string,
+  parentId: string | null,
+  valueJson: string,
+) {
+  const progress = taskProgress(valueJson);
+  if (!progress) {
+    return;
+  }
+
+  const toolItemId = parentId ?? itemId;
+  const tool = toolById.get(toolIdByItemId.get(toolItemId) ?? toolItemId);
+  if (!tool) {
+    return;
+  }
+  tool.taskProgress = progress;
+}
+
+function taskProgress(valueJson: string): TaskProgress | undefined {
+  const payload = parseJsonRecord(valueJson);
+  if (payload.kind !== "task_progress") {
+    return undefined;
+  }
+  const metrics = taskProgressMetrics(asRecord(payload.metrics));
+  return {
+    description: stringInput(payload.description),
+    taskId: stringInput(payload.taskId),
+    mode: stringInput(payload.mode),
+    status: stringInput(payload.status),
+    runId: payload.runId === null || payload.runId === undefined ? null : asBigInt(payload.runId),
+    disposition: stringInput(payload.disposition),
+    queuedCount: asBigInt(payload.queuedCount),
+    metrics,
+  };
+}
+
+function taskProgressMetrics(payload: Record<string, unknown> | undefined): TaskProgressMetrics | undefined {
+  if (!payload) {
+    return undefined;
+  }
+  const usage = asRecord(payload.usage) ?? {};
+  const cost = asRecord(payload.cost);
+  const inputTokens = asBigInt(usage.inputTokens);
+  const outputTokens = asBigInt(usage.outputTokens);
+  const cacheReadTokens = asBigInt(usage.cacheReadTokens);
+  const cacheWriteTokens = asBigInt(usage.cacheWriteTokens);
+  const imageInputTokens = asBigInt(usage.imageInputTokens);
+  const totalInputTokens = asBigInt(usage.totalInputTokens) || inputTokens + cacheReadTokens + cacheWriteTokens + imageInputTokens;
+  return {
+    contextTokens: asBigInt(usage.contextTokens) || totalInputTokens + outputTokens,
+    totalInputTokens,
+    outputTokens,
+    totalTokens: asBigInt(usage.totalTokens),
+    costCurrency: typeof cost?.currency === "string" ? cost.currency : null,
+    totalCostMicros: asBigInt(cost?.totalMicros),
+  };
+}
+
+function taskResultStatus(resultContent: string): string {
+  if (!resultContent) {
+    return "";
+  }
+  return stringInput(parseJsonRecord(resultContent).status);
 }
 
 function appendToolProgress(
