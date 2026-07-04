@@ -20,17 +20,24 @@ use waltr::grpc::waltr::{
         GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
         ListSessionsRequest, ListSessionsResponse, RespondExternalRequestRequest,
         RespondExternalRequestResponse, RollbackSessionRequest, RollbackSessionResponse,
-        SessionListSnapshot, SubmitUserMessageRequest, SubmitUserMessageResponse,
-        TimelineTruncation, UpdateSessionRuntimeConfigRequest, UpdateSessionRuntimeConfigResponse,
-        WatchSessionsRequest, WatchSessionsResponse, WatchTimelineRequest, WatchTimelineResponse,
-        rollback_target, session_service_server::SessionService as GeneratedSessionService,
-        watch_sessions_response, watch_timeline_response,
+        SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionListSnapshot,
+        SessionTemplateKind as ProtoSessionTemplateKind,
+        SessionTemplateOption as ProtoSessionTemplateOption, SessionTemplateOptions,
+        SessionTemplateSearchError,
+        SessionTemplateSearchTarget as ProtoSessionTemplateSearchTarget, SubmitUserMessageRequest,
+        SubmitUserMessageResponse, TimelineTruncation, UpdateSessionRuntimeConfigRequest,
+        UpdateSessionRuntimeConfigResponse, WatchSessionsRequest, WatchSessionsResponse,
+        WatchTimelineRequest, WatchTimelineResponse, rollback_target,
+        search_session_templates_response,
+        session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
+        watch_timeline_response,
     },
 };
 use waltr_agent::{
     AgentSessionRuntimeFactory, ExternalRequestId, FileCredentialStore, RunConflictPolicy,
-    SessionCoordinator, SessionId, SessionListEvent, SessionStore, SessionTimelineEvent,
-    TimelineCursor,
+    SessionCoordinator, SessionId, SessionListEvent, SessionStore, SessionTemplateKind,
+    SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
+    SessionTimelineEvent, TimelineCursor,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -112,7 +119,6 @@ where
         Pin<Box<dyn Stream<Item = Result<WatchSessionsResponse, Status>> + Send>>;
     type WatchTimelineStream =
         Pin<Box<dyn Stream<Item = Result<WatchTimelineResponse, Status>> + Send>>;
-
     #[tracing::instrument(
         name = "server.write",
         skip(self, request),
@@ -418,6 +424,15 @@ where
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn search_session_templates(
+        &self,
+        request: Request<SearchSessionTemplatesRequest>,
+    ) -> Result<Response<SearchSessionTemplatesResponse>, Status> {
+        Ok(Response::new(
+            handle_template_search(&self.sessions, request.into_inner()).await,
+        ))
+    }
+
     #[tracing::instrument(
         name = "server.write",
         skip(self, request),
@@ -607,6 +622,84 @@ fn required_rollback_target(
     target
         .and_then(|target| target.target)
         .ok_or_else(|| Status::invalid_argument("rollback target is required"))
+}
+
+async fn handle_template_search<S>(
+    sessions: &SessionCoordinator<S>,
+    request: SearchSessionTemplatesRequest,
+) -> SearchSessionTemplatesResponse
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    let request_id = request.request_id.clone();
+    let response = match required_session_id(&request.session_id) {
+        Ok(session_id) => {
+            let search = SessionTemplateSearchRequest {
+                query: request.query,
+                limit: request.limit as usize,
+                kinds: template_kinds_from_proto(&request.kinds),
+                target: template_search_target_from_proto(request.target),
+            };
+            match sessions.search_templates(&session_id, search).await {
+                Ok(options) => {
+                    search_session_templates_response::Result::Options(SessionTemplateOptions {
+                        options: options.into_iter().map(template_option_to_proto).collect(),
+                    })
+                }
+                Err(error) => {
+                    search_session_templates_response::Result::Error(SessionTemplateSearchError {
+                        message: error.to_string(),
+                    })
+                }
+            }
+        }
+        Err(error) => {
+            search_session_templates_response::Result::Error(SessionTemplateSearchError {
+                message: error.message().to_owned(),
+            })
+        }
+    };
+
+    SearchSessionTemplatesResponse {
+        request_id,
+        result: Some(response),
+    }
+}
+
+fn template_search_target_from_proto(target: i32) -> SessionTemplateSearchTarget {
+    match ProtoSessionTemplateSearchTarget::try_from(target).ok() {
+        Some(ProtoSessionTemplateSearchTarget::Prompts) => SessionTemplateSearchTarget::Prompts,
+        Some(ProtoSessionTemplateSearchTarget::Resources)
+        | Some(ProtoSessionTemplateSearchTarget::Unspecified)
+        | None => SessionTemplateSearchTarget::Resources,
+    }
+}
+
+fn template_kinds_from_proto(kinds: &[i32]) -> Vec<SessionTemplateKind> {
+    kinds
+        .iter()
+        .filter_map(
+            |kind| match ProtoSessionTemplateKind::try_from(*kind).ok()? {
+                ProtoSessionTemplateKind::File => Some(SessionTemplateKind::File),
+                ProtoSessionTemplateKind::Tool => Some(SessionTemplateKind::Tool),
+                ProtoSessionTemplateKind::Unspecified => None,
+            },
+        )
+        .collect()
+}
+
+fn template_option_to_proto(option: SessionTemplateOption) -> ProtoSessionTemplateOption {
+    let kind = match option.kind {
+        SessionTemplateKind::File => ProtoSessionTemplateKind::File,
+        SessionTemplateKind::Tool => ProtoSessionTemplateKind::Tool,
+    };
+    ProtoSessionTemplateOption {
+        kind: kind as i32,
+        label: option.label,
+        detail: option.detail,
+        template: option.template,
+        metadata_json: option.metadata.to_string(),
+    }
 }
 
 fn push_history(

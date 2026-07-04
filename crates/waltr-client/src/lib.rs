@@ -18,15 +18,17 @@ pub use coordination::event::{
     SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
-    ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime, ClientSnapshot,
+    ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime,
+    ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
     OperationCollectionSnapshot, OperationSnapshot, RollbackTargetView, SessionSnapshot,
-    StatusSnapshot,
+    SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
     ClientOperationState, ClientState, ConfigClientState, OperationKey, OperationState,
-    OperationStatus, SessionClientState, StatusClientState, StreamClientState, StreamState,
-    StreamStatus, TimelineWatchKey, WatchState, watch_reconnect_delay_ms,
+    OperationStatus, SessionClientState, SessionTemplateSearchState, StatusClientState,
+    StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
+    watch_reconnect_delay_ms,
 };
 pub use error::ClientError;
 pub use executor::{
@@ -49,15 +51,18 @@ pub use waltr::grpc::waltr::config::v1::{
 };
 pub use waltr::grpc::waltr::session::v1::{
     ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RollbackTarget,
-    RuntimeConfigMatch, SessionMcpServerRuntime, SessionMetrics, SessionPhase,
-    SessionProviderRuntime, SessionRuntimeConfig, SessionRuntimeConfigRequest, SessionStatus,
-    SessionSummary, Suspension, SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent,
-    TimelineEventKind, TimelineQuery, TimelineStatus, TimelineTruncation, rollback_target,
+    RuntimeConfigMatch, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse,
+    SessionMcpServerRuntime, SessionMetrics, SessionPhase, SessionProviderRuntime,
+    SessionRuntimeConfig, SessionRuntimeConfigRequest, SessionStatus, SessionSummary,
+    SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, Suspension,
+    SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent, TimelineEventKind,
+    TimelineQuery, TimelineStatus, TimelineTruncation, rollback_target,
+    search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use transport::{
-    ConfigWatchUpdate, WaltrTransport, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
-    SessionWatchEvent, SessionWatchUpdate,
+    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, SessionTimelineWatchEvent,
+    SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
 };
 pub use view::{
     CatalogMatchSourceView, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,

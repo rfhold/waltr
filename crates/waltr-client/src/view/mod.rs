@@ -24,11 +24,12 @@ mod tests {
     use ts_rs::TS as _;
 
     use crate::{
-        CatalogMatchSource, ClientCommand, ClientOperationView, ClientSnapshot,
-        ClientTimelineDirection, ConfigSnapshot, Configuration, Model, ModelCapabilities,
-        ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
-        OperationSnapshot, Provider, ProviderType, RollbackTargetView, SessionSnapshot,
-        StatusSnapshot,
+        CatalogMatchSource, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
+        ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection, ConfigSnapshot,
+        Configuration, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits, ModelOptions,
+        ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType,
+        RollbackTargetView, SessionSnapshot, SessionTemplateOptionView,
+        SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -168,6 +169,8 @@ mod tests {
             TimelineContentView::decl(),
             TimelineEventView::decl(),
             SessionTimelineView::decl(),
+            SessionTemplateOptionView::decl(),
+            SessionTemplateSearchSnapshot::decl(),
             RollbackTargetView::decl(),
             ClientOperationView::decl(),
             OperationCollectionSnapshot::decl(),
@@ -176,6 +179,8 @@ mod tests {
             StatusSnapshot::decl(),
             SessionSnapshot::decl(),
             ClientSnapshot::decl(),
+            ClientSessionTemplateKind::decl(),
+            ClientSessionTemplateSearchTarget::decl(),
             ClientTimelineDirection::decl(),
             ClientCommand::decl(),
         ]

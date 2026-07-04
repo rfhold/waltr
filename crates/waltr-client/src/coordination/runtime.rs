@@ -22,9 +22,9 @@ use crate::{
     Client, ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate,
     ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey,
     OperationStatus, ProviderView, RollbackTarget, RuntimeDefaultsView, SessionEffect,
-    SessionEvent, SessionRuntimeConfigRequest, SessionTimelineView, SessionView,
-    StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
-    TimelineWatchKey, rollback_target,
+    SessionEvent, SessionRuntimeConfigRequest, SessionTemplateKind, SessionTemplateOption,
+    SessionTimelineView, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
+    TimelineDirection, TimelineQuery, TimelineWatchKey, rollback_target,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -123,6 +123,23 @@ pub enum ClientCommand {
         limit: u32,
         /// Display-channel filter.
         channels: Vec<String>,
+    },
+    /// Search templates visible to one session.
+    SearchSessionTemplates {
+        /// Runtime-local caller request id.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Session id whose visible templates should be searched.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// Search query.
+        query: String,
+        /// Maximum templates to return.
+        limit: u32,
+        /// Template kinds to include.
+        kinds: Vec<ClientSessionTemplateKind>,
+        /// Template search target.
+        target: ClientSessionTemplateSearchTarget,
     },
     /// Register interest in timeline updates for one session.
     RegisterSessionTimelineWatchInterest {
@@ -224,6 +241,26 @@ pub enum ClientTimelineDirection {
     Forward,
     /// Load events before the cursor.
     Backward,
+}
+
+/// Template kind requested by UI clients.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ClientSessionTemplateKind {
+    /// File templates visible to the session.
+    File,
+    /// Tool templates visible to the session.
+    Tool,
+}
+
+/// Template search target requested by UI clients.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum ClientSessionTemplateSearchTarget {
+    /// Search file and tool reference templates.
+    Resources,
+    /// Search prompt templates such as skills or MCP prompts.
+    Prompts,
 }
 
 /// Stable snapshot of shared client state.
@@ -432,6 +469,42 @@ pub struct SessionSnapshot {
     pub watch: OperationSnapshot,
     /// Session timelines by session id.
     pub timelines: BTreeMap<String, SessionTimelineView>,
+    /// Latest resource search state by session id.
+    pub template_searches: BTreeMap<String, SessionTemplateSearchSnapshot>,
+}
+
+/// Stable snapshot of resource search state for one session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTemplateSearchSnapshot {
+    /// Runtime-local caller request id.
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    /// Session id searched.
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    /// Search query.
+    pub query: String,
+    /// Stable operation status name.
+    pub status: &'static str,
+    /// Last search error, when present.
+    pub error: Option<String>,
+    /// Search options returned by the server.
+    pub options: Vec<SessionTemplateOptionView>,
+}
+
+/// Stable snapshot of one session resource option.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTemplateOptionView {
+    /// Template kind name.
+    pub kind: &'static str,
+    /// Human-readable option label.
+    pub label: String,
+    /// Human-readable option detail.
+    pub detail: String,
+    /// Template text to insert when selected.
+    pub template: String,
 }
 
 /// Stable snapshot of one operation.
@@ -952,6 +1025,7 @@ impl ClientStateStream {
             ClientCommand::CreateSession
             | ClientCommand::DeleteSession { .. }
             | ClientCommand::UpdateSessionRuntimeConfig { .. }
+            | ClientCommand::SearchSessionTemplates { .. }
             | ClientCommand::RegisterSessionWatchInterest
             | ClientCommand::ReleaseSessionWatchInterest
             | ClientCommand::SubmitUserMessage { .. }
@@ -1046,6 +1120,17 @@ impl ClientStateStream {
                     reasoning_effort,
                 },
             ),
+            ClientCommand::SearchSessionTemplates {
+                request_id,
+                session_id,
+                query,
+                limit,
+                kinds,
+                target,
+            } => self
+                .runtime
+                .reducer
+                .search_session_templates(request_id, session_id, query, limit, kinds, target),
             ClientCommand::RegisterSessionWatchInterest => {
                 self.runtime.reducer.register_session_watch_interest()
             }
@@ -1282,7 +1367,45 @@ impl ClientSnapshot {
                         )
                     })
                     .collect(),
+                template_searches: state
+                    .sessions
+                    .template_searches
+                    .iter()
+                    .map(|(session_id, search)| {
+                        (
+                            session_id.clone(),
+                            SessionTemplateSearchSnapshot {
+                                request_id: search.request_id.clone(),
+                                session_id: search.session_id.clone(),
+                                query: search.query.clone(),
+                                status: operation_status_name(search.status),
+                                error: search.error.clone(),
+                                options: search
+                                    .options
+                                    .iter()
+                                    .cloned()
+                                    .map(SessionTemplateOptionView::from)
+                                    .collect(),
+                            },
+                        )
+                    })
+                    .collect(),
             },
+        }
+    }
+}
+
+impl From<SessionTemplateOption> for SessionTemplateOptionView {
+    fn from(option: SessionTemplateOption) -> Self {
+        Self {
+            kind: match SessionTemplateKind::try_from(option.kind).ok() {
+                Some(SessionTemplateKind::File) => "file",
+                Some(SessionTemplateKind::Tool) => "tool",
+                _ => "unknown",
+            },
+            label: option.label,
+            detail: option.detail,
+            template: option.template,
         }
     }
 }

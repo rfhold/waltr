@@ -12,7 +12,8 @@ use crate::transport::{
 };
 use crate::{
     ClientEffect, ClientError, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch, ConfigView,
-    SessionEffect, SessionEvent, SessionSummary, StatusEffect, StatusEvent,
+    SearchSessionTemplatesRequest, SessionEffect, SessionEvent, SessionSummary, StatusEffect,
+    StatusEvent, search_session_templates_response,
 };
 
 /// Stream of configuration changes observed through the gRPC executor.
@@ -282,6 +283,52 @@ impl GrpcEffectExecutor {
                     })],
                 }
             }
+            ClientEffect::Session(SessionEffect::SearchTemplates {
+                request_id,
+                session_id,
+                query,
+                limit,
+                kinds,
+                target,
+            }) => match self
+                .transport
+                .search_session_templates(SearchSessionTemplatesRequest {
+                    request_id: request_id.clone(),
+                    session_id: session_id.clone(),
+                    query,
+                    limit,
+                    kinds: kinds.into_iter().map(|kind| kind as i32).collect(),
+                    target: target as i32,
+                })
+                .await
+            {
+                Ok(response) => match response.result {
+                    Some(search_session_templates_response::Result::Options(options)) => {
+                        vec![ClientEvent::Session(SessionEvent::TemplatesSearched {
+                            request_id: response.request_id,
+                            session_id,
+                            options: options.options,
+                        })]
+                    }
+                    Some(search_session_templates_response::Result::Error(error)) => {
+                        vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+                            request_id: response.request_id,
+                            session_id,
+                            error: ClientError::new(error.message),
+                        })]
+                    }
+                    None => vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+                        request_id,
+                        session_id,
+                        error: ClientError::new("session resource search response missing result"),
+                    })],
+                },
+                Err(error) => vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+                    request_id,
+                    session_id,
+                    error,
+                })],
+            },
             ClientEffect::Session(SessionEffect::Watch) => {
                 match self.transport.watch_sessions().await {
                     Ok(_) => vec![ClientEvent::Session(SessionEvent::WatchStarted)],

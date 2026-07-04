@@ -22,3 +22,6 @@ mod timeline;
 
 #[path = "session/commands.rs"]
 mod commands;
+
+#[path = "session/template_search.rs"]
+mod template_search;

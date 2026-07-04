@@ -101,6 +101,44 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             state.set_session_timeline_load_failed(&session_id, error.to_string());
             ClientUpdate::default()
         }
+        SessionEvent::TemplatesSearchRequested {
+            request_id,
+            session_id,
+            query,
+            limit,
+            kinds,
+            target,
+        } => {
+            state.set_session_template_search_loading(
+                request_id.clone(),
+                session_id.clone(),
+                query.clone(),
+            );
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::SearchTemplates {
+                request_id,
+                session_id,
+                query,
+                limit,
+                kinds,
+                target,
+            }))
+        }
+        SessionEvent::TemplatesSearched {
+            request_id,
+            session_id,
+            options,
+        } => {
+            state.set_session_template_search_ready(&request_id, &session_id, options);
+            ClientUpdate::default()
+        }
+        SessionEvent::TemplatesSearchFailed {
+            request_id,
+            session_id,
+            error,
+        } => {
+            state.set_session_template_search_failed(&request_id, &session_id, error.to_string());
+            ClientUpdate::default()
+        }
         SessionEvent::WatchInterestRegistered => {
             state.add_session_watch_interest();
             maintain_watch(state)

@@ -3,7 +3,10 @@
 use std::collections::BTreeMap;
 
 use crate::transport::SessionTimelineWatchEvent;
-use crate::{Configuration, RollbackTarget, SessionSummary, StreamId, SystemStatus, TimelineEvent};
+use crate::{
+    Configuration, RollbackTarget, SessionSummary, SessionTemplateOption, StreamId, SystemStatus,
+    TimelineEvent,
+};
 
 /// Runtime-local operation identifier used by shells to track command results.
 pub type OperationKey = String;
@@ -119,7 +122,26 @@ pub struct SessionClientState {
     pub watch: WatchState,
     /// Timeline state by session id.
     pub timelines: BTreeMap<String, SessionTimelineState>,
+    /// Latest resource search state by session id.
+    pub template_searches: BTreeMap<String, SessionTemplateSearchState>,
     pub(crate) last_sequence: u64,
+}
+
+/// Resource search coordination state for one session.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionTemplateSearchState {
+    /// Runtime-local caller request id.
+    pub request_id: String,
+    /// Session id searched.
+    pub session_id: String,
+    /// Query used for the latest request.
+    pub query: String,
+    /// Current search status.
+    pub status: OperationStatus,
+    /// Last search error, when present.
+    pub error: Option<String>,
+    /// Search options returned by the server.
+    pub options: Vec<SessionTemplateOption>,
 }
 
 /// Timeline coordination state for one session.
@@ -603,6 +625,63 @@ impl ClientState {
         let timeline = self.session_timeline_mut(session_id);
         timeline.load.status = OperationStatus::Failed;
         timeline.load.error = Some(message);
+    }
+
+    pub(crate) fn set_session_template_search_loading(
+        &mut self,
+        request_id: String,
+        session_id: String,
+        query: String,
+    ) {
+        self.sessions.template_searches.insert(
+            session_id.clone(),
+            SessionTemplateSearchState {
+                request_id,
+                session_id,
+                query,
+                status: OperationStatus::Loading,
+                error: None,
+                options: Vec::new(),
+            },
+        );
+    }
+
+    pub(crate) fn set_session_template_search_ready(
+        &mut self,
+        request_id: &str,
+        session_id: &str,
+        options: Vec<SessionTemplateOption>,
+    ) {
+        let Some(search) = self.sessions.template_searches.get_mut(session_id) else {
+            return;
+        };
+
+        if search.request_id != request_id {
+            return;
+        }
+
+        search.status = OperationStatus::Ready;
+        search.error = None;
+        search.options = options;
+    }
+
+    pub(crate) fn set_session_template_search_failed(
+        &mut self,
+        request_id: &str,
+        session_id: &str,
+        message: String,
+    ) {
+        let Some(search) = self.sessions.template_searches.get_mut(session_id) else {
+            return;
+        };
+
+        if search.request_id != request_id {
+            return;
+        }
+
+        search.status = OperationStatus::Failed;
+        search.error = Some(message);
+        search.options.clear();
     }
 
     pub(crate) fn configure_session_timeline_watch(&mut self, key: TimelineWatchKey) {

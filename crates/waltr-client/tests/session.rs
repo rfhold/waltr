@@ -13,3 +13,6 @@ mod timeline;
 
 #[path = "session/watch.rs"]
 mod watch;
+
+#[path = "session/template_search.rs"]
+mod template_search;

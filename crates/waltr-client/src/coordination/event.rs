@@ -3,8 +3,8 @@
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
     ClientError, Configuration, OperationKey, Provider, RollbackTarget, RuntimeDefaults,
-    SessionRuntimeConfigRequest, SessionSummary, SystemStatus, TimelineEvent, TimelineQuery,
-    TimelineWatchKey,
+    SessionRuntimeConfigRequest, SessionSummary, SessionTemplateKind, SessionTemplateOption,
+    SessionTemplateSearchTarget, SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -172,6 +172,39 @@ pub enum SessionEvent {
         /// Session id whose timeline failed to load.
         session_id: String,
         /// Failure returned by the load effect.
+        error: ClientError,
+    },
+    /// A caller requested resource search for one session.
+    TemplatesSearchRequested {
+        /// Runtime-local caller request id.
+        request_id: String,
+        /// Session id whose visible templates should be searched.
+        session_id: String,
+        /// Search query.
+        query: String,
+        /// Maximum templates to return.
+        limit: u32,
+        /// Template kinds to include.
+        kinds: Vec<SessionTemplateKind>,
+        /// Template search target.
+        target: SessionTemplateSearchTarget,
+    },
+    /// Resource search completed successfully.
+    TemplatesSearched {
+        /// Runtime-local caller request id.
+        request_id: String,
+        /// Session id searched.
+        session_id: String,
+        /// Search options returned by the server.
+        options: Vec<SessionTemplateOption>,
+    },
+    /// Resource search failed.
+    TemplatesSearchFailed {
+        /// Runtime-local caller request id.
+        request_id: String,
+        /// Session id searched.
+        session_id: String,
+        /// Failure returned by the search effect.
         error: ClientError,
     },
     /// A caller registered interest in timeline updates for one session.
@@ -433,6 +466,21 @@ pub enum SessionEffect {
         session_id: String,
         /// Timeline query to submit.
         query: Option<TimelineQuery>,
+    },
+    /// Search templates visible to one session.
+    SearchTemplates {
+        /// Runtime-local caller request id.
+        request_id: String,
+        /// Session id whose visible templates should be searched.
+        session_id: String,
+        /// Search query.
+        query: String,
+        /// Maximum templates to return.
+        limit: u32,
+        /// Template kinds to include.
+        kinds: Vec<SessionTemplateKind>,
+        /// Template search target.
+        target: SessionTemplateSearchTarget,
     },
     /// Open or continue the session watch stream.
     Watch,

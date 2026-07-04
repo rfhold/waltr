@@ -2,7 +2,8 @@
 
 use crate::coordination::{config, session, status, stream};
 use crate::{
-    ClientEffect, ClientError, ClientEvent, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
+    ClientEffect, ClientError, ClientEvent, ClientSessionTemplateKind,
+    ClientSessionTemplateSearchTarget, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
     Configuration, McpServer, OperationKey, Provider, ProviderEditBaseline, RuntimeDefaults,
     SessionEvent, SessionRuntimeConfigRequest, StatusEvent, TimelineQuery,
 };
@@ -558,6 +559,28 @@ impl Client {
         })
     }
 
+    /// Request template search for one session.
+    pub fn search_session_templates(
+        &mut self,
+        request_id: impl Into<String>,
+        session_id: impl Into<String>,
+        query: impl Into<String>,
+        limit: u32,
+        kinds: Vec<ClientSessionTemplateKind>,
+        target: ClientSessionTemplateSearchTarget,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Session(
+            SessionEvent::TemplatesSearchRequested {
+                request_id: request_id.into(),
+                session_id: session_id.into(),
+                query: query.into(),
+                limit,
+                kinds: kinds.into_iter().map(session_template_kind).collect(),
+                target: session_template_search_target(target),
+            },
+        ))
+    }
+
     /// Return whether the provider has changed since the edit baseline.
     ///
     /// # Errors
@@ -782,15 +805,33 @@ impl ClientUpdate {
     }
 }
 
+const fn session_template_kind(kind: ClientSessionTemplateKind) -> crate::SessionTemplateKind {
+    match kind {
+        ClientSessionTemplateKind::File => crate::SessionTemplateKind::File,
+        ClientSessionTemplateKind::Tool => crate::SessionTemplateKind::Tool,
+    }
+}
+
+const fn session_template_search_target(
+    target: ClientSessionTemplateSearchTarget,
+) -> crate::SessionTemplateSearchTarget {
+    match target {
+        ClientSessionTemplateSearchTarget::Resources => {
+            crate::SessionTemplateSearchTarget::Resources
+        }
+        ClientSessionTemplateSearchTarget::Prompts => crate::SessionTemplateSearchTarget::Prompts,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::transport::{SessionTimelineWatchEvent, SessionTimelineWatchUpdate};
     use crate::{
-        ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary, SessionWatchEvent,
-        SessionWatchUpdate, StatusEffect, StreamEvent, StreamStatus, SystemStatus, TimelineEvent,
-        watch_reconnect_delay_ms,
+        ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary, SessionTemplateKind,
+        SessionTemplateOption, SessionWatchEvent, SessionWatchUpdate, StatusEffect, StreamEvent,
+        StreamStatus, SystemStatus, TimelineEvent, watch_reconnect_delay_ms,
     };
 
     #[test]
@@ -992,6 +1033,140 @@ mod tests {
             update.effects(),
             &[ClientEffect::Config(ConfigEffect::Load)]
         );
+    }
+
+    #[test]
+    fn session_template_search_sets_loading_and_emits_search_effect() {
+        let mut client = Client::new();
+
+        let update = client.search_session_templates(
+            "resource-search-1",
+            "session-1",
+            "src",
+            8,
+            vec![
+                ClientSessionTemplateKind::File,
+                ClientSessionTemplateKind::Tool,
+            ],
+            ClientSessionTemplateSearchTarget::Resources,
+        );
+
+        let search = client
+            .state()
+            .sessions
+            .template_searches
+            .get("session-1")
+            .expect("resource search state should exist");
+        assert_eq!(search.status, OperationStatus::Loading);
+        assert_eq!(search.request_id, "resource-search-1");
+        assert_eq!(search.query, "src");
+        assert_eq!(
+            update.effects(),
+            &[ClientEffect::Session(SessionEffect::SearchTemplates {
+                request_id: "resource-search-1".to_owned(),
+                session_id: "session-1".to_owned(),
+                query: "src".to_owned(),
+                limit: 8,
+                kinds: vec![SessionTemplateKind::File, SessionTemplateKind::Tool],
+                target: crate::SessionTemplateSearchTarget::Resources,
+            })]
+        );
+    }
+
+    #[test]
+    fn session_template_search_result_updates_matching_request() {
+        let mut client = Client::new();
+        client.search_session_templates(
+            "resource-search-1",
+            "session-1",
+            "src",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+        );
+
+        let update = client.apply(ClientEvent::Session(SessionEvent::TemplatesSearched {
+            request_id: "resource-search-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            options: vec![resource_option("file", "src/main.rs", "@src/main.rs")],
+        }));
+
+        assert!(update.is_empty());
+        let search = client
+            .state()
+            .sessions
+            .template_searches
+            .get("session-1")
+            .expect("resource search state should exist");
+        assert_eq!(search.status, OperationStatus::Ready);
+        assert_eq!(search.options.len(), 1);
+        assert_eq!(search.options[0].label, "src/main.rs");
+    }
+
+    #[test]
+    fn session_template_search_failure_updates_matching_request() {
+        let mut client = Client::new();
+        client.search_session_templates(
+            "resource-search-1",
+            "session-1",
+            "src",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+        );
+
+        client.apply(ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+            request_id: "resource-search-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            error: ClientError::new("search failed"),
+        }));
+
+        let search = client
+            .state()
+            .sessions
+            .template_searches
+            .get("session-1")
+            .expect("resource search state should exist");
+        assert_eq!(search.status, OperationStatus::Failed);
+        assert_eq!(search.error.as_deref(), Some("search failed"));
+        assert!(search.options.is_empty());
+    }
+
+    #[test]
+    fn session_template_search_ignores_stale_response() {
+        let mut client = Client::new();
+        client.search_session_templates(
+            "resource-search-1",
+            "session-1",
+            "src",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+        );
+        client.search_session_templates(
+            "resource-search-2",
+            "session-1",
+            "src/lib",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+        );
+
+        client.apply(ClientEvent::Session(SessionEvent::TemplatesSearched {
+            request_id: "resource-search-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            options: vec![resource_option("file", "src/main.rs", "@src/main.rs")],
+        }));
+
+        let search = client
+            .state()
+            .sessions
+            .template_searches
+            .get("session-1")
+            .expect("resource search state should exist");
+        assert_eq!(search.status, OperationStatus::Loading);
+        assert_eq!(search.request_id, "resource-search-2");
+        assert!(search.options.is_empty());
     }
 
     #[test]
@@ -1705,6 +1880,20 @@ mod tests {
         SessionSummary {
             id: id.to_owned(),
             ..SessionSummary::default()
+        }
+    }
+
+    fn resource_option(kind: &str, label: &str, template: &str) -> SessionTemplateOption {
+        SessionTemplateOption {
+            kind: match kind {
+                "file" => SessionTemplateKind::File as i32,
+                "tool" => SessionTemplateKind::Tool as i32,
+                _ => 0,
+            },
+            label: label.to_owned(),
+            detail: label.to_owned(),
+            template: template.to_owned(),
+            metadata_json: "{}".to_owned(),
         }
     }
 

@@ -170,6 +170,62 @@ pub struct ContinueSessionRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContinueSessionResponse {
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SearchSessionTemplatesRequest {
+    #[prost(string, tag="1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub query: ::prost::alloc::string::String,
+    #[prost(uint32, tag="4")]
+    pub limit: u32,
+    #[prost(enumeration="SessionTemplateKind", repeated, tag="5")]
+    pub kinds: ::prost::alloc::vec::Vec<i32>,
+    #[prost(enumeration="SessionTemplateSearchTarget", tag="6")]
+    pub target: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SearchSessionTemplatesResponse {
+    #[prost(string, tag="1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(oneof="search_session_templates_response::Result", tags="2, 3")]
+    pub result: ::core::option::Option<search_session_templates_response::Result>,
+}
+/// Nested message and enum types in `SearchSessionTemplatesResponse`.
+pub mod search_session_templates_response {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Result {
+        #[prost(message, tag="2")]
+        Options(super::SessionTemplateOptions),
+        #[prost(message, tag="3")]
+        Error(super::SessionTemplateSearchError),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionTemplateOptions {
+    #[prost(message, repeated, tag="1")]
+    pub options: ::prost::alloc::vec::Vec<SessionTemplateOption>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionTemplateOption {
+    #[prost(enumeration="SessionTemplateKind", tag="1")]
+    pub kind: i32,
+    #[prost(string, tag="2")]
+    pub label: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub detail: ::prost::alloc::string::String,
+    #[prost(string, tag="4")]
+    pub template: ::prost::alloc::string::String,
+    /// JSON object encoded as UTF-8 JSON until template metadata schemas stabilize.
+    #[prost(string, tag="5")]
+    pub metadata_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionTemplateSearchError {
+    #[prost(string, tag="1")]
+    pub message: ::prost::alloc::string::String,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RollbackTarget {
     #[prost(oneof="rollback_target::Target", tags="1, 2, 3")]
@@ -435,6 +491,64 @@ pub struct ExternalRequest {
     /// JSON payload encoded as UTF-8 JSON until request payload protos stabilize.
     #[prost(string, tag="5")]
     pub payload_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionTemplateKind {
+    Unspecified = 0,
+    File = 1,
+    Tool = 2,
+}
+impl SessionTemplateKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SESSION_TEMPLATE_KIND_UNSPECIFIED",
+            Self::File => "SESSION_TEMPLATE_KIND_FILE",
+            Self::Tool => "SESSION_TEMPLATE_KIND_TOOL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SESSION_TEMPLATE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "SESSION_TEMPLATE_KIND_FILE" => Some(Self::File),
+            "SESSION_TEMPLATE_KIND_TOOL" => Some(Self::Tool),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionTemplateSearchTarget {
+    Unspecified = 0,
+    Resources = 1,
+    Prompts = 2,
+}
+impl SessionTemplateSearchTarget {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SESSION_TEMPLATE_SEARCH_TARGET_UNSPECIFIED",
+            Self::Resources => "SESSION_TEMPLATE_SEARCH_TARGET_RESOURCES",
+            Self::Prompts => "SESSION_TEMPLATE_SEARCH_TARGET_PROMPTS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SESSION_TEMPLATE_SEARCH_TARGET_UNSPECIFIED" => Some(Self::Unspecified),
+            "SESSION_TEMPLATE_SEARCH_TARGET_RESOURCES" => Some(Self::Resources),
+            "SESSION_TEMPLATE_SEARCH_TARGET_PROMPTS" => Some(Self::Prompts),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
