@@ -36,11 +36,12 @@ pub(in crate::mcp) struct McpConnection {
 
 impl McpConnection {
     pub(in crate::mcp) async fn start(
+        server_name: String,
         transport: McpTransportConfig,
         handler: Arc<dyn McpConnectionHandler>,
     ) -> Result<Arc<Self>> {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let transport = McpTransport::start(transport, inbound_tx).await?;
+        let transport = McpTransport::start(server_name, transport, inbound_tx).await?;
         let connection = Arc::new(Self {
             transport,
             pending: Arc::new(Mutex::new(BTreeMap::new())),

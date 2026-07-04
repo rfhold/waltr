@@ -27,12 +27,13 @@ pub(in crate::mcp) enum McpTransport {
 
 impl McpTransport {
     pub(in crate::mcp) async fn start(
+        server_name: String,
         config: McpTransportConfig,
         inbound: InboundSender,
     ) -> Result<Self> {
         match config {
             McpTransportConfig::Stdio { command, args } => Ok(Self::Stdio(Box::new(
-                StdioTransport::start(command, args, inbound).await?,
+                StdioTransport::start(server_name, command, args, inbound).await?,
             ))),
             McpTransportConfig::StreamableHttp { endpoint } => Ok(Self::StreamableHttp(
                 StreamableHttpTransport::new(endpoint, inbound),

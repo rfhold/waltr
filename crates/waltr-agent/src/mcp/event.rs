@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use super::log::McpLogLevel;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum McpRuntimeEvent {
@@ -16,7 +18,7 @@ pub enum McpRuntimeEvent {
     },
     LogMessage {
         server_key: String,
-        level: Option<String>,
+        level: McpLogLevel,
         logger: Option<String>,
         data: Value,
     },

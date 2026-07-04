@@ -1,3 +1,7 @@
+use serde_json::json;
+
+use super::log::McpLogLevel;
+
 use std::time::Duration;
 
 pub(in crate::mcp) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -7,6 +11,7 @@ pub(in crate::mcp) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct McpConfig {
     pub(in crate::mcp) servers: Vec<McpServerConfig>,
     pub(in crate::mcp) timeout: Duration,
+    pub(in crate::mcp) log_level: Option<McpLogLevel>,
 }
 
 impl McpConfig {
@@ -16,6 +21,7 @@ impl McpConfig {
         Self {
             servers: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
+            log_level: None,
         }
     }
 
@@ -33,8 +39,17 @@ impl McpConfig {
         self
     }
 
-    pub(in crate::mcp) fn into_parts(self) -> (Vec<McpServerConfig>, Duration) {
-        (self.servers, self.timeout)
+    /// Configure the minimum MCP protocol log level requested from servers that support logging.
+    #[must_use]
+    pub const fn with_log_level(mut self, level: McpLogLevel) -> Self {
+        self.log_level = Some(level);
+        self
+    }
+
+    pub(in crate::mcp) fn into_parts(
+        self,
+    ) -> (Vec<McpServerConfig>, Duration, Option<McpLogLevel>) {
+        (self.servers, self.timeout, self.log_level)
     }
 }
 
@@ -95,4 +110,32 @@ pub enum McpTransportConfig {
         /// MCP endpoint URL.
         endpoint: String,
     },
+}
+
+impl McpTransportConfig {
+    pub(in crate::mcp) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Stdio { .. } => "stdio",
+            Self::StreamableHttp { .. } => "streamable_http",
+        }
+    }
+}
+
+pub(in crate::mcp) fn set_log_level_params(level: McpLogLevel) -> serde_json::Value {
+    json!({ "level": level.as_str() })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{McpLogLevel, set_log_level_params};
+
+    #[test]
+    fn serializes_set_log_level_params() {
+        assert_eq!(
+            set_log_level_params(McpLogLevel::Warning),
+            json!({ "level": "warning" })
+        );
+    }
 }

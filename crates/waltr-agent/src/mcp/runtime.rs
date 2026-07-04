@@ -44,13 +44,14 @@ impl McpClientRuntime {
         root_uri: String,
         cancellation_token: CancellationToken,
     ) -> Result<Arc<Self>> {
-        let (servers, timeout) = config.into_parts();
+        let (servers, timeout, log_level) = config.into_parts();
         let (events, _) = broadcast::channel(128);
         let mut active = BTreeMap::new();
         for server in servers {
             let runtime = McpServerRuntime::start(
                 server,
                 timeout,
+                log_level,
                 root_uri.clone(),
                 events.clone(),
                 cancellation_token.clone(),
