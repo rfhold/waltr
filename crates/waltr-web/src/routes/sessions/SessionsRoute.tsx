@@ -378,10 +378,10 @@ function SessionDetail(props: { session: SessionView }) {
     resourceInputVersion();
 
     if (messageTextarea && document.activeElement === messageTextarea) {
-      return resourceTokenAtCaret(text, messageTextarea.selectionStart, messageTextarea.selectionEnd);
+      return templateTokenAtCaret(text, messageTextarea.selectionStart, messageTextarea.selectionEnd);
     }
 
-    return resourceTokenAtCaret(text, rememberedCaret.start, rememberedCaret.end);
+    return templateTokenAtCaret(text, rememberedCaret.start, rememberedCaret.end);
   });
   const activeTemplateSearch = createMemo(() => {
     const token = activeResourceToken();
@@ -660,7 +660,7 @@ function SessionDetail(props: { session: SessionView }) {
     }
   };
 
-  const sendTemplateSearch = async (token: ActiveResourceToken) => {
+  const sendTemplateSearch = async (token: ActiveTemplateToken) => {
     const requestId = `${props.session.id}-resource-${++templateSearchSequence}`;
     setResourceRequestId(requestId);
     setTemplateSearchError(undefined);
@@ -673,8 +673,8 @@ function SessionDetail(props: { session: SessionView }) {
         sessionId: props.session.id,
         query: token.query,
         limit: RESOURCE_SEARCH_LIMIT,
-        kinds: ["file", "tool"],
-        target: "resources",
+        kinds: token.kinds,
+        target: token.target,
       });
     } catch (error) {
       if (resourceRequestId() === requestId) {
@@ -683,7 +683,7 @@ function SessionDetail(props: { session: SessionView }) {
     }
   };
 
-  const scheduleTemplateSearch = (token: ActiveResourceToken, delay: number) => {
+  const scheduleTemplateSearch = (token: ActiveTemplateToken, delay: number) => {
     cancelTemplateSearchDebounce();
     templateSearchDebounce = window.setTimeout(() => {
       templateSearchDebounce = undefined;
@@ -950,7 +950,7 @@ function SessionDetail(props: { session: SessionView }) {
           </Show>
           <div class="sessions__composer-textarea-shell">
             <div class="sessions__composer-highlight" aria-hidden="true" ref={highlightLayer}>
-              {highlightResourceTokens(draft())}
+              {highlightTemplateTokens(draft())}
             </div>
             <textarea
               ref={messageTextarea}
@@ -1028,7 +1028,7 @@ type TemplateResultPart = {
   content: string;
 };
 type TemplateErrorPart = { kind: "error"; raw: string; message: string };
-type ActiveResourceToken = { start: number; end: number; query: string };
+type ActiveTemplateToken = { start: number; end: number; query: string; target: "resources" | "prompts"; kinds: Array<"file" | "tool" | "prompt"> };
 type ExternalPromptTimelineItem = {
   id: string;
   turn: bigint;
@@ -1097,7 +1097,38 @@ type TurnMetricsTimelineItem = {
   addedInputBaseTokens: bigint | null;
 };
 
-function resourceTokenAtCaret(text: string, selectionStart: number, selectionEnd: number): ActiveResourceToken | undefined {
+function templateTokenAtCaret(text: string, selectionStart: number, selectionEnd: number): ActiveTemplateToken | undefined {
+  return promptTokenAtCaret(text, selectionStart, selectionEnd) ?? resourceTokenAtCaret(text, selectionStart, selectionEnd);
+}
+
+function promptTokenAtCaret(text: string, selectionStart: number, selectionEnd: number): ActiveTemplateToken | undefined {
+  if (selectionStart !== selectionEnd || text.slice(0, selectionStart).includes("\n")) {
+    return undefined;
+  }
+
+  let start = selectionStart;
+  while (start > 0 && !isWhitespace(text[start - 1])) {
+    start -= 1;
+  }
+
+  if (text[start] !== "/" || selectionStart <= start + 1) {
+    return undefined;
+  }
+
+  const query = text.slice(start + 1, selectionStart);
+  if (!query || hasWhitespace(query)) {
+    return undefined;
+  }
+
+  let end = selectionStart;
+  while (end < text.length && !isWhitespace(text[end])) {
+    end += 1;
+  }
+
+  return { start, end, query, target: "prompts", kinds: ["prompt"] };
+}
+
+function resourceTokenAtCaret(text: string, selectionStart: number, selectionEnd: number): ActiveTemplateToken | undefined {
   if (selectionStart !== selectionEnd) {
     return undefined;
   }
@@ -1121,20 +1152,20 @@ function resourceTokenAtCaret(text: string, selectionStart: number, selectionEnd
     end += 1;
   }
 
-  return { start, end, query };
+  return { start, end, query, target: "resources", kinds: ["file", "tool"] };
 }
 
-function highlightResourceTokens(text: string): JSX.Element[] {
+function highlightTemplateTokens(text: string): JSX.Element[] {
   const nodes: JSX.Element[] = [];
   let offset = 0;
-  for (const token of resourceTemplateTokenRanges(text)) {
+  for (const token of templateTokenRanges(text)) {
     const tokenStart = token.start;
 
     if (tokenStart > offset) {
       nodes.push(text.slice(offset, tokenStart));
     }
 
-    nodes.push(<span class="sessions__composer-resource-token">{text.slice(token.start, token.end)}</span>);
+    nodes.push(<span class={`sessions__composer-${token.kind}-token`}>{text.slice(token.start, token.end)}</span>);
     offset = token.end;
   }
 
@@ -1148,27 +1179,38 @@ function highlightResourceTokens(text: string): JSX.Element[] {
 function renderTemplateInline(text: string): JSX.Element[] {
   return parseTemplateText(text).flatMap((part) => {
     if (part.kind === "text") {
-      return highlightResourceTokens(part.text);
+      return highlightTemplateTokens(part.text);
     }
 
     if (part.kind === "error") {
       return [<span class="sessions__template-error-token">{part.message}</span>];
     }
 
+    if (part.kindName === "skill" && part.source) {
+      return [<span class="sessions__composer-prompt-token">/skill:{part.source}</span>];
+    }
+
     if (part.source) {
-      return highlightResourceTokens(fileTemplateReference(part.source));
+      return highlightTemplateTokens(fileTemplateReference(part.source));
     }
 
     if (part.tool) {
-      return highlightResourceTokens(`@tool(${part.tool}, ${part.arguments || "{}"})`);
+      return highlightTemplateTokens(`@tool(${part.tool}, ${part.arguments || "{}"})`);
     }
 
     return [part.raw];
   });
 }
 
-function resourceTemplateTokenRanges(text: string): Array<{ start: number; end: number }> {
-  const ranges: Array<{ start: number; end: number }> = [];
+function templateTokenRanges(text: string): Array<{ start: number; end: number; kind: "resource" | "prompt" }> {
+  return [
+    ...resourceTemplateTokenRanges(text),
+    ...promptTemplateTokenRanges(text),
+  ].sort((left, right) => left.start - right.start);
+}
+
+function resourceTemplateTokenRanges(text: string): Array<{ start: number; end: number; kind: "resource" }> {
+  const ranges: Array<{ start: number; end: number; kind: "resource" }> = [];
   let index = 0;
   while (index < text.length) {
     const start = text.indexOf("@", index);
@@ -1185,9 +1227,39 @@ function resourceTemplateTokenRanges(text: string): Array<{ start: number; end: 
       index = start + 1;
       continue;
     }
-    ranges.push({ start, end });
+    ranges.push({ start, end, kind: "resource" });
     index = end;
   }
+  return ranges;
+}
+
+function promptTemplateTokenRanges(text: string): Array<{ start: number; end: number; kind: "prompt" }> {
+  const ranges: Array<{ start: number; end: number; kind: "prompt" }> = [];
+  const firstLineEnd = text.indexOf("\n") === -1 ? text.length : text.indexOf("\n");
+  let index = 0;
+
+  while (index < firstLineEnd) {
+    const start = text.indexOf("/", index);
+    if (start === -1 || start >= firstLineEnd) {
+      break;
+    }
+    if (start > 0 && !isWhitespace(text[start - 1])) {
+      index = start + 1;
+      continue;
+    }
+
+    let end = start + 1;
+    while (end < firstLineEnd && !isWhitespace(text[end])) {
+      end += 1;
+    }
+    if (end > start + 1) {
+      ranges.push({ start, end, kind: "prompt" });
+      index = end;
+    } else {
+      index = start + 1;
+    }
+  }
+
   return ranges;
 }
 
@@ -2267,6 +2339,9 @@ function retemplatizeUserMessage(text: string) {
     }
     if (part.kind === "error") {
       return part.raw;
+    }
+    if (part.kindName === "skill" && part.source) {
+      return `/skill:${part.source}`;
     }
     if (part.source) {
       return fileTemplateReference(part.source);
