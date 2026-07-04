@@ -30,6 +30,7 @@ import type {
   McpServerView,
   ProviderView,
   RuntimeConfigMatchView,
+  SessionTemplateOptionView,
   SessionTimelineView,
   SessionView,
   TimestampView,
@@ -49,6 +50,8 @@ const TIMELINE_CHANNELS = [
 const TIMELINE_PAGE_SIZE = 64;
 const TIMELINE_TOP_LOAD_THRESHOLD_PX = 320;
 const SHELL_OUTPUT_RECENT_LINE_COUNT = 15;
+const RESOURCE_SEARCH_DEBOUNCE_MS = 120;
+const RESOURCE_SEARCH_LIMIT = 12;
 
 const EXTERNAL_REQUEST_PERMISSION = 1;
 const EXTERNAL_REQUEST_QUESTION = 2;
@@ -329,12 +332,21 @@ function SessionDetail(props: { session: SessionView }) {
   const sessions = useSessionsRoute();
   const [editingRuntime, setEditingRuntime] = createSignal<"provider" | "mcp">();
   const [draft, setDraft] = createSignal("");
+  const [caret, setCaret] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
+  const [resourceInputVersion, setResourceInputVersion] = createSignal(0);
+  const [resourceRequestId, setResourceRequestId] = createSignal<string>();
+  const [selectedResourceIndex, setSelectedResourceIndex] = createSignal(0);
+  const [templateSearchError, setTemplateSearchError] = createSignal<string>();
   const [commandError, setCommandError] = createSignal<string>();
   const [expandedShellOutputs, setExpandedShellOutputs] = createSignal<Record<string, boolean>>({});
   const [historyShift, setHistoryShift] = createSignal(false);
   let timelineScroll: HTMLDivElement | undefined;
   let timelineVirtualizer: VirtualizerHandle | undefined;
+  let messageTextarea: HTMLTextAreaElement | undefined;
+  let highlightLayer: HTMLDivElement | undefined;
   let registeredTimelineSession: string | undefined;
+  let templateSearchDebounce: number | undefined;
+  let templateSearchSequence = 0;
   let previousTimelineItemKeys: string[] = [];
   let initialScrollSession: string | undefined;
   let pendingHistoryCursor: SessionTimelineView["events"][number]["cursor"] | undefined;
@@ -360,6 +372,35 @@ function SessionDetail(props: { session: SessionView }) {
   const testKeepMountedIndexes = createMemo(() => import.meta.env.MODE === "test" ? items().map((_, index) => index) : undefined);
   const working = createMemo(() => active() && !hasOpenExternalPrompt(items()));
   const importantStatus = createMemo(() => sessionImportantStatus(props.session, working(), timeline()?.watch.error));
+  const activeResourceToken = createMemo(() => {
+    const text = draft();
+    const rememberedCaret = caret();
+    resourceInputVersion();
+
+    if (messageTextarea && document.activeElement === messageTextarea) {
+      return resourceTokenAtCaret(text, messageTextarea.selectionStart, messageTextarea.selectionEnd);
+    }
+
+    return resourceTokenAtCaret(text, rememberedCaret.start, rememberedCaret.end);
+  });
+  const activeTemplateSearch = createMemo(() => {
+    const token = activeResourceToken();
+    const requestId = resourceRequestId();
+    const search = app.snapshot()?.sessions.templateSearches?.[props.session.id];
+
+    if (!token || !requestId || !search) {
+      return undefined;
+    }
+
+    if (search.requestId !== requestId || search.query !== token.query) {
+      return undefined;
+    }
+
+    return search;
+  });
+  const visibleResourceOptions = createMemo(() => activeResourceToken() ? activeTemplateSearch()?.options ?? [] : []);
+  const templateSearchPending = createMemo(() => Boolean(activeResourceToken() && resourceRequestId() && activeTemplateSearch()?.status !== "ready" && !templateSearchError()));
+  const templateSearchMessage = createMemo(() => templateSearchError() ?? activeTemplateSearch()?.error);
   const timelineReady = createMemo(() => {
     const status = timeline()?.watch.status;
 
@@ -405,7 +446,21 @@ function SessionDetail(props: { session: SessionView }) {
     })();
   });
 
+  createEffect(on(activeResourceToken, (token) => {
+    cancelTemplateSearchDebounce();
+    setTemplateSearchError(undefined);
+
+    if (!token) {
+      setResourceRequestId(undefined);
+      setSelectedResourceIndex(0);
+      return;
+    }
+
+    scheduleTemplateSearch(token, RESOURCE_SEARCH_DEBOUNCE_MS);
+  }));
+
   onCleanup(() => {
+    cancelTemplateSearchDebounce();
     cancelScheduledTimelineViewportUpdate();
     cancelScheduledHistoryShiftClear();
     if (!registeredTimelineSession) {
@@ -598,8 +653,126 @@ function SessionDetail(props: { session: SessionView }) {
     try {
       await app.dispatchSubmitUserMessage(props.session.id, text);
       setDraft("");
+      setCaret({ start: 0, end: 0 });
+      clearResourceAutocomplete();
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : "Unable to send message.");
+    }
+  };
+
+  const sendTemplateSearch = async (token: ActiveResourceToken) => {
+    const requestId = `${props.session.id}-resource-${++templateSearchSequence}`;
+    setResourceRequestId(requestId);
+    setTemplateSearchError(undefined);
+    setSelectedResourceIndex(0);
+
+    try {
+      await app.dispatch({
+        type: "searchSessionTemplates",
+        requestId,
+        sessionId: props.session.id,
+        query: token.query,
+        limit: RESOURCE_SEARCH_LIMIT,
+        kinds: ["file", "tool"],
+        target: "resources",
+      });
+    } catch (error) {
+      if (resourceRequestId() === requestId) {
+        setTemplateSearchError(error instanceof Error ? error.message : "Unable to search templates.");
+      }
+    }
+  };
+
+  const scheduleTemplateSearch = (token: ActiveResourceToken, delay: number) => {
+    cancelTemplateSearchDebounce();
+    templateSearchDebounce = window.setTimeout(() => {
+      templateSearchDebounce = undefined;
+      void sendTemplateSearch(token);
+    }, delay);
+  };
+
+  const clearResourceAutocomplete = () => {
+    setResourceRequestId(undefined);
+    cancelTemplateSearchDebounce();
+    setSelectedResourceIndex(0);
+    setTemplateSearchError(undefined);
+  };
+
+  const cancelTemplateSearchDebounce = () => {
+    if (templateSearchDebounce !== undefined) {
+      window.clearTimeout(templateSearchDebounce);
+      templateSearchDebounce = undefined;
+    }
+  };
+
+  const rememberTextareaSelection = (textarea: HTMLTextAreaElement) => {
+    setCaret({ start: textarea.selectionStart, end: textarea.selectionEnd });
+    setResourceInputVersion((version) => version + 1);
+  };
+
+  const syncHighlightScroll = (textarea: HTMLTextAreaElement) => {
+    if (!highlightLayer) {
+      return;
+    }
+
+    highlightLayer.scrollTop = textarea.scrollTop;
+    highlightLayer.scrollLeft = textarea.scrollLeft;
+  };
+
+  const selectNextResource = (offset: number) => {
+    const options = visibleResourceOptions();
+    if (options.length === 0) {
+      return;
+    }
+
+    setSelectedResourceIndex((current) => (current + offset + options.length) % options.length);
+  };
+
+  const acceptResourceOption = (option: SessionTemplateOptionView | undefined) => {
+    const token = activeResourceToken();
+    const textarea = messageTextarea;
+
+    if (!token || !option || !textarea) {
+      return;
+    }
+
+    const value = draft();
+    const nextValue = `${value.slice(0, token.start)}${option.template}${value.slice(token.end)}`;
+    const nextCaret = token.start + option.template.length;
+    setDraft(nextValue);
+    clearResourceAutocomplete();
+
+    queueMicrotask(() => {
+      textarea.focus();
+      textarea.setSelectionRange(nextCaret, nextCaret);
+      setCaret({ start: nextCaret, end: nextCaret });
+    });
+  };
+
+  const handleResourceAutocompleteKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      void submit();
+      return;
+    }
+
+    const options = visibleResourceOptions();
+    if (options.length === 0) {
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      selectNextResource(1);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      selectNextResource(-1);
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      acceptResourceOption(options[selectedResourceIndex()]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      clearResourceAutocomplete();
     }
   };
 
@@ -661,7 +834,7 @@ function SessionDetail(props: { session: SessionView }) {
     setCommandError(undefined);
     try {
       await app.dispatch({ type: "rollbackSessionBeforeCursor", sessionId: props.session.id, cursor: item.cursor });
-      setDraft(item.text);
+      setDraft(retemplatizeUserMessage(item.text));
     } catch (error) {
       setCommandError(error instanceof Error ? error.message : "Unable to edit message.");
     }
@@ -754,18 +927,56 @@ function SessionDetail(props: { session: SessionView }) {
           void submit();
         }}
       >
-        <textarea
-          aria-label="Session message"
-          placeholder="Send a message..."
-          value={draft()}
-          onInput={(event) => setDraft(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-              event.preventDefault();
-              void submit();
-            }
-          }}
-        />
+        <div class="sessions__composer-input" onKeyDown={handleResourceAutocompleteKeyDown}>
+          <Show when={visibleResourceOptions().length > 0}>
+            <div class="sessions__resource-popover" role="listbox" aria-label="Resource suggestions">
+              <For each={visibleResourceOptions()}>
+                {(option, index) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={index() === selectedResourceIndex()}
+                    class={`sessions__resource-option${index() === selectedResourceIndex() ? " is-selected" : ""}`}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => acceptResourceOption(option)}
+                  >
+                    <span class="sessions__resource-option-kind">{option.kind}</span>
+                    <span class="sessions__resource-option-label">{option.label}</span>
+                    <span class="sessions__resource-option-detail">{option.detail}</span>
+                  </button>
+                )}
+              </For>
+            </div>
+          </Show>
+          <div class="sessions__composer-textarea-shell">
+            <div class="sessions__composer-highlight" aria-hidden="true" ref={highlightLayer}>
+              {highlightResourceTokens(draft())}
+            </div>
+            <textarea
+              ref={messageTextarea}
+              aria-label="Session message"
+              aria-autocomplete="list"
+              aria-expanded={visibleResourceOptions().length > 0}
+              placeholder="Send a message..."
+              value={draft()}
+              onInput={(event) => {
+                setDraft(event.currentTarget.value);
+                rememberTextareaSelection(event.currentTarget);
+                syncHighlightScroll(event.currentTarget);
+              }}
+              onClick={(event) => rememberTextareaSelection(event.currentTarget)}
+              onKeyUp={(event) => rememberTextareaSelection(event.currentTarget)}
+              onSelect={(event) => rememberTextareaSelection(event.currentTarget)}
+              onScroll={(event) => syncHighlightScroll(event.currentTarget)}
+            />
+          </div>
+          <Show when={templateSearchPending() && visibleResourceOptions().length === 0}>
+            <p class="sessions__resource-status">Searching resources...</p>
+          </Show>
+          <Show when={templateSearchMessage()}>
+            {(message) => <p class="sessions__resource-status sessions__resource-status--error">{message()}</p>}
+          </Show>
+        </div>
         <div class="sessions__composer-actions">
           <button
             type="button"
@@ -805,6 +1016,19 @@ type TimelineItemModel =
   | ExternalPromptTimelineItem;
 
 type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string };
+type TemplateTextPart = TemplatePlainTextPart | TemplateResultPart | TemplateErrorPart;
+type TemplatePlainTextPart = { kind: "text"; text: string };
+type TemplateResultPart = {
+  kind: "result";
+  raw: string;
+  kindName: string;
+  tool: string;
+  source: string;
+  arguments: string;
+  content: string;
+};
+type TemplateErrorPart = { kind: "error"; raw: string; message: string };
+type ActiveResourceToken = { start: number; end: number; query: string };
 type ExternalPromptTimelineItem = {
   id: string;
   turn: bigint;
@@ -872,6 +1096,178 @@ type TurnMetricsTimelineItem = {
   addedInputCacheReadTokens: bigint | null;
   addedInputBaseTokens: bigint | null;
 };
+
+function resourceTokenAtCaret(text: string, selectionStart: number, selectionEnd: number): ActiveResourceToken | undefined {
+  if (selectionStart !== selectionEnd) {
+    return undefined;
+  }
+
+  let start = selectionStart;
+  while (start > 0 && !isWhitespace(text[start - 1])) {
+    start -= 1;
+  }
+
+  if (text[start] !== "@" || selectionStart <= start + 1) {
+    return undefined;
+  }
+
+  const query = text.slice(start + 1, selectionStart);
+  if (!query || hasWhitespace(query)) {
+    return undefined;
+  }
+
+  let end = selectionStart;
+  while (end < text.length && !isWhitespace(text[end])) {
+    end += 1;
+  }
+
+  return { start, end, query };
+}
+
+function highlightResourceTokens(text: string): JSX.Element[] {
+  const nodes: JSX.Element[] = [];
+  let offset = 0;
+  for (const token of resourceTemplateTokenRanges(text)) {
+    const tokenStart = token.start;
+
+    if (tokenStart > offset) {
+      nodes.push(text.slice(offset, tokenStart));
+    }
+
+    nodes.push(<span class="sessions__composer-resource-token">{text.slice(token.start, token.end)}</span>);
+    offset = token.end;
+  }
+
+  if (offset < text.length) {
+    nodes.push(text.slice(offset));
+  }
+
+  return nodes.length > 0 ? nodes : [text];
+}
+
+function renderTemplateInline(text: string): JSX.Element[] {
+  return parseTemplateText(text).flatMap((part) => {
+    if (part.kind === "text") {
+      return highlightResourceTokens(part.text);
+    }
+
+    if (part.kind === "error") {
+      return [<span class="sessions__template-error-token">{part.message}</span>];
+    }
+
+    if (part.source) {
+      return highlightResourceTokens(fileTemplateReference(part.source));
+    }
+
+    if (part.tool) {
+      return highlightResourceTokens(`@tool(${part.tool}, ${part.arguments || "{}"})`);
+    }
+
+    return [part.raw];
+  });
+}
+
+function resourceTemplateTokenRanges(text: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  let index = 0;
+  while (index < text.length) {
+    const start = text.indexOf("@", index);
+    if (start === -1) {
+      break;
+    }
+    if (start > 0 && !isWhitespace(text[start - 1])) {
+      index = start + 1;
+      continue;
+    }
+
+    const end = resourceTemplateTokenEnd(text, start);
+    if (end === undefined || end <= start + 1) {
+      index = start + 1;
+      continue;
+    }
+    ranges.push({ start, end });
+    index = end;
+  }
+  return ranges;
+}
+
+function resourceTemplateTokenEnd(text: string, start: number) {
+  if (text.startsWith('@"', start)) {
+    return quotedResourceTokenEnd(text, start + 2);
+  }
+  if (text.startsWith("@tool(", start)) {
+    return balancedToolTokenEnd(text, start + "@tool(".length);
+  }
+
+  let end = start + 1;
+  while (end < text.length && !isWhitespace(text[end])) {
+    end += 1;
+  }
+  return end;
+}
+
+function quotedResourceTokenEnd(text: string, start: number) {
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      return index + 1;
+    }
+  }
+  return undefined;
+}
+
+function balancedToolTokenEnd(text: string, start: number) {
+  let depth = 1;
+  let quote: string | undefined;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (character === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (character === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === "(") {
+      depth += 1;
+    } else if (character === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return index + 1;
+      }
+    }
+  }
+  return undefined;
+}
+
+function hasWhitespace(value: string) {
+  return /\s/.test(value);
+}
+
+function isWhitespace(value: string | undefined) {
+  return value !== undefined && /\s/.test(value);
+}
 
 function TimelineVirtualizerList(props: CustomContainerComponentProps) {
   return (
@@ -1014,7 +1410,9 @@ function TurnMetricsTimelineItemView(props: { item: TurnMetricsTimelineItem }) {
 }
 
 function TextTimelineItemView(props: { item: Extract<TimelineItemModel, { kind: "user" | "assistant" | "thinking" }> }) {
-  return <MarkdownMessage text={props.item.text} tone={props.item.kind} />;
+  return hasTemplateMarkers(props.item.text)
+    ? <div class={`sessions__markdown sessions__markdown--${props.item.kind} sessions__template-inline`}>{renderTemplateInline(props.item.text)}</div>
+    : <MarkdownMessage text={props.item.text} tone={props.item.kind} />;
 }
 
 function ToolTimelineItemView(props: {
@@ -1825,6 +2223,161 @@ function externalRequestLabel(kind: "permission" | "question" | "prompt") {
     return "question";
   }
   return "external request";
+}
+
+function parseTemplateText(text: string): TemplateTextPart[] {
+  const parts: TemplateTextPart[] = [];
+  let index = 0;
+  while (index < text.length) {
+    const resultStart = text.indexOf("<template-result", index);
+    const errorStart = text.indexOf("<template-error>", index);
+    const nextStart = nextTemplateMarkerStart(resultStart, errorStart);
+    if (nextStart === -1) {
+      pushTemplateTextPart(parts, text.slice(index));
+      break;
+    }
+
+    pushTemplateTextPart(parts, text.slice(index, nextStart));
+    if (nextStart === resultStart) {
+      const parsed = parseTemplateResult(text, nextStart);
+      if (!parsed) {
+        pushTemplateTextPart(parts, text.slice(nextStart));
+        break;
+      }
+      parts.push(parsed.part);
+      index = parsed.end;
+    } else {
+      const parsed = parseTemplateError(text, nextStart);
+      if (!parsed) {
+        pushTemplateTextPart(parts, text.slice(nextStart));
+        break;
+      }
+      parts.push(parsed.part);
+      index = parsed.end;
+    }
+  }
+
+  return parts.length > 0 ? parts : [{ kind: "text", text }];
+}
+
+function retemplatizeUserMessage(text: string) {
+  return parseTemplateText(text).map((part) => {
+    if (part.kind === "text") {
+      return part.text;
+    }
+    if (part.kind === "error") {
+      return part.raw;
+    }
+    if (part.source) {
+      return fileTemplateReference(part.source);
+    }
+    if (part.tool) {
+      return `@tool(${part.tool}, ${part.arguments || "{}"})`;
+    }
+    return part.raw;
+  }).join("");
+}
+
+function hasTemplateMarkers(text: string) {
+  return text.includes("<template-result") || text.includes("<template-error>");
+}
+
+function nextTemplateMarkerStart(resultStart: number, errorStart: number) {
+  if (resultStart === -1) {
+    return errorStart;
+  }
+  if (errorStart === -1) {
+    return resultStart;
+  }
+  return Math.min(resultStart, errorStart);
+}
+
+function pushTemplateTextPart(parts: TemplateTextPart[], text: string) {
+  if (text.length > 0) {
+    parts.push({ kind: "text", text });
+  }
+}
+
+function parseTemplateResult(text: string, start: number): { part: TemplateResultPart; end: number } | undefined {
+  const openEnd = text.indexOf(">", start);
+  if (openEnd === -1) {
+    return undefined;
+  }
+  const closeTag = "</template-result>";
+  const closeStart = text.indexOf(closeTag, openEnd + 1);
+  if (closeStart === -1) {
+    return undefined;
+  }
+
+  const openTag = text.slice(start, openEnd + 1);
+  const body = text.slice(openEnd + 1, closeStart).replace(/^\n/, "").replace(/\n$/, "");
+  const attributes = parseTemplateAttributes(openTag);
+  const argumentsText = extractTemplateChild(body, "arguments");
+  const contentText = extractTemplateChild(body, "content");
+  return {
+    part: {
+      kind: "result",
+      raw: text.slice(start, closeStart + closeTag.length),
+      kindName: attributes.kind ?? "",
+      tool: attributes.tool ?? "",
+      source: attributes.source ?? "",
+      arguments: argumentsText === undefined ? "" : decodeXmlText(argumentsText.trim()),
+      content: contentText === undefined ? body : contentText.replace(/^\n/, "").replace(/\n$/, ""),
+    },
+    end: closeStart + closeTag.length,
+  };
+}
+
+function parseTemplateError(text: string, start: number): { part: TemplateErrorPart; end: number } | undefined {
+  const closeTag = "</template-error>";
+  const contentStart = start + "<template-error>".length;
+  const closeStart = text.indexOf(closeTag, contentStart);
+  if (closeStart === -1) {
+    return undefined;
+  }
+  const raw = text.slice(start, closeStart + closeTag.length);
+  return {
+    part: { kind: "error", raw, message: decodeXmlText(text.slice(contentStart, closeStart)) },
+    end: closeStart + closeTag.length,
+  };
+}
+
+function parseTemplateAttributes(openTag: string) {
+  const attributes: Record<string, string> = {};
+  for (const match of openTag.matchAll(/([A-Za-z_:][A-Za-z0-9_:.-]*)="([^"]*)"/g)) {
+    attributes[match[1]!] = decodeXmlText(match[2]!);
+  }
+  return attributes;
+}
+
+function extractTemplateChild(body: string, tag: string) {
+  const openTag = `<${tag}>`;
+  const closeTag = `</${tag}>`;
+  const openStart = body.indexOf(openTag);
+  if (openStart === -1) {
+    return undefined;
+  }
+  const contentStart = openStart + openTag.length;
+  const closeStart = body.indexOf(closeTag, contentStart);
+  if (closeStart === -1) {
+    return undefined;
+  }
+  return body.slice(contentStart, closeStart);
+}
+
+function decodeXmlText(value: string) {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function fileTemplateReference(path: string) {
+  if (/^[A-Za-z0-9./_-]+$/.test(path)) {
+    return `@${path}`;
+  }
+  return `@"${path.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 function toolLabel(name: string, inputEntries: ToolInputEntry[]) {

@@ -1,10 +1,12 @@
 import { fireEvent, screen, waitFor, within } from "@solidjs/testing-library";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
-import type { ClientCommand, ClientSnapshot, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
+import type { ClientCommand, ClientSnapshot, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, testHistory } from "../support/routes";
 import { emptyConfig, readySessionTimeline, sessionMetricsView, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
+
+const RESOURCE_TEST_DEBOUNCE_MS = 130;
 
 describe("sessions route", () => {
   test("lists sessions sorted by most recently updated", () => {
@@ -187,6 +189,230 @@ describe("sessions route", () => {
       sessionId: "session-compose",
       text: "hello from web",
     }));
+  });
+
+  test("session detail resource autocomplete searches only valid active tokens", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands: ClientCommand[] = [];
+      const snapshot = snapshotWithSessions([
+        sessionWithRuntime("session-resource-rules"),
+      ]);
+      snapshot.sessions.timelines["session-resource-rules"] = readySessionTimeline();
+
+      renderWithAppState(() => <SessionsRouteWithRouter />, {
+        commands,
+        routePath: "/sessions/session-resource-rules",
+        snapshot,
+      });
+
+      const input = screen.getByLabelText("Session message") as HTMLTextAreaElement;
+      await typeComposerText(input, "@");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      expect(templateSearchCommands(commands)).toEqual([]);
+
+      await typeComposerText(input, "foo@src");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      expect(templateSearchCommands(commands)).toEqual([]);
+
+      await typeComposerText(input, "@ src");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      expect(templateSearchCommands(commands)).toEqual([]);
+
+      await typeComposerText(input, "read @src");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(1));
+      expect(templateSearchCommands(commands)[0]).toMatchObject({
+        sessionId: "session-resource-rules",
+        query: "src",
+        limit: 12,
+        kinds: ["file", "tool"],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("session detail resource autocomplete renders delayed unary results", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands: ClientCommand[] = [];
+      let setSnapshot!: (snapshot: ClientSnapshot) => void;
+      const snapshot = snapshotWithSessions([
+        sessionWithRuntime("session-resource-delayed"),
+      ]);
+      snapshot.sessions.timelines["session-resource-delayed"] = readySessionTimeline();
+
+      renderWithAppState(() => <SessionsRouteWithRouter />, {
+        commands,
+        routePath: "/sessions/session-resource-delayed",
+        snapshot,
+        onSnapshotSetter: (setter) => {
+          setSnapshot = setter;
+        },
+      });
+
+      await typeComposerText(screen.getByLabelText("Session message") as HTMLTextAreaElement, "read @src");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(1));
+      expect(screen.queryByRole("listbox", { name: "Resource suggestions" })).toBeNull();
+
+      publishTemplateSearch(snapshot, setSnapshot, latestTemplateSearchCommand(commands), "ready", [
+        { kind: "file", label: "src/lib.rs", detail: "file", template: "@src/lib.rs" },
+      ]);
+
+      await waitFor(() => expect(screen.getByRole("option", { name: /src\/lib\.rs/ })).toBeTruthy());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("session detail resource autocomplete accepts keyboard selection", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands: ClientCommand[] = [];
+      let setSnapshot!: (snapshot: ClientSnapshot) => void;
+      const snapshot = snapshotWithSessions([
+        sessionWithRuntime("session-resource-keyboard"),
+      ]);
+      snapshot.sessions.timelines["session-resource-keyboard"] = readySessionTimeline();
+
+      renderWithAppState(() => <SessionsRouteWithRouter />, {
+        commands,
+        routePath: "/sessions/session-resource-keyboard",
+        snapshot,
+        onSnapshotSetter: (setter) => {
+          setSnapshot = setter;
+        },
+      });
+
+      const input = screen.getByLabelText("Session message") as HTMLTextAreaElement;
+      await typeComposerText(input, "inspect @sr please");
+      input.setSelectionRange("inspect @sr".length, "inspect @sr".length);
+      fireEvent.keyUp(input, { key: "r" });
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(1));
+      publishTemplateSearch(snapshot, setSnapshot, latestTemplateSearchCommand(commands), "ready", [
+        { kind: "file", label: "src/lib.rs", detail: "file", template: "@src/lib.rs" },
+        { kind: "tool", label: "read", detail: "Read files", template: '@tool(read, {"filePath":""})' },
+      ]);
+
+      await waitFor(() => expect(screen.getByRole("listbox", { name: "Resource suggestions" })).toBeTruthy());
+      expect(screen.getByRole("option", { name: /src\/lib\.rs/ }).getAttribute("aria-selected")).toBe("true");
+
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      expect(screen.getByRole("option", { name: /read/ }).getAttribute("aria-selected")).toBe("true");
+
+      const selectedOption = screen.getByRole("option", { name: /read/ }) as HTMLButtonElement;
+      selectedOption.focus();
+      fireEvent.keyDown(selectedOption, { key: "Enter" });
+
+      await waitFor(() => expect(input.value).toBe('inspect @tool(read, {"filePath":""}) please'));
+      expect(screen.queryByRole("listbox", { name: "Resource suggestions" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("session detail resource autocomplete does not reuse trailing tokens after caret moves", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands: ClientCommand[] = [];
+      let setSnapshot!: (snapshot: ClientSnapshot) => void;
+      const snapshot = snapshotWithSessions([
+        sessionWithRuntime("session-resource-caret"),
+      ]);
+      snapshot.sessions.timelines["session-resource-caret"] = readySessionTimeline();
+
+      renderWithAppState(() => <SessionsRouteWithRouter />, {
+        commands,
+        routePath: "/sessions/session-resource-caret",
+        snapshot,
+        onSnapshotSetter: (setter) => {
+          setSnapshot = setter;
+        },
+      });
+
+      const input = screen.getByLabelText("Session message") as HTMLTextAreaElement;
+      await typeComposerText(input, "read @src");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(1));
+      publishTemplateSearch(snapshot, setSnapshot, latestTemplateSearchCommand(commands), "ready", [
+        { kind: "file", label: "src/lib.rs", detail: "file", template: "@src/lib.rs" },
+      ]);
+      await waitFor(() => expect(screen.getByRole("listbox", { name: "Resource suggestions" })).toBeTruthy());
+
+      input.setSelectionRange(0, 0);
+      fireEvent.keyUp(input, { key: "ArrowLeft" });
+      await waitFor(() => expect(screen.queryByRole("listbox", { name: "Resource suggestions" })).toBeNull());
+
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(input.value).toBe("read @src");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("session detail resource autocomplete accepts clicked options and ignores stale responses", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands: ClientCommand[] = [];
+      let setSnapshot!: (snapshot: ClientSnapshot) => void;
+      const snapshot = snapshotWithSessions([
+        sessionWithRuntime("session-resource-click"),
+      ]);
+      snapshot.sessions.timelines["session-resource-click"] = readySessionTimeline();
+
+      renderWithAppState(() => <SessionsRouteWithRouter />, {
+        commands,
+        routePath: "/sessions/session-resource-click",
+        snapshot,
+        onSnapshotSetter: (setter) => {
+          setSnapshot = setter;
+        },
+      });
+
+      const input = screen.getByLabelText("Session message") as HTMLTextAreaElement;
+      await typeComposerText(input, "open @s");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(1));
+      const staleCommand = latestTemplateSearchCommand(commands);
+
+      await typeComposerText(input, "open @src");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(2));
+      publishTemplateSearch(snapshot, setSnapshot, staleCommand, "ready", [
+        { kind: "file", label: "stale", detail: "old", template: "@stale" },
+      ]);
+      expect(screen.queryByText("stale")).toBeNull();
+
+      publishTemplateSearch(snapshot, setSnapshot, latestTemplateSearchCommand(commands), "ready", [
+        { kind: "file", label: "src/main.rs", detail: "file", template: "@src/main.rs" },
+      ]);
+
+      fireEvent.click(await screen.findByRole("option", { name: /src\/main\.rs/ }));
+      await waitFor(() => expect(input.value).toBe("open @src/main.rs"));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("session detail composer highlights resource-looking text", async () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-resource-highlight"),
+    ]);
+    snapshot.sessions.timelines["session-resource-highlight"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-resource-highlight",
+      snapshot,
+    });
+
+    await typeComposerText(screen.getByLabelText("Session message") as HTMLTextAreaElement, "read @src/lib.rs");
+
+    const token = document.querySelector(".sessions__composer-resource-token");
+    expect(token?.textContent).toBe("@src/lib.rs");
   });
 
   test("session detail composer keeps draft and shows operation failures", async () => {
@@ -569,6 +795,61 @@ describe("sessions route", () => {
     expect(timelineRegion.querySelectorAll(".sessions__code-block")[1]?.textContent).toContain("const label = 'ok';");
   });
 
+  test("session detail renders template results like composer resource text", () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-template-render"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [
+      timelineEvent({
+        cursor: 1n,
+        sessionId: "session-template-render",
+        itemId: "user-item",
+        channel: "user_text",
+        content: {
+          kind: "textSnapshot",
+          text: [
+            "Before",
+            "<template-result kind=\"tool\" tool=\"shell\">",
+            "<arguments>{&quot;command&quot;:&quot;pwd&quot;,&quot;description&quot;:&quot;Show the current working directory&quot;}</arguments>",
+            "<content>",
+            "Exit code: 0\n\n/home/rfhold/repos/rfhold/waltr",
+            "</content>",
+            "</template-result>",
+            "<template-result kind=\"file\" tool=\"read\" source=\"docs/two words.md\">",
+            "<path>docs/two words.md</path>\n<type>file</type>\n<content>\n1: file body\n</content>",
+            "</template-result>",
+            "<template-error>tool fail: boom</template-error>",
+            "After",
+          ].join("\n"),
+        },
+      }),
+    ];
+    snapshot.sessions.timelines["session-template-render"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-template-render",
+      snapshot,
+    });
+
+    const timelineRegion = screen.getByLabelText("Session timeline");
+    const resourceTokens = Array.from(timelineRegion.querySelectorAll(".sessions__composer-resource-token"));
+    expect(resourceTokens.map((token) => token.textContent)).toEqual([
+      '@tool(shell, {"command":"pwd","description":"Show the current working directory"})',
+      '@"docs/two words.md"',
+    ]);
+    expect(timelineRegion.textContent).toContain('@tool(shell, {"command":"pwd","description":"Show the current working directory"})');
+    expect(timelineRegion.textContent).toContain('@"docs/two words.md"');
+    expect(timelineRegion.textContent).toContain(
+      'Before\n@tool(shell, {"command":"pwd","description":"Show the current working directory"})\n@"docs/two words.md"\ntool fail: boom\nAfter',
+    );
+    const errorToken = timelineRegion.querySelector(".sessions__template-error-token");
+    expect(errorToken?.textContent).toBe("tool fail: boom");
+    expect(timelineRegion.textContent).not.toContain("<template-error>");
+    expect(timelineRegion.textContent).toContain("Before");
+    expect(timelineRegion.textContent).toContain("After");
+  });
+
   test("session detail edit user message rolls back before cursor and pre-fills composer", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
@@ -605,6 +886,52 @@ describe("sessions route", () => {
       sessionId: "session-edit-user",
       cursor: 7n,
     });
+  });
+
+  test("session detail edit user message re-templatizes rendered template results", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-edit-template-user"),
+    ]);
+    const timeline = readySessionTimeline();
+    timeline.events = [
+      timelineEvent({
+        cursor: 11n,
+        sessionId: "session-edit-template-user",
+        itemId: "user-item",
+        channel: "user_text",
+        content: {
+          kind: "textSnapshot",
+          text: [
+            "Summarize ",
+            "<template-result kind=\"file\" tool=\"read\" source=\"docs/two words.md\">expanded file</template-result>",
+            " and ",
+            "<template-result kind=\"tool\" tool=\"shell\">",
+            "<arguments>{&quot;command&quot;:&quot;pwd&quot;,&quot;description&quot;:&quot;Show cwd&quot;}</arguments>",
+            "<content>Exit code: 0</content>",
+            "</template-result>",
+          ].join(""),
+        },
+      }),
+    ];
+    snapshot.sessions.timelines["session-edit-template-user"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-edit-template-user",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "rollbackSessionBeforeCursor",
+      sessionId: "session-edit-template-user",
+      cursor: 11n,
+    }));
+    expect((screen.getByLabelText("Session message") as HTMLTextAreaElement).value).toBe(
+      'Summarize @"docs/two words.md" and @tool(shell, {"command":"pwd","description":"Show cwd"})',
+    );
   });
 
   test("session detail rerun user message continues from cursor", async () => {
@@ -1473,6 +1800,56 @@ function setElementRect(element: HTMLElement, rect: { top: number; bottom: numbe
 async function waitForTimelineScroll() {
   await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   await Promise.resolve();
+}
+
+type TemplateSearchCommand = Extract<ClientCommand, { type: "searchSessionTemplates" }>;
+
+async function typeComposerText(input: HTMLTextAreaElement, value: string) {
+  fireEvent.input(input, { target: { value } });
+  input.setSelectionRange(value.length, value.length);
+  fireEvent.keyUp(input, { key: value.at(-1) ?? "" });
+  await Promise.resolve();
+}
+
+function templateSearchCommands(commands: ClientCommand[]): TemplateSearchCommand[] {
+  return commands.filter((command): command is TemplateSearchCommand => command.type === "searchSessionTemplates");
+}
+
+function latestTemplateSearchCommand(commands: ClientCommand[]): TemplateSearchCommand {
+  const searches = templateSearchCommands(commands);
+  const command = searches.at(-1);
+  if (!command) {
+    throw new Error("expected a session resource search command");
+  }
+
+  return command;
+}
+
+function publishTemplateSearch(
+  snapshot: ClientSnapshot,
+  setSnapshot: (snapshot: ClientSnapshot) => void,
+  command: TemplateSearchCommand,
+  status: string,
+  options: SessionTemplateOptionView[],
+  error: string | null = null,
+) {
+  setSnapshot({
+    ...snapshot,
+    sessions: {
+      ...snapshot.sessions,
+      templateSearches: {
+        ...snapshot.sessions.templateSearches,
+        [command.sessionId]: {
+          requestId: command.requestId,
+          sessionId: command.sessionId,
+          query: command.query,
+          status,
+          error,
+          options,
+        },
+      },
+    },
+  });
 }
 
 function provider(name: string, modelIds: string[], reasoningEfforts: string[] = []) {

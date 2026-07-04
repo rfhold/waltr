@@ -64,6 +64,32 @@ export type CatalogSuggestResponse = {
   stale: boolean;
 };
 
+export type SessionTemplateKind = "file" | "tool" | "unknown";
+export type SessionTemplateSearchTarget = "resources" | "prompts";
+
+export type SessionTemplateOption = {
+  kind: SessionTemplateKind;
+  label: string;
+  detail: string;
+  template: string;
+  metadata: unknown;
+};
+
+export type SessionTemplateSearchRequest = {
+  requestId: string;
+  sessionId: string;
+  query: string;
+  limit?: number;
+  kinds?: Array<"file" | "tool">;
+  target?: SessionTemplateSearchTarget;
+};
+
+export type SessionTemplateSearchResponse = {
+  requestId: string;
+  options: SessionTemplateOption[];
+  error: string | null;
+};
+
 export type ClientSnapshotListener = (snapshot: ClientSnapshot) => void;
 
 export type WasmClient = {
@@ -74,6 +100,7 @@ export type WasmClient = {
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   searchCatalogModels: (request: CatalogSearchRequest) => Promise<CatalogSearchResponse>;
   suggestCatalogMatches: (request: CatalogSuggestRequest) => Promise<CatalogSuggestResponse>;
+  searchSessionTemplates: (request: SessionTemplateSearchRequest) => Promise<SessionTemplateSearchResponse>;
 };
 
 export type WasmClientLoader = () => Promise<WasmClient>;
@@ -128,6 +155,11 @@ export async function loadWasmClient(): Promise<WasmClient> {
       suggestCatalogMatchesJson(requestJson: string): Promise<string>;
     }).suggestCatalogMatchesJson(JSON.stringify(request))) as CatalogSuggestResponse;
 
+  const searchSessionTemplates = async (request: SessionTemplateSearchRequest) =>
+    JSON.parse(await (client as WaltrClient & {
+      searchSessionTemplatesJson(requestJson: string): Promise<string>;
+    }).searchSessionTemplatesJson(JSON.stringify(request))) as SessionTemplateSearchResponse;
+
   const start = async () => {
     if (started) {
       return;
@@ -159,5 +191,6 @@ export async function loadWasmClient(): Promise<WasmClient> {
     dispatch,
     searchCatalogModels,
     suggestCatalogMatches,
+    searchSessionTemplates,
   };
 }
