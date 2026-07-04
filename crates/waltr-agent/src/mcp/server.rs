@@ -11,6 +11,7 @@ use super::{
     config::McpServerConfig,
     connection::{McpConnection, McpConnectionHandler, roots_response},
     event::McpRuntimeEvent,
+    prompt::{McpPromptDefinition, format_prompt_result, parse_prompt_definition},
     protocol::{JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION, protocol_error},
     tool::{McpToolDefinition, format_tool_result, parse_tool_definition},
 };
@@ -18,6 +19,12 @@ use super::{
 #[derive(Debug, Clone, Default)]
 pub(in crate::mcp) struct McpToolRegistry {
     pub(in crate::mcp) tools: BTreeMap<String, McpToolDefinition>,
+    pub(in crate::mcp) generation: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(in crate::mcp) struct McpPromptRegistry {
+    pub(in crate::mcp) prompts: BTreeMap<String, McpPromptDefinition>,
     pub(in crate::mcp) generation: u64,
 }
 
@@ -36,6 +43,7 @@ struct McpServerState {
     initialized: bool,
     capabilities: McpServerCapabilities,
     tools: McpToolRegistry,
+    prompts: McpPromptRegistry,
     last_sse_event_id: Option<String>,
 }
 
@@ -45,6 +53,7 @@ impl Default for McpServerState {
             initialized: false,
             capabilities: McpServerCapabilities::default(),
             tools: McpToolRegistry::default(),
+            prompts: McpPromptRegistry::default(),
             last_sse_event_id: None,
         }
     }
@@ -101,6 +110,17 @@ impl McpServerRuntime {
             .collect()
     }
 
+    pub(in crate::mcp) async fn prompts(&self) -> Vec<McpPromptDefinition> {
+        self.state
+            .lock()
+            .await
+            .prompts
+            .prompts
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub(in crate::mcp) async fn call_tool(
         &self,
         tool: &str,
@@ -120,6 +140,34 @@ impl McpServerRuntime {
             .request("tools/call", Some(params), self.timeout, cancellation_token)
             .await?;
         Ok(format_tool_result(&response))
+    }
+
+    pub(in crate::mcp) async fn get_prompt(
+        &self,
+        prompt: &str,
+        arguments: Option<Value>,
+        cancellation_token: CancellationToken,
+    ) -> Result<String> {
+        self.ensure_initialized(cancellation_token.clone()).await?;
+        let mut params = json!({
+            "name": prompt,
+            "_meta": {
+                "progressToken": format!("{}:{prompt}", self.name),
+            }
+        });
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        let response = self
+            .connection
+            .request(
+                "prompts/get",
+                Some(params),
+                self.timeout,
+                cancellation_token,
+            )
+            .await?;
+        Ok(format_prompt_result(&response))
     }
 
     async fn ensure_initialized(&self, cancellation_token: CancellationToken) -> Result<()> {
@@ -163,7 +211,8 @@ impl McpServerRuntime {
             state.capabilities = capabilities;
             state.initialized = true;
         }
-        self.refresh_tools(cancellation_token).await?;
+        self.refresh_tools(cancellation_token.clone()).await?;
+        self.refresh_prompts(cancellation_token).await?;
         drop(self.events.send(McpRuntimeEvent::ServerInitialized {
             server_key: self.name.clone(),
         }));
@@ -218,6 +267,47 @@ impl McpServerRuntime {
         Ok(())
     }
 
+    async fn refresh_prompts(&self, cancellation_token: CancellationToken) -> Result<()> {
+        if self.state.lock().await.capabilities.prompts.is_none() {
+            return Ok(());
+        }
+        let mut cursor = None;
+        let mut prompts = BTreeMap::new();
+        loop {
+            let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
+            let response = self
+                .connection
+                .request(
+                    "prompts/list",
+                    params,
+                    self.timeout,
+                    cancellation_token.clone(),
+                )
+                .await?;
+            for prompt in response
+                .get("prompts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(prompt) = parse_prompt_definition(prompt) {
+                    prompts.insert(prompt.name.clone(), prompt);
+                }
+            }
+            cursor = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let mut state = self.state.lock().await;
+        state.prompts.prompts = prompts;
+        state.prompts.generation += 1;
+        Ok(())
+    }
+
     pub(in crate::mcp) async fn shutdown(&self) {
         self.connection.shutdown().await;
     }
@@ -245,6 +335,22 @@ impl McpConnectionHandler for ServerHandler {
                         server_key: name,
                         generation: 0,
                     }));
+                }
+            }
+            "notifications/prompts/list_changed" => {
+                let name = self.name.clone();
+                let refresh = self
+                    .refresh
+                    .try_lock()
+                    .ok()
+                    .and_then(|runtime| runtime.clone());
+                if let Some(runtime) = refresh {
+                    tokio::spawn(async move {
+                        if let Err(error) = runtime.refresh_prompts(CancellationToken::new()).await
+                        {
+                            tracing::warn!(server = %name, %error, "failed to refresh MCP prompts");
+                        }
+                    });
                 }
             }
             "notifications/message" => {

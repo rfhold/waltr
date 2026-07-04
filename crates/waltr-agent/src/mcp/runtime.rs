@@ -7,9 +7,15 @@ use tokio_util::sync::CancellationToken;
 use crate::{AgentTool, Result, ToolDefinition};
 
 use super::{
-    config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, protocol::protocol_error,
-    server::McpServerRuntime,
+    config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, prompt::McpPromptDefinition,
+    protocol::protocol_error, server::McpServerRuntime,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpServerPromptDefinition {
+    pub(crate) server_name: String,
+    pub(crate) prompt: McpPromptDefinition,
+}
 
 pub(crate) struct McpClientRuntime {
     servers: BTreeMap<String, Arc<McpServerRuntime>>,
@@ -96,6 +102,35 @@ impl McpClientRuntime {
         tools
     }
 
+    pub(crate) async fn prompts(&self) -> Vec<McpServerPromptDefinition> {
+        let mut prompts = Vec::new();
+        for server in self.servers.values() {
+            let server_name = server.name().to_owned();
+            for prompt in server.prompts().await {
+                prompts.push(McpServerPromptDefinition {
+                    server_name: server_name.clone(),
+                    prompt,
+                });
+            }
+        }
+        prompts
+    }
+
+    pub(crate) fn has_server(&self, server_name: &str) -> bool {
+        self.servers.contains_key(server_name)
+    }
+
+    pub(crate) async fn has_prompt(&self, server_name: &str, prompt_name: &str) -> bool {
+        let Some(server) = self.servers.get(server_name) else {
+            return false;
+        };
+        server
+            .prompts()
+            .await
+            .iter()
+            .any(|prompt| prompt.name == prompt_name)
+    }
+
     async fn call_tool(
         &self,
         server_name: &str,
@@ -107,6 +142,20 @@ impl McpClientRuntime {
             .get(server_name)
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
             .call_tool(tool_name, arguments, cancellation_token)
+            .await
+    }
+
+    pub(crate) async fn get_prompt(
+        &self,
+        server_name: &str,
+        prompt_name: &str,
+        arguments: Option<Value>,
+        cancellation_token: CancellationToken,
+    ) -> Result<String> {
+        self.servers
+            .get(server_name)
+            .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
+            .get_prompt(prompt_name, arguments, cancellation_token)
             .await
     }
 

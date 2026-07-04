@@ -1,11 +1,19 @@
 //! Stdio MCP test server used by integration tests.
 
+use rmcp::{ErrorData as McpError, service::RequestContext};
 use rmcp::{
-    ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    RoleServer, ServerHandler, ServiceExt,
+    handler::server::{
+        router::{prompt::PromptRouter, tool::ToolRouter},
+        wrapper::Parameters,
+    },
+    model::{
+        GetPromptRequestParams, GetPromptResult, ListPromptsResult, PaginatedRequestParams,
+        PromptArgument, PromptMessage, PromptMessageRole, ServerCapabilities, ServerInfo,
+    },
     schemars, tool, tool_handler, tool_router,
 };
+use rmcp::{prompt, prompt_router};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct EchoMarkerRequest {
@@ -22,12 +30,14 @@ struct DelayedWriteRequest {
 #[derive(Debug, Clone)]
 struct EchoMarkerServer {
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
 }
 
 impl EchoMarkerServer {
     fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         }
     }
 }
@@ -62,11 +72,95 @@ impl EchoMarkerServer {
     }
 }
 
+#[prompt_router]
+impl EchoMarkerServer {
+    #[prompt(
+        name = "status_prompt",
+        description = "Return a deterministic status prompt."
+    )]
+    fn status_prompt(&self) -> Vec<PromptMessage> {
+        let _ = &self.prompt_router;
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            "stdio-mcp-prompt-status-313",
+        )]
+    }
+
+    #[prompt(name = "greet_prompt", description = "Greet a named test subject.")]
+    fn greet_prompt(
+        &self,
+        Parameters(GreetPromptRequest { name }): Parameters<GreetPromptRequest>,
+    ) -> Vec<PromptMessage> {
+        let _ = &self.prompt_router;
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            format!("hello {name} from stdio-mcp-prompt-414"),
+        )]
+    }
+
+    #[prompt(
+        name = "review.code",
+        description = "Spec-valid prompt name outside Waltr slash syntax."
+    )]
+    fn dotted_prompt(&self) -> Vec<PromptMessage> {
+        let _ = &self.prompt_router;
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            "stdio-mcp-prompt-dotted-515",
+        )]
+    }
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GreetPromptRequest {
+    name: String,
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for EchoMarkerServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Echo deterministic test markers")
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_instructions("Echo deterministic test markers")
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let mut result = ListPromptsResult::default();
+        result.prompts = self.prompt_router.list_all();
+        if let Some(prompt) = result
+            .prompts
+            .iter_mut()
+            .find(|prompt| prompt.name == "greet_prompt")
+        {
+            prompt.arguments = Some(vec![
+                PromptArgument::new("name")
+                    .with_description("Name to greet")
+                    .with_required(true),
+            ]);
+        }
+        Ok(result)
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let prompt_context = rmcp::handler::server::prompt::PromptContext::new(
+            self,
+            request.name,
+            request.arguments,
+            context,
+        );
+        self.prompt_router.get_prompt(prompt_context).await
     }
 }
 
