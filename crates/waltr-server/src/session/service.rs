@@ -682,6 +682,7 @@ fn template_kinds_from_proto(kinds: &[i32]) -> Vec<SessionTemplateKind> {
             |kind| match ProtoSessionTemplateKind::try_from(*kind).ok()? {
                 ProtoSessionTemplateKind::File => Some(SessionTemplateKind::File),
                 ProtoSessionTemplateKind::Tool => Some(SessionTemplateKind::Tool),
+                ProtoSessionTemplateKind::Prompt => Some(SessionTemplateKind::Prompt),
                 ProtoSessionTemplateKind::Unspecified => None,
             },
         )
@@ -692,6 +693,7 @@ fn template_option_to_proto(option: SessionTemplateOption) -> ProtoSessionTempla
     let kind = match option.kind {
         SessionTemplateKind::File => ProtoSessionTemplateKind::File,
         SessionTemplateKind::Tool => ProtoSessionTemplateKind::Tool,
+        SessionTemplateKind::Prompt => ProtoSessionTemplateKind::Prompt,
     };
     ProtoSessionTemplateOption {
         kind: kind as i32,
