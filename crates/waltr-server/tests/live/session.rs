@@ -5,7 +5,7 @@ use waltr::grpc::waltr::{
     config::v1::{Configuration, Model, ModelType, Provider, ProviderType, RuntimeDefaults},
     session::v1::{
         CreateSessionRequest, GetTimelineRequest, SubmitUserMessageRequest, TimelineDirection,
-        TimelineQuery, timeline_content,
+        TimelineQuery, timeline_content, watch_timeline_response,
     },
 };
 use waltr_server::{
@@ -131,7 +131,9 @@ async fn assert_provider_watch_timeline_reconnects_with_cursor(
     let update = tokio::time::timeout(std::time::Duration::from_secs(5), watch.message())
         .await??
         .expect("watch should replay assistant event after cursor");
-    let replayed = update.event.expect("timeline event should be present");
+    let Some(watch_timeline_response::Update::Event(replayed)) = update.update else {
+        panic!("timeline event should be present");
+    };
     assert!(replayed.cursor > after_cursor);
     assert!(!assistant_text(&replayed).is_empty());
 
