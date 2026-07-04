@@ -7,6 +7,7 @@ mod event;
 mod name;
 mod prompt;
 mod protocol;
+mod resource;
 mod runtime;
 mod server;
 mod tool;

@@ -8,13 +8,19 @@ use crate::{AgentTool, Result, ToolDefinition};
 
 use super::{
     config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, prompt::McpPromptDefinition,
-    protocol::protocol_error, server::McpServerRuntime,
+    protocol::protocol_error, resource::McpResourceDefinition, server::McpServerRuntime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpServerPromptDefinition {
     pub(crate) server_name: String,
     pub(crate) prompt: McpPromptDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpServerResourceDefinition {
+    pub(crate) server_name: String,
+    pub(crate) resource: McpResourceDefinition,
 }
 
 pub(crate) struct McpClientRuntime {
@@ -116,6 +122,20 @@ impl McpClientRuntime {
         prompts
     }
 
+    pub(crate) async fn resources(&self) -> Vec<McpServerResourceDefinition> {
+        let mut resources = Vec::new();
+        for server in self.servers.values() {
+            let server_name = server.name().to_owned();
+            for resource in server.resources().await {
+                resources.push(McpServerResourceDefinition {
+                    server_name: server_name.clone(),
+                    resource,
+                });
+            }
+        }
+        resources
+    }
+
     pub(crate) fn has_server(&self, server_name: &str) -> bool {
         self.servers.contains_key(server_name)
     }
@@ -129,6 +149,17 @@ impl McpClientRuntime {
             .await
             .iter()
             .any(|prompt| prompt.name == prompt_name)
+    }
+
+    pub(crate) async fn has_resource(&self, server_name: &str, uri: &str) -> bool {
+        let Some(server) = self.servers.get(server_name) else {
+            return false;
+        };
+        server
+            .resources()
+            .await
+            .iter()
+            .any(|resource| resource.uri == uri)
     }
 
     async fn call_tool(
@@ -156,6 +187,19 @@ impl McpClientRuntime {
             .get(server_name)
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
             .get_prompt(prompt_name, arguments, cancellation_token)
+            .await
+    }
+
+    pub(crate) async fn read_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+        cancellation_token: CancellationToken,
+    ) -> Result<String> {
+        self.servers
+            .get(server_name)
+            .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
+            .read_resource(uri, cancellation_token)
             .await
     }
 

@@ -68,6 +68,8 @@ pub enum SessionTemplateKind {
     File,
     /// Agent tool reference, including MCP-backed tools.
     Tool,
+    /// MCP resource reference.
+    Resource,
     /// Prompt reference, such as an Agent Skill or MCP prompt.
     Prompt,
 }
@@ -162,6 +164,15 @@ pub(crate) fn tool_template(name: &str, input_schema: &Value) -> String {
     format!("@tool({name}, {arguments})")
 }
 
+pub(crate) fn mcp_resource_template(server_name: &str, uri: &str) -> Option<String> {
+    if !is_mcp_template_part(server_name) {
+        return None;
+    }
+
+    let uri = serde_json::to_string(uri).ok()?;
+    Some(format!("@resource({server_name}, {uri})"))
+}
+
 pub(crate) fn mcp_prompt_template(
     server_name: &str,
     prompt_name: &str,
@@ -187,6 +198,10 @@ pub(crate) fn mcp_prompt_template(
 }
 
 pub(crate) fn is_mcp_prompt_template_part(part: &str) -> bool {
+    is_mcp_template_part(part)
+}
+
+pub(crate) fn is_mcp_template_part(part: &str) -> bool {
     !part.is_empty()
         && part
             .chars()

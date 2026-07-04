@@ -8,8 +8,10 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        GetPromptRequestParams, GetPromptResult, ListPromptsResult, PaginatedRequestParams,
-        PromptArgument, PromptMessage, PromptMessageRole, ServerCapabilities, ServerInfo,
+        Annotated, GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
+        PaginatedRequestParams, PromptArgument, PromptMessage, PromptMessageRole, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+        ServerInfo,
     },
     schemars, tool, tool_handler, tool_router,
 };
@@ -123,6 +125,7 @@ impl ServerHandler for EchoMarkerServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
+                .enable_resources()
                 .build(),
         )
         .with_instructions("Echo deterministic test markers")
@@ -161,6 +164,35 @@ impl ServerHandler for EchoMarkerServer {
             context,
         );
         self.prompt_router.get_prompt(prompt_context).await
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(vec![Annotated::new(
+            RawResource::new("test://status", "status_resource")
+                .with_title("Status Resource")
+                .with_description("Return deterministic status resource text")
+                .with_mime_type("text/plain")
+                .with_size(28),
+            None,
+        )]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        match request.uri.as_str() {
+            "test://status" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "stdio-mcp-resource-status-616",
+                request.uri,
+            )])),
+            _ => Err(McpError::invalid_params("unknown test resource", None)),
+        }
     }
 }
 
