@@ -47,8 +47,16 @@ pub(super) fn template_inline_spans(
                             &reference,
                             base_style,
                             token_style,
-                            true,
+                            template_attr(open_tag, "kind").as_deref() != Some("tool"),
                         );
+                        if template_attr(open_tag, "status").as_deref() == Some("error") {
+                            if let Some(error) = template_content(body) {
+                                spans.push(Span::styled(
+                                    format!(" {}", decode_xml_entities(error.trim())),
+                                    error_style,
+                                ));
+                            }
+                        }
                     } else {
                         push_template_token_spans(
                             &mut spans,
@@ -286,6 +294,14 @@ fn template_arguments(body: &str) -> Option<String> {
     Some(decode_xml_entities(&body[start..start + end]))
 }
 
+fn template_content(body: &str) -> Option<&str> {
+    let start_tag = "<content>";
+    let end_tag = "</content>";
+    let start = body.find(start_tag)? + start_tag.len();
+    let end = body[start..].find(end_tag)?;
+    Some(&body[start..start + end])
+}
+
 fn file_template_reference(source: &str) -> String {
     if source
         .chars()
@@ -354,6 +370,23 @@ mod tests {
         assert_eq!(
             rendered_text(text),
             "Before @tool(shell, {\"command\":\"pwd\"}) after"
+        );
+    }
+
+    #[test]
+    fn errored_tool_template_result_keeps_tool_reference_and_error() {
+        let text = concat!(
+            "Before ",
+            "<template-result kind=\"tool\" tool=\"shell\" status=\"error\">\n",
+            "<arguments>{&quot;command&quot;:&quot;pwd&quot;}</arguments>\n",
+            "<content>\npermission denied\n</content>\n",
+            "</template-result>",
+            " after",
+        );
+
+        assert_eq!(
+            rendered_text(text),
+            "Before @tool(shell, {\"command\":\"pwd\"}) permission denied after"
         );
     }
 

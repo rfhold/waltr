@@ -1245,7 +1245,11 @@ async fn user_prompt_template_tool_errors_are_rendered_inline() {
             assert!(
                 request
                     .prompt
-                    .contains("<template-result kind=\"tool\" tool=\"fail\">")
+                    .contains("<template-result kind=\"tool\" tool=\"fail\" status=\"error\">")
+            );
+            assert!(
+                request.prompt.contains("<arguments>{}</arguments>"),
+                "{request:?}"
             );
             assert!(request.prompt.contains("Tool error:"), "{request:?}");
             assert!(request.prompt.contains("boom"), "{request:?}");
@@ -1273,7 +1277,15 @@ async fn user_prompt_template_tool_respects_permission_denies() {
     let provider = Arc::new(ScriptedProvider::new(
         "user-template-permission-deny",
         |request| {
-            assert!(request.prompt.contains("<template-error>"), "{request:?}");
+            assert!(
+                request
+                    .prompt
+                    .contains("<template-result kind=\"tool\" tool=\"blocked\" status=\"error\">")
+            );
+            assert!(
+                request.prompt.contains("<arguments>{}</arguments>"),
+                "{request:?}"
+            );
             assert!(
                 request.prompt.contains("tool is not permitted: blocked"),
                 "{request:?}"
