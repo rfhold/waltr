@@ -234,6 +234,50 @@ describe("sessions route", () => {
     }
   });
 
+  test("session detail prompt autocomplete searches only first-line slash tokens", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands: ClientCommand[] = [];
+      const snapshot = snapshotWithSessions([
+        sessionWithRuntime("session-prompt-rules"),
+      ]);
+      snapshot.sessions.timelines["session-prompt-rules"] = readySessionTimeline();
+
+      renderWithAppState(() => <SessionsRouteWithRouter />, {
+        commands,
+        routePath: "/sessions/session-prompt-rules",
+        snapshot,
+      });
+
+      const input = screen.getByLabelText("Session message") as HTMLTextAreaElement;
+      await typeComposerText(input, "/");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      expect(templateSearchCommands(commands)).toEqual([]);
+
+      await typeComposerText(input, "note/skill:doc");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      expect(templateSearchCommands(commands)).toEqual([]);
+
+      await typeComposerText(input, "first\n/skill:doc");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      expect(templateSearchCommands(commands)).toEqual([]);
+
+      await typeComposerText(input, "/skill:doc");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(1));
+      expect(templateSearchCommands(commands)[0]).toMatchObject({
+        sessionId: "session-prompt-rules",
+        query: "skill:doc",
+        limit: 12,
+        kinds: ["prompt"],
+        target: "prompts",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("session detail resource autocomplete renders delayed unary results", async () => {
     vi.useFakeTimers();
     try {
@@ -413,6 +457,23 @@ describe("sessions route", () => {
 
     const token = document.querySelector(".sessions__composer-resource-token");
     expect(token?.textContent).toBe("@src/lib.rs");
+  });
+
+  test("session detail composer highlights first-line prompt text", async () => {
+    const snapshot = snapshotWithSessions([
+      sessionWithRuntime("session-prompt-highlight"),
+    ]);
+    snapshot.sessions.timelines["session-prompt-highlight"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-prompt-highlight",
+      snapshot,
+    });
+
+    await typeComposerText(screen.getByLabelText("Session message") as HTMLTextAreaElement, "/skill:documenting\n/skill:later");
+
+    const promptTokens = Array.from(document.querySelectorAll(".sessions__composer-prompt-token"));
+    expect(promptTokens.map((token) => token.textContent)).toEqual(["/skill:documenting"]);
   });
 
   test("session detail composer keeps draft and shows operation failures", async () => {
@@ -819,6 +880,7 @@ describe("sessions route", () => {
             "<template-result kind=\"file\" tool=\"read\" source=\"docs/two words.md\">",
             "<path>docs/two words.md</path>\n<type>file</type>\n<content>\n1: file body\n</content>",
             "</template-result>",
+            "<template-result kind=\"skill\" tool=\"load\" source=\"documenting\">skill body</template-result>",
             "<template-error>tool fail: boom</template-error>",
             "After",
           ].join("\n"),
@@ -838,10 +900,14 @@ describe("sessions route", () => {
       '@tool(shell, {"command":"pwd","description":"Show the current working directory"})',
       '@"docs/two words.md"',
     ]);
+    const promptTokens = Array.from(timelineRegion.querySelectorAll(".sessions__composer-prompt-token"));
+    expect(promptTokens.map((token) => token.textContent)).toEqual(["/skill:documenting"]);
     expect(timelineRegion.textContent).toContain('@tool(shell, {"command":"pwd","description":"Show the current working directory"})');
     expect(timelineRegion.textContent).toContain('@"docs/two words.md"');
+    expect(timelineRegion.textContent).toContain("/skill:documenting");
+    expect(timelineRegion.textContent).not.toContain("@documenting");
     expect(timelineRegion.textContent).toContain(
-      'Before\n@tool(shell, {"command":"pwd","description":"Show the current working directory"})\n@"docs/two words.md"\ntool fail: boom\nAfter',
+      'Before\n@tool(shell, {"command":"pwd","description":"Show the current working directory"})\n@"docs/two words.md"\n/skill:documenting\ntool fail: boom\nAfter',
     );
     const errorToken = timelineRegion.querySelector(".sessions__template-error-token");
     expect(errorToken?.textContent).toBe("tool fail: boom");
