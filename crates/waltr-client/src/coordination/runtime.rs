@@ -251,6 +251,8 @@ pub enum ClientSessionTemplateKind {
     File,
     /// Tool templates visible to the session.
     Tool,
+    /// Prompt templates visible to the session.
+    Prompt,
 }
 
 /// Template search target requested by UI clients.
@@ -261,6 +263,12 @@ pub enum ClientSessionTemplateSearchTarget {
     Resources,
     /// Search prompt templates such as skills or MCP prompts.
     Prompts,
+}
+
+impl Default for ClientSessionTemplateSearchTarget {
+    fn default() -> Self {
+        Self::Resources
+    }
 }
 
 /// Stable snapshot of shared client state.
@@ -1401,6 +1409,7 @@ impl From<SessionTemplateOption> for SessionTemplateOptionView {
             kind: match SessionTemplateKind::try_from(option.kind).ok() {
                 Some(SessionTemplateKind::File) => "file",
                 Some(SessionTemplateKind::Tool) => "tool",
+                Some(SessionTemplateKind::Prompt) => "prompt",
                 _ => "unknown",
             },
             label: option.label,

@@ -809,6 +809,7 @@ const fn session_template_kind(kind: ClientSessionTemplateKind) -> crate::Sessio
     match kind {
         ClientSessionTemplateKind::File => crate::SessionTemplateKind::File,
         ClientSessionTemplateKind::Tool => crate::SessionTemplateKind::Tool,
+        ClientSessionTemplateKind::Prompt => crate::SessionTemplateKind::Prompt,
     }
 }
 
