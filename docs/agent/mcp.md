@@ -1,6 +1,6 @@
 # MCP
 
-Model Context Protocol support lets a session expose tools and prompt templates from configured MCP servers. The implementation lives in `crates/waltr-agent/` and is owned by the durable session coordinator so MCP servers can remain initialized alongside a session.
+Model Context Protocol support lets a session expose tools, prompt templates, and resource templates from configured MCP servers. The implementation lives in `crates/waltr-agent/` and is owned by the durable session coordinator so MCP servers can remain initialized alongside a session.
 
 ## Entry Points
 
@@ -12,7 +12,7 @@ Model Context Protocol support lets a session expose tools and prompt templates 
 | `SessionRuntimeSettings::mcp_servers` | Per-session MCP server snapshots used by `SessionCoordinator`. |
 | `SessionCoordinator` | Starts and caches a session-scoped MCP runtime when resolving a session runtime. |
 
-MCP is not attached directly to `AgentRuntimeBuilder`. Runtime construction receives tools and prompt-template middleware from the coordinator-owned MCP runtime for that session.
+MCP is not attached directly to `AgentRuntimeBuilder`. Runtime construction receives tools and template middleware from the coordinator-owned MCP runtime for that session.
 
 ## Transports
 
@@ -80,6 +80,20 @@ Prompt names and server keys are inserted only when they can be represented by W
 
 When a user prompt starts with an MCP prompt template, the template middleware sends `prompts/get` to that server and inserts the returned prompt content before the provider request. Prompt content can contain nested template references, which are rendered by the normal template pipeline.
 
+## Resource Discovery
+
+For each configured server, the session MCP runtime lists resources when the server advertises resource support. Resource definitions are stored with their URI, name, title, description, MIME type, and size when provided.
+
+MCP resources are supported only as prompt templates for now. They are surfaced through the normal session template search target for resources, and inserted templates use the server key plus a JSON string URI:
+
+```text
+@resource(foo, "test://status")
+```
+
+When a user prompt contains an MCP resource template, the template middleware sends `resources/read` to that server and inserts the returned resource content before the provider request. Text resource contents are inserted directly. Blob resource contents render an unsupported-content marker.
+
+MCP resources are not exposed as provider tools, and Waltr does not currently list or expand MCP `resources/templates/list` URI templates.
+
 ## Notifications and Server Requests
 
 The MCP connection loop continuously routes inbound messages while a server is running.
@@ -88,6 +102,7 @@ The MCP connection loop continuously routes inbound messages while a server is r
 | --- | --- |
 | `notifications/tools/list_changed` | Refreshes that server's tool registry in the background. Newly built agent runtimes see the refreshed tools. |
 | `notifications/prompts/list_changed` | Refreshes that server's prompt registry in the background. Newly built agent runtimes and template searches see the refreshed prompts. |
+| `notifications/resources/list_changed` | Refreshes that server's resource registry in the background. Template searches see the refreshed resources. |
 | `notifications/message` | Publishes an internal MCP log event and writes a tracing event. |
 | `notifications/progress` | Publishes an internal MCP progress event. |
 | `roots/list` | Responds with the coordinator runtime root as a single `file://` root. |
@@ -97,7 +112,7 @@ The internal MCP event stream is not yet exposed as a public client or UI contra
 ## Boundaries
 
 - MCP support is opt-in through session runtime settings.
-- MCP resources, subscriptions, sampling, elicitation, completion, and extension negotiation are not implemented.
+- MCP resource subscriptions, resource templates, sampling, elicitation, completion, and extension negotiation are not implemented.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - The shared server config names the HTTP MCP server type `SSE`; session runtime settings map that to the agent's Streamable HTTP transport.
@@ -111,7 +126,7 @@ Focused coverage:
 
 | Path | Covers |
 | --- | --- |
-| [../../crates/waltr-agent/tests/agent/mcp.rs](../../crates/waltr-agent/tests/agent/mcp.rs) | Deterministic stdio and streamable HTTP MCP tool flows plus stdio MCP prompt template discovery and rendering. |
+| [../../crates/waltr-agent/tests/agent/mcp.rs](../../crates/waltr-agent/tests/agent/mcp.rs) | Deterministic stdio and streamable HTTP MCP tool flows plus stdio MCP prompt/resource template discovery and rendering. |
 | [../../crates/waltr-agent/tests/live/agent/mcp.rs](../../crates/waltr-agent/tests/live/agent/mcp.rs) | Ignored live-provider MCP coverage. |
 | [../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs](../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs) | Test MCP server binary. |
 
@@ -120,11 +135,12 @@ Focused coverage:
 | Path | Purpose |
 | --- | --- |
 | [../../crates/waltr-agent/src/mcp/config.rs](../../crates/waltr-agent/src/mcp/config.rs) | MCP configuration types. |
-| [../../crates/waltr-agent/src/mcp/runtime.rs](../../crates/waltr-agent/src/mcp/runtime.rs) | Session MCP runtime, `AgentTool` conversion, and prompt access. |
-| [../../crates/waltr-agent/src/mcp/server.rs](../../crates/waltr-agent/src/mcp/server.rs) | MCP initialize, capabilities, tool and prompt registries, notifications, and request behavior. |
+| [../../crates/waltr-agent/src/mcp/runtime.rs](../../crates/waltr-agent/src/mcp/runtime.rs) | Session MCP runtime, `AgentTool` conversion, prompt access, and resource access. |
+| [../../crates/waltr-agent/src/mcp/server.rs](../../crates/waltr-agent/src/mcp/server.rs) | MCP initialize, capabilities, tool/prompt/resource registries, notifications, and request behavior. |
 | [../../crates/waltr-agent/src/mcp/connection.rs](../../crates/waltr-agent/src/mcp/connection.rs) | JSON-RPC request routing, cancellation notifications, server requests, and notification dispatch. |
 | [../../crates/waltr-agent/src/mcp/name.rs](../../crates/waltr-agent/src/mcp/name.rs) | Generated tool-name sanitization. |
 | [../../crates/waltr-agent/src/mcp/tool.rs](../../crates/waltr-agent/src/mcp/tool.rs) | MCP response formatting. |
 | [../../crates/waltr-agent/src/mcp/prompt.rs](../../crates/waltr-agent/src/mcp/prompt.rs) | MCP prompt definition parsing and prompt response formatting. |
+| [../../crates/waltr-agent/src/mcp/resource.rs](../../crates/waltr-agent/src/mcp/resource.rs) | MCP resource definition parsing and resource response formatting. |
 | [../../crates/waltr-agent/src/mcp/transport/stdio.rs](../../crates/waltr-agent/src/mcp/transport/stdio.rs) | Stdio transport. |
 | [../../crates/waltr-agent/src/mcp/transport/http.rs](../../crates/waltr-agent/src/mcp/transport/http.rs) | Streamable HTTP transport. |
