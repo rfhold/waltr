@@ -498,6 +498,7 @@ pub enum SessionTemplateKind {
     Unspecified = 0,
     File = 1,
     Tool = 2,
+    Prompt = 3,
 }
 impl SessionTemplateKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -509,6 +510,7 @@ impl SessionTemplateKind {
             Self::Unspecified => "SESSION_TEMPLATE_KIND_UNSPECIFIED",
             Self::File => "SESSION_TEMPLATE_KIND_FILE",
             Self::Tool => "SESSION_TEMPLATE_KIND_TOOL",
+            Self::Prompt => "SESSION_TEMPLATE_KIND_PROMPT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -517,6 +519,7 @@ impl SessionTemplateKind {
             "SESSION_TEMPLATE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
             "SESSION_TEMPLATE_KIND_FILE" => Some(Self::File),
             "SESSION_TEMPLATE_KIND_TOOL" => Some(Self::Tool),
+            "SESSION_TEMPLATE_KIND_PROMPT" => Some(Self::Prompt),
             _ => None,
         }
     }

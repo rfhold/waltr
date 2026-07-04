@@ -828,7 +828,7 @@ status: StatusSnapshot,
  */
 sessions: SessionSnapshot, };
 
-export type ClientSessionTemplateKind = "file" | "tool";
+export type ClientSessionTemplateKind = "file" | "tool" | "prompt";
 
 export type ClientSessionTemplateSearchTarget = "resources" | "prompts";
 
