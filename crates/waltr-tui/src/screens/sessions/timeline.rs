@@ -818,6 +818,7 @@ fn template_text_lines(text: &str, tone: MarkdownTone) -> Vec<Line<'static>> {
         base_style,
         THEME.focus_style(),
         THEME.status_style(StatusRole::Error),
+        true,
     );
     let mut lines = vec![template_text_line_prefix(prefix, base_style)];
     for span in spans {

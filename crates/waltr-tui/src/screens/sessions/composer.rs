@@ -295,15 +295,17 @@ fn composer_input_widget(section: &SessionsSection, area: Rect) -> (Paragraph<'s
     } else {
         lines
             .into_iter()
+            .enumerate()
             .skip(first_visible_line)
             .take(visible_height)
-            .map(|line| {
+            .map(|(line_index, line)| {
                 let mut spans = vec![Span::raw("  ")];
                 spans.extend(template_inline_spans(
                     &line,
                     panel_style(),
                     THEME.focus_style(),
                     THEME.status_style(StatusRole::Error),
+                    line_index == 0,
                 ));
                 Line::from(spans)
             })

@@ -7,12 +7,19 @@ pub(super) fn template_inline_spans(
     base_style: Style,
     token_style: Style,
     error_style: Style,
+    highlight_prompt_tokens: bool,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut remainder = text;
 
     while let Some(start) = next_template_marker(remainder) {
-        push_resource_token_spans(&mut spans, &remainder[..start], base_style, token_style);
+        push_template_token_spans(
+            &mut spans,
+            &remainder[..start],
+            base_style,
+            token_style,
+            highlight_prompt_tokens,
+        );
         let marker = &remainder[start..];
 
         if marker.starts_with("<template-error>") {
@@ -35,13 +42,20 @@ pub(super) fn template_inline_spans(
                 if let Some(body_end) = marker.find(close) {
                     let body = &marker[open_end + 1..body_end];
                     if let Some(reference) = template_result_reference(open_tag, body) {
-                        push_resource_token_spans(&mut spans, &reference, base_style, token_style);
+                        push_template_token_spans(
+                            &mut spans,
+                            &reference,
+                            base_style,
+                            token_style,
+                            true,
+                        );
                     } else {
-                        push_resource_token_spans(
+                        push_template_token_spans(
                             &mut spans,
                             &marker[..body_end + close.len()],
                             base_style,
                             token_style,
+                            highlight_prompt_tokens,
                         );
                     }
                     remainder = &marker[body_end + close.len()..];
@@ -50,11 +64,23 @@ pub(super) fn template_inline_spans(
             }
         }
 
-        push_resource_token_spans(&mut spans, marker, base_style, token_style);
+        push_template_token_spans(
+            &mut spans,
+            marker,
+            base_style,
+            token_style,
+            highlight_prompt_tokens,
+        );
         return spans;
     }
 
-    push_resource_token_spans(&mut spans, remainder, base_style, token_style);
+    push_template_token_spans(
+        &mut spans,
+        remainder,
+        base_style,
+        token_style,
+        highlight_prompt_tokens,
+    );
     spans
 }
 
@@ -73,14 +99,15 @@ fn next_template_marker(text: &str) -> Option<usize> {
     }
 }
 
-fn push_resource_token_spans(
+fn push_template_token_spans(
     spans: &mut Vec<Span<'static>>,
     text: &str,
     base_style: Style,
     token_style: Style,
+    highlight_prompt_tokens: bool,
 ) {
     let mut offset = 0;
-    for (start, end) in resource_template_token_ranges(text) {
+    for (start, end) in template_token_ranges(text, highlight_prompt_tokens) {
         if start > offset {
             spans.push(Span::styled(text[offset..start].to_owned(), base_style));
         }
@@ -90,6 +117,48 @@ fn push_resource_token_spans(
     if offset < text.len() || text.is_empty() {
         spans.push(Span::styled(text[offset..].to_owned(), base_style));
     }
+}
+
+fn template_token_ranges(text: &str, highlight_prompt_tokens: bool) -> Vec<(usize, usize)> {
+    let mut ranges = resource_template_token_ranges(text);
+    if highlight_prompt_tokens {
+        ranges.extend(prompt_template_token_ranges(text));
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+    }
+    ranges
+}
+
+fn prompt_template_token_ranges(text: &str) -> Vec<(usize, usize)> {
+    let first_line = text.find('\n').unwrap_or(text.len());
+    let mut ranges = Vec::new();
+    let mut index = 0;
+
+    while let Some(relative_start) = text[index..first_line].find('/') {
+        let start = index + relative_start;
+        if start > 0
+            && !text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            index = start + 1;
+            continue;
+        }
+
+        let end = text[start..first_line]
+            .char_indices()
+            .skip(1)
+            .find_map(|(offset, character)| character.is_whitespace().then_some(start + offset))
+            .unwrap_or(first_line);
+        if end > start + 1 {
+            ranges.push((start, end));
+            index = end;
+        } else {
+            index = start + 1;
+        }
+    }
+
+    ranges
 }
 
 fn resource_template_token_ranges(text: &str) -> Vec<(usize, usize)> {
@@ -192,6 +261,7 @@ fn template_result_reference(open_tag: &str, body: &str) -> Option<String> {
     let kind = template_attr(open_tag, "kind")?;
     match kind.as_str() {
         "file" => template_attr(open_tag, "source").map(|source| file_template_reference(&source)),
+        "skill" => template_attr(open_tag, "source").map(|source| format!("/skill:{source}")),
         "tool" => {
             let tool = template_attr(open_tag, "tool")?;
             let arguments = template_arguments(body).unwrap_or_else(|| "{}".to_owned());
@@ -243,10 +313,31 @@ mod tests {
     use super::template_inline_spans;
 
     fn rendered_text(text: &str) -> String {
-        template_inline_spans(text, Style::default(), Style::default(), Style::default())
-            .into_iter()
-            .map(|span| span.content.into_owned())
-            .collect()
+        template_inline_spans(
+            text,
+            Style::default(),
+            Style::default(),
+            Style::default(),
+            true,
+        )
+        .into_iter()
+        .map(|span| span.content.into_owned())
+        .collect()
+    }
+
+    fn highlighted_text(text: &str, highlight_prompts: bool) -> Vec<String> {
+        let token_style = Style::default().fg(ratatui::style::Color::Yellow);
+        template_inline_spans(
+            text,
+            Style::default(),
+            token_style,
+            Style::default(),
+            highlight_prompts,
+        )
+        .into_iter()
+        .filter(|span| span.style == token_style)
+        .map(|span| span.content.into_owned())
+        .collect()
     }
 
     #[test]
@@ -280,6 +371,28 @@ mod tests {
         assert_eq!(
             rendered_text(text),
             "Before\n@tool(shell, {\"command\":\"pwd\"})\nAfter"
+        );
+    }
+
+    #[test]
+    fn skill_template_result_renders_as_prompt_reference() {
+        let text = concat!(
+            "Use ",
+            "<template-result kind=\"skill\" tool=\"load\" source=\"documenting\">contents</template-result>",
+        );
+
+        assert_eq!(rendered_text(text), "Use /skill:documenting");
+    }
+
+    #[test]
+    fn prompt_tokens_highlight_only_when_enabled() {
+        assert_eq!(
+            highlighted_text("/skill:documenting @src/lib.rs", true),
+            vec!["/skill:documenting", "@src/lib.rs"]
+        );
+        assert_eq!(
+            highlighted_text("/skill:documenting @src/lib.rs", false),
+            vec!["@src/lib.rs"]
         );
     }
 }

@@ -104,16 +104,19 @@ pub(super) struct ResourceAutocompleteState {
     query: String,
     token_start: usize,
     token_end: usize,
+    target: ClientSessionTemplateSearchTarget,
     selected_index: usize,
     open: bool,
     sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ResourceToken {
+struct TemplateAutocompleteToken {
     start: usize,
     end: usize,
     query: String,
+    target: ClientSessionTemplateSearchTarget,
+    kinds: Vec<ClientSessionTemplateKind>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,6 +207,7 @@ impl SessionsSection {
                 query: String::new(),
                 token_start: 0,
                 token_end: 0,
+                target: ClientSessionTemplateSearchTarget::Resources,
                 selected_index: 0,
                 open: false,
                 sequence: 0,
@@ -741,7 +745,8 @@ impl SessionsSection {
             self.clear_resource_autocomplete();
             return SectionAction::Continue;
         }
-        let Some(token) = resource_token_at_cursor(&self.composer_draft, self.composer_cursor)
+        let Some(token) =
+            template_autocomplete_token_at_cursor(&self.composer_draft, self.composer_cursor)
         else {
             self.clear_resource_autocomplete();
             return SectionAction::Continue;
@@ -752,6 +757,7 @@ impl SessionsSection {
             && self.resource_autocomplete.query == token.query
             && self.resource_autocomplete.token_start == token.start
             && self.resource_autocomplete.token_end == token.end
+            && self.resource_autocomplete.target == token.target
         {
             return SectionAction::Continue;
         }
@@ -766,6 +772,7 @@ impl SessionsSection {
         self.resource_autocomplete.query = token.query.clone();
         self.resource_autocomplete.token_start = token.start;
         self.resource_autocomplete.token_end = token.end;
+        self.resource_autocomplete.target = token.target;
         self.resource_autocomplete.selected_index = 0;
         self.resource_autocomplete.open = true;
 
@@ -774,11 +781,8 @@ impl SessionsSection {
             session_id,
             query: token.query,
             limit: RESOURCE_SEARCH_LIMIT,
-            kinds: vec![
-                ClientSessionTemplateKind::File,
-                ClientSessionTemplateKind::Tool,
-            ],
-            target: ClientSessionTemplateSearchTarget::Resources,
+            kinds: token.kinds,
+            target: token.target,
         })
     }
 
@@ -788,6 +792,7 @@ impl SessionsSection {
         self.resource_autocomplete.query.clear();
         self.resource_autocomplete.token_start = 0;
         self.resource_autocomplete.token_end = 0;
+        self.resource_autocomplete.target = ClientSessionTemplateSearchTarget::Resources;
         self.resource_autocomplete.selected_index = 0;
         self.resource_autocomplete.open = false;
     }
@@ -2194,25 +2199,49 @@ fn timeline_ready_view(timeline: Option<&SessionTimelineView>) -> bool {
     timeline.is_some_and(|timeline| matches!(timeline.watch.status, "opened" | "received"))
 }
 
-fn resource_token_at_cursor(text: &str, cursor: usize) -> Option<ResourceToken> {
+fn template_autocomplete_token_at_cursor(
+    text: &str,
+    cursor: usize,
+) -> Option<TemplateAutocompleteToken> {
+    prompt_token_at_cursor(text, cursor).or_else(|| resource_token_at_cursor(text, cursor))
+}
+
+fn prompt_token_at_cursor(text: &str, cursor: usize) -> Option<TemplateAutocompleteToken> {
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) || text[..cursor].contains('\n') {
+        return None;
+    }
+
+    let start = token_start_before_cursor(text, cursor);
+
+    if !text[start..].starts_with('/') || cursor <= start + 1 {
+        return None;
+    }
+
+    let end = text[cursor..]
+        .char_indices()
+        .find_map(|(offset, character)| character.is_whitespace().then_some(cursor + offset))
+        .unwrap_or(text.len());
+    if text[start + 1..end].chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some(TemplateAutocompleteToken {
+        start,
+        end,
+        query: text[start + 1..cursor].to_owned(),
+        target: ClientSessionTemplateSearchTarget::Prompts,
+        kinds: vec![ClientSessionTemplateKind::Prompt],
+    })
+}
+
+fn resource_token_at_cursor(text: &str, cursor: usize) -> Option<TemplateAutocompleteToken> {
     let cursor = cursor.min(text.len());
     if !text.is_char_boundary(cursor) {
         return None;
     }
 
-    let start = text[..cursor]
-        .char_indices()
-        .rev()
-        .find_map(|(index, character)| {
-            if character == '@' {
-                Some(index)
-            } else if character.is_whitespace() {
-                Some(index + character.len_utf8())
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
+    let start = token_start_before_cursor(text, cursor);
 
     if !text[start..].starts_with('@') || cursor <= start + 1 {
         return None;
@@ -2226,11 +2255,28 @@ fn resource_token_at_cursor(text: &str, cursor: usize) -> Option<ResourceToken> 
         return None;
     }
 
-    Some(ResourceToken {
+    Some(TemplateAutocompleteToken {
         start,
         end,
         query: text[start + 1..cursor].to_owned(),
+        target: ClientSessionTemplateSearchTarget::Resources,
+        kinds: vec![
+            ClientSessionTemplateKind::File,
+            ClientSessionTemplateKind::Tool,
+        ],
     })
+}
+
+fn token_start_before_cursor(text: &str, cursor: usize) -> usize {
+    text[..cursor]
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            character
+                .is_whitespace()
+                .then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0)
 }
 
 fn retemplatize_user_message(text: &str) -> String {
@@ -2266,6 +2312,7 @@ fn template_result_reference(open_tag: &str, body: &str) -> Option<String> {
     let kind = template_attr(open_tag, "kind")?;
     match kind.as_str() {
         "file" => template_attr(open_tag, "source").map(|source| file_template_reference(&source)),
+        "skill" => template_attr(open_tag, "source").map(|source| format!("/skill:{source}")),
         "tool" => {
             let tool = template_attr(open_tag, "tool")?;
             let arguments = template_arguments(body).unwrap_or_else(|| "{}".to_owned());
@@ -2308,4 +2355,50 @@ fn decode_xml_entities(value: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod tests {
+    use waltr_client::{ClientSessionTemplateKind, ClientSessionTemplateSearchTarget};
+
+    use super::{
+        prompt_token_at_cursor, retemplatize_user_message, template_autocomplete_token_at_cursor,
+    };
+
+    #[test]
+    fn prompt_autocomplete_detects_first_line_slash_tokens() {
+        let token = prompt_token_at_cursor("/skill:doc", "/skill:doc".len()).expect("token");
+
+        assert_eq!(token.start, 0);
+        assert_eq!(token.end, "/skill:doc".len());
+        assert_eq!(token.query, "skill:doc");
+        assert_eq!(token.target, ClientSessionTemplateSearchTarget::Prompts);
+        assert_eq!(token.kinds, vec![ClientSessionTemplateKind::Prompt]);
+    }
+
+    #[test]
+    fn prompt_autocomplete_ignores_later_lines() {
+        assert!(
+            template_autocomplete_token_at_cursor("first\n/skill:doc", "first\n/skill:doc".len())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn prompt_autocomplete_ignores_embedded_slash_tokens() {
+        assert!(
+            template_autocomplete_token_at_cursor("note/skill:doc", "note/skill:doc".len())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retemplatize_user_message_preserves_skill_prompts() {
+        let text = concat!(
+            "Use ",
+            "<template-result kind=\"skill\" tool=\"load\" source=\"documenting\">contents</template-result>",
+        );
+
+        assert_eq!(retemplatize_user_message(text), "Use /skill:documenting");
+    }
 }
