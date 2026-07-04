@@ -292,6 +292,7 @@ struct SessionTemplateSearchRequest {
 enum SessionTemplateKind {
     File,
     Tool,
+    Prompt,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -354,6 +355,7 @@ impl From<session_proto::SessionTemplateOption> for SessionTemplateOption {
             kind: match session_proto::SessionTemplateKind::try_from(option.kind).ok() {
                 Some(session_proto::SessionTemplateKind::File) => "file",
                 Some(session_proto::SessionTemplateKind::Tool) => "tool",
+                Some(session_proto::SessionTemplateKind::Prompt) => "prompt",
                 _ => "unknown",
             },
             label: option.label,
@@ -369,6 +371,7 @@ fn template_kind_to_proto(kind: SessionTemplateKind) -> i32 {
     match kind {
         SessionTemplateKind::File => session_proto::SessionTemplateKind::File as i32,
         SessionTemplateKind::Tool => session_proto::SessionTemplateKind::Tool as i32,
+        SessionTemplateKind::Prompt => session_proto::SessionTemplateKind::Prompt as i32,
     }
 }
 
