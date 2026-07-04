@@ -8,6 +8,7 @@ pub(crate) mod claims;
 pub mod context;
 pub(crate) mod file_templates;
 pub(crate) mod mcp_prompts;
+pub(crate) mod mcp_resources;
 pub(crate) mod prompt;
 pub(crate) mod question_suspension;
 pub(crate) mod skills;

@@ -42,6 +42,11 @@ pub(crate) enum TemplateReference {
         arguments: Value,
         raw: String,
     },
+    Resource {
+        server: String,
+        uri: String,
+        raw: String,
+    },
     Prompt {
         namespace: String,
         name: String,
@@ -53,7 +58,10 @@ pub(crate) enum TemplateReference {
 impl TemplateReference {
     pub(crate) fn raw(&self) -> &str {
         match self {
-            Self::File { raw, .. } | Self::Tool { raw, .. } | Self::Prompt { raw, .. } => raw,
+            Self::File { raw, .. }
+            | Self::Tool { raw, .. }
+            | Self::Resource { raw, .. }
+            | Self::Prompt { raw, .. } => raw,
         }
     }
 }
@@ -127,6 +135,33 @@ impl TemplateRuntime<'_> {
                     }
                     Err(error) => {
                         output.push_str(&template_error("tool", error));
+                        index += remaining
+                            .find(')')
+                            .map_or(remaining.len(), |position| position + 1);
+                    }
+                }
+                continue;
+            }
+
+            if let Some(rest) = remaining.strip_prefix("@resource(") {
+                match parse_resource_reference(rest) {
+                    Ok((server, uri, consumed)) => {
+                        let consumed = "@resource(".len() + consumed;
+                        let reference = TemplateReference::Resource {
+                            server,
+                            uri,
+                            raw: remaining[..consumed].to_owned(),
+                        };
+                        match self.render_reference(reference, depth).await? {
+                            TemplateRender::Rendered(rendered) => output.push_str(&rendered),
+                            TemplateRender::Suspend(suspension) => {
+                                return Ok(TemplateRender::Suspend(suspension));
+                            }
+                        }
+                        index += consumed;
+                    }
+                    Err(error) => {
+                        output.push_str(&template_error("resource", error));
                         index += remaining
                             .find(')')
                             .map_or(remaining.len(), |position| position + 1);
@@ -236,6 +271,10 @@ impl TemplateRuntime<'_> {
         {
             TemplateReferenceRender::Continue => Ok(TemplateRender::Rendered(match &reference {
                 TemplateReference::Prompt { .. } => reference.raw().to_owned(),
+                TemplateReference::Resource { uri, .. } => template_error(
+                    &format!("resource {uri}"),
+                    "no middleware rendered the reference",
+                ),
                 TemplateReference::File { path, .. } => template_error(
                     &format!("file {path}"),
                     "no middleware rendered the reference",
@@ -491,6 +530,33 @@ fn parse_tool_reference(input: &str) -> std::result::Result<(String, Value, usiz
     Ok((name.to_owned(), json, consumed))
 }
 
+fn parse_resource_reference(input: &str) -> std::result::Result<(String, String, usize), String> {
+    let Some(comma) = input.find(',') else {
+        return Err("missing comma after resource server".to_owned());
+    };
+    let server = input[..comma].trim();
+    if !is_template_name(server) {
+        return Err("invalid resource server".to_owned());
+    }
+    let mut uri_start = comma + 1;
+    while input[uri_start..].starts_with(char::is_whitespace) {
+        uri_start += input[uri_start..].chars().next().map_or(0, char::len_utf8);
+    }
+    let (uri, uri_len) = parse_json_value(&input[uri_start..])?;
+    let Some(uri) = uri.as_str() else {
+        return Err("resource URI must be a JSON string".to_owned());
+    };
+    let mut consumed = uri_start + uri_len;
+    while input[consumed..].starts_with(char::is_whitespace) {
+        consumed += input[consumed..].chars().next().map_or(0, char::len_utf8);
+    }
+    if !input[consumed..].starts_with(')') {
+        return Err("missing closing `)` after resource URI".to_owned());
+    }
+    consumed += 1;
+    Ok((server.to_owned(), uri.to_owned(), consumed))
+}
+
 fn parse_json_value(input: &str) -> std::result::Result<(Value, usize), String> {
     let deserializer = serde_json::Deserializer::from_str(input);
     let mut stream = deserializer.into_iter::<Value>();
@@ -534,13 +600,21 @@ fn is_first_line(input: &str, index: usize) -> bool {
 fn parse_prompt_name(input: &str) -> Option<(String, usize)> {
     let mut consumed = 0;
     for character in input.chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+        if is_template_name_character(character) {
             consumed += character.len_utf8();
         } else {
             break;
         }
     }
     (consumed > 0).then(|| (input[..consumed].to_owned(), consumed))
+}
+
+fn is_template_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_template_name_character)
+}
+
+fn is_template_name_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
 }
 
 fn parse_prompt_reference(input: &str) -> Option<(String, String, Option<Value>, usize)> {

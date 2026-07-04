@@ -325,6 +325,113 @@ async fn mcp_prompt_template_rejects_non_string_arguments() -> waltr_agent::Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn mcp_resource_templates_are_discovered_from_stdio_server() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::new(
+        "mcp_resource_search_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    ));
+    let sessions = mcp_sessions(provider);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![stdio_runtime_server(
+                &stdio_command,
+            )])),
+        )
+        .await?;
+
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "status".to_owned(),
+                limit: 20,
+                kinds: vec![SessionTemplateKind::Resource],
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await?;
+
+    let resource = options
+        .iter()
+        .find(|option| option.template == "@resource(stdio_test, \"test://status\")")
+        .unwrap_or_else(|| panic!("expected status resource template: {options:#?}"));
+    assert_eq!(resource.kind, SessionTemplateKind::Resource);
+    assert_eq!(resource.metadata["resourceType"], "mcp");
+    assert_eq!(resource.metadata["server"], "stdio_test");
+    assert_eq!(resource.metadata["uri"], "test://status");
+    assert_eq!(resource.metadata["mimeType"], "text/plain");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_resource_template_renders_before_provider_request() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_resource_render_provider",
+        |_| {
+            vec![
+                Ok(CompletionEvent::Delta(
+                    "resource-render-complete".to_owned(),
+                )),
+                Ok(CompletionEvent::Finished),
+            ]
+        },
+    )));
+    let sessions = mcp_sessions(provider.clone());
+    let session = run_session_prompt(
+        &sessions,
+        "Read @resource(stdio_test, \"test://status\") before answering.",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+    let prompts = provider.request_prompts();
+    let rendered = prompts
+        .first()
+        .unwrap_or_else(|| panic!("expected captured provider prompt"));
+
+    assert!(
+        rendered.contains("stdio-mcp-resource-status-616"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "<template-result kind=\"mcp_resource\" source=\"stdio_test:test://status\">"
+        ),
+        "{rendered}"
+    );
+    assert!(session.tool_calls.is_empty(), "{session:#?}");
+    assert!(session.text.contains("resource-render-complete"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_resources_are_not_surfaced_as_provider_tools() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_resource_tool_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    )));
+    let sessions = mcp_sessions(provider.clone());
+
+    run_session_prompt(
+        &sessions,
+        "resources are templates only",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+
+    assert_tool_was_not_surfaced(&provider, "mcp_stdio_test_status_resource");
+    assert_tool_was_not_surfaced(&provider, "read_mcp_resource");
+
+    Ok(())
+}
+
 fn stdio_runtime_server(command: &str) -> SessionMcpServerRuntimeSettings {
     SessionMcpServerRuntimeSettings {
         key: "stdio_test".to_owned(),

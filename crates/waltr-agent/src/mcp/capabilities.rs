@@ -4,6 +4,7 @@ use serde_json::Value;
 pub(in crate::mcp) struct McpServerCapabilities {
     pub(in crate::mcp) tools: Option<McpToolsCapability>,
     pub(in crate::mcp) prompts: Option<McpPromptsCapability>,
+    pub(in crate::mcp) resources: Option<McpResourcesCapability>,
     #[allow(dead_code)]
     pub(in crate::mcp) logging: bool,
     #[allow(dead_code)]
@@ -18,6 +19,14 @@ pub(in crate::mcp) struct McpToolsCapability {
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::mcp) struct McpPromptsCapability {
+    #[allow(dead_code)]
+    pub(in crate::mcp) list_changed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(in crate::mcp) struct McpResourcesCapability {
+    #[allow(dead_code)]
+    pub(in crate::mcp) subscribe: bool,
     #[allow(dead_code)]
     pub(in crate::mcp) list_changed: bool,
 }
@@ -39,9 +48,22 @@ impl McpServerCapabilities {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         });
+        let resources = value
+            .get("resources")
+            .map(|resources| McpResourcesCapability {
+                subscribe: resources
+                    .get("subscribe")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                list_changed: resources
+                    .get("listChanged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            });
         Self {
             tools,
             prompts,
+            resources,
             logging: value.get("logging").is_some(),
             raw: value.clone(),
         }
