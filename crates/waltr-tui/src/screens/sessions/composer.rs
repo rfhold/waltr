@@ -1,19 +1,24 @@
 //! Detail composer rendering and cursor helpers.
 
-use waltr_client::{SessionRuntimeConfigView, SessionView};
+use waltr_client::{
+    ClientSnapshot, SessionRuntimeConfigView, SessionTemplateSearchSnapshot, SessionView,
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Position, Rect},
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 
-use crate::theme::THEME;
+use crate::theme::{StatusRole, THEME};
 
 use super::{
     DETAIL_COMPOSER_MAX_INPUT_LINES, SessionsSection, cache_rate, format_compact_currency_cost,
-    format_count, panel_muted_style, panel_style, timeline::accent_border_span,
+    format_count, panel_muted_style, panel_style, template_style::template_inline_spans,
+    timeline::accent_border_span,
 };
+
+const RESOURCE_AUTOCOMPLETE_MAX_ROWS: u16 = 6;
 
 pub(super) fn composer_visible_input_line_count(text: &str) -> u16 {
     u16::try_from(composer_line_count(text))
@@ -87,6 +92,7 @@ pub(super) fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
     section: &SessionsSection,
+    snapshot: Option<&ClientSnapshot>,
     session: &SessionView,
     context_tokens: u64,
 ) {
@@ -136,7 +142,6 @@ pub(super) fn render_composer(
     );
     let (input_widget, cursor_position) = composer_input_widget(section, input_area);
     frame.render_widget(input_widget, input_area);
-    frame.set_cursor_position(cursor_position);
     frame.render_widget(
         Paragraph::new(Line::default()).style(panel_style()),
         spacer_area,
@@ -146,6 +151,133 @@ pub(super) fn render_composer(
         Paragraph::new(Line::default()).style(panel_style()),
         bottom_padding_area,
     );
+    render_resource_autocomplete_overlay(frame, area, inner_area, section, snapshot);
+    frame.set_cursor_position(cursor_position);
+}
+
+fn render_resource_autocomplete_overlay(
+    frame: &mut Frame<'_>,
+    composer_area: Rect,
+    inner_area: Rect,
+    section: &SessionsSection,
+    snapshot: Option<&ClientSnapshot>,
+) {
+    if !section.resource_autocomplete.open || composer_area.y <= 1 || inner_area.width <= 2 {
+        return;
+    }
+
+    let height = resource_autocomplete_overlay_height(section, snapshot)
+        .min(composer_area.y.saturating_sub(1))
+        .min(RESOURCE_AUTOCOMPLETE_MAX_ROWS.saturating_add(2));
+    if height <= 2 {
+        return;
+    };
+
+    let area = Rect {
+        x: inner_area.x,
+        y: composer_area.y.saturating_sub(height).saturating_sub(1),
+        width: inner_area.width,
+        height,
+    };
+    let body_area = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let lines = match section.current_template_search(snapshot) {
+        Some(search) => resource_autocomplete_lines(section, search, usize::from(body_area.height)),
+        None => vec![Line::from(vec![Span::styled(
+            "Searching resources...",
+            panel_muted_style(),
+        )])],
+    };
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(Line::default()).style(panel_style()), area);
+    frame.render_widget(Paragraph::new(lines).style(panel_style()), body_area);
+}
+
+fn resource_autocomplete_overlay_height(
+    section: &SessionsSection,
+    snapshot: Option<&ClientSnapshot>,
+) -> u16 {
+    let rows = section
+        .current_template_search(snapshot)
+        .map_or(1, |search| match search.status {
+            "loading" => 1,
+            _ if search.error.is_some() || search.options.is_empty() => 1,
+            _ => u16::try_from(search.options.len())
+                .unwrap_or(RESOURCE_AUTOCOMPLETE_MAX_ROWS)
+                .min(RESOURCE_AUTOCOMPLETE_MAX_ROWS),
+        });
+
+    rows.saturating_add(2)
+}
+
+fn resource_autocomplete_lines(
+    section: &SessionsSection,
+    search: &SessionTemplateSearchSnapshot,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    if search.status == "loading" {
+        return vec![Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Searching resources...", panel_muted_style()),
+        ])];
+    }
+    if let Some(error) = &search.error {
+        return vec![Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("Resource search failed: {error}"),
+                THEME.status_style(StatusRole::Error),
+            ),
+        ])];
+    }
+    if search.options.is_empty() {
+        return vec![Line::from(vec![
+            Span::raw("  "),
+            Span::styled("No resources found", panel_muted_style()),
+        ])];
+    }
+
+    let selected = section.selected_resource_index(search.options.len());
+    let start = selected.saturating_add(1).saturating_sub(max_lines);
+    let end = start.saturating_add(max_lines).min(search.options.len());
+    search
+        .options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(|(index, option)| {
+            let style = if index == selected {
+                THEME.focus_style()
+            } else {
+                panel_style()
+            };
+            Line::from(vec![
+                Span::raw(if index == selected { "> " } else { "  " }),
+                Span::styled(format!("{:<4}", option.kind), style),
+                Span::raw(" "),
+                Span::styled(truncate(&option.label, 28), style),
+                Span::styled("  ", panel_muted_style()),
+                Span::styled(truncate(&option.detail, 36), panel_muted_style()),
+            ])
+        })
+        .collect()
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars().take(limit) {
+        output.push(character);
+    }
+    if value.chars().count() > limit {
+        output.push_str("...");
+    }
+    output
 }
 
 fn composer_input_widget(section: &SessionsSection, area: Rect) -> (Paragraph<'static>, Position) {
@@ -165,7 +297,16 @@ fn composer_input_widget(section: &SessionsSection, area: Rect) -> (Paragraph<'s
             .into_iter()
             .skip(first_visible_line)
             .take(visible_height)
-            .map(|line| Line::from(vec![Span::raw("  "), Span::styled(line, panel_style())]))
+            .map(|line| {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(template_inline_spans(
+                    &line,
+                    panel_style(),
+                    THEME.focus_style(),
+                    THEME.status_style(StatusRole::Error),
+                ));
+                Line::from(spans)
+            })
             .collect::<Vec<_>>()
     };
 

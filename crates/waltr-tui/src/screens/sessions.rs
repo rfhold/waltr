@@ -3,13 +3,16 @@
 mod composer;
 mod prompts;
 mod runtime_editor;
+mod template_style;
 mod timeline;
 
 use std::collections::BTreeSet;
 
 use waltr_client::{
-    ClientCommand, ClientOperationView, ClientSnapshot, ClientTimelineDirection,
-    RuntimeConfigMatchView, SessionPhaseView, SessionTimelineView, SessionView,
+    ClientCommand, ClientOperationView, ClientSessionTemplateKind,
+    ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection,
+    RuntimeConfigMatchView, SessionPhaseView, SessionTemplateSearchSnapshot, SessionTimelineView,
+    SessionView,
 };
 use ratatui::{
     Frame,
@@ -54,6 +57,7 @@ const DETAIL_RESPONSE_TOP_GAP: u16 = 1;
 const DETAIL_TIMELINE_MIN_HEIGHT: u16 = 6;
 const DETAIL_SCROLL_WHEEL_LINES: usize = 3;
 const DETAIL_SCROLL_PAGE_LINES: usize = 12;
+const RESOURCE_SEARCH_LIMIT: u32 = 12;
 const PERMISSION_REQUEST_KIND: i32 = 1;
 const QUESTION_REQUEST_KIND: i32 = 2;
 const TIMELINE_CHANNELS: [&str; 9] = [
@@ -78,6 +82,7 @@ pub struct SessionsSection {
     pending_runtime_editor: Option<RuntimeEditorKind>,
     composer_draft: String,
     composer_cursor: usize,
+    resource_autocomplete: ResourceAutocompleteState,
     timeline_scroll_from_bottom: usize,
     expanded_shell_tools: BTreeSet<String>,
     prompt_draft: PromptDraft,
@@ -90,6 +95,25 @@ pub struct SessionsSection {
     rollback: OperationTracker,
     continue_session: OperationTracker,
     rollback_modal: Option<RollbackModal>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct ResourceAutocompleteState {
+    request_id: Option<String>,
+    session_id: Option<String>,
+    query: String,
+    token_start: usize,
+    token_end: usize,
+    selected_index: usize,
+    open: bool,
+    sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResourceToken {
+    start: usize,
+    end: usize,
+    query: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +198,16 @@ impl SessionsSection {
             pending_runtime_editor: None,
             composer_draft: String::new(),
             composer_cursor: 0,
+            resource_autocomplete: ResourceAutocompleteState {
+                request_id: None,
+                session_id: None,
+                query: String::new(),
+                token_start: 0,
+                token_end: 0,
+                selected_index: 0,
+                open: false,
+                sequence: 0,
+            },
             timeline_scroll_from_bottom: 0,
             expanded_shell_tools: BTreeSet::new(),
             prompt_draft: PromptDraft::new(),
@@ -618,42 +652,58 @@ impl SessionsSection {
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.insert_composer_char('\n');
+                self.update_resource_autocomplete(snapshot)
+            }
+            KeyCode::Enter => {
+                if self.accept_resource_autocomplete(snapshot) {
+                    SectionAction::Continue
+                } else {
+                    self.submit_message(snapshot)
+                }
+            }
+            KeyCode::Esc if self.resource_autocomplete.open => {
+                self.clear_resource_autocomplete();
                 SectionAction::Continue
             }
-            KeyCode::Enter => self.submit_message(snapshot),
             KeyCode::Backspace => {
                 self.delete_composer_char_before_cursor();
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::Delete => {
                 self.delete_composer_char_at_cursor();
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::Left => {
                 self.move_composer_cursor_left();
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::Right => {
                 self.move_composer_cursor_right();
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::Up => {
+                if self.select_previous_resource_option(snapshot) {
+                    return SectionAction::Continue;
+                }
                 self.move_composer_cursor_vertical(-1);
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::Down => {
+                if self.select_next_resource_option(snapshot) {
+                    return SectionAction::Continue;
+                }
                 self.move_composer_cursor_vertical(1);
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::Home => {
                 self.composer_cursor =
                     composer_line_start(&self.composer_draft, self.composer_cursor);
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::End => {
                 self.composer_cursor =
                     composer_line_end(&self.composer_draft, self.composer_cursor);
-                SectionAction::Continue
+                self.update_resource_autocomplete(snapshot)
             }
             KeyCode::Char(character) => {
                 if !key
@@ -661,6 +711,7 @@ impl SessionsSection {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 {
                     self.insert_composer_char(character);
+                    return self.update_resource_autocomplete(snapshot);
                 }
                 SectionAction::Continue
             }
@@ -679,6 +730,147 @@ impl SessionsSection {
 
         self.submit.begin();
         SectionAction::ClientCommand(ClientCommand::SubmitUserMessage { session_id, text })
+    }
+
+    fn update_resource_autocomplete(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
+            self.clear_resource_autocomplete();
+            return SectionAction::Continue;
+        };
+        if !timeline_ready(snapshot, &session_id) {
+            self.clear_resource_autocomplete();
+            return SectionAction::Continue;
+        }
+        let Some(token) = resource_token_at_cursor(&self.composer_draft, self.composer_cursor)
+        else {
+            self.clear_resource_autocomplete();
+            return SectionAction::Continue;
+        };
+
+        if self.resource_autocomplete.open
+            && self.resource_autocomplete.session_id.as_deref() == Some(session_id.as_str())
+            && self.resource_autocomplete.query == token.query
+            && self.resource_autocomplete.token_start == token.start
+            && self.resource_autocomplete.token_end == token.end
+        {
+            return SectionAction::Continue;
+        }
+
+        self.resource_autocomplete.sequence += 1;
+        let request_id = format!(
+            "{session_id}-resource-{}",
+            self.resource_autocomplete.sequence
+        );
+        self.resource_autocomplete.request_id = Some(request_id.clone());
+        self.resource_autocomplete.session_id = Some(session_id.clone());
+        self.resource_autocomplete.query = token.query.clone();
+        self.resource_autocomplete.token_start = token.start;
+        self.resource_autocomplete.token_end = token.end;
+        self.resource_autocomplete.selected_index = 0;
+        self.resource_autocomplete.open = true;
+
+        SectionAction::ClientCommand(ClientCommand::SearchSessionTemplates {
+            request_id,
+            session_id,
+            query: token.query,
+            limit: RESOURCE_SEARCH_LIMIT,
+            kinds: vec![
+                ClientSessionTemplateKind::File,
+                ClientSessionTemplateKind::Tool,
+            ],
+            target: ClientSessionTemplateSearchTarget::Resources,
+        })
+    }
+
+    fn clear_resource_autocomplete(&mut self) {
+        self.resource_autocomplete.request_id = None;
+        self.resource_autocomplete.session_id = None;
+        self.resource_autocomplete.query.clear();
+        self.resource_autocomplete.token_start = 0;
+        self.resource_autocomplete.token_end = 0;
+        self.resource_autocomplete.selected_index = 0;
+        self.resource_autocomplete.open = false;
+    }
+
+    pub(super) fn current_template_search<'a>(
+        &self,
+        snapshot: Option<&'a ClientSnapshot>,
+    ) -> Option<&'a SessionTemplateSearchSnapshot> {
+        if !self.resource_autocomplete.open {
+            return None;
+        }
+        let session_id = self.resource_autocomplete.session_id.as_deref()?;
+        let request_id = self.resource_autocomplete.request_id.as_deref()?;
+        let search = snapshot?.sessions.template_searches.get(session_id)?;
+        if search.request_id == request_id && search.query == self.resource_autocomplete.query {
+            Some(search)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn selected_resource_index(&self, option_count: usize) -> usize {
+        self.resource_autocomplete
+            .selected_index
+            .min(option_count.saturating_sub(1))
+    }
+
+    fn select_previous_resource_option(&mut self, snapshot: Option<&ClientSnapshot>) -> bool {
+        let Some(search) = self.current_template_search(snapshot) else {
+            return false;
+        };
+        if search.options.is_empty() {
+            return false;
+        }
+        self.resource_autocomplete.selected_index =
+            self.resource_autocomplete.selected_index.saturating_sub(1);
+        true
+    }
+
+    fn select_next_resource_option(&mut self, snapshot: Option<&ClientSnapshot>) -> bool {
+        let Some(search) = self.current_template_search(snapshot) else {
+            return false;
+        };
+        if search.options.is_empty() {
+            return false;
+        }
+        let max = search.options.len().saturating_sub(1);
+        self.resource_autocomplete.selected_index =
+            (self.resource_autocomplete.selected_index + 1).min(max);
+        true
+    }
+
+    fn accept_resource_autocomplete(&mut self, snapshot: Option<&ClientSnapshot>) -> bool {
+        let Some(search) = self.current_template_search(snapshot) else {
+            return false;
+        };
+        let Some(option) = search
+            .options
+            .get(self.selected_resource_index(search.options.len()))
+        else {
+            return false;
+        };
+        let token_start = self
+            .resource_autocomplete
+            .token_start
+            .min(self.composer_draft.len());
+        let token_end = self
+            .resource_autocomplete
+            .token_end
+            .min(self.composer_draft.len());
+        if token_start > token_end
+            || !self.composer_draft.is_char_boundary(token_start)
+            || !self.composer_draft.is_char_boundary(token_end)
+        {
+            self.clear_resource_autocomplete();
+            return true;
+        }
+        let template = option.template.clone();
+        self.composer_draft
+            .replace_range(token_start..token_end, &template);
+        self.composer_cursor = token_start + template.len();
+        self.clear_resource_autocomplete();
+        true
     }
 
     fn insert_composer_char(&mut self, character: char) {
@@ -861,8 +1053,9 @@ impl SessionsSection {
             }
             (RollbackModalTarget::UserMessage { cursor, text }, RollbackModalAction::Edit) => {
                 self.rollback.begin();
-                self.composer_draft.clone_from(text);
+                self.composer_draft = retemplatize_user_message(text);
                 self.composer_cursor = self.composer_draft.len();
+                self.clear_resource_autocomplete();
                 self.rollback_modal = None;
                 SectionAction::ClientCommand(ClientCommand::RollbackSessionBeforeCursor {
                     session_id,
@@ -1079,6 +1272,7 @@ impl SessionsSection {
         self.delete_session_id = None;
         self.composer_draft.clear();
         self.composer_cursor = 0;
+        self.clear_resource_autocomplete();
         self.timeline_scroll_from_bottom = 0;
         self.expanded_shell_tools.clear();
         self.prompt_draft.clear();
@@ -1315,6 +1509,7 @@ impl SessionsSection {
                 frame,
                 response_area,
                 self,
+                snapshot,
                 &session,
                 latest_context_tokens(timeline),
             );
@@ -1997,4 +2192,120 @@ fn timeline_ready(snapshot: Option<&ClientSnapshot>, session_id: &str) -> bool {
 
 fn timeline_ready_view(timeline: Option<&SessionTimelineView>) -> bool {
     timeline.is_some_and(|timeline| matches!(timeline.watch.status, "opened" | "received"))
+}
+
+fn resource_token_at_cursor(text: &str, cursor: usize) -> Option<ResourceToken> {
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+
+    let start = text[..cursor]
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            if character == '@' {
+                Some(index)
+            } else if character.is_whitespace() {
+                Some(index + character.len_utf8())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    if !text[start..].starts_with('@') || cursor <= start + 1 {
+        return None;
+    }
+
+    let end = text[cursor..]
+        .char_indices()
+        .find_map(|(offset, character)| character.is_whitespace().then_some(cursor + offset))
+        .unwrap_or(text.len());
+    if text[start + 1..end].chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some(ResourceToken {
+        start,
+        end,
+        query: text[start + 1..cursor].to_owned(),
+    })
+}
+
+fn retemplatize_user_message(text: &str) -> String {
+    let mut output = String::new();
+    let mut remainder = text;
+
+    while let Some(start) = remainder.find("<template-result") {
+        output.push_str(&remainder[..start]);
+        let marker = &remainder[start..];
+        let Some(open_end) = marker.find('>') else {
+            output.push_str(marker);
+            return output;
+        };
+        let open_tag = &marker[..=open_end];
+        let Some(close_start) = marker.find("</template-result>") else {
+            output.push_str(marker);
+            return output;
+        };
+        let body = &marker[open_end + 1..close_start];
+        if let Some(reference) = template_result_reference(open_tag, body) {
+            output.push_str(&reference);
+        } else {
+            output.push_str(&marker[..close_start + "</template-result>".len()]);
+        }
+        remainder = &marker[close_start + "</template-result>".len()..];
+    }
+
+    output.push_str(remainder);
+    output
+}
+
+fn template_result_reference(open_tag: &str, body: &str) -> Option<String> {
+    let kind = template_attr(open_tag, "kind")?;
+    match kind.as_str() {
+        "file" => template_attr(open_tag, "source").map(|source| file_template_reference(&source)),
+        "tool" => {
+            let tool = template_attr(open_tag, "tool")?;
+            let arguments = template_arguments(body).unwrap_or_else(|| "{}".to_owned());
+            Some(format!("@tool({tool},{arguments})"))
+        }
+        _ => None,
+    }
+}
+
+fn template_attr(open_tag: &str, name: &str) -> Option<String> {
+    let needle = format!(" {name}=\"");
+    let start = open_tag.find(&needle)? + needle.len();
+    let end = open_tag[start..].find('"')?;
+    Some(decode_xml_entities(&open_tag[start..start + end]))
+}
+
+fn template_arguments(body: &str) -> Option<String> {
+    let start_tag = "<arguments>";
+    let end_tag = "</arguments>";
+    let start = body.find(start_tag)? + start_tag.len();
+    let end = body[start..].find(end_tag)?;
+    Some(decode_xml_entities(&body[start..start + end]))
+}
+
+fn file_template_reference(source: &str) -> String {
+    if source
+        .chars()
+        .all(|character| !character.is_whitespace() && character != '"')
+    {
+        format!("@{source}")
+    } else {
+        format!("@\"{}\"", source.replace('"', "\\\""))
+    }
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }

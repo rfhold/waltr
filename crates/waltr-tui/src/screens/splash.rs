@@ -4,7 +4,7 @@ use ratatui::{
     Frame,
     layout::{Alignment, Rect},
     text::{Line, Span},
-    widgets::{Block, Padding, Paragraph},
+    widgets::{Block, Clear, Padding, Paragraph},
 };
 
 use waltr_client::ClientSnapshot;
@@ -23,8 +23,9 @@ const WALTR_ASCII: &[&str] = &[
 
 /// Render the splash screen content.
 pub fn draw_splash(frame: &mut Frame<'_>, area: Rect, snapshot: Option<&ClientSnapshot>) {
-    let card = centered_rect(area, 48, 9);
+    let card = centered_rect(area, 52, 11);
 
+    frame.render_widget(Clear, card);
     frame.render_widget(splash_widget(snapshot), card);
 }
 
@@ -36,15 +37,18 @@ fn splash_widget(snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
         .collect::<Vec<_>>();
 
     lines.push(Line::from(""));
-    lines.push(Line::from(status_text(snapshot)));
+    lines.push(Line::from(Span::styled(
+        status_text(snapshot),
+        THEME.panel_muted_style(),
+    )));
 
     Paragraph::new(lines)
         .alignment(Alignment::Center)
-        .style(THEME.surface_style())
+        .style(THEME.panel_style())
         .block(
             Block::default()
-                .style(THEME.surface_style())
-                .padding(Padding::horizontal(2)),
+                .style(THEME.panel_style())
+                .padding(Padding::new(2, 2, 1, 1)),
         )
 }
 

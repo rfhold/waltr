@@ -667,6 +667,7 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 key: None,
             },
             timelines: BTreeMap::new(),
+            template_searches: BTreeMap::new(),
         },
     }
 }
