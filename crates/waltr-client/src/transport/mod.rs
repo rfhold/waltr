@@ -26,14 +26,17 @@ use tonic::Code;
 use tonic::codegen::{Body, Bytes, StdError};
 
 use crate::{
-    ClientError, ConfigPatch, Configuration, RollbackTarget, SessionRuntimeConfigRequest,
-    SessionSummary, TimelineEvent, TimelineQuery,
+    ClientError, ConfigPatch, Configuration, RollbackTarget, SearchSessionTemplatesRequest,
+    SearchSessionTemplatesResponse, SessionRuntimeConfigRequest, SessionSummary, TimelineEvent,
+    TimelineQuery,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Default gRPC transport for native clients.
 pub type DefaultGrpcTransport = NativeGrpcTransport;
 
 #[cfg(target_arch = "wasm32")]
+/// Default gRPC transport for browser WASM clients.
 pub type DefaultGrpcTransport = WasmGrpcTransport;
 
 /// Runtime-neutral transport adapter used by the shared effect executor.
@@ -151,6 +154,12 @@ pub trait WaltrTransport {
         channels: Vec<String>,
         initial_limit: Option<u32>,
     ) -> impl Future<Output = Result<SessionTimelineWatchStream, ClientError>>;
+
+    /// Search session templates visible to one session.
+    fn search_session_templates(
+        &self,
+        request: SearchSessionTemplatesRequest,
+    ) -> impl Future<Output = Result<SearchSessionTemplatesResponse, ClientError>>;
 
     /// Submit a user message to a session.
     fn submit_user_message(
@@ -346,6 +355,13 @@ where
         initial_limit: Option<u32>,
     ) -> Result<SessionTimelineWatchStream, ClientError> {
         session::watch_timeline(self, session_id, after_cursor, channels, initial_limit).await
+    }
+
+    async fn search_session_templates(
+        &self,
+        request: SearchSessionTemplatesRequest,
+    ) -> Result<SearchSessionTemplatesResponse, ClientError> {
+        session::search_session_templates(self, request).await
     }
 
     async fn submit_user_message(

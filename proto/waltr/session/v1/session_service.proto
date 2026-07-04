@@ -18,6 +18,7 @@ service SessionService {
   rpc InterruptSession(InterruptSessionRequest) returns (InterruptSessionResponse);
   rpc RollbackSession(RollbackSessionRequest) returns (RollbackSessionResponse);
   rpc ContinueSession(ContinueSessionRequest) returns (ContinueSessionResponse);
+  rpc SearchSessionTemplates(SearchSessionTemplatesRequest) returns (SearchSessionTemplatesResponse);
 }
 
 message CreateSessionRequest {
@@ -138,6 +139,53 @@ message ContinueSessionRequest {
 }
 
 message ContinueSessionResponse {}
+
+message SearchSessionTemplatesRequest {
+  string request_id = 1;
+  string session_id = 2;
+  string query = 3;
+  uint32 limit = 4;
+  repeated SessionTemplateKind kinds = 5;
+  SessionTemplateSearchTarget target = 6;
+}
+
+message SearchSessionTemplatesResponse {
+  string request_id = 1;
+  oneof result {
+    SessionTemplateOptions options = 2;
+    SessionTemplateSearchError error = 3;
+  }
+}
+
+message SessionTemplateOptions {
+  repeated SessionTemplateOption options = 1;
+}
+
+message SessionTemplateOption {
+  SessionTemplateKind kind = 1;
+  string label = 2;
+  string detail = 3;
+  string template = 4;
+
+  // JSON object encoded as UTF-8 JSON until template metadata schemas stabilize.
+  string metadata_json = 5;
+}
+
+message SessionTemplateSearchError {
+  string message = 1;
+}
+
+enum SessionTemplateKind {
+  SESSION_TEMPLATE_KIND_UNSPECIFIED = 0;
+  SESSION_TEMPLATE_KIND_FILE = 1;
+  SESSION_TEMPLATE_KIND_TOOL = 2;
+}
+
+enum SessionTemplateSearchTarget {
+  SESSION_TEMPLATE_SEARCH_TARGET_UNSPECIFIED = 0;
+  SESSION_TEMPLATE_SEARCH_TARGET_RESOURCES = 1;
+  SESSION_TEMPLATE_SEARCH_TARGET_PROMPTS = 2;
+}
 
 message RollbackTarget {
   oneof target {

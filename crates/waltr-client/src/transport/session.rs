@@ -5,7 +5,8 @@ use futures_util::StreamExt;
 use waltr::grpc::waltr::session::v1::{
     ContinueSessionRequest, CreateSessionRequest, DeleteSessionRequest, GetTimelineRequest,
     InterruptSessionRequest, ListSessionsRequest, RespondExternalRequestRequest,
-    RollbackSessionRequest, RollbackTarget, SessionRuntimeConfigRequest, SessionSummary,
+    RollbackSessionRequest, RollbackTarget, SearchSessionTemplatesRequest,
+    SearchSessionTemplatesResponse, SessionRuntimeConfigRequest, SessionSummary,
     SubmitUserMessageRequest, TimelineEvent, TimelineQuery, TimelineTruncation,
     UpdateSessionRuntimeConfigRequest, WatchSessionsRequest, WatchSessionsResponse,
     WatchTimelineRequest, WatchTimelineResponse, watch_sessions_response, watch_timeline_response,
@@ -250,6 +251,28 @@ where
         });
 
     Ok(Box::pin(stream))
+}
+
+pub(super) async fn search_session_templates<T>(
+    transport: &T,
+    request: SearchSessionTemplatesRequest,
+) -> Result<SearchSessionTemplatesResponse, ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    Ok(transport
+        .session_client()
+        .await?
+        .search_session_templates(request)
+        .await
+        .map_err(|error| status_error(&error))?
+        .into_inner())
 }
 
 pub(super) async fn rollback_session<T>(

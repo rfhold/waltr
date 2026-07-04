@@ -12,7 +12,7 @@ use futures_util::{
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use waltr::grpc::waltr::catalog::v1 as catalog_proto;
+use waltr::grpc::waltr::{catalog::v1 as catalog_proto, session::v1 as session_proto};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -147,6 +147,47 @@ impl WaltrClient {
         serde_json::to_string(&CatalogSuggestResponse::from(response)).map_err(js_error)
     }
 
+    /// Search session templates and return a JSON response.
+    #[wasm_bindgen(js_name = searchSessionTemplatesJson)]
+    pub async fn search_session_templates_json(
+        &self,
+        request_json: String,
+    ) -> Result<String, JsValue> {
+        let request: SessionTemplateSearchRequest =
+            serde_json::from_str(&request_json).map_err(js_error)?;
+        if request.query.trim().is_empty() {
+            return serde_json::to_string(&SessionTemplateSearchResponse {
+                request_id: request.request_id,
+                options: Vec::new(),
+                error: None,
+            })
+            .map_err(js_error);
+        }
+
+        let response = DefaultGrpcTransport::new(self.endpoint.clone())
+            .search_session_templates(session_proto::SearchSessionTemplatesRequest {
+                request_id: request.request_id,
+                session_id: request.session_id,
+                query: request.query,
+                limit: request.limit.unwrap_or(20),
+                kinds: request
+                    .kinds
+                    .into_iter()
+                    .map(template_kind_to_proto)
+                    .collect(),
+                target: template_search_target_to_proto(request.target),
+            })
+            .await
+            .map(SessionTemplateSearchResponse::from)
+            .unwrap_or_else(|error| SessionTemplateSearchResponse {
+                request_id: String::new(),
+                options: Vec::new(),
+                error: Some(error.to_string()),
+            });
+
+        serde_json::to_string(&response).map_err(js_error)
+    }
+
     /// Advance the shared state stream and return the next JSON snapshot.
     #[wasm_bindgen(js_name = nextStateJson)]
     pub async fn next_state_json(&self) -> Result<String, JsValue> {
@@ -231,6 +272,115 @@ struct CatalogSuggestRequest {
     provider_key: String,
     model_key: String,
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTemplateSearchRequest {
+    request_id: String,
+    session_id: String,
+    query: String,
+    limit: Option<u32>,
+    #[serde(default)]
+    kinds: Vec<SessionTemplateKind>,
+    #[serde(default)]
+    target: SessionTemplateSearchTarget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SessionTemplateKind {
+    File,
+    Tool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SessionTemplateSearchTarget {
+    #[default]
+    Resources,
+    Prompts,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTemplateSearchResponse {
+    request_id: String,
+    options: Vec<SessionTemplateOption>,
+    error: Option<String>,
+}
+
+impl From<session_proto::SearchSessionTemplatesResponse> for SessionTemplateSearchResponse {
+    fn from(response: session_proto::SearchSessionTemplatesResponse) -> Self {
+        match response.result {
+            Some(session_proto::search_session_templates_response::Result::Options(options)) => {
+                Self {
+                    request_id: response.request_id,
+                    options: options
+                        .options
+                        .into_iter()
+                        .map(SessionTemplateOption::from)
+                        .collect(),
+                    error: None,
+                }
+            }
+            Some(session_proto::search_session_templates_response::Result::Error(error)) => Self {
+                request_id: response.request_id,
+                options: Vec::new(),
+                error: Some(error.message),
+            },
+            None => Self {
+                request_id: response.request_id,
+                options: Vec::new(),
+                error: Some("session resource search response missing result".to_owned()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionTemplateOption {
+    kind: &'static str,
+    label: String,
+    detail: String,
+    template: String,
+    metadata: serde_json::Value,
+}
+
+impl From<session_proto::SessionTemplateOption> for SessionTemplateOption {
+    fn from(option: session_proto::SessionTemplateOption) -> Self {
+        Self {
+            kind: match session_proto::SessionTemplateKind::try_from(option.kind).ok() {
+                Some(session_proto::SessionTemplateKind::File) => "file",
+                Some(session_proto::SessionTemplateKind::Tool) => "tool",
+                _ => "unknown",
+            },
+            label: option.label,
+            detail: option.detail,
+            template: option.template,
+            metadata: serde_json::from_str(&option.metadata_json)
+                .unwrap_or(serde_json::Value::Null),
+        }
+    }
+}
+
+fn template_kind_to_proto(kind: SessionTemplateKind) -> i32 {
+    match kind {
+        SessionTemplateKind::File => session_proto::SessionTemplateKind::File as i32,
+        SessionTemplateKind::Tool => session_proto::SessionTemplateKind::Tool as i32,
+    }
+}
+
+fn template_search_target_to_proto(target: SessionTemplateSearchTarget) -> i32 {
+    match target {
+        SessionTemplateSearchTarget::Resources => {
+            session_proto::SessionTemplateSearchTarget::Resources as i32
+        }
+        SessionTemplateSearchTarget::Prompts => {
+            session_proto::SessionTemplateSearchTarget::Prompts as i32
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
