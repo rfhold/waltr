@@ -1,7 +1,7 @@
 import { check, sleep } from "k6";
 
 import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
-import { waitForMissingText, waitForPathname, waitForText } from "../support/checks.js";
+import { typeAndKeepFocus, waitForMissingText, waitForPathname, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
 export const options = browserOptions;
@@ -32,6 +32,13 @@ export default async function () {
     const sessionId = decodeURIComponent(createdPathname.replace(/^\/sessions\//, ""));
     const detailTimeline = await waitForText(page, '[aria-label="Session timeline"]', "No messages yet.");
     await screenshot(page, "sessions-detail-thinking-default");
+
+    await typeAndKeepFocus(page, '[aria-label="Session message"]', "@read");
+    const resourceSuggestions = await waitForText(page, '[aria-label="Resource suggestions"]', "read");
+    await screenshot(page, "sessions-resource-search-popover");
+    await page.keyboard.press("Enter");
+    const resourceFilled = await waitForTextareaValueChange(page, '[aria-label="Session message"]', "@read");
+    await clearTextarea(page, '[aria-label="Session message"]');
 
     await setSelectValue(page, '[aria-label="Session thinking level"]', "high");
     const thinkingRuntime = await waitForText(page, '[aria-label="Session status summary"]', `${PRIMARY_PROVIDER}/${PRIMARY_MODEL} (high)`);
@@ -71,6 +78,8 @@ export default async function () {
     check(null, {
       "session detail route reached": () => createdPathname.startsWith("/sessions/") && sessionId.length > 0,
       "session detail shows empty timeline": () => includesText(detailTimeline, "No messages yet."),
+      "session resource search shows suggestions": () => includesText(resourceSuggestions, "read"),
+      "session resource search fills composer": () => resourceFilled.startsWith("@tool(") && resourceFilled !== "@read",
       "session thinking select is enabled": () => thinkingSelectEnabled,
       "session thinking runtime updates": () => includesText(thinkingRuntime, `${PRIMARY_PROVIDER}/${PRIMARY_MODEL} (high)`),
       "session thinking select persists update": () => thinkingSelectValue === "high",
@@ -82,6 +91,42 @@ export default async function () {
       "session list omits deleted session": () => !includesText(listAfterDelete, sessionId),
     });
   });
+}
+
+async function waitForTextareaValueChange(page, selector, previousValue) {
+  const deadline = Date.now() + 10_000;
+  let value = "";
+
+  while (Date.now() < deadline) {
+    value = await page.evaluate((inputSelector) => {
+      const input = document.querySelector(inputSelector);
+      if (!(input instanceof HTMLTextAreaElement)) {
+        throw new Error(`Textarea not found: ${inputSelector}`);
+      }
+
+      return input.value;
+    }, selector);
+
+    if (value && value !== previousValue) {
+      return value;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for ${selector} value to change from ${previousValue}; saw ${value}`);
+}
+
+async function clearTextarea(page, selector) {
+  await page.evaluate((inputSelector) => {
+    const input = document.querySelector(inputSelector);
+    if (!(input instanceof HTMLTextAreaElement)) {
+      throw new Error(`Textarea not found: ${inputSelector}`);
+    }
+
+    input.value = "";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+  }, selector);
 }
 
 async function waitForSelectEnabled(page, selector) {

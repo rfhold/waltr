@@ -60,11 +60,14 @@ function promptFixtureSnapshot(): ClientSnapshot {
       submitUserMessage: operationSnapshot("idle"),
       respondExternalRequest: operationSnapshot("idle"),
       interrupt: operationSnapshot("idle"),
+      rollback: operationSnapshot("idle"),
+      continueSession: operationSnapshot("idle"),
       watch: operationSnapshot("received"),
       timelines: {
         permission: timeline(permissionRequestEvent()),
         question: timeline(questionRequestEvent()),
       },
+      templateSearches: {},
     },
   };
 }

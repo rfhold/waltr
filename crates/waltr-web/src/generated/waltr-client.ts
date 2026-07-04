@@ -312,7 +312,7 @@ seconds: bigint,
  */
 nanos: number, };
 
-export type SessionPhaseView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "evaluatingToolCall" | "runningTool" | "suspended" | "finished" | "failed" | "unknown";
+export type SessionPhaseView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool" | "suspended" | "finished" | "failed" | "unknown";
 
 export type SessionStatusView = { 
 /**
@@ -470,7 +470,7 @@ metrics: SessionMetricsView, };
 
 export type TimelineEventKindView = "unspecified" | "itemStarted" | "contentDelta" | "itemUpdated" | "itemFinished" | "externalRequestOpened" | "externalRequestResolved" | "sessionStatusChanged" | "unknown";
 
-export type TimelineStatusView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "evaluatingToolCall" | "runningTool" | "pending" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "resolved" | "finished" | "failed" | "canceled" | "unknown";
+export type TimelineStatusView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool" | "pending" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "resolved" | "finished" | "failed" | "canceled" | "unknown";
 
 export type ExternalRequestView = { id: string, kind: number, payloadJson: string, };
 
@@ -531,6 +531,50 @@ load: OperationSnapshot,
  * Timeline watch operation snapshot.
  */
 watch: OperationSnapshot, };
+
+export type SessionTemplateOptionView = { 
+/**
+ * Template kind name.
+ */
+kind: string, 
+/**
+ * Human-readable option label.
+ */
+label: string, 
+/**
+ * Human-readable option detail.
+ */
+detail: string, 
+/**
+ * Template text to insert when selected.
+ */
+template: string, };
+
+export type SessionTemplateSearchSnapshot = { 
+/**
+ * Runtime-local caller request id.
+ */
+requestId: string, 
+/**
+ * Session id searched.
+ */
+sessionId: string, 
+/**
+ * Search query.
+ */
+query: string, 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last search error, when present.
+ */
+error: string | null, 
+/**
+ * Search options returned by the server.
+ */
+options: Array<SessionTemplateOptionView>, };
 
 export type RollbackTargetView = { 
 /**
@@ -746,13 +790,25 @@ respondExternalRequest: OperationSnapshot,
  */
 interrupt: OperationSnapshot, 
 /**
+ * Session rollback operation snapshot.
+ */
+rollback: OperationSnapshot, 
+/**
+ * Session continue operation snapshot.
+ */
+continueSession: OperationSnapshot, 
+/**
  * Session watch operation snapshot.
  */
 watch: OperationSnapshot, 
 /**
  * Session timelines by session id.
  */
-timelines: { [key in string]?: SessionTimelineView }, };
+timelines: { [key in string]?: SessionTimelineView }, 
+/**
+ * Latest resource search state by session id.
+ */
+templateSearches: { [key in string]?: SessionTemplateSearchSnapshot }, };
 
 export type ClientSnapshot = { 
 /**
@@ -771,6 +827,10 @@ status: StatusSnapshot,
  * Session coordination snapshot.
  */
 sessions: SessionSnapshot, };
+
+export type ClientSessionTemplateKind = "file" | "tool";
+
+export type ClientSessionTemplateSearchTarget = "resources" | "prompts";
 
 export type ClientTimelineDirection = "forward" | "backward";
 
@@ -854,7 +914,31 @@ limit: number,
 /**
  * Display-channel filter.
  */
-channels: Array<string>, } | { "type": "registerSessionTimelineWatchInterest", 
+channels: Array<string>, } | { "type": "searchSessionTemplates", 
+/**
+ * Runtime-local caller request id.
+ */
+requestId: string, 
+/**
+ * Session id whose visible templates should be searched.
+ */
+sessionId: string, 
+/**
+ * Search query.
+ */
+query: string, 
+/**
+ * Maximum templates to return.
+ */
+limit: number, 
+/**
+ * Template kinds to include.
+ */
+kinds: Array<ClientSessionTemplateKind>, 
+/**
+ * Template search target.
+ */
+target: ClientSessionTemplateSearchTarget, } | { "type": "registerSessionTimelineWatchInterest", 
 /**
  * Session id whose timeline should be watched.
  */
