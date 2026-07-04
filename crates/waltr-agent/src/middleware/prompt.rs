@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 
 use super::{
-    AgentMiddleware,
+    AgentMiddleware, HookOutcome,
     context::{MiddlewareStateAccess, RequestContext, SystemPromptParts},
 };
 
@@ -85,7 +85,7 @@ impl AgentMiddleware for SystemPromptMiddleware {
         &self,
         ctx: &mut RequestContext<'_>,
         prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
+    ) -> Result<HookOutcome> {
         let run_override = ctx.take_system_prompt_override();
         let state = if let Some(stored) =
             ctx.state_as::<SystemPromptState>(SYSTEM_PROMPT_STATE_NAMESPACE)?
@@ -113,7 +113,7 @@ impl AgentMiddleware for SystemPromptMiddleware {
         if let Some(stored) = state.prompt {
             prompt.push(stored);
         }
-        Ok(())
+        Ok(HookOutcome::Continue)
     }
 }
 
@@ -133,6 +133,12 @@ mod tests {
             middleware_state,
             session_metadata_values: std::collections::BTreeMap::new(),
             system_prompt_override,
+            tools: &[],
+            middleware_chain: crate::middleware::chain::MiddlewareChain::new(),
+            permission_policy: crate::PermissionPolicy::default(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            session_id: "test-session",
+            turn: 0,
         }
     }
 

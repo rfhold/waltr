@@ -6,9 +6,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
-    CompletionTurn, PermissionClaim, PromptTurn, Result, ToolCall, ToolDefinition, ToolResult,
+    AgentTool, CompletionTurn, PermissionClaim, PermissionPolicy, PromptTurn, Result, ToolCall,
+    ToolDefinition, ToolResult,
     agent::session::{SessionJournalEvent, SessionSnapshot},
+    middleware::chain::MiddlewareChain,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::prompt::SystemPromptOverride;
 
@@ -143,6 +146,18 @@ pub(crate) struct RequestContext<'a> {
     pub(crate) session_metadata_values: BTreeMap<String, Value>,
     /// Pending per-run system prompt override, consumed by the system prompt middleware.
     pub(crate) system_prompt_override: &'a mut Option<SystemPromptOverride>,
+    /// Registered host tools available for prompt templating.
+    pub(crate) tools: &'a [AgentTool],
+    /// Middleware chain used by prompt template tool calls.
+    pub(crate) middleware_chain: MiddlewareChain,
+    /// Permission policy used by prompt template tool calls.
+    pub(crate) permission_policy: PermissionPolicy,
+    /// Shared cancellation token for prompt templating tool calls.
+    pub(crate) cancellation_token: CancellationToken,
+    /// Durable session id for prompt templating tool calls.
+    pub(crate) session_id: &'a str,
+    /// Current provider turn for prompt templating tool calls.
+    pub(crate) turn: u64,
 }
 
 impl RequestContext<'_> {
@@ -196,6 +211,18 @@ pub(crate) struct ToolResultContext<'a> {
     pub(crate) result: &'a mut ToolResult,
     /// Durable middleware state for this run.
     pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+    /// Registered host tools available for prompt templating.
+    pub(crate) tools: &'a [AgentTool],
+    /// Middleware chain used by prompt template tool calls.
+    pub(crate) middleware_chain: MiddlewareChain,
+    /// Permission policy used by prompt template tool calls.
+    pub(crate) permission_policy: PermissionPolicy,
+    /// Shared cancellation token for prompt templating tool calls.
+    pub(crate) cancellation_token: CancellationToken,
+    /// Durable session id for prompt templating tool calls.
+    pub(crate) session_id: &'a str,
+    /// Current provider turn for prompt templating tool calls.
+    pub(crate) turn: u64,
 }
 
 impl MiddlewareStateAccess for ToolResultContext<'_> {

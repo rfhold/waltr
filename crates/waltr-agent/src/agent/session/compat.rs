@@ -1,6 +1,6 @@
 //! Compatibility input for ephemeral session-backed runs.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{LlmStream, ModelCost, ModelRef, PermissionPolicy};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +24,7 @@ where
     pub middleware_chain: MiddlewareChain,
     pub permission_policy: PermissionPolicy,
     pub retry_config: ProviderRetryConfig,
+    pub template_base_dir: Option<PathBuf>,
     pub session_id: SessionId,
     pub session_store: S,
     pub session_broadcaster: Option<SessionListBroadcaster>,

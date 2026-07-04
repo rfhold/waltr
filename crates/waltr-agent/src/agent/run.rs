@@ -181,6 +181,7 @@ where
             middleware_chain: default_chain,
             permission_policy,
             retry_config,
+            template_base_dir,
         } = self.runtime;
         let system_prompt = self.system_prompt;
 
@@ -203,6 +204,7 @@ where
             middleware_chain,
             permission_policy,
             retry_config,
+            template_base_dir,
             session_id: self.session_id,
             session_store: self.session_store,
             session_broadcaster: self.session_broadcaster,

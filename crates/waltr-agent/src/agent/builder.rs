@@ -41,6 +41,7 @@ pub struct AgentRuntimeBuilder {
     permission_policy: PermissionPolicy,
     explicit_permission_policy: bool,
     retry_config: ProviderRetryConfig,
+    template_base_dir: Option<PathBuf>,
 }
 
 impl AgentRuntimeBuilder {
@@ -64,6 +65,7 @@ impl AgentRuntimeBuilder {
             permission_policy: PermissionPolicy::default(),
             explicit_permission_policy: false,
             retry_config: ProviderRetryConfig::default(),
+            template_base_dir: None,
         }
     }
 
@@ -231,6 +233,13 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Set the base directory used for prompt template file references.
+    #[must_use]
+    pub fn with_template_base_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.template_base_dir = Some(path.into());
+        self
+    }
+
     /// Build the agent runtime configuration.
     ///
     /// Middleware assembly order is deterministic and affects provider request
@@ -259,6 +268,7 @@ impl AgentRuntimeBuilder {
             middleware_chain,
             permission_policy: self.permission_policy,
             retry_config: self.retry_config,
+            template_base_dir: self.template_base_dir,
         }
     }
 }
@@ -283,6 +293,7 @@ impl fmt::Debug for AgentRuntimeBuilder {
                 &self.explicit_permission_policy,
             )
             .field("retry_config", &self.retry_config)
+            .field("template_base_dir", &self.template_base_dir)
             .finish()
     }
 }

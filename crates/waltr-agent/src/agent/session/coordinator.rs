@@ -28,6 +28,7 @@ use super::{
     SessionTimelineBroadcaster, SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
+use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
 
 /// Durable session coordinator bound to a store.
 #[derive(Debug, Clone)]
@@ -758,6 +759,54 @@ where
     /// Return the session store used by this coordinator.
     pub const fn store(&self) -> &S {
         &self.store
+    }
+
+    /// Search prompt-template resources available to a durable session.
+    pub async fn search_templates(
+        &self,
+        session_id: &SessionId,
+        request: SessionTemplateSearchRequest,
+    ) -> std::result::Result<Vec<SessionTemplateOption>, AgentSessionRunError> {
+        let root = self
+            .runtime_factory
+            .as_ref()
+            .ok_or_else(|| {
+                super::AgentSessionRuntimeError::Internal(
+                    "session runtime factory is not configured".to_owned(),
+                )
+            })?
+            .root
+            .clone();
+        let runtime = self.resolve_runtime_for_template_search(session_id).await?;
+        Ok(crate::resource::search_session_templates(
+            &root, &runtime, &request,
+        ))
+    }
+
+    async fn resolve_runtime_for_template_search(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<AgentRuntime, AgentSessionRunError> {
+        let session = self.load(session_id).await?;
+        let settings = session.record.runtime_settings.as_ref().ok_or_else(|| {
+            super::AgentSessionRuntimeError::FailedPrecondition(
+                "session runtime settings are required before prompting".to_owned(),
+            )
+        })?;
+        let factory = self.runtime_factory.as_ref().ok_or_else(|| {
+            super::AgentSessionRuntimeError::Internal(
+                "session runtime factory is not configured".to_owned(),
+            )
+        })?;
+        let mcp_runtime = self
+            .ensure_mcp_runtime(session_id, settings, factory)
+            .await
+            .ok()
+            .flatten();
+        let builder = factory
+            .runtime_builder_for_sessions(settings, self.clone(), mcp_runtime)
+            .await?;
+        Ok(builder.build())
     }
 
     pub(crate) async fn resolve_runtime(

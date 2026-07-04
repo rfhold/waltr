@@ -45,6 +45,7 @@ pub struct AgentRuntime {
     pub(super) middleware_chain: MiddlewareChain,
     pub(super) permission_policy: PermissionPolicy,
     pub(super) retry_config: ProviderRetryConfig,
+    pub(super) template_base_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentRuntime {

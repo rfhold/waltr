@@ -99,10 +99,12 @@ impl AgentSessionRuntimeFactory {
         settings: &SessionRuntimeSettings,
     ) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError> {
         if let Some(build) = self.runtime_builder_override.as_ref() {
-            return build(settings);
+            return build(settings)
+                .map(|builder| builder.with_template_base_dir(self.root.clone()));
         }
         let builder = self.provider_builder(settings).await?;
         let mut builder = builder
+            .with_template_base_dir(self.root.clone())
             .with_base_system_prompt()
             .with_permission_policy(PermissionPolicy::filesystem_external(
                 self.root.clone(),

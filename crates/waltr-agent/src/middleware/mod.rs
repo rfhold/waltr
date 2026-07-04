@@ -103,8 +103,8 @@ pub(crate) trait AgentMiddleware: Send + Sync {
         &self,
         _ctx: &mut RequestContext<'_>,
         _prompt: &mut SystemPromptParts,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
+    ) -> impl Future<Output = Result<HookOutcome>> + Send {
+        async { Ok(HookOutcome::Continue) }
     }
 
     /// Add or remove tools before provider request assembly.

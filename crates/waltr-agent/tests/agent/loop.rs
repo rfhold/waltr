@@ -8,27 +8,232 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream};
-#[cfg(feature = "shell")]
-use waltr_agent::PermissionPolicy;
-#[cfg(feature = "shell")]
-use waltr_agent::tools::shell::ShellConfig;
 use waltr_agent::{
     AGENTS_INSTRUCTION_FILE, AgentRuntime, AgentTimelineEvent, AgentTool, AgentsPromptConfig,
     BASE_SYSTEM_PROMPT, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
     CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO,
     CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent, CompletionReplayItem,
     CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
-    FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi, ModelRef,
-    ProviderId, ProviderRetryConfig, ProviderTurnMetadata, ResumeInput, SessionCoordinator,
-    SessionStatus, SessionStore, SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta,
-    TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall,
-    ToolDefinition, TurnItem, tools::filesystem::FilesystemConfig,
-    tools::question::QUESTION_TOOL_NAME, tools::question::QuestionConfig,
+    FileCredentialStore, FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi,
+    ModelRef, ProviderId, ProviderRetryConfig, ProviderTurnMetadata, ResumeInput,
+    SessionCoordinator, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
+    SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStatus, SessionStore,
+    SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget, SkillsConfig,
+    ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind,
+    TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
+    tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
+    tools::question::QuestionConfig,
 };
+#[cfg(feature = "shell")]
+use waltr_agent::{PermissionCommandPattern, tools::shell::ShellConfig};
+use waltr_agent::{PermissionEffect, PermissionPolicy, PermissionToolSelector};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::scripted_provider::ScriptedProvider;
+
+#[tokio::test]
+async fn session_template_search_finds_files_and_tools() {
+    let root = tempfile::tempdir().expect("temp dir");
+    fs::create_dir_all(root.path().join("src/nested")).expect("created dirs");
+    fs::write(root.path().join("src/nested/resource.rs"), "resource").expect("wrote file");
+    fs::write(root.path().join("src/two words.md"), "notes").expect("wrote file");
+    fs::write(root.path().join(".hidden.rs"), "hidden").expect("wrote hidden file");
+
+    let invoked = Arc::new(Mutex::new(false));
+    let invoked_for_tool = Arc::clone(&invoked);
+    let provider = Arc::new(ScriptedProvider::from_turns("resource-search", Vec::new()));
+    let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
+        root.path().to_path_buf(),
+        FileCredentialStore::new(root.path().join("auth.json")),
+    )
+    .with_runtime_builder(move |_| {
+        let invoked_for_tool = Arc::clone(&invoked_for_tool);
+        Ok(
+            AgentRuntime::builder(test_model(), provider.clone()).with_tool(AgentTool::new(
+                ToolDefinition::new(
+                    "custom_search",
+                    "Search custom test resources",
+                    json!({ "type": "object", "required": ["query"] }),
+                ),
+                move |context| {
+                    *invoked_for_tool.lock().expect("invoked lock") = true;
+                    Ok(context.result("unexpected"))
+                },
+            )),
+        )
+    });
+    let sessions =
+        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let session_id = sessions
+        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .await
+        .expect("created session")
+        .id()
+        .clone();
+
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "resource".to_owned(),
+                limit: 10,
+                kinds: Vec::new(),
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await
+        .expect("searched resources");
+
+    assert!(options.iter().any(|option| {
+        option.kind == SessionTemplateKind::File
+            && option.detail == "src/nested/resource.rs"
+            && option.template == "@src/nested/resource.rs"
+    }));
+    assert!(options.iter().any(|option| {
+        option.kind == SessionTemplateKind::Tool
+            && option.label == "custom_search"
+            && option.template == "@tool(custom_search, {\"query\":\"\"})"
+    }));
+    assert!(!options.iter().any(|option| option.detail == ".hidden.rs"));
+    assert!(!*invoked.lock().expect("invoked lock"));
+
+    let quoted = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "words".to_owned(),
+                limit: 10,
+                kinds: vec![SessionTemplateKind::File],
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await
+        .expect("searched files");
+    assert!(quoted.iter().any(|option| {
+        option.detail == "src/two words.md" && option.template == "@\"src/two words.md\""
+    }));
+}
+
+#[tokio::test]
+async fn session_template_search_clamps_oversized_limits() {
+    let root = tempfile::tempdir().expect("temp dir");
+    for index in 0..150 {
+        fs::write(
+            root.path().join(format!("resource-{index:03}.rs")),
+            "resource",
+        )
+        .expect("wrote file");
+    }
+
+    let provider = Arc::new(ScriptedProvider::from_turns("resource-limit", Vec::new()));
+    let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
+        root.path().to_path_buf(),
+        FileCredentialStore::new(root.path().join("auth.json")),
+    )
+    .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
+    let sessions =
+        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let session_id = sessions
+        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .await
+        .expect("created session")
+        .id()
+        .clone();
+
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "resource".to_owned(),
+                limit: usize::MAX,
+                kinds: vec![SessionTemplateKind::File],
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await
+        .expect("searched resources");
+
+    assert_eq!(options.len(), 100);
+}
+
+#[tokio::test]
+async fn session_template_search_ignores_mcp_startup_failures() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
+        root.path().to_path_buf(),
+        FileCredentialStore::new(root.path().join("auth.json")),
+    );
+    let sessions =
+        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let mut settings = test_runtime_settings();
+    settings.mcp_servers.push(SessionMcpServerRuntimeSettings {
+        key: "missing".to_owned(),
+        kind: SessionMcpServerRuntimeKind::Stdio,
+        command: "definitely-not-installed-waltr-mcp".to_owned(),
+        url: String::new(),
+    });
+    let session_id = sessions
+        .create_with_runtime_settings(Some(settings), Default::default())
+        .await
+        .expect("created session")
+        .id()
+        .clone();
+
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "read".to_owned(),
+                limit: 10,
+                kinds: vec![SessionTemplateKind::Tool],
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await
+        .expect("searched resources");
+
+    assert!(options.iter().any(|option| {
+        option.kind == SessionTemplateKind::Tool
+            && option.label == "read"
+            && option.template == "@tool(read, {\"filePath\":\"\"})"
+    }));
+}
+
+#[tokio::test]
+async fn session_template_search_empty_query_returns_no_options() {
+    let root = tempfile::tempdir().expect("temp dir");
+    fs::write(root.path().join("visible.rs"), "visible").expect("wrote file");
+    let provider = Arc::new(ScriptedProvider::from_turns("resource-empty", Vec::new()));
+    let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
+        root.path().to_path_buf(),
+        FileCredentialStore::new(root.path().join("auth.json")),
+    )
+    .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
+    let sessions =
+        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let session_id = sessions
+        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .await
+        .expect("created session")
+        .id()
+        .clone();
+
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: String::new(),
+                limit: 10,
+                kinds: Vec::new(),
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await
+        .expect("searched resources");
+
+    assert!(options.is_empty());
+}
 
 #[tokio::test]
 async fn durable_session_resume_continues_same_agent_loop() {
@@ -947,6 +1152,366 @@ async fn agents_system_prompt_is_sent_to_provider() {
 }
 
 #[tokio::test]
+async fn agents_system_prompt_expands_file_references() {
+    let temp = TempRoot::new("waltr-agent-agents-template-file-test");
+    temp.write(AGENTS_INSTRUCTION_FILE, "Follow @CONTRIBUTING.md\n");
+    temp.write("CONTRIBUTING.md", "template included instructions\n");
+    let provider = Arc::new(ScriptedProvider::new("agents-template-file", |request| {
+        let system_prompt = request.system_prompt.expect("system prompt");
+        assert!(
+            system_prompt.contains(
+                "<template-result kind=\"file\" tool=\"read\" source=\"CONTRIBUTING.md\">"
+            ) && system_prompt.contains("<type>file</type>")
+                && system_prompt.contains("1: template included instructions"),
+            "{system_prompt}"
+        );
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_agents_system_prompt(AgentsPromptConfig::new(temp.path()))
+        .build();
+
+    drain(agent.prompt("hello").stream()).await;
+}
+
+#[tokio::test]
+async fn user_prompt_expands_file_references_and_persists_rendered_prompt() {
+    let temp = TempRoot::new("waltr-agent-user-template-file-test");
+    temp.write("prompt-fragment.md", "rendered user file\n");
+    let file_ref = "@prompt-fragment.md";
+    let provider = Arc::new(ScriptedProvider::new("user-template-file", |request| {
+        assert!(
+            request
+                .prompt
+                .contains("<template-result kind=\"file\" tool=\"read\""),
+            "{request:?}"
+        );
+        assert!(request.prompt.contains("<type>file</type>"), "{request:?}");
+        assert!(
+            request.prompt.contains("1: rendered user file"),
+            "{request:?}"
+        );
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_template_base_dir(temp.path())
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    drain(
+        sessions
+            .prompt(&agent, session_id.clone(), file_ref)
+            .stream(),
+    )
+    .await;
+
+    let record = store.load(&session_id).await.expect("stored session");
+    let snapshot = record.snapshot();
+    let prompt = snapshot.current_prompt.as_deref().expect("stored prompt");
+    assert!(
+        prompt.contains("<template-result kind=\"file\" tool=\"read\""),
+        "{prompt}"
+    );
+    assert!(prompt.contains("<type>file</type>"), "{prompt}");
+    assert!(prompt.contains("1: rendered user file"), "{prompt}");
+}
+
+#[tokio::test]
+async fn user_prompt_keeps_non_file_at_mentions_literal() {
+    let provider = Arc::new(ScriptedProvider::new("user-template-mentions", |request| {
+        assert!(request.prompt.contains("foo@example.com"), "{request:?}");
+        assert!(request.prompt.contains("@username"), "{request:?}");
+        assert!(!request.prompt.contains("<template-error>"), "{request:?}");
+        assert!(!request.prompt.contains("<template-result"), "{request:?}");
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider).build();
+
+    drain(
+        agent
+            .prompt("email foo@example.com and mention @username")
+            .stream(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn user_prompt_template_tool_errors_are_rendered_inline() {
+    let provider = Arc::new(ScriptedProvider::new(
+        "user-template-tool-error",
+        |request| {
+            assert!(
+                request
+                    .prompt
+                    .contains("<template-result kind=\"tool\" tool=\"fail\">")
+            );
+            assert!(request.prompt.contains("Tool error:"), "{request:?}");
+            assert!(request.prompt.contains("boom"), "{request:?}");
+            vec![Ok(CompletionEvent::Finished)]
+        },
+    ));
+    let tool = AgentTool::new(
+        ToolDefinition::new("fail", "Fail template call.", json!({ "type": "object" })),
+        |_call| {
+            Err(LlmError::Protocol {
+                provider: "test",
+                message: "boom".to_owned(),
+            })
+        },
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_tool(tool)
+        .build();
+
+    drain(agent.prompt("before @tool(fail, {}) after").stream()).await;
+}
+
+#[tokio::test]
+async fn user_prompt_template_tool_respects_permission_denies() {
+    let provider = Arc::new(ScriptedProvider::new(
+        "user-template-permission-deny",
+        |request| {
+            assert!(request.prompt.contains("<template-error>"), "{request:?}");
+            assert!(
+                request.prompt.contains("tool is not permitted: blocked"),
+                "{request:?}"
+            );
+            assert!(!request.prompt.contains("blocked output"), "{request:?}");
+            vec![Ok(CompletionEvent::Finished)]
+        },
+    ));
+    let tool = AgentTool::new(
+        ToolDefinition::new("blocked", "Blocked tool.", json!({ "type": "object" })),
+        |call| Ok(call.result("blocked output")),
+    );
+    let policy = PermissionPolicy::default().with_tool_rule(
+        PermissionToolSelector::exact("blocked"),
+        PermissionEffect::deny(),
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_tool(tool)
+        .with_permission_policy(policy)
+        .build();
+
+    let events = collect_events(agent.prompt("@tool(blocked, {})").stream()).await;
+
+    assert!(!events.iter().any(|event| matches!(
+        event.content,
+        TimelineContent::ToolCall { .. } | TimelineContent::ToolResult { .. }
+    )));
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn user_prompt_template_tool_auto_approves_ask_permissions() {
+    let root = TempRoot::new("waltr-agent-user-template-shell-root");
+    let outside = TempRoot::new("waltr-agent-user-template-shell-outside");
+    outside.write("secret.txt", "template ask approved\n");
+    let command = format!("cat {}", outside.path().join("secret.txt").display());
+    let provider = Arc::new(ScriptedProvider::new(
+        "user-template-permission-ask",
+        |request| {
+            assert!(
+                request
+                    .prompt
+                    .contains("<template-result kind=\"tool\" tool=\"shell\">")
+            );
+            assert!(
+                request.prompt.contains("template ask approved"),
+                "{request:?}"
+            );
+            vec![Ok(CompletionEvent::Finished)]
+        },
+    ));
+    let policy = PermissionPolicy::default().with_command_rule(
+        PermissionToolSelector::exact("shell"),
+        PermissionCommandPattern::Name("cat".to_owned()),
+        PermissionEffect::ask(),
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .with_permission_policy(policy)
+        .build();
+
+    let events = collect_events(
+        agent
+            .prompt(&format!(
+                "@tool(shell, {{\"command\":{command:?},\"description\":\"Read the test fixture.\"}})"
+            ))
+            .stream(),
+    )
+    .await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.content, TimelineContent::ExternalRequest { .. }))
+    );
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn runtime_prompt_template_tool_asks_for_permission() {
+    let root = TempRoot::new("waltr-agent-runtime-template-shell-root");
+    let outside = TempRoot::new("waltr-agent-runtime-template-shell-outside");
+    outside.write("secret.txt", "runtime ask should pause\n");
+    let command = format!("cat {}", outside.path().join("secret.txt").display());
+    root.write(
+        AGENTS_INSTRUCTION_FILE,
+        &format!(
+            "Use fixture: @tool(shell, {{\"command\":{command:?},\"description\":\"Read the runtime fixture.\"}})\n"
+        ),
+    );
+    let provider = Arc::new(ScriptedProvider::new(
+        "runtime-template-permission-ask",
+        |_request| panic!("provider should not be called before permission is answered"),
+    ));
+    let policy = PermissionPolicy::default().with_command_rule(
+        PermissionToolSelector::exact("shell"),
+        PermissionCommandPattern::Name("cat".to_owned()),
+        PermissionEffect::ask(),
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .with_permission_policy(policy)
+        .build();
+
+    let events = collect_events(agent.prompt("hello").stream()).await;
+
+    let request = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("permission request");
+    assert_eq!(request.kind, ExternalRequestKind::Permission);
+    assert_eq!(request.tool_call_id.as_deref(), Some("template-shell"));
+    assert!(request.prompt.contains("cat"), "{request:#?}");
+}
+
+#[cfg(feature = "shell")]
+#[tokio::test]
+async fn runtime_prompt_template_tool_runs_after_permission_approval() {
+    let root = TempRoot::new("waltr-agent-runtime-template-resume-root");
+    let outside = TempRoot::new("waltr-agent-runtime-template-resume-outside");
+    outside.write("secret.txt", "runtime template approved\n");
+    let command = format!("cat {}", outside.path().join("secret.txt").display());
+    root.write(
+        AGENTS_INSTRUCTION_FILE,
+        &format!(
+            "Use fixture: @tool(shell, {{\"command\":{command:?},\"description\":\"Read the runtime fixture.\"}})\n"
+        ),
+    );
+    let provider = Arc::new(ScriptedProvider::new(
+        "runtime-template-permission-resume",
+        |request| {
+            let system_prompt = request.system_prompt.expect("system prompt");
+            assert!(
+                system_prompt.contains("runtime template approved"),
+                "{system_prompt}"
+            );
+            vec![Ok(CompletionEvent::Finished)]
+        },
+    ));
+    let policy = PermissionPolicy::default().with_command_rule(
+        PermissionToolSelector::exact("shell"),
+        PermissionCommandPattern::Name("cat".to_owned()),
+        PermissionEffect::ask(),
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .with_permission_policy(policy)
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store);
+    let session_id = create_session_id(&sessions).await;
+
+    let events = collect_events(
+        sessions
+            .prompt(&agent, session_id.clone(), "hello")
+            .stream(),
+    )
+    .await;
+    let request_id = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("permission request");
+
+    drain(
+        sessions
+            .resume(
+                &agent,
+                session_id,
+                ResumeInput::ExternalResponse {
+                    request_id,
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn user_prompt_template_tool_result_includes_arguments() {
+    let provider = Arc::new(ScriptedProvider::new(
+        "user-template-tool-arguments",
+        |request| {
+            assert!(
+                request
+                    .prompt
+                    .contains("<template-result kind=\"tool\" tool=\"shell\">")
+            );
+            assert!(request.prompt.contains("<arguments>"), "{request:?}");
+            assert!(
+                request.prompt.contains("\"command\":\"pwd\""),
+                "{request:?}"
+            );
+            assert!(
+                request
+                    .prompt
+                    .contains("\"description\":\"Show the current working directory.\""),
+                "{request:?}"
+            );
+            assert!(request.prompt.contains("<content>"), "{request:?}");
+            assert!(request.prompt.contains("pwd output marker"), "{request:?}");
+            vec![Ok(CompletionEvent::Finished)]
+        },
+    ));
+    let tool = AgentTool::new(
+        ToolDefinition::new("shell", "Run shell command.", json!({ "type": "object" })),
+        |context| {
+            assert_eq!(context.call().arguments["command"], "pwd");
+            assert_eq!(
+                context.call().arguments["description"],
+                "Show the current working directory."
+            );
+            Ok(context.result("Exit code: 0\n\npwd output marker"))
+        },
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_tool(tool)
+        .build();
+
+    drain(
+        agent
+            .prompt(
+                "@tool(shell, {\"command\":\"pwd\",\"description\":\"Show the current working directory.\"})",
+            )
+            .stream(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn filesystem_read_agents_context_is_opt_in_and_loaded_once() {
     let temp = TempRoot::new("waltr-agent-read-agents-test");
     temp.write("AGENTS.md", "Root instructions.\n");
@@ -1315,6 +1880,22 @@ async fn agent_replays_assistant_text_on_tool_continuation() {
 
 fn test_model() -> ModelRef {
     ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses)
+}
+
+fn test_runtime_settings() -> SessionRuntimeSettings {
+    SessionRuntimeSettings {
+        provider: SessionProviderRuntimeSettings {
+            key: "test".to_owned(),
+            api: ModelApi::OpenAiResponses,
+            url: String::new(),
+            model_id: "test-model".to_owned(),
+            model_cost: None,
+            headers: Default::default(),
+            oauth: None,
+            reasoning_effort: None,
+        },
+        mcp_servers: Vec::new(),
+    }
 }
 
 async fn create_session_id<S>(sessions: &waltr_agent::SessionCoordinator<S>) -> waltr_agent::SessionId
@@ -2172,11 +2753,17 @@ struct TempRoot {
 
 impl TempRoot {
     fn new(prefix: &str) -> Self {
+        Self::new_under(std::env::temp_dir(), prefix)
+    }
+
+    fn new_under(root: impl AsRef<Path>, prefix: &str) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        let path = root
+            .as_ref()
+            .join(format!("{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).expect("create temp root");
         Self { path }
     }

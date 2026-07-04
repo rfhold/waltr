@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     hash::{Hash, Hasher},
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -28,6 +29,7 @@ use crate::{
         },
         tools::tool_is_visible,
     },
+    template::{TemplateRender, TemplateRuntime, TemplateSource},
     timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS, TimelineStatus},
 };
 use tokio::{sync::mpsc, time::Sleep};
@@ -77,6 +79,7 @@ where
     middleware_state: MiddlewareStateLog,
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
     cancellation_token: CancellationToken,
+    template_base_dir: Option<PathBuf>,
     turn_span: Option<Span>,
 }
 
@@ -164,6 +167,7 @@ where
             middleware_state: MiddlewareStateLog::default(),
             system_prompt_override: run.system_prompt_override,
             cancellation_token: run.cancellation_token,
+            template_base_dir: run.template_base_dir,
             turn_span: None,
         }
     }
@@ -195,7 +199,8 @@ where
                     // Crash recovery is retry-the-turn: the request is journaled before
                     // dispatch and parser progress is intentionally not persisted.
                     let draft = match self.build_provider_request().await {
-                        Ok(draft) => draft,
+                        Ok(Some(draft)) => draft,
+                        Ok(None) => continue,
                         Err(error) => return Some((Err(error), self)),
                     };
                     let request = completion_request_from_draft(&draft);
@@ -510,18 +515,33 @@ where
         }
     }
 
-    async fn build_provider_request(&mut self) -> Result<ModelRequestDraft> {
+    async fn build_provider_request(&mut self) -> Result<Option<ModelRequestDraft>> {
         let prompt_turns = self.prompt_turns();
+        let middleware_chain = self.middleware_chain.clone();
         let mut ctx = RequestContext {
             middleware_state: &mut self.middleware_state,
             session_metadata_values: self.session_metadata_values.clone(),
             system_prompt_override: &mut self.system_prompt_override,
+            tools: &self.tools,
+            middleware_chain: middleware_chain.clone(),
+            permission_policy: self.permission_policy.clone(),
+            cancellation_token: self.cancellation_token.clone(),
+            session_id: self.session_id.as_str(),
+            turn: self.turn as u64,
         };
 
         let mut prompt = SystemPromptParts::default();
-        self.middleware_chain
+        match middleware_chain
             .build_system_prompt(&mut ctx, &mut prompt)
-            .await?;
+            .await?
+        {
+            HookOutcome::Continue => {}
+            HookOutcome::Suspend(suspension) => {
+                self.suspend_from_hook(suspension).await?;
+                return Ok(None);
+            }
+            outcome => return Err(unsupported_build_system_prompt_outcome(&outcome)),
+        }
 
         let mut tools = ToolDraft::default();
         self.middleware_chain
@@ -544,7 +564,7 @@ where
             .before_provider_request(&mut ctx, &mut request)
             .await?
         {
-            HookOutcome::Continue => Ok(request),
+            HookOutcome::Continue => Ok(Some(request)),
             outcome => Err(unsupported_before_provider_request_outcome(&outcome)),
         }
     }
@@ -697,6 +717,12 @@ where
                 call: Some(&call),
                 result: &mut result,
                 middleware_state: &mut self.middleware_state,
+                tools: &self.tools,
+                middleware_chain: self.middleware_chain.clone(),
+                permission_policy: self.permission_policy.clone(),
+                cancellation_token: self.cancellation_token.clone(),
+                session_id: self.session_id.as_str(),
+                turn: self.turn as u64,
             };
             self.middleware_chain.after_tool_call(&mut ctx).await
         };
@@ -761,40 +787,38 @@ where
                 "",
             ))),
             HookOutcome::ReplaceToolResult(result) => Ok(Some(result)),
-            HookOutcome::Suspend(mut suspension) => {
+            HookOutcome::Suspend(suspension) => {
                 self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, "agent turn suspended"));
-                let mut ctx = RunContext {
-                    middleware_state: &mut self.middleware_state,
-                };
-                if let Err(error) = self
-                    .middleware_chain
-                    .on_suspend(&mut ctx, &mut suspension)
-                    .await
-                {
+                if let Err(error) = self.suspend_from_hook(suspension).await {
                     return Ok(Some(error_tool_result(call, &error)));
                 }
-                if let Some(request) = suspension.external_request.clone() {
-                    let event = match self.persist_external_request(&request).await {
-                        Ok(event) => event,
-                        Err(error) => return Ok(Some(error_tool_result(call, &error))),
-                    };
-                    let session_request = external_request_from_draft(&request);
-                    let mut events = self.middleware_state.drain_pending();
-                    events.push(SessionJournalEvent::Suspended {
-                        suspension: SessionSuspension::AwaitingExternalInput {
-                            request: Box::new(session_request),
-                        },
-                    });
-                    if let Err(error) = self.append_journal_events(events).await {
-                        return Ok(Some(error_tool_result(call, &error)));
-                    }
-                    self.pending.push_back(Ok(event));
-                }
-                self.phase = AgentLoopPhase::Done;
-                self.close_turn_span("suspended");
                 Ok(None)
             }
         }
+    }
+
+    async fn suspend_from_hook(&mut self, mut suspension: middleware::Suspension) -> Result<()> {
+        let mut ctx = RunContext {
+            middleware_state: &mut self.middleware_state,
+        };
+        self.middleware_chain
+            .on_suspend(&mut ctx, &mut suspension)
+            .await?;
+        if let Some(request) = suspension.external_request.clone() {
+            let event = self.persist_external_request(&request).await?;
+            let session_request = external_request_from_draft(&request);
+            let mut events = self.middleware_state.drain_pending();
+            events.push(SessionJournalEvent::Suspended {
+                suspension: SessionSuspension::AwaitingExternalInput {
+                    request: Box::new(session_request),
+                },
+            });
+            self.append_journal_events(events).await?;
+            self.pending.push_back(Ok(event));
+        }
+        self.phase = AgentLoopPhase::Done;
+        self.close_turn_span("suspended");
+        Ok(())
     }
 
     fn permission_outcome(
@@ -900,6 +924,10 @@ where
                 ));
             }
         };
+        let prompts = match self.render_prompt_templates(prompts).await? {
+            Some(prompts) => prompts,
+            None => return Ok(false),
+        };
         self.prompt = prompts.last().cloned().unwrap_or_default();
         let record = self
             .session_store
@@ -949,6 +977,10 @@ where
         let record = match input {
             ResumeInput::Continue => record,
             ResumeInput::Prompt(prompt) => {
+                let prompt = match self.render_prompt_templates(vec![prompt]).await? {
+                    Some(mut prompts) => prompts.remove(0),
+                    None => return Ok(false),
+                };
                 let snapshot = record.snapshot();
                 if snapshot.current_prompt.as_deref() == Some(prompt.as_str())
                     && snapshot.prompts.len() == 1
@@ -967,6 +999,10 @@ where
                 }
             }
             ResumeInput::Prompts(prompts) => {
+                let prompts = match self.render_prompt_templates(prompts).await? {
+                    Some(prompts) => prompts,
+                    None => return Ok(false),
+                };
                 match self
                     .session_runtime()
                     .resume(&self.session_id, ResumeInput::Prompts(prompts))
@@ -1047,6 +1083,41 @@ where
         } else {
             self.prompt_turns.clone()
         }
+    }
+
+    async fn render_prompt_templates(
+        &mut self,
+        prompts: Vec<String>,
+    ) -> Result<Option<Vec<String>>> {
+        let current_dir;
+        let base_dir = if let Some(base_dir) = self.template_base_dir.as_deref() {
+            base_dir
+        } else {
+            current_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            current_dir.as_path()
+        };
+        let mut rendered = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            let mut runtime = TemplateRuntime {
+                base_dir,
+                tools: &self.tools,
+                middleware_chain: &self.middleware_chain,
+                permission_policy: &self.permission_policy,
+                middleware_state: &mut self.middleware_state,
+                cancellation_token: self.cancellation_token.clone(),
+                session_id: self.session_id.as_str(),
+                turn: self.turn as u64,
+                source: TemplateSource::UserPrompt,
+            };
+            match runtime.render_template(&prompt).await? {
+                TemplateRender::Rendered(prompt) => rendered.push(prompt),
+                TemplateRender::Suspend(suspension) => {
+                    self.suspend_from_hook(suspension).await?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(rendered))
     }
 
     async fn append_journal_event(&mut self, event: SessionJournalEvent) -> Result<()> {
@@ -1743,6 +1814,14 @@ fn pending_tool_batch_for_permission_retry(
     ) {
         return Ok(Vec::new());
     }
+    if request
+        .payload
+        .get("template")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(Vec::new());
+    }
     let Some(tool_call_id) = request.tool_call_id.as_deref() else {
         return Err(session_store_error(
             "permission request missing tool call id",
@@ -1823,6 +1902,15 @@ fn unsupported_before_provider_request_outcome(outcome: &HookOutcome) -> LlmErro
         provider: "middleware",
         message: format!(
             "unsupported before_provider_request middleware outcome during agent loop request construction: {outcome:?}"
+        ),
+    }
+}
+
+fn unsupported_build_system_prompt_outcome(outcome: &HookOutcome) -> LlmError {
+    LlmError::Protocol {
+        provider: "middleware",
+        message: format!(
+            "unsupported build_system_prompt middleware outcome during agent loop request construction: {outcome:?}"
         ),
     }
 }
