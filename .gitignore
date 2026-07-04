@@ -4,3 +4,4 @@ dist/
 crates/waltr-web/generated/wasm/
 .dev/
 tests/web/k6/snapshots/
+.worktrees/
