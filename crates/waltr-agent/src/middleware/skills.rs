@@ -10,6 +10,11 @@ use serde_json::json;
 
 use crate::{
     Result, ToolDefinition, ToolResult,
+    resource::{
+        SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
+        TemplateSearchResults, prompt_score,
+    },
+    template::{TemplateReference, TemplateReferenceRender, template_error},
     tools::{
         filesystem::{GlobInput, GrepInput, ReadInput, model_path, resolve_existing_path},
         skills::{
@@ -25,8 +30,8 @@ use crate::{
 use super::{
     AgentMiddleware, HookOutcome,
     context::{
-        MiddlewareStateAccess, RequestContext, SystemPromptParts, ToolCallContext, ToolDraft,
-        ToolResultContext,
+        MiddlewareStateAccess, RequestContext, SystemPromptParts, TemplateRenderContext,
+        TemplateSearchContext, ToolCallContext, ToolDraft, ToolResultContext,
     },
 };
 
@@ -108,6 +113,88 @@ impl AgentMiddleware for SkillsMiddleware {
     async fn list_tools(&self, _ctx: &mut RequestContext<'_>, tools: &mut ToolDraft) -> Result<()> {
         tools.push(load_skill_definition());
         Ok(())
+    }
+
+    async fn search_templates(
+        &self,
+        ctx: &TemplateSearchContext<'_>,
+        results: &mut TemplateSearchResults,
+    ) -> Result<()> {
+        if ctx.request.target != SessionTemplateSearchTarget::Prompts
+            || !ctx.request.includes(SessionTemplateKind::Prompt)
+        {
+            return Ok(());
+        }
+
+        let query = ctx.request.query.trim().trim_start_matches('/');
+        let query = query.strip_prefix("skill:").unwrap_or(query);
+        let query_lower = query.to_lowercase();
+        for skill in self.visible_catalog(ctx)? {
+            let Some(score) = prompt_score(&skill.name, &skill.description, &query_lower) else {
+                continue;
+            };
+            results.push(
+                score,
+                SessionTemplateOption {
+                    kind: SessionTemplateKind::Prompt,
+                    label: format!("skill:{}", skill.name),
+                    detail: skill.description.clone(),
+                    template: format!("/skill:{}", skill.name),
+                    metadata: json!({
+                        "promptType": "skill",
+                        "name": skill.name.clone(),
+                        "description": skill.description.clone(),
+                        "root": skill.root.display().to_string(),
+                    }),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn render_template_reference(
+        &self,
+        ctx: &mut TemplateRenderContext<'_>,
+        reference: &TemplateReference,
+    ) -> Result<TemplateReferenceRender> {
+        let TemplateReference::Prompt {
+            namespace, name, ..
+        } = reference
+        else {
+            return Ok(TemplateReferenceRender::Continue);
+        };
+        if namespace != "skill" {
+            return Ok(TemplateReferenceRender::Continue);
+        }
+
+        let catalog = self.visible_catalog_for_render(ctx)?;
+        let input = LoadSkillInput {
+            name: name.clone(),
+            root: None,
+        };
+        let skill = match resolve_skill(&input, &catalog) {
+            Ok(skill) => skill,
+            Err(error) => {
+                return Ok(TemplateReferenceRender::Rendered(template_error(
+                    "skill", error,
+                )));
+            }
+        };
+        let content = match render_loaded_skill(skill) {
+            Ok(content) => content,
+            Err(error) => {
+                return Ok(TemplateReferenceRender::Rendered(template_error(
+                    "skill", error,
+                )));
+            }
+        };
+        Ok(TemplateReferenceRender::TemplateResult {
+            kind: "skill".to_owned(),
+            tool: Some("load".to_owned()),
+            source: Some(skill.name.clone()),
+            content,
+            render_nested: false,
+        })
     }
 
     async fn before_tool_call(&self, ctx: &mut ToolCallContext<'_>) -> Result<HookOutcome> {
@@ -216,6 +303,23 @@ impl AgentMiddleware for SkillsMiddleware {
             ctx.set_state_as(SKILLS_STATE_NAMESPACE, &state)?;
         }
         Ok(HookOutcome::Continue)
+    }
+}
+
+impl SkillsMiddleware {
+    fn visible_catalog(&self, ctx: &TemplateSearchContext<'_>) -> Result<Vec<SkillDefinition>> {
+        Ok(ctx
+            .state_as::<SkillsState>(SKILLS_STATE_NAMESPACE)?
+            .map_or_else(|| self.initial_catalog.clone(), |state| state.catalog))
+    }
+
+    fn visible_catalog_for_render(
+        &self,
+        ctx: &TemplateRenderContext<'_>,
+    ) -> Result<Vec<SkillDefinition>> {
+        Ok(ctx
+            .state_as::<SkillsState>(SKILLS_STATE_NAMESPACE)?
+            .map_or_else(|| self.initial_catalog.clone(), |state| state.catalog))
     }
 }
 

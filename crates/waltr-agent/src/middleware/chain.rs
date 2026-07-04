@@ -2,13 +2,17 @@
 
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
-use crate::Result;
+use crate::{
+    Result,
+    resource::TemplateSearchResults,
+    template::{TemplateReference, TemplateReferenceRender},
+};
 
 use super::{
     AgentMiddleware, HookOutcome, Suspension,
     context::{
-        ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, ToolCallContext,
-        ToolDraft, ToolResultContext,
+        ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, TemplateRenderContext,
+        TemplateSearchContext, ToolCallContext, ToolDraft, ToolResultContext,
     },
 };
 
@@ -38,6 +42,18 @@ trait ChainMiddleware: Send + Sync {
         ctx: &'a mut RequestContext<'_>,
         request: &'a mut ModelRequestDraft,
     ) -> BoxHookFuture<'a, HookOutcome>;
+
+    fn search_templates<'a>(
+        &'a self,
+        ctx: &'a TemplateSearchContext<'_>,
+        results: &'a mut TemplateSearchResults,
+    ) -> BoxHookFuture<'a, ()>;
+
+    fn render_template_reference<'a>(
+        &'a self,
+        ctx: &'a mut TemplateRenderContext<'_>,
+        reference: &'a TemplateReference,
+    ) -> BoxHookFuture<'a, TemplateReferenceRender>;
 
     fn before_tool_call<'a>(
         &'a self,
@@ -90,6 +106,24 @@ where
         request: &'a mut ModelRequestDraft,
     ) -> BoxHookFuture<'a, HookOutcome> {
         Box::pin(AgentMiddleware::before_provider_request(self, ctx, request))
+    }
+
+    fn search_templates<'a>(
+        &'a self,
+        ctx: &'a TemplateSearchContext<'_>,
+        results: &'a mut TemplateSearchResults,
+    ) -> BoxHookFuture<'a, ()> {
+        Box::pin(AgentMiddleware::search_templates(self, ctx, results))
+    }
+
+    fn render_template_reference<'a>(
+        &'a self,
+        ctx: &'a mut TemplateRenderContext<'_>,
+        reference: &'a TemplateReference,
+    ) -> BoxHookFuture<'a, TemplateReferenceRender> {
+        Box::pin(AgentMiddleware::render_template_reference(
+            self, ctx, reference,
+        ))
     }
 
     fn before_tool_call<'a>(
@@ -216,6 +250,35 @@ impl MiddlewareChain {
         Ok(HookOutcome::Continue)
     }
 
+    /// Run template-search middleware in insertion order.
+    pub(crate) async fn search_templates(
+        &self,
+        ctx: &TemplateSearchContext<'_>,
+        results: &mut TemplateSearchResults,
+    ) -> Result<()> {
+        for middleware in &self.middleware {
+            middleware.search_templates(ctx, results).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Run template-render middleware until the first owner renders the reference.
+    pub(crate) async fn render_template_reference(
+        &self,
+        ctx: &mut TemplateRenderContext<'_>,
+        reference: &TemplateReference,
+    ) -> Result<TemplateReferenceRender> {
+        for middleware in &self.middleware {
+            let rendered = middleware.render_template_reference(ctx, reference).await?;
+            if !matches!(rendered, TemplateReferenceRender::Continue) {
+                return Ok(rendered);
+            }
+        }
+
+        Ok(TemplateReferenceRender::Continue)
+    }
+
     /// Run pre-tool-call middleware until the first non-continue outcome.
     pub(crate) async fn before_tool_call(
         &self,
@@ -326,7 +389,6 @@ mod tests {
             middleware_state,
             session_metadata_values: std::collections::BTreeMap::new(),
             system_prompt_override,
-            tools: &[],
             middleware_chain: MiddlewareChain::new(),
             permission_policy: crate::PermissionPolicy::default(),
             cancellation_token: tokio_util::sync::CancellationToken::new(),

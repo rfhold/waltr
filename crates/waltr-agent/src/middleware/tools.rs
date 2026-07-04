@@ -1,24 +1,32 @@
 //! Tool-list middleware helpers.
 
-use crate::{PermissionLevel, PermissionPolicy, Result, ToolDefinition};
+use serde_json::json;
 
-use super::{AgentMiddleware, context::RequestContext, context::ToolDraft};
+use crate::{
+    AgentTool, PermissionLevel, PermissionPolicy, Result, ToolDefinition,
+    resource::{
+        SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, tool_score,
+        tool_template,
+    },
+    template::{TemplateReference, TemplateReferenceRender, render_tool_template_reference},
+};
+
+use super::{
+    AgentMiddleware,
+    context::{RequestContext, TemplateRenderContext, TemplateSearchContext, ToolDraft},
+};
 
 /// Middleware that exposes registered tools according to the active permission policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PermissionFilteredToolRegistryMiddleware {
-    tools: Vec<ToolDefinition>,
+    tools: Vec<AgentTool>,
     policy: PermissionPolicy,
     ask_available: bool,
 }
 
 impl PermissionFilteredToolRegistryMiddleware {
-    /// Create middleware from provider-neutral tool definitions and permission visibility inputs.
-    pub const fn new(
-        tools: Vec<ToolDefinition>,
-        policy: PermissionPolicy,
-        ask_available: bool,
-    ) -> Self {
+    /// Create middleware from provider-neutral tools and permission visibility inputs.
+    pub const fn new(tools: Vec<AgentTool>, policy: PermissionPolicy, ask_available: bool) -> Self {
         Self {
             tools,
             policy,
@@ -28,14 +36,79 @@ impl PermissionFilteredToolRegistryMiddleware {
 }
 
 impl AgentMiddleware for PermissionFilteredToolRegistryMiddleware {
-    async fn list_tools(&self, _ctx: &mut RequestContext<'_>, draft: &mut ToolDraft) -> Result<()> {
+    async fn list_tools(&self, ctx: &mut RequestContext<'_>, draft: &mut ToolDraft) -> Result<()> {
         draft.tools.extend(
             self.tools
                 .iter()
-                .filter(|tool| tool_is_visible(&self.policy, tool, self.ask_available))
+                .map(AgentTool::definition)
+                .filter(|tool| tool_is_visible(&ctx.permission_policy, tool, self.ask_available))
                 .cloned(),
         );
         Ok(())
+    }
+
+    async fn search_templates(
+        &self,
+        ctx: &TemplateSearchContext<'_>,
+        results: &mut crate::resource::TemplateSearchResults,
+    ) -> Result<()> {
+        if ctx.request.target != SessionTemplateSearchTarget::Resources
+            || !ctx.request.includes(SessionTemplateKind::Tool)
+        {
+            return Ok(());
+        }
+
+        let query_lower = ctx.request.query.trim().to_lowercase();
+        let limit = ctx.request.effective_limit();
+        for tool in &self.tools {
+            let definition = tool.definition();
+            if !tool_is_visible(&self.policy, definition, self.ask_available) {
+                continue;
+            }
+            let Some(score) = tool_score(&definition.name, &definition.description, &query_lower)
+            else {
+                continue;
+            };
+            results.push_limited(
+                score,
+                SessionTemplateOption {
+                    kind: SessionTemplateKind::Tool,
+                    label: definition.name.clone(),
+                    detail: definition.description.clone(),
+                    template: tool_template(&definition.name, &definition.input_schema),
+                    metadata: json!({
+                        "name": definition.name.clone(),
+                        "description": definition.description.clone(),
+                        "inputSchema": definition.input_schema.clone(),
+                    }),
+                },
+                limit,
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn render_template_reference(
+        &self,
+        ctx: &mut TemplateRenderContext<'_>,
+        reference: &TemplateReference,
+    ) -> Result<TemplateReferenceRender> {
+        let TemplateReference::Tool {
+            name, arguments, ..
+        } = reference
+        else {
+            return Ok(TemplateReferenceRender::Continue);
+        };
+        if !self
+            .tools
+            .iter()
+            .any(|tool| tool.definition().name == *name)
+        {
+            return Ok(TemplateReferenceRender::Continue);
+        }
+
+        render_tool_template_reference(ctx, &self.tools, name, arguments.clone()).await
     }
 }
 
@@ -56,7 +129,10 @@ pub fn tool_is_visible(
 mod tests {
     use serde_json::json;
 
-    use crate::middleware::context::{MiddlewareStateLog, RequestContext};
+    use crate::{
+        AgentTool,
+        middleware::context::{MiddlewareStateLog, RequestContext},
+    };
 
     use super::*;
 
@@ -68,7 +144,6 @@ mod tests {
             middleware_state,
             session_metadata_values: std::collections::BTreeMap::new(),
             system_prompt_override,
-            tools: &[],
             middleware_chain: crate::middleware::chain::MiddlewareChain::new(),
             permission_policy: crate::PermissionPolicy::default(),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
@@ -86,6 +161,10 @@ mod tests {
                 "properties": {}
             }),
         )
+    }
+
+    fn agent_tool(definition: ToolDefinition) -> AgentTool {
+        AgentTool::new(definition, |call| Ok(call.result("unused")))
     }
 
     #[tokio::test]
@@ -107,10 +186,15 @@ mod tests {
         let mut middleware_state = MiddlewareStateLog::default();
         let mut system_prompt_override = None;
         let mut ctx = request_context(&mut middleware_state, &mut system_prompt_override);
+        ctx.permission_policy = policy.clone();
         let mut draft = ToolDraft::default();
 
         PermissionFilteredToolRegistryMiddleware::new(
-            vec![allowed.clone(), ask.clone(), denied],
+            vec![
+                agent_tool(allowed.clone()),
+                agent_tool(ask.clone()),
+                agent_tool(denied),
+            ],
             policy,
             true,
         )
@@ -134,12 +218,17 @@ mod tests {
         let mut middleware_state = MiddlewareStateLog::default();
         let mut system_prompt_override = None;
         let mut ctx = request_context(&mut middleware_state, &mut system_prompt_override);
+        ctx.permission_policy = policy.clone();
         let mut draft = ToolDraft::default();
 
-        PermissionFilteredToolRegistryMiddleware::new(vec![allowed.clone(), ask], policy, false)
-            .list_tools(&mut ctx, &mut draft)
-            .await
-            .expect("filtered tool middleware should run");
+        PermissionFilteredToolRegistryMiddleware::new(
+            vec![agent_tool(allowed.clone()), agent_tool(ask)],
+            policy,
+            false,
+        )
+        .list_tools(&mut ctx, &mut draft)
+        .await
+        .expect("filtered tool middleware should run");
 
         assert_eq!(draft.tools, vec![allowed]);
     }

@@ -777,17 +777,28 @@ where
             })?
             .root
             .clone();
-        let runtime = self.resolve_runtime_for_template_search(session_id).await?;
-        Ok(crate::resource::search_session_templates(
-            &root, &runtime, &request,
-        ))
+        let (runtime, middleware_state) =
+            self.resolve_runtime_for_template_search(session_id).await?;
+        Ok(crate::resource::search_session_templates_with_state(
+            &root,
+            &runtime,
+            &request,
+            Some(&middleware_state),
+        )
+        .await?)
     }
 
     async fn resolve_runtime_for_template_search(
         &self,
         session_id: &SessionId,
-    ) -> std::result::Result<AgentRuntime, AgentSessionRunError> {
+    ) -> std::result::Result<
+        (AgentRuntime, crate::middleware::context::MiddlewareStateLog),
+        AgentSessionRunError,
+    > {
         let session = self.load(session_id).await?;
+        let middleware_state = crate::middleware::context::MiddlewareStateLog::from_snapshot(
+            &session.record.snapshot(),
+        );
         let settings = session.record.runtime_settings.as_ref().ok_or_else(|| {
             super::AgentSessionRuntimeError::FailedPrecondition(
                 "session runtime settings are required before prompting".to_owned(),
@@ -806,7 +817,7 @@ where
         let builder = factory
             .runtime_builder_for_sessions(settings, self.clone(), mcp_runtime)
             .await?;
-        Ok(builder.build())
+        Ok((builder.build(), middleware_state))
     }
 
     pub(crate) async fn resolve_runtime(

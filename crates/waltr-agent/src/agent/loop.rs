@@ -522,7 +522,6 @@ where
             middleware_state: &mut self.middleware_state,
             session_metadata_values: self.session_metadata_values.clone(),
             system_prompt_override: &mut self.system_prompt_override,
-            tools: &self.tools,
             middleware_chain: middleware_chain.clone(),
             permission_policy: self.permission_policy.clone(),
             cancellation_token: self.cancellation_token.clone(),
@@ -717,7 +716,6 @@ where
                 call: Some(&call),
                 result: &mut result,
                 middleware_state: &mut self.middleware_state,
-                tools: &self.tools,
                 middleware_chain: self.middleware_chain.clone(),
                 permission_policy: self.permission_policy.clone(),
                 cancellation_token: self.cancellation_token.clone(),
@@ -1100,7 +1098,6 @@ where
         for prompt in prompts {
             let mut runtime = TemplateRuntime {
                 base_dir,
-                tools: &self.tools,
                 middleware_chain: &self.middleware_chain,
                 permission_policy: &self.permission_policy,
                 middleware_state: &mut self.middleware_state,

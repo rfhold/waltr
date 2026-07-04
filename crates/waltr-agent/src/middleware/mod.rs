@@ -6,17 +6,22 @@ pub(crate) mod agents;
 pub mod chain;
 pub(crate) mod claims;
 pub mod context;
+pub(crate) mod file_templates;
 pub(crate) mod prompt;
 pub(crate) mod question_suspension;
 pub(crate) mod skills;
 pub(crate) mod tool_metadata;
 pub(crate) mod tools;
 
-use crate::{Result, ToolResult};
+use crate::{
+    Result, ToolResult,
+    resource::TemplateSearchResults,
+    template::{TemplateReference, TemplateReferenceRender},
+};
 
 use self::context::{
-    ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, ToolCallContext, ToolDraft,
-    ToolResultContext,
+    ModelRequestDraft, RequestContext, RunContext, SystemPromptParts, TemplateRenderContext,
+    TemplateSearchContext, ToolCallContext, ToolDraft, ToolResultContext,
 };
 
 /// Provider-neutral external request kind.
@@ -132,6 +137,24 @@ pub(crate) trait AgentMiddleware: Send + Sync {
         _request: &mut ModelRequestDraft,
     ) -> impl Future<Output = Result<HookOutcome>> + Send {
         async { Ok(HookOutcome::Continue) }
+    }
+
+    /// Append matching prompt-template options for host autocomplete.
+    fn search_templates(
+        &self,
+        _ctx: &TemplateSearchContext<'_>,
+        _results: &mut TemplateSearchResults,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Render one parsed prompt-template reference when this middleware owns it.
+    fn render_template_reference(
+        &self,
+        _ctx: &mut TemplateRenderContext<'_>,
+        _reference: &TemplateReference,
+    ) -> impl Future<Output = Result<TemplateReferenceRender>> + Send {
+        async { Ok(TemplateReferenceRender::Continue) }
     }
 
     /// Observe or alter a tool call before execution.

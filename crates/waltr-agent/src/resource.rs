@@ -2,11 +2,13 @@
 
 use std::{cmp::Ordering, path::Path};
 
-use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
-use crate::AgentRuntime;
+use crate::{
+    AgentRuntime, Result,
+    middleware::context::{MiddlewareStateLog, TemplateSearchContext},
+};
 
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
@@ -20,7 +22,7 @@ pub struct SessionTemplateSearchRequest {
     pub limit: usize,
     /// Template kinds to include. Empty searches all supported kinds.
     pub kinds: Vec<SessionTemplateKind>,
-    /// Search target. Resource-backed templates are available today; prompt-backed templates are reserved.
+    /// Search target. Resources cover file/tool templates; prompts cover skill and future prompt templates.
     pub target: SessionTemplateSearchTarget,
 }
 
@@ -37,7 +39,7 @@ impl SessionTemplateSearchRequest {
         }
     }
 
-    fn includes(&self, kind: SessionTemplateKind) -> bool {
+    pub(crate) fn includes(&self, kind: SessionTemplateKind) -> bool {
         self.kinds.is_empty() || self.kinds.contains(&kind)
     }
 }
@@ -66,6 +68,8 @@ pub enum SessionTemplateKind {
     File,
     /// Agent tool reference, including MCP-backed tools.
     Tool,
+    /// Prompt reference, such as an Agent Skill or MCP prompt.
+    Prompt,
 }
 
 /// Template option suitable for insertion into a prompt.
@@ -89,121 +93,63 @@ struct ScoredTemplateOption {
     option: SessionTemplateOption,
 }
 
-/// Search files and tools visible to a session runtime.
-#[must_use]
-pub fn search_session_templates(
+/// Mutable scored template-search results collected by middleware.
+#[derive(Debug, Default)]
+pub(crate) struct TemplateSearchResults {
+    results: Vec<ScoredTemplateOption>,
+}
+
+impl TemplateSearchResults {
+    /// Add one scored option.
+    pub(crate) fn push(&mut self, score: u8, option: SessionTemplateOption) {
+        self.results.push(ScoredTemplateOption { score, option });
+    }
+
+    /// Add one scored option while keeping only the best known matches.
+    pub(crate) fn push_limited(&mut self, score: u8, option: SessionTemplateOption, limit: usize) {
+        self.push(score, option);
+        self.results.sort_by(compare_options);
+        self.results.truncate(limit);
+    }
+
+    fn finish(mut self, limit: usize) -> Vec<SessionTemplateOption> {
+        self.results.sort_by(compare_options);
+        self.results
+            .into_iter()
+            .take(limit)
+            .map(|result| result.option)
+            .collect()
+    }
+}
+
+/// Search prompt-template resources available to a session runtime.
+pub(crate) async fn search_session_templates_with_state(
     root: &Path,
     runtime: &AgentRuntime,
     request: &SessionTemplateSearchRequest,
-) -> Vec<SessionTemplateOption> {
-    if request.target == SessionTemplateSearchTarget::Prompts {
-        return Vec::new();
-    }
-
-    let query = request.query.trim();
-    if query.is_empty() {
-        return Vec::new();
-    }
-
+    middleware_state: Option<&MiddlewareStateLog>,
+) -> Result<Vec<SessionTemplateOption>> {
     let limit = request.effective_limit();
-    let mut results = Vec::new();
-    if request.includes(SessionTemplateKind::File) {
-        results.extend(search_files(root, query, limit));
-    }
-    if request.includes(SessionTemplateKind::Tool) {
-        results.extend(search_tools(runtime, query, limit));
+    let mut results = TemplateSearchResults::default();
+
+    if request.target == SessionTemplateSearchTarget::Resources && request.query.trim().is_empty() {
+        return Ok(Vec::new());
     }
 
-    results.sort_by(compare_options);
-    results
-        .into_iter()
-        .take(limit)
-        .map(|result| result.option)
-        .collect()
+    let ctx = TemplateSearchContext {
+        root,
+        request,
+        middleware_state,
+    };
+    runtime
+        .middleware_chain()
+        .search_templates(&ctx, &mut results)
+        .await?;
+
+    Ok(results.finish(limit))
 }
 
-fn search_files(root: &Path, query: &str, limit: usize) -> Vec<ScoredTemplateOption> {
-    if !root.is_dir() {
-        return Vec::new();
-    }
-
-    let query_lower = query.to_lowercase();
-    let mut results = Vec::new();
-
-    for entry in WalkBuilder::new(root)
-        .standard_filters(true)
-        .build()
-        .filter_map(Result::ok)
-    {
-        let file_type = entry.file_type();
-        if !file_type.is_some_and(|file_type| file_type.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let detail = normalize_path(relative);
-        let label = relative
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(detail.as_str())
-            .to_owned();
-        let Some(score) = file_score(&label, &detail, &query_lower) else {
-            continue;
-        };
-        push_limited(
-            &mut results,
-            limit,
-            ScoredTemplateOption {
-                score,
-                option: SessionTemplateOption {
-                    kind: SessionTemplateKind::File,
-                    label,
-                    detail: detail.clone(),
-                    template: file_template(&detail),
-                    metadata: json!({ "path": detail }),
-                },
-            },
-        );
-    }
-
-    results
-}
-
-fn search_tools(runtime: &AgentRuntime, query: &str, limit: usize) -> Vec<ScoredTemplateOption> {
-    let query_lower = query.to_lowercase();
-    let mut results = Vec::new();
-    for tool in runtime.tools() {
-        let definition = tool.definition();
-        let Some(score) = tool_score(&definition.name, &definition.description, &query_lower)
-        else {
-            continue;
-        };
-        let template = tool_template(&definition.name, &definition.input_schema);
-        push_limited(
-            &mut results,
-            limit,
-            ScoredTemplateOption {
-                score,
-                option: SessionTemplateOption {
-                    kind: SessionTemplateKind::Tool,
-                    label: definition.name.clone(),
-                    detail: definition.description.clone(),
-                    template,
-                    metadata: json!({
-                        "name": definition.name.clone(),
-                        "description": definition.description.clone(),
-                        "inputSchema": definition.input_schema.clone(),
-                    }),
-                },
-            },
-        );
-    }
-    results
-}
-
-fn tool_template(name: &str, input_schema: &Value) -> String {
+pub(crate) fn tool_template(name: &str, input_schema: &Value) -> String {
     let mut arguments = Map::new();
     if let Some(required) = input_schema.get("required").and_then(Value::as_array) {
         for field in required.iter().filter_map(Value::as_str) {
@@ -216,17 +162,7 @@ fn tool_template(name: &str, input_schema: &Value) -> String {
     format!("@tool({name}, {arguments})")
 }
 
-fn push_limited(
-    results: &mut Vec<ScoredTemplateOption>,
-    limit: usize,
-    option: ScoredTemplateOption,
-) {
-    results.push(option);
-    results.sort_by(compare_options);
-    results.truncate(limit);
-}
-
-fn file_score(label: &str, detail: &str, query_lower: &str) -> Option<u8> {
+pub(crate) fn file_score(label: &str, detail: &str, query_lower: &str) -> Option<u8> {
     let label_lower = label.to_lowercase();
     let detail_lower = detail.to_lowercase();
     if label_lower == query_lower {
@@ -247,7 +183,7 @@ fn file_score(label: &str, detail: &str, query_lower: &str) -> Option<u8> {
     }
 }
 
-fn tool_score(name: &str, description: &str, query_lower: &str) -> Option<u8> {
+pub(crate) fn tool_score(name: &str, description: &str, query_lower: &str) -> Option<u8> {
     let name_lower = name.to_lowercase();
     let description_lower = description.to_lowercase();
     if name_lower == query_lower {
@@ -263,6 +199,13 @@ fn tool_score(name: &str, description: &str, query_lower: &str) -> Option<u8> {
     }
 }
 
+pub(crate) fn prompt_score(name: &str, description: &str, query_lower: &str) -> Option<u8> {
+    if query_lower.is_empty() || "skill:".starts_with(query_lower) {
+        return Some(4);
+    }
+    tool_score(name, description, query_lower)
+}
+
 fn compare_options(left: &ScoredTemplateOption, right: &ScoredTemplateOption) -> Ordering {
     left.score
         .cmp(&right.score)
@@ -271,14 +214,14 @@ fn compare_options(left: &ScoredTemplateOption, right: &ScoredTemplateOption) ->
         .then_with(|| left.option.label.cmp(&right.option.label))
 }
 
-fn normalize_path(path: &Path) -> String {
+pub(crate) fn normalize_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
 }
 
-fn file_template(path: &str) -> String {
+pub(crate) fn file_template(path: &str) -> String {
     if is_bare_file_ref(path) {
         format!("@{path}")
     } else {
@@ -286,7 +229,7 @@ fn file_template(path: &str) -> String {
     }
 }
 
-fn is_bare_file_ref(path: &str) -> bool {
+pub(crate) fn is_bare_file_ref(path: &str) -> bool {
     !path.is_empty()
         && (path.contains('/') || path.contains('.'))
         && path.chars().all(|character| {
@@ -296,7 +239,18 @@ fn is_bare_file_ref(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_template, is_bare_file_ref};
+    use std::{path::PathBuf, sync::Arc};
+
+    use futures_util::stream;
+
+    use super::{
+        SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
+        file_template, is_bare_file_ref, search_session_templates_with_state,
+    };
+    use crate::{
+        AgentRuntime, BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionRequest,
+        ModelApi, ModelRef, ProviderId, SkillDefinition,
+    };
 
     #[test]
     fn file_templates_quote_when_needed() {
@@ -313,5 +267,58 @@ mod tests {
         assert!(is_bare_file_ref("src/lib-test_1.rs"));
         assert!(!is_bare_file_ref("src/two words.rs"));
         assert!(!is_bare_file_ref(""));
+    }
+
+    #[tokio::test]
+    async fn prompt_search_returns_skill_templates() {
+        let root = PathBuf::from("/workspace");
+        let runtime = AgentRuntime::builder(
+            ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+            Arc::new(TestProvider),
+        )
+        .with_skill_definitions(vec![SkillDefinition {
+            name: "documenting".to_owned(),
+            description: "Write repository documentation".to_owned(),
+            root: root.clone(),
+            skills_dir: root.join(".agents/skills"),
+            skill_dir: root.join(".agents/skills/documenting"),
+            skill_path: root.join(".agents/skills/documenting/SKILL.md"),
+        }])
+        .build();
+
+        let options = search_session_templates_with_state(
+            &root,
+            &runtime,
+            &SessionTemplateSearchRequest {
+                query: "skill:doc".to_owned(),
+                limit: 10,
+                kinds: vec![SessionTemplateKind::Prompt],
+                target: SessionTemplateSearchTarget::Prompts,
+            },
+            None,
+        )
+        .await
+        .expect("template search should succeed");
+
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].kind, SessionTemplateKind::Prompt);
+        assert_eq!(options[0].label, "skill:documenting");
+        assert_eq!(options[0].template, "/skill:documenting");
+        assert_eq!(options[0].metadata["promptType"], "skill");
+    }
+
+    struct TestProvider;
+
+    impl crate::LlmStream for TestProvider {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async move {
+                Ok(Box::pin(stream::iter(vec![Ok(CompletionEvent::Finished)]))
+                    as BoxCompletionStream)
+            })
+        }
     }
 }
