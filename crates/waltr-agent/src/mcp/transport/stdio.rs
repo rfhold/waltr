@@ -19,6 +19,7 @@ pub(in crate::mcp) struct StdioTransport {
 
 impl StdioTransport {
     pub(in crate::mcp) async fn start(
+        server_name: String,
         command: String,
         args: Vec<String>,
         inbound: InboundSender,
@@ -38,15 +39,28 @@ impl StdioTransport {
             .take()
             .ok_or_else(|| protocol_error("missing stdout"))?;
         if let Some(stderr) = child.stderr.take() {
-            let command = command.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 loop {
                     match lines.next_line().await {
-                        Ok(Some(line)) => tracing::debug!(server = %command, line, "mcp stderr"),
+                        Ok(Some(line)) => tracing::debug!(
+                            mcp.server = %server_name,
+                            mcp.transport = "stdio",
+                            mcp.source = "stderr",
+                            stream = "stderr",
+                            line,
+                            "mcp stderr"
+                        ),
                         Ok(None) => break,
                         Err(error) => {
-                            tracing::debug!(server = %command, %error, "mcp stderr closed");
+                            tracing::debug!(
+                                mcp.server = %server_name,
+                                mcp.transport = "stdio",
+                                mcp.source = "stderr",
+                                stream = "stderr",
+                                %error,
+                                "mcp stderr closed"
+                            );
                             break;
                         }
                     }

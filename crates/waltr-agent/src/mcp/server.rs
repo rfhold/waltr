@@ -8,9 +8,10 @@ use crate::Result;
 
 use super::{
     capabilities::McpServerCapabilities,
-    config::McpServerConfig,
+    config::{McpServerConfig, set_log_level_params},
     connection::{McpConnection, McpConnectionHandler, roots_response},
     event::McpRuntimeEvent,
+    log::McpLogLevel,
     prompt::{McpPromptDefinition, format_prompt_result, parse_prompt_definition},
     protocol::{JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION, protocol_error},
     resource::{McpResourceDefinition, format_resource_result, parse_resource_definition},
@@ -39,6 +40,8 @@ pub(in crate::mcp) struct McpServerRuntime {
     name: String,
     connection: Arc<McpConnection>,
     timeout: Duration,
+    log_level: Option<McpLogLevel>,
+    transport_kind: &'static str,
     #[allow(dead_code)]
     root_uri: String,
     events: broadcast::Sender<McpRuntimeEvent>,
@@ -79,22 +82,27 @@ impl McpServerRuntime {
     pub(in crate::mcp) async fn start(
         config: McpServerConfig,
         timeout: Duration,
+        log_level: Option<McpLogLevel>,
         root_uri: String,
         events: broadcast::Sender<McpRuntimeEvent>,
         cancellation_token: CancellationToken,
     ) -> Result<Arc<Self>> {
         let name = config.name.clone();
+        let transport_kind = config.transport.kind();
         let handler = Arc::new(ServerHandler {
             name: name.clone(),
             root_uri: root_uri.clone(),
             events: events.clone(),
             refresh: Mutex::new(None),
         });
-        let connection = McpConnection::start(config.transport, handler.clone()).await?;
+        let connection =
+            McpConnection::start(name.clone(), config.transport, handler.clone()).await?;
         let runtime = Arc::new(Self {
             name,
             connection,
             timeout,
+            log_level,
+            transport_kind,
             root_uri,
             events,
             state: Mutex::new(McpServerState::default()),
@@ -255,12 +263,31 @@ impl McpServerRuntime {
             state.capabilities = capabilities;
             state.initialized = true;
         }
+        self.configure_logging(cancellation_token.clone()).await?;
         self.refresh_tools(cancellation_token.clone()).await?;
         self.refresh_prompts(cancellation_token.clone()).await?;
         self.refresh_resources(cancellation_token).await?;
         drop(self.events.send(McpRuntimeEvent::ServerInitialized {
             server_key: self.name.clone(),
         }));
+        Ok(())
+    }
+
+    async fn configure_logging(&self, cancellation_token: CancellationToken) -> Result<()> {
+        let Some(level) = self.log_level else {
+            return Ok(());
+        };
+        if !self.state.lock().await.capabilities.logging {
+            return Ok(());
+        }
+        self.connection
+            .request(
+                "logging/setLevel",
+                Some(set_log_level_params(level)),
+                self.timeout,
+                cancellation_token,
+            )
+            .await?;
         Ok(())
     }
 
@@ -457,23 +484,7 @@ impl McpConnectionHandler for ServerHandler {
                 }
             }
             "notifications/message" => {
-                let params = notification.params.unwrap_or(Value::Null);
-                let level = params
-                    .get("level")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                let logger = params
-                    .get("logger")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                let data = params.get("data").cloned().unwrap_or(Value::Null);
-                tracing::debug!(server = %self.name, ?level, ?logger, data = %data, "mcp log message");
-                drop(self.events.send(McpRuntimeEvent::LogMessage {
-                    server_key: self.name.clone(),
-                    level,
-                    logger,
-                    data,
-                }));
+                self.log_message(notification.params.unwrap_or(Value::Null));
             }
             "notifications/progress" => {
                 let params = notification.params.unwrap_or(Value::Null);
@@ -519,5 +530,161 @@ impl McpConnectionHandler for ServerHandler {
                 runtime.state.lock().await.last_sse_event_id = Some(id);
             });
         }
+    }
+}
+
+impl ServerHandler {
+    fn log_message(&self, params: Value) {
+        let raw_level = params
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("debug");
+        let level = raw_level.parse().unwrap_or_else(|()| {
+            tracing::warn!(
+                mcp.server = %self.name,
+                mcp.transport = self.transport_kind(),
+                mcp.source = "notification",
+                mcp.log.level = raw_level,
+                "invalid MCP log level"
+            );
+            McpLogLevel::Debug
+        });
+        let logger = params
+            .get("logger")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let data = params.get("data").cloned().unwrap_or(Value::Null);
+        let logging_capability = self.logging_capability();
+        trace_mcp_log(
+            &self.name,
+            self.transport_kind(),
+            logging_capability,
+            level,
+            logger.as_deref(),
+            &data,
+        );
+        drop(self.events.send(McpRuntimeEvent::LogMessage {
+            server_key: self.name.clone(),
+            level,
+            logger,
+            data,
+        }));
+    }
+
+    fn transport_kind(&self) -> &'static str {
+        self.refresh
+            .try_lock()
+            .ok()
+            .and_then(|runtime| runtime.as_ref().map(|runtime| runtime.transport_kind))
+            .unwrap_or("unknown")
+    }
+
+    fn logging_capability(&self) -> bool {
+        self.refresh
+            .try_lock()
+            .ok()
+            .and_then(|runtime| runtime.clone())
+            .and_then(|runtime| {
+                runtime
+                    .state
+                    .try_lock()
+                    .ok()
+                    .map(|state| state.capabilities.logging)
+            })
+            .unwrap_or(false)
+    }
+}
+
+fn trace_mcp_log(
+    server: &str,
+    transport: &'static str,
+    logging_capability: bool,
+    level: McpLogLevel,
+    logger: Option<&str>,
+    data: &Value,
+) {
+    match level {
+        McpLogLevel::Debug => tracing::debug!(
+            mcp.server = %server,
+            mcp.transport = transport,
+            mcp.source = "notification",
+            mcp.log.level = level.as_str(),
+            mcp.logger = logger,
+            mcp.capability.logging = logging_capability,
+            data = %data,
+            "mcp log message"
+        ),
+        McpLogLevel::Info | McpLogLevel::Notice => tracing::info!(
+            mcp.server = %server,
+            mcp.transport = transport,
+            mcp.source = "notification",
+            mcp.log.level = level.as_str(),
+            mcp.logger = logger,
+            mcp.capability.logging = logging_capability,
+            data = %data,
+            "mcp log message"
+        ),
+        McpLogLevel::Warning => tracing::warn!(
+            mcp.server = %server,
+            mcp.transport = transport,
+            mcp.source = "notification",
+            mcp.log.level = level.as_str(),
+            mcp.logger = logger,
+            mcp.capability.logging = logging_capability,
+            data = %data,
+            "mcp log message"
+        ),
+        McpLogLevel::Error
+        | McpLogLevel::Critical
+        | McpLogLevel::Alert
+        | McpLogLevel::Emergency => tracing::error!(
+            mcp.server = %server,
+            mcp.transport = transport,
+            mcp.source = "notification",
+            mcp.log.level = level.as_str(),
+            mcp.logger = logger,
+            mcp.capability.logging = logging_capability,
+            data = %data,
+            "mcp log message"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tokio::sync::{Mutex, broadcast};
+
+    use super::{McpRuntimeEvent, ServerHandler};
+    use crate::mcp::log::McpLogLevel;
+
+    #[test]
+    fn normalizes_mcp_log_notification_events() {
+        let (events, mut receiver) = broadcast::channel(8);
+        let handler = ServerHandler {
+            name: "test_server".to_owned(),
+            root_uri: "file:///workspace".to_owned(),
+            events,
+            refresh: Mutex::new(None),
+        };
+
+        handler.log_message(json!({
+            "level": "warning",
+            "logger": "test.logger",
+            "data": { "message": "hello" }
+        }));
+
+        let event = receiver.try_recv().expect("log event");
+        assert!(matches!(
+            event,
+            McpRuntimeEvent::LogMessage {
+                server_key,
+                level: McpLogLevel::Warning,
+                logger,
+                data,
+            } if server_key == "test_server"
+                && logger.as_deref() == Some("test.logger")
+                && data == json!({ "message": "hello" })
+        ));
     }
 }

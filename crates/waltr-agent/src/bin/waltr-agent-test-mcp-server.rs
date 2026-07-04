@@ -9,11 +9,15 @@ use rmcp::{
     },
     model::{
         Annotated, GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
-        PaginatedRequestParams, PromptArgument, PromptMessage, PromptMessageRole, RawResource,
-        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-        ServerInfo,
+        LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams, PromptArgument,
+        PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParams,
+        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+        SetLevelRequestParams,
     },
     schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
 use rmcp::{prompt, prompt_router};
 
@@ -27,6 +31,11 @@ struct DelayedWriteRequest {
     path: String,
     value: String,
     delay_ms: u64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EmitLogRequest {
+    message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +80,31 @@ impl EchoMarkerServer {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         std::fs::write(path, &value).expect("delayed marker write should succeed");
         value
+    }
+
+    #[tool(
+        name = "emit_log_marker",
+        description = "Emit a deterministic MCP log message."
+    )]
+    async fn emit_log_marker(
+        &self,
+        Parameters(EmitLogRequest { message }): Parameters<EmitLogRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let _ = &self.tool_router;
+        context
+            .peer
+            .notify_logging_message(LoggingMessageNotificationParam {
+                level: LoggingLevel::Warning,
+                logger: Some("waltr.test".to_owned()),
+                data: serde_json::json!({
+                    "message": message,
+                    "marker": "stdio-mcp-log-notification-818"
+                }),
+            })
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(message)
     }
 }
 
@@ -123,12 +157,25 @@ impl ServerHandler for EchoMarkerServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
+                .enable_logging()
                 .enable_tools()
                 .enable_prompts()
                 .enable_resources()
                 .build(),
         )
         .with_instructions("Echo deterministic test markers")
+    }
+
+    async fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        if let Ok(path) = std::env::var("WALTR_TEST_MCP_LOG_LEVEL_FILE") {
+            std::fs::write(path, format!("{:?}", request.level).to_lowercase())
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        }
+        Ok(())
     }
 
     async fn list_prompts(
@@ -198,10 +245,38 @@ impl ServerHandler for EchoMarkerServer {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--http") {
+        let bind = args.next().unwrap_or_else(|| "127.0.0.1:0".to_owned());
+        let address_file = args.next();
+        serve_http(&bind, address_file.as_deref()).await?;
+        return Ok(());
+    }
+
     EchoMarkerServer::new()
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
         .await?;
+    Ok(())
+}
+
+async fn serve_http(
+    bind: &str,
+    address_file: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let address = listener.local_addr()?;
+    if let Some(path) = address_file {
+        std::fs::write(path, address.to_string())?;
+    }
+    let service: StreamableHttpService<EchoMarkerServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(EchoMarkerServer::new()),
+            std::sync::Arc::default(),
+            StreamableHttpServerConfig::default().with_sse_keep_alive(None),
+        );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    axum::serve(listener, app).await?;
     Ok(())
 }

@@ -1,8 +1,7 @@
 //! MCP agent integration tests.
 
-use std::{fs, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fs, process::Child, sync::Arc, time::Duration};
 
-use axum::Router;
 use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
@@ -13,22 +12,74 @@ use waltr_agent::{
     SessionTemplateSearchTarget, Suspension, TimelineContent, TimelineEventKind, TimelineQuery,
     TimelineStatus, ToolCall,
 };
-use rmcp::{
-    ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
-    transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-    },
-};
 use serde_json::json;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+#[tokio::test]
+async fn test_mcp_server_advertises_logging_and_accepts_set_level() -> waltr_agent::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let level_file = temp.path().join("mcp-log-level.txt");
+    let mut child = tokio::process::Command::new(test_stdio_server_command())
+        .env("WALTR_TEST_MCP_LOG_LEVEL_FILE", &level_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stdout = BufReader::new(stdout).lines();
+
+    write_json_rpc(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "waltr-agent-test", "version": "0" }
+            }
+        }),
+    )
+    .await?;
+    let initialize = read_json_rpc(&mut stdout).await?;
+    assert_eq!(initialize["id"], json!(1));
+    assert_eq!(initialize["result"]["capabilities"]["logging"], json!({}));
+
+    write_json_rpc(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    )
+    .await?;
+    write_json_rpc(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "logging/setLevel",
+            "params": { "level": "warning" }
+        }),
+    )
+    .await?;
+    let set_level = read_json_rpc(&mut stdout).await?;
+    assert_eq!(set_level["id"], json!(2));
+    assert!(set_level.get("error").is_none(), "{set_level:#?}");
+    assert_eq!(fs::read_to_string(&level_file)?, "warning");
+
+    child.kill().await.ok();
+    child.wait().await.ok();
+    Ok(())
+}
 
 #[tokio::test]
 async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direct_tools()
@@ -59,18 +110,30 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
     let direct_results = tool_result_text(&session);
 
     assert_tool_was_surfaced(&provider, "mcp_stdio_test_echo_marker");
+    assert_tool_was_surfaced(&provider, "mcp_stdio_test_emit_log_marker");
     assert_tool_was_surfaced(&provider, "mcp_http_test_echo_marker");
+    assert_tool_was_surfaced(&provider, "mcp_http_test_emit_log_marker");
     assert_tool_was_not_surfaced(&provider, "search_mcp_tools");
     assert_tool_was_not_surfaced(&provider, "get_mcp_tool_details");
     assert_tool_was_not_surfaced(&provider, "call_mcp_tool");
     assert_tool_call(&session, "mcp_stdio_test_echo_marker", &context);
+    assert_tool_call(&session, "mcp_stdio_test_emit_log_marker", &context);
     assert_tool_call(&session, "mcp_http_test_echo_marker", &context);
+    assert_tool_call(&session, "mcp_http_test_emit_log_marker", &context);
     assert!(
         direct_results.contains("stdio-mcp-tool-called-707"),
         "{context}"
     );
     assert!(
         direct_results.contains("http-mcp-tool-called-707"),
+        "{context}"
+    );
+    assert!(
+        direct_results.contains("stdio-mcp-log-emitted-818"),
+        "{context}"
+    );
+    assert!(
+        direct_results.contains("http-mcp-log-emitted-818"),
         "{context}"
     );
     assert!(session.text.contains("mcp-flow-complete"), "{context}");
@@ -446,7 +509,7 @@ fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSet
         key: "http_test".to_owned(),
         kind: SessionMcpServerRuntimeKind::StreamableHttp,
         command: String::new(),
-        url: format!("http://{}/mcp", server.address),
+        url: server.endpoint.clone(),
     }
 }
 
@@ -563,9 +626,19 @@ fn direct_events(step: usize) -> Vec<waltr_agent::Result<CompletionEvent>> {
             json!({ "value": "stdio-mcp-tool-called-707" }),
         )))],
         1 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+            "call_direct_stdio_log",
+            "mcp_stdio_test_emit_log_marker",
+            json!({ "message": "stdio-mcp-log-emitted-818" }),
+        )))],
+        2 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
             "call_direct_http",
             "mcp_http_test_echo_marker",
             json!({ "value": "http-mcp-tool-called-707" }),
+        )))],
+        3 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+            "call_direct_http_log",
+            "mcp_http_test_emit_log_marker",
+            json!({ "message": "http-mcp-log-emitted-818" }),
         )))],
         _ => vec![
             Ok(CompletionEvent::Delta("mcp-flow-complete".to_owned())),
@@ -605,45 +678,81 @@ fn test_stdio_server_command() -> String {
     path.display().to_string()
 }
 
+async fn write_json_rpc(
+    stdin: &mut tokio::process::ChildStdin,
+    value: serde_json::Value,
+) -> waltr_agent::Result<()> {
+    stdin.write_all(value.to_string().as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn read_json_rpc(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) -> waltr_agent::Result<serde_json::Value> {
+    let line = lines.next_line().await?.ok_or_else(|| {
+        waltr_agent::LlmError::api("mcp", "MCP test server closed stdout before response")
+    })?;
+    Ok(serde_json::from_str(&line)?)
+}
+
 #[derive(Debug)]
 struct HttpMcpTestServer {
-    address: SocketAddr,
-    shutdown: Option<oneshot::Sender<()>>,
+    endpoint: String,
+    child: Child,
 }
 
 impl HttpMcpTestServer {
     async fn start() -> waltr_agent::Result<Self> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-        let address = listener.local_addr()?;
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let service: StreamableHttpService<EchoMarkerServer, LocalSessionManager> =
-            StreamableHttpService::new(
-                || Ok(EchoMarkerServer::new()),
-                Arc::default(),
-                StreamableHttpServerConfig::default().with_sse_keep_alive(None),
-            );
-        let app = Router::new().nest_service("/mcp", service);
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    shutdown_receiver.await.ok();
-                })
-                .await
-                .ok();
-        });
+        let temp = tempfile::tempdir()?;
+        let address_file = temp.path().join("mcp-http-address.txt");
+        let mut child = std::process::Command::new(test_stdio_server_command())
+            .arg("--http")
+            .arg("127.0.0.1:0")
+            .arg(&address_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let address = wait_for_http_address(&mut child, &address_file).await?;
         Ok(Self {
-            address,
-            shutdown: Some(shutdown_sender),
+            endpoint: format!("http://{address}/mcp"),
+            child,
         })
     }
 }
 
 impl Drop for HttpMcpTestServer {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+        drop(self.child.kill());
+        drop(self.child.wait());
     }
+}
+
+async fn wait_for_http_address(
+    child: &mut Child,
+    address_file: &std::path::Path,
+) -> waltr_agent::Result<String> {
+    for _ in 0..100 {
+        if let Some(status) = child.try_wait()? {
+            return Err(waltr_agent::LlmError::api(
+                "mcp",
+                format!("MCP HTTP test server exited before startup: {status}"),
+            ));
+        }
+        if let Ok(address) = fs::read_to_string(address_file) {
+            let address = address.trim().to_owned();
+            if !address.is_empty() {
+                return Ok(address);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(waltr_agent::LlmError::api(
+        "mcp",
+        "MCP HTTP test server did not report an address",
+    ))
 }
 
 fn tool_result_text(session: &AgentTestSession) -> String {
@@ -675,42 +784,4 @@ fn test_model() -> ModelRef {
         OPENAI_TEST_MODEL,
         ModelApi::OpenAiResponses,
     )
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct EchoMarkerRequest {
-    value: String,
-}
-
-#[derive(Debug, Clone)]
-struct EchoMarkerServer {
-    tool_router: ToolRouter<Self>,
-}
-
-impl EchoMarkerServer {
-    fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
-    }
-}
-
-#[tool_router]
-impl EchoMarkerServer {
-    #[tool(name = "echo_marker", description = "Echo a deterministic marker.")]
-    fn echo_marker(
-        &self,
-        Parameters(EchoMarkerRequest { value }): Parameters<EchoMarkerRequest>,
-    ) -> String {
-        let _ = &self.tool_router;
-        value
-    }
-}
-
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for EchoMarkerServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Echo deterministic test markers")
-    }
 }
