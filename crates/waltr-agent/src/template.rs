@@ -45,6 +45,7 @@ pub(crate) enum TemplateReference {
     Prompt {
         namespace: String,
         name: String,
+        arguments: Option<Value>,
         raw: String,
     },
 }
@@ -139,10 +140,13 @@ impl TemplateRuntime<'_> {
                 && remaining.starts_with('/')
                 && is_reference_boundary(input, index)
             {
-                if let Some((namespace, name, consumed)) = parse_prompt_reference(remaining) {
+                if let Some((namespace, name, arguments, consumed)) =
+                    parse_prompt_reference(remaining)
+                {
                     let reference = TemplateReference::Prompt {
                         namespace,
                         name,
+                        arguments,
                         raw: remaining[..consumed].to_owned(),
                     };
                     match self.render_reference(reference, depth).await? {
@@ -532,7 +536,7 @@ fn is_first_line(input: &str, index: usize) -> bool {
 fn parse_prompt_name(input: &str) -> Option<(String, usize)> {
     let mut consumed = 0;
     for character in input.chars() {
-        if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-' {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
             consumed += character.len_utf8();
         } else {
             break;
@@ -541,7 +545,7 @@ fn parse_prompt_name(input: &str) -> Option<(String, usize)> {
     (consumed > 0).then(|| (input[..consumed].to_owned(), consumed))
 }
 
-fn parse_prompt_reference(input: &str) -> Option<(String, String, usize)> {
+fn parse_prompt_reference(input: &str) -> Option<(String, String, Option<Value>, usize)> {
     let rest = input.strip_prefix('/')?;
     let (namespace, namespace_len) = parse_prompt_name(rest)?;
     let name_start = namespace_len + 1;
@@ -549,7 +553,20 @@ fn parse_prompt_reference(input: &str) -> Option<(String, String, usize)> {
         return None;
     }
     let (name, name_len) = parse_prompt_name(&rest[name_start..])?;
-    Some((namespace, name, 1 + name_start + name_len))
+    let mut consumed = 1 + name_start + name_len;
+    if !input[consumed..].starts_with('(') {
+        return Some((namespace, name, None, consumed));
+    }
+    let (arguments, arguments_len) = parse_json_value(&input[consumed + 1..]).ok()?;
+    consumed += 1 + arguments_len;
+    while input[consumed..].starts_with(char::is_whitespace) {
+        consumed += input[consumed..].chars().next().map_or(0, char::len_utf8);
+    }
+    if !input[consumed..].starts_with(')') {
+        return None;
+    }
+    consumed += 1;
+    Some((namespace, name, Some(arguments), consumed))
 }
 
 fn parse_bare_file_reference(input: &str) -> Option<(String, usize)> {

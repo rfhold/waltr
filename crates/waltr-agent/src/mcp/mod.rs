@@ -5,6 +5,7 @@ mod config;
 mod connection;
 mod event;
 mod name;
+mod prompt;
 mod protocol;
 mod runtime;
 mod server;

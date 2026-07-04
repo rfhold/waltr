@@ -162,6 +162,37 @@ pub(crate) fn tool_template(name: &str, input_schema: &Value) -> String {
     format!("@tool({name}, {arguments})")
 }
 
+pub(crate) fn mcp_prompt_template(
+    server_name: &str,
+    prompt_name: &str,
+    arguments: &[(String, bool)],
+) -> Option<String> {
+    if !is_mcp_prompt_template_part(server_name) || !is_mcp_prompt_template_part(prompt_name) {
+        return None;
+    }
+
+    let mut required = Map::new();
+    for (name, is_required) in arguments {
+        if *is_required {
+            required.insert(name.clone(), Value::String(String::new()));
+        }
+    }
+    if required.is_empty() {
+        Some(format!("/{server_name}:{prompt_name}"))
+    } else {
+        let arguments =
+            serde_json::to_string(&Value::Object(required)).unwrap_or_else(|_| "{}".to_owned());
+        Some(format!("/{server_name}:{prompt_name}({arguments})"))
+    }
+}
+
+pub(crate) fn is_mcp_prompt_template_part(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 pub(crate) fn file_score(label: &str, detail: &str, query_lower: &str) -> Option<u8> {
     let label_lower = label.to_lowercase();
     let detail_lower = detail.to_lowercase();

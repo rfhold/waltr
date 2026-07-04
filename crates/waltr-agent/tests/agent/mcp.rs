@@ -9,8 +9,9 @@ use waltr_agent::{
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, FileCredentialStore, LlmStream,
     MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus, ProviderId, SessionCoordinator,
     SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
-    SessionRuntimeSettings, SessionStore, Suspension, TimelineContent, TimelineEventKind,
-    TimelineQuery, TimelineStatus, ToolCall,
+    SessionRuntimeSettings, SessionStore, SessionTemplateKind, SessionTemplateSearchRequest,
+    SessionTemplateSearchTarget, Suspension, TimelineContent, TimelineEventKind, TimelineQuery,
+    TimelineStatus, ToolCall,
 };
 use rmcp::{
     ServerHandler,
@@ -195,6 +196,131 @@ async fn mcp_cancellation_cancels_tool_work_and_preserves_stdio_runtime() -> wal
         "{}",
         crate::session::session_context(&recovery_provider, &recovery)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_prompt_templates_are_discovered_from_stdio_server() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::new("mcp_prompt_search_provider", |_| {
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let sessions = mcp_sessions(provider);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![stdio_runtime_server(
+                &stdio_command,
+            )])),
+        )
+        .await?;
+
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "stdio".to_owned(),
+                limit: 20,
+                kinds: vec![SessionTemplateKind::Prompt],
+                target: SessionTemplateSearchTarget::Prompts,
+            },
+        )
+        .await?;
+
+    let status = options
+        .iter()
+        .find(|option| option.template == "/stdio_test:status_prompt")
+        .unwrap_or_else(|| panic!("expected status prompt template: {options:#?}"));
+    assert_eq!(status.metadata["promptType"], "mcp");
+    assert_eq!(status.metadata["server"], "stdio_test");
+    let greet = options
+        .iter()
+        .find(|option| option.template == "/stdio_test:greet_prompt({\"name\":\"\"})")
+        .unwrap_or_else(|| panic!("expected greet prompt template: {options:#?}"));
+    assert_eq!(greet.kind, SessionTemplateKind::Prompt);
+    assert_eq!(greet.metadata["arguments"][0]["name"], "name");
+    assert_eq!(greet.metadata["arguments"][0]["required"], true);
+    assert!(
+        options
+            .iter()
+            .all(|option| option.metadata["name"] != "review.code"),
+        "dotted MCP prompt names cannot be represented by slash templates yet: {options:#?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_prompt_template_renders_before_provider_request() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_prompt_render_provider",
+        |_| {
+            vec![
+                Ok(CompletionEvent::Delta("prompt-render-complete".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ]
+        },
+    )));
+    let sessions = mcp_sessions(provider.clone());
+    let session = run_session_prompt(
+        &sessions,
+        "/stdio_test:greet_prompt({\"name\":\"Waltr\"})\nUse this prompt.",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+    let prompts = provider.request_prompts();
+    let rendered = prompts
+        .first()
+        .unwrap_or_else(|| panic!("expected captured provider prompt"));
+
+    assert!(
+        rendered.contains("hello Waltr from stdio-mcp-prompt-414"),
+        "{rendered}"
+    );
+    assert!(
+        rendered
+            .contains("<template-result kind=\"mcp_prompt\" source=\"stdio_test:greet_prompt\">"),
+        "{rendered}"
+    );
+    assert!(session.tool_calls.is_empty(), "{session:#?}");
+    assert!(session.text.contains("prompt-render-complete"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_prompt_template_rejects_non_string_arguments() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_prompt_argument_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    )));
+    let sessions = mcp_sessions(provider.clone());
+    let session = run_session_prompt(
+        &sessions,
+        "/stdio_test:greet_prompt({\"name\":123})\nUse this prompt.",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+    let prompts = provider.request_prompts();
+    let rendered = prompts
+        .first()
+        .unwrap_or_else(|| panic!("expected captured provider prompt"));
+
+    assert!(
+        rendered.contains(
+            "<template-error>mcp prompt stdio_test:greet_prompt: argument `name` must be a string</template-error>"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("hello 123 from stdio-mcp-prompt-414"),
+        "{rendered}"
+    );
+    assert!(session.tool_calls.is_empty(), "{session:#?}");
 
     Ok(())
 }

@@ -147,6 +147,9 @@ impl AgentSessionRuntimeFactory {
             for tool in mcp_runtime.agent_tools().await {
                 builder = builder.with_tool(tool);
             }
+            builder = builder.with_middleware(
+                crate::middleware::mcp_prompts::McpPromptsMiddleware::new(mcp_runtime),
+            );
         }
         Ok(builder)
     }
