@@ -9,10 +9,10 @@ use rmcp::{
     },
     model::{
         Annotated, GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
-        LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams, PromptArgument,
-        PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParams,
-        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
-        SetLevelRequestParams,
+        LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams,
+        ProgressNotificationParam, PromptArgument, PromptMessage, PromptMessageRole, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
+        ServerInfo, SetLevelRequestParams,
     },
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -105,6 +105,32 @@ impl EchoMarkerServer {
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(message)
+    }
+
+    #[tool(
+        name = "progress_marker",
+        description = "Emit progress and echo a deterministic marker."
+    )]
+    async fn progress_marker(
+        &self,
+        Parameters(EchoMarkerRequest { value }): Parameters<EchoMarkerRequest>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let _ = &self.tool_router;
+        let token = context
+            .meta
+            .get_progress_token()
+            .ok_or_else(|| McpError::invalid_params("missing progress token", None))?;
+        context
+            .peer
+            .notify_progress(
+                ProgressNotificationParam::new(token, 1.0)
+                    .with_total(2.0)
+                    .with_message("stdio-mcp-progress-marker"),
+            )
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(value)
     }
 }
 

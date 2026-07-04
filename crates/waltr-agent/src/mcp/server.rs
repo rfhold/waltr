@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
-use crate::Result;
+use crate::{Result, ToolProgressSink};
 
 use super::{
     capabilities::McpServerCapabilities,
@@ -45,6 +45,7 @@ pub(in crate::mcp) struct McpServerRuntime {
     #[allow(dead_code)]
     root_uri: String,
     events: broadcast::Sender<McpRuntimeEvent>,
+    active_progress: Arc<std::sync::Mutex<BTreeMap<String, ToolProgressSink>>>,
     state: Mutex<McpServerState>,
 }
 
@@ -75,6 +76,7 @@ struct ServerHandler {
     name: String,
     root_uri: String,
     events: broadcast::Sender<McpRuntimeEvent>,
+    active_progress: Arc<std::sync::Mutex<BTreeMap<String, ToolProgressSink>>>,
     refresh: Mutex<Option<Arc<McpServerRuntime>>>,
 }
 
@@ -89,10 +91,12 @@ impl McpServerRuntime {
     ) -> Result<Arc<Self>> {
         let name = config.name.clone();
         let transport_kind = config.transport.kind();
+        let active_progress = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let handler = Arc::new(ServerHandler {
             name: name.clone(),
             root_uri: root_uri.clone(),
             events: events.clone(),
+            active_progress: Arc::clone(&active_progress),
             refresh: Mutex::new(None),
         });
         let connection =
@@ -105,6 +109,7 @@ impl McpServerRuntime {
             transport_kind,
             root_uri,
             events,
+            active_progress,
             state: Mutex::new(McpServerState::default()),
         });
         *handler.refresh.lock().await = Some(Arc::clone(&runtime));
@@ -153,20 +158,33 @@ impl McpServerRuntime {
         &self,
         tool: &str,
         arguments: Value,
+        call_id: &str,
+        progress: ToolProgressSink,
         cancellation_token: CancellationToken,
     ) -> Result<String> {
         self.ensure_initialized(cancellation_token.clone()).await?;
+        let progress_token = format!("{}:{tool}:{call_id}", self.name);
         let params = json!({
             "name": tool,
             "arguments": arguments,
             "_meta": {
-                "progressToken": format!("{}:{tool}", self.name),
+                "progressToken": progress_token,
             }
         });
+        self.active_progress
+            .lock()
+            .map_err(|_| protocol_error("MCP progress registry lock poisoned"))?
+            .insert(progress_token.clone(), progress);
         let response = self
             .connection
             .request("tools/call", Some(params), self.timeout, cancellation_token)
-            .await?;
+            .await;
+        drop(
+            self.active_progress
+                .lock()
+                .map(|mut active| active.remove(&progress_token)),
+        );
+        let response = response?;
         Ok(format_tool_result(&response))
     }
 
@@ -491,18 +509,30 @@ impl McpConnectionHandler for ServerHandler {
                 let Some(token) = params.get("progressToken").cloned() else {
                     return;
                 };
-                drop(
-                    self.events.send(McpRuntimeEvent::Progress {
-                        server_key: self.name.clone(),
-                        token,
-                        progress: params.get("progress").and_then(Value::as_f64),
-                        total: params.get("total").and_then(Value::as_f64),
-                        message: params
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned),
-                    }),
-                );
+                let progress = params.get("progress").and_then(Value::as_f64);
+                let total = params.get("total").and_then(Value::as_f64);
+                let message = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if let Some(sink) = self
+                    .active_progress
+                    .lock()
+                    .ok()
+                    .and_then(|active| active.get(&progress_token_key(&token)).cloned())
+                {
+                    let rendered = render_progress_message(message.as_deref(), progress, total);
+                    if let Err(error) = sink.info(rendered) {
+                        tracing::warn!(server = %self.name, %error, "failed to emit MCP progress");
+                    }
+                }
+                drop(self.events.send(McpRuntimeEvent::Progress {
+                    server_key: self.name.clone(),
+                    token,
+                    progress,
+                    total,
+                    message,
+                }));
             }
             _ => {}
         }
@@ -592,6 +622,27 @@ impl ServerHandler {
                     .map(|state| state.capabilities.logging)
             })
             .unwrap_or(false)
+    }
+}
+
+fn progress_token_key(token: &Value) -> String {
+    token
+        .as_str()
+        .map_or_else(|| token.to_string(), ToOwned::to_owned)
+}
+
+fn render_progress_message(
+    message: Option<&str>,
+    progress: Option<f64>,
+    total: Option<f64>,
+) -> String {
+    match (message, progress, total) {
+        (Some(message), Some(progress), Some(total)) => format!("{message} ({progress}/{total})"),
+        (Some(message), Some(progress), None) => format!("{message} ({progress})"),
+        (Some(message), None, _) => message.to_owned(),
+        (None, Some(progress), Some(total)) => format!("MCP progress: {progress}/{total}"),
+        (None, Some(progress), None) => format!("MCP progress: {progress}"),
+        (None, None, _) => "MCP progress".to_owned(),
     }
 }
 
