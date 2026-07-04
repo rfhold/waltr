@@ -21,7 +21,9 @@ use crate::{
 
 use super::{
     SHELL_OUTPUT_RECENT_LINE_COUNT, TIMELINE_CHANNELS, TIMELINE_PAGE_SIZE, TIMELINE_TEXT_PREFIX,
-    format_compact_cost, format_count, panel_style, prompts::external_request_kind_label,
+    format_compact_cost, format_count, panel_style,
+    prompts::external_request_kind_label,
+    template_style::{has_template_markers, template_inline_spans},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -758,6 +760,11 @@ fn append_markdown_text_lines(
     tone: MarkdownTone,
     width: Option<u16>,
 ) {
+    if has_template_markers(text) {
+        append_template_text_lines(lines, text, tone, width);
+        return;
+    }
+
     let options = match tone {
         MarkdownTone::User => MarkdownRenderOptions {
             tone,
@@ -786,6 +793,73 @@ fn append_markdown_text_lines(
         append_user_message_lines(lines, rendered, width);
     } else {
         lines.extend(rendered);
+    }
+}
+
+fn append_template_text_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    tone: MarkdownTone,
+    width: Option<u16>,
+) {
+    let rendered = template_text_lines(text, tone);
+
+    if tone == MarkdownTone::User {
+        append_user_message_lines(lines, rendered, width);
+    } else {
+        lines.extend(rendered);
+    }
+}
+
+fn template_text_lines(text: &str, tone: MarkdownTone) -> Vec<Line<'static>> {
+    let (prefix, base_style) = template_text_prefix_and_style(tone);
+    let spans = template_inline_spans(
+        text,
+        base_style,
+        THEME.focus_style(),
+        THEME.status_style(StatusRole::Error),
+    );
+    let mut lines = vec![template_text_line_prefix(prefix, base_style)];
+    for span in spans {
+        push_split_template_span(&mut lines, span, prefix, base_style);
+    }
+    lines.into_iter().map(Line::from).collect()
+}
+
+fn template_text_prefix_and_style(tone: MarkdownTone) -> (&'static str, Style) {
+    match tone {
+        MarkdownTone::User => ("", panel_style()),
+        MarkdownTone::Assistant => (TIMELINE_TEXT_PREFIX, THEME.text_style()),
+        MarkdownTone::Thinking => (TIMELINE_TEXT_PREFIX, THEME.muted_text_style()),
+    }
+}
+
+fn template_text_line_prefix(prefix: &str, style: Style) -> Vec<Span<'static>> {
+    if prefix.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(prefix.to_owned(), style)]
+    }
+}
+
+fn push_split_template_span(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    span: Span<'static>,
+    prefix: &str,
+    prefix_style: Style,
+) {
+    let style = span.style;
+    let content = span.content.into_owned();
+    for (index, segment) in content.split('\n').enumerate() {
+        if index > 0 {
+            lines.push(template_text_line_prefix(prefix, prefix_style));
+        }
+        if !segment.is_empty() {
+            lines
+                .last_mut()
+                .expect("template text should always have a current line")
+                .push(Span::styled(segment.to_owned(), style));
+        }
     }
 }
 

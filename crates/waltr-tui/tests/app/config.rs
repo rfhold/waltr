@@ -1041,4 +1041,5 @@ fn splash_logo_uses_neon_lavender() {
     let logo_cell = &buffer[(24, 7)];
 
     assert_eq!(logo_cell.fg, Color::Rgb(190, 132, 242));
+    assert_eq!(logo_cell.bg, THEME.panel());
 }
