@@ -240,9 +240,9 @@ impl TemplateRuntime<'_> {
                     &format!("file {path}"),
                     "no middleware rendered the reference",
                 ),
-                TemplateReference::Tool { name, .. } => {
-                    template_error("tool", format!("unknown tool `{name}`"))
-                }
+                TemplateReference::Tool {
+                    name, arguments, ..
+                } => template_tool_error_result(name, arguments, format!("unknown tool `{name}`")),
             })),
             TemplateReferenceRender::Rendered(rendered) => Ok(TemplateRender::Rendered(rendered)),
             TemplateReferenceRender::TemplateResult {
@@ -281,19 +281,17 @@ pub(crate) async fn render_tool_template_reference(
     arguments: Value,
 ) -> Result<TemplateReferenceRender> {
     let Some(tool_index) = tools.iter().position(|tool| tool.definition().name == name) else {
-        return Ok(TemplateReferenceRender::Rendered(template_error(
-            "tool",
-            format!("unknown tool `{name}`"),
-        )));
+        return Ok(TemplateReferenceRender::Rendered(
+            template_tool_error_result(name, &arguments, format!("unknown tool `{name}`")),
+        ));
     };
     let tool_definition = tools[tool_index].definition().clone();
     let mut call = ToolCall::new(format!("template-{name}"), name, arguments.clone());
 
     if !tool_is_visible(ctx.permission_policy, &tool_definition, true) {
-        return Ok(TemplateReferenceRender::Rendered(template_error(
-            "tool",
-            format!("tool is not permitted: {name}"),
-        )));
+        return Ok(TemplateReferenceRender::Rendered(
+            template_tool_error_result(name, &arguments, format!("tool is not permitted: {name}")),
+        ));
     }
 
     let mut claims = Vec::new();
@@ -321,20 +319,18 @@ pub(crate) async fn render_tool_template_reference(
             return Ok(TemplateReferenceRender::Suspend(suspension));
         }
         Err(error) => {
-            return Ok(TemplateReferenceRender::Rendered(template_error(
-                &format!("tool {name}"),
-                error,
-            )));
+            return Ok(TemplateReferenceRender::Rendered(
+                template_tool_error_result(name, &arguments, error),
+            ));
         }
     }
 
     match permission_outcome(ctx, &call, &claims)? {
         TemplatePermissionOutcome::Allow => {}
         TemplatePermissionOutcome::Deny(message) => {
-            return Ok(TemplateReferenceRender::Rendered(template_error(
-                &format!("tool {name}"),
-                message,
-            )));
+            return Ok(TemplateReferenceRender::Rendered(
+                template_tool_error_result(name, &arguments, message),
+            ));
         }
         TemplatePermissionOutcome::Ask(claims) => {
             if ctx.source == TemplateSource::RuntimePrompt {
@@ -358,9 +354,9 @@ pub(crate) async fn render_tool_template_reference(
             .with_session_context(ctx.session_id.into(), ctx.turn),
         )
         .await;
-    let mut result = match result {
-        Ok(result) => result,
-        Err(error) => error_tool_result(&call, &error),
+    let (mut result, result_error) = match result {
+        Ok(result) => (result, false),
+        Err(error) => (error_tool_result(&call, &error), true),
     };
     let after_outcome = {
         let middleware_chain = ctx.middleware_chain;
@@ -377,19 +373,21 @@ pub(crate) async fn render_tool_template_reference(
         middleware_chain.after_tool_call(&mut result_ctx).await
     };
     match after_outcome {
-        Ok(HookOutcome::Continue) => Ok(TemplateReferenceRender::Rendered(template_tool_result(
-            name,
-            &arguments,
-            &result.content,
-        ))),
+        Ok(HookOutcome::Continue) => {
+            let rendered = if result_error {
+                template_tool_error_result(name, &arguments, &result.content)
+            } else {
+                template_tool_result(name, &arguments, &result.content)
+            };
+            Ok(TemplateReferenceRender::Rendered(rendered))
+        }
         Ok(HookOutcome::ReplaceToolResult(result)) => Ok(TemplateReferenceRender::Rendered(
             template_tool_result(&result.name, &arguments, &result.content),
         )),
         Ok(HookOutcome::Suspend(suspension)) => Ok(TemplateReferenceRender::Suspend(suspension)),
-        Err(error) => Ok(TemplateReferenceRender::Rendered(template_error(
-            &format!("tool {name}"),
-            error,
-        ))),
+        Err(error) => Ok(TemplateReferenceRender::Rendered(
+            template_tool_error_result(name, &arguments, error),
+        )),
     }
 }
 
@@ -618,6 +616,20 @@ fn template_tool_result(name: &str, arguments: &Value, content: &str) -> String 
         escape_xml_attribute(name),
         escape_xml_text(&arguments),
         content,
+    )
+}
+
+fn template_tool_error_result(
+    name: &str,
+    arguments: &Value,
+    error: impl std::fmt::Display,
+) -> String {
+    let arguments = serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string());
+    format!(
+        "<template-result kind=\"tool\" tool=\"{}\" status=\"error\">\n<arguments>{}</arguments>\n<content>\n{}\n</content>\n</template-result>",
+        escape_xml_attribute(name),
+        escape_xml_text(&arguments),
+        escape_xml_text(&error.to_string()),
     )
 }
 

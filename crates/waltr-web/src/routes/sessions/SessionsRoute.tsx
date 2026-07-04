@@ -1024,6 +1024,7 @@ type TemplateResultPart = {
   kindName: string;
   tool: string;
   source: string;
+  status: string;
   arguments: string;
   content: string;
 };
@@ -1195,7 +1196,15 @@ function renderTemplateInline(text: string): JSX.Element[] {
     }
 
     if (part.tool) {
-      return highlightTemplateTokens(`@tool(${part.tool}, ${part.arguments || "{}"})`);
+      const toolReference = `@tool(${part.tool}, ${part.arguments || "{}"})`;
+      const token = [<span class="sessions__composer-resource-token">{toolReference}</span>];
+      if (part.status === "error") {
+        return [
+          ...token,
+          <span class="sessions__template-error-token"> {decodeXmlText(part.content.trim())}</span>,
+        ];
+      }
+      return token;
     }
 
     return [part.raw];
@@ -2396,6 +2405,7 @@ function parseTemplateResult(text: string, start: number): { part: TemplateResul
       kindName: attributes.kind ?? "",
       tool: attributes.tool ?? "",
       source: attributes.source ?? "",
+      status: attributes.status ?? "",
       arguments: argumentsText === undefined ? "" : decodeXmlText(argumentsText.trim()),
       content: contentText === undefined ? body : contentText.replace(/^\n/, "").replace(/\n$/, ""),
     },

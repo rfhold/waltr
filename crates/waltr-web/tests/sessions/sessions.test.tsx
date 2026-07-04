@@ -881,6 +881,12 @@ describe("sessions route", () => {
             "<path>docs/two words.md</path>\n<type>file</type>\n<content>\n1: file body\n</content>",
             "</template-result>",
             "<template-result kind=\"skill\" tool=\"load\" source=\"documenting\">skill body</template-result>",
+            "<template-result kind=\"tool\" tool=\"shell\" status=\"error\">",
+            "<arguments>{&quot;command&quot;:&quot;ls /root&quot;,&quot;description&quot;:&quot;List root&quot;}</arguments>",
+            "<content>",
+            "permission denied",
+            "</content>",
+            "</template-result>",
             "<template-error>tool fail: boom</template-error>",
             "After",
           ].join("\n"),
@@ -899,6 +905,7 @@ describe("sessions route", () => {
     expect(resourceTokens.map((token) => token.textContent)).toEqual([
       '@tool(shell, {"command":"pwd","description":"Show the current working directory"})',
       '@"docs/two words.md"',
+      '@tool(shell, {"command":"ls /root","description":"List root"})',
     ]);
     const promptTokens = Array.from(timelineRegion.querySelectorAll(".sessions__composer-prompt-token"));
     expect(promptTokens.map((token) => token.textContent)).toEqual(["/skill:documenting"]);
@@ -907,10 +914,11 @@ describe("sessions route", () => {
     expect(timelineRegion.textContent).toContain("/skill:documenting");
     expect(timelineRegion.textContent).not.toContain("@documenting");
     expect(timelineRegion.textContent).toContain(
-      'Before\n@tool(shell, {"command":"pwd","description":"Show the current working directory"})\n@"docs/two words.md"\n/skill:documenting\ntool fail: boom\nAfter',
+      'Before\n@tool(shell, {"command":"pwd","description":"Show the current working directory"})\n@"docs/two words.md"\n/skill:documenting\n@tool(shell, {"command":"ls /root","description":"List root"}) permission denied\ntool fail: boom\nAfter',
     );
-    const errorToken = timelineRegion.querySelector(".sessions__template-error-token");
-    expect(errorToken?.textContent).toBe("tool fail: boom");
+    expect(timelineRegion.textContent).toContain('@tool(shell, {"command":"ls /root","description":"List root"}) permission denied');
+    const errorTokens = Array.from(timelineRegion.querySelectorAll(".sessions__template-error-token"));
+    expect(errorTokens.map((token) => token.textContent)).toEqual([" permission denied", "tool fail: boom"]);
     expect(timelineRegion.textContent).not.toContain("<template-error>");
     expect(timelineRegion.textContent).toContain("Before");
     expect(timelineRegion.textContent).toContain("After");
@@ -976,6 +984,11 @@ describe("sessions route", () => {
             "<arguments>{&quot;command&quot;:&quot;pwd&quot;,&quot;description&quot;:&quot;Show cwd&quot;}</arguments>",
             "<content>Exit code: 0</content>",
             "</template-result>",
+            " then ",
+            "<template-result kind=\"tool\" tool=\"shell\" status=\"error\">",
+            "<arguments>{&quot;command&quot;:&quot;ls /root&quot;,&quot;description&quot;:&quot;List root&quot;}</arguments>",
+            "<content>permission denied</content>",
+            "</template-result>",
           ].join(""),
         },
       }),
@@ -996,7 +1009,7 @@ describe("sessions route", () => {
       cursor: 11n,
     }));
     expect((screen.getByLabelText("Session message") as HTMLTextAreaElement).value).toBe(
-      'Summarize @"docs/two words.md" and @tool(shell, {"command":"pwd","description":"Show cwd"})',
+      'Summarize @"docs/two words.md" and @tool(shell, {"command":"pwd","description":"Show cwd"}) then @tool(shell, {"command":"ls /root","description":"List root"})',
     );
   });
 

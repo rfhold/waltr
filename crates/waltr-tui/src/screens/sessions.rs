@@ -2401,4 +2401,20 @@ mod tests {
 
         assert_eq!(retemplatize_user_message(text), "Use /skill:documenting");
     }
+
+    #[test]
+    fn retemplatize_user_message_rebuilds_errored_tool_templates() {
+        let text = concat!(
+            "Run ",
+            "<template-result kind=\"tool\" tool=\"shell\" status=\"error\">\n",
+            "<arguments>{&quot;command&quot;:&quot;pwd&quot;}</arguments>\n",
+            "<content>permission denied</content>\n",
+            "</template-result>",
+        );
+
+        assert_eq!(
+            retemplatize_user_message(text),
+            "Run @tool(shell,{\"command\":\"pwd\"})"
+        );
+    }
 }
