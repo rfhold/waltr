@@ -8,7 +8,9 @@ mod model;
 mod permission;
 pub mod prompt;
 pub mod provider;
+mod resource;
 mod stream;
+mod template;
 pub mod timeline;
 pub mod tools;
 
@@ -45,6 +47,10 @@ pub use prompt::ShellPromptConfig;
 pub use prompt::{
     AGENTS_INSTRUCTION_FILE, AgentsInstruction, AgentsPromptConfig, BASE_SYSTEM_PROMPT,
     FilesystemPromptConfig, SystemPromptBuilder,
+};
+pub use resource::{
+    SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchRequest,
+    SessionTemplateSearchTarget,
 };
 pub use stream::{
     BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionReplayItem, CompletionRequest,

@@ -1,6 +1,6 @@
 //! Deterministic middleware chain execution.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use crate::Result;
 
@@ -19,7 +19,7 @@ trait ChainMiddleware: Send + Sync {
         &'a self,
         ctx: &'a mut RequestContext<'_>,
         prompt: &'a mut SystemPromptParts,
-    ) -> BoxHookFuture<'a, ()>;
+    ) -> BoxHookFuture<'a, HookOutcome>;
 
     fn list_tools<'a>(
         &'a self,
@@ -64,7 +64,7 @@ where
         &'a self,
         ctx: &'a mut RequestContext<'_>,
         prompt: &'a mut SystemPromptParts,
-    ) -> BoxHookFuture<'a, ()> {
+    ) -> BoxHookFuture<'a, HookOutcome> {
         Box::pin(AgentMiddleware::build_system_prompt(self, ctx, prompt))
     }
 
@@ -121,6 +121,15 @@ pub(crate) struct MiddlewareChain {
     middleware: Vec<Arc<dyn ChainMiddleware>>,
 }
 
+impl fmt::Debug for MiddlewareChain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MiddlewareChain")
+            .field("len", &self.middleware.len())
+            .finish()
+    }
+}
+
 impl MiddlewareChain {
     /// Create an empty middleware chain.
     #[must_use]
@@ -154,12 +163,15 @@ impl MiddlewareChain {
         &self,
         ctx: &mut RequestContext<'_>,
         prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
+    ) -> Result<HookOutcome> {
         for middleware in &self.middleware {
-            middleware.build_system_prompt(ctx, prompt).await?;
+            let outcome = middleware.build_system_prompt(ctx, prompt).await?;
+            if !matches!(outcome, HookOutcome::Continue) {
+                return Ok(outcome);
+            }
         }
 
-        Ok(())
+        Ok(HookOutcome::Continue)
     }
 
     /// Run tool-list middleware in insertion order.
@@ -266,13 +278,13 @@ mod tests {
             &self,
             _ctx: &mut RequestContext<'_>,
             prompt: &mut SystemPromptParts,
-        ) -> Result<()> {
+        ) -> Result<HookOutcome> {
             self.calls
                 .lock()
                 .expect("call log poisoned")
                 .push(self.name);
             prompt.push(self.name);
-            Ok(())
+            Ok(HookOutcome::Continue)
         }
     }
 
@@ -314,6 +326,12 @@ mod tests {
             middleware_state,
             session_metadata_values: std::collections::BTreeMap::new(),
             system_prompt_override,
+            tools: &[],
+            middleware_chain: MiddlewareChain::new(),
+            permission_policy: crate::PermissionPolicy::default(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            session_id: "test-session",
+            turn: 0,
         }
     }
 

@@ -302,7 +302,7 @@ impl AgentTool {
         &self.definition
     }
 
-    pub(super) fn call(&self, context: ToolExecutionContext) -> ToolFuture {
+    pub(crate) fn call(&self, context: ToolExecutionContext) -> ToolFuture {
         (self.handler)(context)
     }
 }

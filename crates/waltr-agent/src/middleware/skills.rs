@@ -80,7 +80,7 @@ impl AgentMiddleware for SkillsMiddleware {
         &self,
         ctx: &mut RequestContext<'_>,
         prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
+    ) -> Result<HookOutcome> {
         let state = if let Some(state) = ctx.state_as::<SkillsState>(SKILLS_STATE_NAMESPACE)? {
             state
         } else {
@@ -102,7 +102,7 @@ impl AgentMiddleware for SkillsMiddleware {
         if let Some(catalog) = render_skills_catalog(&state.catalog, "Available skills:") {
             prompt.push(catalog);
         }
-        Ok(())
+        Ok(HookOutcome::Continue)
     }
 
     async fn list_tools(&self, _ctx: &mut RequestContext<'_>, tools: &mut ToolDraft) -> Result<()> {

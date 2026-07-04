@@ -13,6 +13,7 @@ use crate::{
         AGENTS_INSTRUCTION_FILE, AgentsPromptConfig, canonicalize_existing,
         render_agents_instruction,
     },
+    template::{TemplateRender, TemplateRuntime, TemplateSource},
     tools::filesystem::{ReadInput, model_path, resolve_existing_path},
 };
 
@@ -61,7 +62,7 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
         &self,
         ctx: &mut RequestContext<'_>,
         prompt: &mut SystemPromptParts,
-    ) -> Result<()> {
+    ) -> Result<HookOutcome> {
         let mut state = ctx
             .state_as::<AgentsState>(AGENTS_STATE_NAMESPACE)?
             .unwrap_or_default();
@@ -76,9 +77,33 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
                     {
                         continue;
                     }
+                    let base_dir = instruction
+                        .path
+                        .parent()
+                        .map_or_else(|| config.root.as_path(), |parent| parent);
+                    let mut template_runtime = TemplateRuntime {
+                        base_dir,
+                        tools: ctx.tools,
+                        middleware_chain: &ctx.middleware_chain,
+                        permission_policy: &ctx.permission_policy,
+                        middleware_state: ctx.middleware_state,
+                        cancellation_token: ctx.cancellation_token.clone(),
+                        session_id: ctx.session_id,
+                        turn: ctx.turn,
+                        source: TemplateSource::RuntimePrompt,
+                    };
+                    let content = match template_runtime
+                        .render_template(&instruction.content)
+                        .await?
+                    {
+                        TemplateRender::Rendered(content) => content,
+                        TemplateRender::Suspend(suspension) => {
+                            return Ok(HookOutcome::Suspend(suspension));
+                        }
+                    };
                     state.loaded.push(LoadedInstruction {
                         path: instruction.path,
-                        content: instruction.content,
+                        content,
                         prompt: true,
                     });
                 }
@@ -89,7 +114,7 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
         for instruction in state.loaded.iter().filter(|loaded| loaded.prompt) {
             prompt.push(instruction.content.clone());
         }
-        Ok(())
+        Ok(HookOutcome::Continue)
     }
 
     async fn after_tool_call(&self, ctx: &mut ToolResultContext<'_>) -> Result<HookOutcome> {
@@ -125,7 +150,7 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
             {
                 continue;
             }
-            collect_unloaded_instructions(&root, &target, &mut state, &mut reminders)?;
+            collect_unloaded_instructions(&root, &target, ctx, &mut state, &mut reminders).await?;
         }
 
         if !reminders.is_empty() {
@@ -138,9 +163,10 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
     }
 }
 
-fn collect_unloaded_instructions(
+async fn collect_unloaded_instructions(
     root: &Path,
     target: &Path,
+    ctx: &mut ToolResultContext<'_>,
     state: &mut AgentsState,
     reminders: &mut Vec<String>,
 ) -> Result<()> {
@@ -162,6 +188,24 @@ fn collect_unloaded_instructions(
             {
                 let instruction_text = fs::read_to_string(&instruction_path)?;
                 let content = render_agents_instruction(&instruction_path, &instruction_text);
+                let base_dir = instruction_path
+                    .parent()
+                    .map_or_else(|| root, |parent| parent);
+                let mut template_runtime = TemplateRuntime {
+                    base_dir,
+                    tools: ctx.tools,
+                    middleware_chain: &ctx.middleware_chain,
+                    permission_policy: &ctx.permission_policy,
+                    middleware_state: ctx.middleware_state,
+                    cancellation_token: ctx.cancellation_token.clone(),
+                    session_id: ctx.session_id,
+                    turn: ctx.turn,
+                    source: TemplateSource::RuntimePrompt,
+                };
+                let content = match template_runtime.render_template(&content).await? {
+                    TemplateRender::Rendered(content) => content,
+                    TemplateRender::Suspend(_) => content,
+                };
                 reminders.push(content.clone());
                 state.loaded.push(LoadedInstruction {
                     path: instruction_path,
