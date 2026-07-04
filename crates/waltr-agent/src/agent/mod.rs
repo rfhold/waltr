@@ -80,6 +80,10 @@ impl AgentRuntime {
     pub fn tools(&self) -> &[AgentTool] {
         &self.tools
     }
+
+    pub(crate) const fn middleware_chain(&self) -> &MiddlewareChain {
+        &self.middleware_chain
+    }
 }
 
 impl fmt::Debug for AgentRuntime {
@@ -131,7 +135,7 @@ mod tests {
 
         let agent = AgentRuntime::builder(model, Arc::new(TextOnlyProvider)).build();
 
-        assert_eq!(agent.middleware_chain.len(), 1);
+        assert_eq!(agent.middleware_chain.len(), 3);
     }
 
     #[test]
@@ -147,8 +151,8 @@ mod tests {
             .with_middleware_chain(chain)
             .build();
 
-        assert_eq!(agent.middleware_chain.len(), 2);
-        assert_eq!(chain_agent.middleware_chain.len(), 2);
+        assert_eq!(agent.middleware_chain.len(), 4);
+        assert_eq!(chain_agent.middleware_chain.len(), 4);
     }
 
     #[test]

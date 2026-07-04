@@ -1,15 +1,17 @@
 //! Middleware context and draft types.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
-    AgentTool, CompletionTurn, PermissionClaim, PermissionPolicy, PromptTurn, Result, ToolCall,
+    CompletionTurn, PermissionClaim, PermissionPolicy, PromptTurn, Result, ToolCall,
     ToolDefinition, ToolResult,
     agent::session::{SessionJournalEvent, SessionSnapshot},
     middleware::chain::MiddlewareChain,
+    resource::SessionTemplateSearchRequest,
+    template::TemplateSource,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -146,8 +148,6 @@ pub(crate) struct RequestContext<'a> {
     pub(crate) session_metadata_values: BTreeMap<String, Value>,
     /// Pending per-run system prompt override, consumed by the system prompt middleware.
     pub(crate) system_prompt_override: &'a mut Option<SystemPromptOverride>,
-    /// Registered host tools available for prompt templating.
-    pub(crate) tools: &'a [AgentTool],
     /// Middleware chain used by prompt template tool calls.
     pub(crate) middleware_chain: MiddlewareChain,
     /// Permission policy used by prompt template tool calls.
@@ -211,8 +211,6 @@ pub(crate) struct ToolResultContext<'a> {
     pub(crate) result: &'a mut ToolResult,
     /// Durable middleware state for this run.
     pub(crate) middleware_state: &'a mut MiddlewareStateLog,
-    /// Registered host tools available for prompt templating.
-    pub(crate) tools: &'a [AgentTool],
     /// Middleware chain used by prompt template tool calls.
     pub(crate) middleware_chain: MiddlewareChain,
     /// Permission policy used by prompt template tool calls.
@@ -226,6 +224,62 @@ pub(crate) struct ToolResultContext<'a> {
 }
 
 impl MiddlewareStateAccess for ToolResultContext<'_> {
+    fn state_log(&self) -> &MiddlewareStateLog {
+        self.middleware_state
+    }
+
+    fn state_log_mut(&mut self) -> &mut MiddlewareStateLog {
+        self.middleware_state
+    }
+}
+
+/// Context shared by template autocomplete middleware.
+#[derive(Debug)]
+pub(crate) struct TemplateSearchContext<'a> {
+    /// Workspace root for resource-style searches.
+    pub(crate) root: &'a Path,
+    /// Original search request from the host.
+    pub(crate) request: &'a SessionTemplateSearchRequest,
+    /// Durable middleware state from the session snapshot, when available.
+    pub(crate) middleware_state: Option<&'a MiddlewareStateLog>,
+}
+
+impl TemplateSearchContext<'_> {
+    /// Return durable middleware state deserialized as `T`, when present.
+    pub(crate) fn state_as<T: DeserializeOwned>(&self, namespace: &str) -> Result<Option<T>> {
+        self.middleware_state
+            .and_then(|state| state.get(namespace))
+            .map(|state| serde_json::from_value(state.clone()))
+            .transpose()
+            .map_err(|error| crate::LlmError::Protocol {
+                provider: "middleware-state",
+                message: error.to_string(),
+            })
+    }
+}
+
+/// Context shared by template rendering middleware.
+#[derive(Debug)]
+pub(crate) struct TemplateRenderContext<'a> {
+    /// Base directory used for relative file references.
+    pub(crate) base_dir: &'a Path,
+    /// Source currently being rendered.
+    pub(crate) source: TemplateSource,
+    /// Durable middleware state for this run.
+    pub(crate) middleware_state: &'a mut MiddlewareStateLog,
+    /// Middleware chain used by template-owned tool calls.
+    pub(crate) middleware_chain: &'a MiddlewareChain,
+    /// Permission policy used by template-owned tool calls.
+    pub(crate) permission_policy: &'a PermissionPolicy,
+    /// Shared cancellation token for template-owned tool calls.
+    pub(crate) cancellation_token: CancellationToken,
+    /// Durable session id for template-owned tool calls.
+    pub(crate) session_id: &'a str,
+    /// Current provider turn for template-owned tool calls.
+    pub(crate) turn: u64,
+}
+
+impl MiddlewareStateAccess for TemplateRenderContext<'_> {
     fn state_log(&self) -> &MiddlewareStateLog {
         self.middleware_state
     }

@@ -83,7 +83,6 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
                         .map_or_else(|| config.root.as_path(), |parent| parent);
                     let mut template_runtime = TemplateRuntime {
                         base_dir,
-                        tools: ctx.tools,
                         middleware_chain: &ctx.middleware_chain,
                         permission_policy: &ctx.permission_policy,
                         middleware_state: ctx.middleware_state,
@@ -193,7 +192,6 @@ async fn collect_unloaded_instructions(
                     .map_or_else(|| root, |parent| parent);
                 let mut template_runtime = TemplateRuntime {
                     base_dir,
-                    tools: ctx.tools,
                     middleware_chain: &ctx.middleware_chain,
                     permission_policy: &ctx.permission_policy,
                     middleware_state: ctx.middleware_state,

@@ -12,11 +12,10 @@ use crate::{
     middleware::{
         self, HookOutcome,
         chain::MiddlewareChain,
-        context::{MiddlewareStateLog, ToolCallContext, ToolResultContext},
+        context::{MiddlewareStateLog, TemplateRenderContext, ToolCallContext, ToolResultContext},
         tools::tool_is_visible,
     },
     permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
-    tools::filesystem::{FilesystemConfig, ReadInput},
 };
 
 const MAX_TEMPLATE_DEPTH: usize = 8;
@@ -32,6 +31,45 @@ pub(crate) enum TemplateRender {
     Suspend(middleware::Suspension),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TemplateReference {
+    File {
+        path: String,
+        raw: String,
+    },
+    Tool {
+        name: String,
+        arguments: Value,
+        raw: String,
+    },
+    Prompt {
+        namespace: String,
+        name: String,
+        raw: String,
+    },
+}
+
+impl TemplateReference {
+    pub(crate) fn raw(&self) -> &str {
+        match self {
+            Self::File { raw, .. } | Self::Tool { raw, .. } | Self::Prompt { raw, .. } => raw,
+        }
+    }
+}
+
+pub(crate) enum TemplateReferenceRender {
+    Continue,
+    Rendered(String),
+    TemplateResult {
+        kind: String,
+        tool: Option<String>,
+        source: Option<String>,
+        content: String,
+        render_nested: bool,
+    },
+    Suspend(middleware::Suspension),
+}
+
 enum TemplatePermissionOutcome {
     Allow,
     Deny(String),
@@ -42,8 +80,6 @@ enum TemplatePermissionOutcome {
 pub(crate) struct TemplateRuntime<'a> {
     /// Base directory used for relative file references.
     pub(crate) base_dir: &'a Path,
-    /// Registered host tools callable from templates.
-    pub(crate) tools: &'a [AgentTool],
     pub(crate) middleware_chain: &'a MiddlewareChain,
     pub(crate) permission_policy: &'a PermissionPolicy,
     pub(crate) middleware_state: &'a mut MiddlewareStateLog,
@@ -74,13 +110,19 @@ impl TemplateRuntime<'_> {
             if let Some(rest) = remaining.strip_prefix("@tool(") {
                 match parse_tool_reference(rest) {
                     Ok((name, arguments, consumed)) => {
-                        match self.render_tool_reference(&name, arguments).await? {
+                        let consumed = "@tool(".len() + consumed;
+                        let reference = TemplateReference::Tool {
+                            name,
+                            arguments,
+                            raw: remaining[..consumed].to_owned(),
+                        };
+                        match self.render_reference(reference, depth).await? {
                             TemplateRender::Rendered(rendered) => output.push_str(&rendered),
                             TemplateRender::Suspend(suspension) => {
                                 return Ok(TemplateRender::Suspend(suspension));
                             }
                         }
-                        index += "@tool(".len() + consumed;
+                        index += consumed;
                     }
                     Err(error) => {
                         output.push_str(&template_error("tool", error));
@@ -92,16 +134,43 @@ impl TemplateRuntime<'_> {
                 continue;
             }
 
+            if self.source == TemplateSource::UserPrompt
+                && is_first_line(input, index)
+                && remaining.starts_with('/')
+                && is_reference_boundary(input, index)
+            {
+                if let Some((namespace, name, consumed)) = parse_prompt_reference(remaining) {
+                    let reference = TemplateReference::Prompt {
+                        namespace,
+                        name,
+                        raw: remaining[..consumed].to_owned(),
+                    };
+                    match self.render_reference(reference, depth).await? {
+                        TemplateRender::Rendered(rendered) => output.push_str(&rendered),
+                        TemplateRender::Suspend(suspension) => {
+                            return Ok(TemplateRender::Suspend(suspension));
+                        }
+                    }
+                    index += consumed;
+                    continue;
+                }
+            }
+
             if let Some(rest) = remaining.strip_prefix("@\"") {
                 match parse_quoted_file_reference(rest) {
                     Ok((path, consumed)) => {
-                        match self.render_file_reference(&path, depth + 1).await? {
+                        let consumed = "@\"".len() + consumed;
+                        let reference = TemplateReference::File {
+                            path,
+                            raw: remaining[..consumed].to_owned(),
+                        };
+                        match self.render_reference(reference, depth).await? {
                             TemplateRender::Rendered(rendered) => output.push_str(&rendered),
                             TemplateRender::Suspend(suspension) => {
                                 return Ok(TemplateRender::Suspend(suspension));
                             }
                         }
-                        index += "@\"".len() + consumed;
+                        index += consumed;
                     }
                     Err(error) => {
                         output.push_str(&template_error("file", error));
@@ -113,13 +182,18 @@ impl TemplateRuntime<'_> {
 
             if remaining.starts_with('@') && is_reference_boundary(input, index) {
                 if let Some((path, consumed)) = parse_bare_file_reference(&remaining[1..]) {
-                    match self.render_file_reference(&path, depth + 1).await? {
+                    let consumed = 1 + consumed;
+                    let reference = TemplateReference::File {
+                        path,
+                        raw: remaining[..consumed].to_owned(),
+                    };
+                    match self.render_reference(reference, depth).await? {
                         TemplateRender::Rendered(rendered) => output.push_str(&rendered),
                         TemplateRender::Suspend(suspension) => {
                             return Ok(TemplateRender::Suspend(suspension));
                         }
                     }
-                    index += 1 + consumed;
+                    index += consumed;
                     continue;
                 }
             }
@@ -134,214 +208,261 @@ impl TemplateRuntime<'_> {
         Ok(TemplateRender::Rendered(output))
     }
 
-    async fn render_file_reference(&mut self, path: &str, depth: usize) -> Result<TemplateRender> {
-        let filesystem = FilesystemConfig::new(self.base_dir);
-        match filesystem.read(&ReadInput::new(path)) {
-            Ok(content) => {
-                match Box::pin(self.render_template_depth(&content, depth)).await? {
-                    TemplateRender::Rendered(content) => Ok(TemplateRender::Rendered(
-                        template_result("file", Some("read"), Some(path), &content),
-                    )),
-                    TemplateRender::Suspend(suspension) => Ok(TemplateRender::Suspend(suspension)),
+    async fn render_reference(
+        &mut self,
+        reference: TemplateReference,
+        depth: usize,
+    ) -> Result<TemplateRender> {
+        let middleware_chain = self.middleware_chain;
+        let permission_policy = self.permission_policy;
+        let cancellation_token = self.cancellation_token.clone();
+        let mut ctx = TemplateRenderContext {
+            base_dir: self.base_dir,
+            source: self.source,
+            middleware_state: self.middleware_state,
+            middleware_chain,
+            permission_policy,
+            cancellation_token,
+            session_id: self.session_id,
+            turn: self.turn,
+        };
+        match middleware_chain
+            .render_template_reference(&mut ctx, &reference)
+            .await?
+        {
+            TemplateReferenceRender::Continue => Ok(TemplateRender::Rendered(match &reference {
+                TemplateReference::Prompt { .. } => reference.raw().to_owned(),
+                TemplateReference::File { path, .. } => template_error(
+                    &format!("file {path}"),
+                    "no middleware rendered the reference",
+                ),
+                TemplateReference::Tool { name, .. } => {
+                    template_error("tool", format!("unknown tool `{name}`"))
                 }
+            })),
+            TemplateReferenceRender::Rendered(rendered) => Ok(TemplateRender::Rendered(rendered)),
+            TemplateReferenceRender::TemplateResult {
+                kind,
+                tool,
+                source,
+                content,
+                render_nested,
+            } => {
+                let content = if render_nested {
+                    match Box::pin(self.render_template_depth(&content, depth + 1)).await? {
+                        TemplateRender::Rendered(content) => content,
+                        TemplateRender::Suspend(suspension) => {
+                            return Ok(TemplateRender::Suspend(suspension));
+                        }
+                    }
+                } else {
+                    content
+                };
+                Ok(TemplateRender::Rendered(template_result(
+                    &kind,
+                    tool.as_deref(),
+                    source.as_deref(),
+                    &content,
+                )))
             }
-            Err(error) => Ok(TemplateRender::Rendered(template_error(
-                &format!("file {path}"),
-                error,
-            ))),
+            TemplateReferenceRender::Suspend(suspension) => Ok(TemplateRender::Suspend(suspension)),
         }
     }
+}
 
-    async fn render_tool_reference(
-        &mut self,
-        name: &str,
-        arguments: Value,
-    ) -> Result<TemplateRender> {
-        let Some(tool_index) = self
-            .tools
-            .iter()
-            .position(|tool| tool.definition().name == name)
-        else {
-            return Ok(TemplateRender::Rendered(template_error(
-                "tool",
-                format!("unknown tool `{name}`"),
-            )));
+pub(crate) async fn render_tool_template_reference(
+    ctx: &mut TemplateRenderContext<'_>,
+    tools: &[AgentTool],
+    name: &str,
+    arguments: Value,
+) -> Result<TemplateReferenceRender> {
+    let Some(tool_index) = tools.iter().position(|tool| tool.definition().name == name) else {
+        return Ok(TemplateReferenceRender::Rendered(template_error(
+            "tool",
+            format!("unknown tool `{name}`"),
+        )));
+    };
+    let tool_definition = tools[tool_index].definition().clone();
+    let mut call = ToolCall::new(format!("template-{name}"), name, arguments.clone());
+
+    if !tool_is_visible(ctx.permission_policy, &tool_definition, true) {
+        return Ok(TemplateReferenceRender::Rendered(template_error(
+            "tool",
+            format!("tool is not permitted: {name}"),
+        )));
+    }
+
+    let mut claims = Vec::new();
+    let before_outcome = {
+        let middleware_chain = ctx.middleware_chain;
+        let mut tool_ctx = ToolCallContext {
+            session_id: ctx.session_id,
+            turn: ctx.turn,
+            call: &mut call,
+            permission_claims: &mut claims,
+            middleware_state: ctx.middleware_state,
         };
-        let tool_definition = self.tools[tool_index].definition().clone();
-        let mut call = ToolCall::new(format!("template-{name}"), name, arguments.clone());
-
-        if !tool_is_visible(self.permission_policy, &tool_definition, true) {
-            return Ok(TemplateRender::Rendered(template_error(
-                "tool",
-                format!("tool is not permitted: {name}"),
-            )));
-        }
-
-        let mut claims = Vec::new();
-        let before_outcome = {
-            let mut ctx = ToolCallContext {
-                session_id: self.session_id,
-                turn: self.turn,
-                call: &mut call,
-                permission_claims: &mut claims,
-                middleware_state: self.middleware_state,
-            };
-            self.middleware_chain.before_tool_call(&mut ctx).await
-        };
-        match before_outcome {
-            Ok(HookOutcome::Continue) => {}
-            Ok(HookOutcome::ReplaceToolResult(result)) => {
-                return Ok(TemplateRender::Rendered(template_tool_result(
-                    &result.name,
-                    &arguments,
-                    &result.content,
-                )));
-            }
-            Ok(HookOutcome::Suspend(suspension)) => return Ok(TemplateRender::Suspend(suspension)),
-            Err(error) => {
-                return Ok(TemplateRender::Rendered(template_error(
-                    &format!("tool {name}"),
-                    error,
-                )));
-            }
-        }
-
-        match self.permission_outcome(&call, &claims)? {
-            TemplatePermissionOutcome::Allow => {}
-            TemplatePermissionOutcome::Deny(message) => {
-                return Ok(TemplateRender::Rendered(template_error(
-                    &format!("tool {name}"),
-                    message,
-                )));
-            }
-            TemplatePermissionOutcome::Ask(claims) => {
-                if self.source == TemplateSource::RuntimePrompt {
-                    return Ok(TemplateRender::Suspend(permission_suspension(
-                        self.session_id,
-                        self.turn,
-                        &call,
-                        &claims,
-                    )));
-                }
-            }
-        }
-
-        let result = self.tools[tool_index]
-            .call(
-                ToolExecutionContext::with_progress_and_cancellation(
-                    call.clone(),
-                    ToolProgressSink::noop(),
-                    self.cancellation_token.clone(),
-                )
-                .with_session_context(self.session_id.into(), self.turn),
-            )
-            .await;
-        let mut result = match result {
-            Ok(result) => result,
-            Err(error) => error_tool_result(&call, &error),
-        };
-        let after_outcome = {
-            let mut ctx = ToolResultContext {
-                call: Some(&call),
-                result: &mut result,
-                middleware_state: self.middleware_state,
-                tools: self.tools,
-                middleware_chain: self.middleware_chain.clone(),
-                permission_policy: self.permission_policy.clone(),
-                cancellation_token: self.cancellation_token.clone(),
-                session_id: self.session_id,
-                turn: self.turn,
-            };
-            self.middleware_chain.after_tool_call(&mut ctx).await
-        };
-        match after_outcome {
-            Ok(HookOutcome::Continue) => Ok(TemplateRender::Rendered(template_tool_result(
-                name,
+        middleware_chain.before_tool_call(&mut tool_ctx).await
+    };
+    match before_outcome {
+        Ok(HookOutcome::Continue) => {}
+        Ok(HookOutcome::ReplaceToolResult(result)) => {
+            return Ok(TemplateReferenceRender::Rendered(template_tool_result(
+                &result.name,
                 &arguments,
                 &result.content,
-            ))),
-            Ok(HookOutcome::ReplaceToolResult(result)) => Ok(TemplateRender::Rendered(
-                template_tool_result(&result.name, &arguments, &result.content),
-            )),
-            Ok(HookOutcome::Suspend(suspension)) => Ok(TemplateRender::Suspend(suspension)),
-            Err(error) => Ok(TemplateRender::Rendered(template_error(
-                &format!("tool {name}"),
-                error,
-            ))),
-        }
-    }
-
-    fn permission_outcome(
-        &mut self,
-        tool_call: &ToolCall,
-        claims: &[PermissionClaim],
-    ) -> Result<TemplatePermissionOutcome> {
-        let denied = claims
-            .iter()
-            .filter(|claim| {
-                self.permission_policy
-                    .evaluate_claim_effect(&tool_call.name, claim)
-                    .level
-                    == PermissionLevel::Deny
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !denied.is_empty() {
-            return Ok(TemplatePermissionOutcome::Deny(permission_claim_message(
-                "permission denied",
-                &denied,
             )));
         }
-
-        let mut state = self.permission_runtime_state()?;
-        let unmatched = claims
-            .iter()
-            .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
-            .cloned()
-            .collect::<Vec<_>>();
-        if unmatched.is_empty() {
-            return Ok(TemplatePermissionOutcome::Allow);
+        Ok(HookOutcome::Suspend(suspension)) => {
+            return Ok(TemplateReferenceRender::Suspend(suspension));
         }
-
-        if state.consume_one_shot(&tool_call.id) {
-            self.set_permission_runtime_state(&state)?;
-            return Ok(TemplatePermissionOutcome::Allow);
-        }
-
-        let ask = unmatched
-            .iter()
-            .filter(|claim| {
-                self.permission_policy
-                    .evaluate_claim_effect(&tool_call.name, claim)
-                    .level
-                    == PermissionLevel::Ask
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if ask.is_empty() {
-            Ok(TemplatePermissionOutcome::Allow)
-        } else {
-            Ok(TemplatePermissionOutcome::Ask(ask))
+        Err(error) => {
+            return Ok(TemplateReferenceRender::Rendered(template_error(
+                &format!("tool {name}"),
+                error,
+            )));
         }
     }
 
-    fn permission_runtime_state(&self) -> Result<PermissionRuntimeState> {
-        self.middleware_state
-            .get(PERMISSION_STATE_NAMESPACE)
-            .map(|state| serde_json::from_value(state.clone()))
-            .transpose()
-            .map_err(|error| template_runtime_error(error.to_string()))
-            .map(Option::unwrap_or_default)
+    match permission_outcome(ctx, &call, &claims)? {
+        TemplatePermissionOutcome::Allow => {}
+        TemplatePermissionOutcome::Deny(message) => {
+            return Ok(TemplateReferenceRender::Rendered(template_error(
+                &format!("tool {name}"),
+                message,
+            )));
+        }
+        TemplatePermissionOutcome::Ask(claims) => {
+            if ctx.source == TemplateSource::RuntimePrompt {
+                return Ok(TemplateReferenceRender::Suspend(permission_suspension(
+                    ctx.session_id,
+                    ctx.turn,
+                    &call,
+                    &claims,
+                )));
+            }
+        }
     }
 
-    fn set_permission_runtime_state(&mut self, state: &PermissionRuntimeState) -> Result<()> {
-        self.middleware_state.set(
-            PERMISSION_STATE_NAMESPACE,
-            serde_json::to_value(state)
-                .map_err(|error| template_runtime_error(error.to_string()))?,
-        );
-        Ok(())
+    let result = tools[tool_index]
+        .call(
+            ToolExecutionContext::with_progress_and_cancellation(
+                call.clone(),
+                ToolProgressSink::noop(),
+                ctx.cancellation_token.clone(),
+            )
+            .with_session_context(ctx.session_id.into(), ctx.turn),
+        )
+        .await;
+    let mut result = match result {
+        Ok(result) => result,
+        Err(error) => error_tool_result(&call, &error),
+    };
+    let after_outcome = {
+        let middleware_chain = ctx.middleware_chain;
+        let mut result_ctx = ToolResultContext {
+            call: Some(&call),
+            result: &mut result,
+            middleware_state: ctx.middleware_state,
+            middleware_chain: middleware_chain.clone(),
+            permission_policy: ctx.permission_policy.clone(),
+            cancellation_token: ctx.cancellation_token.clone(),
+            session_id: ctx.session_id,
+            turn: ctx.turn,
+        };
+        middleware_chain.after_tool_call(&mut result_ctx).await
+    };
+    match after_outcome {
+        Ok(HookOutcome::Continue) => Ok(TemplateReferenceRender::Rendered(template_tool_result(
+            name,
+            &arguments,
+            &result.content,
+        ))),
+        Ok(HookOutcome::ReplaceToolResult(result)) => Ok(TemplateReferenceRender::Rendered(
+            template_tool_result(&result.name, &arguments, &result.content),
+        )),
+        Ok(HookOutcome::Suspend(suspension)) => Ok(TemplateReferenceRender::Suspend(suspension)),
+        Err(error) => Ok(TemplateReferenceRender::Rendered(template_error(
+            &format!("tool {name}"),
+            error,
+        ))),
     }
+}
+
+fn permission_outcome(
+    ctx: &mut TemplateRenderContext<'_>,
+    tool_call: &ToolCall,
+    claims: &[PermissionClaim],
+) -> Result<TemplatePermissionOutcome> {
+    let denied = claims
+        .iter()
+        .filter(|claim| {
+            ctx.permission_policy
+                .evaluate_claim_effect(&tool_call.name, claim)
+                .level
+                == PermissionLevel::Deny
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !denied.is_empty() {
+        return Ok(TemplatePermissionOutcome::Deny(permission_claim_message(
+            "permission denied",
+            &denied,
+        )));
+    }
+
+    let mut state = permission_runtime_state(ctx.middleware_state)?;
+    let unmatched = claims
+        .iter()
+        .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unmatched.is_empty() {
+        return Ok(TemplatePermissionOutcome::Allow);
+    }
+
+    if state.consume_one_shot(&tool_call.id) {
+        set_permission_runtime_state(ctx.middleware_state, &state)?;
+        return Ok(TemplatePermissionOutcome::Allow);
+    }
+
+    let ask = unmatched
+        .iter()
+        .filter(|claim| {
+            ctx.permission_policy
+                .evaluate_claim_effect(&tool_call.name, claim)
+                .level
+                == PermissionLevel::Ask
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if ask.is_empty() {
+        Ok(TemplatePermissionOutcome::Allow)
+    } else {
+        Ok(TemplatePermissionOutcome::Ask(ask))
+    }
+}
+
+fn permission_runtime_state(
+    middleware_state: &MiddlewareStateLog,
+) -> Result<PermissionRuntimeState> {
+    middleware_state
+        .get(PERMISSION_STATE_NAMESPACE)
+        .map(|state| serde_json::from_value(state.clone()))
+        .transpose()
+        .map_err(|error| template_runtime_error(error.to_string()))
+        .map(Option::unwrap_or_default)
+}
+
+fn set_permission_runtime_state(
+    middleware_state: &mut MiddlewareStateLog,
+    state: &PermissionRuntimeState,
+) -> Result<()> {
+    middleware_state.set(
+        PERMISSION_STATE_NAMESPACE,
+        serde_json::to_value(state).map_err(|error| template_runtime_error(error.to_string()))?,
+    );
+    Ok(())
 }
 
 fn parse_tool_reference(input: &str) -> std::result::Result<(String, Value, usize), String> {
@@ -404,6 +525,33 @@ fn is_reference_boundary(input: &str, index: usize) -> bool {
             .is_some_and(char::is_whitespace)
 }
 
+fn is_first_line(input: &str, index: usize) -> bool {
+    !input[..index].contains('\n')
+}
+
+fn parse_prompt_name(input: &str) -> Option<(String, usize)> {
+    let mut consumed = 0;
+    for character in input.chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-' {
+            consumed += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (consumed > 0).then(|| (input[..consumed].to_owned(), consumed))
+}
+
+fn parse_prompt_reference(input: &str) -> Option<(String, String, usize)> {
+    let rest = input.strip_prefix('/')?;
+    let (namespace, namespace_len) = parse_prompt_name(rest)?;
+    let name_start = namespace_len + 1;
+    if !rest[namespace_len..].starts_with(':') {
+        return None;
+    }
+    let (name, name_len) = parse_prompt_name(&rest[name_start..])?;
+    Some((namespace, name, 1 + name_start + name_len))
+}
+
 fn parse_bare_file_reference(input: &str) -> Option<(String, usize)> {
     let mut consumed = 0;
     for character in input.chars() {
@@ -428,7 +576,7 @@ fn is_bare_file_reference(path: &str) -> bool {
         })
 }
 
-fn template_error(context: &str, error: impl std::fmt::Display) -> String {
+pub(crate) fn template_error(context: &str, error: impl std::fmt::Display) -> String {
     format!("<template-error>{context}: {error}</template-error>")
 }
 

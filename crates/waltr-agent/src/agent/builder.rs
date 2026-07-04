@@ -6,14 +6,13 @@ use crate::{
     LlmStream, ModelCost, ModelRef, PermissionPolicy, SystemPromptBuilder,
     middleware::{
         AgentMiddleware, agents::AgentsInstructionsMiddleware, chain::MiddlewareChain,
-        claims::FilesystemClaimsMiddleware, prompt::SystemPromptMiddleware,
-        skills::SkillsMiddleware,
+        claims::FilesystemClaimsMiddleware, file_templates::FileTemplateMiddleware,
+        prompt::SystemPromptMiddleware, skills::SkillsMiddleware,
+        tools::PermissionFilteredToolRegistryMiddleware,
     },
     prompt::{AgentsPromptConfig, FilesystemPromptConfig},
     tools::{
-        filesystem::FilesystemConfig,
-        question::QuestionConfig,
-        skills::{SkillDefinition, SkillsConfig},
+        filesystem::FilesystemConfig, question::QuestionConfig, skills::SkillsConfig,
         task::TaskConfig,
     },
 };
@@ -36,7 +35,8 @@ pub struct AgentRuntimeBuilder {
     system_prompt: SystemPromptBuilder,
     agents_prompt_configs: Vec<AgentsPromptConfig>,
     agents_read_roots: Vec<PathBuf>,
-    skills_catalog: Option<Vec<SkillDefinition>>,
+    skills_enabled: bool,
+    skills: Vec<crate::SkillDefinition>,
     skills_reveal_roots: Vec<PathBuf>,
     permission_policy: PermissionPolicy,
     explicit_permission_policy: bool,
@@ -60,7 +60,8 @@ impl AgentRuntimeBuilder {
             system_prompt: SystemPromptBuilder::new(),
             agents_prompt_configs: Vec::new(),
             agents_read_roots: Vec::new(),
-            skills_catalog: None,
+            skills_enabled: false,
+            skills: Vec::new(),
             skills_reveal_roots: Vec::new(),
             permission_policy: PermissionPolicy::default(),
             explicit_permission_policy: false,
@@ -139,9 +140,15 @@ impl AgentRuntimeBuilder {
     #[allow(clippy::needless_pass_by_value)]
     pub fn with_skills(mut self, config: SkillsConfig) -> Self {
         let skills = config.discover();
-        self.skills_catalog
-            .get_or_insert_with(Vec::new)
-            .extend(skills);
+        self.skills_enabled = true;
+        self.skills.extend(skills);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_skill_definitions(mut self, skills: Vec<crate::SkillDefinition>) -> Self {
+        self.skills_enabled = true;
+        self.skills.extend(skills);
         self
     }
 
@@ -250,6 +257,12 @@ impl AgentRuntimeBuilder {
     pub fn build(self) -> AgentRuntime {
         let mut middleware_chain = MiddlewareChain::new();
         middleware_chain.push(SystemPromptMiddleware::new(self.system_prompt.build()));
+        middleware_chain.push(FileTemplateMiddleware);
+        middleware_chain.push(PermissionFilteredToolRegistryMiddleware::new(
+            self.tools.clone(),
+            self.permission_policy.clone(),
+            true,
+        ));
         middleware_chain.extend(self.middleware_chain);
         if !self.agents_prompt_configs.is_empty() || !self.agents_read_roots.is_empty() {
             middleware_chain.push(AgentsInstructionsMiddleware::new(
@@ -257,8 +270,8 @@ impl AgentRuntimeBuilder {
                 self.agents_read_roots,
             ));
         }
-        if let Some(catalog) = self.skills_catalog {
-            middleware_chain.push(SkillsMiddleware::new(catalog, self.skills_reveal_roots));
+        if self.skills_enabled {
+            middleware_chain.push(SkillsMiddleware::new(self.skills, self.skills_reveal_roots));
         }
         AgentRuntime {
             provider: self.provider,
@@ -285,7 +298,8 @@ impl fmt::Debug for AgentRuntimeBuilder {
             .field("system_prompt", &self.system_prompt)
             .field("agents_prompt_configs", &self.agents_prompt_configs)
             .field("agents_read_roots", &self.agents_read_roots)
-            .field("skills_catalog", &self.skills_catalog)
+            .field("skills_enabled", &self.skills_enabled)
+            .field("skills", &self.skills)
             .field("skills_reveal_roots", &self.skills_reveal_roots)
             .field("permission_policy", &self.permission_policy)
             .field(
