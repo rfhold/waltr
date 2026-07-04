@@ -4,7 +4,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AgentTool, Result, ToolDefinition};
+use crate::{AgentTool, Result, ToolDefinition, ToolProgressSink};
 
 use super::{
     config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, prompt::McpPromptDefinition,
@@ -92,13 +92,18 @@ impl McpClientRuntime {
                     let server_name = closure_server_name.clone();
                     let tool_name = tool_name.clone();
                     let arguments = context.call().arguments.clone();
+                    let call_id = context.call().id.clone();
+                    let progress = context.progress().clone();
+                    let cancellation_token = context.cancellation_token().clone();
                     Box::pin(async move {
                         let content = runtime
                             .call_tool(
                                 &server_name,
                                 &tool_name,
                                 arguments,
-                                context.cancellation_token().clone(),
+                                &call_id,
+                                progress,
+                                cancellation_token,
                             )
                             .await?;
                         Ok(context.result(content))
@@ -168,12 +173,14 @@ impl McpClientRuntime {
         server_name: &str,
         tool_name: &str,
         arguments: Value,
+        call_id: &str,
+        progress: ToolProgressSink,
         cancellation_token: CancellationToken,
     ) -> Result<String> {
         self.servers
             .get(server_name)
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
-            .call_tool(tool_name, arguments, cancellation_token)
+            .call_tool(tool_name, arguments, call_id, progress, cancellation_token)
             .await
     }
 

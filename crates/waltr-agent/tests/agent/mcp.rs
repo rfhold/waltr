@@ -5,12 +5,12 @@ use std::{fs, process::Child, sync::Arc, time::Duration};
 use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
-    CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, CompletionEvent, FileCredentialStore, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus, ProviderId, SessionCoordinator,
-    SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
-    SessionRuntimeSettings, SessionStore, SessionTemplateKind, SessionTemplateSearchRequest,
-    SessionTemplateSearchTarget, Suspension, TimelineContent, TimelineEventKind, TimelineQuery,
-    TimelineStatus, ToolCall,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent,
+    FileCredentialStore, LlmStream, MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus,
+    ProviderId, SessionCoordinator, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
+    SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStore, SessionTemplateKind,
+    SessionTemplateSearchRequest, SessionTemplateSearchTarget, Suspension, TimelineContent,
+    TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall,
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -137,6 +137,53 @@ async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direc
         "{context}"
     );
     assert!(session.text.contains("mcp-flow-complete"), "{context}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_progress_notifications_are_forwarded_to_timeline() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_progress_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "call_direct_progress",
+                "mcp_stdio_test_progress_marker",
+                json!({ "value": "stdio-mcp-progress-result-919" }),
+            ))],
+            vec![
+                CompletionEvent::Delta("mcp-progress-flow-complete".to_owned()),
+                CompletionEvent::Finished,
+            ],
+        ],
+    ));
+    let sessions = mcp_sessions(provider);
+    let session = run_session_prompt(
+        &sessions,
+        "call MCP progress tool",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+
+    assert!(
+        tool_result_text(&session).contains("stdio-mcp-progress-result-919"),
+        "{session:#?}"
+    );
+    assert!(
+        session.timeline.iter().any(|event| {
+            crate::session::channel_is(event, CHANNEL_TOOL_PROGRESS_INFO)
+                && event.parent_id.as_ref().map(|id| id.as_str())
+                    == Some("tool-call:call_direct_progress")
+                && matches!(
+                    &event.content,
+                    TimelineContent::TextDelta { delta }
+                        if delta.contains("stdio-mcp-progress-marker (1/2)")
+                )
+        }),
+        "expected MCP progress timeline event: {:#?}",
+        session.timeline
+    );
 
     Ok(())
 }
