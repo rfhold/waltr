@@ -116,6 +116,7 @@ pub(super) fn resolve_runtime_config(
             reasoning_effort,
         },
         mcp_servers,
+        mcp_trace_propagation: true,
     })
 }
 
@@ -245,6 +246,48 @@ fn mcp_server_type(kind: SessionMcpServerRuntimeKind) -> McpServerType {
     match kind {
         SessionMcpServerRuntimeKind::Stdio => McpServerType::Stdio,
         SessionMcpServerRuntimeKind::StreamableHttp => McpServerType::Sse,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use waltr::grpc::waltr::config::v1::{Configuration, Model, ModelType, Provider, ProviderType};
+
+    use super::{ProtoSessionRuntimeConfigRequest, resolve_runtime_config};
+
+    #[test]
+    fn resolved_runtime_config_enables_mcp_trace_propagation() {
+        let runtime = resolve_runtime_config(
+            ProtoSessionRuntimeConfigRequest {
+                provider_key: "openai".to_owned(),
+                model_id: "gpt".to_owned(),
+                enabled_mcp_server_keys: Vec::new(),
+                reasoning_effort: None,
+            },
+            &Configuration {
+                providers: HashMap::from([(
+                    "openai".to_owned(),
+                    Provider {
+                        r#type: ProviderType::OpenaiResponses as i32,
+                        url: "https://openai.example.test".to_owned(),
+                        models: HashMap::from([(
+                            "gpt".to_owned(),
+                            Model {
+                                r#type: ModelType::Llm as i32,
+                                ..Model::default()
+                            },
+                        )]),
+                        ..Provider::default()
+                    },
+                )]),
+                ..Configuration::default()
+            },
+        )
+        .expect("runtime config should resolve");
+
+        assert!(runtime.mcp_trace_propagation);
     }
 }
 
