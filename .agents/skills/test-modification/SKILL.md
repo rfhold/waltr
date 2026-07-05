@@ -10,7 +10,7 @@ Preserve Waltr's intentional layered feature testing strategy.
 # Workflow
 
 1. Identify every layer the feature crosses.
-2. Preserve layered coverage across agent, server, client, web, and TUI where the feature applies.
+2. Preserve layered coverage across generic protocol crates, agent, server, client, web, and TUI where the feature applies.
 3. Keep assertions focused on the layer under test instead of collapsing coverage into one layer.
 4. Use existing shared setup before adding new fixtures.
 5. Read the matching reference before changing specialized test areas.
@@ -20,6 +20,7 @@ Preserve Waltr's intentional layered feature testing strategy.
 | Path | Info |
 | --- | --- |
 | [references/feature-testing.md](references/feature-testing.md) | General layered feature testing requirements. |
+| [references/mcp-protocol.md](references/mcp-protocol.md) | MCP protocol conformance and ecosystem interoperability tests. |
 | [references/tui-server-backed.md](references/tui-server-backed.md) | TUI tests that run against a real server. |
 | [references/web-k6.md](references/web-k6.md) | Browser-level k6 end-to-end tests. |
 | [references/agent-live.md](references/agent-live.md) | Ignored live-provider agent tests. |
