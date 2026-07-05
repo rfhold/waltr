@@ -80,6 +80,7 @@ async fn session_template_search_finds_files_and_tools() {
                 limit: 10,
                 kinds: Vec::new(),
                 target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
             },
         )
         .await
@@ -106,6 +107,7 @@ async fn session_template_search_finds_files_and_tools() {
                 limit: 10,
                 kinds: vec![SessionTemplateKind::File],
                 target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
             },
         )
         .await
@@ -149,6 +151,7 @@ async fn session_template_search_clamps_oversized_limits() {
                 limit: usize::MAX,
                 kinds: vec![SessionTemplateKind::File],
                 target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
             },
         )
         .await
@@ -188,6 +191,7 @@ async fn session_template_search_ignores_mcp_startup_failures() {
                 limit: 10,
                 kinds: vec![SessionTemplateKind::Tool],
                 target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
             },
         )
         .await
@@ -227,6 +231,7 @@ async fn session_template_search_empty_query_returns_no_options() {
                 limit: 10,
                 kinds: Vec::new(),
                 target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
             },
         )
         .await

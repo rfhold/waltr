@@ -102,6 +102,7 @@ pub(super) struct ResourceAutocompleteState {
     request_id: Option<String>,
     session_id: Option<String>,
     query: String,
+    cursor: usize,
     token_start: usize,
     token_end: usize,
     target: ClientSessionTemplateSearchTarget,
@@ -115,6 +116,7 @@ struct TemplateAutocompleteToken {
     start: usize,
     end: usize,
     query: String,
+    cursor: usize,
     target: ClientSessionTemplateSearchTarget,
     kinds: Vec<ClientSessionTemplateKind>,
 }
@@ -205,6 +207,7 @@ impl SessionsSection {
                 request_id: None,
                 session_id: None,
                 query: String::new(),
+                cursor: 0,
                 token_start: 0,
                 token_end: 0,
                 target: ClientSessionTemplateSearchTarget::Resources,
@@ -755,6 +758,7 @@ impl SessionsSection {
         if self.resource_autocomplete.open
             && self.resource_autocomplete.session_id.as_deref() == Some(session_id.as_str())
             && self.resource_autocomplete.query == token.query
+            && self.resource_autocomplete.cursor == token.cursor
             && self.resource_autocomplete.token_start == token.start
             && self.resource_autocomplete.token_end == token.end
             && self.resource_autocomplete.target == token.target
@@ -770,6 +774,7 @@ impl SessionsSection {
         self.resource_autocomplete.request_id = Some(request_id.clone());
         self.resource_autocomplete.session_id = Some(session_id.clone());
         self.resource_autocomplete.query = token.query.clone();
+        self.resource_autocomplete.cursor = token.cursor;
         self.resource_autocomplete.token_start = token.start;
         self.resource_autocomplete.token_end = token.end;
         self.resource_autocomplete.target = token.target;
@@ -783,6 +788,7 @@ impl SessionsSection {
             limit: RESOURCE_SEARCH_LIMIT,
             kinds: token.kinds,
             target: token.target,
+            cursor: Some(token.cursor as u32),
         })
     }
 
@@ -790,6 +796,7 @@ impl SessionsSection {
         self.resource_autocomplete.request_id = None;
         self.resource_autocomplete.session_id = None;
         self.resource_autocomplete.query.clear();
+        self.resource_autocomplete.cursor = 0;
         self.resource_autocomplete.token_start = 0;
         self.resource_autocomplete.token_end = 0;
         self.resource_autocomplete.target = ClientSessionTemplateSearchTarget::Resources;
@@ -2230,6 +2237,7 @@ fn prompt_token_at_cursor(text: &str, cursor: usize) -> Option<TemplateAutocompl
         start,
         end,
         query: text[start + 1..cursor].to_owned(),
+        cursor: cursor - start - 1,
         target: ClientSessionTemplateSearchTarget::Prompts,
         kinds: vec![ClientSessionTemplateKind::Prompt],
     })
@@ -2247,6 +2255,10 @@ fn resource_token_at_cursor(text: &str, cursor: usize) -> Option<TemplateAutocom
         return None;
     }
 
+    if let Some(token) = resource_reference_token_at_cursor(text, start, cursor) {
+        return Some(token);
+    }
+
     let end = text[cursor..]
         .char_indices()
         .find_map(|(offset, character)| character.is_whitespace().then_some(cursor + offset))
@@ -2259,11 +2271,41 @@ fn resource_token_at_cursor(text: &str, cursor: usize) -> Option<TemplateAutocom
         start,
         end,
         query: text[start + 1..cursor].to_owned(),
+        cursor: cursor - start - 1,
         target: ClientSessionTemplateSearchTarget::Resources,
         kinds: vec![
             ClientSessionTemplateKind::File,
             ClientSessionTemplateKind::Tool,
+            ClientSessionTemplateKind::Resource,
         ],
+    })
+}
+
+fn resource_reference_token_at_cursor(
+    text: &str,
+    start: usize,
+    cursor: usize,
+) -> Option<TemplateAutocompleteToken> {
+    let reference_start = start;
+    let after_at = reference_start + 1;
+    if !text[after_at..].starts_with("resource(") {
+        return None;
+    }
+    let mut end = after_at;
+    while end < text.len() && !text[end..].starts_with(')') && !text[end..].starts_with('\n') {
+        end += text[end..].chars().next()?.len_utf8();
+    }
+    if end >= text.len() || !text[end..].starts_with(')') || cursor > end {
+        return None;
+    }
+    let query = text[reference_start..=end].to_owned();
+    Some(TemplateAutocompleteToken {
+        start: reference_start,
+        end: end + 1,
+        cursor: cursor - reference_start,
+        query,
+        target: ClientSessionTemplateSearchTarget::Resources,
+        kinds: vec![ClientSessionTemplateKind::Resource],
     })
 }
 

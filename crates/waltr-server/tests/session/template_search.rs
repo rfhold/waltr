@@ -26,6 +26,7 @@ async fn search_session_templates_returns_tagged_tool_results()
             limit: 10,
             kinds: vec![SessionTemplateKind::Tool as i32],
             target: SessionTemplateSearchTarget::Resources as i32,
+            cursor: None,
         })
         .await?
         .into_inner();
@@ -43,6 +44,7 @@ async fn search_session_templates_returns_tagged_tool_results()
             limit: 10,
             kinds: vec![SessionTemplateKind::Tool as i32],
             target: SessionTemplateSearchTarget::Resources as i32,
+            cursor: None,
         })
         .await?
         .into_inner();

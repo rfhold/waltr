@@ -1,14 +1,19 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::{AgentTool, Result, ToolDefinition, ToolProgressSink};
 
 use super::{
-    config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, prompt::McpPromptDefinition,
-    protocol::protocol_error, resource::McpResourceDefinition, server::McpServerRuntime,
+    config::McpConfig,
+    event::McpRuntimeEvent,
+    name::direct_tool_name,
+    prompt::McpPromptDefinition,
+    protocol::protocol_error,
+    resource::{McpCompletionResult, McpResourceDefinition, McpResourceTemplateDefinition},
+    server::McpServerRuntime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +26,12 @@ pub(crate) struct McpServerPromptDefinition {
 pub(crate) struct McpServerResourceDefinition {
     pub(crate) server_name: String,
     pub(crate) resource: McpResourceDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpServerResourceTemplateDefinition {
+    pub(crate) server_name: String,
+    pub(crate) resource_template: McpResourceTemplateDefinition,
 }
 
 pub(crate) struct McpClientRuntime {
@@ -142,6 +153,20 @@ impl McpClientRuntime {
         resources
     }
 
+    pub(crate) async fn resource_templates(&self) -> Vec<McpServerResourceTemplateDefinition> {
+        let mut resource_templates = Vec::new();
+        for server in self.servers.values() {
+            let server_name = server.name().to_owned();
+            for resource_template in server.resource_templates().await {
+                resource_templates.push(McpServerResourceTemplateDefinition {
+                    server_name: server_name.clone(),
+                    resource_template,
+                });
+            }
+        }
+        resource_templates
+    }
+
     pub(crate) fn has_server(&self, server_name: &str) -> bool {
         self.servers.contains_key(server_name)
     }
@@ -166,6 +191,17 @@ impl McpClientRuntime {
             .await
             .iter()
             .any(|resource| resource.uri == uri)
+    }
+
+    pub(crate) async fn has_resource_template_match(&self, server_name: &str, uri: &str) -> bool {
+        let Some(server) = self.servers.get(server_name) else {
+            return false;
+        };
+        server
+            .resource_templates()
+            .await
+            .iter()
+            .any(|resource_template| resource_template.matches_uri(uri))
     }
 
     async fn call_tool(
@@ -208,6 +244,29 @@ impl McpClientRuntime {
             .get(server_name)
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?
             .read_resource(uri, cancellation_token)
+            .await
+    }
+
+    pub(crate) async fn complete_resource_template(
+        &self,
+        server_name: &str,
+        uri_template: &str,
+        argument_name: &str,
+        argument_value: &str,
+        context_arguments: Map<String, Value>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Option<McpCompletionResult>> {
+        let Some(server) = self.servers.get(server_name) else {
+            return Ok(None);
+        };
+        server
+            .complete_resource_template(
+                uri_template,
+                argument_name,
+                argument_value,
+                context_arguments,
+                cancellation_token,
+            )
             .await
     }
 

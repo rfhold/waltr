@@ -828,7 +828,7 @@ status: StatusSnapshot,
  */
 sessions: SessionSnapshot, };
 
-export type ClientSessionTemplateKind = "file" | "tool" | "prompt";
+export type ClientSessionTemplateKind = "file" | "tool" | "resource" | "prompt";
 
 export type ClientSessionTemplateSearchTarget = "resources" | "prompts";
 
@@ -938,7 +938,11 @@ kinds: Array<ClientSessionTemplateKind>,
 /**
  * Template search target.
  */
-target: ClientSessionTemplateSearchTarget, } | { "type": "registerSessionTimelineWatchInterest", 
+target: ClientSessionTemplateSearchTarget, 
+/**
+ * Cursor byte offset relative to query for context-aware completions.
+ */
+cursor: number | null, } | { "type": "registerSessionTimelineWatchInterest", 
 /**
  * Session id whose timeline should be watched.
  */

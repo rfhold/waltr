@@ -108,6 +108,7 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             limit,
             kinds,
             target,
+            cursor,
         } => {
             state.set_session_template_search_loading(
                 request_id.clone(),
@@ -121,6 +122,7 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
                 limit,
                 kinds,
                 target,
+                cursor,
             }))
         }
         SessionEvent::TemplatesSearched {

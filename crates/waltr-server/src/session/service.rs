@@ -639,6 +639,7 @@ where
                 limit: request.limit as usize,
                 kinds: template_kinds_from_proto(&request.kinds),
                 target: template_search_target_from_proto(request.target),
+                cursor: request.cursor.map(|cursor| cursor as usize),
             };
             match sessions.search_templates(&session_id, search).await {
                 Ok(options) => {
@@ -683,6 +684,7 @@ fn template_kinds_from_proto(kinds: &[i32]) -> Vec<SessionTemplateKind> {
                 ProtoSessionTemplateKind::File => Some(SessionTemplateKind::File),
                 ProtoSessionTemplateKind::Tool => Some(SessionTemplateKind::Tool),
                 ProtoSessionTemplateKind::Prompt => Some(SessionTemplateKind::Prompt),
+                ProtoSessionTemplateKind::Resource => Some(SessionTemplateKind::Resource),
                 ProtoSessionTemplateKind::Unspecified => None,
             },
         )
@@ -694,6 +696,7 @@ fn template_option_to_proto(option: SessionTemplateOption) -> ProtoSessionTempla
         SessionTemplateKind::File => ProtoSessionTemplateKind::File,
         SessionTemplateKind::Tool => ProtoSessionTemplateKind::Tool,
         SessionTemplateKind::Prompt => ProtoSessionTemplateKind::Prompt,
+        SessionTemplateKind::Resource => ProtoSessionTemplateKind::Resource,
     };
     ProtoSessionTemplateOption {
         kind: kind as i32,

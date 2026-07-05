@@ -82,7 +82,7 @@ When a user prompt starts with an MCP prompt template, the template middleware s
 
 ## Resource Discovery
 
-For each configured server, the session MCP runtime lists resources when the server advertises resource support. Resource definitions are stored with their URI, name, title, description, MIME type, and size when provided.
+For each configured server, the session MCP runtime lists concrete resources and resource URI templates when the server advertises resource support. Concrete resource definitions are stored with their URI, name, title, description, MIME type, and size when provided. Resource URI templates are stored with their URI template, name, title, description, and MIME type when provided.
 
 MCP resources are supported only as prompt templates for now. They are surfaced through the normal session template search target for resources, and inserted templates use the server key plus a JSON string URI:
 
@@ -92,7 +92,21 @@ MCP resources are supported only as prompt templates for now. They are surfaced 
 
 When a user prompt contains an MCP resource template, the template middleware sends `resources/read` to that server and inserts the returned resource content before the provider request. Text resource contents are inserted directly. Blob resource contents render an unsupported-content marker.
 
-MCP resources are not exposed as provider tools, and Waltr does not currently list or expand MCP `resources/templates/list` URI templates.
+MCP `resources/templates/list` entries are surfaced through the same resource search target. Waltr inserts them as concrete resource references containing the server's URI template:
+
+```text
+@resource(foo, "test://items/{id}")
+```
+
+The user fills the URI path in-place before submitting, for example:
+
+```text
+@resource(foo, "test://items/42")
+```
+
+The renderer permits `resources/read` when the requested URI either exactly matches a listed concrete resource or matches one of the server's listed URI templates. Waltr does not currently call the MCP completion API for URI template arguments.
+
+MCP resources are not exposed as provider tools.
 
 ## Notifications and Server Requests
 
@@ -102,7 +116,7 @@ The MCP connection loop continuously routes inbound messages while a server is r
 | --- | --- |
 | `notifications/tools/list_changed` | Refreshes that server's tool registry in the background. Newly built agent runtimes see the refreshed tools. |
 | `notifications/prompts/list_changed` | Refreshes that server's prompt registry in the background. Newly built agent runtimes and template searches see the refreshed prompts. |
-| `notifications/resources/list_changed` | Refreshes that server's resource registry in the background. Template searches see the refreshed resources. |
+| `notifications/resources/list_changed` | Refreshes that server's concrete resource and resource URI template registries in the background. Template searches see the refreshed resources. |
 | `notifications/message` | Publishes an internal MCP log event and writes a tracing event. |
 | `notifications/progress` | Publishes an internal MCP progress event. |
 | `roots/list` | Responds with the coordinator runtime root as a single `file://` root. |
@@ -112,7 +126,7 @@ The internal MCP event stream is not yet exposed as a public client or UI contra
 ## Boundaries
 
 - MCP support is opt-in through session runtime settings.
-- MCP resource subscriptions, resource templates, sampling, elicitation, completion, and extension negotiation are not implemented.
+- MCP resource subscriptions, sampling, elicitation, completion, and extension negotiation are not implemented.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - The shared server config names the HTTP MCP server type `SSE`; session runtime settings map that to the agent's Streamable HTTP transport.

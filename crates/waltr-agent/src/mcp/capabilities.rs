@@ -5,6 +5,7 @@ pub(in crate::mcp) struct McpServerCapabilities {
     pub(in crate::mcp) tools: Option<McpToolsCapability>,
     pub(in crate::mcp) prompts: Option<McpPromptsCapability>,
     pub(in crate::mcp) resources: Option<McpResourcesCapability>,
+    pub(in crate::mcp) completions: bool,
     #[allow(dead_code)]
     pub(in crate::mcp) logging: bool,
     #[allow(dead_code)]
@@ -64,6 +65,7 @@ impl McpServerCapabilities {
             tools,
             prompts,
             resources,
+            completions: value.get("completions").is_some(),
             logging: value.get("logging").is_some(),
             raw: value.clone(),
         }

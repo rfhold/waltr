@@ -24,6 +24,8 @@ pub struct SessionTemplateSearchRequest {
     pub kinds: Vec<SessionTemplateKind>,
     /// Search target. Resources cover file/tool templates; prompts cover skill and future prompt templates.
     pub target: SessionTemplateSearchTarget,
+    /// Cursor byte offset relative to `query`, when the client wants context-aware completions.
+    pub cursor: Option<usize>,
 }
 
 impl SessionTemplateSearchRequest {
@@ -340,6 +342,7 @@ mod tests {
                 limit: 10,
                 kinds: vec![SessionTemplateKind::Prompt],
                 target: SessionTemplateSearchTarget::Prompts,
+                cursor: None,
             },
             None,
         )

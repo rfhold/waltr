@@ -64,7 +64,7 @@ export type CatalogSuggestResponse = {
   stale: boolean;
 };
 
-export type SessionTemplateKind = "file" | "tool" | "unknown";
+export type SessionTemplateKind = "file" | "tool" | "prompt" | "resource" | "unknown";
 export type SessionTemplateSearchTarget = "resources" | "prompts";
 
 export type SessionTemplateOption = {
@@ -79,8 +79,9 @@ export type SessionTemplateSearchRequest = {
   requestId: string;
   sessionId: string;
   query: string;
+  cursor?: number;
   limit?: number;
-  kinds?: Array<"file" | "tool">;
+  kinds?: Array<"file" | "tool" | "prompt" | "resource">;
   target?: SessionTemplateSearchTarget;
 };
 

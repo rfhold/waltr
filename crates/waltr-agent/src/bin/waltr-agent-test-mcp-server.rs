@@ -8,11 +8,12 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        Annotated, GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
+        Annotated, CompleteRequestParams, CompleteResult, CompletionInfo, GetPromptRequestParams,
+        GetPromptResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
         LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams,
         ProgressNotificationParam, PromptArgument, PromptMessage, PromptMessageRole, RawResource,
-        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-        ServerInfo, SetLevelRequestParams,
+        RawResourceTemplate, ReadResourceRequestParams, ReadResourceResult, Reference,
+        ResourceContents, ServerCapabilities, ServerInfo, SetLevelRequestParams,
     },
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -184,6 +185,7 @@ impl ServerHandler for EchoMarkerServer {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_logging()
+                .enable_completions()
                 .enable_tools()
                 .enable_prompts()
                 .enable_resources()
@@ -202,6 +204,28 @@ impl ServerHandler for EchoMarkerServer {
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         }
         Ok(())
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, McpError> {
+        let Reference::Resource(reference) = request.r#ref else {
+            return Ok(CompleteResult::default());
+        };
+        if reference.uri != "test://items/{id}" || request.argument.name != "id" {
+            return Ok(CompleteResult::default());
+        }
+
+        let values = ["42", "420", "4242"]
+            .into_iter()
+            .filter(|value| value.starts_with(&request.argument.value))
+            .map(ToOwned::to_owned)
+            .collect();
+        let completion = CompletionInfo::with_all_values(values)
+            .map_err(|error| McpError::internal_error(error, None))?;
+        Ok(CompleteResult::new(completion))
     }
 
     async fn list_prompts(
@@ -254,6 +278,22 @@ impl ServerHandler for EchoMarkerServer {
         )]))
     }
 
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, McpError> {
+        Ok(ListResourceTemplatesResult::with_all_items(vec![
+            Annotated::new(
+                RawResourceTemplate::new("test://items/{id}", "item_resource")
+                    .with_title("Item Resource")
+                    .with_description("Return deterministic templated item resource text")
+                    .with_mime_type("text/plain"),
+                None,
+            ),
+        ]))
+    }
+
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
@@ -262,6 +302,10 @@ impl ServerHandler for EchoMarkerServer {
         match request.uri.as_str() {
             "test://status" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 "stdio-mcp-resource-status-616",
+                request.uri,
+            )])),
+            "test://items/42" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "stdio-mcp-resource-template-item-42-717",
                 request.uri,
             )])),
             _ => Err(McpError::invalid_params("unknown test resource", None)),
