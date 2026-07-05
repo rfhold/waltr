@@ -87,7 +87,7 @@ Built-in tool areas:
 | `tools::skills` | Agent skill discovery and loading. |
 | `tools::task` | Task-oriented agent tool support. |
 | `tools::shell` | Optional shell execution tool behind the `shell` feature. |
-| `mcp` | Model Context Protocol server integration exposed as agent tools. |
+| `mcp` | Waltr-side Model Context Protocol integration exposed as agent tools and templates. |
 
 Tool execution passes through generic permission claims. Tools and middleware describe requested operations as `PermissionClaim` values, and `PermissionPolicy` evaluates those claims by tool selector, operation class, filesystem path, shell command, or resource pattern.
 
@@ -123,7 +123,7 @@ Crash recovery is retry-the-turn. The request is journaled before provider dispa
 
 ## Dependencies
 
-The agent crate depends on provider, storage, protocol, and async infrastructure crates such as `reqwest`, `tokio`, `rmcp`, `opendal`, `aws-sdk-s3`, `scylla`, `tokio-postgres`, and provider protocol helpers. The optional `shell` feature adds shell parsing dependencies through `tree-sitter` and `tree-sitter-bash`.
+The agent crate depends on provider, storage, protocol, and async infrastructure crates such as `reqwest`, `tokio`, `mcp`, `opendal`, `aws-sdk-s3`, `scylla`, `tokio-postgres`, and provider protocol helpers. The optional `shell` feature adds shell parsing dependencies through `tree-sitter` and `tree-sitter-bash`.
 
 These dependencies stay inside the agent layer. Higher layers should use the public agent API instead of depending on provider adapter internals, middleware internals, or storage implementation details.
 
@@ -173,6 +173,8 @@ Focused paths:
 | [../../crates/waltr-agent/src/provider/mod.rs](../../crates/waltr-agent/src/provider/mod.rs) | Provider adapter exports. |
 | [../../crates/waltr-agent/src/middleware/mod.rs](../../crates/waltr-agent/src/middleware/mod.rs) | Middleware hook contract. |
 | [../../crates/waltr-agent/src/tools/mod.rs](../../crates/waltr-agent/src/tools/mod.rs) | Built-in tool modules. |
-| [../../crates/waltr-agent/src/mcp/mod.rs](../../crates/waltr-agent/src/mcp/mod.rs) | MCP integration boundary. |
+| [../../crates/waltr-agent/src/mcp/mod.rs](../../crates/waltr-agent/src/mcp/mod.rs) | Waltr-side MCP integration boundary. |
+| [../../crates/mcp/](../../crates/mcp/) | Generic MCP protocol crate. |
 | [../../crates/waltr-agent/src/permission/mod.rs](../../crates/waltr-agent/src/permission/mod.rs) | Permission policy, claims, matching, and effects. |
 | [../agent/README.md](../agent/README.md) | Index of detailed agent feature docs. |
+| [../mcp/README.md](../mcp/README.md) | Generic MCP protocol documentation. |

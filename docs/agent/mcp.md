@@ -1,39 +1,32 @@
-# MCP
+# MCP Integration
 
-Model Context Protocol support lets a session expose tools, prompt templates, and resource templates from configured MCP servers. The implementation lives in `crates/waltr-agent/` and is owned by the durable session coordinator so MCP servers can remain initialized alongside a session.
+Waltr agent MCP integration lets a session expose tools, prompt templates, and resource templates from configured MCP servers. Generic protocol behavior lives in [../mcp/protocol.md](../mcp/protocol.md); this document covers how the agent layer adapts that protocol surface into Waltr session behavior.
+
+MCP servers are owned by the durable session coordinator so they can remain initialized alongside a session. MCP is not attached directly to `AgentRuntimeBuilder`; runtime construction receives tools and template middleware from the coordinator-owned MCP runtime for that session.
 
 ## Entry Points
 
 | API | Purpose |
 | --- | --- |
-| `McpConfig` | Collection of MCP servers plus request timeout. |
-| `McpServerConfig` | One named server and its transport configuration. |
-| `McpTransportConfig` | Agent-supported MCP transport configuration. |
+| `McpConfig` | Agent-side collection of MCP servers, request timeout, log level, and trace propagation mode. |
+| `McpServerConfig` | One named server and its generic `mcp::client::McpTransportConfig`. |
+| `McpClientRuntime` | Session-scoped runtime that starts configured servers and adapts their registries. |
+| `McpServerRuntime` | Per-server runtime that owns the typed generic `McpClient`, registries, progress routing, and refresh behavior. |
 | `SessionRuntimeSettings::mcp_servers` | Per-session MCP server snapshots used by `SessionCoordinator`. |
+| `SessionRuntimeSettings::mcp_trace_propagation` | Session setting that enables MCP request trace context propagation. |
 | `SessionCoordinator` | Starts and caches a session-scoped MCP runtime when resolving a session runtime. |
 
-MCP is not attached directly to `AgentRuntimeBuilder`. Runtime construction receives tools and template middleware from the coordinator-owned MCP runtime for that session.
-
-## Transports
-
-| Transport | Behavior |
-| --- | --- |
-| Stdio | Starts a persistent subprocess with a command and args, keeps stdin/stdout open, and routes line-delimited JSON-RPC messages through a connection loop. |
-| Streamable HTTP | Sends JSON-RPC over HTTP POST, accepts JSON or `text/event-stream`, tracks `mcp-session-id`, sends `mcp-protocol-version` after initialization, and records SSE event IDs seen in POST responses. |
-
-The current Streamable HTTP client handles request responses and SSE responses to POST requests. It does not yet open the optional long-lived GET SSE stream or resume with `Last-Event-ID`.
+The agent integration depends on the generic `mcp` crate. The generic crate must not depend back on `waltr-agent`.
 
 ## Tool Discovery
 
 For each configured server, the session MCP runtime:
 
-1. Opens the transport.
-2. Sends `initialize` with protocol version `2025-06-18`.
-3. Sends `notifications/initialized`.
-4. Stores server capabilities from the initialize response.
-5. Lists tools when the server advertises tool support, following cursors until all pages are loaded.
-6. Stores tool metadata, including `inputSchema`, `outputSchema`, and annotations.
-7. Converts the current tool registry into `AgentTool`s when an agent runtime is resolved.
+1. Starts a typed generic MCP client for each server.
+2. Stores server capabilities from the initialize response.
+3. Lists tools when the server advertises tool support, following cursors until all pages are loaded.
+4. Stores tool metadata, including `inputSchema`, `outputSchema`, and annotations.
+5. Converts the current tool registry into `AgentTool`s when an agent runtime is resolved.
 
 MCP tools are exposed directly. Tool names are generated as:
 
@@ -104,13 +97,13 @@ The user fills the URI path in-place before submitting, for example:
 @resource(foo, "test://items/42")
 ```
 
-The renderer permits `resources/read` when the requested URI either exactly matches a listed concrete resource or matches one of the server's listed URI templates. Waltr does not currently call the MCP completion API for URI template arguments.
+The renderer permits `resources/read` when the requested URI either exactly matches a listed concrete resource or matches one of the server's listed URI templates. Resource template search can call the MCP completion API for URI template arguments when the server advertises completion support.
 
 MCP resources are not exposed as provider tools.
 
 ## Notifications and Server Requests
 
-The MCP connection loop continuously routes inbound messages while a server is running.
+The generic MCP client routes inbound messages while a server is running. The agent-side handler converts relevant messages into registry refreshes, progress updates, logs, or roots responses.
 
 | MCP message | Current behavior |
 | --- | --- |
@@ -123,14 +116,30 @@ The MCP connection loop continuously routes inbound messages while a server is r
 
 The internal MCP event stream is not yet exposed as a public client or UI contract.
 
+## Trace Propagation and Spans
+
+Agent MCP trace propagation is disabled by default at the agent config boundary. When `SessionRuntimeSettings::mcp_trace_propagation` is true, runtime construction maps it to `McpTracePropagation::TraceContext` before connecting to servers. Server-resolved session runtime configs enable this setting for managed sessions.
+
+Trace context is propagated through MCP request `_meta.traceparent` and `_meta.tracestate`, not only through HTTP headers. See [../mcp/tracing.md](../mcp/tracing.md) for generic client/server span and propagation details.
+
+The agent integration also wraps Waltr-facing MCP operations in `mcp.agent.operation` spans:
+
+| Operation | Fields |
+| --- | --- |
+| `tools/call` | `mcp.server`, `mcp.transport`, `rpc.method`, `mcp.tool.name`. |
+| `prompts/get` | `mcp.server`, `mcp.transport`, `rpc.method`, `mcp.prompt.name`. |
+| `resources/read` | `mcp.server`, `mcp.transport`, `rpc.method`, `mcp.resource.uri`. |
+| `completion/complete` | `mcp.server`, `mcp.transport`, `rpc.method`, `mcp.resource_template.uri_template`. |
+
 ## Boundaries
 
 - MCP support is opt-in through session runtime settings.
-- MCP resource subscriptions, sampling, elicitation, completion, and extension negotiation are not implemented.
+- Generic MCP protocol implementation belongs in `crates/mcp`; Waltr conversion into tools, templates, permissions, and session runtime belongs in `crates/waltr-agent/src/mcp/`.
+- MCP resource subscriptions, sampling, elicitation, and extension negotiation are not implemented.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - The shared server config names the HTTP MCP server type `SSE`; session runtime settings map that to the agent's Streamable HTTP transport.
-- HTTP GET SSE streams, `Last-Event-ID` resume requests, and DELETE session termination are not implemented yet.
+- HTTP GET SSE streams, `Last-Event-ID` resume requests, and DELETE session termination are generic MCP transport gaps tracked in `crates/mcp`.
 
 ## Tests
 
@@ -140,6 +149,8 @@ Focused coverage:
 
 | Path | Covers |
 | --- | --- |
+| [../../crates/mcp/tests/spec.rs](../../crates/mcp/tests/spec.rs) and [../../crates/mcp/tests/spec/](../../crates/mcp/tests/spec/) | Generic MCP protocol conformance. |
+| [../../crates/mcp/tests/ecosystem.rs](../../crates/mcp/tests/ecosystem.rs) and [../../crates/mcp/tests/ecosystem/](../../crates/mcp/tests/ecosystem/) | Generic MCP ecosystem interoperability. |
 | [../../crates/waltr-agent/tests/agent/mcp.rs](../../crates/waltr-agent/tests/agent/mcp.rs) | Deterministic stdio and streamable HTTP MCP tool flows plus stdio MCP prompt/resource template discovery and rendering. |
 | [../../crates/waltr-agent/tests/live/agent/mcp.rs](../../crates/waltr-agent/tests/live/agent/mcp.rs) | Ignored live-provider MCP coverage. |
 | [../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs](../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs) | Test MCP server binary. |
@@ -148,13 +159,13 @@ Focused coverage:
 
 | Path | Purpose |
 | --- | --- |
+| [../mcp/protocol.md](../mcp/protocol.md) | Generic MCP protocol crate behavior and boundaries. |
+| [../mcp/tracing.md](../mcp/tracing.md) | Generic MCP spans and trace propagation. |
+| [../../crates/mcp/src/client/](../../crates/mcp/src/client/) | Typed generic MCP client, connection loop, and transports. |
+| [../../crates/mcp/src/server/mod.rs](../../crates/mcp/src/server/mod.rs) | Typed generic MCP server. |
+| [../../crates/mcp/src/protocol.rs](../../crates/mcp/src/protocol.rs) | JSON-RPC helpers and MCP protocol version. |
+| [../../crates/mcp/src/trace.rs](../../crates/mcp/src/trace.rs) | Generic request `_meta` trace propagation helpers. |
 | [../../crates/waltr-agent/src/mcp/config.rs](../../crates/waltr-agent/src/mcp/config.rs) | MCP configuration types. |
 | [../../crates/waltr-agent/src/mcp/runtime.rs](../../crates/waltr-agent/src/mcp/runtime.rs) | Session MCP runtime, `AgentTool` conversion, prompt access, and resource access. |
-| [../../crates/waltr-agent/src/mcp/server.rs](../../crates/waltr-agent/src/mcp/server.rs) | MCP initialize, capabilities, tool/prompt/resource registries, notifications, and request behavior. |
-| [../../crates/waltr-agent/src/mcp/connection.rs](../../crates/waltr-agent/src/mcp/connection.rs) | JSON-RPC request routing, cancellation notifications, server requests, and notification dispatch. |
+| [../../crates/waltr-agent/src/mcp/server.rs](../../crates/waltr-agent/src/mcp/server.rs) | Waltr-side MCP server runtime, registries, notifications, progress, roots, and request behavior. |
 | [../../crates/waltr-agent/src/mcp/name.rs](../../crates/waltr-agent/src/mcp/name.rs) | Generated tool-name sanitization. |
-| [../../crates/waltr-agent/src/mcp/tool.rs](../../crates/waltr-agent/src/mcp/tool.rs) | MCP response formatting. |
-| [../../crates/waltr-agent/src/mcp/prompt.rs](../../crates/waltr-agent/src/mcp/prompt.rs) | MCP prompt definition parsing and prompt response formatting. |
-| [../../crates/waltr-agent/src/mcp/resource.rs](../../crates/waltr-agent/src/mcp/resource.rs) | MCP resource definition parsing and resource response formatting. |
-| [../../crates/waltr-agent/src/mcp/transport/stdio.rs](../../crates/waltr-agent/src/mcp/transport/stdio.rs) | Stdio transport. |
-| [../../crates/waltr-agent/src/mcp/transport/http.rs](../../crates/waltr-agent/src/mcp/transport/http.rs) | Streamable HTTP transport. |

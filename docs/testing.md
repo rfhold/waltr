@@ -6,6 +6,8 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 
 | Path | Intent |
 | --- | --- |
+| `crates/mcp/tests/spec.rs` and `crates/mcp/tests/spec/` | Generic MCP protocol conformance tests grouped by spec revision. |
+| `crates/mcp/tests/ecosystem.rs` and `crates/mcp/tests/ecosystem/` | Generic MCP interoperability tests against ecosystem clients and servers. |
 | `crates/waltr-agent/tests/agent.rs` and `crates/waltr-agent/tests/agent/` | Deterministic agent library tests using scripted/shared providers. |
 | `crates/waltr-agent/tests/live.rs` and `crates/waltr-agent/tests/live/` | Ignored live-provider and external-service agent tests. |
 | `crates/waltr-server/tests/` | Server contract, coordination, watch, validation, health, and system flows. |
@@ -21,9 +23,17 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 
 Do not remove higher-layer coverage just because lower-layer coverage exists.
 
-Server tests validate the server-facing contract. Client tests validate the shared state machine on top of that contract. Web and TUI tests validate user-facing behavior through their platform-specific UI layers. Agent tests validate the agent library as a normal library boundary.
+Generic protocol/library tests validate reusable crates such as `mcp`. Agent tests validate the agent library as a normal library boundary on top of generic dependencies. Server tests validate the server-facing contract. Client tests validate the shared state machine on top of that contract. Web and TUI tests validate user-facing behavior through their platform-specific UI layers.
 
 # Commands
+
+Run MCP spec tests:
+
+`cargo test -p mcp --test spec`
+
+Run all MCP integration tests:
+
+`cargo test -p mcp --tests`
 
 Run server unit tests:
 

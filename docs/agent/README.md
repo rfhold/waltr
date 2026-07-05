@@ -6,7 +6,7 @@ Agent docs describe Waltr's isolated agent library features, provider integratio
 | --- | --- |
 | [agents_md.md](agents_md.md) | `AGENTS.md` discovery and prompt contribution behavior. |
 | [filesystem.md](filesystem.md) | Filesystem tool behavior, permissions, and boundaries. |
-| [mcp.md](mcp.md) | MCP server integration and tool exposure. |
+| [mcp.md](mcp.md) | Waltr agent MCP integration, tool exposure, and template adaptation. |
 | [middleware.md](middleware.md) | Agent middleware responsibilities and ordering. |
 | [model-catalog.md](model-catalog.md) | Model catalog data and provider model metadata. |
 | [otel.md](otel.md) | OpenTelemetry instrumentation behavior. |
