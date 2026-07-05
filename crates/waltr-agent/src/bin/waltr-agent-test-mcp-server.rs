@@ -83,6 +83,12 @@ impl ServerHandler for EchoMarkerServer {
             .logging()
     }
 
+    fn instructions(&self) -> Option<String> {
+        std::env::var("WALTR_TEST_MCP_INSTRUCTIONS")
+            .ok()
+            .filter(|instructions| !instructions.trim().is_empty())
+    }
+
     fn list_tools(
         &self,
         _cursor: Option<String>,

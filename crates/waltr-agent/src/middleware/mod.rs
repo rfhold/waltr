@@ -7,6 +7,7 @@ pub mod chain;
 pub(crate) mod claims;
 pub mod context;
 pub(crate) mod file_templates;
+pub(crate) mod mcp_instructions;
 pub(crate) mod mcp_prompts;
 pub(crate) mod mcp_resources;
 pub(crate) mod prompt;
