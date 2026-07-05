@@ -12,6 +12,7 @@ MCP servers are owned by the durable session coordinator so they can remain init
 | `McpServerConfig` | One named server and its generic `mcp::client::McpTransportConfig`. |
 | `McpClientRuntime` | Session-scoped runtime that starts configured servers and adapts their registries. |
 | `McpServerRuntime` | Per-server runtime that owns the typed generic `McpClient`, registries, progress routing, and refresh behavior. |
+| `McpInstructionsMiddleware` | Middleware that adds initialized MCP server instructions to the system prompt. |
 | `SessionRuntimeSettings::mcp_servers` | Per-session MCP server snapshots used by `SessionCoordinator`. |
 | `SessionRuntimeSettings::mcp_trace_propagation` | Session setting that enables MCP request trace context propagation. |
 | `SessionCoordinator` | Starts and caches a session-scoped MCP runtime when resolving a session runtime. |
@@ -101,6 +102,26 @@ The renderer permits `resources/read` when the requested URI either exactly matc
 
 MCP resources are not exposed as provider tools.
 
+## Server Instructions
+
+If an MCP server returns `instructions` in its initialize result, Waltr stores them with that session's MCP server runtime and adds them to the provider system prompt through MCP middleware.
+
+Instructions are enabled by default on `AgentSessionRuntimeFactory`. Embedders can opt out with:
+
+```rust
+AgentSessionRuntimeFactory::new(root, credentials)
+    .with_mcp_server_instructions_enabled(false);
+```
+
+Prompt fragments are emitted in server-key order and include the source server key:
+
+```text
+MCP server instructions from `foo`:
+...
+```
+
+The instructions middleware is registered with the other MCP session middleware, after the durable base system prompt and before AGENTS/skills middleware.
+
 ## Notifications and Server Requests
 
 The generic MCP client routes inbound messages while a server is running. The agent-side handler converts relevant messages into registry refreshes, progress updates, logs, or roots responses.
@@ -135,6 +156,7 @@ The agent integration also wraps Waltr-facing MCP operations in `mcp.agent.opera
 
 - MCP support is opt-in through session runtime settings.
 - Generic MCP protocol implementation belongs in `crates/mcp`; Waltr conversion into tools, templates, permissions, and session runtime belongs in `crates/waltr-agent/src/mcp/`.
+- MCP server instructions are injected into the provider system prompt by default for factory-built session runtimes; this is a factory policy, not generic MCP protocol behavior.
 - MCP resource subscriptions, sampling, elicitation, and extension negotiation are not implemented.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
@@ -151,7 +173,7 @@ Focused coverage:
 | --- | --- |
 | [../../crates/mcp/tests/spec.rs](../../crates/mcp/tests/spec.rs) and [../../crates/mcp/tests/spec/](../../crates/mcp/tests/spec/) | Generic MCP protocol conformance. |
 | [../../crates/mcp/tests/ecosystem.rs](../../crates/mcp/tests/ecosystem.rs) and [../../crates/mcp/tests/ecosystem/](../../crates/mcp/tests/ecosystem/) | Generic MCP ecosystem interoperability. |
-| [../../crates/waltr-agent/tests/agent/mcp.rs](../../crates/waltr-agent/tests/agent/mcp.rs) | Deterministic stdio and streamable HTTP MCP tool flows plus stdio MCP prompt/resource template discovery and rendering. |
+| [../../crates/waltr-agent/tests/agent/mcp.rs](../../crates/waltr-agent/tests/agent/mcp.rs) | Deterministic stdio and streamable HTTP MCP tool flows, server instructions, plus stdio MCP prompt/resource template discovery and rendering. |
 | [../../crates/waltr-agent/tests/live/agent/mcp.rs](../../crates/waltr-agent/tests/live/agent/mcp.rs) | Ignored live-provider MCP coverage. |
 | [../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs](../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs) | Test MCP server binary. |
 
@@ -168,4 +190,5 @@ Focused coverage:
 | [../../crates/waltr-agent/src/mcp/config.rs](../../crates/waltr-agent/src/mcp/config.rs) | MCP configuration types. |
 | [../../crates/waltr-agent/src/mcp/runtime.rs](../../crates/waltr-agent/src/mcp/runtime.rs) | Session MCP runtime, `AgentTool` conversion, prompt access, and resource access. |
 | [../../crates/waltr-agent/src/mcp/server.rs](../../crates/waltr-agent/src/mcp/server.rs) | Waltr-side MCP server runtime, registries, notifications, progress, roots, and request behavior. |
+| [../../crates/waltr-agent/src/middleware/mcp_instructions.rs](../../crates/waltr-agent/src/middleware/mcp_instructions.rs) | System-prompt middleware for initialized MCP server instructions. |
 | [../../crates/waltr-agent/src/mcp/name.rs](../../crates/waltr-agent/src/mcp/name.rs) | Generated tool-name sanitization. |
