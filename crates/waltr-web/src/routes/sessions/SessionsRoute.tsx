@@ -672,6 +672,7 @@ function SessionDetail(props: { session: SessionView }) {
         requestId,
         sessionId: props.session.id,
         query: token.query,
+        cursor: token.cursor,
         limit: RESOURCE_SEARCH_LIMIT,
         kinds: token.kinds,
         target: token.target,
@@ -1029,7 +1030,7 @@ type TemplateResultPart = {
   content: string;
 };
 type TemplateErrorPart = { kind: "error"; raw: string; message: string };
-type ActiveTemplateToken = { start: number; end: number; query: string; target: "resources" | "prompts"; kinds: Array<"file" | "tool" | "prompt"> };
+type ActiveTemplateToken = { start: number; end: number; query: string; cursor: number; target: "resources" | "prompts"; kinds: Array<"file" | "tool" | "prompt" | "resource"> };
 type ExternalPromptTimelineItem = {
   id: string;
   turn: bigint;
@@ -1126,7 +1127,7 @@ function promptTokenAtCaret(text: string, selectionStart: number, selectionEnd: 
     end += 1;
   }
 
-  return { start, end, query, target: "prompts", kinds: ["prompt"] };
+  return { start, end, query, cursor: selectionStart - start - 1, target: "prompts", kinds: ["prompt"] };
 }
 
 function resourceTokenAtCaret(text: string, selectionStart: number, selectionEnd: number): ActiveTemplateToken | undefined {
@@ -1143,6 +1144,11 @@ function resourceTokenAtCaret(text: string, selectionStart: number, selectionEnd
     return undefined;
   }
 
+  const resourceReference = resourceReferenceTokenAtCaret(text, start, selectionStart);
+  if (resourceReference) {
+    return resourceReference;
+  }
+
   const query = text.slice(start + 1, selectionStart);
   if (!query || hasWhitespace(query)) {
     return undefined;
@@ -1153,7 +1159,27 @@ function resourceTokenAtCaret(text: string, selectionStart: number, selectionEnd
     end += 1;
   }
 
-  return { start, end, query, target: "resources", kinds: ["file", "tool"] };
+  return { start, end, query, cursor: selectionStart - start - 1, target: "resources", kinds: ["file", "tool", "resource"] };
+}
+
+function resourceReferenceTokenAtCaret(text: string, start: number, cursor: number): ActiveTemplateToken | undefined {
+  if (!text.startsWith("@resource(", start)) {
+    return undefined;
+  }
+
+  const end = balancedResourceTokenEnd(text, start + "@resource(".length);
+  if (end === undefined || cursor > end) {
+    return undefined;
+  }
+
+  return {
+    start,
+    end,
+    query: text.slice(start, end),
+    cursor: cursor - start,
+    target: "resources",
+    kinds: ["resource"],
+  };
 }
 
 function highlightTemplateTokens(text: string): JSX.Element[] {
@@ -1279,6 +1305,9 @@ function resourceTemplateTokenEnd(text: string, start: number) {
   if (text.startsWith("@tool(", start)) {
     return balancedToolTokenEnd(text, start + "@tool(".length);
   }
+  if (text.startsWith("@resource(", start)) {
+    return balancedResourceTokenEnd(text, start + "@resource(".length);
+  }
 
   let end = start + 1;
   while (end < text.length && !isWhitespace(text[end])) {
@@ -1307,6 +1336,14 @@ function quotedResourceTokenEnd(text: string, start: number) {
 }
 
 function balancedToolTokenEnd(text: string, start: number) {
+  return balancedCallTokenEnd(text, start);
+}
+
+function balancedResourceTokenEnd(text: string, start: number) {
+  return balancedCallTokenEnd(text, start);
+}
+
+function balancedCallTokenEnd(text: string, start: number) {
   let depth = 1;
   let quote: string | undefined;
   let escaped = false;

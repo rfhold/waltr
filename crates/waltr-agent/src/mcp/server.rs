@@ -14,7 +14,11 @@ use super::{
     log::McpLogLevel,
     prompt::{McpPromptDefinition, format_prompt_result, parse_prompt_definition},
     protocol::{JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION, protocol_error},
-    resource::{McpResourceDefinition, format_resource_result, parse_resource_definition},
+    resource::{
+        McpCompletionResult, McpResourceDefinition, McpResourceTemplateDefinition,
+        format_resource_result, parse_completion_result, parse_resource_definition,
+        parse_resource_template_definition,
+    },
     tool::{McpToolDefinition, format_tool_result, parse_tool_definition},
 };
 
@@ -33,6 +37,7 @@ pub(in crate::mcp) struct McpPromptRegistry {
 #[derive(Debug, Clone, Default)]
 pub(in crate::mcp) struct McpResourceRegistry {
     pub(in crate::mcp) resources: BTreeMap<String, McpResourceDefinition>,
+    pub(in crate::mcp) resource_templates: BTreeMap<String, McpResourceTemplateDefinition>,
     pub(in crate::mcp) generation: u64,
 }
 
@@ -154,6 +159,17 @@ impl McpServerRuntime {
             .collect()
     }
 
+    pub(in crate::mcp) async fn resource_templates(&self) -> Vec<McpResourceTemplateDefinition> {
+        self.state
+            .lock()
+            .await
+            .resources
+            .resource_templates
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub(in crate::mcp) async fn call_tool(
         &self,
         tool: &str,
@@ -238,6 +254,47 @@ impl McpServerRuntime {
             )
             .await?;
         Ok(format_resource_result(&response))
+    }
+
+    pub(in crate::mcp) async fn complete_resource_template(
+        &self,
+        uri_template: &str,
+        argument_name: &str,
+        argument_value: &str,
+        context_arguments: serde_json::Map<String, Value>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Option<McpCompletionResult>> {
+        self.ensure_initialized(cancellation_token.clone()).await?;
+        if !self.state.lock().await.capabilities.completions {
+            return Ok(None);
+        }
+
+        let mut params = json!({
+            "ref": {
+                "type": "ref/resource",
+                "uri": uri_template,
+            },
+            "argument": {
+                "name": argument_name,
+                "value": argument_value,
+            },
+        });
+        if !context_arguments.is_empty() {
+            params["context"] = json!({
+                "arguments": context_arguments,
+            });
+        }
+
+        let response = self
+            .connection
+            .request(
+                "completion/complete",
+                Some(params),
+                self.timeout,
+                cancellation_token,
+            )
+            .await?;
+        Ok(Some(parse_completion_result(&response)))
     }
 
     async fn ensure_initialized(&self, cancellation_token: CancellationToken) -> Result<()> {
@@ -435,6 +492,55 @@ impl McpServerRuntime {
         }
         let mut state = self.state.lock().await;
         state.resources.resources = resources;
+        state.resources.generation += 1;
+        drop(state);
+        self.refresh_resource_templates(cancellation_token).await?;
+        Ok(())
+    }
+
+    async fn refresh_resource_templates(
+        &self,
+        cancellation_token: CancellationToken,
+    ) -> Result<()> {
+        if self.state.lock().await.capabilities.resources.is_none() {
+            return Ok(());
+        }
+        let mut cursor = None;
+        let mut resource_templates = BTreeMap::new();
+        loop {
+            let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
+            let response = self
+                .connection
+                .request(
+                    "resources/templates/list",
+                    params,
+                    self.timeout,
+                    cancellation_token.clone(),
+                )
+                .await?;
+            for resource_template in response
+                .get("resourceTemplates")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(resource_template) =
+                    parse_resource_template_definition(resource_template)
+                {
+                    resource_templates
+                        .insert(resource_template.uri_template.clone(), resource_template);
+                }
+            }
+            cursor = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        let mut state = self.state.lock().await;
+        state.resources.resource_templates = resource_templates;
         state.resources.generation += 1;
         Ok(())
     }

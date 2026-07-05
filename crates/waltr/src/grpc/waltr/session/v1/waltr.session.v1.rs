@@ -184,6 +184,8 @@ pub struct SearchSessionTemplatesRequest {
     pub kinds: ::prost::alloc::vec::Vec<i32>,
     #[prost(enumeration="SessionTemplateSearchTarget", tag="6")]
     pub target: i32,
+    #[prost(uint32, optional, tag="7")]
+    pub cursor: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SearchSessionTemplatesResponse {
@@ -499,6 +501,7 @@ pub enum SessionTemplateKind {
     File = 1,
     Tool = 2,
     Prompt = 3,
+    Resource = 4,
 }
 impl SessionTemplateKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -511,6 +514,7 @@ impl SessionTemplateKind {
             Self::File => "SESSION_TEMPLATE_KIND_FILE",
             Self::Tool => "SESSION_TEMPLATE_KIND_TOOL",
             Self::Prompt => "SESSION_TEMPLATE_KIND_PROMPT",
+            Self::Resource => "SESSION_TEMPLATE_KIND_RESOURCE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -520,6 +524,7 @@ impl SessionTemplateKind {
             "SESSION_TEMPLATE_KIND_FILE" => Some(Self::File),
             "SESSION_TEMPLATE_KIND_TOOL" => Some(Self::Tool),
             "SESSION_TEMPLATE_KIND_PROMPT" => Some(Self::Prompt),
+            "SESSION_TEMPLATE_KIND_RESOURCE" => Some(Self::Resource),
             _ => None,
         }
     }

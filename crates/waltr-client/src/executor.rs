@@ -290,6 +290,7 @@ impl GrpcEffectExecutor {
                 limit,
                 kinds,
                 target,
+                cursor,
             }) => match self
                 .transport
                 .search_session_templates(SearchSessionTemplatesRequest {
@@ -299,6 +300,7 @@ impl GrpcEffectExecutor {
                     limit,
                     kinds: kinds.into_iter().map(|kind| kind as i32).collect(),
                     target: target as i32,
+                    cursor,
                 })
                 .await
             {

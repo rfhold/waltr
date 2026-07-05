@@ -140,6 +140,8 @@ pub enum ClientCommand {
         kinds: Vec<ClientSessionTemplateKind>,
         /// Template search target.
         target: ClientSessionTemplateSearchTarget,
+        /// Cursor byte offset relative to query for context-aware completions.
+        cursor: Option<u32>,
     },
     /// Register interest in timeline updates for one session.
     RegisterSessionTimelineWatchInterest {
@@ -251,6 +253,8 @@ pub enum ClientSessionTemplateKind {
     File,
     /// Tool templates visible to the session.
     Tool,
+    /// MCP resource templates visible to the session.
+    Resource,
     /// Prompt templates visible to the session.
     Prompt,
 }
@@ -1135,10 +1139,10 @@ impl ClientStateStream {
                 limit,
                 kinds,
                 target,
-            } => self
-                .runtime
-                .reducer
-                .search_session_templates(request_id, session_id, query, limit, kinds, target),
+                cursor,
+            } => self.runtime.reducer.search_session_templates(
+                request_id, session_id, query, limit, kinds, target, cursor,
+            ),
             ClientCommand::RegisterSessionWatchInterest => {
                 self.runtime.reducer.register_session_watch_interest()
             }

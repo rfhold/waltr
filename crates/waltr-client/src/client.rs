@@ -568,6 +568,7 @@ impl Client {
         limit: u32,
         kinds: Vec<ClientSessionTemplateKind>,
         target: ClientSessionTemplateSearchTarget,
+        cursor: Option<u32>,
     ) -> ClientUpdate {
         self.apply(ClientEvent::Session(
             SessionEvent::TemplatesSearchRequested {
@@ -577,6 +578,7 @@ impl Client {
                 limit,
                 kinds: kinds.into_iter().map(session_template_kind).collect(),
                 target: session_template_search_target(target),
+                cursor,
             },
         ))
     }
@@ -809,6 +811,7 @@ const fn session_template_kind(kind: ClientSessionTemplateKind) -> crate::Sessio
     match kind {
         ClientSessionTemplateKind::File => crate::SessionTemplateKind::File,
         ClientSessionTemplateKind::Tool => crate::SessionTemplateKind::Tool,
+        ClientSessionTemplateKind::Resource => crate::SessionTemplateKind::Resource,
         ClientSessionTemplateKind::Prompt => crate::SessionTemplateKind::Prompt,
     }
 }
@@ -1050,6 +1053,7 @@ mod tests {
                 ClientSessionTemplateKind::Tool,
             ],
             ClientSessionTemplateSearchTarget::Resources,
+            Some(3),
         );
 
         let search = client
@@ -1070,6 +1074,7 @@ mod tests {
                 limit: 8,
                 kinds: vec![SessionTemplateKind::File, SessionTemplateKind::Tool],
                 target: crate::SessionTemplateSearchTarget::Resources,
+                cursor: Some(3),
             })]
         );
     }
@@ -1084,6 +1089,7 @@ mod tests {
             8,
             vec![ClientSessionTemplateKind::File],
             ClientSessionTemplateSearchTarget::Resources,
+            None,
         );
 
         let update = client.apply(ClientEvent::Session(SessionEvent::TemplatesSearched {
@@ -1114,6 +1120,7 @@ mod tests {
             8,
             vec![ClientSessionTemplateKind::File],
             ClientSessionTemplateSearchTarget::Resources,
+            None,
         );
 
         client.apply(ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
@@ -1143,6 +1150,7 @@ mod tests {
             8,
             vec![ClientSessionTemplateKind::File],
             ClientSessionTemplateSearchTarget::Resources,
+            None,
         );
         client.search_session_templates(
             "resource-search-2",
@@ -1151,6 +1159,7 @@ mod tests {
             8,
             vec![ClientSessionTemplateKind::File],
             ClientSessionTemplateSearchTarget::Resources,
+            None,
         );
 
         client.apply(ClientEvent::Session(SessionEvent::TemplatesSearched {

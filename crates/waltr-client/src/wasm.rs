@@ -176,6 +176,7 @@ impl WaltrClient {
                     .map(template_kind_to_proto)
                     .collect(),
                 target: template_search_target_to_proto(request.target),
+                cursor: request.cursor,
             })
             .await
             .map(SessionTemplateSearchResponse::from)
@@ -285,6 +286,7 @@ struct SessionTemplateSearchRequest {
     kinds: Vec<SessionTemplateKind>,
     #[serde(default)]
     target: SessionTemplateSearchTarget,
+    cursor: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +294,7 @@ struct SessionTemplateSearchRequest {
 enum SessionTemplateKind {
     File,
     Tool,
+    Resource,
     Prompt,
 }
 
@@ -371,6 +374,7 @@ fn template_kind_to_proto(kind: SessionTemplateKind) -> i32 {
     match kind {
         SessionTemplateKind::File => session_proto::SessionTemplateKind::File as i32,
         SessionTemplateKind::Tool => session_proto::SessionTemplateKind::Tool as i32,
+        SessionTemplateKind::Resource => session_proto::SessionTemplateKind::Resource as i32,
         SessionTemplateKind::Prompt => session_proto::SessionTemplateKind::Prompt as i32,
     }
 }

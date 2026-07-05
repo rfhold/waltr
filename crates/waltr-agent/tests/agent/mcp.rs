@@ -335,6 +335,7 @@ async fn mcp_prompt_templates_are_discovered_from_stdio_server() -> waltr_agent:
                 limit: 20,
                 kinds: vec![SessionTemplateKind::Prompt],
                 target: SessionTemplateSearchTarget::Prompts,
+                cursor: None,
             },
         )
         .await?;
@@ -461,6 +462,7 @@ async fn mcp_resource_templates_are_discovered_from_stdio_server() -> waltr_agen
                 limit: 20,
                 kinds: vec![SessionTemplateKind::Resource],
                 target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
             },
         )
         .await?;
@@ -474,6 +476,102 @@ async fn mcp_resource_templates_are_discovered_from_stdio_server() -> waltr_agen
     assert_eq!(resource.metadata["server"], "stdio_test");
     assert_eq!(resource.metadata["uri"], "test://status");
     assert_eq!(resource.metadata["mimeType"], "text/plain");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_uri_resource_templates_are_discovered_from_stdio_server() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::new(
+        "mcp_uri_resource_search_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    ));
+    let sessions = mcp_sessions(provider);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![stdio_runtime_server(
+                &stdio_command,
+            )])),
+        )
+        .await?;
+
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query: "item".to_owned(),
+                limit: 20,
+                kinds: vec![SessionTemplateKind::Resource],
+                target: SessionTemplateSearchTarget::Resources,
+                cursor: None,
+            },
+        )
+        .await?;
+
+    let resource = options
+        .iter()
+        .find(|option| option.template == "@resource(stdio_test, \"test://items/{id}\")")
+        .unwrap_or_else(|| panic!("expected item resource URI template: {options:#?}"));
+    assert_eq!(resource.kind, SessionTemplateKind::Resource);
+    assert_eq!(resource.metadata["resourceType"], "mcp_template");
+    assert_eq!(resource.metadata["server"], "stdio_test");
+    assert_eq!(resource.metadata["uriTemplate"], "test://items/{id}");
+    assert_eq!(resource.metadata["mimeType"], "text/plain");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_uri_resource_template_completions_are_search_options() -> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::new(
+        "mcp_uri_resource_completion_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    ));
+    let sessions = mcp_sessions(provider);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![stdio_runtime_server(
+                &stdio_command,
+            )])),
+        )
+        .await?;
+
+    let query = "@resource(stdio_test, \"test://items/4\")".to_owned();
+    let cursor = query.rfind('"').expect("query contains closing quote");
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query,
+                cursor: Some(cursor),
+                limit: 20,
+                kinds: vec![SessionTemplateKind::Resource],
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await?;
+
+    let completion = options
+        .iter()
+        .find(|option| option.template == "@resource(stdio_test, \"test://items/42\")")
+        .unwrap_or_else(|| panic!("expected item resource URI completion: {options:#?}"));
+    assert_eq!(completion.kind, SessionTemplateKind::Resource);
+    assert_eq!(completion.label, "42");
+    assert_eq!(completion.detail, "test://items/42");
+    assert_eq!(
+        completion.metadata["resourceType"],
+        "mcp_template_completion"
+    );
+    assert_eq!(completion.metadata["server"], "stdio_test");
+    assert_eq!(completion.metadata["uriTemplate"], "test://items/{id}");
+    assert_eq!(completion.metadata["argument"], "id");
+    assert_eq!(completion.metadata["value"], "42");
 
     Ok(())
 }
@@ -516,6 +614,49 @@ async fn mcp_resource_template_renders_before_provider_request() -> waltr_agent:
     );
     assert!(session.tool_calls.is_empty(), "{session:#?}");
     assert!(session.text.contains("resource-render-complete"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_uri_resource_template_renders_filled_uri_before_provider_request()
+-> waltr_agent::Result<()> {
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_uri_resource_render_provider",
+        |_| {
+            vec![
+                Ok(CompletionEvent::Delta(
+                    "resource-template-render-complete".to_owned(),
+                )),
+                Ok(CompletionEvent::Finished),
+            ]
+        },
+    )));
+    let sessions = mcp_sessions(provider.clone());
+    let session = run_session_prompt(
+        &sessions,
+        "Read @resource(stdio_test, \"test://items/42\") before answering.",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+    let prompts = provider.request_prompts();
+    let rendered = prompts
+        .first()
+        .unwrap_or_else(|| panic!("expected captured provider prompt"));
+
+    assert!(
+        rendered.contains("stdio-mcp-resource-template-item-42-717"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "<template-result kind=\"mcp_resource\" source=\"stdio_test:test://items/42\">"
+        ),
+        "{rendered}"
+    );
+    assert!(session.tool_calls.is_empty(), "{session:#?}");
+    assert!(session.text.contains("resource-template-render-complete"));
 
     Ok(())
 }

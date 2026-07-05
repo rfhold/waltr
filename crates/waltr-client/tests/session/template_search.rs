@@ -24,6 +24,7 @@ async fn transport_returns_session_template_search_results()
             limit: 10,
             kinds: vec![SessionTemplateKind::Tool as i32],
             target: SessionTemplateSearchTarget::Resources as i32,
+            cursor: None,
         })
         .await?;
     assert_eq!(response.request_id, "tool");

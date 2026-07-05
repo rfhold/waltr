@@ -147,6 +147,7 @@ message SearchSessionTemplatesRequest {
   uint32 limit = 4;
   repeated SessionTemplateKind kinds = 5;
   SessionTemplateSearchTarget target = 6;
+  optional uint32 cursor = 7;
 }
 
 message SearchSessionTemplatesResponse {
@@ -180,6 +181,7 @@ enum SessionTemplateKind {
   SESSION_TEMPLATE_KIND_FILE = 1;
   SESSION_TEMPLATE_KIND_TOOL = 2;
   SESSION_TEMPLATE_KIND_PROMPT = 3;
+  SESSION_TEMPLATE_KIND_RESOURCE = 4;
 }
 
 enum SessionTemplateSearchTarget {

@@ -188,6 +188,8 @@ pub enum SessionEvent {
         kinds: Vec<SessionTemplateKind>,
         /// Template search target.
         target: SessionTemplateSearchTarget,
+        /// Cursor byte offset relative to query for context-aware completions.
+        cursor: Option<u32>,
     },
     /// Resource search completed successfully.
     TemplatesSearched {
@@ -481,6 +483,8 @@ pub enum SessionEffect {
         kinds: Vec<SessionTemplateKind>,
         /// Template search target.
         target: SessionTemplateSearchTarget,
+        /// Cursor byte offset relative to query for context-aware completions.
+        cursor: Option<u32>,
     },
     /// Open or continue the session watch stream.
     Watch,
