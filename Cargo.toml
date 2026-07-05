@@ -6,6 +6,7 @@ members = [
     "crates/waltr-server",
     "crates/waltr-tui",
     "crates/waltr-web",
+    "crates/mcp",
 ]
 resolver = "3"
 
@@ -31,6 +32,7 @@ waltr = { version = "0.1.0", path = "crates/waltr" }
 waltr-agent = { version = "0.1.0", path = "crates/waltr-agent" }
 waltr-client = { version = "0.1.0", path = "crates/waltr-client" }
 waltr-server = { version = "0.1.0", path = "crates/waltr-server" }
+mcp = { version = "0.1.0", path = "crates/mcp" }
 notify = "8.2.0"
 opentelemetry = "0.32.0"
 opentelemetry-appender-tracing = "0.32.0"
