@@ -89,6 +89,7 @@ pub struct McpClient {
     connection: Arc<McpConnection>,
     timeout: Duration,
     capabilities: McpServerCapabilities,
+    instructions: Option<String>,
     trace_propagation: McpTracePropagation,
 }
 
@@ -133,12 +134,18 @@ impl McpClient {
             )));
         }
         let capabilities = McpServerCapabilities::parse(initialize.get("capabilities"));
+        let instructions = initialize
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|instructions| !instructions.trim().is_empty());
         connection.mark_initialized().await;
         connection.notify("notifications/initialized", None).await?;
         Ok(Self {
             connection,
             timeout: options.timeout,
             capabilities,
+            instructions,
             trace_propagation,
         })
     }
@@ -147,6 +154,12 @@ impl McpClient {
     #[must_use]
     pub fn capabilities(&self) -> &McpServerCapabilities {
         &self.capabilities
+    }
+
+    /// Return optional server instructions from the initialize response.
+    #[must_use]
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 
     /// Call a server tool.

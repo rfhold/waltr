@@ -302,6 +302,10 @@ pub trait ServerHandler: Send + Sync + 'static {
     fn server_info(&self) -> ServerInfo;
     /// Server capabilities.
     fn capabilities(&self) -> ServerCapabilities;
+    /// Optional instructions sent to clients during initialize.
+    fn instructions(&self) -> Option<String> {
+        None
+    }
     /// List tools.
     fn list_tools(
         &self,
@@ -695,17 +699,23 @@ async fn handle_request(
     context: ServerContext,
 ) -> Value {
     match request.method.as_str() {
-        "initialize" => json_rpc_success(
-            request.id,
-            json!({
+        "initialize" => {
+            let mut result = json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": handler.capabilities().to_value(),
                 "serverInfo": {
                     "name": handler.server_info().name,
                     "version": handler.server_info().version,
                 }
-            }),
-        ),
+            });
+            if let Some(instructions) = handler
+                .instructions()
+                .filter(|instructions| !instructions.trim().is_empty())
+            {
+                result["instructions"] = Value::String(instructions);
+            }
+            json_rpc_success(request.id, result)
+        }
         "ping" => json_rpc_success(request.id, json!({})),
         method if method.starts_with("notifications/") => {
             tracing::debug!(

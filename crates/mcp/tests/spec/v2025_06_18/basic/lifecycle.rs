@@ -14,12 +14,23 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct LifecycleServer {
     notifications: Arc<Mutex<Vec<String>>>,
+    instructions: Option<String>,
 }
 
 impl Default for LifecycleServer {
     fn default() -> Self {
         Self {
             notifications: Arc::new(Mutex::new(Vec::new())),
+            instructions: None,
+        }
+    }
+}
+
+impl LifecycleServer {
+    fn with_instructions(instructions: impl Into<String>) -> Self {
+        Self {
+            notifications: Arc::new(Mutex::new(Vec::new())),
+            instructions: Some(instructions.into()),
         }
     }
 }
@@ -35,6 +46,10 @@ impl ServerHandler for LifecycleServer {
             .prompts()
             .resources()
             .logging()
+    }
+
+    fn instructions(&self) -> Option<String> {
+        self.instructions.clone()
     }
 
     fn handle_notification(
@@ -102,8 +117,67 @@ async fn initialize_returns_protocol_capabilities_and_server_info() -> mcp::Resu
             "tools": { "listChanged": false },
         })
     );
+    assert!(response.body["result"].get("instructions").is_none());
     assert!(response.body.get("error").is_none());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn initialize_returns_server_instructions_when_available() -> mcp::Result<()> {
+    let server = SpecServer::start(Arc::new(LifecycleServer::with_instructions(
+        "Use this server for lifecycle-marker requests.",
+    )))
+    .await?;
+
+    let response = post_json(
+        &server.endpoint(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": "initialize-with-instructions",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "mcp-spec-client", "version": "1.0.0" },
+            },
+        }),
+    )
+    .await?;
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response.body["result"]["instructions"],
+        "Use this server for lifecycle-marker requests."
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_exposes_server_instructions() -> mcp::Result<()> {
+    let server = SpecServer::start(Arc::new(LifecycleServer::with_instructions(
+        "Prefer lifecycle-marker tools.",
+    )))
+    .await?;
+
+    let client = McpClient::connect(
+        "mcp-spec-server",
+        McpTransportConfig::StreamableHttp {
+            endpoint: server.endpoint(),
+        },
+        Arc::new(LifecycleClient),
+        McpClientOptions::new("mcp-spec-client", "1.0.0", Duration::from_secs(5)),
+        CancellationToken::new(),
+    )
+    .await?;
+
+    assert_eq!(
+        client.instructions(),
+        Some("Prefer lifecycle-marker tools.")
+    );
+
+    client.shutdown().await;
     Ok(())
 }
 
