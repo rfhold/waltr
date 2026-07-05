@@ -32,6 +32,12 @@ pub(crate) struct McpServerResourceTemplateDefinition {
     pub(crate) resource_template: McpResourceTemplateDefinition,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpServerInstructions {
+    pub(crate) server_name: String,
+    pub(crate) instructions: String,
+}
+
 pub(crate) struct McpClientRuntime {
     servers: BTreeMap<String, Arc<McpServerRuntime>>,
     #[allow(dead_code)]
@@ -171,6 +177,19 @@ impl McpClientRuntime {
             }
         }
         resource_templates
+    }
+
+    pub(crate) async fn instructions(&self) -> Vec<McpServerInstructions> {
+        let mut instructions = Vec::new();
+        for server in self.servers.values() {
+            if let Some(server_instructions) = server.instructions().await {
+                instructions.push(McpServerInstructions {
+                    server_name: server.name().to_owned(),
+                    instructions: server_instructions,
+                });
+            }
+        }
+        instructions
     }
 
     pub(crate) fn has_server(&self, server_name: &str) -> bool {

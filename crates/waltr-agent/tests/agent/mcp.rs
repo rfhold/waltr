@@ -872,6 +872,95 @@ async fn mcp_resources_are_not_surfaced_as_provider_tools() -> waltr_agent::Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn mcp_server_instructions_are_added_to_system_prompt() -> waltr_agent::Result<()> {
+    let server = HttpMcpTestServer::start_with_instructions(
+        "Prefer http marker tools for instruction-test requests.",
+    )
+    .await?;
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_instructions_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    )));
+    let sessions = mcp_sessions(provider.clone());
+
+    run_session_prompt(
+        &sessions,
+        "check MCP instructions",
+        vec![http_runtime_server(&server)],
+    )
+    .await?;
+
+    let system_prompt = captured_system_prompt(&provider);
+    assert!(
+        system_prompt.contains("MCP server instructions from `http_test`:"),
+        "{system_prompt}"
+    );
+    assert!(
+        system_prompt.contains("Prefer http marker tools for instruction-test requests."),
+        "{system_prompt}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_server_instructions_are_ordered_by_server_key() -> waltr_agent::Result<()> {
+    let alpha = HttpMcpTestServer::start_with_instructions("alpha instructions marker").await?;
+    let beta = HttpMcpTestServer::start_with_instructions("beta instructions marker").await?;
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_ordered_instructions_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    )));
+    let sessions = mcp_sessions(provider.clone());
+
+    run_session_prompt(
+        &sessions,
+        "check ordered MCP instructions",
+        vec![
+            http_runtime_server_with_key("beta", &beta),
+            http_runtime_server_with_key("alpha", &alpha),
+        ],
+    )
+    .await?;
+
+    let system_prompt = captured_system_prompt(&provider);
+    let alpha_index = system_prompt
+        .find("MCP server instructions from `alpha`:")
+        .expect("alpha instructions");
+    let beta_index = system_prompt
+        .find("MCP server instructions from `beta`:")
+        .expect("beta instructions");
+    assert!(alpha_index < beta_index, "{system_prompt}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_server_instructions_can_be_disabled_on_factory() -> waltr_agent::Result<()> {
+    let server = HttpMcpTestServer::start_with_instructions("disabled instructions marker").await?;
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_disabled_instructions_provider",
+        |_| vec![Ok(CompletionEvent::Finished)],
+    )));
+    let sessions = mcp_sessions_with_instructions_enabled(provider.clone(), false);
+
+    run_session_prompt(
+        &sessions,
+        "check disabled MCP instructions",
+        vec![http_runtime_server(&server)],
+    )
+    .await?;
+
+    let system_prompt = captured_system_prompt(&provider);
+    assert!(
+        !system_prompt.contains("disabled instructions marker"),
+        "{system_prompt}"
+    );
+
+    Ok(())
+}
+
 fn stdio_runtime_server(command: &str) -> SessionMcpServerRuntimeSettings {
     SessionMcpServerRuntimeSettings {
         key: "stdio_test".to_owned(),
@@ -882,8 +971,15 @@ fn stdio_runtime_server(command: &str) -> SessionMcpServerRuntimeSettings {
 }
 
 fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSettings {
+    http_runtime_server_with_key("http_test", server)
+}
+
+fn http_runtime_server_with_key(
+    key: &str,
+    server: &HttpMcpTestServer,
+) -> SessionMcpServerRuntimeSettings {
     SessionMcpServerRuntimeSettings {
-        key: "http_test".to_owned(),
+        key: key.to_owned(),
         kind: SessionMcpServerRuntimeKind::StreamableHttp,
         command: String::new(),
         url: server.endpoint.clone(),
@@ -891,16 +987,36 @@ fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSet
 }
 
 fn mcp_sessions(provider: Arc<impl LlmStream + 'static>) -> SessionCoordinator<MemorySessionStore> {
-    mcp_sessions_with_store(MemorySessionStore::new(), provider)
+    mcp_sessions_with_instructions_enabled(provider, true)
+}
+
+fn mcp_sessions_with_instructions_enabled(
+    provider: Arc<impl LlmStream + 'static>,
+    instructions_enabled: bool,
+) -> SessionCoordinator<MemorySessionStore> {
+    mcp_sessions_with_store_and_instructions_enabled(
+        MemorySessionStore::new(),
+        provider,
+        instructions_enabled,
+    )
 }
 
 fn mcp_sessions_with_store(
     store: MemorySessionStore,
     provider: Arc<impl LlmStream + 'static>,
 ) -> SessionCoordinator<MemorySessionStore> {
+    mcp_sessions_with_store_and_instructions_enabled(store, provider, true)
+}
+
+fn mcp_sessions_with_store_and_instructions_enabled(
+    store: MemorySessionStore,
+    provider: Arc<impl LlmStream + 'static>,
+    instructions_enabled: bool,
+) -> SessionCoordinator<MemorySessionStore> {
     let root = tempfile::tempdir().expect("tempdir").keep();
     let credentials = FileCredentialStore::new(root.join("credentials.json"));
     let factory = AgentSessionRuntimeFactory::new(root, credentials)
+        .with_mcp_server_instructions_enabled(instructions_enabled)
         .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
     SessionCoordinator::new(store).with_runtime_factory(factory)
 }
@@ -1004,6 +1120,15 @@ fn test_session_from_timeline(timeline: Vec<AgentTimelineEvent>) -> AgentTestSes
     session
 }
 
+fn captured_system_prompt(provider: &CapturingProvider<impl LlmStream>) -> String {
+    provider
+        .system_prompts()
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or_default()
+}
+
 fn direct_events(step: usize) -> Vec<waltr_agent::Result<CompletionEvent>> {
     match step {
         0 => vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
@@ -1091,16 +1216,30 @@ struct HttpMcpTestServer {
 
 impl HttpMcpTestServer {
     async fn start() -> waltr_agent::Result<Self> {
+        Self::start_with_optional_instructions(None).await
+    }
+
+    async fn start_with_instructions(instructions: &str) -> waltr_agent::Result<Self> {
+        Self::start_with_optional_instructions(Some(instructions)).await
+    }
+
+    async fn start_with_optional_instructions(
+        instructions: Option<&str>,
+    ) -> waltr_agent::Result<Self> {
         let temp = tempfile::tempdir()?;
         let address_file = temp.path().join("mcp-http-address.txt");
-        let mut child = std::process::Command::new(test_stdio_server_command())
+        let mut command = std::process::Command::new(test_stdio_server_command());
+        command
             .arg("--http")
             .arg("127.0.0.1:0")
             .arg(&address_file)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+            .stderr(std::process::Stdio::null());
+        if let Some(instructions) = instructions {
+            command.env("WALTR_TEST_MCP_INSTRUCTIONS", instructions);
+        }
+        let mut child = command.spawn()?;
         let address = wait_for_http_address(&mut child, &address_file).await?;
         Ok(Self {
             endpoint: format!("http://{address}/mcp"),

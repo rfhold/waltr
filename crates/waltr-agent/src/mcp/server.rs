@@ -51,6 +51,7 @@ pub(in crate::mcp) struct McpServerRuntime {
 struct McpServerState {
     initialized: bool,
     capabilities: McpServerCapabilities,
+    instructions: Option<String>,
     tools: McpToolRegistry,
     prompts: McpPromptRegistry,
     resources: McpResourceRegistry,
@@ -62,6 +63,7 @@ impl Default for McpServerState {
         Self {
             initialized: false,
             capabilities: McpServerCapabilities::default(),
+            instructions: None,
             tools: McpToolRegistry::default(),
             prompts: McpPromptRegistry::default(),
             resources: McpResourceRegistry::default(),
@@ -168,6 +170,10 @@ impl McpServerRuntime {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub(in crate::mcp) async fn instructions(&self) -> Option<String> {
+        self.state.lock().await.instructions.clone()
     }
 
     pub(in crate::mcp) async fn call_tool(
@@ -304,9 +310,11 @@ impl McpServerRuntime {
             return Ok(());
         }
         let capabilities = self.client.capabilities().clone();
+        let instructions = self.client.instructions().map(str::to_owned);
         {
             let mut state = self.state.lock().await;
             state.capabilities = capabilities;
+            state.instructions = instructions;
             state.initialized = true;
         }
         self.configure_logging(cancellation_token.clone()).await?;

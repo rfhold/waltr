@@ -44,6 +44,7 @@ pub struct AgentSessionRuntimeFactory {
     /// Credential store used for provider auth.
     pub credential_store: FileCredentialStore,
     task_max_subagent_depth: usize,
+    mcp_server_instructions_enabled: bool,
     runtime_builder_override: Option<RuntimeBuilderOverride>,
 }
 
@@ -54,6 +55,10 @@ impl std::fmt::Debug for AgentSessionRuntimeFactory {
             .field("root", &self.root)
             .field("credential_store", &self.credential_store)
             .field("task_max_subagent_depth", &self.task_max_subagent_depth)
+            .field(
+                "mcp_server_instructions_enabled",
+                &self.mcp_server_instructions_enabled,
+            )
             .field(
                 "runtime_builder_override",
                 &self.runtime_builder_override.as_ref().map(|_| "<override>"),
@@ -70,6 +75,7 @@ impl AgentSessionRuntimeFactory {
             root,
             credential_store,
             task_max_subagent_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            mcp_server_instructions_enabled: true,
             runtime_builder_override: None,
         }
     }
@@ -78,6 +84,13 @@ impl AgentSessionRuntimeFactory {
     #[must_use]
     pub const fn with_task_max_subagent_depth(mut self, max_subagent_depth: usize) -> Self {
         self.task_max_subagent_depth = max_subagent_depth;
+        self
+    }
+
+    /// Enable or disable adding MCP server instructions to the system prompt.
+    #[must_use]
+    pub const fn with_mcp_server_instructions_enabled(mut self, enabled: bool) -> Self {
+        self.mcp_server_instructions_enabled = enabled;
         self
     }
 
@@ -147,6 +160,13 @@ impl AgentSessionRuntimeFactory {
         if let Some(mcp_runtime) = mcp_runtime {
             for tool in mcp_runtime.agent_tools().await {
                 builder = builder.with_tool(tool);
+            }
+            if self.mcp_server_instructions_enabled {
+                builder = builder.with_middleware(
+                    crate::middleware::mcp_instructions::McpInstructionsMiddleware::new(
+                        Arc::clone(&mcp_runtime),
+                    ),
+                );
             }
             builder = builder
                 .with_middleware(
