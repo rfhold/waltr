@@ -2892,10 +2892,12 @@ dependencies = [
  "http 1.4.1",
  "httpdate",
  "ignore",
+ "mcp",
  "opendal",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "refinery",
  "reqwest",
- "rmcp",
  "rustls 0.23.40",
  "scylla",
  "serde",
@@ -2909,6 +2911,8 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "tree-sitter",
  "tree-sitter-bash",
  "uuid",
@@ -3190,6 +3194,26 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "mcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "opentelemetry",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "uuid",
+]
 
 [[package]]
 name = "md-5"
@@ -4836,11 +4860,12 @@ checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
 
 [[package]]
 name = "rmcp"
-version = "1.7.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0810a9f717d9828f475fe1f629f4c305c8464b7f496c3a854b58d29e65f4058e"
+checksum = "f00a32c3b81b7b254076a65abd5ab2551209146713ba38f73818657e865e9433"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "futures",
@@ -4850,6 +4875,7 @@ dependencies = [
  "pastey",
  "pin-project-lite",
  "rand 0.10.1",
+ "reqwest",
  "rmcp-macros",
  "schemars 1.2.1",
  "serde",
@@ -4866,9 +4892,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "1.7.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aefac48c364756e97f04c0401ba3231e8607882c7c1d92da0437dc16307904d"
+checksum = "2ee70afb7956da9f30d5348a2539b5eb90d9038f834463657ab717076ac3b1ad"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
