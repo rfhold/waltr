@@ -34,7 +34,7 @@ The crate exports these protocol types through [../../crates/mcp/src/lib.rs](../
 
 ## Client Behavior
 
-`McpClient::connect` starts a configured transport, sends `initialize` with protocol version `2025-06-18`, verifies the server protocol version, stores advertised capabilities, marks the transport initialized, and sends `notifications/initialized`.
+`McpClient::connect` starts a configured transport, sends `initialize` with protocol version `2025-06-18`, verifies the server protocol version, stores advertised capabilities and optional server `instructions`, marks the transport initialized, and sends `notifications/initialized`.
 
 After initialization, typed helpers send protocol requests for tools, prompts, resources, completions, logging, ping, and listing operations. Requests are wrapped by `mcp.client.request` spans; trace propagation is optional and documented in [tracing.md](tracing.md).
 
@@ -43,6 +43,8 @@ The client handler callback surface currently covers roots, list-changed notific
 ## Server Behavior
 
 The typed server API exposes `ServerHandler` methods for initialize, ping, tool listing/calls, prompt listing/get, resource listing/reading, resource-template listing, completions, logging-level updates, and notifications. Handler errors convert to JSON-RPC error responses.
+
+Servers can provide initialize-time instructions with `ServerHandler::instructions`. Empty instructions are omitted from the initialize result. Clients can read non-empty initialize instructions with `McpClient::instructions`.
 
 Server transports create `mcp.server.request` spans for inbound requests and notifications. When a request includes valid trace context in `params._meta`, the server span uses that context as its remote parent.
 
