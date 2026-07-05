@@ -1,6 +1,6 @@
 ---
 name: agent-modification
-description: Helps an agent modify the isolated Waltr agent library when the user asks to change agent loops, providers, tools, permissions, middleware, sessions, or agent tests.
+description: Helps an agent modify the isolated Waltr agent library when the user asks to change agent loops, providers, tools, permissions, middleware, sessions, Waltr-side MCP integration, or agent tests.
 ---
 
 # Agent Modification
@@ -9,13 +9,15 @@ Treat the agent as an isolated hostable library for model interaction, tools, pe
 
 ## When To Use
 
-Use this skill when changing `crates/waltr-agent/`, provider adapters, provider-neutral streaming types, agent loop behavior, middleware, prompt assembly, tools, permissions, MCP integration, durable sessions, timeline events, session storage, or agent library tests.
+Use this skill when changing `crates/waltr-agent/`, provider adapters, provider-neutral streaming types, agent loop behavior, middleware, prompt assembly, tools, permissions, Waltr-side MCP integration, durable sessions, timeline events, session storage, or agent library tests.
 
 Do not use this skill for server coordination, shared client reducers, browser UI, or terminal UI unless the change exposes behavior that belongs in the isolated agent library.
 
+Do not use this skill for generic MCP protocol types, JSON-RPC behavior, typed MCP client/server APIs, transports, trace propagation internals, spec tests, or ecosystem interoperability. Use the mcp-modification skill for those changes.
+
 ## Core Boundary
 
-`waltr-agent` is a normal Rust library boundary. It owns provider-neutral agent configuration, model request and stream types, tool contracts, permission evaluation, middleware hooks, timeline output, and durable session replay. It should not depend on `waltr-server`, `waltr-client`, `waltr-tui`, or `waltr-web`; host layers own server APIs, UI presentation, process lifecycle, and runtime wiring around the library.
+`waltr-agent` is a normal Rust library boundary. It owns provider-neutral agent configuration, model request and stream types, tool contracts, permission evaluation, middleware hooks, timeline output, durable session replay, and Waltr-side MCP runtime adaptation. It should not depend on `waltr-server`, `waltr-client`, `waltr-tui`, or `waltr-web`; host layers own server APIs, UI presentation, process lifecycle, and runtime wiring around the library. It may depend on the generic `mcp` crate, but `mcp` must not depend back on `waltr-agent`.
 
 ## Modification Patterns
 
@@ -27,7 +29,8 @@ Do not use this skill for server coordination, shared client reducers, browser U
 6. Evaluate permission claims before executing host tools that read, write, delete, execute, or otherwise affect external resources.
 7. Preserve deterministic middleware assembly order because it affects prompt construction, tool visibility, and provider request shape.
 8. Base durable session replay on persisted timeline and journal records, not provider-specific transient parser state.
-9. Keep deterministic tests on scripted providers and shared support; reserve real provider and external service behavior for ignored live tests.
+9. Keep MCP protocol changes in `crates/mcp/`; keep conversion into agent tools, prompt templates, resource templates, roots, progress, and sessions in `crates/waltr-agent/src/mcp/`.
+10. Keep deterministic tests on scripted providers and shared support; reserve real provider and external service behavior for ignored live tests.
 
 ## Test Selection
 
@@ -55,6 +58,8 @@ Run ignored live agent tests:
 | Path | Info |
 | --- | --- |
 | [../../../docs/architecture/agent.md](../../../docs/architecture/agent.md) | Agent architecture, boundaries, runtime flow, providers, tools, permissions, middleware, sessions, and invariants. |
+| [../../../docs/agent/mcp.md](../../../docs/agent/mcp.md) | Waltr-side MCP integration and generic MCP handoff. |
+| [../../../docs/mcp/protocol.md](../../../docs/mcp/protocol.md) | Generic MCP crate behavior and boundaries. |
 | [../../../docs/testing.md](../../../docs/testing.md) | Canonical layered test structure, commands, live-test setup, and container-backed test notes. |
 | [../../../crates/waltr-agent/AGENTS.md](../../../crates/waltr-agent/AGENTS.md) | Agent crate isolation boundary and dependency contract. |
 | [../../../crates/waltr-agent/src/lib.rs](../../../crates/waltr-agent/src/lib.rs) | Public exports and module boundary. |
@@ -65,6 +70,8 @@ Run ignored live agent tests:
 | [../../../crates/waltr-agent/src/provider/](../../../crates/waltr-agent/src/provider/) | Provider adapter implementations and provider-specific protocol handling. |
 | [../../../crates/waltr-agent/src/middleware/mod.rs](../../../crates/waltr-agent/src/middleware/mod.rs) | Middleware hook contract for prompt, tools, requests, results, and suspensions. |
 | [../../../crates/waltr-agent/src/tools/mod.rs](../../../crates/waltr-agent/src/tools/mod.rs) | Built-in tool modules. |
+| [../../../crates/waltr-agent/src/mcp/](../../../crates/waltr-agent/src/mcp/) | Waltr-side MCP runtime adaptation. |
+| [../../../crates/mcp/](../../../crates/mcp/) | Generic MCP protocol crate used by agent integration. |
 | [../../../crates/waltr-agent/src/permission/mod.rs](../../../crates/waltr-agent/src/permission/mod.rs) | Permission policy, claims, matching, and effects. |
 | [../../../crates/waltr-agent/tests/AGENTS.md](../../../crates/waltr-agent/tests/AGENTS.md) | Deterministic agent test boundaries and support structure. |
 | [../../../crates/waltr-agent/tests/live/AGENTS.md](../../../crates/waltr-agent/tests/live/AGENTS.md) | Live provider and external service test boundaries. |

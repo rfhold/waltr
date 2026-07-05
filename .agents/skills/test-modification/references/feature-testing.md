@@ -8,6 +8,7 @@ Feature coverage should start at the most isolated layer that owns the behavior,
 
 | Layer | Test Intent |
 | --- | --- |
+| Protocol/library | Generic reusable crate behavior below Waltr-specific layers. |
 | Agent | Agent library behavior from a library consumer's perspective. |
 | Server | Server contract and coordination behavior. |
 | Client | Server plus shared client state-machine behavior. |

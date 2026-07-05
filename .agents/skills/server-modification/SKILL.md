@@ -13,6 +13,8 @@ Use this skill when changing `crates/waltr-server/`, server APIs, gRPC service b
 
 Do not use this skill for client reducer decisions or UI state unless the server contract itself must change.
 
+Use this skill for server-owned MCP configuration validation or resolved session runtime defaults. Use the mcp-modification skill for generic MCP protocol, client/server, transport, trace propagation internals, spec tests, or ecosystem interoperability.
+
 ## Core Boundary
 
 `waltr-server` owns shared coordination and server-side contracts. It exposes RPC services, validates and persists shared state, protects concurrent writes, publishes watch updates, and reports readiness. It should not own browser or terminal UI state, and it should not encode client reducer policy beyond explicit server contract semantics.
