@@ -22,6 +22,10 @@ Build a Rust crate:
 
 `cargo build -p <crate>`
 
+Build the MCP crate:
+
+`cargo build -p mcp`
+
 Build the server:
 
 `cargo build -p waltr-server`
@@ -44,6 +48,14 @@ Run `buf lint` and `buf generate` after changing proto files.
 
 See [docs/testing.md](docs/testing.md) for test structure, commands, layering expectations, live-test setup, and container-backed test notes.
 
+Run MCP spec tests:
+
+`cargo test -p mcp --test spec`
+
+Run all MCP tests:
+
+`cargo test -p mcp --tests`
+
 # Commits
 
 Use Conventional Commits.
@@ -58,6 +70,7 @@ Examples:
 Suggested scopes:
 
 - `agent`
+- `mcp`
 - `client`
 - `server`
 - `tui`
