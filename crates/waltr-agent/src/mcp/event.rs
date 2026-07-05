@@ -1,6 +1,5 @@
+use mcp::McpLogLevel;
 use serde_json::Value;
-
-use super::log::McpLogLevel;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

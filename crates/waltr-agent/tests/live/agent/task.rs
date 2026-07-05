@@ -241,6 +241,7 @@ fn runtime_settings(model: &ModelRef) -> SessionRuntimeSettings {
             reasoning_effort: None,
         },
         mcp_servers: Vec::new(),
+        mcp_trace_propagation: false,
     }
 }
 

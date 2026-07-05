@@ -2,7 +2,6 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::Router;
 use waltr_agent::{
     AgentRuntime, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, FileCredentialStore, LlmError, LlmStream,
@@ -10,15 +9,14 @@ use waltr_agent::{
     SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
     SessionRuntimeSettings, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
 };
-use rmcp::{
-    ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
-    transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+use mcp::{
+    McpToolCall, McpToolDefinition, McpToolList, McpToolResult,
+    server::{
+        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
+        ServerResult, streamable_http_router,
     },
 };
+use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::{live_provider, scripted_provider::CapturingProvider, session::AgentTestSession};
@@ -196,6 +194,7 @@ fn test_runtime_settings(
             reasoning_effort: None,
         },
         mcp_servers,
+        mcp_trace_propagation: false,
     }
 }
 
@@ -259,13 +258,7 @@ impl HttpMcpTestServer {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let service: StreamableHttpService<EchoMarkerServer, LocalSessionManager> =
-            StreamableHttpService::new(
-                || Ok(EchoMarkerServer::new()),
-                Arc::default(),
-                StreamableHttpServerConfig::default().with_sse_keep_alive(None),
-            );
-        let app = Router::new().nest_service("/mcp", service);
+        let app = streamable_http_router(Arc::new(EchoMarkerServer));
         tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
@@ -349,40 +342,62 @@ fn require_timeline_tool_execution(
     })
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
 struct EchoMarkerRequest {
     value: String,
 }
 
 #[derive(Debug, Clone)]
-struct EchoMarkerServer {
-    tool_router: ToolRouter<Self>,
-}
+struct EchoMarkerServer;
 
-impl EchoMarkerServer {
-    fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
-    }
-}
-
-#[tool_router]
-impl EchoMarkerServer {
-    #[tool(name = "echo_marker", description = "Echo a deterministic marker.")]
-    fn echo_marker(
-        &self,
-        Parameters(EchoMarkerRequest { value }): Parameters<EchoMarkerRequest>,
-    ) -> String {
-        let _ = &self.tool_router;
-        value
-    }
-}
-
-#[tool_handler(router = self.tool_router)]
 impl ServerHandler for EchoMarkerServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Echo deterministic test markers")
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo::new("waltr-live-test-mcp-server", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities::new().tools()
+    }
+
+    fn list_tools(
+        &self,
+        _cursor: Option<String>,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<McpToolList>> {
+        Box::pin(async {
+            Ok(McpToolList {
+                tools: vec![McpToolDefinition {
+                    name: "echo_marker".to_owned(),
+                    title: None,
+                    description: Some("Echo a deterministic marker.".to_owned()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "value": { "type": "string" } },
+                        "required": ["value"]
+                    }),
+                    output_schema: None,
+                    annotations: None,
+                }],
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn call_tool(
+        &self,
+        call: McpToolCall,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<McpToolResult>> {
+        Box::pin(async move { call_echo_marker(call) })
+    }
+}
+
+fn call_echo_marker(call: McpToolCall) -> ServerResult<McpToolResult> {
+    if call.name != "echo_marker" {
+        return Err(ServerError::invalid_params("unknown test tool"));
+    }
+    match serde_json::from_value::<EchoMarkerRequest>(call.arguments) {
+        Ok(EchoMarkerRequest { value }) => Ok(McpToolResult::text(value)),
+        Err(error) => Err(ServerError::invalid_params(error.to_string())),
     }
 }

@@ -1,26 +1,20 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 
-use crate::{Result, ToolProgressSink};
-
-use super::{
-    capabilities::McpServerCapabilities,
-    config::{McpServerConfig, set_log_level_params},
-    connection::{McpConnection, McpConnectionHandler, roots_response},
-    event::McpRuntimeEvent,
-    log::McpLogLevel,
-    prompt::{McpPromptDefinition, format_prompt_result, parse_prompt_definition},
-    protocol::{JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION, protocol_error},
-    resource::{
-        McpCompletionResult, McpResourceDefinition, McpResourceTemplateDefinition,
-        format_resource_result, parse_completion_result, parse_resource_definition,
-        parse_resource_template_definition,
-    },
-    tool::{McpToolDefinition, format_tool_result, parse_tool_definition},
+use mcp::client::{McpClient, McpClientHandler, McpClientOptions};
+use mcp::{
+    McpCompletionRequest, McpCompletionResult, McpLogLevel, McpProgressNotification,
+    McpPromptDefinition, McpResourceDefinition, McpResourceTemplateDefinition, McpRoot,
+    McpServerCapabilities, McpToolCall, McpToolDefinition, McpTracePropagation,
 };
+
+use crate::{LlmError, Result, ToolProgressSink};
+
+use super::{config::McpServerConfig, event::McpRuntimeEvent};
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::mcp) struct McpToolRegistry {
@@ -43,8 +37,7 @@ pub(in crate::mcp) struct McpResourceRegistry {
 
 pub(in crate::mcp) struct McpServerRuntime {
     name: String,
-    connection: Arc<McpConnection>,
-    timeout: Duration,
+    client: McpClient,
     log_level: Option<McpLogLevel>,
     transport_kind: &'static str,
     #[allow(dead_code)]
@@ -90,6 +83,7 @@ impl McpServerRuntime {
         config: McpServerConfig,
         timeout: Duration,
         log_level: Option<McpLogLevel>,
+        trace_propagation: McpTracePropagation,
         root_uri: String,
         events: broadcast::Sender<McpRuntimeEvent>,
         cancellation_token: CancellationToken,
@@ -104,12 +98,18 @@ impl McpServerRuntime {
             active_progress: Arc::clone(&active_progress),
             refresh: Mutex::new(None),
         });
-        let connection =
-            McpConnection::start(name.clone(), config.transport, handler.clone()).await?;
+        let client = McpClient::connect(
+            name.clone(),
+            config.transport,
+            handler.clone(),
+            McpClientOptions::new("waltr-agent", env!("CARGO_PKG_VERSION"), timeout)
+                .with_trace_propagation(trace_propagation),
+            cancellation_token.clone(),
+        )
+        .await?;
         let runtime = Arc::new(Self {
             name,
-            connection,
-            timeout,
+            client,
             log_level,
             transport_kind,
             root_uri,
@@ -118,7 +118,7 @@ impl McpServerRuntime {
             state: Mutex::new(McpServerState::default()),
         });
         *handler.refresh.lock().await = Some(Arc::clone(&runtime));
-        runtime.ensure_initialized(cancellation_token).await?;
+        runtime.finish_initialization(cancellation_token).await?;
         Ok(runtime)
     }
 
@@ -178,30 +178,37 @@ impl McpServerRuntime {
         progress: ToolProgressSink,
         cancellation_token: CancellationToken,
     ) -> Result<String> {
-        self.ensure_initialized(cancellation_token.clone()).await?;
-        let progress_token = format!("{}:{tool}:{call_id}", self.name);
-        let params = json!({
-            "name": tool,
-            "arguments": arguments,
-            "_meta": {
-                "progressToken": progress_token,
-            }
-        });
-        self.active_progress
-            .lock()
-            .map_err(|_| protocol_error("MCP progress registry lock poisoned"))?
-            .insert(progress_token.clone(), progress);
-        let response = self
-            .connection
-            .request("tools/call", Some(params), self.timeout, cancellation_token)
-            .await;
-        drop(
+        let span = tracing::info_span!(
+            "mcp.agent.operation",
+            mcp.server = %self.name,
+            mcp.transport = self.transport_kind,
+            rpc.method = "tools/call",
+            mcp.tool.name = %tool,
+        );
+        async move {
+            self.ensure_initialized(cancellation_token.clone()).await?;
+            let progress_token = format!("{}:{tool}:{call_id}", self.name);
             self.active_progress
                 .lock()
-                .map(|mut active| active.remove(&progress_token)),
-        );
-        let response = response?;
-        Ok(format_tool_result(&response))
+                .map_err(|_| protocol_error("MCP progress registry lock poisoned"))?
+                .insert(progress_token.clone(), progress);
+            let response = self
+                .client
+                .call_tool(
+                    McpToolCall::new(tool, arguments).with_progress_token(progress_token.clone()),
+                    cancellation_token,
+                )
+                .await;
+            drop(
+                self.active_progress
+                    .lock()
+                    .map(|mut active| active.remove(&progress_token)),
+            );
+            let response = response?;
+            Ok(response.format_text())
+        }
+        .instrument(span)
+        .await
     }
 
     pub(in crate::mcp) async fn get_prompt(
@@ -210,26 +217,23 @@ impl McpServerRuntime {
         arguments: Option<Value>,
         cancellation_token: CancellationToken,
     ) -> Result<String> {
-        self.ensure_initialized(cancellation_token.clone()).await?;
-        let mut params = json!({
-            "name": prompt,
-            "_meta": {
-                "progressToken": format!("{}:{prompt}", self.name),
-            }
-        });
-        if let Some(arguments) = arguments {
-            params["arguments"] = arguments;
+        let span = tracing::info_span!(
+            "mcp.agent.operation",
+            mcp.server = %self.name,
+            mcp.transport = self.transport_kind,
+            rpc.method = "prompts/get",
+            mcp.prompt.name = %prompt,
+        );
+        async move {
+            self.ensure_initialized(cancellation_token.clone()).await?;
+            let response = self
+                .client
+                .get_prompt(prompt, arguments, cancellation_token)
+                .await?;
+            Ok(response.format_text())
         }
-        let response = self
-            .connection
-            .request(
-                "prompts/get",
-                Some(params),
-                self.timeout,
-                cancellation_token,
-            )
-            .await?;
-        Ok(format_prompt_result(&response))
+        .instrument(span)
+        .await
     }
 
     pub(in crate::mcp) async fn read_resource(
@@ -237,23 +241,20 @@ impl McpServerRuntime {
         uri: &str,
         cancellation_token: CancellationToken,
     ) -> Result<String> {
-        self.ensure_initialized(cancellation_token.clone()).await?;
-        let params = json!({
-            "uri": uri,
-            "_meta": {
-                "progressToken": format!("{}:{uri}", self.name),
-            }
-        });
-        let response = self
-            .connection
-            .request(
-                "resources/read",
-                Some(params),
-                self.timeout,
-                cancellation_token,
-            )
-            .await?;
-        Ok(format_resource_result(&response))
+        let span = tracing::info_span!(
+            "mcp.agent.operation",
+            mcp.server = %self.name,
+            mcp.transport = self.transport_kind,
+            rpc.method = "resources/read",
+            mcp.resource.uri = %uri,
+        );
+        async move {
+            self.ensure_initialized(cancellation_token.clone()).await?;
+            let response = self.client.read_resource(uri, cancellation_token).await?;
+            Ok(response.format_text())
+        }
+        .instrument(span)
+        .await
     }
 
     pub(in crate::mcp) async fn complete_resource_template(
@@ -264,75 +265,45 @@ impl McpServerRuntime {
         context_arguments: serde_json::Map<String, Value>,
         cancellation_token: CancellationToken,
     ) -> Result<Option<McpCompletionResult>> {
-        self.ensure_initialized(cancellation_token.clone()).await?;
-        if !self.state.lock().await.capabilities.completions {
-            return Ok(None);
-        }
+        let span = tracing::info_span!(
+            "mcp.agent.operation",
+            mcp.server = %self.name,
+            mcp.transport = self.transport_kind,
+            rpc.method = "completion/complete",
+            mcp.resource_template.uri_template = %uri_template,
+        );
+        async move {
+            self.ensure_initialized(cancellation_token.clone()).await?;
+            if !self.state.lock().await.capabilities.completions {
+                return Ok(None);
+            }
 
-        let mut params = json!({
-            "ref": {
-                "type": "ref/resource",
-                "uri": uri_template,
-            },
-            "argument": {
-                "name": argument_name,
-                "value": argument_value,
-            },
-        });
-        if !context_arguments.is_empty() {
-            params["context"] = json!({
-                "arguments": context_arguments,
-            });
-        }
+            let mut request =
+                McpCompletionRequest::new(uri_template, argument_name, argument_value);
+            request.context_arguments = context_arguments;
 
-        let response = self
-            .connection
-            .request(
-                "completion/complete",
-                Some(params),
-                self.timeout,
-                cancellation_token,
-            )
-            .await?;
-        Ok(Some(parse_completion_result(&response)))
+            let response = self
+                .client
+                .complete_resource_template(request, cancellation_token)
+                .await?;
+            Ok(Some(response))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn ensure_initialized(&self, cancellation_token: CancellationToken) -> Result<()> {
         if self.state.lock().await.initialized {
             return Ok(());
         }
-        let response = self
-            .connection
-            .request(
-                "initialize",
-                Some(json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {
-                        "roots": { "listChanged": false }
-                    },
-                    "clientInfo": {
-                        "name": "waltr-agent",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                })),
-                self.timeout,
-                cancellation_token.clone(),
-            )
-            .await?;
-        let protocol = response
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .unwrap_or(MCP_PROTOCOL_VERSION);
-        if protocol != MCP_PROTOCOL_VERSION {
-            return Err(protocol_error(format!(
-                "unsupported MCP protocol version `{protocol}`"
-            )));
+        self.finish_initialization(cancellation_token).await
+    }
+
+    async fn finish_initialization(&self, cancellation_token: CancellationToken) -> Result<()> {
+        if self.state.lock().await.initialized {
+            return Ok(());
         }
-        let capabilities = McpServerCapabilities::parse(response.get("capabilities"));
-        self.connection
-            .notify("notifications/initialized", None)
-            .await?;
-        self.connection.mark_initialized().await;
+        let capabilities = self.client.capabilities().clone();
         {
             let mut state = self.state.lock().await;
             state.capabilities = capabilities;
@@ -355,14 +326,7 @@ impl McpServerRuntime {
         if !self.state.lock().await.capabilities.logging {
             return Ok(());
         }
-        self.connection
-            .request(
-                "logging/setLevel",
-                Some(set_log_level_params(level)),
-                self.timeout,
-                cancellation_token,
-            )
-            .await?;
+        self.client.set_log_level(level, cancellation_token).await?;
         Ok(())
     }
 
@@ -370,36 +334,9 @@ impl McpServerRuntime {
         if self.state.lock().await.capabilities.tools.is_none() {
             return Ok(());
         }
-        let mut cursor = None;
         let mut tools = BTreeMap::new();
-        loop {
-            let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
-            let response = self
-                .connection
-                .request(
-                    "tools/list",
-                    params,
-                    self.timeout,
-                    cancellation_token.clone(),
-                )
-                .await?;
-            for tool in response
-                .get("tools")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(tool) = parse_tool_definition(tool) {
-                    tools.insert(tool.name.clone(), tool);
-                }
-            }
-            cursor = response
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if cursor.is_none() {
-                break;
-            }
+        for tool in self.client.list_tools(cancellation_token).await? {
+            tools.insert(tool.name.clone(), tool);
         }
         let generation = {
             let mut state = self.state.lock().await;
@@ -418,36 +355,9 @@ impl McpServerRuntime {
         if self.state.lock().await.capabilities.prompts.is_none() {
             return Ok(());
         }
-        let mut cursor = None;
         let mut prompts = BTreeMap::new();
-        loop {
-            let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
-            let response = self
-                .connection
-                .request(
-                    "prompts/list",
-                    params,
-                    self.timeout,
-                    cancellation_token.clone(),
-                )
-                .await?;
-            for prompt in response
-                .get("prompts")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(prompt) = parse_prompt_definition(prompt) {
-                    prompts.insert(prompt.name.clone(), prompt);
-                }
-            }
-            cursor = response
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if cursor.is_none() {
-                break;
-            }
+        for prompt in self.client.list_prompts(cancellation_token).await? {
+            prompts.insert(prompt.name.clone(), prompt);
         }
         let mut state = self.state.lock().await;
         state.prompts.prompts = prompts;
@@ -459,36 +369,13 @@ impl McpServerRuntime {
         if self.state.lock().await.capabilities.resources.is_none() {
             return Ok(());
         }
-        let mut cursor = None;
         let mut resources = BTreeMap::new();
-        loop {
-            let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
-            let response = self
-                .connection
-                .request(
-                    "resources/list",
-                    params,
-                    self.timeout,
-                    cancellation_token.clone(),
-                )
-                .await?;
-            for resource in response
-                .get("resources")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(resource) = parse_resource_definition(resource) {
-                    resources.insert(resource.uri.clone(), resource);
-                }
-            }
-            cursor = response
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if cursor.is_none() {
-                break;
-            }
+        for resource in self
+            .client
+            .list_resources(cancellation_token.clone())
+            .await?
+        {
+            resources.insert(resource.uri.clone(), resource);
         }
         let mut state = self.state.lock().await;
         state.resources.resources = resources;
@@ -505,39 +392,13 @@ impl McpServerRuntime {
         if self.state.lock().await.capabilities.resources.is_none() {
             return Ok(());
         }
-        let mut cursor = None;
         let mut resource_templates = BTreeMap::new();
-        loop {
-            let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
-            let response = self
-                .connection
-                .request(
-                    "resources/templates/list",
-                    params,
-                    self.timeout,
-                    cancellation_token.clone(),
-                )
-                .await?;
-            for resource_template in response
-                .get("resourceTemplates")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(resource_template) =
-                    parse_resource_template_definition(resource_template)
-                {
-                    resource_templates
-                        .insert(resource_template.uri_template.clone(), resource_template);
-                }
-            }
-            cursor = response
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            if cursor.is_none() {
-                break;
-            }
+        for resource_template in self
+            .client
+            .list_resource_templates(cancellation_token)
+            .await?
+        {
+            resource_templates.insert(resource_template.uri_template.clone(), resource_template);
         }
         let mut state = self.state.lock().await;
         state.resources.resource_templates = resource_templates;
@@ -546,106 +407,99 @@ impl McpServerRuntime {
     }
 
     pub(in crate::mcp) async fn shutdown(&self) {
-        self.connection.shutdown().await;
+        self.client.shutdown().await;
     }
 }
 
-impl McpConnectionHandler for ServerHandler {
-    fn notification(&self, notification: JsonRpcNotification) {
-        match notification.method.as_str() {
-            "notifications/tools/list_changed" => {
-                let name = self.name.clone();
-                let events = self.events.clone();
-                let refresh = self
-                    .refresh
-                    .try_lock()
-                    .ok()
-                    .and_then(|runtime| runtime.clone());
-                if let Some(runtime) = refresh {
-                    tokio::spawn(async move {
-                        if let Err(error) = runtime.refresh_tools(CancellationToken::new()).await {
-                            tracing::warn!(server = %name, %error, "failed to refresh MCP tools");
-                        }
-                    });
-                } else {
-                    drop(events.send(McpRuntimeEvent::ToolsChanged {
-                        server_key: name,
-                        generation: 0,
-                    }));
+impl McpClientHandler for ServerHandler {
+    fn roots(&self) -> Vec<McpRoot> {
+        vec![McpRoot::new(
+            self.root_uri.clone(),
+            Some("workspace".to_owned()),
+        )]
+    }
+
+    fn tools_changed(&self) {
+        let name = self.name.clone();
+        let events = self.events.clone();
+        let refresh = self
+            .refresh
+            .try_lock()
+            .ok()
+            .and_then(|runtime| runtime.clone());
+        if let Some(runtime) = refresh {
+            tokio::spawn(async move {
+                if let Err(error) = runtime.refresh_tools(CancellationToken::new()).await {
+                    tracing::warn!(server = %name, %error, "failed to refresh MCP tools");
                 }
-            }
-            "notifications/prompts/list_changed" => {
-                let name = self.name.clone();
-                let refresh = self
-                    .refresh
-                    .try_lock()
-                    .ok()
-                    .and_then(|runtime| runtime.clone());
-                if let Some(runtime) = refresh {
-                    tokio::spawn(async move {
-                        if let Err(error) = runtime.refresh_prompts(CancellationToken::new()).await
-                        {
-                            tracing::warn!(server = %name, %error, "failed to refresh MCP prompts");
-                        }
-                    });
-                }
-            }
-            "notifications/resources/list_changed" => {
-                let name = self.name.clone();
-                let refresh = self
-                    .refresh
-                    .try_lock()
-                    .ok()
-                    .and_then(|runtime| runtime.clone());
-                if let Some(runtime) = refresh {
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            runtime.refresh_resources(CancellationToken::new()).await
-                        {
-                            tracing::warn!(server = %name, %error, "failed to refresh MCP resources");
-                        }
-                    });
-                }
-            }
-            "notifications/message" => {
-                self.log_message(notification.params.unwrap_or(Value::Null));
-            }
-            "notifications/progress" => {
-                let params = notification.params.unwrap_or(Value::Null);
-                let Some(token) = params.get("progressToken").cloned() else {
-                    return;
-                };
-                let progress = params.get("progress").and_then(Value::as_f64);
-                let total = params.get("total").and_then(Value::as_f64);
-                let message = params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
-                if let Some(sink) = self
-                    .active_progress
-                    .lock()
-                    .ok()
-                    .and_then(|active| active.get(&progress_token_key(&token)).cloned())
-                {
-                    let rendered = render_progress_message(message.as_deref(), progress, total);
-                    if let Err(error) = sink.info(rendered) {
-                        tracing::warn!(server = %self.name, %error, "failed to emit MCP progress");
-                    }
-                }
-                drop(self.events.send(McpRuntimeEvent::Progress {
-                    server_key: self.name.clone(),
-                    token,
-                    progress,
-                    total,
-                    message,
-                }));
-            }
-            _ => {}
+            });
+        } else {
+            drop(events.send(McpRuntimeEvent::ToolsChanged {
+                server_key: name,
+                generation: 0,
+            }));
         }
     }
 
-    fn request(&self, request: JsonRpcRequest) -> Value {
-        roots_response(request, &self.root_uri)
+    fn prompts_changed(&self) {
+        let name = self.name.clone();
+        let refresh = self
+            .refresh
+            .try_lock()
+            .ok()
+            .and_then(|runtime| runtime.clone());
+        if let Some(runtime) = refresh {
+            tokio::spawn(async move {
+                if let Err(error) = runtime.refresh_prompts(CancellationToken::new()).await {
+                    tracing::warn!(server = %name, %error, "failed to refresh MCP prompts");
+                }
+            });
+        }
+    }
+
+    fn resources_changed(&self) {
+        let name = self.name.clone();
+        let refresh = self
+            .refresh
+            .try_lock()
+            .ok()
+            .and_then(|runtime| runtime.clone());
+        if let Some(runtime) = refresh {
+            tokio::spawn(async move {
+                if let Err(error) = runtime.refresh_resources(CancellationToken::new()).await {
+                    tracing::warn!(server = %name, %error, "failed to refresh MCP resources");
+                }
+            });
+        }
+    }
+
+    fn log_message(&self, params: Value) {
+        self.log_message(params);
+    }
+
+    fn progress(&self, progress: McpProgressNotification) {
+        if let Some(sink) = self
+            .active_progress
+            .lock()
+            .ok()
+            .and_then(|active| active.get(&progress_token_key(&progress.token)).cloned())
+        {
+            let rendered = render_progress_message(
+                progress.message.as_deref(),
+                progress.progress,
+                progress.total,
+            );
+            if let Err(error) = sink.info(rendered) {
+                tracing::warn!(server = %self.name, %error, "failed to emit MCP progress");
+            }
+        }
+        drop(self.events.send(McpRuntimeEvent::Progress {
+            server_key: self.name.clone(),
+            token: progress.token,
+            progress: progress.progress,
+            total: progress.total,
+            message: progress.message,
+        }));
     }
 
     fn disconnected(&self, error: String) {
@@ -807,13 +661,23 @@ fn trace_mcp_log(
     }
 }
 
+fn protocol_error(message: impl Into<String>) -> LlmError {
+    LlmError::Protocol {
+        provider: "mcp",
+        message: message.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
     use serde_json::json;
     use tokio::sync::{Mutex, broadcast};
 
+    use mcp::McpLogLevel;
+
     use super::{McpRuntimeEvent, ServerHandler};
-    use crate::mcp::log::McpLogLevel;
 
     #[test]
     fn normalizes_mcp_log_notification_events() {
@@ -822,6 +686,7 @@ mod tests {
             name: "test_server".to_owned(),
             root_uri: "file:///workspace".to_owned(),
             events,
+            active_progress: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             refresh: Mutex::new(None),
         };
 

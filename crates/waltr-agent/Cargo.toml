@@ -16,10 +16,10 @@ globset.workspace = true
 http.workspace = true
 httpdate.workspace = true
 ignore.workspace = true
+mcp.workspace = true
 opendal.workspace = true
 refinery = { workspace = true, features = ["tokio-postgres"] }
 reqwest = { workspace = true, features = ["form", "json", "rustls", "stream"] }
-rmcp = { version = "1.7.0", default-features = false, features = ["macros", "server", "transport-io", "transport-streamable-http-server"] }
 rustls.workspace = true
 scylla.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -38,8 +38,12 @@ webpki-roots.workspace = true
 
 [dev-dependencies]
 aws-config.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 testcontainers.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

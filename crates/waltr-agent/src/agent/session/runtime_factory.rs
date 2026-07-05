@@ -14,6 +14,7 @@ use crate::{
 };
 #[cfg(feature = "shell")]
 use crate::{ShellPromptConfig, shell::ShellConfig};
+use mcp::McpTracePropagation;
 
 mod headers;
 mod oauth;
@@ -319,6 +320,9 @@ fn builder_with_model_cost(
 
 fn mcp_config(settings: &SessionRuntimeSettings) -> Result<McpConfig, AgentSessionRuntimeError> {
     let mut mcp = McpConfig::new();
+    if settings.mcp_trace_propagation {
+        mcp = mcp.with_trace_propagation(McpTracePropagation::TraceContext);
+    }
     for server in &settings.mcp_servers {
         let config = match server.kind {
             SessionMcpServerRuntimeKind::Stdio => {
@@ -462,6 +466,7 @@ mod tests {
                 reasoning_effort: None,
             },
             mcp_servers: Vec::new(),
+            mcp_trace_propagation: false,
         };
 
         let error = factory

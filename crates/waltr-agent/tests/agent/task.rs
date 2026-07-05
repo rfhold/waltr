@@ -542,6 +542,7 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             reasoning_effort: None,
         },
         mcp_servers: Vec::new(),
+        mcp_trace_propagation: false,
     }
 }
 

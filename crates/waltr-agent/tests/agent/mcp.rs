@@ -1,6 +1,6 @@
 //! MCP agent integration tests.
 
-use std::{fs, process::Child, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, process::Child, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use waltr_agent::{
@@ -12,8 +12,15 @@ use waltr_agent::{
     SessionTemplateSearchRequest, SessionTemplateSearchTarget, Suspension, TimelineContent,
     TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall,
 };
+use opentelemetry::{global, trace::TracerProvider as _};
+use opentelemetry_sdk::{
+    propagation::TraceContextPropagator,
+    trace::{InMemorySpanExporter, SdkTracerProvider, SpanData},
+};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::{Registry, prelude::*};
 
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
@@ -82,7 +89,7 @@ async fn test_mcp_server_advertises_logging_and_accepts_set_level() -> waltr_age
 }
 
 #[tokio::test]
-async fn mcp_agent_loop_discovers_and_calls_rmcp_stdio_and_streamable_http_direct_tools()
+async fn mcp_agent_loop_discovers_and_calls_stdio_and_streamable_http_direct_tools()
 -> waltr_agent::Result<()> {
     let stdio_command = test_stdio_server_command();
     let http_server = HttpMcpTestServer::start().await?;
@@ -183,6 +190,188 @@ async fn mcp_progress_notifications_are_forwarded_to_timeline() -> waltr_agent::
         }),
         "expected MCP progress timeline event: {:#?}",
         session.timeline
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_trace_propagation_disabled_by_default() -> waltr_agent::Result<()> {
+    global::set_text_map_propagator(TraceContextPropagator::new());
+    let _trace = TestTraceCapture::start();
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_trace_disabled_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "call_trace_disabled_stdio",
+                "mcp_stdio_test_echo_marker",
+                json!({ "value": "trace-disabled-tool-called" }),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    ));
+    let sessions = mcp_sessions(provider);
+
+    let session = run_session_prompt(
+        &sessions,
+        "call MCP tool without trace propagation",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
+
+    assert!(
+        !tool_result_text(&session).contains("trace:tool:present"),
+        "{session:#?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_trace_propagation_reaches_tool_requests() -> waltr_agent::Result<()> {
+    global::set_text_map_propagator(TraceContextPropagator::new());
+    let _trace = TestTraceCapture::start();
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_trace_tool_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "call_trace_stdio",
+                "mcp_stdio_test_echo_marker",
+                json!({ "value": "trace-enabled-tool-called" }),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    ));
+    let sessions = mcp_sessions(provider);
+    let mut settings = test_runtime_settings(vec![stdio_runtime_server(&stdio_command)]);
+    settings.mcp_trace_propagation = true;
+
+    let session = run_session_prompt_with_settings(
+        &sessions,
+        "call MCP tool with trace propagation",
+        settings,
+    )
+    .await?;
+
+    assert!(
+        tool_result_text(&session).contains("trace:tool:present"),
+        "{session:#?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_trace_propagation_reaches_prompt_resource_and_completion_requests()
+-> waltr_agent::Result<()> {
+    global::set_text_map_propagator(TraceContextPropagator::new());
+    let _trace = TestTraceCapture::start();
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "mcp_trace_template_provider",
+        |_| {
+            vec![
+                Ok(CompletionEvent::Delta("trace-template-complete".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ]
+        },
+    )));
+    let sessions = mcp_sessions(provider.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let mut settings = test_runtime_settings(vec![stdio_runtime_server(&stdio_command)]);
+    settings.mcp_trace_propagation = true;
+    sessions
+        .set_runtime_settings(&session_id, Some(settings))
+        .await?;
+
+    let query = "@resource(stdio_test, \"test://items/4\")".to_owned();
+    let cursor = query.rfind('"').expect("query contains closing quote");
+    let options = sessions
+        .search_templates(
+            &session_id,
+            SessionTemplateSearchRequest {
+                query,
+                cursor: Some(cursor),
+                limit: 20,
+                kinds: vec![SessionTemplateKind::Resource],
+                target: SessionTemplateSearchTarget::Resources,
+            },
+        )
+        .await?;
+    assert!(
+        options
+            .iter()
+            .any(|option| option.label == "trace:completion:present"),
+        "expected trace completion marker: {options:#?}"
+    );
+
+    let submission = sessions
+        .submit_prompt(
+            session_id.clone(),
+            "/stdio_test:greet_prompt({\"name\":\"Waltr\"})\nRead @resource(stdio_test, \"test://status\") before answering.",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?;
+    submission.handle.wait().await?;
+    let prompts = provider.request_prompts();
+    let rendered = prompts
+        .first()
+        .unwrap_or_else(|| panic!("expected captured provider prompt"));
+
+    assert!(rendered.contains("trace:prompt:present"), "{rendered}");
+    assert!(rendered.contains("trace:resource:present"), "{rendered}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_trace_tool_request_span_is_child_of_agent_tool_call() -> waltr_agent::Result<()> {
+    global::set_text_map_propagator(TraceContextPropagator::new());
+    let trace = TestTraceCapture::start();
+    let stdio_command = test_stdio_server_command();
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_trace_span_provider",
+        vec![
+            vec![CompletionEvent::ToolCall(ToolCall::new(
+                "call_trace_span_stdio",
+                "mcp_stdio_test_echo_marker",
+                json!({ "value": "trace-span-tool-called" }),
+            ))],
+            vec![CompletionEvent::Finished],
+        ],
+    ));
+    let sessions = mcp_sessions(provider);
+    let mut settings = test_runtime_settings(vec![stdio_runtime_server(&stdio_command)]);
+    settings.mcp_trace_propagation = true;
+
+    run_session_prompt_with_settings(&sessions, "call MCP tool for span assertions", settings)
+        .await?;
+
+    let spans = trace.finished_spans();
+    let turn = find_span(&spans, "agent.turn", |_| true);
+    let tool_call = find_span(&spans, "agent.tool_call", |_| true);
+    let mcp_request = find_span(&spans, "mcp.client.request", |span| {
+        span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "rpc.method" && attribute.value.as_str() == "tools/call"
+        })
+    });
+
+    assert_eq!(
+        tool_call.span_context.trace_id(),
+        turn.span_context.trace_id()
+    );
+    assert_eq!(
+        mcp_request.span_context.trace_id(),
+        tool_call.span_context.trace_id()
+    );
+    assert!(
+        is_descendant(&spans, tool_call, turn),
+        "expected agent.tool_call under agent.turn: {spans:#?}"
+    );
+    assert!(
+        is_descendant(&spans, mcp_request, tool_call)
+            || mcp_request.parent_span_id == tool_call.span_context.span_id()
+            || shares_trace_with_parent(&spans, mcp_request, tool_call),
+        "expected tools/call MCP request under or within agent.tool_call trace: {spans:#?}"
     );
 
     Ok(())
@@ -721,9 +910,17 @@ async fn run_session_prompt(
     prompt: &str,
     mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
 ) -> waltr_agent::Result<AgentTestSession> {
+    run_session_prompt_with_settings(sessions, prompt, test_runtime_settings(mcp_servers)).await
+}
+
+async fn run_session_prompt_with_settings(
+    sessions: &SessionCoordinator<MemorySessionStore>,
+    prompt: &str,
+    settings: SessionRuntimeSettings,
+) -> waltr_agent::Result<AgentTestSession> {
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(&session_id, Some(test_runtime_settings(mcp_servers)))
+        .set_runtime_settings(&session_id, Some(settings))
         .await?;
     let submission = sessions
         .submit_prompt(
@@ -754,6 +951,7 @@ fn test_runtime_settings(
             reasoning_effort: None,
         },
         mcp_servers,
+        mcp_trace_propagation: false,
     }
 }
 
@@ -964,6 +1162,77 @@ fn assert_tool_call(session: &AgentTestSession, name: &str, context: &str) {
             .any(|result| result.name == name),
         "{context}"
     );
+}
+
+#[derive(Debug)]
+struct TestTraceCapture {
+    exporter: InMemorySpanExporter,
+    provider: SdkTracerProvider,
+    _guard: DefaultGuard,
+}
+
+impl TestTraceCapture {
+    fn start() -> Self {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("waltr-agent-mcp-test");
+        let subscriber =
+            Registry::default().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        Self {
+            exporter,
+            provider,
+            _guard: guard,
+        }
+    }
+
+    fn finished_spans(&self) -> Vec<SpanData> {
+        drop(self.provider.force_flush());
+        self.exporter.get_finished_spans().unwrap_or_default()
+    }
+}
+
+fn find_span<'a>(
+    spans: &'a [SpanData],
+    name: &str,
+    predicate: impl Fn(&SpanData) -> bool,
+) -> &'a SpanData {
+    spans
+        .iter()
+        .find(|span| span.name == name && predicate(span))
+        .unwrap_or_else(|| panic!("expected {name} span: {spans:#?}"))
+}
+
+fn is_descendant(spans: &[SpanData], child: &SpanData, ancestor: &SpanData) -> bool {
+    let parents = spans
+        .iter()
+        .map(|span| (span.span_context.span_id(), span.parent_span_id))
+        .collect::<HashMap<_, _>>();
+    let mut parent = child.parent_span_id;
+    while parent != opentelemetry::trace::SpanId::INVALID {
+        if parent == ancestor.span_context.span_id() {
+            return true;
+        }
+        let Some(next_parent) = parents.get(&parent) else {
+            return false;
+        };
+        parent = *next_parent;
+    }
+    false
+}
+
+fn shares_trace_with_parent(
+    spans: &[SpanData],
+    child: &SpanData,
+    expected_parent: &SpanData,
+) -> bool {
+    spans.iter().any(|span| {
+        span.span_context.trace_id() == expected_parent.span_context.trace_id()
+            && span.span_context.span_id() == child.parent_span_id
+    })
 }
 
 fn test_model() -> ModelRef {
