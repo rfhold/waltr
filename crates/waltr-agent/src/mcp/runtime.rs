@@ -4,16 +4,14 @@ use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AgentTool, Result, ToolDefinition, ToolProgressSink};
+use mcp::{
+    McpCompletionResult, McpPromptDefinition, McpResourceDefinition, McpResourceTemplateDefinition,
+};
+
+use crate::{AgentTool, LlmError, Result, ToolDefinition, ToolProgressSink};
 
 use super::{
-    config::McpConfig,
-    event::McpRuntimeEvent,
-    name::direct_tool_name,
-    prompt::McpPromptDefinition,
-    protocol::protocol_error,
-    resource::{McpCompletionResult, McpResourceDefinition, McpResourceTemplateDefinition},
-    server::McpServerRuntime,
+    config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, server::McpServerRuntime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +38,13 @@ pub(crate) struct McpClientRuntime {
     events: broadcast::Sender<McpRuntimeEvent>,
 }
 
+fn protocol_error(message: impl Into<String>) -> LlmError {
+    LlmError::Protocol {
+        provider: "mcp",
+        message: message.into(),
+    }
+}
+
 impl std::fmt::Debug for McpClientRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -55,7 +60,7 @@ impl McpClientRuntime {
         root_uri: String,
         cancellation_token: CancellationToken,
     ) -> Result<Arc<Self>> {
-        let (servers, timeout, log_level) = config.into_parts();
+        let (servers, timeout, log_level, trace_propagation) = config.into_parts();
         let (events, _) = broadcast::channel(128);
         let mut active = BTreeMap::new();
         for server in servers {
@@ -63,6 +68,7 @@ impl McpClientRuntime {
                 server,
                 timeout,
                 log_level,
+                trace_propagation.clone(),
                 root_uri.clone(),
                 events.clone(),
                 cancellation_token.clone(),

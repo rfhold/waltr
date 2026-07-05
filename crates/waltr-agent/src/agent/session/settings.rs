@@ -12,6 +12,9 @@ pub struct SessionRuntimeSettings {
     /// Enabled MCP server snapshots.
     #[serde(default)]
     pub mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+    /// Whether MCP requests propagate the current trace context.
+    #[serde(default)]
+    pub mcp_trace_propagation: bool,
 }
 
 /// Provider settings needed to build a runtime without consulting server config.
@@ -110,3 +113,30 @@ pub enum SessionOAuthTokenFieldTarget {
 mod credentials;
 
 pub use credentials::{FileCredentialStore, OAuthCredential, StoredCredential};
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn runtime_settings_default_mcp_trace_propagation_is_false() {
+        let settings: SessionRuntimeSettings = serde_json::from_value(json!({
+            "provider": {
+                "key": "test",
+                "api": "OpenAiResponses",
+                "url": "",
+                "model_id": "test-model",
+                "model_cost": null,
+                "headers": {},
+                "oauth": null,
+                "reasoning_effort": null
+            },
+            "mcp_servers": []
+        }))
+        .expect("settings deserialize");
+
+        assert!(!settings.mcp_trace_propagation);
+    }
+}

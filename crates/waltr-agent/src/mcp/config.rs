@@ -1,6 +1,5 @@
-use serde_json::json;
-
-use super::log::McpLogLevel;
+pub use mcp::client::McpTransportConfig;
+use mcp::{McpLogLevel, McpTracePropagation};
 
 use std::time::Duration;
 
@@ -12,6 +11,7 @@ pub struct McpConfig {
     pub(in crate::mcp) servers: Vec<McpServerConfig>,
     pub(in crate::mcp) timeout: Duration,
     pub(in crate::mcp) log_level: Option<McpLogLevel>,
+    pub(in crate::mcp) trace_propagation: McpTracePropagation,
 }
 
 impl McpConfig {
@@ -22,6 +22,7 @@ impl McpConfig {
             servers: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             log_level: None,
+            trace_propagation: McpTracePropagation::Disabled,
         }
     }
 
@@ -46,10 +47,27 @@ impl McpConfig {
         self
     }
 
+    /// Configure MCP request trace propagation.
+    #[must_use]
+    pub const fn with_trace_propagation(mut self, trace_propagation: McpTracePropagation) -> Self {
+        self.trace_propagation = trace_propagation;
+        self
+    }
+
     pub(in crate::mcp) fn into_parts(
         self,
-    ) -> (Vec<McpServerConfig>, Duration, Option<McpLogLevel>) {
-        (self.servers, self.timeout, self.log_level)
+    ) -> (
+        Vec<McpServerConfig>,
+        Duration,
+        Option<McpLogLevel>,
+        McpTracePropagation,
+    ) {
+        (
+            self.servers,
+            self.timeout,
+            self.log_level,
+            self.trace_propagation,
+        )
     }
 }
 
@@ -92,50 +110,5 @@ impl McpServerConfig {
                 endpoint: endpoint.into(),
             },
         }
-    }
-}
-
-/// MCP transport configuration.
-#[derive(Debug, Clone)]
-pub enum McpTransportConfig {
-    /// MCP stdio subprocess transport.
-    Stdio {
-        /// Command to spawn.
-        command: String,
-        /// Command arguments.
-        args: Vec<String>,
-    },
-    /// MCP Streamable HTTP endpoint.
-    StreamableHttp {
-        /// MCP endpoint URL.
-        endpoint: String,
-    },
-}
-
-impl McpTransportConfig {
-    pub(in crate::mcp) const fn kind(&self) -> &'static str {
-        match self {
-            Self::Stdio { .. } => "stdio",
-            Self::StreamableHttp { .. } => "streamable_http",
-        }
-    }
-}
-
-pub(in crate::mcp) fn set_log_level_params(level: McpLogLevel) -> serde_json::Value {
-    json!({ "level": level.as_str() })
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::{McpLogLevel, set_log_level_params};
-
-    #[test]
-    fn serializes_set_log_level_params() {
-        assert_eq!(
-            set_log_level_params(McpLogLevel::Warning),
-            json!({ "level": "warning" })
-        );
     }
 }

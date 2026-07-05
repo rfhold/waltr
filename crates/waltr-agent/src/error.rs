@@ -125,3 +125,12 @@ impl From<io::Error> for LlmError {
         Self::Io(error)
     }
 }
+
+impl From<mcp::Error> for LlmError {
+    fn from(error: mcp::Error) -> Self {
+        Self::Protocol {
+            provider: "mcp",
+            message: error.to_string(),
+        }
+    }
+}
