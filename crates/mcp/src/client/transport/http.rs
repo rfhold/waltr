@@ -1,4 +1,10 @@
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -24,6 +30,8 @@ pub struct StreamableHttpTransport {
     client: reqwest::Client,
     state: Arc<Mutex<HttpSessionState>>,
     inbound: InboundSender,
+    polling_started: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for StreamableHttpTransport {
@@ -44,6 +52,8 @@ impl StreamableHttpTransport {
             client: reqwest::Client::new(),
             state: Arc::new(Mutex::new(HttpSessionState::default())),
             inbound,
+            polling_started: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -104,6 +114,9 @@ impl StreamableHttpTransport {
             self.state.lock().await.session_id = Some(session_id.to_owned());
         }
         if status == reqwest::StatusCode::ACCEPTED || response.content_length() == Some(0) {
+            if initialized && method == "notifications/initialized" {
+                self.start_polling();
+            }
             return Ok(());
         }
         let content_type = response
@@ -127,6 +140,84 @@ impl StreamableHttpTransport {
                     .send(TransportInbound::Message(parse_json_rpc_message(value)?)),
             );
         }
+        if initialized && method == "notifications/initialized" {
+            self.start_polling();
+        }
         Ok(())
+    }
+
+    fn start_polling(&self) {
+        if self.polling_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let endpoint = self.endpoint.clone();
+        let client = self.client.clone();
+        let state = Arc::clone(&self.state);
+        let inbound = self.inbound.clone();
+        let shutdown = Arc::clone(&self.shutdown);
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Relaxed) {
+                let state_snapshot = state.lock().await;
+                let session_id = state_snapshot.session_id.clone();
+                let last_event_id = state_snapshot.last_event_id.clone();
+                drop(state_snapshot);
+                let Some(session_id) = session_id else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+
+                let mut request = client
+                    .get(&endpoint)
+                    .header("accept", "text/event-stream")
+                    .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+                    .header("mcp-session-id", &session_id);
+                if let Some(last_event_id) = &last_event_id {
+                    request = request.header("last-event-id", last_event_id);
+                }
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        drop(inbound.send(TransportInbound::Disconnected(format!(
+                            "MCP HTTP polling failed: {error}"
+                        ))));
+                        break;
+                    }
+                };
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    state.lock().await.session_id = None;
+                    drop(inbound.send(TransportInbound::Disconnected(
+                        "MCP HTTP session expired".to_owned(),
+                    )));
+                    break;
+                }
+                if !response.status().is_success() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                match parse_sse_response(response).await {
+                    Ok(events) => {
+                        for event in events {
+                            if let Some(id) = event.id {
+                                state.lock().await.last_event_id = Some(id.clone());
+                                drop(inbound.send(TransportInbound::SseEventId(id)));
+                            }
+                            drop(inbound.send(TransportInbound::Message(event.message)));
+                        }
+                    }
+                    Err(error) => {
+                        drop(inbound.send(TransportInbound::Disconnected(format!(
+                            "MCP HTTP polling failed: {error}"
+                        ))));
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    /// Stop background polling.
+    pub async fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }

@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::types::{McpIcon, parse_icons};
+
 /// MCP resource definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpResourceDefinition {
@@ -13,6 +15,8 @@ pub struct McpResourceDefinition {
     pub description: Option<String>,
     /// Optional MIME type.
     pub mime_type: Option<String>,
+    /// Optional icon metadata.
+    pub icons: Vec<McpIcon>,
     /// Optional size.
     pub size: Option<u64>,
     /// Optional annotations.
@@ -34,6 +38,8 @@ pub struct McpResourceTemplateDefinition {
     pub description: Option<String>,
     /// Optional MIME type.
     pub mime_type: Option<String>,
+    /// Optional icon metadata.
+    pub icons: Vec<McpIcon>,
     /// Optional annotations.
     pub annotations: Option<Value>,
     /// Optional metadata.
@@ -76,6 +82,7 @@ pub fn parse_resource_definition(value: &Value) -> Option<McpResourceDefinition>
         title,
         description,
         mime_type,
+        icons: parse_icons(value),
         size,
         annotations,
         meta,
@@ -106,6 +113,7 @@ pub fn parse_resource_template_definition(value: &Value) -> Option<McpResourceTe
         title,
         description,
         mime_type,
+        icons: parse_icons(value),
         annotations,
         meta,
     })

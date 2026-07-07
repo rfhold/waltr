@@ -1,6 +1,6 @@
 # MCP Protocol
 
-The `mcp` package in [../../crates/mcp/](../../crates/mcp/) is Waltr's generic Model Context Protocol implementation. It owns protocol primitives, typed client/server APIs, transports, request/response parsing, capability helpers, and protocol-level tests.
+The `mcp` package in [../../crates/mcp/](../../crates/mcp/) is Waltr's generic Model Context Protocol implementation. It owns protocol primitives, typed client/server APIs, transports, request/response parsing, capability helpers, and protocol-level tests. The crate supports a single active protocol revision, `2025-11-25`.
 
 Waltr-specific session behavior belongs outside this crate. Agent runtime adaptation is documented in [../agent/mcp.md](../agent/mcp.md).
 
@@ -34,11 +34,11 @@ The crate exports these protocol types through [../../crates/mcp/src/lib.rs](../
 
 ## Client Behavior
 
-`McpClient::connect` starts a configured transport, sends `initialize` with protocol version `2025-06-18`, verifies the server protocol version, stores advertised capabilities and optional server `instructions`, marks the transport initialized, and sends `notifications/initialized`.
+`McpClient::connect` starts a configured transport, sends `initialize` with protocol version `2025-11-25`, verifies the server protocol version, stores advertised capabilities and optional server `instructions`, marks the transport initialized, and sends `notifications/initialized`.
 
 After initialization, typed helpers send protocol requests for tools, prompts, resources, completions, logging, ping, and listing operations. Requests are wrapped by `mcp.client.request` spans; trace propagation is optional and documented in [tracing.md](tracing.md).
 
-The client handler callback surface currently covers roots, list-changed notifications, logging notifications, progress notifications, transport disconnection, and Streamable HTTP SSE event ids observed from POST responses.
+The client handler callback surface currently covers roots, list-changed notifications, logging notifications, progress notifications, transport disconnection, and Streamable HTTP SSE event ids observed from POST responses or GET polling.
 
 ## Server Behavior
 
@@ -46,20 +46,24 @@ The typed server API exposes `ServerHandler` methods for initialize, ping, tool 
 
 Servers can provide initialize-time instructions with `ServerHandler::instructions`. Empty instructions are omitted from the initialize result. Clients can read non-empty initialize instructions with `McpClient::instructions`.
 
+Server and feature metadata supports 2025-11-25 baseline fields used by existing APIs: implementation `description`, implementation `icons`, tool/prompt/resource/resource-template `icons`, and tool `execution.taskSupport` metadata. JSON schemas follow the 2025-11-25 default dialect, JSON Schema 2020-12; callers may include explicit schema keywords in raw schema values.
+
 Server transports create `mcp.server.request` spans for inbound requests and notifications. When a request includes valid trace context in `params._meta`, the server span uses that context as its remote parent.
 
 Server capabilities advertise only implemented behavior. Resource support advertises `subscribe: false` and `listChanged: false`; subscriptions are intentionally not presented as supported.
+
+Roots, sampling, and logging still exist in `2025-11-25`, but the MCP deprecation roadmap targets them for a future revision. Keep compatibility coverage for existing support, but do not expand those surfaces unless a concrete consumer needs it.
 
 ## Transports
 
 | Transport | Current behavior |
 | --- | --- |
 | Stdio client | Starts a subprocess, writes line-delimited JSON-RPC to stdin, reads line-delimited JSON-RPC from stdout, and routes inbound responses, notifications, requests, and disconnects through the connection loop. |
-| Streamable HTTP client | Sends JSON-RPC over HTTP POST, accepts JSON or `text/event-stream` POST responses, tracks `mcp-session-id`, sends `mcp-protocol-version` after initialization, and records SSE event ids observed in POST responses. |
+| Streamable HTTP client | Sends JSON-RPC over HTTP POST, accepts JSON or `text/event-stream` POST responses, tracks `mcp-session-id`, sends `mcp-protocol-version` after initialization, records SSE event ids, and starts GET polling after `notifications/initialized`. |
 | Stdio server | Reads line-delimited JSON-RPC from stdin and writes line-delimited JSON-RPC responses to stdout. |
-| Streamable HTTP server | Serves POST requests at `/mcp`, manages initialize/session state, returns JSON responses or SSE POST responses when notifications are emitted with the response. |
+| Streamable HTTP server | Serves POST, GET, and DELETE requests at `/mcp`, manages initialize/session state, returns JSON responses or SSE POST responses when notifications are emitted with the response, queues notification-only SSE messages for GET polling, and supports opt-in Origin validation. |
 
-The current Streamable HTTP implementation handles request/response traffic and SSE responses to POST requests. It does not yet open an optional long-lived GET SSE stream, resume with `Last-Event-ID`, or terminate sessions with DELETE.
+Streamable HTTP GET requires `Accept: text/event-stream` and an initialized `mcp-session-id`. GET drains queued SSE messages and accepts `Last-Event-ID` to skip already-observed queued events. DELETE requires `mcp-session-id` and terminates the in-memory HTTP session. Servers can install an Origin policy with `StreamableHttpOptions::with_origin_policy`; invalid origins return HTTP `403 Forbidden` before JSON-RPC handling.
 
 ## Unsupported Areas
 
@@ -68,9 +72,8 @@ Unsupported protocol areas should stay explicit in code, docs, and tests. Curren
 - Resource subscriptions.
 - Sampling.
 - Elicitation.
-- Streamable HTTP long-lived GET SSE streams.
-- Streamable HTTP `Last-Event-ID` resume requests.
-- Streamable HTTP DELETE session termination.
+- Task runtime execution. Task capability shapes and tool `execution.taskSupport` metadata are represented, but server-side task execution is planned separately.
+- OAuth authorization flows. HTTP auth discovery metadata handling is planned separately.
 
 Do not add placeholder success behavior for unsupported features. Prefer explicit unsupported coverage in spec tests.
 
@@ -80,7 +83,7 @@ MCP tests are split by purpose:
 
 | Path | Covers |
 | --- | --- |
-| [../../crates/mcp/tests/spec.rs](../../crates/mcp/tests/spec.rs) and [../../crates/mcp/tests/spec/](../../crates/mcp/tests/spec/) | Revision-scoped protocol conformance tests. |
+| [../../crates/mcp/tests/spec.rs](../../crates/mcp/tests/spec.rs) and [../../crates/mcp/tests/spec/](../../crates/mcp/tests/spec/) | Protocol conformance tests for the single supported revision, `2025-11-25`. Older revision tests are used only as migration scaffolding and should not remain active. |
 | [../../crates/mcp/tests/ecosystem.rs](../../crates/mcp/tests/ecosystem.rs) and [../../crates/mcp/tests/ecosystem/](../../crates/mcp/tests/ecosystem/) | Interoperability against ecosystem clients and servers such as `rmcp`. |
 
 `rmcp` is a dev-dependency used for ecosystem compatibility tests. It should not be introduced into runtime/library code.

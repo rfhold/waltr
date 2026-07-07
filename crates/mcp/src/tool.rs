@@ -1,5 +1,18 @@
 use serde_json::{Value, json};
 
+use crate::types::{McpIcon, parse_icons};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// MCP tool task support level.
+pub enum McpToolTaskSupport {
+    /// Tool calls must not be run as tasks.
+    Forbidden,
+    /// Tool calls may be run as tasks.
+    Optional,
+    /// Tool calls must be run as tasks.
+    Required,
+}
+
 /// MCP tool definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpToolDefinition {
@@ -9,10 +22,14 @@ pub struct McpToolDefinition {
     pub title: Option<String>,
     /// Optional description.
     pub description: Option<String>,
+    /// Optional icon metadata.
+    pub icons: Vec<McpIcon>,
     /// JSON schema for input.
     pub input_schema: Value,
     /// Optional JSON schema for output.
     pub output_schema: Option<Value>,
+    /// Optional task execution support metadata.
+    pub task_support: Option<McpToolTaskSupport>,
     /// Optional MCP annotations.
     pub annotations: Option<Value>,
 }
@@ -36,10 +53,35 @@ pub fn parse_tool_definition(value: &Value) -> Option<McpToolDefinition> {
         name,
         title,
         description,
+        icons: parse_icons(value),
         input_schema,
         output_schema: value.get("outputSchema").cloned(),
+        task_support: value
+            .get("execution")
+            .and_then(|execution| execution.get("taskSupport"))
+            .and_then(Value::as_str)
+            .and_then(McpToolTaskSupport::parse),
         annotations: value.get("annotations").cloned(),
     })
+}
+
+impl McpToolTaskSupport {
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Forbidden => "forbidden",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "forbidden" => Some(Self::Forbidden),
+            "optional" => Some(Self::Optional),
+            "required" => Some(Self::Required),
+            _ => None,
+        }
+    }
 }
 
 impl McpToolDefinition {

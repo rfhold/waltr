@@ -71,6 +71,7 @@ impl McpConnection {
     }
 
     /// Send a request and wait for its response.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn request_with_trace_propagation(
         &self,
         method: &str,

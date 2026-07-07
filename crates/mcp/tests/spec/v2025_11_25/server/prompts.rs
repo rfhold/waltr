@@ -33,6 +33,7 @@ impl ServerHandler for PromptsServer {
                     name: "code_review".to_owned(),
                     title: Some("Request Code Review".to_owned()),
                     description: Some("Asks the LLM to analyze code quality".to_owned()),
+                    icons: Vec::new(),
                     arguments: vec![McpPromptArgument {
                         name: "code".to_owned(),
                         description: Some("The code to review".to_owned()),
@@ -88,7 +89,7 @@ async fn initialize_declares_prompts_capability() -> mcp::Result<()> {
             "id": "initialize-prompts",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": { "name": "spec-test", "version": "0" }
             }

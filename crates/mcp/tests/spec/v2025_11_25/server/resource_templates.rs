@@ -33,6 +33,7 @@ impl ServerHandler for ResourceTemplatesServer {
                     title: Some("Project Files".to_owned()),
                     description: Some("Access files in the project directory".to_owned()),
                     mime_type: Some("application/octet-stream".to_owned()),
+                    icons: Vec::new(),
                     annotations: None,
                     meta: None,
                 }],
@@ -53,7 +54,7 @@ async fn initialize_declares_resources_capability_for_templates() -> mcp::Result
             "id": "initialize-resource-templates",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": { "name": "spec-test", "version": "0" }
             }

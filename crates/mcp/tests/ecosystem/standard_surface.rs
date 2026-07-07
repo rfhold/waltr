@@ -47,6 +47,7 @@ pub fn prompts() -> Vec<McpPromptDefinition> {
             name: STATUS_PROMPT.to_owned(),
             title: None,
             description: Some("Return deterministic status prompt.".to_owned()),
+            icons: Vec::new(),
             arguments: Vec::new(),
             meta: None,
         },
@@ -54,6 +55,7 @@ pub fn prompts() -> Vec<McpPromptDefinition> {
             name: GREET_PROMPT.to_owned(),
             title: None,
             description: Some("Greet a named test subject.".to_owned()),
+            icons: Vec::new(),
             arguments: vec![McpPromptArgument {
                 name: "name".to_owned(),
                 description: Some("Name to greet".to_owned()),
@@ -71,6 +73,7 @@ pub fn resources() -> Vec<McpResourceDefinition> {
         title: Some("Status Resource".to_owned()),
         description: Some("Return deterministic status resource text".to_owned()),
         mime_type: Some("text/plain".to_owned()),
+        icons: Vec::new(),
         size: Some(29),
         annotations: None,
         meta: None,
@@ -84,6 +87,7 @@ pub fn resource_templates() -> Vec<McpResourceTemplateDefinition> {
         title: Some("Item Resource".to_owned()),
         description: Some("Return deterministic templated item resource text".to_owned()),
         mime_type: Some("text/plain".to_owned()),
+        icons: Vec::new(),
         annotations: None,
         meta: None,
     }]
@@ -102,8 +106,10 @@ fn tool(name: &str, description: &str, input_schema: Value) -> McpToolDefinition
         name: name.to_owned(),
         title: None,
         description: Some(description.to_owned()),
+        icons: Vec::new(),
         input_schema,
         output_schema: None,
+        task_support: None,
         annotations: None,
     }
 }

@@ -16,7 +16,8 @@ mod trace;
 mod types;
 
 pub use capabilities::{
-    McpPromptsCapability, McpResourcesCapability, McpServerCapabilities, McpToolsCapability,
+    McpElicitationCapability, McpPromptsCapability, McpResourcesCapability, McpSamplingCapability,
+    McpServerCapabilities, McpTasksCapability, McpToolsCapability,
 };
 pub use error::{Error, Result};
 pub use log::McpLogLevel;
@@ -28,9 +29,10 @@ pub use resource::{
     format_resource_result, parse_completion_result, parse_resource_definition,
     parse_resource_template_definition,
 };
-pub use tool::{McpToolDefinition, format_tool_result, parse_tool_definition};
+pub use tool::{McpToolDefinition, McpToolTaskSupport, format_tool_result, parse_tool_definition};
 pub use trace::McpTracePropagation;
 pub use types::{
-    McpCompletionRequest, McpProgressNotification, McpPromptList, McpPromptResult, McpResourceList,
-    McpResourceResult, McpResourceTemplateList, McpRoot, McpToolCall, McpToolList, McpToolResult,
+    McpCompletionRequest, McpIcon, McpProgressNotification, McpPromptList, McpPromptResult,
+    McpResourceList, McpResourceResult, McpResourceTemplateList, McpRoot, McpToolCall, McpToolList,
+    McpToolResult,
 };

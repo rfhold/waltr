@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+use crate::types::{McpIcon, parse_icons};
+
 /// MCP prompt definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpPromptDefinition {
@@ -9,6 +11,8 @@ pub struct McpPromptDefinition {
     pub title: Option<String>,
     /// Optional description.
     pub description: Option<String>,
+    /// Optional icon metadata.
+    pub icons: Vec<McpIcon>,
     /// Prompt arguments.
     pub arguments: Vec<McpPromptArgument>,
     /// Optional metadata.
@@ -49,6 +53,7 @@ pub fn parse_prompt_definition(value: &Value) -> Option<McpPromptDefinition> {
         name,
         title,
         description,
+        icons: parse_icons(value),
         arguments,
         meta,
     })

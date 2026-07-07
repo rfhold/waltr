@@ -26,7 +26,7 @@ use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
-const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 #[tokio::test]
 async fn test_mcp_server_advertises_logging_and_accepts_set_level() -> waltr_agent::Result<()> {

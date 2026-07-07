@@ -13,6 +13,12 @@ pub struct McpServerCapabilities {
     pub completions: bool,
     /// Logging support.
     pub logging: bool,
+    /// Tasks capability.
+    pub tasks: Option<McpTasksCapability>,
+    /// Sampling capability.
+    pub sampling: Option<McpSamplingCapability>,
+    /// Elicitation capability.
+    pub elicitation: Option<McpElicitationCapability>,
     /// Raw capabilities object.
     pub raw: Value,
 }
@@ -38,6 +44,35 @@ pub struct McpResourcesCapability {
     pub subscribe: bool,
     /// Whether list changed notifications are supported.
     pub list_changed: bool,
+}
+
+/// Tasks capability.
+#[derive(Debug, Clone, Default)]
+pub struct McpTasksCapability {
+    /// Raw tasks capability object.
+    pub raw: Value,
+}
+
+/// Sampling capability.
+#[derive(Debug, Clone, Default)]
+pub struct McpSamplingCapability {
+    /// Whether sampling tool calls are supported.
+    pub tools: bool,
+    /// Whether sampling context controls are supported.
+    pub context: bool,
+    /// Raw sampling capability object.
+    pub raw: Value,
+}
+
+/// Elicitation capability.
+#[derive(Debug, Clone, Default)]
+pub struct McpElicitationCapability {
+    /// Whether form elicitation is supported.
+    pub form: bool,
+    /// Whether URL elicitation is supported.
+    pub url: bool,
+    /// Raw elicitation capability object.
+    pub raw: Value,
 }
 
 impl McpServerCapabilities {
@@ -77,6 +112,24 @@ impl McpServerCapabilities {
             resources,
             completions: value.get("completions").is_some(),
             logging: value.get("logging").is_some(),
+            tasks: value
+                .get("tasks")
+                .map(|tasks| McpTasksCapability { raw: tasks.clone() }),
+            sampling: value.get("sampling").map(|sampling| McpSamplingCapability {
+                tools: sampling.get("tools").is_some(),
+                context: sampling.get("context").is_some(),
+                raw: sampling.clone(),
+            }),
+            elicitation: value
+                .get("elicitation")
+                .map(|elicitation| McpElicitationCapability {
+                    form: elicitation
+                        .as_object()
+                        .is_none_or(|object| object.is_empty())
+                        || elicitation.get("form").is_some(),
+                    url: elicitation.get("url").is_some(),
+                    raw: elicitation.clone(),
+                }),
             raw: value.clone(),
         }
     }

@@ -370,12 +370,14 @@ impl ServerHandler for EchoMarkerServer {
                     name: "echo_marker".to_owned(),
                     title: None,
                     description: Some("Echo a deterministic marker.".to_owned()),
+                    icons: Vec::new(),
                     input_schema: json!({
                         "type": "object",
                         "properties": { "value": { "type": "string" } },
                         "required": ["value"]
                     }),
                     output_schema: None,
+                    task_support: None,
                     annotations: None,
                 }],
                 next_cursor: None,

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -36,8 +36,9 @@ use crate::{
     },
     trace::{request_meta, set_span_parent_from_meta},
     types::{
-        McpCompletionRequest, McpPromptList, McpPromptResult, McpResourceList, McpResourceResult,
-        McpResourceTemplateList, McpToolCall, McpToolList, McpToolResult, require_string,
+        McpCompletionRequest, McpIcon, McpPromptList, McpPromptResult, McpResourceList,
+        McpResourceResult, McpResourceTemplateList, McpToolCall, McpToolList, McpToolResult,
+        icons_to_value, require_string,
     },
 };
 
@@ -51,6 +52,10 @@ pub struct ServerInfo {
     pub name: String,
     /// Server version.
     pub version: String,
+    /// Optional human-readable server description.
+    pub description: Option<String>,
+    /// Optional server icon metadata.
+    pub icons: Vec<McpIcon>,
 }
 
 impl ServerInfo {
@@ -59,7 +64,23 @@ impl ServerInfo {
         Self {
             name: name.into(),
             version: version.into(),
+            description: None,
+            icons: Vec::new(),
         }
+    }
+
+    /// Attach a human-readable server description.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Attach server icon metadata.
+    #[must_use]
+    pub fn with_icons(mut self, icons: Vec<McpIcon>) -> Self {
+        self.icons = icons;
+        self
     }
 }
 
@@ -76,6 +97,8 @@ pub struct ServerCapabilities {
     pub completions: Option<Value>,
     /// Logging capability object.
     pub logging: Option<Value>,
+    /// Tasks capability object.
+    pub tasks: Option<Value>,
 }
 
 impl ServerCapabilities {
@@ -120,6 +143,13 @@ impl ServerCapabilities {
         self
     }
 
+    /// Advertise task support with a caller-supplied capability object.
+    #[must_use]
+    pub fn tasks(mut self, capability: Value) -> Self {
+        self.tasks = Some(capability);
+        self
+    }
+
     fn to_value(&self) -> Value {
         let mut object = serde_json::Map::new();
         if let Some(value) = &self.tools {
@@ -136,6 +166,9 @@ impl ServerCapabilities {
         }
         if let Some(value) = &self.logging {
             object.insert("logging".to_owned(), value.clone());
+        }
+        if let Some(value) = &self.tasks {
+            object.insert("tasks".to_owned(), value.clone());
         }
         Value::Object(object)
     }
@@ -450,13 +483,50 @@ pub async fn serve_stdio(handler: Arc<dyn ServerHandler>) -> Result<()> {
 }
 
 /// Create an Axum router serving Streamable HTTP MCP at `/mcp`.
-#[must_use]
 pub fn streamable_http_router(handler: Arc<dyn ServerHandler>) -> Router {
+    streamable_http_router_with_options(handler, StreamableHttpOptions::default())
+}
+
+type OriginPolicy = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Streamable HTTP server options.
+#[derive(Clone, Default)]
+pub struct StreamableHttpOptions {
+    origin_policy: Option<OriginPolicy>,
+}
+
+impl std::fmt::Debug for StreamableHttpOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamableHttpOptions")
+            .field("origin_policy", &self.origin_policy.is_some())
+            .finish()
+    }
+}
+
+impl StreamableHttpOptions {
+    /// Set an Origin validation policy. Invalid origins are rejected with 403.
+    #[must_use]
+    pub fn with_origin_policy(
+        mut self,
+        policy: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.origin_policy = Some(Arc::new(policy));
+        self
+    }
+}
+
+/// Create an Axum router serving Streamable HTTP MCP at `/mcp` with options.
+pub fn streamable_http_router_with_options(
+    handler: Arc<dyn ServerHandler>,
+    options: StreamableHttpOptions,
+) -> Router {
     Router::new()
-        .route("/mcp", post(http_post))
+        .route("/mcp", post(http_post).get(http_get).delete(http_delete))
         .with_state(HttpState {
             handler,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            origin_policy: options.origin_policy,
         })
 }
 
@@ -475,11 +545,24 @@ pub async fn serve_streamable_http(
 #[derive(Clone)]
 struct HttpState {
     handler: Arc<dyn ServerHandler>,
-    sessions: Arc<Mutex<HashMap<String, HttpSessionState>>>,
+    sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
+    origin_policy: Option<OriginPolicy>,
+}
+
+#[derive(Debug, Default)]
+struct HttpSession {
+    lifecycle: HttpSessionLifecycle,
+    events: VecDeque<SseEvent>,
+}
+
+#[derive(Clone, Debug)]
+struct SseEvent {
+    id: String,
+    message: Value,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum HttpSessionState {
+enum HttpSessionLifecycle {
     #[default]
     Uninitialized,
     InitializeResponded,
@@ -491,6 +574,9 @@ async fn http_post(
     headers: HeaderMap,
     axum::Json(value): axum::Json<Value>,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     if !accepts_streamable_http_post(&headers) {
         tracing::warn!(
             mcp.transport = "streamable_http",
@@ -564,13 +650,15 @@ async fn http_post(
                 let mut context = context;
                 context.request_id = Some(request.id.clone());
                 context.request_meta = request_meta(request.params.as_ref()).cloned();
-                let response = handle_request(state.handler, request, context).await;
+                let response = handle_request(Arc::clone(&state.handler), request, context).await;
                 if is_initialize {
                     state
                         .sessions
                         .lock()
                         .await
-                        .insert(session_id.clone(), HttpSessionState::InitializeResponded);
+                        .entry(session_id.clone())
+                        .or_default()
+                        .lifecycle = HttpSessionLifecycle::InitializeResponded;
                 }
                 Some(response)
             }
@@ -580,7 +668,9 @@ async fn http_post(
                         .sessions
                         .lock()
                         .await
-                        .insert(session_id.clone(), HttpSessionState::Initialized);
+                        .entry(session_id.clone())
+                        .or_default()
+                        .lifecycle = HttpSessionLifecycle::Initialized;
                 }
                 state
                     .handler
@@ -608,6 +698,9 @@ async fn http_post(
         );
 
         let Some(response) = response else {
+            if !notifications.is_empty() {
+                queue_sse_events(&state, &session_id, notifications).await;
+            }
             tracing::Span::current().record("mcp.outcome", "success");
             return (StatusCode::ACCEPTED, headers).into_response();
         };
@@ -636,6 +729,87 @@ async fn http_post(
     .await
 }
 
+async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !accepts_streamable_http_get(&headers) {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "MCP Streamable HTTP GET requires Accept: text/event-stream",
+        )
+            .into_response();
+    }
+    if let Some(response) = unsupported_version_response(&headers) {
+        return response;
+    }
+    let Some(session_id) = session_id_header(&headers) else {
+        return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response();
+    };
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let mut sessions = state.sessions.lock().await;
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if session.lifecycle != HttpSessionLifecycle::Initialized {
+        return (
+            StatusCode::BAD_REQUEST,
+            "MCP session has not completed initialization",
+        )
+            .into_response();
+    }
+    if let Some(last_event_id) = last_event_id {
+        while session
+            .events
+            .front()
+            .is_some_and(|event| event.id <= last_event_id)
+        {
+            session.events.pop_front();
+        }
+    }
+    let events = session.events.drain(..).collect::<Vec<_>>();
+    drop(sessions);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static(MCP_PROTOCOL_VERSION),
+    );
+    if let Ok(value) = HeaderValue::from_str(&session_id) {
+        headers.insert("mcp-session-id", value);
+    }
+    let stream = stream::iter(events.into_iter().map(|event| {
+        let data = serde_json::to_string(&event.message).expect("json-rpc message serializes");
+        Ok::<_, std::convert::Infallible>(format!("id: {}\ndata: {data}\n\n", event.id))
+    }));
+    (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
+}
+
+async fn http_delete(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(response) = unsupported_version_response(&headers) {
+        return response;
+    }
+    let Some(session_id) = session_id_header(&headers) else {
+        return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response();
+    };
+    let removed = state.sessions.lock().await.remove(&session_id).is_some();
+    if removed {
+        StatusCode::ACCEPTED.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 async fn lifecycle_error(
     state: &HttpState,
     session_id: &str,
@@ -648,10 +822,10 @@ async fn lifecycle_error(
                 .lock()
                 .await
                 .get(session_id)
-                .copied()
+                .map(|session| session.lifecycle)
                 .unwrap_or_default();
             match request.method.as_str() {
-                "initialize" if session_state != HttpSessionState::Uninitialized => {
+                "initialize" if session_state != HttpSessionLifecycle::Uninitialized => {
                     Some(json_rpc_error(
                         request.id.clone(),
                         -32600,
@@ -659,7 +833,7 @@ async fn lifecycle_error(
                     ))
                 }
                 "initialize" | "ping" => None,
-                _ if session_state == HttpSessionState::Initialized => None,
+                _ if session_state == HttpSessionLifecycle::Initialized => None,
                 _ => Some(json_rpc_error(
                     request.id.clone(),
                     -32600,
@@ -674,6 +848,47 @@ async fn lifecycle_error(
         }
         JsonRpcInbound::Notification(_) | JsonRpcInbound::Response(_) => None,
     }
+}
+
+async fn queue_sse_events(state: &HttpState, session_id: &str, messages: Vec<Value>) {
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.entry(session_id.to_owned()).or_default();
+    for message in messages {
+        session.events.push_back(SseEvent {
+            id: next_sse_id().to_string(),
+            message,
+        });
+    }
+}
+
+fn session_id_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+fn unsupported_version_response(headers: &HeaderMap) -> Option<Response> {
+    let version = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())?;
+    if version == MCP_PROTOCOL_VERSION {
+        return None;
+    }
+    Some((StatusCode::BAD_REQUEST, "unsupported MCP protocol version").into_response())
+}
+
+fn origin_allowed(state: &HttpState, headers: &HeaderMap) -> bool {
+    let Some(policy) = &state.origin_policy else {
+        return true;
+    };
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    policy(origin)
 }
 
 fn accepts_streamable_http_post(headers: &HeaderMap) -> bool {
@@ -693,6 +908,19 @@ fn accepts_streamable_http_post(headers: &HeaderMap) -> bool {
             .any(|value| value == "text/event-stream" || value == "*/*")
 }
 
+fn accepts_streamable_http_get(headers: &HeaderMap) -> bool {
+    let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    accept
+        .split(',')
+        .map(|value| value.trim().split(';').next().unwrap_or_default().trim())
+        .any(|value| value == "text/event-stream" || value == "*/*")
+}
+
 async fn handle_request(
     handler: Arc<dyn ServerHandler>,
     request: JsonRpcRequest,
@@ -700,14 +928,21 @@ async fn handle_request(
 ) -> Value {
     match request.method.as_str() {
         "initialize" => {
+            let server_info = handler.server_info();
             let mut result = json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": handler.capabilities().to_value(),
                 "serverInfo": {
-                    "name": handler.server_info().name,
-                    "version": handler.server_info().version,
+                    "name": server_info.name,
+                    "version": server_info.version,
                 }
             });
+            if let Some(description) = server_info.description {
+                result["serverInfo"]["description"] = Value::String(description);
+            }
+            if !server_info.icons.is_empty() {
+                result["serverInfo"]["icons"] = icons_to_value(&server_info.icons);
+            }
             if let Some(instructions) = handler
                 .instructions()
                 .filter(|instructions| !instructions.trim().is_empty())
@@ -863,8 +1098,7 @@ async fn handle_request(
                                     "hasMore": completion.has_more,
                                 }
                             }))
-                        })
-                        .map(|value| value),
+                        }),
                 ),
                 Err(error) => server_error_response(request.id, error),
             }
