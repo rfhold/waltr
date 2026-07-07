@@ -33,6 +33,7 @@ impl ServerHandler for ToolsServer {
                     name: "get_weather_data".to_owned(),
                     title: Some("Weather Data Retriever".to_owned()),
                     description: Some("Get current weather data for a location".to_owned()),
+                    icons: Vec::new(),
                     input_schema: json!({
                         "type": "object",
                         "properties": {
@@ -48,6 +49,7 @@ impl ServerHandler for ToolsServer {
                         },
                         "required": ["temperature", "conditions"]
                     })),
+                    task_support: None,
                     annotations: None,
                 }],
                 next_cursor: Some("next-tool-page".to_owned()),
@@ -93,7 +95,7 @@ async fn initialize_declares_tools_capability() -> mcp::Result<()> {
             "id": "initialize-tools",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": { "name": "spec-test", "version": "0" }
             }

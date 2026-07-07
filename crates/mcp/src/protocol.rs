@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use crate::{Error, Result};
 
-/// MCP protocol version used by Waltr and this crate.
-pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// MCP protocol version used by this crate.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 /// JSON-RPC request identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

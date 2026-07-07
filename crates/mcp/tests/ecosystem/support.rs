@@ -5,17 +5,15 @@ use mcp::client::McpTransportConfig;
 use super::{mcp_client, mcp_server, rmcp_client, rmcp_server};
 
 pub type BoxTestFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+type StartServer = fn() -> BoxTestFuture<mcp::Result<Box<dyn RunningServer>>>;
 
 pub struct EcosystemServerCase {
     pub name: &'static str,
-    start: fn() -> BoxTestFuture<mcp::Result<Box<dyn RunningServer>>>,
+    start: StartServer,
 }
 
 impl EcosystemServerCase {
-    pub fn new(
-        name: &'static str,
-        start: fn() -> BoxTestFuture<mcp::Result<Box<dyn RunningServer>>>,
-    ) -> Self {
+    pub fn new(name: &'static str, start: StartServer) -> Self {
         Self { name, start }
     }
 

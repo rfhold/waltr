@@ -35,6 +35,7 @@ impl ServerHandler for ResourcesServer {
                     title: Some("Rust Software Application Main File".to_owned()),
                     description: Some("Primary application entry point".to_owned()),
                     mime_type: Some("text/x-rust".to_owned()),
+                    icons: Vec::new(),
                     size: Some(42),
                     annotations: None,
                     meta: None,
@@ -82,7 +83,7 @@ async fn initialize_declares_resources_capability() -> mcp::Result<()> {
             "id": "initialize-resources",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": { "name": "spec-test", "version": "0" }
             }

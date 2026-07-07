@@ -37,8 +37,10 @@ fn tool_list_reemits_tool_annotations_without_renaming() {
             name: "search".to_owned(),
             title: None,
             description: None,
+            icons: Vec::new(),
             input_schema: json!({ "type": "object" }),
             output_schema: None,
+            task_support: None,
             annotations: Some(json!({
                 "title": "Trusted Search",
                 "readOnlyHint": true,

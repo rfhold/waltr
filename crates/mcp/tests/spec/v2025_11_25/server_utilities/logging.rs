@@ -58,7 +58,7 @@ async fn initialize_advertises_logging_capability() -> mcp::Result<()> {
             "id": "init-logging",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": { "name": "spec-test", "version": "0" }
             }

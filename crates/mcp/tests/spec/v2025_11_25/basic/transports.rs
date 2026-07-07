@@ -130,7 +130,7 @@ async fn streamable_http_rejects_unsupported_protocol_version_header() -> mcp::R
 }
 
 #[tokio::test]
-async fn streamable_http_get_without_sse_stream_is_method_not_allowed() -> mcp::Result<()> {
+async fn streamable_http_get_without_session_is_bad_request() -> mcp::Result<()> {
     let server = SpecServer::start(Arc::new(TransportServer)).await?;
 
     let response = reqwest::Client::new()
@@ -139,7 +139,7 @@ async fn streamable_http_get_without_sse_stream_is_method_not_allowed() -> mcp::
         .send()
         .await?;
 
-    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     Ok(())
 }

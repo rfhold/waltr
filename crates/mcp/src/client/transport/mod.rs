@@ -107,8 +107,9 @@ impl McpTransport {
 
     /// Shutdown the transport.
     pub async fn shutdown(&self) {
-        if let Self::Stdio(transport) = self {
-            transport.shutdown().await;
+        match self {
+            Self::Stdio(transport) => transport.shutdown().await,
+            Self::StreamableHttp(transport) => transport.shutdown().await,
         }
     }
 }

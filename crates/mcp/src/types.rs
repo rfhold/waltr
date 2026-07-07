@@ -12,6 +12,19 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Icon metadata used by MCP implementations and feature definitions.
+pub struct McpIcon {
+    /// Icon source URI.
+    pub src: String,
+    /// Optional MIME type.
+    pub mime_type: Option<String>,
+    /// Optional icon size hint.
+    pub sizes: Option<String>,
+    /// Optional theme hint.
+    pub theme: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// A root directory exposed by an MCP client.
 pub struct McpRoot {
     /// Root URI.
@@ -133,6 +146,59 @@ impl McpRoot {
         }
         value
     }
+}
+
+impl McpIcon {
+    /// Create an icon from its source URI.
+    #[must_use]
+    pub fn new(src: impl Into<String>) -> Self {
+        Self {
+            src: src.into(),
+            mime_type: None,
+            sizes: None,
+            theme: None,
+        }
+    }
+}
+
+pub(crate) fn parse_icons(value: &Value) -> Vec<McpIcon> {
+    value
+        .get("icons")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(parse_icon)
+        .collect()
+}
+
+fn parse_icon(value: &Value) -> Option<McpIcon> {
+    Some(McpIcon {
+        src: value.get("src")?.as_str()?.to_owned(),
+        mime_type: value
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        sizes: value
+            .get("sizes")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        theme: value
+            .get("theme")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+pub(crate) fn icons_to_value(icons: &[McpIcon]) -> Value {
+    Value::Array(icons.iter().map(icon_to_value).collect())
+}
+
+fn icon_to_value(icon: &McpIcon) -> Value {
+    let mut value = json!({ "src": icon.src });
+    optional_string(&mut value, "mimeType", &icon.mime_type);
+    optional_string(&mut value, "sizes", &icon.sizes);
+    optional_string(&mut value, "theme", &icon.theme);
+    value
 }
 
 impl McpToolCall {
@@ -407,7 +473,13 @@ fn tool_to_value(tool: &McpToolDefinition) -> Value {
     let mut value = json!({ "name": tool.name, "inputSchema": tool.input_schema });
     optional_string(&mut value, "title", &tool.title);
     optional_string(&mut value, "description", &tool.description);
+    if !tool.icons.is_empty() {
+        value["icons"] = icons_to_value(&tool.icons);
+    }
     optional_value(&mut value, "outputSchema", &tool.output_schema);
+    if let Some(task_support) = &tool.task_support {
+        value["execution"] = json!({ "taskSupport": task_support.as_str() });
+    }
     optional_value(&mut value, "annotations", &tool.annotations);
     value
 }
@@ -416,6 +488,9 @@ fn prompt_to_value(prompt: &McpPromptDefinition) -> Value {
     let mut value = json!({ "name": prompt.name });
     optional_string(&mut value, "title", &prompt.title);
     optional_string(&mut value, "description", &prompt.description);
+    if !prompt.icons.is_empty() {
+        value["icons"] = icons_to_value(&prompt.icons);
+    }
     if !prompt.arguments.is_empty() {
         value["arguments"] = json!(
             prompt
@@ -438,6 +513,9 @@ fn resource_to_value(resource: &McpResourceDefinition) -> Value {
     optional_string(&mut value, "title", &resource.title);
     optional_string(&mut value, "description", &resource.description);
     optional_string(&mut value, "mimeType", &resource.mime_type);
+    if !resource.icons.is_empty() {
+        value["icons"] = icons_to_value(&resource.icons);
+    }
     if let Some(size) = resource.size {
         value["size"] = json!(size);
     }
@@ -454,6 +532,9 @@ fn resource_template_to_value(resource_template: &McpResourceTemplateDefinition)
     optional_string(&mut value, "title", &resource_template.title);
     optional_string(&mut value, "description", &resource_template.description);
     optional_string(&mut value, "mimeType", &resource_template.mime_type);
+    if !resource_template.icons.is_empty() {
+        value["icons"] = icons_to_value(&resource_template.icons);
+    }
     optional_value(&mut value, "annotations", &resource_template.annotations);
     optional_value(&mut value, "_meta", &resource_template.meta);
     value

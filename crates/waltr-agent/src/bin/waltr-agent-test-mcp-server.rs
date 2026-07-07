@@ -354,8 +354,10 @@ fn tool_definition(name: &str, description: &str, input_schema: Value) -> McpToo
         name: name.to_owned(),
         title: None,
         description: Some(description.to_owned()),
+        icons: Vec::new(),
         input_schema,
         output_schema: None,
+        task_support: None,
         annotations: None,
     }
 }
@@ -417,6 +419,7 @@ fn prompt_definition(
         name: name.to_owned(),
         title: None,
         description: Some(description.to_owned()),
+        icons: Vec::new(),
         arguments,
         meta: None,
     }
@@ -455,6 +458,7 @@ fn resources_list() -> Vec<McpResourceDefinition> {
         title: Some("Status Resource".to_owned()),
         description: Some("Return deterministic status resource text".to_owned()),
         mime_type: Some("text/plain".to_owned()),
+        icons: Vec::new(),
         size: Some(28),
         annotations: None,
         meta: None,
@@ -468,6 +472,7 @@ fn resource_templates_list() -> Vec<McpResourceTemplateDefinition> {
         title: Some("Item Resource".to_owned()),
         description: Some("Return deterministic templated item resource text".to_owned()),
         mime_type: Some("text/plain".to_owned()),
+        icons: Vec::new(),
         annotations: None,
         meta: None,
     }]
