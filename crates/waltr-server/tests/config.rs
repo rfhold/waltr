@@ -16,3 +16,6 @@ mod stale_etag;
 
 #[path = "config/validation.rs"]
 mod validation;
+
+#[path = "config/mcp_server.rs"]
+mod mcp_server;
