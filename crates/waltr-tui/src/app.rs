@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use waltr_client::{ClientCommand, ClientSnapshot};
+use waltr_client::{ClientAuthTarget, ClientCommand, ClientSnapshot};
 use ratatui::Frame;
 use ratatui::crossterm::{
     event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind},
@@ -87,6 +87,7 @@ pub struct App {
     leader_armed: bool,
     notice: Option<TransientNotice>,
     screen: AppScreen,
+    auth_input: String,
     client_snapshot: Option<ClientSnapshot>,
 }
 
@@ -105,6 +106,7 @@ impl App {
             leader_armed: false,
             notice: None,
             screen: AppScreen::Waiting,
+            auth_input: String::new(),
             client_snapshot: None,
         }
     }
@@ -136,6 +138,9 @@ impl App {
     fn handle_input_event(&mut self, input: InputEvent, now: Instant) -> AppAction {
         match input {
             InputEvent::CtrlC => self.handle_close_intent(CloseIntent::CtrlC, now),
+            InputEvent::Key(key) if self.auth_requirement().is_some() => {
+                self.handle_auth_key(key, now)
+            }
             InputEvent::Key(key) if self.screen == AppScreen::Config => {
                 self.handle_config_key(key, now)
             }
@@ -204,6 +209,12 @@ impl App {
         self.client_snapshot.as_ref()
     }
 
+    /// Return the current pasted OAuth redirect/code draft.
+    #[must_use]
+    pub fn auth_input(&self) -> &str {
+        &self.auth_input
+    }
+
     /// Return the active config tab.
     #[must_use]
     pub const fn active_config_tab(&self) -> ConfigTab {
@@ -256,6 +267,66 @@ impl App {
         });
 
         AppAction::Continue
+    }
+
+    fn handle_auth_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        let snapshot = match self.client_snapshot() {
+            Some(snapshot) => snapshot,
+            None => return AppAction::Continue,
+        };
+        let requirement = match snapshot.auth.pending.first() {
+            Some(requirement) => requirement,
+            None => return AppAction::Continue,
+        };
+        let target = requirement.target.clone();
+        let active_attempt_id = snapshot
+            .auth
+            .active_attempt
+            .as_ref()
+            .filter(|attempt| auth_targets_match(&attempt.target, &target))
+            .map(|attempt| attempt.attempt_id.clone());
+
+        match key.code {
+            KeyCode::Esc => {
+                self.auth_input.clear();
+                if let Some(attempt_id) = active_attempt_id.clone() {
+                    return AppAction::ClientCommand(ClientCommand::CancelAuth { attempt_id });
+                }
+
+                AppAction::ClientCommand(ClientCommand::DismissAuthRequirement { target })
+            }
+            KeyCode::Enter => {
+                if let Some(attempt_id) = active_attempt_id.clone() {
+                    let input = self.auth_input.trim().to_owned();
+                    if input.is_empty() {
+                        self.notice = Some(TransientNotice {
+                            text: "paste redirect URL or code first".to_owned(),
+                            expires_at: now + NOTICE_DURATION,
+                        });
+                        return AppAction::Continue;
+                    }
+
+                    self.auth_input.clear();
+                    AppAction::ClientCommand(ClientCommand::CompleteAuth { attempt_id, input })
+                } else {
+                    AppAction::ClientCommand(ClientCommand::BeginAuth { target })
+                }
+            }
+            KeyCode::Backspace => {
+                self.auth_input.pop();
+                AppAction::Continue
+            }
+            KeyCode::Char(character) if active_attempt_id.is_some() => {
+                self.auth_input.push(character);
+                AppAction::Continue
+            }
+            _ => AppAction::Continue,
+        }
+    }
+
+    fn auth_requirement(&self) -> Option<&waltr_client::AuthRequirementSnapshot> {
+        self.client_snapshot()
+            .and_then(|snapshot| snapshot.auth.pending.first())
     }
 
     fn handle_key_command(&mut self, command: KeyCommand, now: Instant) -> AppAction {
@@ -662,6 +733,10 @@ impl AppAction {
             _ => Self::ClientCommands(commands),
         }
     }
+}
+
+fn auth_targets_match(left: &ClientAuthTarget, right: &ClientAuthTarget) -> bool {
+    left.kind == right.kind && left.key == right.key
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,7 +1,7 @@
 import { createMemo, type ParentProps } from "solid-js";
 
 import { AppStateContextProvider, type AppPhase, type AppState } from "./context";
-import type { ClientCommand, ClientSnapshot, OperationSnapshot, SessionTimelineView, SessionView, TimelineEventView } from "../generated/waltr-client";
+import type { AuthSnapshot, ClientCommand, ClientSnapshot, OperationSnapshot, SessionTimelineView, SessionView, TimelineEventView } from "../generated/waltr-client";
 
 export function fixtureSnapshotForPath(pathname: string) {
   if (!import.meta.env.DEV && import.meta.env.MODE !== "test") {
@@ -44,6 +44,7 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
 function promptFixtureSnapshot(): ClientSnapshot {
   return {
     operations: { current: {} },
+    auth: emptyAuthSnapshot(),
     config: {
       current: { etag: "fixture", providers: {}, mcpServers: {}, runtimeDefaults: null },
       load: operationSnapshot("idle"),
@@ -69,6 +70,18 @@ function promptFixtureSnapshot(): ClientSnapshot {
       },
       templateSearches: {},
     },
+  };
+}
+
+function emptyAuthSnapshot(): AuthSnapshot {
+  return {
+    pending: [],
+    activeAttempt: null,
+    list: operationSnapshot("idle"),
+    begin: operationSnapshot("idle"),
+    complete: operationSnapshot("idle"),
+    cancel: operationSnapshot("idle"),
+    logout: operationSnapshot("idle"),
   };
 }
 
