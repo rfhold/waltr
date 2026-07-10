@@ -28,6 +28,7 @@ http = "1.4.1"
 httpdate = "1.0.3"
 ignore = "0.4.25"
 insta = "1.44.1"
+jsonwebtoken = "9.3.1"
 waltr = { version = "0.1.0", path = "crates/waltr" }
 waltr-agent = { version = "0.1.0", path = "crates/waltr-agent" }
 waltr-client = { version = "0.1.0", path = "crates/waltr-client" }

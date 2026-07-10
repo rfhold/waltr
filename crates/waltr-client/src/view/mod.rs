@@ -24,7 +24,8 @@ mod tests {
     use ts_rs::TS as _;
 
     use crate::{
-        CatalogMatchSource, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
+        AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot, CatalogMatchSource,
+        ClientAuthTarget, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
         ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection, ConfigSnapshot,
         Configuration, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits, ModelOptions,
         ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType,
@@ -172,6 +173,10 @@ mod tests {
             SessionTemplateOptionView::decl(),
             SessionTemplateSearchSnapshot::decl(),
             RollbackTargetView::decl(),
+            ClientAuthTarget::decl(),
+            AuthAttemptSnapshot::decl(),
+            AuthRequirementSnapshot::decl(),
+            AuthSnapshot::decl(),
             ClientOperationView::decl(),
             OperationCollectionSnapshot::decl(),
             OperationSnapshot::decl(),

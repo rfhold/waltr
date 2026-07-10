@@ -19,12 +19,13 @@ use crate::executor::{
 };
 use crate::transport::SessionTimelineWatchUpdate;
 use crate::{
-    Client, ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate,
-    ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey,
-    OperationStatus, ProviderView, RollbackTarget, RuntimeDefaultsView, SessionEffect,
-    SessionEvent, SessionRuntimeConfigRequest, SessionTemplateKind, SessionTemplateOption,
-    SessionTimelineView, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
-    TimelineDirection, TimelineQuery, TimelineWatchKey, rollback_target,
+    AuthAttemptState, AuthRequirement, AuthTarget, Client, ClientEffect, ClientError, ClientEvent,
+    ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
+    McpServerView, OperationKey, OperationStatus, ProviderView, RollbackTarget,
+    RuntimeDefaultsView, SessionEffect, SessionEvent, SessionRuntimeConfigRequest,
+    SessionTemplateKind, SessionTemplateOption, SessionTimelineView, SessionView,
+    StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
+    TimelineWatchKey, rollback_target,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -35,6 +36,37 @@ type ClientSleep = Rc<dyn Fn(u64) -> LocalBoxFuture<'static, ()>>;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ClientCommand {
+    /// Load secret-safe auth statuses.
+    RequestAuthStatuses,
+    /// Dismiss one queued auth requirement.
+    DismissAuthRequirement {
+        /// Target to dismiss from the queue.
+        target: ClientAuthTarget,
+    },
+    /// Begin manual OAuth for a target.
+    BeginAuth {
+        /// Target to authenticate.
+        target: ClientAuthTarget,
+    },
+    /// Complete manual OAuth with a pasted redirect URL or code.
+    CompleteAuth {
+        /// Attempt id returned by begin.
+        #[serde(rename = "attemptId")]
+        attempt_id: String,
+        /// Pasted redirect URL or code.
+        input: String,
+    },
+    /// Cancel a manual OAuth attempt.
+    CancelAuth {
+        /// Attempt id returned by begin.
+        #[serde(rename = "attemptId")]
+        attempt_id: String,
+    },
+    /// Delete stored credentials for a target.
+    LogoutAuth {
+        /// Target to log out.
+        target: ClientAuthTarget,
+    },
     /// Load the current configuration.
     RequestConfig,
     /// Add a provider to the latest configuration.
@@ -235,6 +267,16 @@ pub enum ClientCommand {
     WaitForSystemReady,
 }
 
+/// Stable UI-facing auth target.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientAuthTarget {
+    /// Target kind, currently `provider` or `mcpServer`.
+    pub kind: String,
+    /// Config key for the target.
+    pub key: String,
+}
+
 /// Direction for loading a timeline page from an exclusive cursor boundary.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -279,6 +321,8 @@ impl Default for ClientSessionTemplateSearchTarget {
 #[derive(Clone, Debug, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSnapshot {
+    /// Auth coordination snapshot.
+    pub auth: AuthSnapshot,
     /// Command operation result snapshots.
     pub operations: OperationCollectionSnapshot,
     /// Configuration coordination snapshot.
@@ -287,6 +331,68 @@ pub struct ClientSnapshot {
     pub status: StatusSnapshot,
     /// Session coordination snapshot.
     pub sessions: SessionSnapshot,
+}
+
+/// Stable auth coordination snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthSnapshot {
+    /// Pending auth requirements in modal display order.
+    pub pending: Vec<AuthRequirementSnapshot>,
+    /// Active manual auth attempt, when one has started.
+    #[serde(rename = "activeAttempt")]
+    pub active_attempt: Option<AuthAttemptSnapshot>,
+    /// Auth status list operation state.
+    pub list: OperationSnapshot,
+    /// Begin auth operation state.
+    pub begin: OperationSnapshot,
+    /// Complete auth operation state.
+    pub complete: OperationSnapshot,
+    /// Cancel auth operation state.
+    pub cancel: OperationSnapshot,
+    /// Logout operation state.
+    pub logout: OperationSnapshot,
+}
+
+/// One pending auth requirement.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRequirementSnapshot {
+    /// Target that requires authentication.
+    pub target: ClientAuthTarget,
+    /// Human-readable reason.
+    pub message: String,
+    /// Session whose work reported the requirement.
+    #[serde(rename = "sourceSessionId")]
+    pub source_session_id: Option<String>,
+}
+
+/// Active manual auth attempt details.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthAttemptSnapshot {
+    /// Target being authenticated.
+    pub target: ClientAuthTarget,
+    /// Attempt id returned by the server.
+    #[serde(rename = "attemptId")]
+    pub attempt_id: String,
+    /// URL to open for browser-based auth.
+    #[serde(rename = "authUrl")]
+    pub auth_url: String,
+    /// Verification URL for device-style auth, when supplied.
+    #[serde(rename = "verificationUrl")]
+    pub verification_url: String,
+    /// User code for device-style auth, when supplied.
+    #[serde(rename = "userCode")]
+    pub user_code: String,
+    /// Attempt expiration timestamp in milliseconds since epoch.
+    #[serde(rename = "expiresAtMs")]
+    pub expires_at_ms: i64,
+    /// Poll interval for device-style auth.
+    #[serde(rename = "pollIntervalSeconds")]
+    pub poll_interval_seconds: i32,
+    /// User-facing instructions returned by the server.
+    pub messages: Vec<String>,
 }
 
 /// Stable snapshot of command operation results.
@@ -301,6 +407,40 @@ pub struct OperationCollectionSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, TS)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ClientOperationView {
+    /// Begin auth command result.
+    AuthBegin {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Target being authenticated.
+        target: ClientAuthTarget,
+        /// Attempt details returned by the server.
+        attempt: Option<AuthAttemptSnapshot>,
+    },
+    /// Complete auth command result.
+    AuthComplete {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+    },
+    /// Cancel auth command result.
+    AuthCancel {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+    },
+    /// Logout command result.
+    AuthLogout {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Target logged out.
+        target: ClientAuthTarget,
+    },
     /// Configuration patch command result.
     ConfigPatch {
         /// Stable operation status name.
@@ -1024,6 +1164,12 @@ impl ClientStateStream {
 
     fn begin_command(&mut self, command: ClientCommand) -> Result<(), ClientError> {
         let update = match command {
+            ClientCommand::RequestAuthStatuses
+            | ClientCommand::DismissAuthRequirement { .. }
+            | ClientCommand::BeginAuth { .. }
+            | ClientCommand::CompleteAuth { .. }
+            | ClientCommand::CancelAuth { .. }
+            | ClientCommand::LogoutAuth { .. } => self.begin_auth_command(command),
             ClientCommand::RequestConfig
             | ClientCommand::AddProvider { .. }
             | ClientCommand::UpdateProvider { .. }
@@ -1061,6 +1207,29 @@ impl ClientStateStream {
 
         self.extend_effects(&update);
         Ok(())
+    }
+
+    fn begin_auth_command(&mut self, command: ClientCommand) -> ClientUpdate {
+        match command {
+            ClientCommand::RequestAuthStatuses => self.runtime.reducer.request_auth_statuses(),
+            ClientCommand::DismissAuthRequirement { target } => self
+                .runtime
+                .reducer
+                .dismiss_auth_requirement(target.into_auth_target()),
+            ClientCommand::BeginAuth { target } => {
+                self.runtime.reducer.begin_auth(target.into_auth_target())
+            }
+            ClientCommand::CompleteAuth { attempt_id, input } => {
+                self.runtime.reducer.complete_auth(attempt_id, input)
+            }
+            ClientCommand::CancelAuth { attempt_id } => {
+                self.runtime.reducer.cancel_auth(attempt_id)
+            }
+            ClientCommand::LogoutAuth { target } => {
+                self.runtime.reducer.logout_auth(target.into_auth_target())
+            }
+            _ => unreachable!("non-auth command routed to auth handler"),
+        }
     }
 
     fn begin_config_command(
@@ -1309,6 +1478,25 @@ impl ClientSnapshot {
         let state = client.state();
 
         Self {
+            auth: AuthSnapshot {
+                pending: state
+                    .auth
+                    .pending
+                    .iter()
+                    .cloned()
+                    .map(AuthRequirementSnapshot::from)
+                    .collect(),
+                active_attempt: state
+                    .auth
+                    .active_attempt
+                    .clone()
+                    .map(AuthAttemptSnapshot::from),
+                list: OperationSnapshot::from_state(&state.auth.list),
+                begin: OperationSnapshot::from_state(&state.auth.begin),
+                complete: OperationSnapshot::from_state(&state.auth.complete),
+                cancel: OperationSnapshot::from_state(&state.auth.cancel),
+                logout: OperationSnapshot::from_state(&state.auth.logout),
+            },
             operations: OperationCollectionSnapshot {
                 current: state
                     .operations
@@ -1423,9 +1611,98 @@ impl From<SessionTemplateOption> for SessionTemplateOptionView {
     }
 }
 
+impl ClientAuthTarget {
+    fn into_auth_target(self) -> AuthTarget {
+        let target = match self.kind.as_str() {
+            "provider" => waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(self.key),
+            "mcpServer" | "mcp_server" => {
+                waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(self.key)
+            }
+            _ => waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(self.key),
+        };
+
+        AuthTarget {
+            target: Some(target),
+        }
+    }
+}
+
+impl From<AuthTarget> for ClientAuthTarget {
+    fn from(target: AuthTarget) -> Self {
+        match target.target {
+            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(key)) => Self {
+                kind: "provider".to_owned(),
+                key,
+            },
+            Some(waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(key)) => Self {
+                kind: "mcpServer".to_owned(),
+                key,
+            },
+            None => Self {
+                kind: "unknown".to_owned(),
+                key: String::new(),
+            },
+        }
+    }
+}
+
+impl From<AuthRequirement> for AuthRequirementSnapshot {
+    fn from(requirement: AuthRequirement) -> Self {
+        Self {
+            target: ClientAuthTarget::from(requirement.target),
+            message: requirement.message,
+            source_session_id: requirement.source_session_id,
+        }
+    }
+}
+
+impl From<AuthAttemptState> for AuthAttemptSnapshot {
+    fn from(attempt: AuthAttemptState) -> Self {
+        Self {
+            target: ClientAuthTarget::from(attempt.target),
+            attempt_id: attempt.attempt_id,
+            auth_url: attempt.auth_url,
+            verification_url: attempt.verification_url,
+            user_code: attempt.user_code,
+            expires_at_ms: attempt.expires_at_ms,
+            poll_interval_seconds: attempt.poll_interval_seconds,
+            messages: attempt.messages,
+        }
+    }
+}
+
 impl From<ClientOperationState> for ClientOperationView {
     fn from(operation: ClientOperationState) -> Self {
         match operation {
+            ClientOperationState::AuthBegin {
+                status,
+                error,
+                target,
+                attempt,
+            } => Self::AuthBegin {
+                status: operation_status_name(status),
+                error,
+                target: ClientAuthTarget::from(target),
+                attempt: attempt.map(AuthAttemptSnapshot::from),
+            },
+            ClientOperationState::AuthComplete { status, error, .. } => Self::AuthComplete {
+                status: operation_status_name(status),
+                error,
+            },
+            ClientOperationState::AuthCancel { status, error } => Self::AuthCancel {
+                status: operation_status_name(status),
+                error,
+            },
+            ClientOperationState::AuthLogout {
+                status,
+                error,
+                target,
+                ..
+            } => Self::AuthLogout {
+                status: operation_status_name(status),
+                error,
+                target: ClientAuthTarget::from(target),
+            },
             ClientOperationState::ConfigPatch {
                 status,
                 error,

@@ -17,6 +17,7 @@ futures-core.workspace = true
 futures-util.workspace = true
 waltr = { path = "../waltr", version = "0.1.0", default-features = false, features = ["grpc"] }
 prost-types.workspace = true
+prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 tonic.workspace = true

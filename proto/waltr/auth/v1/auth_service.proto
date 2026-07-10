@@ -3,12 +3,103 @@ syntax = "proto3";
 package waltr.auth.v1;
 
 service AuthService {
+  rpc ListAuthStatuses(ListAuthStatusesRequest) returns (ListAuthStatusesResponse);
+  rpc GetAuthStatus(GetAuthStatusRequest) returns (GetAuthStatusResponse);
+  rpc BeginAuth(BeginAuthRequest) returns (BeginAuthResponse);
+  rpc CompleteAuth(CompleteAuthRequest) returns (CompleteAuthResponse);
+  rpc CancelAuth(CancelAuthRequest) returns (CancelAuthResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc ListProviderAuthStatuses(ListProviderAuthStatusesRequest) returns (ListProviderAuthStatusesResponse);
   rpc GetProviderAuthStatus(GetProviderAuthStatusRequest) returns (GetProviderAuthStatusResponse);
   rpc BeginProviderAuth(BeginProviderAuthRequest) returns (BeginProviderAuthResponse);
   rpc CompleteProviderAuth(CompleteProviderAuthRequest) returns (CompleteProviderAuthResponse);
   rpc CancelProviderAuth(CancelProviderAuthRequest) returns (CancelProviderAuthResponse);
   rpc LogoutProvider(LogoutProviderRequest) returns (LogoutProviderResponse);
+}
+
+message ListAuthStatusesRequest {}
+
+message ListAuthStatusesResponse {
+  repeated AuthStatus statuses = 1;
+}
+
+message GetAuthStatusRequest {
+  AuthTarget target = 1;
+}
+
+message GetAuthStatusResponse {
+  AuthStatus status = 1;
+}
+
+message BeginAuthRequest {
+  AuthTarget target = 1;
+  AuthMethod method = 2;
+}
+
+message BeginAuthResponse {
+  string attempt_id = 1;
+  AuthMethod method = 2;
+  string auth_url = 3;
+  string verification_url = 4;
+  string user_code = 5;
+  int64 expires_at_ms = 6;
+  int32 poll_interval_seconds = 7;
+  repeated string messages = 8;
+}
+
+message CompleteAuthRequest {
+  string attempt_id = 1;
+  string input = 2;
+}
+
+message CompleteAuthResponse {
+  AuthStatus status = 1;
+}
+
+message CancelAuthRequest {
+  string attempt_id = 1;
+}
+
+message CancelAuthResponse {}
+
+message LogoutRequest {
+  AuthTarget target = 1;
+}
+
+message LogoutResponse {
+  AuthStatus status = 1;
+}
+
+message AuthTarget {
+  oneof target {
+    string provider_key = 1;
+    string mcp_server_key = 2;
+  }
+}
+
+message AuthStatus {
+  AuthTarget target = 1;
+  AuthStatusKind kind = 2;
+  repeated AuthMethod supported_methods = 3;
+  int64 expires_at_ms = 4;
+  map<string, string> metadata = 5;
+  string message = 6;
+}
+
+enum AuthStatusKind {
+  AUTH_STATUS_KIND_UNSPECIFIED = 0;
+  AUTH_STATUS_KIND_NOT_CONFIGURED = 1;
+  AUTH_STATUS_KIND_API_KEY_CONFIGURED = 2;
+  AUTH_STATUS_KIND_OAUTH_CONFIGURED = 3;
+  AUTH_STATUS_KIND_EXPIRED = 4;
+  AUTH_STATUS_KIND_UNSUPPORTED = 5;
+  AUTH_STATUS_KIND_AUTHORIZATION_REQUIRED = 6;
+}
+
+enum AuthMethod {
+  AUTH_METHOD_UNSPECIFIED = 0;
+  AUTH_METHOD_OAUTH_MANUAL = 1;
+  AUTH_METHOD_OAUTH_DEVICE = 2;
 }
 
 message ListProviderAuthStatusesRequest {}

@@ -2,9 +2,10 @@
 
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
-    ClientError, Configuration, OperationKey, Provider, RollbackTarget, RuntimeDefaults,
-    SessionRuntimeConfigRequest, SessionSummary, SessionTemplateKind, SessionTemplateOption,
-    SessionTemplateSearchTarget, SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
+    AuthStatus, AuthTarget, ClientError, Configuration, GenericAuthAttempt, OperationKey, Provider,
+    RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest, SessionSummary,
+    SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus,
+    TimelineEvent, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -14,6 +15,8 @@ pub type StreamId = u64;
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
+    /// Auth coordination event.
+    Auth(AuthEvent),
     /// Configuration coordination event.
     Config(ConfigEvent),
     /// Status coordination event.
@@ -22,6 +25,119 @@ pub enum ClientEvent {
     Session(SessionEvent),
     /// A model or tool stream coordination event.
     Stream(StreamEvent),
+}
+
+/// Auth coordination event applied to the reducer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuthEvent {
+    /// A caller requested all auth statuses.
+    ListRequested,
+    /// Auth statuses loaded successfully.
+    Listed(Vec<AuthStatus>),
+    /// Auth statuses failed to load.
+    ListFailed(ClientError),
+    /// A session run reported an auth target that must be completed.
+    AuthorizationRequired {
+        /// Target that requires authentication.
+        target: AuthTarget,
+        /// Human-readable reason.
+        message: String,
+        /// Session whose work reported the requirement.
+        source_session_id: Option<String>,
+    },
+    /// A caller dismissed one queued auth requirement.
+    Dismissed {
+        /// Target to remove from the pending queue.
+        target: AuthTarget,
+    },
+    /// A caller requested a manual OAuth attempt.
+    BeginRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target to authenticate.
+        target: AuthTarget,
+    },
+    /// A manual OAuth attempt started successfully.
+    Begun {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target being authenticated.
+        target: AuthTarget,
+        /// Attempt details returned by the server.
+        attempt: GenericAuthAttempt,
+    },
+    /// A manual OAuth attempt failed to start.
+    BeginFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target being authenticated.
+        target: AuthTarget,
+        /// Failure returned by the begin effect.
+        error: ClientError,
+    },
+    /// A caller requested completion of a manual OAuth attempt.
+    CompleteRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Attempt id returned by begin.
+        attempt_id: String,
+        /// Pasted code or final redirect URL.
+        input: String,
+    },
+    /// A manual OAuth attempt completed successfully.
+    Completed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Secret-safe status after completion.
+        status: AuthStatus,
+    },
+    /// A manual OAuth attempt failed to complete.
+    CompleteFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the complete effect.
+        error: ClientError,
+    },
+    /// A caller requested cancellation of a manual OAuth attempt.
+    CancelRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Attempt id returned by begin.
+        attempt_id: String,
+    },
+    /// A manual OAuth attempt was canceled successfully.
+    Canceled {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+    },
+    /// A manual OAuth attempt failed to cancel.
+    CancelFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the cancel effect.
+        error: ClientError,
+    },
+    /// A caller requested logout for a target.
+    LogoutRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target to log out.
+        target: AuthTarget,
+    },
+    /// Logout completed successfully.
+    LoggedOut {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Secret-safe status after logout.
+        status: AuthStatus,
+    },
+    /// Logout failed.
+    LogoutFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the logout effect.
+        error: ClientError,
+    },
 }
 
 /// Configuration coordination event applied to the reducer.
@@ -275,6 +391,15 @@ pub enum SessionEvent {
         /// Failure returned by the submit effect.
         error: ClientError,
     },
+    /// A session run reported an auth target that must be completed.
+    AuthRequiredFromSession {
+        /// Target that requires authentication.
+        target: AuthTarget,
+        /// Human-readable reason.
+        message: String,
+        /// Session whose work reported the requirement.
+        session_id: String,
+    },
     /// A caller requested a response to an external request.
     ExternalRequestRespondRequested {
         /// Operation key allocated when the command was requested.
@@ -381,12 +506,51 @@ pub enum SessionEvent {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEffect {
+    /// Auth side-effect intent.
+    Auth(AuthEffect),
     /// Configuration side-effect intent.
     Config(ConfigEffect),
     /// Status side-effect intent.
     Status(StatusEffect),
     /// Session side-effect intent.
     Session(SessionEffect),
+}
+
+/// Auth side-effect intent emitted by the client.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuthEffect {
+    /// List secret-safe auth statuses.
+    ListStatuses,
+    /// Begin a manual OAuth attempt.
+    Begin {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target to authenticate.
+        target: AuthTarget,
+    },
+    /// Complete a manual OAuth attempt.
+    Complete {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Attempt id returned by begin.
+        attempt_id: String,
+        /// Pasted code or final redirect URL.
+        input: String,
+    },
+    /// Cancel a manual OAuth attempt.
+    Cancel {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Attempt id returned by begin.
+        attempt_id: String,
+    },
+    /// Delete stored credentials for a target.
+    Logout {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target to log out.
+        target: AuthTarget,
+    },
 }
 
 /// Sparse top-level configuration patch emitted by the client.

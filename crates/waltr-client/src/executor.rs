@@ -11,9 +11,9 @@ use crate::transport::{
     SessionWatchStream, StatusWatchStream,
 };
 use crate::{
-    ClientEffect, ClientError, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch, ConfigView,
-    SearchSessionTemplatesRequest, SessionEffect, SessionEvent, SessionSummary, StatusEffect,
-    StatusEvent, search_session_templates_response,
+    AuthEffect, AuthEvent, ClientEffect, ClientError, ClientEvent, ConfigEffect, ConfigEvent,
+    ConfigPatch, ConfigView, SearchSessionTemplatesRequest, SessionEffect, SessionEvent,
+    SessionSummary, StatusEffect, StatusEvent, search_session_templates_response,
 };
 
 /// Stream of configuration changes observed through the gRPC executor.
@@ -188,6 +188,64 @@ impl GrpcEffectExecutor {
         SleepFuture: Future<Output = ()>,
     {
         match effect {
+            ClientEffect::Auth(AuthEffect::ListStatuses) => {
+                match self.transport.list_auth_statuses().await {
+                    Ok(statuses) => vec![ClientEvent::Auth(AuthEvent::Listed(statuses))],
+                    Err(error) => vec![ClientEvent::Auth(AuthEvent::ListFailed(error))],
+                }
+            }
+            ClientEffect::Auth(AuthEffect::Begin {
+                operation_key,
+                target,
+            }) => match self.transport.begin_auth(target.clone()).await {
+                Ok(attempt) => vec![ClientEvent::Auth(AuthEvent::Begun {
+                    operation_key,
+                    target,
+                    attempt,
+                })],
+                Err(error) => vec![ClientEvent::Auth(AuthEvent::BeginFailed {
+                    operation_key,
+                    target,
+                    error,
+                })],
+            },
+            ClientEffect::Auth(AuthEffect::Complete {
+                operation_key,
+                attempt_id,
+                input,
+            }) => match self.transport.complete_auth(attempt_id, input).await {
+                Ok(status) => vec![ClientEvent::Auth(AuthEvent::Completed {
+                    operation_key,
+                    status,
+                })],
+                Err(error) => vec![ClientEvent::Auth(AuthEvent::CompleteFailed {
+                    operation_key,
+                    error,
+                })],
+            },
+            ClientEffect::Auth(AuthEffect::Cancel {
+                operation_key,
+                attempt_id,
+            }) => match self.transport.cancel_auth(attempt_id).await {
+                Ok(()) => vec![ClientEvent::Auth(AuthEvent::Canceled { operation_key })],
+                Err(error) => vec![ClientEvent::Auth(AuthEvent::CancelFailed {
+                    operation_key,
+                    error,
+                })],
+            },
+            ClientEffect::Auth(AuthEffect::Logout {
+                operation_key,
+                target,
+            }) => match self.transport.logout(target).await {
+                Ok(status) => vec![ClientEvent::Auth(AuthEvent::LoggedOut {
+                    operation_key,
+                    status,
+                })],
+                Err(error) => vec![ClientEvent::Auth(AuthEvent::LogoutFailed {
+                    operation_key,
+                    error,
+                })],
+            },
             ClientEffect::Config(ConfigEffect::Load) => match self.transport.get_config().await {
                 Ok(config) => vec![ClientEvent::Config(ConfigEvent::Loaded(config))],
                 Err(error) => vec![ClientEvent::Config(ConfigEvent::LoadFailed(error))],
