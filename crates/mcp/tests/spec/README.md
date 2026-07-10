@@ -17,6 +17,7 @@ Planned coverage belongs here when a test case is validating protocol requiremen
 | Area | File | Status | Notes |
 | --- | --- | --- | --- |
 | Basic / JSON-RPC | `v2025_11_25/basic/json_rpc.rs` | Partial | Covers public builder/parser shapes, malformed message rejection, and HTTP JSON-RPC error shape. Batch requests remain unsupported. |
+| Basic / Authorization | `v2025_11_25/basic/authorization.rs` | Partial | Covers protected-resource metadata validation, well-known discovery paths and fallback, bearer challenges, bearer token injection, validator outcomes, post-initialize polling authorization failures, structured client authorization errors, and discovery URL ordering. Full OAuth authorization-code flow, registration, token exchange, refresh, and storage remain outside the crate. |
 | Basic / Lifecycle | `v2025_11_25/basic/lifecycle.rs` | Partial | Covers initialize result shape, client initialized notification, pre-initialize request rejection, and repeated initialize rejection. Stdio sequencing remains uncovered. |
 | Basic / Transports | `v2025_11_25/basic/transports.rs` and `v2025_11_25/transports.rs` | Partial | Covers Streamable HTTP POST behavior, required POST `Accept`, protocol-version rejection, GET polling, DELETE termination, Origin rejection, and end-to-end client polling. |
 | Basic / Cancellation | `v2025_11_25/basic/cancellation.rs` | Partial | Covers cancellation notification parameter shape. End-to-end cancellation remains unsupported. |

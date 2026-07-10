@@ -5,6 +5,7 @@ mod capabilities;
 pub mod client;
 mod error;
 mod log;
+pub mod oauth;
 mod prompt;
 /// JSON-RPC and MCP wire protocol helpers.
 pub mod protocol;
@@ -21,6 +22,12 @@ pub use capabilities::{
 };
 pub use error::{Error, Result};
 pub use log::McpLogLevel;
+pub use oauth::{
+    McpAccessToken, McpAuthorizationError, McpAuthorizationServerMetadata, McpBearerChallenge,
+    McpProtectedResourceMetadata, McpTokenValidation, authorization_server_metadata_urls,
+    discover_authorization_server_metadata, discover_protected_resource_metadata,
+    protected_resource_metadata_urls,
+};
 pub use prompt::{
     McpPromptArgument, McpPromptDefinition, format_prompt_result, parse_prompt_definition,
 };

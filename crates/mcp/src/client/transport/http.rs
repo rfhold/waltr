@@ -12,6 +12,7 @@ use tracing::Instrument as _;
 
 use crate::{
     Error, Result,
+    oauth::{McpAuthorizationError, McpBearerChallenge},
     protocol::{MCP_PROTOCOL_VERSION, parse_json_rpc_message},
     trace::{request_id, request_method},
 };
@@ -27,6 +28,7 @@ struct HttpSessionState {
 /// Streamable HTTP client transport.
 pub struct StreamableHttpTransport {
     endpoint: String,
+    bearer_token: Option<String>,
     client: reqwest::Client,
     state: Arc<Mutex<HttpSessionState>>,
     inbound: InboundSender,
@@ -46,9 +48,10 @@ impl std::fmt::Debug for StreamableHttpTransport {
 impl StreamableHttpTransport {
     /// Create a streamable HTTP transport.
     #[must_use]
-    pub fn new(endpoint: String, inbound: InboundSender) -> Self {
+    pub fn new(endpoint: String, bearer_token: Option<String>, inbound: InboundSender) -> Self {
         Self {
             endpoint,
+            bearer_token,
             client: reqwest::Client::new(),
             state: Arc::new(Mutex::new(HttpSessionState::default())),
             inbound,
@@ -77,6 +80,9 @@ impl StreamableHttpTransport {
         if let Some(session_id) = &session_id {
             builder = builder.header("mcp-session-id", session_id);
         }
+        if let Some(bearer_token) = &self.bearer_token {
+            builder = builder.bearer_auth(bearer_token);
+        }
         let span = tracing::info_span!(
             "http.client.request",
             http_request_method = "POST",
@@ -100,6 +106,11 @@ impl StreamableHttpTransport {
                 "MCP HTTP session expired".to_owned(),
             )));
             return Ok(());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(Error::Authorization(Box::new(authorization_error(
+                &response,
+            ))));
         }
         if !status.is_success() {
             return Err(Error::protocol(format!(
@@ -151,6 +162,7 @@ impl StreamableHttpTransport {
             return;
         }
         let endpoint = self.endpoint.clone();
+        let bearer_token = self.bearer_token.clone();
         let client = self.client.clone();
         let state = Arc::clone(&self.state);
         let inbound = self.inbound.clone();
@@ -171,6 +183,9 @@ impl StreamableHttpTransport {
                     .header("accept", "text/event-stream")
                     .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
                     .header("mcp-session-id", &session_id);
+                if let Some(bearer_token) = &bearer_token {
+                    request = request.bearer_auth(bearer_token);
+                }
                 if let Some(last_event_id) = &last_event_id {
                     request = request.header("last-event-id", last_event_id);
                 }
@@ -188,6 +203,16 @@ impl StreamableHttpTransport {
                     drop(inbound.send(TransportInbound::Disconnected(
                         "MCP HTTP session expired".to_owned(),
                     )));
+                    break;
+                }
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || response.status() == reqwest::StatusCode::FORBIDDEN
+                {
+                    drop(
+                        inbound.send(TransportInbound::AuthorizationFailed(authorization_error(
+                            &response,
+                        ))),
+                    );
                     break;
                 }
                 if !response.status().is_success() {
@@ -219,5 +244,19 @@ impl StreamableHttpTransport {
     /// Stop background polling.
     pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+    }
+}
+
+fn authorization_error(response: &reqwest::Response) -> McpAuthorizationError {
+    let challenge = McpBearerChallenge::parse_any(
+        response
+            .headers()
+            .get_all(reqwest::header::WWW_AUTHENTICATE)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
+    McpAuthorizationError {
+        status: response.status(),
+        challenge,
     }
 }

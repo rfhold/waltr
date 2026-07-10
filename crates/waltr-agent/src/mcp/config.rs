@@ -108,6 +108,7 @@ impl McpServerConfig {
             name: name.into(),
             transport: McpTransportConfig::StreamableHttp {
                 endpoint: endpoint.into(),
+                bearer_token: None,
             },
         }
     }

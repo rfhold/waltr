@@ -7,7 +7,7 @@ use std::fmt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::{Result, protocol::JsonRpcInbound};
+use crate::{McpAuthorizationError, Result, protocol::JsonRpcInbound};
 use http::StreamableHttpTransport;
 use stdio::StdioTransport;
 
@@ -21,6 +21,8 @@ pub enum TransportInbound {
     Message(JsonRpcInbound),
     /// Streamable HTTP SSE event id.
     SseEventId(String),
+    /// Streamable HTTP authorization failure.
+    AuthorizationFailed(McpAuthorizationError),
     /// Transport disconnection.
     Disconnected(String),
 }
@@ -39,6 +41,8 @@ pub enum McpTransportConfig {
     StreamableHttp {
         /// Endpoint URL.
         endpoint: String,
+        /// Optional bearer token used on every HTTP request.
+        bearer_token: Option<String>,
     },
 }
 
@@ -82,9 +86,14 @@ impl McpTransport {
             McpTransportConfig::Stdio { command, args } => Ok(Self::Stdio(Box::new(
                 StdioTransport::start(server_name, command, args, inbound).await?,
             ))),
-            McpTransportConfig::StreamableHttp { endpoint } => Ok(Self::StreamableHttp(
-                StreamableHttpTransport::new(endpoint, inbound),
-            )),
+            McpTransportConfig::StreamableHttp {
+                endpoint,
+                bearer_token,
+            } => Ok(Self::StreamableHttp(StreamableHttpTransport::new(
+                endpoint,
+                bearer_token,
+                inbound,
+            ))),
         }
     }
 

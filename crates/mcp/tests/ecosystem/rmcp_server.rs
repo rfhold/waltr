@@ -64,6 +64,7 @@ impl RunningServer for RmcpStreamableHttpServer {
     fn transport(&self) -> McpTransportConfig {
         McpTransportConfig::StreamableHttp {
             endpoint: format!("http://{}/mcp", self.address),
+            bearer_token: None,
         }
     }
 }

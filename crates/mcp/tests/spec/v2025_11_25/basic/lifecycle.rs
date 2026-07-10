@@ -165,6 +165,7 @@ async fn client_exposes_server_instructions() -> mcp::Result<()> {
         "mcp-spec-server",
         McpTransportConfig::StreamableHttp {
             endpoint: server.endpoint(),
+            bearer_token: None,
         },
         Arc::new(LifecycleClient),
         McpClientOptions::new("mcp-spec-client", "1.0.0", Duration::from_secs(5)),
@@ -274,6 +275,7 @@ async fn initialized_notification_is_sent_after_client_initializes() -> mcp::Res
         "mcp-spec-server",
         McpTransportConfig::StreamableHttp {
             endpoint: server.endpoint(),
+            bearer_token: None,
         },
         Arc::new(LifecycleClient),
         McpClientOptions::new("mcp-spec-client", "1.0.0", Duration::from_secs(5)),
