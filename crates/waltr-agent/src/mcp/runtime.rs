@@ -44,6 +44,28 @@ pub(crate) struct McpClientRuntime {
     events: broadcast::Sender<McpRuntimeEvent>,
 }
 
+#[derive(Debug)]
+pub(crate) struct McpRuntimeStartError {
+    pub(crate) server_key: String,
+    pub(crate) error: LlmError,
+}
+
+impl std::fmt::Display for McpRuntimeStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "mcp server '{}' failed to start: {}",
+            self.server_key, self.error
+        )
+    }
+}
+
+impl std::error::Error for McpRuntimeStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 fn protocol_error(message: impl Into<String>) -> LlmError {
     LlmError::Protocol {
         provider: "mcp",
@@ -65,11 +87,12 @@ impl McpClientRuntime {
         config: McpConfig,
         root_uri: String,
         cancellation_token: CancellationToken,
-    ) -> Result<Arc<Self>> {
+    ) -> std::result::Result<Arc<Self>, McpRuntimeStartError> {
         let (servers, timeout, log_level, trace_propagation) = config.into_parts();
         let (events, _) = broadcast::channel(128);
         let mut active = BTreeMap::new();
         for server in servers {
+            let server_key = server.name.clone();
             let runtime = McpServerRuntime::start(
                 server,
                 timeout,
@@ -79,7 +102,8 @@ impl McpClientRuntime {
                 events.clone(),
                 cancellation_token.clone(),
             )
-            .await?;
+            .await
+            .map_err(|error| McpRuntimeStartError { server_key, error })?;
             active.insert(runtime.name().to_owned(), runtime);
         }
         Ok(Arc::new(Self {

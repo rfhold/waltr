@@ -45,6 +45,15 @@ pub enum LlmError {
         /// Protocol error message.
         message: String,
     },
+    /// The provider or transport requires authentication.
+    Authorization {
+        /// Provider or transport that requires authentication.
+        provider: &'static str,
+        /// Authentication failure message.
+        message: String,
+        /// HTTP status code, when available.
+        status: Option<u16>,
+    },
 }
 
 impl fmt::Display for LlmError {
@@ -64,6 +73,11 @@ impl fmt::Display for LlmError {
             Self::Protocol { provider, message } => {
                 write!(formatter, "{provider} protocol error: {message}")
             }
+            Self::Authorization {
+                provider, message, ..
+            } => {
+                write!(formatter, "{provider} authorization required: {message}")
+            }
         }
     }
 }
@@ -76,7 +90,10 @@ impl Error for LlmError {
             Self::Request(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::MissingConfig { .. } | Self::Api { .. } | Self::Protocol { .. } => None,
+            Self::MissingConfig { .. }
+            | Self::Api { .. }
+            | Self::Protocol { .. }
+            | Self::Authorization { .. } => None,
         }
     }
 }
@@ -128,9 +145,16 @@ impl From<io::Error> for LlmError {
 
 impl From<mcp::Error> for LlmError {
     fn from(error: mcp::Error) -> Self {
-        Self::Protocol {
-            provider: "mcp",
-            message: error.to_string(),
+        match error {
+            mcp::Error::Authorization(error) => Self::Authorization {
+                provider: "mcp",
+                status: Some(error.status.as_u16()),
+                message: error.to_string(),
+            },
+            error => Self::Protocol {
+                provider: "mcp",
+                message: error.to_string(),
+            },
         }
     }
 }
