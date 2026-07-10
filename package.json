@@ -12,7 +12,8 @@
     "test:web:integration:dev": "WALTR_WEB_INTEGRATION_MODE=dev node scripts/test-web-integration.mjs",
     "test:web:live": "WALTR_WEB_LIVE=1 node scripts/test-web-integration.mjs",
     "test:web:screenshots": "WALTR_WEB_SCREENSHOTS=1 node scripts/test-web-integration.mjs",
-    "test:web:screenshots:update": "WALTR_WEB_SCREENSHOTS=1 WALTR_WEB_UPDATE_SCREENSHOTS=1 node scripts/test-web-integration.mjs"
+    "test:web:screenshots:update": "WALTR_WEB_SCREENSHOTS=1 WALTR_WEB_UPDATE_SCREENSHOTS=1 node scripts/test-web-integration.mjs",
+    "oauth:login": "node scripts/oauth-login-k6.mjs"
   },
   "devDependencies": {}
 }

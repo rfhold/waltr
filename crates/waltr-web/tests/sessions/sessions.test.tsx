@@ -227,7 +227,7 @@ describe("sessions route", () => {
         sessionId: "session-resource-rules",
         query: "src",
         limit: 12,
-        kinds: ["file", "tool"],
+        kinds: ["file", "tool", "resource"],
       });
     } finally {
       vi.useRealTimers();

@@ -1,4 +1,5 @@
 import type {
+  AuthSnapshot,
   ClientSnapshot,
   ConfigView,
   McpServerView,
@@ -16,6 +17,7 @@ export function snapshotWithConfig(
 ): ClientSnapshot {
   return {
     operations: { current: {} },
+    auth: emptyAuthSnapshot(),
     config: {
       current: config,
       load: operationSnapshot("idle"),
@@ -27,6 +29,18 @@ export function snapshotWithConfig(
       watch: operationSnapshot("ready"),
     },
     sessions: emptySessionSnapshot(),
+  };
+}
+
+export function emptyAuthSnapshot(): AuthSnapshot {
+  return {
+    pending: [],
+    activeAttempt: null,
+    list: operationSnapshot("idle"),
+    begin: operationSnapshot("idle"),
+    complete: operationSnapshot("idle"),
+    cancel: operationSnapshot("idle"),
+    logout: operationSnapshot("idle"),
   };
 }
 

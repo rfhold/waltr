@@ -6,14 +6,17 @@ use std::{
     time::Duration,
 };
 
+use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use mcp::{
     McpCompletionRequest, McpPromptArgument, McpPromptDefinition, McpPromptList, McpPromptResult,
-    McpResourceDefinition, McpResourceList, McpResourceResult, McpResourceTemplateDefinition,
-    McpResourceTemplateList, McpToolCall, McpToolDefinition, McpToolList, McpToolResult,
+    McpProtectedResourceMetadata, McpResourceDefinition, McpResourceList, McpResourceResult,
+    McpResourceTemplateDefinition, McpResourceTemplateList, McpTokenValidation, McpToolCall,
+    McpToolDefinition, McpToolList, McpToolResult,
     protocol::JsonRpcNotification,
     server::{
         BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-        ServerResult, serve_stdio, streamable_http_router,
+        ServerResult, StreamableHttpAuthorization, StreamableHttpOptions, serve_stdio,
+        streamable_http_router, streamable_http_router_with_options,
     },
 };
 use serde::Deserialize;
@@ -34,6 +37,32 @@ struct DelayedWriteRequest {
 #[derive(Debug, Deserialize)]
 struct EmitLogRequest {
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenIdConfiguration {
+    jwks_uri: String,
+}
+
+#[derive(Debug, Clone)]
+struct JwtValidator {
+    issuer: String,
+    audience: String,
+    jwks: Arc<JwkSet>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtClaims {
+    exp: usize,
+    iss: String,
+    aud: JwtAudience,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum JwtAudience {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -308,12 +337,133 @@ async fn serve_http(
     if let Some(path) = address_file {
         std::fs::write(path, address.to_string())?;
     }
-    axum::serve(
-        listener,
-        streamable_http_router(Arc::new(EchoMarkerServer::default())),
-    )
-    .await?;
+    let handler = Arc::new(EchoMarkerServer::default());
+    let resource =
+        std::env::var("WALTR_TEST_MCP_RESOURCE").unwrap_or_else(|_| format!("http://{address}/mcp"));
+    let router = if let Some(validator) = jwt_validator_from_env().await? {
+        let metadata =
+            McpProtectedResourceMetadata::new(resource.clone(), [validator.issuer.clone()])
+                .with_scopes(["openid", "email", "profile"])
+                .with_resource_name("Waltr protected MCP test server");
+        let authorization = StreamableHttpAuthorization::new(metadata, move |token, _context| {
+            let validator = validator.clone();
+            Box::pin(async move { validate_jwt_token(&validator, &token.0) })
+                as BoxFuture<McpTokenValidation>
+        })?;
+        streamable_http_router_with_options(
+            handler,
+            StreamableHttpOptions::default().with_authorization(authorization),
+        )
+    } else if let Ok(required_token) = std::env::var("WALTR_TEST_MCP_REQUIRED_BEARER") {
+        let issuer = std::env::var("WALTR_TEST_MCP_OAUTH_ISSUER")
+            .unwrap_or_else(|_| "https://auth.example.test".to_owned());
+        let metadata = McpProtectedResourceMetadata::new(resource, [issuer]);
+        let authorization = StreamableHttpAuthorization::new(metadata, move |token, _context| {
+            let required_token = required_token.clone();
+            Box::pin(async move {
+                if token.0 == required_token {
+                    McpTokenValidation::Authorized
+                } else {
+                    McpTokenValidation::Unauthorized {
+                        error_description: Some("invalid test token".to_owned()),
+                    }
+                }
+            }) as BoxFuture<McpTokenValidation>
+        })?;
+        streamable_http_router_with_options(
+            handler,
+            StreamableHttpOptions::default().with_authorization(authorization),
+        )
+    } else {
+        streamable_http_router(handler)
+    };
+    axum::serve(listener, router).await?;
     Ok(())
+}
+
+async fn jwt_validator_from_env() -> Result<Option<JwtValidator>, Box<dyn std::error::Error>> {
+    let issuer = match std::env::var("WALTR_TEST_MCP_OAUTH_ISSUER") {
+        Ok(issuer) if !issuer.trim().is_empty() => issuer,
+        _ => return Ok(None),
+    };
+    let audience = std::env::var("WALTR_TEST_MCP_OAUTH_AUDIENCE")
+        .or_else(|_| std::env::var("WALTR_TEST_MCP_OAUTH_CLIENT_ID"))
+        .unwrap_or_else(|_| "waltr-test".to_owned());
+    let jwks_uri = match std::env::var("WALTR_TEST_MCP_OAUTH_JWKS_URI") {
+        Ok(uri) if !uri.trim().is_empty() => uri,
+        _ => {
+            let issuer = issuer.trim_end_matches('/');
+            let config: OpenIdConfiguration =
+                reqwest::get(format!("{issuer}/.well-known/openid-configuration"))
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+            config.jwks_uri
+        }
+    };
+    let jwks: JwkSet = reqwest::get(jwks_uri)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    Ok(Some(JwtValidator {
+        issuer,
+        audience,
+        jwks: Arc::new(jwks),
+    }))
+}
+
+fn validate_jwt_token(validator: &JwtValidator, token: &str) -> McpTokenValidation {
+    match decode_validated_jwt(validator, token) {
+        Ok(()) => McpTokenValidation::Authorized,
+        Err(message) => McpTokenValidation::Unauthorized {
+            error_description: Some(message),
+        },
+    }
+}
+
+fn decode_validated_jwt(validator: &JwtValidator, token: &str) -> Result<(), String> {
+    let header = decode_header(token).map_err(|error| format!("invalid JWT header: {error}"))?;
+    let key = validator
+        .jwks
+        .keys
+        .iter()
+        .find(|jwk| {
+            header
+                .kid
+                .as_deref()
+                .is_some_and(|kid| jwk.common.key_id.as_deref() == Some(kid))
+        })
+        .or_else(|| validator.jwks.keys.first())
+        .ok_or_else(|| "authorization server JWKS is empty".to_owned())?;
+    let decoding_key = DecodingKey::from_jwk(key)
+        .map_err(|error| format!("invalid authorization server JWK: {error}"))?;
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[validator.issuer.as_str()]);
+    validation.set_audience(&[validator.audience.as_str()]);
+    let token = decode::<JwtClaims>(token, &decoding_key, &validation)
+        .map_err(|error| format!("invalid JWT: {error}"))?;
+
+    if token.claims.iss != validator.issuer {
+        return Err("JWT issuer mismatch".to_owned());
+    }
+    if !token.claims.aud.contains(&validator.audience) {
+        return Err("JWT audience mismatch".to_owned());
+    }
+    let _ = token.claims.exp;
+
+    Ok(())
+}
+
+impl JwtAudience {
+    fn contains(&self, audience: &str) -> bool {
+        match self {
+            Self::One(value) => value == audience,
+            Self::Many(values) => values.iter().any(|value| value == audience),
+        }
+    }
 }
 
 fn tools_list() -> Vec<McpToolDefinition> {
