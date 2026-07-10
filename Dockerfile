@@ -38,7 +38,9 @@ RUN --mount=type=cache,id=waltr-cargo-registry,target=/usr/local/cargo/registry 
     pnpm install --frozen-lockfile --store-dir /pnpm/store --config.dangerouslyAllowAllBuilds=true && \
     pnpm --filter @rfhold/waltr-web build && \
     cargo build -p waltr-server --features web --locked --release && \
-    cp /workspace/target/release/waltr-server /usr/local/bin/waltr-server
+    cargo build -p waltr-agent --bin waltr-agent-test-mcp-server --locked --release && \
+    cp /workspace/target/release/waltr-server /usr/local/bin/waltr-server && \
+    cp /workspace/target/release/waltr-agent-test-mcp-server /usr/local/bin/waltr-agent-test-mcp-server
 
 FROM debian:bookworm-slim AS runtime
 
@@ -53,6 +55,7 @@ ENV WALTR_SESSION_STORE=filesystem
 
 WORKDIR /data
 COPY --from=build /usr/local/bin/waltr-server /usr/local/bin/waltr-server
+COPY --from=build /usr/local/bin/waltr-agent-test-mcp-server /usr/local/bin/waltr-agent-test-mcp-server
 
 EXPOSE 14333
 CMD ["waltr-server"]

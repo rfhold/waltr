@@ -12,3 +12,6 @@ mod status;
 
 #[path = "server-backed/sessions.rs"]
 mod sessions;
+
+#[path = "server-backed/oauth.rs"]
+mod oauth;

@@ -22,16 +22,19 @@ const webUrl = `http://127.0.0.1:${webPort}`;
 const dockerWebUrl = `http://${getHostAddress()}:${webPort}`;
 const modelsDevFixture = `${repoRoot}/tests/web/k6/support/models-dev-api.fixture.json`;
 const sessionsRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/sessions-runtime-config.fixture.toml`;
+const mcpOauthRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/mcp-oauth-runtime-config.fixture.toml`;
 const composeModelsDevFixture = "/data/support/models-dev-api.fixture.json";
 const composeEnvFile = `${serverRoot}/compose.env`;
+const dexPort = await getFreePort();
 const screenshotsEnabled = process.env.WALTR_WEB_SCREENSHOTS === "1";
 const screenshotsUpdate = process.env.WALTR_WEB_UPDATE_SCREENSHOTS === "1";
 const liveEnabled = process.env.WALTR_WEB_LIVE === "1";
+const selectedBrowserScript = process.argv.slice(2).find((argument) => argument !== "--") ?? process.env.WALTR_WEB_K6_SCRIPT;
 const screenshotsDir = screenshotsEnabled
   ? `${repoRoot}/.dev/web-screenshots/current`
   : null;
 const screenshotSnapshotDir = `${repoRoot}/tests/web/k6/snapshots/screenshots`;
-const browserScripts = browserScriptsForMode(integrationMode, liveEnabled);
+const browserScripts = browserScriptsForMode(integrationMode, liveEnabled, selectedBrowserScript);
 
 process.once("SIGINT", () => stop(130));
 process.once("SIGTERM", () => stop(143));
@@ -40,6 +43,9 @@ mkdirSync(launchLogDir, { recursive: true });
 console.log(`web integration logs: ${launchLogDir}`);
 console.log(`web integration server root: ${serverRoot}`);
 console.log(`web integration mode: ${integrationMode}`);
+if (selectedBrowserScript) {
+  console.log(`web integration script: ${browserScripts[0]}`);
+}
 if (screenshotsDir) {
   rmSync(screenshotsDir, { force: true, recursive: true });
   mkdirSync(screenshotsDir, { recursive: true });
@@ -100,15 +106,16 @@ function seedConfigForBrowserScript(browserScript) {
     return;
   }
 
+  if (browserScript === "tests/web/k6/sessions/mcp-oauth.browser.js") {
+    copyFileSync(mcpOauthRuntimeConfigFixture, configPath);
+    return;
+  }
+
   copyFileSync(`${repoRoot}/tests/web/k6/support/empty-config.fixture.toml`, configPath);
 }
 
-function browserScriptsForMode(mode, live) {
-  if (live) {
-    return ["tests/web/k6/sessions/session-live.browser.js"];
-  }
-
-  const scripts = [
+function browserScriptsForMode(mode, live, selectedScript) {
+  const scripts = live ? ["tests/web/k6/sessions/session-live.browser.js"] : [
     "tests/web/k6/status/landing.browser.js",
     "tests/web/k6/sessions/sessions.browser.js",
     "tests/web/k6/config/watch.browser.js",
@@ -117,8 +124,20 @@ function browserScriptsForMode(mode, live) {
     "tests/web/k6/config/defaults.browser.js",
   ];
 
-  if (mode === "dev") {
+  if (!live && mode === "dev") {
     scripts.splice(2, 0, "tests/web/k6/sessions/prompts.browser.js");
+  } else if (!live) {
+    scripts.push("tests/web/k6/sessions/mcp-oauth.browser.js");
+  }
+
+  if (selectedScript) {
+    const normalized = selectedScript.replace(/^\.\//, "");
+    const match = scripts.find((script) => script === normalized || script.endsWith(normalized));
+    if (!match) {
+      throw new Error(`selected web integration script is not enabled for this mode: ${selectedScript}`);
+    }
+
+    return [match];
   }
 
   return scripts;
@@ -167,7 +186,9 @@ async function startComposeStack() {
   writeFileSync(composeEnvFile, `WALTR_MODELS_DEV_PATH=${composeModelsDevFixture}\n`);
 
   await runCompose(["--profile", "test", "build"]);
-  await runCompose(["--profile", "test", "up", "-d", "waltr"]);
+  await runCompose(["--profile", "test", "up", "-d", "dex"]);
+  await waitForHttp(`http://127.0.0.1:${dexPort}/dex/.well-known/openid-configuration`, "dex container");
+  await runCompose(["--profile", "test", "up", "-d", "mcp", "waltr"]);
   await waitForHttp(`${serverUrl}/health`, "server container");
 }
 
@@ -220,6 +241,7 @@ function composeEnv() {
     WALTR_DATA_ROOT: serverRoot,
     WALTR_COMPOSE_ENV_FILE: composeEnvFile,
     WALTR_SERVER_WEB_PORT: String(serverPort),
+    WALTR_DEX_PORT: String(dexPort),
     WALTR_AUTH_PATH: "/data/auth.json",
     WALTR_SESSION_FILESYSTEM_ROOT: "/data/sessions",
     WALTR_SESSION_STORE: "filesystem",
@@ -227,6 +249,14 @@ function composeEnv() {
     WALTR_WEB_SCREENSHOTS_HOST_DIR: screenshotsDir ?? `${serverRoot}/screenshots`,
     K6_BROWSER_HEADLESS: process.env.K6_BROWSER_HEADLESS ?? "true",
     WALTR_AGENT_LIVE_GATEWAY: process.env.WALTR_AGENT_LIVE_GATEWAY ?? "0",
+    WALTR_OAUTH_ISSUER: process.env.WALTR_OAUTH_ISSUER ?? "http://dex:5556/dex",
+    WALTR_OAUTH_CLIENT_ID: process.env.WALTR_OAUTH_CLIENT_ID ?? "waltr-test",
+    WALTR_OAUTH_REDIRECT_URI: process.env.WALTR_OAUTH_REDIRECT_URI ?? "http://127.0.0.1/oauth/callback",
+    WALTR_OAUTH_USERNAME: process.env.WALTR_OAUTH_USERNAME ?? "waltr@example.test",
+    WALTR_OAUTH_PASSWORD: process.env.WALTR_OAUTH_PASSWORD ?? "password",
+    WALTR_MCP_OAUTH_ISSUER: process.env.WALTR_MCP_OAUTH_ISSUER ?? "http://dex:5556/dex",
+    WALTR_MCP_OAUTH_CLIENT_ID: process.env.WALTR_MCP_OAUTH_CLIENT_ID ?? "waltr-test",
+    WALTR_MCP_OAUTH_REDIRECT_URI: process.env.WALTR_MCP_OAUTH_REDIRECT_URI ?? "http://waltr:14333/oauth/callback",
   };
 }
 

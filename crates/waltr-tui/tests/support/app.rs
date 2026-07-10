@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use waltr_client::{
-    CatalogMatchSourceView, ClientCommand, ClientOperationView, ClientSnapshot, ConfigSnapshot,
-    ConfigView, ExternalRequestView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
-    OperationCollectionSnapshot, OperationSnapshot, ProviderKindView, ProviderView,
+    AuthSnapshot, CatalogMatchSourceView, ClientCommand, ClientOperationView, ClientSnapshot,
+    ConfigSnapshot, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView,
+    ModelView, OperationCollectionSnapshot, OperationSnapshot, ProviderKindView, ProviderView,
     SessionPhaseView, SessionSnapshot, SessionStatusView, SessionTimelineView, SessionView,
     StatusSnapshot, TimelineContentView, TimelineEventKindView, TimelineEventView,
     TimelineStatusView, TimestampView,
@@ -585,6 +585,35 @@ pub(crate) fn session_with_phase(
 
 pub(crate) const fn ready_snapshot() -> ClientSnapshot {
     ClientSnapshot {
+        auth: AuthSnapshot {
+            pending: Vec::new(),
+            active_attempt: None,
+            list: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            begin: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            complete: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            cancel: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            logout: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+        },
         operations: OperationCollectionSnapshot {
             current: BTreeMap::new(),
         },
