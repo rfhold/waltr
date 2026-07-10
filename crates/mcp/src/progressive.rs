@@ -299,6 +299,30 @@ pub fn tool_result(output: Value, filter: Option<&str>) -> ServerResult<McpToolR
     })))
 }
 
+/// Convert workflow Markdown into an MCP tool result with object-shaped structured content.
+pub fn workflow_tool_result(
+    workflow: &str,
+    markdown: String,
+    filter: Option<&str>,
+) -> ServerResult<McpToolResult> {
+    let structured = json!({
+        "workflow": workflow,
+        "markdown": markdown,
+    });
+    let output = match filter.map(str::trim).filter(|filter| !filter.is_empty()) {
+        Some(filter) => apply_filter(structured, filter)?,
+        None => structured,
+    };
+    let text = output
+        .get("markdown")
+        .and_then(Value::as_str)
+        .map_or_else(|| text_for_value(&output), ToOwned::to_owned);
+    Ok(McpToolResult::new(json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": output
+    })))
+}
+
 /// Convert workflow Markdown into an MCP prompt result.
 #[must_use]
 pub fn workflow_prompt_result(markdown: String) -> McpPromptResult {

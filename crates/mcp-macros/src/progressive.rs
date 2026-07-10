@@ -696,7 +696,7 @@ fn workflow_load_call(workflows: &[ProgressiveWorkflow]) -> TokenStream2 {
                 let future = #call;
                 return Box::pin(async move {
                     let markdown = future.await?;
-                    ::mcp::progressive::tool_result(::mcp::server::JsonValue::String(markdown), request.filter.as_deref())
+                    ::mcp::progressive::workflow_tool_result(#name, markdown, request.filter.as_deref())
                 }) as ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpToolResult>>;
             }
         }
