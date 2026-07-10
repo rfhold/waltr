@@ -1,3 +1,4 @@
+pub mod authorization;
 pub mod cancellation;
 pub mod json_rpc;
 pub mod lifecycle;

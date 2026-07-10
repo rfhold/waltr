@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::{
-    Error, McpTracePropagation, Result,
+    Error, McpAuthorizationError, McpTracePropagation, Result,
     client::transport::{McpTransport, McpTransportConfig, TransportInbound},
     protocol::{
         JsonRpcId, JsonRpcInbound, JsonRpcNotification, JsonRpcRequest, cancellation_params,
@@ -30,6 +30,8 @@ pub trait McpConnectionHandler: Send + Sync {
     fn disconnected(&self, error: String);
     /// Handle an SSE event id received from streamable HTTP.
     fn sse_event_id(&self, id: String);
+    /// Handle an authorization failure received from streamable HTTP.
+    fn authorization_failed(&self, error: McpAuthorizationError);
 }
 
 /// JSON-RPC connection over one MCP transport.
@@ -220,6 +222,10 @@ async fn dispatch_loop(
                 }
             }
             TransportInbound::SseEventId(id) => handler.sse_event_id(id),
+            TransportInbound::AuthorizationFailed(error) => {
+                fail_pending_with_authorization(&connection, &error).await;
+                handler.authorization_failed(error);
+            }
             TransportInbound::Disconnected(error) => {
                 fail_pending(&connection, &error).await;
                 handler.disconnected(error);
@@ -232,5 +238,15 @@ async fn fail_pending(connection: &McpConnection, error: &str) {
     let pending = std::mem::take(&mut *connection.pending.lock().await);
     for sender in pending.into_values() {
         drop(sender.send(Err(Error::protocol(error.to_owned()))));
+    }
+}
+
+async fn fail_pending_with_authorization(
+    connection: &McpConnection,
+    error: &McpAuthorizationError,
+) {
+    let pending = std::mem::take(&mut *connection.pending.lock().await);
+    for sender in pending.into_values() {
+        drop(sender.send(Err(Error::Authorization(Box::new(error.clone())))));
     }
 }

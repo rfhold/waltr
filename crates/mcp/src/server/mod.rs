@@ -15,7 +15,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -29,6 +29,10 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
+    oauth::{
+        McpAccessToken, McpBearerChallenge, McpProtectedResourceMetadata, McpTokenValidation,
+        protected_resource_metadata_urls,
+    },
     protocol::{
         JsonRpcId, JsonRpcInbound, JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION,
         json_rpc_error, json_rpc_method_not_found, json_rpc_notification, json_rpc_success,
@@ -488,11 +492,81 @@ pub fn streamable_http_router(handler: Arc<dyn ServerHandler>) -> Router {
 }
 
 type OriginPolicy = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type TokenValidator = Arc<
+    dyn Fn(McpAccessToken, McpAuthorizationContext) -> BoxFuture<McpTokenValidation> + Send + Sync,
+>;
+
+/// Streamable HTTP authorization context passed to token validators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpAuthorizationContext {
+    /// Protected resource identifier expected by this MCP server.
+    pub resource: String,
+    /// Scopes configured as required for the request.
+    pub required_scopes: Vec<String>,
+}
+
+/// Streamable HTTP OAuth protected resource configuration.
+#[derive(Clone)]
+pub struct StreamableHttpAuthorization {
+    metadata: McpProtectedResourceMetadata,
+    required_scopes: Vec<String>,
+    realm: Option<String>,
+    validator: TokenValidator,
+}
+
+impl std::fmt::Debug for StreamableHttpAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamableHttpAuthorization")
+            .field("metadata", &self.metadata)
+            .field("required_scopes", &self.required_scopes)
+            .field("realm", &self.realm)
+            .field("validator", &true)
+            .finish()
+    }
+}
+
+impl StreamableHttpAuthorization {
+    /// Create OAuth authorization config with protected resource metadata and a validator.
+    pub fn new(
+        metadata: McpProtectedResourceMetadata,
+        validator: impl Fn(McpAccessToken, McpAuthorizationContext) -> BoxFuture<McpTokenValidation>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<Self> {
+        metadata.validate_for_mcp_resource(&metadata.resource)?;
+        Ok(Self {
+            metadata,
+            required_scopes: Vec::new(),
+            realm: None,
+            validator: Arc::new(validator),
+        })
+    }
+
+    /// Set scopes advertised in authorization challenges and passed to the validator.
+    #[must_use]
+    pub fn with_required_scopes(
+        mut self,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.required_scopes = scopes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the optional bearer realm.
+    #[must_use]
+    pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
+        self.realm = Some(realm.into());
+        self
+    }
+}
 
 /// Streamable HTTP server options.
 #[derive(Clone, Default)]
 pub struct StreamableHttpOptions {
     origin_policy: Option<OriginPolicy>,
+    authorization: Option<StreamableHttpAuthorization>,
 }
 
 impl std::fmt::Debug for StreamableHttpOptions {
@@ -500,6 +574,7 @@ impl std::fmt::Debug for StreamableHttpOptions {
         formatter
             .debug_struct("StreamableHttpOptions")
             .field("origin_policy", &self.origin_policy.is_some())
+            .field("authorization", &self.authorization)
             .finish()
     }
 }
@@ -514,6 +589,13 @@ impl StreamableHttpOptions {
         self.origin_policy = Some(Arc::new(policy));
         self
     }
+
+    /// Set OAuth protected resource authorization for Streamable HTTP requests.
+    #[must_use]
+    pub fn with_authorization(mut self, authorization: StreamableHttpAuthorization) -> Self {
+        self.authorization = Some(authorization);
+        self
+    }
 }
 
 /// Create an Axum router serving Streamable HTTP MCP at `/mcp` with options.
@@ -523,10 +605,19 @@ pub fn streamable_http_router_with_options(
 ) -> Router {
     Router::new()
         .route("/mcp", post(http_post).get(http_get).delete(http_delete))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(http_protected_resource_metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/{*resource_path}",
+            get(http_protected_resource_metadata),
+        )
         .with_state(HttpState {
             handler,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             origin_policy: options.origin_policy,
+            authorization: options.authorization,
         })
 }
 
@@ -547,6 +638,7 @@ struct HttpState {
     handler: Arc<dyn ServerHandler>,
     sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
     origin_policy: Option<OriginPolicy>,
+    authorization: Option<StreamableHttpAuthorization>,
 }
 
 #[derive(Debug, Default)]
@@ -599,6 +691,9 @@ async fn http_post(
             "MCP HTTP request rejected due to unsupported protocol version"
         );
         return (StatusCode::BAD_REQUEST, "unsupported MCP protocol version").into_response();
+    }
+    if let Some(response) = authorize_http_request(&state, &headers).await {
+        return response;
     }
     let session_id = headers
         .get("mcp-session-id")
@@ -743,6 +838,9 @@ async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Respons
     if let Some(response) = unsupported_version_response(&headers) {
         return response;
     }
+    if let Some(response) = authorize_http_request(&state, &headers).await {
+        return response;
+    }
     let Some(session_id) = session_id_header(&headers) else {
         return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response();
     };
@@ -799,6 +897,9 @@ async fn http_delete(State(state): State<HttpState>, headers: HeaderMap) -> Resp
     if let Some(response) = unsupported_version_response(&headers) {
         return response;
     }
+    if let Some(response) = authorize_http_request(&state, &headers).await {
+        return response;
+    }
     let Some(session_id) = session_id_header(&headers) else {
         return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response();
     };
@@ -807,6 +908,126 @@ async fn http_delete(State(state): State<HttpState>, headers: HeaderMap) -> Resp
         StatusCode::ACCEPTED.into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+async fn http_protected_resource_metadata(State(state): State<HttpState>) -> Response {
+    let Some(authorization) = &state.authorization else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    (
+        StatusCode::OK,
+        headers,
+        axum::Json(authorization.metadata.clone()),
+    )
+        .into_response()
+}
+
+async fn authorize_http_request(state: &HttpState, headers: &HeaderMap) -> Option<Response> {
+    let Some(authorization) = &state.authorization else {
+        return None;
+    };
+    let Some(token) = bearer_token(headers) else {
+        return Some(authorization_challenge_response(
+            authorization,
+            StatusCode::UNAUTHORIZED,
+            None,
+            None,
+        ));
+    };
+    let context = McpAuthorizationContext {
+        resource: authorization.metadata.resource.clone(),
+        required_scopes: authorization.required_scopes.clone(),
+    };
+    match (authorization.validator)(token, context).await {
+        McpTokenValidation::Authorized => None,
+        McpTokenValidation::Unauthorized { error_description } => {
+            Some(authorization_challenge_response(
+                authorization,
+                StatusCode::UNAUTHORIZED,
+                Some("invalid_token"),
+                error_description.as_deref(),
+            ))
+        }
+        McpTokenValidation::InsufficientScope {
+            required_scopes,
+            error_description,
+        } => Some(insufficient_scope_response(
+            authorization,
+            &required_scopes,
+            error_description.as_deref(),
+        )),
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<McpAccessToken> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let split = value.find(char::is_whitespace)?;
+    let (scheme, token) = value.split_at(split);
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(McpAccessToken(token.to_owned()))
+}
+
+fn authorization_challenge_response(
+    authorization: &StreamableHttpAuthorization,
+    status: StatusCode,
+    error: Option<&str>,
+    error_description: Option<&str>,
+) -> Response {
+    let mut challenge = base_challenge(authorization);
+    challenge.error = error.map(ToOwned::to_owned);
+    challenge.error_description = error_description.map(ToOwned::to_owned);
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&challenge.to_header_value()) {
+        headers.insert(header::WWW_AUTHENTICATE, value);
+    }
+    (status, headers).into_response()
+}
+
+fn insufficient_scope_response(
+    authorization: &StreamableHttpAuthorization,
+    required_scopes: &[String],
+    error_description: Option<&str>,
+) -> Response {
+    let mut challenge = base_challenge(authorization);
+    challenge.error = Some("insufficient_scope".to_owned());
+    challenge.scope =
+        scope_value(required_scopes).or_else(|| scope_value(&authorization.required_scopes));
+    challenge.error_description = error_description.map(ToOwned::to_owned);
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&challenge.to_header_value()) {
+        headers.insert(header::WWW_AUTHENTICATE, value);
+    }
+    (StatusCode::FORBIDDEN, headers).into_response()
+}
+
+fn base_challenge(authorization: &StreamableHttpAuthorization) -> McpBearerChallenge {
+    let mut challenge = McpBearerChallenge::new();
+    challenge.realm = authorization.realm.clone();
+    challenge.resource_metadata =
+        protected_resource_metadata_urls(&authorization.metadata.resource)
+            .into_iter()
+            .next();
+    challenge.scope = scope_value(&authorization.required_scopes);
+    challenge
+}
+
+fn scope_value(scopes: &[String]) -> Option<String> {
+    if scopes.is_empty() {
+        None
+    } else {
+        Some(scopes.join(" "))
     }
 }
 

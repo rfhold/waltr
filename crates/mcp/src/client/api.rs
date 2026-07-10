@@ -4,9 +4,10 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    McpCompletionRequest, McpCompletionResult, McpLogLevel, McpProgressNotification, McpPromptList,
-    McpPromptResult, McpResourceList, McpResourceResult, McpResourceTemplateList, McpRoot,
-    McpServerCapabilities, McpToolCall, McpToolList, McpToolResult, McpTracePropagation, Result,
+    McpAuthorizationError, McpCompletionRequest, McpCompletionResult, McpLogLevel,
+    McpProgressNotification, McpPromptList, McpPromptResult, McpResourceList, McpResourceResult,
+    McpResourceTemplateList, McpRoot, McpServerCapabilities, McpToolCall, McpToolList,
+    McpToolResult, McpTracePropagation, Result,
     protocol::{
         JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION, json_rpc_method_not_found,
         json_rpc_success,
@@ -81,6 +82,9 @@ pub trait McpClientHandler: Send + Sync + 'static {
 
     /// Called when a Streamable HTTP SSE event id is observed.
     fn sse_event_id(&self, _id: String) {}
+
+    /// Called when Streamable HTTP authorization fails after connection startup.
+    fn authorization_failed(&self, _error: McpAuthorizationError) {}
 }
 
 #[derive(Debug)]
@@ -448,6 +452,10 @@ impl super::connection::McpConnectionHandler for ClientHandlerAdapter {
 
     fn sse_event_id(&self, id: String) {
         self.inner.sse_event_id(id);
+    }
+
+    fn authorization_failed(&self, error: McpAuthorizationError) {
+        self.inner.authorization_failed(error);
     }
 }
 

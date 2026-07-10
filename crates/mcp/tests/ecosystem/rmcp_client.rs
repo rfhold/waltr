@@ -19,7 +19,7 @@ use super::standard_surface::{
 };
 
 pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Result<()> {
-    let McpTransportConfig::StreamableHttp { endpoint } = transport else {
+    let McpTransportConfig::StreamableHttp { endpoint, .. } = transport else {
         return Err(mcp::Error::protocol(
             "rmcp ecosystem test requires streamable HTTP",
         ));

@@ -16,6 +16,8 @@ pub enum Error {
     Http(reqwest::Error),
     /// HTTP server failure.
     Hyper(axum::BoxError),
+    /// OAuth authorization failure.
+    Authorization(Box<crate::oauth::McpAuthorizationError>),
 }
 
 impl Error {
@@ -34,6 +36,7 @@ impl fmt::Display for Error {
             Self::Io(error) => write!(formatter, "{error}"),
             Self::Http(error) => write!(formatter, "{error}"),
             Self::Hyper(error) => write!(formatter, "{error}"),
+            Self::Authorization(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -46,6 +49,7 @@ impl error::Error for Error {
             Self::Io(error) => Some(error),
             Self::Http(error) => Some(error),
             Self::Hyper(error) => Some(error.as_ref()),
+            Self::Authorization(error) => Some(error),
         }
     }
 }

@@ -123,7 +123,10 @@ async fn client_ping_request_returns_empty_result_object() -> mcp::Result<()> {
 async fn connect_roots_client(endpoint: String) -> mcp::Result<McpClient> {
     McpClient::connect(
         "mcp-spec-roots-server",
-        McpTransportConfig::StreamableHttp { endpoint },
+        McpTransportConfig::StreamableHttp {
+            endpoint,
+            bearer_token: None,
+        },
         Arc::new(RootsClient),
         McpClientOptions::new("mcp-spec-roots-client", "1.0.0", Duration::from_secs(5)),
         CancellationToken::new(),

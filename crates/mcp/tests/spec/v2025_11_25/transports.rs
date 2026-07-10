@@ -53,6 +53,7 @@ async fn streamable_http_get_polls_queued_sse_messages_end_to_end() -> mcp::Resu
         "polling-server",
         McpTransportConfig::StreamableHttp {
             endpoint: server.endpoint(),
+            bearer_token: None,
         },
         Arc::new(RecordingClient { tx }),
         McpClientOptions::new("polling-client", "0", Duration::from_secs(5)),

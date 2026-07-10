@@ -22,6 +22,7 @@ The crate must not depend on `waltr-agent`, `waltr-server`, `waltr-client`, `wal
 | --- | --- |
 | [`client`](../../crates/mcp/src/client/) | Typed MCP client, connection loop, handler callbacks, and transports. |
 | [`server`](../../crates/mcp/src/server/mod.rs) | Typed MCP server handlers, server context, stdio serving, and Streamable HTTP router. |
+| [`oauth`](../../crates/mcp/src/oauth.rs) | HTTP transport authorization metadata, bearer challenges, and discovery helpers. |
 | [`protocol`](../../crates/mcp/src/protocol.rs) | JSON-RPC helpers, protocol version, cancellation helpers, and parse/format utilities. |
 | [`capabilities`](../../crates/mcp/src/capabilities.rs) | Capability parsing for initialized peers. |
 | [`tool`](../../crates/mcp/src/tool.rs) | Tool definitions, calls, result formatting, and schemas. |
@@ -59,11 +60,23 @@ Roots, sampling, and logging still exist in `2025-11-25`, but the MCP deprecatio
 | Transport | Current behavior |
 | --- | --- |
 | Stdio client | Starts a subprocess, writes line-delimited JSON-RPC to stdin, reads line-delimited JSON-RPC from stdout, and routes inbound responses, notifications, requests, and disconnects through the connection loop. |
-| Streamable HTTP client | Sends JSON-RPC over HTTP POST, accepts JSON or `text/event-stream` POST responses, tracks `mcp-session-id`, sends `mcp-protocol-version` after initialization, records SSE event ids, and starts GET polling after `notifications/initialized`. |
+| Streamable HTTP client | Sends JSON-RPC over HTTP POST, accepts JSON or `text/event-stream` POST responses, tracks `mcp-session-id`, sends `mcp-protocol-version` after initialization, records SSE event ids, starts GET polling after `notifications/initialized`, and can attach an optional bearer token to every HTTP request. |
 | Stdio server | Reads line-delimited JSON-RPC from stdin and writes line-delimited JSON-RPC responses to stdout. |
-| Streamable HTTP server | Serves POST, GET, and DELETE requests at `/mcp`, manages initialize/session state, returns JSON responses or SSE POST responses when notifications are emitted with the response, queues notification-only SSE messages for GET polling, and supports opt-in Origin validation. |
+| Streamable HTTP server | Serves POST, GET, and DELETE requests at `/mcp`, manages initialize/session state, returns JSON responses or SSE POST responses when notifications are emitted with the response, queues notification-only SSE messages for GET polling, supports opt-in Origin validation, and can publish OAuth protected-resource metadata plus validate bearer tokens through caller-provided hooks. |
 
 Streamable HTTP GET requires `Accept: text/event-stream` and an initialized `mcp-session-id`. GET drains queued SSE messages and accepts `Last-Event-ID` to skip already-observed queued events. DELETE requires `mcp-session-id` and terminates the in-memory HTTP session. Servers can install an Origin policy with `StreamableHttpOptions::with_origin_policy`; invalid origins return HTTP `403 Forbidden` before JSON-RPC handling.
+
+## Authorization
+
+Authorization support is scoped to HTTP transports, matching MCP `2025-11-25`. Stdio remains unauthenticated at the protocol layer and should obtain credentials from the calling environment if a consumer needs that behavior.
+
+The `oauth` module represents RFC 9728 protected resource metadata, RFC 8414 authorization server metadata, bearer challenges from `WWW-Authenticate`, and MCP discovery URL ordering. Unknown metadata fields are preserved for extension compatibility. Protected-resource metadata validation requires an exact resource match, non-empty `authorization_servers`, and no fragment in the resource identifier.
+
+Streamable HTTP clients can be configured with an optional bearer token through `McpTransportConfig::StreamableHttp`. When present, the token is sent with `Authorization: Bearer <token>` on POST and GET polling requests. HTTP `401 Unauthorized` and `403 Forbidden` responses are returned as `Error::Authorization` with the parsed bearer challenge when available. Authorization failures observed by background GET polling are surfaced through `McpClientHandler::authorization_failed` and stop polling instead of retrying indefinitely.
+
+Streamable HTTP servers can enable protected-resource behavior with `StreamableHttpOptions::with_authorization`. The server publishes protected-resource metadata at RFC 9728 well-known paths, challenges unauthenticated requests with `WWW-Authenticate: Bearer`, and delegates token validation to the caller-provided validator. Invalid or expired tokens return `401`; insufficient scopes return `403` with `error="insufficient_scope"` and the required `scope` value.
+
+The crate intentionally does not implement a complete OAuth authorization-code flow. Client registration, browser/device UX, redirect handling, PKCE verifier storage, token exchange, token refresh, secure token storage, and Waltr-specific config or UI policy belong in the integrating layers.
 
 ## Unsupported Areas
 
@@ -73,7 +86,7 @@ Unsupported protocol areas should stay explicit in code, docs, and tests. Curren
 - Sampling.
 - Elicitation.
 - Task runtime execution. Task capability shapes and tool `execution.taskSupport` metadata are represented, but server-side task execution is planned separately.
-- OAuth authorization flows. HTTP auth discovery metadata handling is planned separately.
+- OAuth authorization-code flows, automatic refresh, and token lifecycle management. HTTP protected-resource metadata validation, bearer challenges, bearer injection, authorization errors, discovery URL helpers, post-initialize authorization failure reporting, and server validation hooks are implemented.
 
 Do not add placeholder success behavior for unsupported features. Prefer explicit unsupported coverage in spec tests.
 
