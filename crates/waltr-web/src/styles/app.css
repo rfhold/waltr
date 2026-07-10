@@ -201,6 +201,46 @@
   font-weight: 700;
 }
 
+.oauth-dialog__body,
+.oauth-dialog__attempt {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.oauth-dialog__intro {
+  margin: 0;
+  color: var(--color-text-muted);
+}
+
+.oauth-dialog__messages {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding-left: 1.25rem;
+  color: var(--color-text-muted);
+}
+
+.oauth-dialog__open {
+  width: fit-content;
+  text-decoration: none;
+}
+
+.oauth-dialog__field {
+  display: grid;
+  gap: var(--space-2);
+  color: var(--color-text-muted);
+}
+
+.oauth-dialog__field textarea {
+  min-width: 0;
+  resize: vertical;
+}
+
+.oauth-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .shell {
   display: grid;
   height: 100vh;

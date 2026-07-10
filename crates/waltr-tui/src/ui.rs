@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Padding, Paragraph},
+    widgets::{Block, Clear, Padding, Paragraph, Wrap},
 };
 
 use crate::{
@@ -53,6 +53,81 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             });
         }
     });
+
+    render_auth_modal(frame, app);
+}
+
+fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
+    let snapshot = match app.client_snapshot() {
+        Some(snapshot) => snapshot,
+        None => return,
+    };
+    let requirement = match snapshot.auth.pending.first() {
+        Some(requirement) => requirement,
+        None => return,
+    };
+    let attempt = snapshot.auth.active_attempt.as_ref().filter(|attempt| {
+        attempt.target.kind == requirement.target.kind
+            && attempt.target.key == requirement.target.key
+    });
+    let area = centered_percent_rect(frame.area(), 78, if attempt.is_some() { 16 } else { 10 });
+    let body = render_modal_frame(
+        frame,
+        area,
+        "OAuth required",
+        if attempt.is_some() {
+            "type/paste URL or code · Enter complete · Esc cancel"
+        } else {
+            "Enter begin OAuth · Esc dismiss"
+        },
+    );
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Target: ", THEME.muted_text_style()),
+            Span::styled(auth_target_label(&requirement.target), THEME.accent_bold()),
+        ]),
+        Line::from(Span::styled(
+            requirement.message.clone(),
+            THEME.accent_bold(),
+        )),
+    ];
+
+    if let Some(attempt) = attempt {
+        lines.push(Line::from(""));
+        for message in &attempt.messages {
+            lines.push(Line::from(Span::styled(
+                message.clone(),
+                THEME.muted_text_style(),
+            )));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("URL: ", THEME.muted_text_style()),
+            Span::styled(attempt.auth_url.clone(), THEME.text_style()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Input: ", THEME.muted_text_style()),
+            Span::styled(app.auth_input().to_owned(), THEME.text_style()),
+        ]));
+    } else if let Some(error) = snapshot.auth.begin.error.as_ref() {
+        lines.push(Line::from(""));
+        lines.push(error_line(error));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(THEME.panel_style())
+            .wrap(Wrap { trim: false }),
+        body,
+    );
+}
+
+fn auth_target_label(target: &waltr_client::ClientAuthTarget) -> String {
+    if target.kind == "mcpServer" {
+        format!("MCP server {}", target.key)
+    } else {
+        format!("provider {}", target.key)
+    }
 }
 
 /// Render content inside the global UI wrapper.
