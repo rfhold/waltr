@@ -104,11 +104,21 @@ impl McpServerConfig {
     /// Create a Streamable HTTP MCP server configuration.
     #[must_use]
     pub fn streamable_http(name: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self::streamable_http_with_bearer_token(name, endpoint, None)
+    }
+
+    /// Create a Streamable HTTP MCP server configuration with an optional bearer token.
+    #[must_use]
+    pub fn streamable_http_with_bearer_token(
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        bearer_token: Option<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             transport: McpTransportConfig::StreamableHttp {
                 endpoint: endpoint.into(),
-                bearer_token: None,
+                bearer_token,
             },
         }
     }

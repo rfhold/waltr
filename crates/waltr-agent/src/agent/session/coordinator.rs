@@ -856,11 +856,19 @@ where
         if let Some(runtime) = self.mcp_sessions.lock().await.get(session_id).cloned() {
             return Ok(Some(runtime));
         }
-        let config = factory.mcp_config(settings)?;
+        let config = factory.mcp_config(settings).await?;
         let runtime =
             McpClientRuntime::start(config, factory.mcp_root_uri(), CancellationToken::new())
                 .await
-                .map_err(super::AgentSessionRuntimeError::from)?;
+                .map_err(|error| match error.error {
+                    crate::LlmError::Authorization { message, .. } => {
+                        super::AgentSessionRuntimeError::AuthorizationRequired {
+                            target: crate::AuthTarget::mcp_server(error.server_key),
+                            message,
+                        }
+                    }
+                    error => super::AgentSessionRuntimeError::from(error),
+                })?;
         self.mcp_sessions
             .lock()
             .await

@@ -4,10 +4,11 @@ use std::{collections::HashMap, fs, process::Child, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use waltr_agent::{
-    AgentRuntime, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
-    CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent,
-    FileCredentialStore, LlmStream, MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus,
-    ProviderId, SessionCoordinator, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
+    AgentRuntime, AgentSessionRunError, AgentSessionRuntimeError, AgentSessionRuntimeFactory,
+    AgentTimelineEvent, AuthTarget, CHANNEL_ASSISTANT_TEXT, CHANNEL_TOOL_CALL,
+    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent, FileCredentialStore,
+    LlmStream, MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus, ProviderId,
+    SessionCoordinator, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
     SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStore, SessionTemplateKind,
     SessionTemplateSearchRequest, SessionTemplateSearchTarget, Suspension, TimelineContent,
     TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall,
@@ -144,6 +145,54 @@ async fn mcp_agent_loop_discovers_and_calls_stdio_and_streamable_http_direct_too
         "{context}"
     );
     assert!(session.text.contains("mcp-flow-complete"), "{context}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_streamable_http_auth_failure_is_reported_as_auth_required() -> waltr_agent::Result<()> {
+    let http_server = HttpMcpTestServer::start_requiring_bearer("valid-token").await?;
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_auth_required_provider",
+        vec![vec![CompletionEvent::Finished]],
+    ));
+    let sessions = mcp_sessions(provider);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![http_runtime_server(
+                &http_server,
+            )])),
+        )
+        .await?;
+
+    let result = sessions
+        .submit_prompt(
+            session_id,
+            "trigger mcp auth check",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await;
+    let error = match result {
+        Ok(submission) => submission
+            .handle
+            .wait()
+            .await
+            .expect_err("protected MCP server should require auth"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            AgentSessionRunError::Runtime(AgentSessionRuntimeError::AuthorizationRequired {
+                target: AuthTarget::McpServer { ref key },
+                ..
+            }) if key == "http_test"
+        ),
+        "unexpected error: {error:?}"
+    );
 
     Ok(())
 }
@@ -1223,8 +1272,19 @@ impl HttpMcpTestServer {
         Self::start_with_optional_instructions(Some(instructions)).await
     }
 
+    async fn start_requiring_bearer(token: &str) -> waltr_agent::Result<Self> {
+        Self::start_with_options(None, Some(token)).await
+    }
+
     async fn start_with_optional_instructions(
         instructions: Option<&str>,
+    ) -> waltr_agent::Result<Self> {
+        Self::start_with_options(instructions, None).await
+    }
+
+    async fn start_with_options(
+        instructions: Option<&str>,
+        required_bearer: Option<&str>,
     ) -> waltr_agent::Result<Self> {
         let temp = tempfile::tempdir()?;
         let address_file = temp.path().join("mcp-http-address.txt");
@@ -1238,6 +1298,9 @@ impl HttpMcpTestServer {
             .stderr(std::process::Stdio::null());
         if let Some(instructions) = instructions {
             command.env("WALTR_TEST_MCP_INSTRUCTIONS", instructions);
+        }
+        if let Some(required_bearer) = required_bearer {
+            command.env("WALTR_TEST_MCP_REQUIRED_BEARER", required_bearer);
         }
         let mut child = command.spawn()?;
         let address = wait_for_http_address(&mut child, &address_file).await?;

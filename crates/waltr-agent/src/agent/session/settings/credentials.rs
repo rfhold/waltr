@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-/// Durable provider credential stored outside shared config.
+/// Durable credential stored outside shared config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StoredCredential {
@@ -25,7 +25,7 @@ pub struct OAuthCredential {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// File-backed provider credential store.
+/// File-backed credential store.
 #[derive(Debug, Clone)]
 pub struct FileCredentialStore {
     path: PathBuf,
@@ -58,20 +58,17 @@ impl FileCredentialStore {
         &self.path
     }
 
-    /// Read a provider credential.
-    pub async fn read(
-        &self,
-        provider_key: &str,
-    ) -> Result<Option<StoredCredential>, std::io::Error> {
+    /// Read a credential by namespaced target key.
+    pub async fn read(&self, target_key: &str) -> Result<Option<StoredCredential>, std::io::Error> {
         let _guard = self.lock.lock().await;
         let credentials = self.read_unlocked().await?;
-        Ok(credentials.get(provider_key).cloned())
+        Ok(credentials.get(target_key).cloned())
     }
 
-    /// Serialize a read-modify-write for a provider credential.
+    /// Serialize a read-modify-write for a credential target.
     pub async fn modify<F>(
         &self,
-        provider_key: &str,
+        target_key: &str,
         f: F,
     ) -> Result<Option<StoredCredential>, std::io::Error>
     where
@@ -79,22 +76,22 @@ impl FileCredentialStore {
     {
         let _guard = self.lock.lock().await;
         let mut credentials = self.read_unlocked().await?;
-        let next = f(credentials.get(provider_key).cloned());
+        let next = f(credentials.get(target_key).cloned());
         match &next {
             Some(credential) => {
-                credentials.insert(provider_key.to_owned(), credential.clone());
+                credentials.insert(target_key.to_owned(), credential.clone());
             }
             None => {
-                credentials.remove(provider_key);
+                credentials.remove(target_key);
             }
         }
         self.write_unlocked(&credentials).await?;
         Ok(next)
     }
 
-    /// Delete a provider credential.
-    pub async fn delete(&self, provider_key: &str) -> Result<(), std::io::Error> {
-        self.modify(provider_key, |_| None).await.map(|_| ())
+    /// Delete a credential by namespaced target key.
+    pub async fn delete(&self, target_key: &str) -> Result<(), std::io::Error> {
+        self.modify(target_key, |_| None).await.map(|_| ())
     }
 
     async fn read_unlocked(&self) -> Result<BTreeMap<String, StoredCredential>, std::io::Error> {

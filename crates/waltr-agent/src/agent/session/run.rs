@@ -4,7 +4,7 @@ use std::{error::Error, fmt};
 
 use tokio::sync::oneshot;
 
-use crate::{LlmError, ToolResult};
+use crate::{AuthTarget, LlmError, ToolResult};
 
 use super::{ExternalRequestId, ExternalResponse, SessionId, SessionStatus};
 
@@ -20,6 +20,13 @@ pub enum AgentSessionRuntimeError {
     Internal(String),
     /// Runtime resolution failed with a provider-neutral agent error.
     Agent(LlmError),
+    /// Runtime resolution found a target that needs authentication.
+    AuthorizationRequired {
+        /// Target that requires authentication.
+        target: AuthTarget,
+        /// Human-readable reason.
+        message: String,
+    },
 }
 
 impl fmt::Display for AgentSessionRuntimeError {
@@ -29,6 +36,12 @@ impl fmt::Display for AgentSessionRuntimeError {
                 formatter.write_str(message)
             }
             Self::Agent(error) => write!(formatter, "{error}"),
+            Self::AuthorizationRequired { target, message } => {
+                write!(
+                    formatter,
+                    "authentication required for {target:?}: {message}"
+                )
+            }
         }
     }
 }
@@ -37,7 +50,9 @@ impl Error for AgentSessionRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::FailedPrecondition(_) | Self::Internal(_) => None,
+            Self::FailedPrecondition(_)
+            | Self::Internal(_)
+            | Self::AuthorizationRequired { .. } => None,
         }
     }
 }

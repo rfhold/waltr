@@ -1,6 +1,7 @@
 //! Agent library for Waltr.
 
 mod agent;
+mod auth;
 mod error;
 pub mod mcp;
 pub mod middleware;
@@ -33,6 +34,7 @@ pub use agent::{
     Suspension, ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
     run_postgresql_migrations,
 };
+pub use auth::AuthTarget;
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
 pub use permission::{

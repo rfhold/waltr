@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use crate::{
-    AgentRuntimeBuilder, AgentsPromptConfig, FilesystemPromptConfig, ModelApi, ModelCost, ModelRef,
-    PermissionEffect, PermissionPolicy, ProviderId, SkillsConfig,
+    AgentRuntimeBuilder, AgentsPromptConfig, AuthTarget, FilesystemPromptConfig, ModelApi,
+    ModelCost, ModelRef, PermissionEffect, PermissionPolicy, ProviderId, SkillsConfig,
     filesystem::FilesystemConfig,
     mcp::{McpClientRuntime, McpConfig, McpServerConfig},
     provider::{
@@ -24,8 +24,8 @@ use oauth::{now_ms, refresh_oauth};
 
 use super::{
     AgentSessionRuntimeError, FileCredentialStore, OAuthCredential, SessionCoordinator,
-    SessionMcpServerRuntimeKind, SessionProviderRuntimeSettings, SessionRuntimeSettings,
-    SessionStore, StoredCredential,
+    SessionMcpServerRuntimeKind, SessionOAuthProviderSettings, SessionOAuthTokenRequestStyle,
+    SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStore, StoredCredential,
 };
 
 const ENV_PREFIX: &str = "${env:";
@@ -181,11 +181,11 @@ impl AgentSessionRuntimeFactory {
         Ok(builder)
     }
 
-    pub(crate) fn mcp_config(
+    pub(crate) async fn mcp_config(
         &self,
         settings: &SessionRuntimeSettings,
     ) -> Result<McpConfig, AgentSessionRuntimeError> {
-        mcp_config(settings)
+        self.mcp_config_with_credentials(settings).await
     }
 
     pub(crate) fn mcp_root_uri(&self) -> String {
@@ -291,7 +291,7 @@ impl AgentSessionRuntimeFactory {
         };
         let Some(StoredCredential::OAuth(mut credential)) = self
             .credential_store
-            .read(&provider.key)
+            .read(&AuthTarget::provider(&provider.key).credential_key())
             .await
             .map_err(|error| {
                 AgentSessionRuntimeError::Internal(format!(
@@ -303,10 +303,16 @@ impl AgentSessionRuntimeFactory {
         };
 
         if credential.expires_at_ms <= now_ms() + 5 * 60 * 1000 {
+            if credential.refresh.is_empty() {
+                return Ok(None);
+            }
             credential = refresh_oauth(definition, &credential).await?;
             let stored = credential.clone();
             self.credential_store
-                .modify(&provider.key, |_| Some(StoredCredential::OAuth(stored)))
+                .modify(
+                    &AuthTarget::provider(&provider.key).credential_key(),
+                    |_| Some(StoredCredential::OAuth(stored)),
+                )
                 .await
                 .map_err(|error| {
                     AgentSessionRuntimeError::Internal(format!(
@@ -317,6 +323,99 @@ impl AgentSessionRuntimeFactory {
 
         Ok(Some(credential))
     }
+
+    async fn mcp_config_with_credentials(
+        &self,
+        settings: &SessionRuntimeSettings,
+    ) -> Result<McpConfig, AgentSessionRuntimeError> {
+        let mut mcp = McpConfig::new();
+        if settings.mcp_trace_propagation {
+            mcp = mcp.with_trace_propagation(McpTracePropagation::TraceContext);
+        }
+        for server in &settings.mcp_servers {
+            let config = match server.kind {
+                SessionMcpServerRuntimeKind::Stdio => {
+                    let mut parts = server.command.split_whitespace();
+                    let command = parts.next().ok_or_else(|| {
+                        AgentSessionRuntimeError::FailedPrecondition(format!(
+                            "mcp server '{}' command must not be empty",
+                            server.key
+                        ))
+                    })?;
+                    McpServerConfig::stdio(server.key.clone(), command, parts)
+                }
+                SessionMcpServerRuntimeKind::StreamableHttp => {
+                    let bearer_token = self.mcp_bearer_token(&server.key).await?;
+                    McpServerConfig::streamable_http_with_bearer_token(
+                        server.key.clone(),
+                        server.url.clone(),
+                        bearer_token,
+                    )
+                }
+            };
+            mcp = mcp.with_server(config);
+        }
+        Ok(mcp)
+    }
+
+    async fn mcp_bearer_token(
+        &self,
+        server_key: &str,
+    ) -> Result<Option<String>, AgentSessionRuntimeError> {
+        let Some(StoredCredential::OAuth(mut credential)) = self
+            .credential_store
+            .read(&AuthTarget::mcp_server(server_key).credential_key())
+            .await
+            .map_err(|error| {
+                AgentSessionRuntimeError::Internal(format!(
+                    "failed to read mcp credentials: {error}"
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
+
+        if credential.expires_at_ms <= now_ms() + 5 * 60 * 1000 {
+            let Some(definition) = mcp_refresh_definition(&credential) else {
+                return Ok(None);
+            };
+            if credential.refresh.is_empty() {
+                return Ok(None);
+            }
+            credential = match refresh_oauth(&definition, &credential).await {
+                Ok(credential) => credential,
+                Err(_) => return Ok(None),
+            };
+            let stored = credential.clone();
+            self.credential_store
+                .modify(&AuthTarget::mcp_server(server_key).credential_key(), |_| {
+                    Some(StoredCredential::OAuth(stored))
+                })
+                .await
+                .map_err(|error| {
+                    AgentSessionRuntimeError::Internal(format!(
+                        "failed to store refreshed mcp credential: {error}"
+                    ))
+                })?;
+        }
+        Ok(Some(credential.access))
+    }
+}
+
+fn mcp_refresh_definition(credential: &OAuthCredential) -> Option<SessionOAuthProviderSettings> {
+    let token_url = credential.metadata.get("token_url")?.clone();
+    let client_id = credential.metadata.get("client_id")?.clone();
+    Some(SessionOAuthProviderSettings {
+        token_url,
+        client_id,
+        redirect_uri: credential
+            .metadata
+            .get("redirect_uri")
+            .cloned()
+            .unwrap_or_default(),
+        token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
+        token_fields: Vec::new(),
+    })
 }
 
 const fn provider_id(api: ModelApi) -> ProviderId {
@@ -336,32 +435,6 @@ fn builder_with_model_cost(
         builder = builder.with_model_cost(cost);
     }
     builder
-}
-
-fn mcp_config(settings: &SessionRuntimeSettings) -> Result<McpConfig, AgentSessionRuntimeError> {
-    let mut mcp = McpConfig::new();
-    if settings.mcp_trace_propagation {
-        mcp = mcp.with_trace_propagation(McpTracePropagation::TraceContext);
-    }
-    for server in &settings.mcp_servers {
-        let config = match server.kind {
-            SessionMcpServerRuntimeKind::Stdio => {
-                let mut parts = server.command.split_whitespace();
-                let command = parts.next().ok_or_else(|| {
-                    AgentSessionRuntimeError::FailedPrecondition(format!(
-                        "mcp server '{}' command must not be empty",
-                        server.key
-                    ))
-                })?;
-                McpServerConfig::stdio(server.key.clone(), command, parts)
-            }
-            SessionMcpServerRuntimeKind::StreamableHttp => {
-                McpServerConfig::streamable_http(server.key.clone(), server.url.clone())
-            }
-        };
-        mcp = mcp.with_server(config);
-    }
-    Ok(mcp)
 }
 
 fn ensure_no_reasoning_effort(
@@ -462,6 +535,7 @@ impl ConfigurableHeaders for OpenAiResponsesWebSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn runtime_builder_resolves_headers_at_agent_boundary() {
@@ -503,5 +577,98 @@ mod tests {
                 .to_string()
                 .contains("provider header 'Authorization' references unset env var")
         );
+    }
+
+    #[tokio::test]
+    async fn provider_oauth_uses_namespaced_credential_key() {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "waltr-agent-runtime-test-auth-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth_path = auth_dir.join("auth.json");
+        let factory =
+            AgentSessionRuntimeFactory::new(auth_dir, FileCredentialStore::new(auth_path));
+        factory
+            .credential_store
+            .modify(&AuthTarget::provider("test").credential_key(), |_| {
+                Some(StoredCredential::OAuth(OAuthCredential {
+                    access: "access-token".to_owned(),
+                    refresh: "refresh-token".to_owned(),
+                    expires_at_ms: now_ms() + 60 * 60 * 1000,
+                    metadata: BTreeMap::new(),
+                }))
+            })
+            .await
+            .expect("store credential");
+        let provider = SessionProviderRuntimeSettings {
+            key: "test".to_owned(),
+            api: ModelApi::OpenAiResponses,
+            url: String::new(),
+            model_id: "test-model".to_owned(),
+            model_cost: None,
+            headers: BTreeMap::new(),
+            oauth: Some(SessionOAuthProviderSettings {
+                token_url: "https://example.test/token".to_owned(),
+                client_id: "client".to_owned(),
+                redirect_uri: "http://localhost/callback".to_owned(),
+                token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
+                token_fields: Vec::new(),
+            }),
+            reasoning_effort: None,
+        };
+
+        let credential = factory
+            .oauth_access(&provider, &BTreeMap::new())
+            .await
+            .expect("oauth lookup succeeds")
+            .expect("credential is found");
+
+        assert_eq!(credential.access, "access-token");
+    }
+
+    #[tokio::test]
+    async fn provider_oauth_without_refresh_token_is_not_used_when_expired() {
+        let auth_dir = std::env::temp_dir().join(format!(
+            "waltr-agent-runtime-test-auth-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let auth_path = auth_dir.join("auth.json");
+        let factory =
+            AgentSessionRuntimeFactory::new(auth_dir, FileCredentialStore::new(auth_path));
+        factory
+            .credential_store
+            .modify(&AuthTarget::provider("test").credential_key(), |_| {
+                Some(StoredCredential::OAuth(OAuthCredential {
+                    access: "stale-token".to_owned(),
+                    refresh: String::new(),
+                    expires_at_ms: now_ms() - 1000,
+                    metadata: BTreeMap::new(),
+                }))
+            })
+            .await
+            .expect("store credential");
+        let provider = SessionProviderRuntimeSettings {
+            key: "test".to_owned(),
+            api: ModelApi::OpenAiResponses,
+            url: String::new(),
+            model_id: "test-model".to_owned(),
+            model_cost: None,
+            headers: BTreeMap::new(),
+            oauth: Some(SessionOAuthProviderSettings {
+                token_url: "https://example.test/token".to_owned(),
+                client_id: "client".to_owned(),
+                redirect_uri: "http://localhost/callback".to_owned(),
+                token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
+                token_fields: Vec::new(),
+            }),
+            reasoning_effort: None,
+        };
+
+        let credential = factory
+            .oauth_access(&provider, &BTreeMap::new())
+            .await
+            .expect("oauth lookup succeeds");
+
+        assert!(credential.is_none());
     }
 }
