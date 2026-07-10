@@ -7,6 +7,9 @@ mod error;
 mod log;
 /// MCP OAuth protected-resource discovery and bearer-token validation helpers.
 pub mod oauth;
+/// Opinionated progressive-workflow MCP server helpers.
+#[cfg(feature = "progressive")]
+pub mod progressive;
 mod prompt;
 /// JSON-RPC and MCP wire protocol helpers.
 pub mod protocol;
@@ -25,6 +28,8 @@ pub use error::{Error, Result};
 pub use log::McpLogLevel;
 #[cfg(feature = "macros")]
 pub use mcp_macros::mcp_server;
+#[cfg(feature = "progressive")]
+pub use mcp_macros::progressive_server;
 pub use oauth::{
     McpAccessToken, McpAuthorizationError, McpAuthorizationServerMetadata, McpBearerChallenge,
     McpProtectedResourceMetadata, McpTokenValidation, authorization_server_metadata_urls,

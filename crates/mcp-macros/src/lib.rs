@@ -1,5 +1,7 @@
 //! Procedural macros for building typed MCP servers.
 
+mod progressive;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -18,6 +20,20 @@ pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ServerArgs);
     let input = parse_macro_input!(input as ItemImpl);
     expand_mcp_server(args, input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Generate an opinionated progressive-workflow MCP server.
+///
+/// Progressive servers expose one `exec` tool, generated help actions, workflow
+/// prompts/resources, optional action resources, and the same Streamable HTTP
+/// helper methods as `#[mcp_server]`.
+#[proc_macro_attribute]
+pub fn progressive_server(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as progressive::ProgressiveArgs);
+    let input = parse_macro_input!(input as ItemImpl);
+    progressive::expand_progressive_server(args, input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
