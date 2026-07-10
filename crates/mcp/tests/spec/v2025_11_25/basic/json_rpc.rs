@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
-use mcp::{
-    protocol::{
-        JsonRpcId, JsonRpcInbound, json_rpc_error, json_rpc_notification, json_rpc_request,
-        json_rpc_success, parse_json_rpc_message,
-    },
-    server::{ServerCapabilities, ServerHandler, ServerInfo},
+use mcp::protocol::{
+    JsonRpcId, JsonRpcInbound, json_rpc_error, json_rpc_notification, json_rpc_request,
+    json_rpc_success, parse_json_rpc_message,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -14,15 +11,8 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct JsonRpcServer;
 
-impl ServerHandler for JsonRpcServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-json-rpc-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-    }
-}
+#[mcp::mcp_server(name = "mcp-spec-json-rpc-server", version = "0")]
+impl JsonRpcServer {}
 
 #[test]
 fn request_notification_and_response_builders_emit_spec_shapes() {

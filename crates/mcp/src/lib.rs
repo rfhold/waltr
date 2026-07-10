@@ -5,6 +5,7 @@ mod capabilities;
 pub mod client;
 mod error;
 mod log;
+/// MCP OAuth protected-resource discovery and bearer-token validation helpers.
 pub mod oauth;
 mod prompt;
 /// JSON-RPC and MCP wire protocol helpers.
@@ -22,6 +23,8 @@ pub use capabilities::{
 };
 pub use error::{Error, Result};
 pub use log::McpLogLevel;
+#[cfg(feature = "macros")]
+pub use mcp_macros::mcp_server;
 pub use oauth::{
     McpAccessToken, McpAuthorizationError, McpAuthorizationServerMetadata, McpBearerChallenge,
     McpProtectedResourceMetadata, McpTokenValidation, authorization_server_metadata_urls,

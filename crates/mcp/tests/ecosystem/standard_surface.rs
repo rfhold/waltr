@@ -22,52 +22,69 @@ pub fn string_value_schema(property: &str) -> Value {
 }
 
 pub fn tools() -> Vec<McpToolDefinition> {
-    vec![
-        tool(
-            ECHO_TOOL,
-            "Echo a deterministic marker.",
-            string_value_schema("value"),
-        ),
-        tool(
-            LOG_TOOL,
-            "Emit a deterministic MCP log message.",
-            string_value_schema("message"),
-        ),
-        tool(
-            PROGRESS_TOOL,
-            "Emit progress and echo a deterministic marker.",
-            string_value_schema("value"),
-        ),
-    ]
+    vec![echo_tool(), log_tool(), progress_tool()]
+}
+
+pub fn echo_tool() -> McpToolDefinition {
+    tool(
+        ECHO_TOOL,
+        "Echo a deterministic marker.",
+        string_value_schema("value"),
+    )
+}
+
+pub fn log_tool() -> McpToolDefinition {
+    tool(
+        LOG_TOOL,
+        "Emit a deterministic MCP log message.",
+        string_value_schema("message"),
+    )
+}
+
+pub fn progress_tool() -> McpToolDefinition {
+    tool(
+        PROGRESS_TOOL,
+        "Emit progress and echo a deterministic marker.",
+        string_value_schema("value"),
+    )
 }
 
 pub fn prompts() -> Vec<McpPromptDefinition> {
-    vec![
-        McpPromptDefinition {
-            name: STATUS_PROMPT.to_owned(),
-            title: None,
-            description: Some("Return deterministic status prompt.".to_owned()),
-            icons: Vec::new(),
-            arguments: Vec::new(),
-            meta: None,
-        },
-        McpPromptDefinition {
-            name: GREET_PROMPT.to_owned(),
-            title: None,
-            description: Some("Greet a named test subject.".to_owned()),
-            icons: Vec::new(),
-            arguments: vec![McpPromptArgument {
-                name: "name".to_owned(),
-                description: Some("Name to greet".to_owned()),
-                required: true,
-            }],
-            meta: None,
-        },
-    ]
+    vec![status_prompt(), greet_prompt()]
+}
+
+pub fn status_prompt() -> McpPromptDefinition {
+    McpPromptDefinition {
+        name: STATUS_PROMPT.to_owned(),
+        title: None,
+        description: Some("Return deterministic status prompt.".to_owned()),
+        icons: Vec::new(),
+        arguments: Vec::new(),
+        meta: None,
+    }
+}
+
+pub fn greet_prompt() -> McpPromptDefinition {
+    McpPromptDefinition {
+        name: GREET_PROMPT.to_owned(),
+        title: None,
+        description: Some("Greet a named test subject.".to_owned()),
+        icons: Vec::new(),
+        arguments: vec![McpPromptArgument {
+            name: "name".to_owned(),
+            description: Some("Name to greet".to_owned()),
+            required: true,
+        }],
+        meta: None,
+    }
 }
 
 pub fn resources() -> Vec<McpResourceDefinition> {
-    vec![McpResourceDefinition {
+    vec![status_resource()]
+}
+
+pub fn status_resource() -> McpResourceDefinition {
+    McpResourceDefinition {
         uri: STATUS_RESOURCE.to_owned(),
         name: "status_resource".to_owned(),
         title: Some("Status Resource".to_owned()),
@@ -77,11 +94,15 @@ pub fn resources() -> Vec<McpResourceDefinition> {
         size: Some(29),
         annotations: None,
         meta: None,
-    }]
+    }
 }
 
 pub fn resource_templates() -> Vec<McpResourceTemplateDefinition> {
-    vec![McpResourceTemplateDefinition {
+    vec![item_resource_template()]
+}
+
+pub fn item_resource_template() -> McpResourceTemplateDefinition {
+    McpResourceTemplateDefinition {
         uri_template: ITEM_TEMPLATE.to_owned(),
         name: "item_resource".to_owned(),
         title: Some("Item Resource".to_owned()),
@@ -90,7 +111,7 @@ pub fn resource_templates() -> Vec<McpResourceTemplateDefinition> {
         icons: Vec::new(),
         annotations: None,
         meta: None,
-    }]
+    }
 }
 
 pub fn item_completions(prefix: &str) -> Vec<String> {

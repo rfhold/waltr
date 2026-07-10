@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use mcp::{
-    McpPromptArgument, McpPromptDefinition, McpPromptList, McpPromptResult,
-    server::{
-        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-    },
+    McpPromptArgument, McpPromptDefinition, McpPromptResult,
+    server::{ServerContext, ServerError, ServerResult},
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -13,68 +11,48 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct PromptsServer;
 
-impl ServerHandler for PromptsServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-prompts-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().prompts()
-    }
-
-    fn list_prompts(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<mcp::server::ServerResult<McpPromptList>> {
-        Box::pin(async {
-            Ok(McpPromptList {
-                prompts: vec![McpPromptDefinition {
-                    name: "code_review".to_owned(),
-                    title: Some("Request Code Review".to_owned()),
-                    description: Some("Asks the LLM to analyze code quality".to_owned()),
-                    icons: Vec::new(),
-                    arguments: vec![McpPromptArgument {
-                        name: "code".to_owned(),
-                        description: Some("The code to review".to_owned()),
-                        required: true,
-                    }],
-                    meta: None,
-                }],
-                next_cursor: Some("next-prompt-page".to_owned()),
-            })
-        })
-    }
-
-    fn get_prompt(
-        &self,
-        name: String,
+#[mcp::mcp_server(
+    name = "mcp-spec-prompts-server",
+    version = "0",
+    prompts_next_cursor = "next-prompt-page"
+)]
+impl PromptsServer {
+    #[prompt(name = "code_review", definition = code_review_prompt_definition())]
+    fn get_code_review_prompt(
         arguments: Option<Value>,
         _context: ServerContext,
-    ) -> BoxFuture<mcp::server::ServerResult<McpPromptResult>> {
-        Box::pin(async move {
-            if name != "code_review" {
-                return Err(ServerError::invalid_params(format!(
-                    "Invalid prompt name: {name}"
-                )));
-            }
-            let code = arguments
-                .as_ref()
-                .and_then(|arguments| arguments.get("code"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| ServerError::invalid_params("Missing required argument: code"))?;
+    ) -> ServerResult<McpPromptResult> {
+        let code = arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("code"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| ServerError::invalid_params("Missing required argument: code"))?;
 
-            Ok(McpPromptResult::new(json!({
-                "description": "Code review prompt",
-                "messages": [{
-                    "role": "user",
-                    "content": {
-                        "type": "text",
-                        "text": format!("Please review this code:\n{code}")
-                    }
-                }]
-            })))
-        })
+        Ok(McpPromptResult::new(json!({
+            "description": "Code review prompt",
+            "messages": [{
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": format!("Please review this code:\n{code}")
+                }
+            }]
+        })))
+    }
+}
+
+fn code_review_prompt_definition() -> McpPromptDefinition {
+    McpPromptDefinition {
+        name: "code_review".to_owned(),
+        title: Some("Request Code Review".to_owned()),
+        description: Some("Asks the LLM to analyze code quality".to_owned()),
+        icons: Vec::new(),
+        arguments: vec![McpPromptArgument {
+            name: "code".to_owned(),
+            description: Some("The code to review".to_owned()),
+            required: true,
+        }],
+        meta: None,
     }
 }
 

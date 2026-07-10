@@ -1,13 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use mcp::server::{
-    BoxFuture, ServerCapabilities, ServerContext, ServerHandler, ServerInfo, ServerResult,
-};
+use mcp::server::{ServerContext, ServerResult};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use crate::spec::support::{SpecServer, initialized_session, post_json};
 
+#[derive(Clone)]
 struct LoggingServer {
     seen_levels: Arc<Mutex<Vec<String>>>,
 }
@@ -18,29 +17,20 @@ impl LoggingServer {
     }
 }
 
-impl ServerHandler for LoggingServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-logging-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().logging()
-    }
-
-    fn set_log_level(&self, level: String, context: ServerContext) -> BoxFuture<ServerResult<()>> {
-        let seen_levels = Arc::clone(&self.seen_levels);
-        Box::pin(async move {
-            seen_levels.lock().expect("levels lock").push(level);
-            context
-                .log(
-                    "error",
-                    Some("database"),
-                    json!({ "error": "Connection failed", "details": { "port": 5432 } }),
-                )
-                .await
-                .map_err(|error| mcp::server::ServerError::internal(error.to_string()))?;
-            Ok(())
-        })
+#[mcp::mcp_server(name = "mcp-spec-logging-server", version = "0")]
+impl LoggingServer {
+    #[log_level]
+    async fn set_log_level(&self, level: String, context: ServerContext) -> ServerResult<()> {
+        self.seen_levels.lock().expect("levels lock").push(level);
+        context
+            .log(
+                "error",
+                Some("database"),
+                json!({ "error": "Connection failed", "details": { "port": 5432 } }),
+            )
+            .await
+            .map_err(|error| mcp::server::ServerError::internal(error.to_string()))?;
+        Ok(())
     }
 }
 

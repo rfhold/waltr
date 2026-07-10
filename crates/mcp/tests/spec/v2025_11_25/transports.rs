@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use mcp::{
     client::{McpClient, McpClientHandler, McpClientOptions, McpTransportConfig},
     protocol::MCP_PROTOCOL_VERSION,
-    server::{ServerCapabilities, ServerContext, ServerHandler, ServerInfo, StreamableHttpOptions},
+    server::{ServerContext, StreamableHttpOptions},
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -14,34 +14,27 @@ use crate::spec::support::{SpecServer, initialized_session};
 
 struct TransportServer;
 
-impl ServerHandler for TransportServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-2025-11-25-transport", "1.0.0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().logging()
-    }
-
-    fn handle_notification(
-        &self,
-        notification: mcp::protocol::JsonRpcNotification,
+#[mcp::mcp_server(
+    name = "mcp-2025-11-25-transport",
+    version = "1.0.0",
+    capabilities(logging)
+)]
+impl TransportServer {
+    #[notification(method = "notifications/initialized")]
+    async fn initialized(
+        _notification: mcp::protocol::JsonRpcNotification,
         context: ServerContext,
-    ) -> mcp::server::BoxFuture<()> {
-        Box::pin(async move {
-            if notification.method == "notifications/initialized" {
-                context
-                    .notify(
-                        "notifications/message",
-                        Some(json!({
-                            "level": "info",
-                            "data": "queued-for-get-polling"
-                        })),
-                    )
-                    .await
-                    .expect("queue notification");
-            }
-        })
+    ) {
+        context
+            .notify(
+                "notifications/message",
+                Some(json!({
+                    "level": "info",
+                    "data": "queued-for-get-polling"
+                })),
+            )
+            .await
+            .expect("queue notification");
     }
 }
 

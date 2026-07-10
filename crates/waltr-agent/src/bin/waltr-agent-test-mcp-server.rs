@@ -8,16 +8,11 @@ use std::{
 
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use mcp::{
-    McpCompletionRequest, McpPromptArgument, McpPromptDefinition, McpPromptList, McpPromptResult,
-    McpProtectedResourceMetadata, McpResourceDefinition, McpResourceList, McpResourceResult,
-    McpResourceTemplateDefinition, McpResourceTemplateList, McpTokenValidation, McpToolCall,
-    McpToolDefinition, McpToolList, McpToolResult,
+    McpAccessToken, McpCompletionRequest, McpPromptArgument, McpPromptDefinition, McpPromptResult,
+    McpResourceDefinition, McpResourceResult, McpResourceTemplateDefinition, McpTokenValidation,
+    McpToolCall, McpToolDefinition, McpToolResult,
     protocol::JsonRpcNotification,
-    server::{
-        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-        ServerResult, StreamableHttpAuthorization, StreamableHttpOptions, serve_stdio,
-        streamable_http_router, streamable_http_router_with_options,
-    },
+    server::{McpAuthorizationContext, ServerContext, ServerError, ServerResult, serve_stdio},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -68,9 +63,21 @@ enum JwtAudience {
 #[derive(Debug, Clone, Default)]
 struct EchoMarkerServer {
     cancelled: Arc<Mutex<BTreeSet<String>>>,
+    authorization: Option<AuthorizationMode>,
+}
+
+#[derive(Debug, Clone)]
+enum AuthorizationMode {
+    Jwt(JwtValidator),
+    Bearer(String),
 }
 
 impl EchoMarkerServer {
+    fn with_authorization(mut self, authorization: AuthorizationMode) -> Self {
+        self.authorization = Some(authorization);
+        self
+    }
+
     fn cancel_request(&self, id: String) {
         if let Ok(mut cancelled) = self.cancelled.lock() {
             cancelled.insert(id);
@@ -98,138 +105,22 @@ impl EchoMarkerServer {
     }
 }
 
-impl ServerHandler for EchoMarkerServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("waltr-agent-test-mcp-server", env!("CARGO_PKG_VERSION"))
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-            .tools()
-            .prompts()
-            .resources()
-            .completions()
-            .logging()
-    }
-
-    fn instructions(&self) -> Option<String> {
+#[mcp::mcp_server(name = "waltr-agent-test-mcp-server", version = env!("CARGO_PKG_VERSION"))]
+impl EchoMarkerServer {
+    #[instructions]
+    fn instructions() -> Option<String> {
         std::env::var("WALTR_TEST_MCP_INSTRUCTIONS")
             .ok()
             .filter(|instructions| !instructions.trim().is_empty())
     }
 
-    fn list_tools(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolList>> {
-        Box::pin(async {
-            Ok(McpToolList {
-                tools: tools_list(),
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn call_tool(
-        &self,
-        call: McpToolCall,
-        context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolResult>> {
-        let server = self.clone();
-        Box::pin(async move { server.call_tool(call, context).await })
-    }
-
-    fn set_log_level(&self, level: String, _context: ServerContext) -> BoxFuture<ServerResult<()>> {
-        Box::pin(async move { set_log_level(&level) })
-    }
-
-    fn list_prompts(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpPromptList>> {
-        Box::pin(async {
-            Ok(McpPromptList {
-                prompts: prompts_list(),
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn get_prompt(
-        &self,
-        name: String,
-        arguments: Option<Value>,
-        context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpPromptResult>> {
-        Box::pin(async move { get_prompt(&name, arguments.as_ref(), &context) })
-    }
-
-    fn list_resources(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpResourceList>> {
-        Box::pin(async {
-            Ok(McpResourceList {
-                resources: resources_list(),
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn list_resource_templates(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpResourceTemplateList>> {
-        Box::pin(async {
-            Ok(McpResourceTemplateList {
-                resource_templates: resource_templates_list(),
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn read_resource(
-        &self,
-        uri: String,
-        context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpResourceResult>> {
-        Box::pin(async move { read_resource(&uri, &context) })
-    }
-
-    fn complete(
-        &self,
-        request: McpCompletionRequest,
-        context: ServerContext,
-    ) -> BoxFuture<ServerResult<mcp::McpCompletionResult>> {
-        Box::pin(async move { complete(request, &context) })
-    }
-
-    fn handle_notification(
-        &self,
-        notification: JsonRpcNotification,
-        _context: ServerContext,
-    ) -> BoxFuture<()> {
-        let server = self.clone();
-        Box::pin(async move {
-            if notification.method == "notifications/cancelled" {
-                if let Some(id) = notification
-                    .params
-                    .as_ref()
-                    .and_then(|params| params.get("requestId"))
-                    .map(request_id_string)
-                {
-                    server.cancel_request(id);
-                }
-            }
-        })
-    }
-}
-
-impl EchoMarkerServer {
+    #[tool(name = "echo_marker", definition = echo_marker_tool_definition())]
+    #[tool(
+        name = "delayed_write_marker",
+        definition = delayed_write_marker_tool_definition()
+    )]
+    #[tool(name = "emit_log_marker", definition = emit_log_marker_tool_definition())]
+    #[tool(name = "progress_marker", definition = progress_marker_tool_definition())]
     async fn call_tool(
         &self,
         call: McpToolCall,
@@ -312,6 +203,84 @@ impl EchoMarkerServer {
             _ => Err(ServerError::invalid_params("unknown test tool")),
         }
     }
+
+    #[log_level]
+    fn set_log_level(level: String, _context: ServerContext) -> ServerResult<()> {
+        set_log_level(&level)
+    }
+
+    #[prompt(name = "status_prompt", definition = status_prompt_definition())]
+    fn status_prompt(
+        arguments: Option<Value>,
+        context: ServerContext,
+    ) -> ServerResult<McpPromptResult> {
+        get_prompt("status_prompt", arguments.as_ref(), &context)
+    }
+
+    #[prompt(name = "greet_prompt", definition = greet_prompt_definition())]
+    fn greet_prompt(
+        arguments: Option<Value>,
+        context: ServerContext,
+    ) -> ServerResult<McpPromptResult> {
+        get_prompt("greet_prompt", arguments.as_ref(), &context)
+    }
+
+    #[prompt(name = "review.code", definition = review_code_prompt_definition())]
+    fn review_code_prompt(
+        arguments: Option<Value>,
+        context: ServerContext,
+    ) -> ServerResult<McpPromptResult> {
+        get_prompt("review.code", arguments.as_ref(), &context)
+    }
+
+    #[resource(uri = "test://status", definition = status_resource_definition())]
+    #[resource_template(
+        uri_template = "test://items/{id}",
+        definition = item_resource_template_definition()
+    )]
+    fn read_resource(uri: String, context: ServerContext) -> ServerResult<McpResourceResult> {
+        read_resource(&uri, &context)
+    }
+
+    #[complete]
+    fn complete(
+        request: McpCompletionRequest,
+        context: ServerContext,
+    ) -> ServerResult<mcp::McpCompletionResult> {
+        complete(request, &context)
+    }
+
+    #[notification(method = "notifications/cancelled")]
+    fn handle_cancelled(&self, notification: JsonRpcNotification, _context: ServerContext) {
+        if let Some(id) = notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("requestId"))
+            .map(request_id_string)
+        {
+            self.cancel_request(id);
+        }
+    }
+
+    #[token_validator]
+    fn validate_token(
+        &self,
+        token: McpAccessToken,
+        _context: McpAuthorizationContext,
+    ) -> McpTokenValidation {
+        match &self.authorization {
+            Some(AuthorizationMode::Jwt(validator)) => validate_jwt_token(validator, &token.0),
+            Some(AuthorizationMode::Bearer(required_token)) if token.0 == *required_token => {
+                McpTokenValidation::Authorized
+            }
+            Some(AuthorizationMode::Bearer(_)) => McpTokenValidation::Unauthorized {
+                error_description: Some("invalid test token".to_owned()),
+            },
+            None => McpTokenValidation::Unauthorized {
+                error_description: Some("test server authorization is not configured".to_owned()),
+            },
+        }
+    }
 }
 
 #[tokio::main]
@@ -337,45 +306,25 @@ async fn serve_http(
     if let Some(path) = address_file {
         std::fs::write(path, address.to_string())?;
     }
-    let handler = Arc::new(EchoMarkerServer::default());
     let resource =
         std::env::var("WALTR_TEST_MCP_RESOURCE").unwrap_or_else(|_| format!("http://{address}/mcp"));
     let router = if let Some(validator) = jwt_validator_from_env().await? {
-        let metadata =
-            McpProtectedResourceMetadata::new(resource.clone(), [validator.issuer.clone()])
-                .with_scopes(["openid", "email", "profile"])
-                .with_resource_name("Waltr protected MCP test server");
-        let authorization = StreamableHttpAuthorization::new(metadata, move |token, _context| {
-            let validator = validator.clone();
-            Box::pin(async move { validate_jwt_token(&validator, &token.0) })
-                as BoxFuture<McpTokenValidation>
-        })?;
-        streamable_http_router_with_options(
-            handler,
-            StreamableHttpOptions::default().with_authorization(authorization),
-        )
+        let issuer = validator.issuer.clone();
+        let metadata = EchoMarkerServer::protected_resource_metadata(resource.clone(), [issuer])
+            .with_scopes(["openid", "email", "profile"])
+            .with_resource_name("Waltr protected MCP test server");
+        EchoMarkerServer::default()
+            .with_authorization(AuthorizationMode::Jwt(validator))
+            .streamable_http_router_with_auth(metadata)?
     } else if let Ok(required_token) = std::env::var("WALTR_TEST_MCP_REQUIRED_BEARER") {
         let issuer = std::env::var("WALTR_TEST_MCP_OAUTH_ISSUER")
             .unwrap_or_else(|_| "https://auth.example.test".to_owned());
-        let metadata = McpProtectedResourceMetadata::new(resource, [issuer]);
-        let authorization = StreamableHttpAuthorization::new(metadata, move |token, _context| {
-            let required_token = required_token.clone();
-            Box::pin(async move {
-                if token.0 == required_token {
-                    McpTokenValidation::Authorized
-                } else {
-                    McpTokenValidation::Unauthorized {
-                        error_description: Some("invalid test token".to_owned()),
-                    }
-                }
-            }) as BoxFuture<McpTokenValidation>
-        })?;
-        streamable_http_router_with_options(
-            handler,
-            StreamableHttpOptions::default().with_authorization(authorization),
-        )
+        let metadata = EchoMarkerServer::protected_resource_metadata(resource, [issuer]);
+        EchoMarkerServer::default()
+            .with_authorization(AuthorizationMode::Bearer(required_token))
+            .streamable_http_router_with_auth(metadata)?
     } else {
-        streamable_http_router(handler)
+        EchoMarkerServer::default().streamable_http_router()
     };
     axum::serve(listener, router).await?;
     Ok(())
@@ -466,37 +415,44 @@ impl JwtAudience {
     }
 }
 
-fn tools_list() -> Vec<McpToolDefinition> {
-    vec![
-        tool_definition(
-            "echo_marker",
-            "Echo a deterministic marker.",
-            string_schema("value"),
-        ),
-        tool_definition(
-            "delayed_write_marker",
-            "Write a marker after a delay.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "value": { "type": "string" },
-                    "delay_ms": { "type": "integer" }
-                },
-                "required": ["path", "value", "delay_ms"]
-            }),
-        ),
-        tool_definition(
-            "emit_log_marker",
-            "Emit a deterministic MCP log message.",
-            string_schema("message"),
-        ),
-        tool_definition(
-            "progress_marker",
-            "Emit progress and echo a deterministic marker.",
-            string_schema("value"),
-        ),
-    ]
+fn echo_marker_tool_definition() -> McpToolDefinition {
+    tool_definition(
+        "echo_marker",
+        "Echo a deterministic marker.",
+        string_schema("value"),
+    )
+}
+
+fn delayed_write_marker_tool_definition() -> McpToolDefinition {
+    tool_definition(
+        "delayed_write_marker",
+        "Write a marker after a delay.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": { "type": "string" },
+                "delay_ms": { "type": "integer" }
+            },
+            "required": ["path", "value", "delay_ms"]
+        }),
+    )
+}
+
+fn emit_log_marker_tool_definition() -> McpToolDefinition {
+    tool_definition(
+        "emit_log_marker",
+        "Emit a deterministic MCP log message.",
+        string_schema("message"),
+    )
+}
+
+fn progress_marker_tool_definition() -> McpToolDefinition {
+    tool_definition(
+        "progress_marker",
+        "Emit progress and echo a deterministic marker.",
+        string_schema("value"),
+    )
 }
 
 fn tool_definition(name: &str, description: &str, input_schema: Value) -> McpToolDefinition {
@@ -536,28 +492,32 @@ fn set_log_level(level: &str) -> ServerResult<()> {
     Ok(())
 }
 
-fn prompts_list() -> Vec<McpPromptDefinition> {
-    vec![
-        prompt_definition(
-            "status_prompt",
-            "Return a deterministic status prompt.",
-            Vec::new(),
-        ),
-        prompt_definition(
-            "greet_prompt",
-            "Greet a named test subject.",
-            vec![McpPromptArgument {
-                name: "name".to_owned(),
-                description: Some("Name to greet".to_owned()),
-                required: true,
-            }],
-        ),
-        prompt_definition(
-            "review.code",
-            "Spec-valid prompt name outside Waltr slash syntax.",
-            Vec::new(),
-        ),
-    ]
+fn status_prompt_definition() -> McpPromptDefinition {
+    prompt_definition(
+        "status_prompt",
+        "Return a deterministic status prompt.",
+        Vec::new(),
+    )
+}
+
+fn greet_prompt_definition() -> McpPromptDefinition {
+    prompt_definition(
+        "greet_prompt",
+        "Greet a named test subject.",
+        vec![McpPromptArgument {
+            name: "name".to_owned(),
+            description: Some("Name to greet".to_owned()),
+            required: true,
+        }],
+    )
+}
+
+fn review_code_prompt_definition() -> McpPromptDefinition {
+    prompt_definition(
+        "review.code",
+        "Spec-valid prompt name outside Waltr slash syntax.",
+        Vec::new(),
+    )
 }
 
 fn prompt_definition(
@@ -601,8 +561,8 @@ fn get_prompt(
     Ok(McpPromptResult::text_user(text))
 }
 
-fn resources_list() -> Vec<McpResourceDefinition> {
-    vec![McpResourceDefinition {
+fn status_resource_definition() -> McpResourceDefinition {
+    McpResourceDefinition {
         uri: "test://status".to_owned(),
         name: "status_resource".to_owned(),
         title: Some("Status Resource".to_owned()),
@@ -612,11 +572,11 @@ fn resources_list() -> Vec<McpResourceDefinition> {
         size: Some(28),
         annotations: None,
         meta: None,
-    }]
+    }
 }
 
-fn resource_templates_list() -> Vec<McpResourceTemplateDefinition> {
-    vec![McpResourceTemplateDefinition {
+fn item_resource_template_definition() -> McpResourceTemplateDefinition {
+    McpResourceTemplateDefinition {
         uri_template: "test://items/{id}".to_owned(),
         name: "item_resource".to_owned(),
         title: Some("Item Resource".to_owned()),
@@ -625,7 +585,7 @@ fn resource_templates_list() -> Vec<McpResourceTemplateDefinition> {
         icons: Vec::new(),
         annotations: None,
         meta: None,
-    }]
+    }
 }
 
 fn read_resource(uri: &str, context: &ServerContext) -> ServerResult<McpResourceResult> {

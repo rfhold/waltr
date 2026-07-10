@@ -46,6 +46,12 @@ use crate::{
     },
 };
 
+/// Axum router returned by Streamable HTTP server helpers.
+pub type StreamableHttpRouter = Router;
+
+/// JSON value type used by generated server handlers.
+pub type JsonValue = Value;
+
 /// Boxed MCP server future.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 

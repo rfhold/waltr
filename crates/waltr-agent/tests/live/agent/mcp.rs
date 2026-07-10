@@ -10,11 +10,8 @@ use waltr_agent::{
     SessionRuntimeSettings, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
 };
 use mcp::{
-    McpToolCall, McpToolDefinition, McpToolList, McpToolResult,
-    server::{
-        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-        ServerResult, streamable_http_router,
-    },
+    McpToolCall, McpToolDefinition, McpToolResult,
+    server::{ServerContext, ServerError, ServerResult},
 };
 use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -258,7 +255,7 @@ impl HttpMcpTestServer {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let app = streamable_http_router(Arc::new(EchoMarkerServer));
+        let app = EchoMarkerServer.streamable_http_router();
         tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
@@ -350,47 +347,28 @@ struct EchoMarkerRequest {
 #[derive(Debug, Clone)]
 struct EchoMarkerServer;
 
-impl ServerHandler for EchoMarkerServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("waltr-live-test-mcp-server", env!("CARGO_PKG_VERSION"))
+#[mcp::mcp_server(name = "waltr-live-test-mcp-server", version = env!("CARGO_PKG_VERSION"))]
+impl EchoMarkerServer {
+    #[tool(name = "echo_marker", definition = echo_marker_tool_definition())]
+    fn call_echo_marker(call: McpToolCall, _context: ServerContext) -> ServerResult<McpToolResult> {
+        call_echo_marker(call)
     }
+}
 
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().tools()
-    }
-
-    fn list_tools(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolList>> {
-        Box::pin(async {
-            Ok(McpToolList {
-                tools: vec![McpToolDefinition {
-                    name: "echo_marker".to_owned(),
-                    title: None,
-                    description: Some("Echo a deterministic marker.".to_owned()),
-                    icons: Vec::new(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": { "value": { "type": "string" } },
-                        "required": ["value"]
-                    }),
-                    output_schema: None,
-                    task_support: None,
-                    annotations: None,
-                }],
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn call_tool(
-        &self,
-        call: McpToolCall,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolResult>> {
-        Box::pin(async move { call_echo_marker(call) })
+fn echo_marker_tool_definition() -> McpToolDefinition {
+    McpToolDefinition {
+        name: "echo_marker".to_owned(),
+        title: None,
+        description: Some("Echo a deterministic marker.".to_owned()),
+        icons: Vec::new(),
+        input_schema: json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"]
+        }),
+        output_schema: None,
+        task_support: None,
+        annotations: None,
     }
 }
 

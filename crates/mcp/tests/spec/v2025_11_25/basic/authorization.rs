@@ -13,34 +13,44 @@ use mcp::{
     client::{McpClient, McpClientHandler, McpClientOptions, McpTransportConfig},
     discover_protected_resource_metadata,
     oauth::{authorization_server_metadata_urls, protected_resource_metadata_urls},
-    server::{
-        BoxFuture, McpAuthorizationContext, ServerCapabilities, ServerContext, ServerHandler,
-        ServerInfo, StreamableHttpAuthorization, StreamableHttpOptions,
-    },
+    server::{BoxFuture, McpAuthorizationContext},
 };
 use reqwest::StatusCode;
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Mutex, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Default)]
-struct AuthorizationServer;
+type AuthorizationValidator = Arc<
+    dyn Fn(McpAccessToken, McpAuthorizationContext) -> BoxFuture<McpTokenValidation> + Send + Sync,
+>;
 
-impl ServerHandler for AuthorizationServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-authorization-spec-server", "1.0.0")
+#[derive(Clone)]
+struct AuthorizationServer {
+    validator: AuthorizationValidator,
+}
+
+#[mcp::mcp_server(
+    name = "mcp-authorization-spec-server",
+    version = "1.0.0",
+    auth(
+        scopes = ["files:read"],
+        required_scopes = ["files:read"],
+        realm = "mcp-spec",
+        resource_name = "Authorization spec MCP server"
+    )
+)]
+impl AuthorizationServer {
+    fn new(validator: AuthorizationValidator) -> Self {
+        Self { validator }
     }
 
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-    }
-
-    fn handle_notification(
+    #[token_validator]
+    async fn validate_token(
         &self,
-        _notification: mcp::protocol::JsonRpcNotification,
-        _context: ServerContext,
-    ) -> BoxFuture<()> {
-        Box::pin(async {})
+        token: McpAccessToken,
+        context: McpAuthorizationContext,
+    ) -> McpTokenValidation {
+        (self.validator)(token, context).await
     }
 }
 
@@ -438,17 +448,12 @@ impl AuthorizedSpecServer {
         let address: SocketAddr = listener.local_addr()?;
         let origin = format!("http://{address}");
         let endpoint = format!("{origin}/mcp");
-        let metadata =
-            McpProtectedResourceMetadata::new(endpoint.clone(), ["https://auth.example.com"])
-                .with_scopes(["files:read"])
-                .with_resource_name("Authorization spec MCP server");
-        let authorization = StreamableHttpAuthorization::new(metadata, validator)?
-            .with_required_scopes(["files:read"])
-            .with_realm("mcp-spec");
-        let router = mcp::server::streamable_http_router_with_options(
-            Arc::new(AuthorizationServer),
-            StreamableHttpOptions::default().with_authorization(authorization),
+        let server = AuthorizationServer::new(Arc::new(validator));
+        let metadata = AuthorizationServer::protected_resource_metadata(
+            endpoint.clone(),
+            ["https://auth.example.com"],
         );
+        let router = server.streamable_http_router_with_auth(metadata)?;
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, router).await {
                 tracing::debug!(%error, "mcp authorization spec server stopped");

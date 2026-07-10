@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use mcp::{
     protocol::{JsonRpcId, JsonRpcInbound, json_rpc_success, parse_json_rpc_message},
-    server::{ServerCapabilities, ServerHandler, ServerInfo},
+    server::ServerContext,
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::spec::support::SpecServer;
 
+#[derive(Clone)]
 struct MetaServer {
     notification_params: Arc<Mutex<Option<Value>>>,
 }
@@ -22,25 +23,15 @@ impl Default for MetaServer {
     }
 }
 
-impl ServerHandler for MetaServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-meta-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-    }
-
-    fn handle_notification(
+#[mcp::mcp_server(name = "mcp-spec-meta-server", version = "0")]
+impl MetaServer {
+    #[notification]
+    async fn handle_notification(
         &self,
         notification: mcp::protocol::JsonRpcNotification,
-        _context: mcp::server::ServerContext,
-    ) -> mcp::server::BoxFuture<()> {
-        let params = notification.params;
-        let notification_params = self.notification_params.clone();
-        Box::pin(async move {
-            *notification_params.lock().await = params;
-        })
+        _context: ServerContext,
+    ) {
+        *self.notification_params.lock().await = notification.params;
     }
 }
 

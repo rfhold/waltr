@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use mcp::{
-    McpResourceDefinition, McpResourceList, McpResourceResult,
-    server::{
-        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-    },
+    McpResourceDefinition, McpResourceResult,
+    server::{ServerContext, ServerResult},
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -13,62 +11,42 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct ResourcesServer;
 
-impl ServerHandler for ResourcesServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-resources-server", "0")
+#[mcp::mcp_server(
+    name = "mcp-spec-resources-server",
+    version = "0",
+    resources_next_cursor = "next-resource-page"
+)]
+impl ResourcesServer {
+    #[resource(uri = "file:///project/src/main.rs", definition = main_rs_resource_definition())]
+    fn read_main_rs(_uri: String, _context: ServerContext) -> ServerResult<McpResourceResult> {
+        Ok(McpResourceResult::new(json!({
+            "contents": [
+                {
+                    "uri": "file:///project/src/main.rs",
+                    "mimeType": "text/x-rust",
+                    "text": "fn main() {}"
+                },
+                {
+                    "uri": "file:///project/image.png",
+                    "mimeType": "image/png",
+                    "blob": "aW1hZ2U="
+                }
+            ]
+        })))
     }
+}
 
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().resources()
-    }
-
-    fn list_resources(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<mcp::server::ServerResult<McpResourceList>> {
-        Box::pin(async {
-            Ok(McpResourceList {
-                resources: vec![McpResourceDefinition {
-                    uri: "file:///project/src/main.rs".to_owned(),
-                    name: "main.rs".to_owned(),
-                    title: Some("Rust Software Application Main File".to_owned()),
-                    description: Some("Primary application entry point".to_owned()),
-                    mime_type: Some("text/x-rust".to_owned()),
-                    icons: Vec::new(),
-                    size: Some(42),
-                    annotations: None,
-                    meta: None,
-                }],
-                next_cursor: Some("next-resource-page".to_owned()),
-            })
-        })
-    }
-
-    fn read_resource(
-        &self,
-        uri: String,
-        _context: ServerContext,
-    ) -> BoxFuture<mcp::server::ServerResult<McpResourceResult>> {
-        Box::pin(async move {
-            if uri != "file:///project/src/main.rs" {
-                return Err(ServerError::resource_not_found(uri));
-            }
-            Ok(McpResourceResult::new(json!({
-                "contents": [
-                    {
-                        "uri": "file:///project/src/main.rs",
-                        "mimeType": "text/x-rust",
-                        "text": "fn main() {}"
-                    },
-                    {
-                        "uri": "file:///project/image.png",
-                        "mimeType": "image/png",
-                        "blob": "aW1hZ2U="
-                    }
-                ]
-            })))
-        })
+fn main_rs_resource_definition() -> McpResourceDefinition {
+    McpResourceDefinition {
+        uri: "file:///project/src/main.rs".to_owned(),
+        name: "main.rs".to_owned(),
+        title: Some("Rust Software Application Main File".to_owned()),
+        description: Some("Primary application entry point".to_owned()),
+        mime_type: Some("text/x-rust".to_owned()),
+        icons: Vec::new(),
+        size: Some(42),
+        annotations: None,
+        meta: None,
     }
 }
 
