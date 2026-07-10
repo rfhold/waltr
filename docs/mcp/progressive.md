@@ -18,6 +18,8 @@ Progressive servers expose one tool, `exec`. Clients choose a dot-notated `actio
 
 The default workflow resource template is `workflows://{workflow}`. Override it with `workflow_uri_template = "..."`.
 
+`workflows.load` returns the workflow Markdown as text content and also includes object-shaped structured content with `workflow` and `markdown` fields.
+
 ## Help Content
 
 Namespaces are declared on the server macro with descriptions. Root `help` lists each namespace and when to use it.

@@ -306,9 +306,13 @@ async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp
             .is_some_and(|text| text.contains("## Promote to production"))
     );
     assert!(
-        workflow["structuredContent"]
+        workflow["structuredContent"]["markdown"]
             .as_str()
             .is_some_and(|text| text.contains("Check policy"))
+    );
+    assert_eq!(
+        workflow["structuredContent"]["workflow"],
+        "promote-to-production"
     );
 
     let prompts = post_json(
