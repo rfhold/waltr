@@ -5,6 +5,7 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod config_service;
+pub mod mcp_service;
 pub mod observability;
 pub mod profiling;
 pub mod session;

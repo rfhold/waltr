@@ -5,6 +5,7 @@ use crate::{
     catalog::{CatalogLoader, CatalogService},
     config::ConfigHandle,
     config_service::ConfigService,
+    mcp_service::WaltrMcpServer,
     session,
     status_service::StatusService,
 };
@@ -81,6 +82,8 @@ where
     let credential_store = FileCredentialStore::from_env();
     let auth_service = AuthService::new(config_service.store().clone(), credential_store.clone());
     let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
+    let mcp_router =
+        WaltrMcpServer::new(std::sync::Arc::clone(&config_service)).streamable_http_router();
     let mut grpc_routes = Routes::builder();
     grpc_routes.add_service(ConfigServiceServer::from_arc(config_service));
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
@@ -94,7 +97,9 @@ where
         .layer(GrpcWebLayer::new())
         .service(grpc_routes);
 
-    let router = Router::new().route("/health", get(health));
+    let router = Router::new()
+        .route("/health", get(health))
+        .merge(mcp_router);
     #[cfg(feature = "web")]
     let router = router.route("/", get(crate::web_assets::serve_root)).route(
         "/{*path}",
