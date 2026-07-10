@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use mcp::{
-    McpResourceTemplateDefinition, McpResourceTemplateList,
-    server::{BoxFuture, ServerCapabilities, ServerContext, ServerHandler, ServerInfo},
+    McpResourceResult, McpResourceTemplateDefinition,
+    server::{ServerContext, ServerError, ServerResult},
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -11,35 +11,28 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct ResourceTemplatesServer;
 
-impl ServerHandler for ResourceTemplatesServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-resource-templates-server", "0")
+#[mcp::mcp_server(
+    name = "mcp-spec-resource-templates-server",
+    version = "0",
+    resource_templates_next_cursor = "next-template-page"
+)]
+impl ResourceTemplatesServer {
+    #[resource_template(uri_template = "file:///{path}", definition = project_files_template())]
+    fn read_project_file(uri: String, _context: ServerContext) -> ServerResult<McpResourceResult> {
+        Err(ServerError::resource_not_found(uri))
     }
+}
 
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().resources()
-    }
-
-    fn list_resource_templates(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<mcp::server::ServerResult<McpResourceTemplateList>> {
-        Box::pin(async {
-            Ok(McpResourceTemplateList {
-                resource_templates: vec![McpResourceTemplateDefinition {
-                    uri_template: "file:///{path}".to_owned(),
-                    name: "Project Files".to_owned(),
-                    title: Some("Project Files".to_owned()),
-                    description: Some("Access files in the project directory".to_owned()),
-                    mime_type: Some("application/octet-stream".to_owned()),
-                    icons: Vec::new(),
-                    annotations: None,
-                    meta: None,
-                }],
-                next_cursor: Some("next-template-page".to_owned()),
-            })
-        })
+fn project_files_template() -> McpResourceTemplateDefinition {
+    McpResourceTemplateDefinition {
+        uri_template: "file:///{path}".to_owned(),
+        name: "Project Files".to_owned(),
+        title: Some("Project Files".to_owned()),
+        description: Some("Access files in the project directory".to_owned()),
+        mime_type: Some("application/octet-stream".to_owned()),
+        icons: Vec::new(),
+        annotations: None,
+        meta: None,
     }
 }
 

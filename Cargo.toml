@@ -7,6 +7,7 @@ members = [
     "crates/waltr-tui",
     "crates/waltr-web",
     "crates/mcp",
+    "crates/mcp-macros",
 ]
 resolver = "3"
 
@@ -34,6 +35,7 @@ waltr-agent = { version = "0.1.0", path = "crates/waltr-agent" }
 waltr-client = { version = "0.1.0", path = "crates/waltr-client" }
 waltr-server = { version = "0.1.0", path = "crates/waltr-server" }
 mcp = { version = "0.1.0", path = "crates/mcp" }
+mcp-macros = { version = "0.1.0", path = "crates/mcp-macros" }
 notify = "8.2.0"
 opentelemetry = "0.32.0"
 opentelemetry-appender-tracing = "0.32.0"
@@ -43,7 +45,9 @@ opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opendal = { version = "0.57.0", features = ["services-fs", "services-s3", "services-postgresql"] }
 prost = "0.14.1"
 prost-types = "0.14.1"
+proc-macro2 = "1.0.103"
 pulldown-cmark = "0.13.0"
+quote = "1.0.42"
 pyroscope = { version = "2.0.6", features = ["backend-pprof-rs"] }
 reqwest = { version = "0.13.4", default-features = false }
 refinery = "0.8.16"
@@ -52,6 +56,7 @@ rustls = { version = "0.23.40", default-features = false, features = ["ring", "s
 serde = "1.0.228"
 serde_json = "1.0.150"
 sha2 = "0.11.0"
+syn = { version = "2.0.111", features = ["full"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 scylla = "1.6.0"
 tempfile = "3.23.0"

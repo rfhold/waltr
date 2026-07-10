@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use mcp::server::{ServerCapabilities, ServerHandler, ServerInfo};
 use reqwest::StatusCode;
 use serde_json::json;
 
@@ -8,15 +7,8 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct PingServer;
 
-impl ServerHandler for PingServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-ping-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-    }
-}
+#[mcp::mcp_server(name = "mcp-spec-ping-server", version = "0")]
+impl PingServer {}
 
 #[tokio::test]
 async fn ping_returns_empty_result_object() -> mcp::Result<()> {

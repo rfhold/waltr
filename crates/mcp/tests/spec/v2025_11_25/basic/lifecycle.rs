@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use mcp::{
     client::{McpClient, McpClientHandler, McpClientOptions, McpTransportConfig},
     protocol::MCP_PROTOCOL_VERSION,
-    server::{ServerCapabilities, ServerHandler, ServerInfo},
+    server::ServerContext,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::spec::support::{SpecServer, post_json};
 
+#[derive(Clone)]
 struct LifecycleServer {
     notifications: Arc<Mutex<Vec<String>>>,
     instructions: Option<String>,
@@ -35,33 +36,24 @@ impl LifecycleServer {
     }
 }
 
-impl ServerHandler for LifecycleServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-lifecycle-server", "1.0.0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-            .tools()
-            .prompts()
-            .resources()
-            .logging()
-    }
-
+#[mcp::mcp_server(
+    name = "mcp-spec-lifecycle-server",
+    version = "1.0.0",
+    capabilities(tools, prompts, resources, logging)
+)]
+impl LifecycleServer {
+    #[instructions]
     fn instructions(&self) -> Option<String> {
         self.instructions.clone()
     }
 
-    fn handle_notification(
+    #[notification]
+    async fn handle_notification(
         &self,
         notification: mcp::protocol::JsonRpcNotification,
-        _context: mcp::server::ServerContext,
-    ) -> mcp::server::BoxFuture<()> {
-        let method = notification.method;
-        let notifications = self.notifications.clone();
-        Box::pin(async move {
-            notifications.lock().await.push(method);
-        })
+        _context: ServerContext,
+    ) {
+        self.notifications.lock().await.push(notification.method);
     }
 }
 

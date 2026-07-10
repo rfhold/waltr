@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
 use mcp::{
-    McpToolCall, McpToolResult,
-    server::{
-        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-        ServerResult,
-    },
+    McpToolCall, McpToolDefinition, McpToolResult,
+    server::{ServerContext, ServerError, ServerResult},
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -15,60 +12,62 @@ use crate::spec::support::{SpecServer, initialized_session};
 
 struct ProgressServer;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ContextCaptureServer {
     progress_token: Arc<Mutex<Option<Value>>>,
     traceparent: Arc<Mutex<Option<Value>>>,
 }
 
-impl ServerHandler for ProgressServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-progress-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().tools()
-    }
-
-    fn call_tool(
-        &self,
+#[mcp::mcp_server(name = "mcp-spec-progress-server", version = "0")]
+impl ProgressServer {
+    #[tool(name = "progress-tool", definition = progress_tool_definition())]
+    async fn progress_tool(
         call: McpToolCall,
         context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolResult>> {
-        Box::pin(async move {
-            let token = call
-                .progress_token
-                .ok_or_else(|| ServerError::invalid_params("missing progress token"))?;
-            context
-                .progress(token, 0.5, Some(1.0), Some("Halfway done".to_owned()))
-                .await
-                .map_err(|error| ServerError::internal(error.to_string()))?;
-            Ok(McpToolResult::text("progress complete"))
-        })
+    ) -> ServerResult<McpToolResult> {
+        let token = call
+            .progress_token
+            .ok_or_else(|| ServerError::invalid_params("missing progress token"))?;
+        context
+            .progress(token, 0.5, Some(1.0), Some("Halfway done".to_owned()))
+            .await
+            .map_err(|error| ServerError::internal(error.to_string()))?;
+        Ok(McpToolResult::text("progress complete"))
     }
 }
 
-impl ServerHandler for ContextCaptureServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-context-capture-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().tools()
-    }
-
-    fn call_tool(
+#[mcp::mcp_server(name = "mcp-spec-context-capture-server", version = "0")]
+impl ContextCaptureServer {
+    #[tool(name = "capture-context", definition = context_capture_tool_definition())]
+    async fn capture_context(
         &self,
         _call: McpToolCall,
         context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolResult>> {
-        let progress_token = self.progress_token.clone();
-        let traceparent = self.traceparent.clone();
-        Box::pin(async move {
-            *progress_token.lock().await = context.progress_token();
-            *traceparent.lock().await = context.meta_value("traceparent").cloned();
-            Ok(McpToolResult::text("captured"))
-        })
+    ) -> ServerResult<McpToolResult> {
+        *self.progress_token.lock().await = context.progress_token();
+        *self.traceparent.lock().await = context.meta_value("traceparent").cloned();
+        Ok(McpToolResult::text("captured"))
+    }
+}
+
+fn progress_tool_definition() -> McpToolDefinition {
+    tool_definition("progress-tool")
+}
+
+fn context_capture_tool_definition() -> McpToolDefinition {
+    tool_definition("capture-context")
+}
+
+fn tool_definition(name: &str) -> McpToolDefinition {
+    McpToolDefinition {
+        name: name.to_owned(),
+        title: None,
+        description: None,
+        icons: Vec::new(),
+        input_schema: json!({ "type": "object", "properties": {} }),
+        output_schema: None,
+        task_support: None,
+        annotations: None,
     }
 }
 

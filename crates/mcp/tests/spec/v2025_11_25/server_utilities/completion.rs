@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use mcp::server::{
-    BoxFuture, ServerCapabilities, ServerContext, ServerHandler, ServerInfo, ServerResult,
-};
+use mcp::server::{ServerContext, ServerResult};
 use mcp::{McpCompletionRequest, McpCompletionResult};
 use reqwest::StatusCode;
 use serde_json::json;
@@ -13,67 +11,49 @@ struct CompletionServer;
 
 struct TooManyCompletionsServer;
 
-impl ServerHandler for CompletionServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-completion-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().completions()
-    }
-
+#[mcp::mcp_server(name = "mcp-spec-completion-server", version = "0")]
+impl CompletionServer {
+    #[complete]
     fn complete(
-        &self,
         request: McpCompletionRequest,
         _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpCompletionResult>> {
-        Box::pin(async move {
-            if request.uri_template == "code_review" {
-                assert_eq!(request.argument_name, "code");
-                assert_eq!(request.argument_value, "fn");
-                return Ok(McpCompletionResult {
-                    values: vec!["fn main".to_owned()],
-                    total: Some(1),
-                    has_more: false,
-                });
-            }
+    ) -> ServerResult<McpCompletionResult> {
+        if request.uri_template == "code_review" {
+            assert_eq!(request.argument_name, "code");
+            assert_eq!(request.argument_value, "fn");
+            return Ok(McpCompletionResult {
+                values: vec!["fn main".to_owned()],
+                total: Some(1),
+                has_more: false,
+            });
+        }
 
-            assert_eq!(request.uri_template, "file:///{path}");
-            assert_eq!(request.argument_name, "path");
-            assert_eq!(request.argument_value, "src");
-            assert_eq!(
-                request.context_arguments.get("language"),
-                Some(&json!("rust"))
-            );
-            Ok(McpCompletionResult {
-                values: vec!["src/lib.rs".to_owned(), "src/main.rs".to_owned()],
-                total: Some(4),
-                has_more: true,
-            })
+        assert_eq!(request.uri_template, "file:///{path}");
+        assert_eq!(request.argument_name, "path");
+        assert_eq!(request.argument_value, "src");
+        assert_eq!(
+            request.context_arguments.get("language"),
+            Some(&json!("rust"))
+        );
+        Ok(McpCompletionResult {
+            values: vec!["src/lib.rs".to_owned(), "src/main.rs".to_owned()],
+            total: Some(4),
+            has_more: true,
         })
     }
 }
 
-impl ServerHandler for TooManyCompletionsServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-completion-limit-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().completions()
-    }
-
+#[mcp::mcp_server(name = "mcp-spec-completion-limit-server", version = "0")]
+impl TooManyCompletionsServer {
+    #[complete]
     fn complete(
-        &self,
         _request: McpCompletionRequest,
         _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpCompletionResult>> {
-        Box::pin(async move {
-            Ok(McpCompletionResult {
-                values: (0..101).map(|index| format!("value-{index}")).collect(),
-                total: Some(101),
-                has_more: false,
-            })
+    ) -> ServerResult<McpCompletionResult> {
+        Ok(McpCompletionResult {
+            values: (0..101).map(|index| format!("value-{index}")).collect(),
+            total: Some(101),
+            has_more: false,
         })
     }
 }

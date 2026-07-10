@@ -3220,6 +3220,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "mcp-macros",
  "opentelemetry",
  "reqwest",
  "rmcp",
@@ -3232,6 +3233,15 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "uuid",
+]
+
+[[package]]
+name = "mcp-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

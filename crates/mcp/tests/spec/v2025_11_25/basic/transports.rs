@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use mcp::server::{ServerCapabilities, ServerHandler, ServerInfo};
 use reqwest::StatusCode;
 use serde_json::json;
 
@@ -8,15 +7,8 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct TransportServer;
 
-impl ServerHandler for TransportServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-transport-server", "0")
-    }
-
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-    }
-}
+#[mcp::mcp_server(name = "mcp-spec-transport-server", version = "0")]
+impl TransportServer {}
 
 #[tokio::test]
 async fn streamable_http_accepts_client_notifications_with_accepted_status() -> mcp::Result<()> {

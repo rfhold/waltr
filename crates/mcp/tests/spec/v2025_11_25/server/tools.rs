@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use mcp::{
-    McpToolCall, McpToolDefinition, McpToolList, McpToolResult,
-    server::{
-        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-    },
+    McpToolCall, McpToolDefinition, McpToolResult,
+    server::{ServerContext, ServerError, ServerResult},
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -13,74 +11,57 @@ use crate::spec::support::{SpecServer, post_json};
 
 struct ToolsServer;
 
-impl ServerHandler for ToolsServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-spec-tools-server", "0")
+#[mcp::mcp_server(
+    name = "mcp-spec-tools-server",
+    version = "0",
+    tools_next_cursor = "next-tool-page"
+)]
+impl ToolsServer {
+    #[tool(name = "get_weather_data", definition = weather_tool_definition())]
+    fn get_weather_data(call: McpToolCall, _context: ServerContext) -> ServerResult<McpToolResult> {
+        if call.name != "get_weather_data" {
+            return Err(ServerError::invalid_params(format!(
+                "Unknown tool: {}",
+                call.name
+            )));
+        }
+        Ok(McpToolResult::new(json!({
+            "content": [{
+                "type": "text",
+                "text": "{\"temperature\":22.5,\"conditions\":\"Partly cloudy\"}"
+            }],
+            "structuredContent": {
+                "temperature": 22.5,
+                "conditions": "Partly cloudy"
+            },
+            "isError": false
+        })))
     }
+}
 
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new().tools()
-    }
-
-    fn list_tools(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<mcp::server::ServerResult<McpToolList>> {
-        Box::pin(async {
-            Ok(McpToolList {
-                tools: vec![McpToolDefinition {
-                    name: "get_weather_data".to_owned(),
-                    title: Some("Weather Data Retriever".to_owned()),
-                    description: Some("Get current weather data for a location".to_owned()),
-                    icons: Vec::new(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "location": { "type": "string", "description": "City name" }
-                        },
-                        "required": ["location"]
-                    }),
-                    output_schema: Some(json!({
-                        "type": "object",
-                        "properties": {
-                            "temperature": { "type": "number" },
-                            "conditions": { "type": "string" }
-                        },
-                        "required": ["temperature", "conditions"]
-                    })),
-                    task_support: None,
-                    annotations: None,
-                }],
-                next_cursor: Some("next-tool-page".to_owned()),
-            })
-        })
-    }
-
-    fn call_tool(
-        &self,
-        call: McpToolCall,
-        _context: ServerContext,
-    ) -> BoxFuture<mcp::server::ServerResult<McpToolResult>> {
-        Box::pin(async move {
-            if call.name != "get_weather_data" {
-                return Err(ServerError::invalid_params(format!(
-                    "Unknown tool: {}",
-                    call.name
-                )));
-            }
-            Ok(McpToolResult::new(json!({
-                "content": [{
-                    "type": "text",
-                    "text": "{\"temperature\":22.5,\"conditions\":\"Partly cloudy\"}"
-                }],
-                "structuredContent": {
-                    "temperature": 22.5,
-                    "conditions": "Partly cloudy"
-                },
-                "isError": false
-            })))
-        })
+fn weather_tool_definition() -> McpToolDefinition {
+    McpToolDefinition {
+        name: "get_weather_data".to_owned(),
+        title: Some("Weather Data Retriever".to_owned()),
+        description: Some("Get current weather data for a location".to_owned()),
+        icons: Vec::new(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "location": { "type": "string", "description": "City name" }
+            },
+            "required": ["location"]
+        }),
+        output_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "temperature": { "type": "number" },
+                "conditions": { "type": "string" }
+            },
+            "required": ["temperature", "conditions"]
+        })),
+        task_support: None,
+        annotations: None,
     }
 }
 

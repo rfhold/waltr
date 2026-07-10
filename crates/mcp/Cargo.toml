@@ -4,9 +4,14 @@ edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ["macros"]
+macros = ["dep:mcp-macros"]
+
 [dependencies]
 axum.workspace = true
 futures-util.workspace = true
+mcp-macros = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 opentelemetry.workspace = true
 serde = { workspace = true, features = ["derive"] }

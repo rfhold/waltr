@@ -1,13 +1,9 @@
 use std::net::SocketAddr;
 
 use mcp::{
-    McpCompletionRequest, McpPromptList, McpPromptResult, McpResourceList, McpResourceResult,
-    McpResourceTemplateList, McpToolCall, McpToolList, McpToolResult,
+    McpCompletionRequest, McpPromptResult, McpResourceResult, McpToolCall, McpToolResult,
     client::McpTransportConfig,
-    server::{
-        BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
-        ServerResult,
-    },
+    server::{ServerContext, ServerError, ServerResult},
 };
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -15,7 +11,8 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use super::{
     standard_surface::{
         ECHO_TOOL, GREET_PROMPT, ITEM_42, ITEM_TEMPLATE, LOG_TOOL, PROGRESS_TOOL, STATUS_PROMPT,
-        STATUS_RESOURCE, item_completions, prompts, resource_templates, resources, tools,
+        STATUS_RESOURCE, echo_tool, greet_prompt, item_completions, item_resource_template,
+        log_tool, progress_tool, status_prompt, status_resource,
     },
     support::RunningServer,
 };
@@ -29,7 +26,7 @@ impl McpStreamableHttpServer {
     pub async fn start() -> mcp::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let router = mcp::server::streamable_http_router(std::sync::Arc::new(StandardMcpServer));
+        let router = StandardMcpServer.streamable_http_router();
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, router).await {
                 tracing::debug!(%error, "mcp ecosystem server stopped");
@@ -51,113 +48,51 @@ impl RunningServer for McpStreamableHttpServer {
     }
 }
 
+#[derive(Clone, Copy)]
 struct StandardMcpServer;
 
-impl ServerHandler for StandardMcpServer {
-    fn server_info(&self) -> ServerInfo {
-        ServerInfo::new("mcp-ecosystem-server", "0")
+#[mcp::mcp_server(name = "mcp-ecosystem-server", version = "0")]
+impl StandardMcpServer {
+    #[tool(name = ECHO_TOOL, definition = echo_tool())]
+    #[tool(name = LOG_TOOL, definition = log_tool())]
+    #[tool(name = PROGRESS_TOOL, definition = progress_tool())]
+    async fn call_tool(call: McpToolCall, context: ServerContext) -> ServerResult<McpToolResult> {
+        call_tool(call, context).await
     }
 
-    fn capabilities(&self) -> ServerCapabilities {
-        ServerCapabilities::new()
-            .tools()
-            .prompts()
-            .resources()
-            .completions()
-            .logging()
+    #[log_level]
+    fn set_log_level(_level: String, _context: ServerContext) -> ServerResult<()> {
+        Ok(())
     }
 
-    fn list_tools(
-        &self,
-        _cursor: Option<String>,
+    #[prompt(name = STATUS_PROMPT, definition = status_prompt())]
+    fn get_status_prompt(
+        _arguments: Option<Value>,
         _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolList>> {
-        Box::pin(async {
-            Ok(McpToolList {
-                tools: tools(),
-                next_cursor: None,
-            })
-        })
+    ) -> ServerResult<McpPromptResult> {
+        get_prompt(STATUS_PROMPT, None)
     }
 
-    fn call_tool(
-        &self,
-        call: McpToolCall,
-        context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpToolResult>> {
-        Box::pin(async move { call_tool(call, context).await })
-    }
-
-    fn set_log_level(
-        &self,
-        _level: String,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn list_prompts(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpPromptList>> {
-        Box::pin(async {
-            Ok(McpPromptList {
-                prompts: prompts(),
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn get_prompt(
-        &self,
-        name: String,
+    #[prompt(name = GREET_PROMPT, definition = greet_prompt())]
+    fn get_greet_prompt(
         arguments: Option<Value>,
         _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpPromptResult>> {
-        Box::pin(async move { get_prompt(&name, arguments.as_ref()) })
+    ) -> ServerResult<McpPromptResult> {
+        get_prompt(GREET_PROMPT, arguments.as_ref())
     }
 
-    fn list_resources(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpResourceList>> {
-        Box::pin(async {
-            Ok(McpResourceList {
-                resources: resources(),
-                next_cursor: None,
-            })
-        })
+    #[resource(uri = STATUS_RESOURCE, definition = status_resource())]
+    #[resource_template(uri_template = ITEM_TEMPLATE, definition = item_resource_template())]
+    fn read_resource(uri: String, _context: ServerContext) -> ServerResult<McpResourceResult> {
+        read_resource(&uri)
     }
 
-    fn list_resource_templates(
-        &self,
-        _cursor: Option<String>,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpResourceTemplateList>> {
-        Box::pin(async {
-            Ok(McpResourceTemplateList {
-                resource_templates: resource_templates(),
-                next_cursor: None,
-            })
-        })
-    }
-
-    fn read_resource(
-        &self,
-        uri: String,
-        _context: ServerContext,
-    ) -> BoxFuture<ServerResult<McpResourceResult>> {
-        Box::pin(async move { read_resource(&uri) })
-    }
-
-    fn complete(
-        &self,
+    #[complete]
+    fn complete_item(
         request: McpCompletionRequest,
         _context: ServerContext,
-    ) -> BoxFuture<ServerResult<mcp::McpCompletionResult>> {
-        Box::pin(async move { complete(request) })
+    ) -> ServerResult<mcp::McpCompletionResult> {
+        complete(request)
     }
 }
 
