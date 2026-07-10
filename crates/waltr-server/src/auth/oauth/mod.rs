@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 use tonic::Status;
 use uuid::Uuid;
 
-use super::OAuthCredential;
+use super::{AuthTarget, OAuthCredential};
 
 /// Resolved provider OAuth definition.
 #[derive(Debug, Clone)]
@@ -25,8 +25,8 @@ pub(crate) struct ProviderOAuthDefinition {
 /// Pending manual OAuth attempt.
 #[derive(Debug, Clone)]
 pub struct OAuthAttempt {
-    /// Provider key this attempt belongs to.
-    provider_key: String,
+    /// Target this attempt belongs to.
+    target: AuthTarget,
     definition: OAuthProvider,
     verifier: String,
     state: String,
@@ -34,10 +34,25 @@ pub struct OAuthAttempt {
 }
 
 impl OAuthAttempt {
-    /// Return the owning provider key.
+    /// Return the owning target.
     #[must_use]
-    pub fn provider_key(&self) -> &str {
-        &self.provider_key
+    pub fn target(&self) -> &AuthTarget {
+        &self.target
+    }
+
+    /// Return the OAuth definition used for the attempt.
+    #[must_use]
+    pub fn definition(&self) -> &OAuthProvider {
+        &self.definition
+    }
+
+    /// Return the owning provider key when this is a provider attempt.
+    #[must_use]
+    pub fn provider_key(&self) -> Option<&str> {
+        match &self.target {
+            AuthTarget::Provider { key } => Some(key),
+            AuthTarget::McpServer { .. } => None,
+        }
     }
 }
 
@@ -79,7 +94,7 @@ pub(crate) fn definition_is_empty(definition: &OAuthProvider) -> bool {
 
 /// Build a manual OAuth authorization attempt from a provider definition.
 pub fn begin_manual(
-    provider_key: String,
+    target: AuthTarget,
     definition: OAuthProvider,
     now_ms: i64,
 ) -> Result<(OAuthAttempt, BeginProviderAuthResponse), Status> {
@@ -90,7 +105,7 @@ pub fn begin_manual(
     let expires_at_ms = now_ms + 15 * 60 * 1000;
     let auth_url = authorize_url(&definition, &challenge, &state);
     let attempt = OAuthAttempt {
-        provider_key,
+        target,
         definition,
         verifier,
         state,

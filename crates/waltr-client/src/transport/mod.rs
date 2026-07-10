@@ -17,6 +17,7 @@ use waltr::grpc::waltr::catalog::v1::{
 use waltr::grpc::waltr::config::v1::config_service_client::ConfigServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
+use prost::Message;
 pub use session::{
     SessionTimelineWatchEvent, SessionTimelineWatchStream, SessionTimelineWatchUpdate,
     SessionWatchEvent, SessionWatchStream, SessionWatchUpdate,
@@ -89,6 +90,28 @@ pub trait WaltrTransport {
 
     /// Subscribe to future system status changes.
     fn watch_status(&self) -> impl Future<Output = Result<StatusWatchStream, ClientError>>;
+
+    /// List secret-safe provider auth statuses.
+    fn list_auth_statuses(&self) -> impl Future<Output = Result<Vec<AuthStatus>, ClientError>>;
+
+    /// Begin a manual OAuth attempt for any supported auth target.
+    fn begin_auth(
+        &self,
+        target: AuthTarget,
+    ) -> impl Future<Output = Result<GenericAuthAttempt, ClientError>>;
+
+    /// Complete a manual OAuth attempt for any supported auth target.
+    fn complete_auth(
+        &self,
+        attempt_id: String,
+        input: String,
+    ) -> impl Future<Output = Result<AuthStatus, ClientError>>;
+
+    /// Cancel an auth attempt.
+    fn cancel_auth(&self, attempt_id: String) -> impl Future<Output = Result<(), ClientError>>;
+
+    /// Logout any supported auth target by deleting its stored credential.
+    fn logout(&self, target: AuthTarget) -> impl Future<Output = Result<AuthStatus, ClientError>>;
 
     /// List secret-safe provider auth statuses.
     fn list_provider_auth_statuses(
@@ -286,6 +309,30 @@ where
 
     async fn watch_status(&self) -> Result<StatusWatchStream, ClientError> {
         status::watch_status(self).await
+    }
+
+    async fn list_auth_statuses(&self) -> Result<Vec<AuthStatus>, ClientError> {
+        auth::list_auth_statuses(self).await
+    }
+
+    async fn begin_auth(&self, target: AuthTarget) -> Result<GenericAuthAttempt, ClientError> {
+        auth::begin_auth(self, target).await
+    }
+
+    async fn complete_auth(
+        &self,
+        attempt_id: String,
+        input: String,
+    ) -> Result<AuthStatus, ClientError> {
+        auth::complete_auth(self, attempt_id, input).await
+    }
+
+    async fn cancel_auth(&self, attempt_id: String) -> Result<(), ClientError> {
+        auth::cancel_auth(self, attempt_id).await
+    }
+
+    async fn logout(&self, target: AuthTarget) -> Result<AuthStatus, ClientError> {
+        auth::logout(self, target).await
     }
 
     async fn list_provider_auth_statuses(&self) -> Result<Vec<ProviderAuthStatus>, ClientError> {
@@ -519,6 +566,16 @@ impl RemoteTransport for WasmGrpcTransport {
 }
 
 fn status_error(error: &tonic::Status) -> ClientError {
+    if error.code() == Code::Unauthenticated
+        && let Ok(target) = AuthTarget::decode(error.details())
+        && target.target.is_some()
+    {
+        return ClientError::authorization_required(
+            format!("{}: {}", status_code_name(error.code()), error.message()),
+            target,
+        );
+    }
+
     ClientError::new(format!(
         "{}: {}",
         status_code_name(error.code()),
@@ -547,5 +604,6 @@ const fn status_code_name(code: Code) -> &'static str {
         Code::Unauthenticated => "unauthenticated",
     }
 }
-pub use auth::{AuthAttempt, ProviderAuthStatus};
+pub use auth::{AuthAttempt, AuthStatus, GenericAuthAttempt, ProviderAuthStatus};
+pub use waltr::grpc::waltr::auth::v1::AuthTarget;
 use waltr::grpc::waltr::auth::v1::auth_service_client::AuthServiceClient;

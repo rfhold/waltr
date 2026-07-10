@@ -2,8 +2,8 @@
 
 use crate::transport::{SessionWatchEvent, SessionWatchUpdate};
 use crate::{
-    ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect, SessionEvent,
-    TimelineWatchKey,
+    AuthEvent, ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect,
+    SessionEvent, TimelineWatchKey,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -209,13 +209,37 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             error,
         } => {
             let session_id = operation_session_id(state, &operation_key);
+            let target = error.auth_target().cloned();
+            let message = error.to_string();
             state.set_session_submit_user_message_failed(
                 operation_key,
-                session_id,
-                error.to_string(),
+                session_id.clone(),
+                message.clone(),
             );
+            if let Some(target) = target {
+                return reduce(
+                    state,
+                    SessionEvent::AuthRequiredFromSession {
+                        target,
+                        message,
+                        session_id,
+                    },
+                );
+            }
             ClientUpdate::default()
         }
+        SessionEvent::AuthRequiredFromSession {
+            target,
+            message,
+            session_id,
+        } => crate::coordination::auth::reduce(
+            state,
+            AuthEvent::AuthorizationRequired {
+                target,
+                message,
+                source_session_id: Some(session_id),
+            },
+        ),
         SessionEvent::ExternalRequestRespondRequested {
             operation_key,
             session_id,

@@ -2839,6 +2839,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64",
+ "js-sys",
+ "pem",
+ "ring",
+ "serde",
+ "serde_json",
+ "simple_asn1",
+]
+
+[[package]]
 name = "kasuari"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2892,6 +2907,7 @@ dependencies = [
  "http 1.4.1",
  "httpdate",
  "ignore",
+ "jsonwebtoken",
  "mcp",
  "opendal",
  "opentelemetry",
@@ -2929,6 +2945,7 @@ dependencies = [
  "waltr",
  "waltr-agent",
  "waltr-server",
+ "prost",
  "prost-types",
  "serde",
  "serde_json",
@@ -2949,11 +2966,13 @@ dependencies = [
  "futures-util",
  "waltr",
  "waltr-agent",
+ "mcp",
  "notify",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "prost",
  "prost-types",
  "pyroscope",
  "reqwest",
@@ -3926,6 +3945,16 @@ dependencies = [
  "thiserror 2.0.18",
  "zerocopy",
  "zerocopy-derive",
+]
+
+[[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64",
+ "serde_core",
 ]
 
 [[package]]
@@ -5555,6 +5584,18 @@ name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+
+[[package]]
+name = "simple_asn1"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "thiserror 2.0.18",
+ "time",
+]
 
 [[package]]
 name = "siphasher"

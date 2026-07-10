@@ -14,21 +14,23 @@ mod wasm;
 
 pub use client::{Client, ClientUpdate};
 pub use coordination::event::{
-    ClientEffect, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch, ProviderEditBaseline,
-    SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent, StreamId,
+    AuthEffect, AuthEvent, ClientEffect, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch,
+    ProviderEditBaseline, SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent,
+    StreamId,
 };
 pub use coordination::runtime::{
-    ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime,
-    ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
-    ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
-    OperationCollectionSnapshot, OperationSnapshot, RollbackTargetView, SessionSnapshot,
-    SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
+    AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot, ClientAuthTarget, ClientCommand,
+    ClientCommandRequest, ClientOperationView, ClientRuntime, ClientSessionTemplateKind,
+    ClientSessionTemplateSearchTarget, ClientSnapshot, ClientStateStream, ClientStateStreamEvent,
+    ClientTimelineDirection, ConfigSnapshot, OperationCollectionSnapshot, OperationSnapshot,
+    RollbackTargetView, SessionSnapshot, SessionTemplateOptionView, SessionTemplateSearchSnapshot,
+    StatusSnapshot,
 };
 pub use coordination::state::{
-    ClientOperationState, ClientState, ConfigClientState, OperationKey, OperationState,
-    OperationStatus, SessionClientState, SessionTemplateSearchState, StatusClientState,
-    StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
-    watch_reconnect_delay_ms,
+    AuthAttemptState, AuthClientState, AuthRequirement, ClientOperationState, ClientState,
+    ConfigClientState, OperationKey, OperationState, OperationStatus, SessionClientState,
+    SessionTemplateSearchState, StatusClientState, StreamClientState, StreamState, StreamStatus,
+    TimelineWatchKey, WatchState, watch_reconnect_delay_ms,
 };
 pub use error::ClientError;
 pub use executor::{
@@ -61,7 +63,8 @@ pub use waltr::grpc::waltr::session::v1::{
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use transport::{
-    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, SessionTimelineWatchEvent,
+    AuthAttempt, AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport,
+    GenericAuthAttempt, WaltrTransport, ProviderAuthStatus, SessionTimelineWatchEvent,
     SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
 };
 pub use view::{

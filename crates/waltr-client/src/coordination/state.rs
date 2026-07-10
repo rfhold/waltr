@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use crate::transport::SessionTimelineWatchEvent;
 use crate::{
-    Configuration, RollbackTarget, SessionSummary, SessionTemplateOption, StreamId, SystemStatus,
-    TimelineEvent,
+    AuthStatus, AuthTarget, Configuration, GenericAuthAttempt, RollbackTarget, SessionSummary,
+    SessionTemplateOption, StreamId, SystemStatus, TimelineEvent,
 };
 
 /// Runtime-local operation identifier used by shells to track command results.
@@ -60,6 +60,8 @@ pub fn watch_reconnect_delay_ms(attempt: usize) -> u64 {
 /// Full headless state for Waltr shells.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClientState {
+    /// Auth coordination state.
+    pub auth: AuthClientState,
     /// Configuration coordination state.
     pub config: ConfigClientState,
     /// System status coordination state.
@@ -71,6 +73,59 @@ pub struct ClientState {
     /// Command operation results by runtime-local key.
     pub operations: BTreeMap<OperationKey, ClientOperationState>,
     next_operation_id: u64,
+}
+
+/// Auth coordination state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AuthClientState {
+    /// Queued auth requirements reported by session runs.
+    pub pending: Vec<AuthRequirement>,
+    /// Last known statuses by target key.
+    pub statuses: BTreeMap<String, AuthStatus>,
+    /// Auth status list operation state.
+    pub list: OperationState,
+    /// Begin auth operation state.
+    pub begin: OperationState,
+    /// Complete auth operation state.
+    pub complete: OperationState,
+    /// Cancel auth operation state.
+    pub cancel: OperationState,
+    /// Logout operation state.
+    pub logout: OperationState,
+    /// Active manual auth attempt, when one has been started.
+    pub active_attempt: Option<AuthAttemptState>,
+}
+
+/// One queued auth requirement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthRequirement {
+    /// Target that requires authentication.
+    pub target: AuthTarget,
+    /// Human-readable reason.
+    pub message: String,
+    /// Session whose work reported the requirement.
+    pub source_session_id: Option<String>,
+}
+
+/// Active OAuth attempt details safe to show in clients.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthAttemptState {
+    /// Target being authenticated.
+    pub target: AuthTarget,
+    /// Attempt id returned by the server.
+    pub attempt_id: String,
+    /// URL to open for browser-based auth.
+    pub auth_url: String,
+    /// Verification URL for device-style auth, when supplied.
+    pub verification_url: String,
+    /// User code for device-style auth, when supplied.
+    pub user_code: String,
+    /// Attempt expiration timestamp in milliseconds since epoch.
+    pub expires_at_ms: i64,
+    /// Poll interval for device-style auth.
+    pub poll_interval_seconds: i32,
+    /// User-facing instructions returned by the server.
+    pub messages: Vec<String>,
 }
 
 /// Configuration coordination state.
@@ -179,6 +234,44 @@ pub struct OperationState {
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientOperationState {
+    /// Begin auth command result.
+    AuthBegin {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Target being authenticated.
+        target: AuthTarget,
+        /// Attempt details returned by the server.
+        attempt: Option<AuthAttemptState>,
+    },
+    /// Complete auth command result.
+    AuthComplete {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Secret-safe status returned by the server.
+        auth_status: Option<AuthStatus>,
+    },
+    /// Cancel auth command result.
+    AuthCancel {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+    },
+    /// Logout command result.
+    AuthLogout {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Target logged out.
+        target: AuthTarget,
+        /// Secret-safe status returned by the server.
+        auth_status: Option<AuthStatus>,
+    },
     /// Configuration patch command result.
     ConfigPatch {
         /// Current operation status.
@@ -299,6 +392,275 @@ impl ClientState {
     pub(crate) fn set_config_load_loading(&mut self) {
         self.config.load.status = OperationStatus::Loading;
         self.config.load.error = None;
+    }
+
+    pub(crate) fn set_auth_list_loading(&mut self) {
+        self.auth.list.status = OperationStatus::Loading;
+        self.auth.list.error = None;
+    }
+
+    pub(crate) fn set_auth_list_ready(&mut self, statuses: Vec<AuthStatus>) {
+        self.auth.statuses = statuses
+            .into_iter()
+            .filter_map(|status| {
+                let target = status.target.clone()?;
+                Some((auth_target_key(&target), status))
+            })
+            .collect();
+        self.auth.list.status = OperationStatus::Ready;
+        self.auth.list.error = None;
+    }
+
+    pub(crate) fn set_auth_list_failed(&mut self, message: String) {
+        self.auth.list.status = OperationStatus::Failed;
+        self.auth.list.error = Some(message);
+    }
+
+    pub(crate) fn enqueue_auth_requirement(
+        &mut self,
+        target: AuthTarget,
+        message: String,
+        source_session_id: Option<String>,
+    ) {
+        if self
+            .auth
+            .pending
+            .iter()
+            .any(|requirement| requirement.target == target)
+        {
+            return;
+        }
+
+        self.auth.pending.push(AuthRequirement {
+            target,
+            message,
+            source_session_id,
+        });
+    }
+
+    pub(crate) fn remove_auth_requirement(&mut self, target: &AuthTarget) {
+        self.auth
+            .pending
+            .retain(|requirement| &requirement.target != target);
+
+        if self
+            .auth
+            .active_attempt
+            .as_ref()
+            .is_some_and(|attempt| &attempt.target == target)
+        {
+            self.auth.active_attempt = None;
+        }
+    }
+
+    pub(crate) fn set_auth_begin_loading(&mut self, key: OperationKey, target: AuthTarget) {
+        self.auth.begin.status = OperationStatus::Loading;
+        self.auth.begin.error = None;
+        self.auth.begin.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthBegin {
+                status: OperationStatus::Loading,
+                error: None,
+                target,
+                attempt: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_begin_ready(
+        &mut self,
+        key: OperationKey,
+        target: AuthTarget,
+        attempt: GenericAuthAttempt,
+    ) {
+        let attempt = AuthAttemptState {
+            target: target.clone(),
+            attempt_id: attempt.attempt_id,
+            auth_url: attempt.auth_url,
+            verification_url: attempt.verification_url,
+            user_code: attempt.user_code,
+            expires_at_ms: attempt.expires_at_ms,
+            poll_interval_seconds: attempt.poll_interval_seconds,
+            messages: attempt.messages,
+        };
+
+        self.auth.begin.status = OperationStatus::Ready;
+        self.auth.begin.error = None;
+        self.auth.begin.key = Some(key.clone());
+        self.auth.active_attempt = Some(attempt.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthBegin {
+                status: OperationStatus::Ready,
+                error: None,
+                target,
+                attempt: Some(attempt),
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_begin_failed(
+        &mut self,
+        key: OperationKey,
+        target: AuthTarget,
+        message: String,
+    ) {
+        self.auth.begin.status = OperationStatus::Failed;
+        self.auth.begin.error = Some(message.clone());
+        self.auth.begin.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthBegin {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                target,
+                attempt: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_complete_loading(&mut self, key: OperationKey) {
+        self.auth.complete.status = OperationStatus::Loading;
+        self.auth.complete.error = None;
+        self.auth.complete.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthComplete {
+                status: OperationStatus::Loading,
+                error: None,
+                auth_status: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_complete_ready(&mut self, key: OperationKey, status: AuthStatus) {
+        if let Some(target) = status.target.as_ref() {
+            self.remove_auth_requirement(target);
+            self.auth
+                .statuses
+                .insert(auth_target_key(target), status.clone());
+        }
+        self.auth.complete.status = OperationStatus::Ready;
+        self.auth.complete.error = None;
+        self.auth.complete.key = Some(key.clone());
+        self.auth.active_attempt = None;
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthComplete {
+                status: OperationStatus::Ready,
+                error: None,
+                auth_status: Some(status),
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_complete_failed(&mut self, key: OperationKey, message: String) {
+        self.auth.complete.status = OperationStatus::Failed;
+        self.auth.complete.error = Some(message.clone());
+        self.auth.complete.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthComplete {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                auth_status: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_cancel_loading(&mut self, key: OperationKey) {
+        self.auth.cancel.status = OperationStatus::Loading;
+        self.auth.cancel.error = None;
+        self.auth.cancel.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthCancel {
+                status: OperationStatus::Loading,
+                error: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_cancel_ready(&mut self, key: OperationKey) {
+        self.auth.cancel.status = OperationStatus::Ready;
+        self.auth.cancel.error = None;
+        self.auth.cancel.key = Some(key.clone());
+        self.auth.active_attempt = None;
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthCancel {
+                status: OperationStatus::Ready,
+                error: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_cancel_failed(&mut self, key: OperationKey, message: String) {
+        self.auth.cancel.status = OperationStatus::Failed;
+        self.auth.cancel.error = Some(message.clone());
+        self.auth.cancel.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthCancel {
+                status: OperationStatus::Failed,
+                error: Some(message),
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_logout_loading(&mut self, key: OperationKey, target: AuthTarget) {
+        self.auth.logout.status = OperationStatus::Loading;
+        self.auth.logout.error = None;
+        self.auth.logout.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthLogout {
+                status: OperationStatus::Loading,
+                error: None,
+                target,
+                auth_status: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_logout_ready(&mut self, key: OperationKey, status: AuthStatus) {
+        let target = status.target.clone().unwrap_or_default();
+        self.remove_auth_requirement(&target);
+        self.auth
+            .statuses
+            .insert(auth_target_key(&target), status.clone());
+        self.auth.logout.status = OperationStatus::Ready;
+        self.auth.logout.error = None;
+        self.auth.logout.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthLogout {
+                status: OperationStatus::Ready,
+                error: None,
+                target,
+                auth_status: Some(status),
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_logout_failed(&mut self, key: OperationKey, message: String) {
+        let target = match self.operations.get(&key) {
+            Some(ClientOperationState::AuthLogout { target, .. }) => target.clone(),
+            _ => AuthTarget::default(),
+        };
+        self.auth.logout.status = OperationStatus::Failed;
+        self.auth.logout.error = Some(message.clone());
+        self.auth.logout.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthLogout {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                target,
+                auth_status: None,
+            },
+        );
     }
 
     pub(crate) fn set_config_load_ready(&mut self, config: Configuration) {
@@ -1246,6 +1608,18 @@ impl StreamState {
     pub(crate) fn fail(&mut self, message: String) {
         self.status = StreamStatus::Failed;
         self.error = Some(message);
+    }
+}
+
+pub(crate) fn auth_target_key(target: &AuthTarget) -> String {
+    match target.target.as_ref() {
+        Some(waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(key)) => {
+            format!("provider:{key}")
+        }
+        Some(waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(key)) => {
+            format!("mcp:{key}")
+        }
+        None => "unknown:".to_owned(),
     }
 }
 

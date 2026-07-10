@@ -1,8 +1,8 @@
 //! Shell-neutral client reducer.
 
-use crate::coordination::{config, session, status, stream};
+use crate::coordination::{auth, config, session, status, stream};
 use crate::{
-    ClientEffect, ClientError, ClientEvent, ClientSessionTemplateKind,
+    AuthEvent, AuthTarget, ClientEffect, ClientError, ClientEvent, ClientSessionTemplateKind,
     ClientSessionTemplateSearchTarget, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
     Configuration, McpServer, OperationKey, Provider, ProviderEditBaseline, RuntimeDefaults,
     SessionEvent, SessionRuntimeConfigRequest, StatusEvent, TimelineQuery,
@@ -30,6 +30,7 @@ impl Client {
     /// Apply a shell-neutral event and return resulting side-effect intents.
     pub fn apply(&mut self, event: ClientEvent) -> ClientUpdate {
         match event {
+            ClientEvent::Auth(event) => auth::reduce(&mut self.state, event),
             ClientEvent::Config(event) => config::reduce(&mut self.state, event),
             ClientEvent::Status(event) => status::reduce(&mut self.state, event),
             ClientEvent::Session(event) => session::reduce(&mut self.state, event),
@@ -38,6 +39,71 @@ impl Client {
                 ClientUpdate::default()
             }
         }
+    }
+
+    /// Request all secret-safe auth statuses.
+    pub fn request_auth_statuses(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Auth(AuthEvent::ListRequested))
+    }
+
+    /// Queue an auth requirement surfaced by a server-side run.
+    pub fn require_auth(
+        &mut self,
+        target: AuthTarget,
+        message: impl Into<String>,
+        source_session_id: Option<String>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Auth(AuthEvent::AuthorizationRequired {
+            target,
+            message: message.into(),
+            source_session_id,
+        }))
+    }
+
+    /// Dismiss one queued auth requirement.
+    pub fn dismiss_auth_requirement(&mut self, target: AuthTarget) -> ClientUpdate {
+        self.apply(ClientEvent::Auth(AuthEvent::Dismissed { target }))
+    }
+
+    /// Begin manual OAuth for a target.
+    pub fn begin_auth(&mut self, target: AuthTarget) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Auth(AuthEvent::BeginRequested {
+            operation_key,
+            target,
+        }))
+    }
+
+    /// Complete manual OAuth with a pasted redirect URL or code.
+    pub fn complete_auth(
+        &mut self,
+        attempt_id: impl Into<String>,
+        input: impl Into<String>,
+    ) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Auth(AuthEvent::CompleteRequested {
+            operation_key,
+            attempt_id: attempt_id.into(),
+            input: input.into(),
+        }))
+    }
+
+    /// Cancel a manual OAuth attempt.
+    pub fn cancel_auth(&mut self, attempt_id: impl Into<String>) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Auth(AuthEvent::CancelRequested {
+            operation_key,
+            attempt_id: attempt_id.into(),
+        }))
+    }
+
+    /// Delete stored credentials for a target.
+    pub fn logout_auth(&mut self, target: AuthTarget) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Auth(AuthEvent::LogoutRequested {
+            operation_key,
+            target,
+        }))
     }
 
     /// Request that the current configuration be loaded.

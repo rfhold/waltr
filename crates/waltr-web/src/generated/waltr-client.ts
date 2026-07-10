@@ -586,7 +586,139 @@ turn: bigint | null,
  */
 cursor: bigint | null, };
 
-export type ClientOperationView = { "kind": "configPatch", 
+export type ClientAuthTarget = { 
+/**
+ * Target kind, currently `provider` or `mcpServer`.
+ */
+kind: string, 
+/**
+ * Config key for the target.
+ */
+key: string, };
+
+export type AuthAttemptSnapshot = { 
+/**
+ * Target being authenticated.
+ */
+target: ClientAuthTarget, 
+/**
+ * Attempt id returned by the server.
+ */
+attemptId: string, 
+/**
+ * URL to open for browser-based auth.
+ */
+authUrl: string, 
+/**
+ * Verification URL for device-style auth, when supplied.
+ */
+verificationUrl: string, 
+/**
+ * User code for device-style auth, when supplied.
+ */
+userCode: string, 
+/**
+ * Attempt expiration timestamp in milliseconds since epoch.
+ */
+expiresAtMs: bigint, 
+/**
+ * Poll interval for device-style auth.
+ */
+pollIntervalSeconds: number, 
+/**
+ * User-facing instructions returned by the server.
+ */
+messages: Array<string>, };
+
+export type AuthRequirementSnapshot = { 
+/**
+ * Target that requires authentication.
+ */
+target: ClientAuthTarget, 
+/**
+ * Human-readable reason.
+ */
+message: string, 
+/**
+ * Session whose work reported the requirement.
+ */
+sourceSessionId: string | null, };
+
+export type AuthSnapshot = { 
+/**
+ * Pending auth requirements in modal display order.
+ */
+pending: Array<AuthRequirementSnapshot>, 
+/**
+ * Active manual auth attempt, when one has started.
+ */
+activeAttempt: AuthAttemptSnapshot | null, 
+/**
+ * Auth status list operation state.
+ */
+list: OperationSnapshot, 
+/**
+ * Begin auth operation state.
+ */
+begin: OperationSnapshot, 
+/**
+ * Complete auth operation state.
+ */
+complete: OperationSnapshot, 
+/**
+ * Cancel auth operation state.
+ */
+cancel: OperationSnapshot, 
+/**
+ * Logout operation state.
+ */
+logout: OperationSnapshot, };
+
+export type ClientOperationView = { "kind": "authBegin", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Target being authenticated.
+ */
+target: ClientAuthTarget, 
+/**
+ * Attempt details returned by the server.
+ */
+attempt: AuthAttemptSnapshot | null, } | { "kind": "authComplete", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, } | { "kind": "authCancel", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, } | { "kind": "authLogout", 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last operation error, when present.
+ */
+error: string | null, 
+/**
+ * Target logged out.
+ */
+target: ClientAuthTarget, } | { "kind": "configPatch", 
 /**
  * Stable operation status name.
  */
@@ -812,6 +944,10 @@ templateSearches: { [key in string]?: SessionTemplateSearchSnapshot }, };
 
 export type ClientSnapshot = { 
 /**
+ * Auth coordination snapshot.
+ */
+auth: AuthSnapshot, 
+/**
  * Command operation result snapshots.
  */
 operations: OperationCollectionSnapshot, 
@@ -834,7 +970,31 @@ export type ClientSessionTemplateSearchTarget = "resources" | "prompts";
 
 export type ClientTimelineDirection = "forward" | "backward";
 
-export type ClientCommand = { "type": "requestConfig" } | { "type": "addProvider", 
+export type ClientCommand = { "type": "requestAuthStatuses" } | { "type": "dismissAuthRequirement", 
+/**
+ * Target to dismiss from the queue.
+ */
+target: ClientAuthTarget, } | { "type": "beginAuth", 
+/**
+ * Target to authenticate.
+ */
+target: ClientAuthTarget, } | { "type": "completeAuth", 
+/**
+ * Attempt id returned by begin.
+ */
+attemptId: string, 
+/**
+ * Pasted redirect URL or code.
+ */
+input: string, } | { "type": "cancelAuth", 
+/**
+ * Attempt id returned by begin.
+ */
+attemptId: string, } | { "type": "logoutAuth", 
+/**
+ * Target to log out.
+ */
+target: ClientAuthTarget, } | { "type": "requestConfig" } | { "type": "addProvider", 
 /**
  * Provider to add.
  */
