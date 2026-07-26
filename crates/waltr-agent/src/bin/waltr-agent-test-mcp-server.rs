@@ -3,14 +3,14 @@
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use mcp::{
-    McpAccessToken, McpCompletionRequest, McpPromptArgument, McpPromptDefinition, McpPromptResult,
-    McpResourceDefinition, McpResourceResult, McpResourceTemplateDefinition, McpTokenValidation,
-    McpToolCall, McpToolDefinition, McpToolResult,
+    McpAccessToken, McpCompletionRequest, McpPrincipalId, McpPromptArgument, McpPromptDefinition,
+    McpPromptResult, McpResourceDefinition, McpResourceResult, McpResourceTemplateDefinition,
+    McpTokenValidation, McpToolCall, McpToolDefinition, McpToolResult,
     protocol::JsonRpcNotification,
     server::{McpAuthorizationContext, ServerContext, ServerError, ServerResult, serve_stdio},
 };
@@ -49,6 +49,7 @@ struct JwtValidator {
 #[derive(Debug, Deserialize)]
 struct JwtClaims {
     exp: usize,
+    sub: String,
     iss: String,
     aud: JwtAudience,
 }
@@ -271,7 +272,11 @@ impl EchoMarkerServer {
         match &self.authorization {
             Some(AuthorizationMode::Jwt(validator)) => validate_jwt_token(validator, &token.0),
             Some(AuthorizationMode::Bearer(required_token)) if token.0 == *required_token => {
-                McpTokenValidation::Authorized
+                McpTokenValidation::Authorized {
+                    principal_id: McpPrincipalId::new("waltr-agent-test-bearer")
+                        .expect("static test principal is valid"),
+                    expires_at: None,
+                }
             }
             Some(AuthorizationMode::Bearer(_)) => McpTokenValidation::Unauthorized {
                 error_description: Some("invalid test token".to_owned()),
@@ -366,14 +371,20 @@ async fn jwt_validator_from_env() -> Result<Option<JwtValidator>, Box<dyn std::e
 
 fn validate_jwt_token(validator: &JwtValidator, token: &str) -> McpTokenValidation {
     match decode_validated_jwt(validator, token) {
-        Ok(()) => McpTokenValidation::Authorized,
+        Ok((principal_id, expires_at)) => McpTokenValidation::Authorized {
+            principal_id,
+            expires_at: Some(expires_at),
+        },
         Err(message) => McpTokenValidation::Unauthorized {
             error_description: Some(message),
         },
     }
 }
 
-fn decode_validated_jwt(validator: &JwtValidator, token: &str) -> Result<(), String> {
+fn decode_validated_jwt(
+    validator: &JwtValidator,
+    token: &str,
+) -> Result<(McpPrincipalId, SystemTime), String> {
     let header = decode_header(token).map_err(|error| format!("invalid JWT header: {error}"))?;
     let key = validator
         .jwks
@@ -401,9 +412,15 @@ fn decode_validated_jwt(validator: &JwtValidator, token: &str) -> Result<(), Str
     if !token.claims.aud.contains(&validator.audience) {
         return Err("JWT audience mismatch".to_owned());
     }
-    let _ = token.claims.exp;
+    let principal_id = McpPrincipalId::new(token.claims.sub)
+        .map_err(|error| format!("invalid JWT subject: {error}"))?;
+    let expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_secs(
+            u64::try_from(token.claims.exp).map_err(|_| "JWT expiry is out of range")?,
+        ))
+        .ok_or_else(|| "JWT expiry is out of range".to_owned())?;
 
-    Ok(())
+    Ok((principal_id, expires_at))
 }
 
 impl JwtAudience {

@@ -31,6 +31,12 @@ impl std::fmt::Debug for StdioTransport {
 
 impl StdioTransport {
     /// Start a subprocess transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the subprocess or its standard streams cannot be started.
+    // Keep startup async to match the transport constructor API used by callers.
+    #[allow(clippy::unused_async)]
     pub async fn start(
         server_name: String,
         command: String,
@@ -112,6 +118,10 @@ impl StdioTransport {
     }
 
     /// Send one JSON-RPC message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization or writing to subprocess stdin fails.
     pub async fn send(&self, message: Value) -> Result<()> {
         let method = request_method(&message).unwrap_or("");
         let id = request_id(&message);
@@ -129,13 +139,20 @@ impl StdioTransport {
         stdin.write_all(line.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
+        drop(stdin);
         Ok(())
     }
 
     /// Kill and wait for the subprocess.
-    pub async fn shutdown(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the subprocess cannot be killed or reaped.
+    pub async fn shutdown(&self) -> Result<()> {
         let mut child = self.child.lock().await;
-        drop(child.start_kill());
-        drop(child.wait().await);
+        child.start_kill()?;
+        child.wait().await?;
+        drop(child);
+        Ok(())
     }
 }

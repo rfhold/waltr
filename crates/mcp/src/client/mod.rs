@@ -4,4 +4,6 @@ mod connection;
 pub mod transport;
 
 pub use api::{McpClient, McpClientHandler, McpClientOptions};
-pub use transport::{McpTransport, McpTransportConfig, TransportInbound};
+pub use transport::{
+    McpTransport, McpTransportConfig, McpTransportError, McpTransportErrorKind, TransportInbound,
+};

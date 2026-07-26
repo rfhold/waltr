@@ -106,7 +106,10 @@ impl MacroServer {
                 context.required_scopes.join(" ")
             ));
         if token.0 == "valid-token" {
-            McpTokenValidation::Authorized
+            McpTokenValidation::Authorized {
+                principal_id: mcp::McpPrincipalId::new("macro-test").expect("valid principal"),
+                expires_at: None,
+            }
         } else {
             McpTokenValidation::Unauthorized {
                 error_description: Some("invalid macro test token".to_owned()),

@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use mcp::protocol::MCP_PROTOCOL_VERSION;
 use reqwest::StatusCode;
 use serde_json::json;
 
-use crate::spec::support::{SpecServer, post_json};
+use crate::spec::support::{SpecServer, initialized_session, post_json};
 
 struct TransportServer;
 
@@ -13,13 +14,16 @@ impl TransportServer {}
 #[tokio::test]
 async fn streamable_http_accepts_client_notifications_with_accepted_status() -> mcp::Result<()> {
     let server = SpecServer::start(Arc::new(TransportServer)).await?;
+    let session_id = initialized_session(&server.endpoint()).await?;
 
     let response = reqwest::Client::new()
         .post(server.endpoint())
         .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
         .json(&json!({
             "jsonrpc": "2.0",
-            "method": "notifications/initialized",
+            "method": "notifications/example",
         }))
         .send()
         .await?;
@@ -33,10 +37,13 @@ async fn streamable_http_accepts_client_notifications_with_accepted_status() -> 
 #[tokio::test]
 async fn streamable_http_accepts_client_responses_with_accepted_status() -> mcp::Result<()> {
     let server = SpecServer::start(Arc::new(TransportServer)).await?;
+    let session_id = initialized_session(&server.endpoint()).await?;
 
     let response = reqwest::Client::new()
         .post(server.endpoint())
         .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
         .json(&json!({
             "jsonrpc": "2.0",
             "id": "server-request-1",
@@ -47,6 +54,37 @@ async fn streamable_http_accepts_client_responses_with_accepted_status() -> mcp:
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(response.bytes().await?.len(), 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamable_http_post_requires_a_known_session_after_initialize() -> mcp::Result<()> {
+    let server = SpecServer::start(Arc::new(TransportServer)).await?;
+    let client = reqwest::Client::new();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": "session-required",
+        "method": "ping",
+    });
+
+    let missing = client
+        .post(server.endpoint())
+        .header("accept", "application/json, text/event-stream")
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let unknown = client
+        .post(server.endpoint())
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", "unknown-session")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
     Ok(())
 }

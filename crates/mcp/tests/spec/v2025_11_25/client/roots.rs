@@ -65,7 +65,7 @@ async fn client_declares_roots_capability_during_initialization() -> mcp::Result
         json!({ "roots": { "listChanged": false } })
     );
 
-    client.shutdown().await;
+    client.shutdown().await?;
     Ok(())
 }
 
@@ -97,7 +97,7 @@ async fn roots_list_request_returns_exposed_file_uri_roots() -> mcp::Result<()> 
     );
     assert!(response.get("error").is_none());
 
-    client.shutdown().await;
+    client.shutdown().await?;
     Ok(())
 }
 
@@ -116,7 +116,7 @@ async fn client_ping_request_returns_empty_result_object() -> mcp::Result<()> {
     assert_eq!(response["result"], json!({}));
     assert!(response.get("error").is_none());
 
-    client.shutdown().await;
+    client.shutdown().await?;
     Ok(())
 }
 

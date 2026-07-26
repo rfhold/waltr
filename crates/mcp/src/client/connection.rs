@@ -10,7 +10,7 @@ use tracing::Instrument as _;
 
 use crate::{
     Error, McpAuthorizationError, McpTracePropagation, Result,
-    client::transport::{McpTransport, McpTransportConfig, TransportInbound},
+    client::transport::{McpTransport, McpTransportConfig, McpTransportError, TransportInbound},
     protocol::{
         JsonRpcId, JsonRpcInbound, JsonRpcNotification, JsonRpcRequest, cancellation_params,
         json_rpc_notification, json_rpc_request, json_rpc_result, next_id,
@@ -32,6 +32,8 @@ pub trait McpConnectionHandler: Send + Sync {
     fn sse_event_id(&self, id: String);
     /// Handle an authorization failure received from streamable HTTP.
     fn authorization_failed(&self, error: McpAuthorizationError);
+    /// Handle a classified background transport failure.
+    fn transport_failed(&self, error: McpTransportError);
 }
 
 /// JSON-RPC connection over one MCP transport.
@@ -68,8 +70,10 @@ impl McpConnection {
     }
 
     /// Mark the connection initialized so HTTP sends the MCP protocol header.
-    pub async fn mark_initialized(&self) {
+    pub async fn mark_initialized(&self, protocol_version: &str) -> Result<()> {
+        self.transport.mark_initialized(protocol_version).await?;
         *self.initialized.lock().await = true;
+        Ok(())
     }
 
     /// Send a request and wait for its response.
@@ -122,10 +126,13 @@ impl McpConnection {
         span.record("mcp.request_id", id.to_string());
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id.clone(), tx);
-        if let Err(error) = self
-            .send(json_rpc_request(id.clone(), method, params))
-            .await
-        {
+        let send_result = self
+            .send(
+                json_rpc_request(id.clone(), method, params),
+                Some(&cancellation_token),
+            )
+            .await;
+        if let Err(error) = send_result {
             self.pending.lock().await.remove(&id);
             span.record("mcp.outcome", "error");
             tracing::debug!(%error, mcp.outcome = "error", "MCP client request send failed");
@@ -175,17 +182,19 @@ impl McpConnection {
 
     /// Send a notification.
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
-        self.send(json_rpc_notification(method, params)).await
+        self.send(json_rpc_notification(method, params), None).await
     }
 
-    async fn send(&self, message: Value) -> Result<()> {
+    async fn send(&self, message: Value, cancellation: Option<&CancellationToken>) -> Result<()> {
         let initialized = *self.initialized.lock().await;
-        self.transport.send(message, initialized).await
+        self.transport
+            .send(message, initialized, cancellation)
+            .await
     }
 
     /// Shutdown the underlying transport.
-    pub async fn shutdown(&self) {
-        self.transport.shutdown().await;
+    pub async fn shutdown(&self) -> Result<()> {
+        self.transport.shutdown().await
     }
 }
 
@@ -217,7 +226,7 @@ async fn dispatch_loop(
             }
             TransportInbound::Message(JsonRpcInbound::Request(request)) => {
                 let response = handler.request(request.clone());
-                if let Err(error) = connection.send(response).await {
+                if let Err(error) = connection.send(response, None).await {
                     handler.disconnected(format!("failed to send MCP response: {error}"));
                 }
             }
@@ -226,6 +235,7 @@ async fn dispatch_loop(
                 fail_pending_with_authorization(&connection, &error).await;
                 handler.authorization_failed(error);
             }
+            TransportInbound::TransportFailed(error) => handler.transport_failed(error),
             TransportInbound::Disconnected(error) => {
                 fail_pending(&connection, &error).await;
                 handler.disconnected(error);
