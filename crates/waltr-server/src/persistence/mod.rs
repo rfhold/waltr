@@ -1,6 +1,9 @@
 //! Server-owned database configuration and initialization.
 
 mod migrations;
+mod outbound_oauth;
+
+pub(crate) use outbound_oauth::{DurableAttemptRecord, OutboundOAuthStore};
 
 use std::{
     env,
@@ -372,6 +375,10 @@ impl Persistence {
     pub async fn ready(&self) -> Result<(), PersistenceError> {
         check_pool(&self.pool).await?;
         check_pool(&self.mcp_pool).await
+    }
+
+    pub(crate) fn outbound_oauth_store(&self) -> Arc<OutboundOAuthStore> {
+        Arc::new(OutboundOAuthStore::new(self.pool.clone()))
     }
 }
 

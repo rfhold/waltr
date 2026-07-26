@@ -43,6 +43,10 @@ pub struct BeginAuthResponse {
     pub poll_interval_seconds: i32,
     #[prost(string, repeated, tag="8")]
     pub messages: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration="AuthCompletionMode", tag="9")]
+    pub completion_mode: i32,
+    #[prost(enumeration="McpOAuthRegistrationMethod", tag="10")]
+    pub registration_method: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CompleteAuthRequest {
@@ -55,6 +59,35 @@ pub struct CompleteAuthRequest {
 pub struct CompleteAuthResponse {
     #[prost(message, optional, tag="1")]
     pub status: ::core::option::Option<AuthStatus>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetAuthAttemptStatusRequest {
+    #[prost(string, tag="1")]
+    pub attempt_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetAuthAttemptStatusResponse {
+    #[prost(message, optional, tag="1")]
+    pub attempt: ::core::option::Option<AuthAttemptStatus>,
+    #[prost(message, optional, tag="2")]
+    pub status: ::core::option::Option<AuthStatus>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthAttemptStatus {
+    #[prost(string, tag="1")]
+    pub attempt_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub target: ::core::option::Option<AuthTarget>,
+    #[prost(enumeration="AuthAttemptLifecycle", tag="3")]
+    pub lifecycle: i32,
+    #[prost(enumeration="AuthCompletionMode", tag="4")]
+    pub completion_mode: i32,
+    #[prost(enumeration="McpOAuthRegistrationMethod", tag="5")]
+    pub registration_method: i32,
+    #[prost(int64, tag="6")]
+    pub expires_at_ms: i64,
+    #[prost(string, tag="7")]
+    pub failure_reason: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CancelAuthRequest {
@@ -90,7 +123,7 @@ pub mod auth_target {
     }
 }
 /// Versioned machine-readable authentication failure carried in gRPC status details.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AuthenticationFailure {
     #[prost(uint32, tag="1")]
     pub version: u32,
@@ -98,6 +131,30 @@ pub struct AuthenticationFailure {
     pub domain: i32,
     #[prost(enumeration="AuthenticationFailureReason", tag="3")]
     pub reason: i32,
+    #[prost(message, optional, tag="4")]
+    pub target: ::core::option::Option<AuthTarget>,
+    #[prost(message, optional, tag="5")]
+    pub mcp_authorization: ::core::option::Option<McpAuthorizationContext>,
+}
+/// Sanitized MCP bearer challenge and protected endpoint context.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct McpAuthorizationContext {
+    #[prost(string, tag="1")]
+    pub endpoint: ::prost::alloc::string::String,
+    #[prost(uint32, tag="2")]
+    pub http_status: u32,
+    #[prost(string, optional, tag="3")]
+    pub resource_metadata_url: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub scope: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="5")]
+    pub error: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="6")]
+    pub error_description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="7")]
+    pub error_uri: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="8")]
+    pub realm: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AuthStatus {
@@ -113,6 +170,8 @@ pub struct AuthStatus {
     pub metadata: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(string, tag="6")]
     pub message: ::prost::alloc::string::String,
+    #[prost(enumeration="McpOAuthRegistrationMethod", tag="7")]
+    pub registration_method: i32,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListProviderAuthStatusesRequest {
@@ -205,9 +264,113 @@ pub struct ProviderAuthStatus {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
+pub enum AuthAttemptLifecycle {
+    Unspecified = 0,
+    Pending = 1,
+    Completing = 2,
+    Succeeded = 3,
+    Failed = 4,
+    Canceled = 5,
+    Expired = 6,
+}
+impl AuthAttemptLifecycle {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AUTH_ATTEMPT_LIFECYCLE_UNSPECIFIED",
+            Self::Pending => "AUTH_ATTEMPT_LIFECYCLE_PENDING",
+            Self::Completing => "AUTH_ATTEMPT_LIFECYCLE_COMPLETING",
+            Self::Succeeded => "AUTH_ATTEMPT_LIFECYCLE_SUCCEEDED",
+            Self::Failed => "AUTH_ATTEMPT_LIFECYCLE_FAILED",
+            Self::Canceled => "AUTH_ATTEMPT_LIFECYCLE_CANCELED",
+            Self::Expired => "AUTH_ATTEMPT_LIFECYCLE_EXPIRED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AUTH_ATTEMPT_LIFECYCLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "AUTH_ATTEMPT_LIFECYCLE_PENDING" => Some(Self::Pending),
+            "AUTH_ATTEMPT_LIFECYCLE_COMPLETING" => Some(Self::Completing),
+            "AUTH_ATTEMPT_LIFECYCLE_SUCCEEDED" => Some(Self::Succeeded),
+            "AUTH_ATTEMPT_LIFECYCLE_FAILED" => Some(Self::Failed),
+            "AUTH_ATTEMPT_LIFECYCLE_CANCELED" => Some(Self::Canceled),
+            "AUTH_ATTEMPT_LIFECYCLE_EXPIRED" => Some(Self::Expired),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AuthCompletionMode {
+    Unspecified = 0,
+    Manual = 1,
+    ServerCallback = 2,
+}
+impl AuthCompletionMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AUTH_COMPLETION_MODE_UNSPECIFIED",
+            Self::Manual => "AUTH_COMPLETION_MODE_MANUAL",
+            Self::ServerCallback => "AUTH_COMPLETION_MODE_SERVER_CALLBACK",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AUTH_COMPLETION_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "AUTH_COMPLETION_MODE_MANUAL" => Some(Self::Manual),
+            "AUTH_COMPLETION_MODE_SERVER_CALLBACK" => Some(Self::ServerCallback),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum McpOAuthRegistrationMethod {
+    Unspecified = 0,
+    Preregistered = 1,
+    ClientMetadata = 2,
+    Dynamic = 3,
+}
+impl McpOAuthRegistrationMethod {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MCP_O_AUTH_REGISTRATION_METHOD_UNSPECIFIED",
+            Self::Preregistered => "MCP_O_AUTH_REGISTRATION_METHOD_PREREGISTERED",
+            Self::ClientMetadata => "MCP_O_AUTH_REGISTRATION_METHOD_CLIENT_METADATA",
+            Self::Dynamic => "MCP_O_AUTH_REGISTRATION_METHOD_DYNAMIC",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MCP_O_AUTH_REGISTRATION_METHOD_UNSPECIFIED" => Some(Self::Unspecified),
+            "MCP_O_AUTH_REGISTRATION_METHOD_PREREGISTERED" => Some(Self::Preregistered),
+            "MCP_O_AUTH_REGISTRATION_METHOD_CLIENT_METADATA" => Some(Self::ClientMetadata),
+            "MCP_O_AUTH_REGISTRATION_METHOD_DYNAMIC" => Some(Self::Dynamic),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
 pub enum AuthenticationDomain {
     Unspecified = 0,
     WaltrAccess = 1,
+    OutboundProvider = 2,
+    OutboundMcp = 3,
 }
 impl AuthenticationDomain {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -218,6 +381,8 @@ impl AuthenticationDomain {
         match self {
             Self::Unspecified => "AUTHENTICATION_DOMAIN_UNSPECIFIED",
             Self::WaltrAccess => "AUTHENTICATION_DOMAIN_WALTR_ACCESS",
+            Self::OutboundProvider => "AUTHENTICATION_DOMAIN_OUTBOUND_PROVIDER",
+            Self::OutboundMcp => "AUTHENTICATION_DOMAIN_OUTBOUND_MCP",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -225,6 +390,8 @@ impl AuthenticationDomain {
         match value {
             "AUTHENTICATION_DOMAIN_UNSPECIFIED" => Some(Self::Unspecified),
             "AUTHENTICATION_DOMAIN_WALTR_ACCESS" => Some(Self::WaltrAccess),
+            "AUTHENTICATION_DOMAIN_OUTBOUND_PROVIDER" => Some(Self::OutboundProvider),
+            "AUTHENTICATION_DOMAIN_OUTBOUND_MCP" => Some(Self::OutboundMcp),
             _ => None,
         }
     }
@@ -236,6 +403,9 @@ pub enum AuthenticationFailureReason {
     CredentialRequired = 1,
     CredentialRejected = 2,
     NetworkFailed = 3,
+    TokenExchangeFailed = 4,
+    ResponseInvalid = 5,
+    ConfigurationRequired = 6,
 }
 impl AuthenticationFailureReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -248,6 +418,9 @@ impl AuthenticationFailureReason {
             Self::CredentialRequired => "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REQUIRED",
             Self::CredentialRejected => "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REJECTED",
             Self::NetworkFailed => "AUTHENTICATION_FAILURE_REASON_NETWORK_FAILED",
+            Self::TokenExchangeFailed => "AUTHENTICATION_FAILURE_REASON_TOKEN_EXCHANGE_FAILED",
+            Self::ResponseInvalid => "AUTHENTICATION_FAILURE_REASON_RESPONSE_INVALID",
+            Self::ConfigurationRequired => "AUTHENTICATION_FAILURE_REASON_CONFIGURATION_REQUIRED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -257,6 +430,9 @@ impl AuthenticationFailureReason {
             "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REQUIRED" => Some(Self::CredentialRequired),
             "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REJECTED" => Some(Self::CredentialRejected),
             "AUTHENTICATION_FAILURE_REASON_NETWORK_FAILED" => Some(Self::NetworkFailed),
+            "AUTHENTICATION_FAILURE_REASON_TOKEN_EXCHANGE_FAILED" => Some(Self::TokenExchangeFailed),
+            "AUTHENTICATION_FAILURE_REASON_RESPONSE_INVALID" => Some(Self::ResponseInvalid),
+            "AUTHENTICATION_FAILURE_REASON_CONFIGURATION_REQUIRED" => Some(Self::ConfigurationRequired),
             _ => None,
         }
     }
