@@ -18,7 +18,7 @@ const ENV_MODELS_DEV_URL: &str = "WALTR_MODELS_DEV_URL";
 const ENV_MODELS_DEV_PATH: &str = "WALTR_MODELS_DEV_PATH";
 const ENV_MODELS_DEV_CACHE_PATH: &str = "WALTR_MODELS_DEV_CACHE_PATH";
 const CACHE_RELATIVE_PATH: &[&str] = &[".local", "share", "waltr", "cache", "models-dev-api.json"];
-const CATALOG_FRESHNESS: Duration = Duration::from_secs(24 * 60 * 60);
+const CATALOG_FRESHNESS: Duration = Duration::from_hours(24);
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 
@@ -36,7 +36,7 @@ impl LoadedCatalog {
     }
 
     #[must_use]
-    fn stale(&self) -> bool {
+    const fn stale(&self) -> bool {
         self.stale
     }
 }
@@ -63,14 +63,14 @@ impl CatalogLoader {
     /// Create a loader from `WALTR_MODELS_DEV_PATH`, `WALTR_MODELS_DEV_URL`, or defaults.
     #[must_use]
     pub fn from_env() -> Self {
-        let source = std::env::var_os(ENV_MODELS_DEV_PATH)
-            .map(PathBuf::from)
-            .map(CatalogSource::Path)
-            .unwrap_or_else(|| {
+        let source = std::env::var_os(ENV_MODELS_DEV_PATH).map_or_else(
+            || {
                 let url = std::env::var(ENV_MODELS_DEV_URL)
                     .unwrap_or_else(|_| DEFAULT_MODELS_DEV_URL.to_owned());
                 CatalogSource::Url(url)
-            });
+            },
+            |path| CatalogSource::Path(PathBuf::from(path)),
+        );
 
         Self::new(source, default_cache_path())
     }
@@ -1269,6 +1269,10 @@ where
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these flags directly represent independent requested proto fields"
+)]
 struct RequestedDefaultFields {
     name: bool,
     model_type: bool,
@@ -1389,6 +1393,10 @@ fn model_type_is_blank(value: i32) -> bool {
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arguments preserve explicit serving and catalog match inputs"
+)]
 fn resolve_catalog_match(
     catalog: &models_dev::ModelCatalog,
     provider_key: &str,
@@ -1619,7 +1627,7 @@ fn derive_upstream_model_ref(
     Some(models_dev::CatalogModelRef::new(provider_id, model_id))
 }
 
-fn proto_confidence(
+const fn proto_confidence(
     confidence: models_dev::CatalogMatchConfidence,
 ) -> catalog_proto::CatalogMatchConfidence {
     match confidence {
@@ -1631,7 +1639,7 @@ fn proto_confidence(
     }
 }
 
-fn high_confidence(confidence: models_dev::CatalogMatchConfidence) -> bool {
+const fn high_confidence(confidence: models_dev::CatalogMatchConfidence) -> bool {
     matches!(
         confidence,
         models_dev::CatalogMatchConfidence::Exact | models_dev::CatalogMatchConfidence::High
@@ -1647,7 +1655,7 @@ fn proto_drift_field(drift: models_dev::CatalogDrift) -> catalog_proto::CatalogD
     }
 }
 
-fn drift_field_name(field: models_dev::CatalogDriftField) -> &'static str {
+const fn drift_field_name(field: models_dev::CatalogDriftField) -> &'static str {
     match field {
         models_dev::CatalogDriftField::Status => "status",
         models_dev::CatalogDriftField::LimitContext => "limit_context",
@@ -1669,7 +1677,9 @@ fn drift_field_name(field: models_dev::CatalogDriftField) -> &'static str {
     }
 }
 
-fn drift_severity(field: models_dev::CatalogDriftField) -> catalog_proto::CatalogDriftSeverity {
+const fn drift_severity(
+    field: models_dev::CatalogDriftField,
+) -> catalog_proto::CatalogDriftSeverity {
     match field {
         models_dev::CatalogDriftField::LimitContext
         | models_dev::CatalogDriftField::LimitInput

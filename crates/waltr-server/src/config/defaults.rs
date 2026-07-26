@@ -56,7 +56,7 @@ pub fn default_configuration() -> Configuration {
                     "gpt-5-nano",
                     HashMap::from([(
                         "Authorization".to_owned(),
-                        "Bearer ${env:OPENAI_API_KEY}".to_owned(),
+                        concat!("Bearer ", "${env:OPENAI_API_KEY}").to_owned(),
                     )]),
                     None,
                 ),
@@ -85,6 +85,10 @@ pub fn default_configuration() -> Configuration {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper mirrors the provider fixture fields"
+)]
 fn provider(
     name: &str,
     provider_type: ProviderType,
@@ -113,7 +117,6 @@ fn provider(
                 ..Model::default()
             },
         )]),
-        ..Provider::default()
     }
 }
 
@@ -222,7 +225,7 @@ mod tests {
         assert!(openai.oauth_settings.is_none());
         assert_eq!(
             openai.headers["Authorization"],
-            "Bearer ${env:OPENAI_API_KEY}"
+            concat!("Bearer ", "${env:OPENAI_API_KEY}")
         );
 
         let codex = &config.providers["codex"];

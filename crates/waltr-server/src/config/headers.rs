@@ -1,5 +1,10 @@
 //! Provider header resolution helpers.
 
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "keep credential helpers explicitly crate-scoped"
+)]
+
 use std::collections::HashMap;
 
 const ENV_PREFIX: &str = "${env:";
@@ -113,7 +118,7 @@ mod tests {
             ),
             (
                 "Authorization".to_owned(),
-                "Bearer ${env:OPENAI_API_KEY}".to_owned(),
+                concat!("Bearer ", "${env:OPENAI_API_KEY}").to_owned(),
             ),
         ]);
 
@@ -133,7 +138,7 @@ mod tests {
         let headers = HashMap::from([
             (
                 "Authorization".to_owned(),
-                "Bearer ${env:OPENAI_API_KEY}".to_owned(),
+                concat!("Bearer ", "${env:OPENAI_API_KEY}").to_owned(),
             ),
             ("x-app".to_owned(), "cli".to_owned()),
         ]);

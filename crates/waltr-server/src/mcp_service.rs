@@ -1,5 +1,10 @@
 //! Waltr Model Context Protocol server surface.
 
+#![allow(
+    clippy::useless_vec,
+    reason = "the progressive_server macro generates this allocation"
+)]
+
 use crate::config_service::ConfigService;
 use waltr::grpc::waltr::config::v1::{
     GetConfigRequest, GetConfigResponse, PatchConfigRequest,
@@ -20,7 +25,7 @@ pub struct WaltrMcpServer {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PatchConfigurationInput {
-    /// Current configuration ETag from `configuration.inspect`.
+    /// Current configuration `ETag` from `configuration.inspect`.
     expected_etag: String,
     /// Replacement providers section: `{ "providers": { "key": { ... } } }`.
     #[serde(default)]
@@ -36,6 +41,10 @@ struct PatchConfigurationInput {
 impl WaltrMcpServer {
     /// Create a Waltr MCP server backed by the generated config service implementation.
     #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "keep the public constructor non-const without an API expansion"
+    )]
     pub fn new(config_service: Arc<ConfigService>) -> Self {
         Self { config_service }
     }
@@ -46,7 +55,7 @@ impl WaltrMcpServer {
             Request::new(GetConfigRequest::default()),
         )
         .await
-        .map_err(rpc_status_to_server_error)?;
+        .map_err(|status| rpc_status_to_server_error(&status))?;
 
         Ok(response.into_inner())
     }
@@ -67,7 +76,7 @@ impl WaltrMcpServer {
     /// Inspect the current Waltr configuration before proposing or applying a change.
     ///
     /// Use this first for configuration requests. The result includes the
-    /// current config and ETag needed for updates.
+    /// current config and `ETag` needed for updates.
     #[action(
         name = "configuration.inspect",
         resource = "waltr://configuration/current"
@@ -89,7 +98,7 @@ impl WaltrMcpServer {
             Request::new(request),
         )
         .await
-        .map_err(rpc_status_to_server_error)?;
+        .map_err(|status| rpc_status_to_server_error(&status))?;
 
         response_to_value(response.into_inner())
     }
@@ -98,9 +107,14 @@ impl WaltrMcpServer {
     ///
     /// Load this workflow for any request to add, remove, or adjust providers,
     /// MCP servers, or runtime defaults. First call `configuration.inspect`,
-    /// then prepare one top-level replacement patch with the current ETag, and
+    /// then prepare one top-level replacement patch with the current `ETag`, and
     /// finally call `configuration.patch`.
     #[workflow(name = "configuration")]
+    #[allow(
+        clippy::unnecessary_wraps,
+        clippy::unused_self,
+        reason = "the workflow macro requires this method signature"
+    )]
     fn configuration_workflow(&self) -> ServerResult<String> {
         Ok(
             "## Waltr configuration workflow\n\n\
@@ -150,7 +164,7 @@ where
     })
 }
 
-fn rpc_status_to_server_error(status: Status) -> ServerError {
+fn rpc_status_to_server_error(status: &Status) -> ServerError {
     let message = format!("config RPC {}: {}", status.code(), status.message());
     match status.code() {
         Code::InvalidArgument | Code::FailedPrecondition => ServerError::invalid_params(message),

@@ -168,7 +168,7 @@ async fn create_session_preserves_unresolved_header_templates()
         .headers
         .insert(
             "Authorization".to_owned(),
-            "Bearer ${env:WALTR_SERVER_TEST_UNSET_PROVIDER_TOKEN}".to_owned(),
+            concat!("Bearer ", "${env:WALTR_SERVER_TEST_UNSET_PROVIDER_TOKEN}").to_owned(),
         );
     config_service
         .store()
