@@ -25,6 +25,7 @@ use crate::config::{
     headers::{configured_credential, has_unresolved_credential, resolve_provider_headers},
 };
 
+use super::outbound_http::OutboundHttpPolicy;
 use super::{AuthTarget, FileCredentialStore, StoredCredential, oauth};
 
 /// gRPC auth service for provider credentials.
@@ -441,6 +442,13 @@ where
             definition.definition,
             now_ms(),
         )?;
+        let policy = OutboundHttpPolicy::production();
+        policy
+            .validate_destination(&attempt.definition().authorize_url)
+            .await?;
+        policy
+            .validate_destination(&attempt.definition().token_url)
+            .await?;
         let attempt_id = Uuid::new_v4().to_string();
         response.attempt_id.clone_from(&attempt_id);
         self.attempts.lock().await.insert(attempt_id, attempt);
