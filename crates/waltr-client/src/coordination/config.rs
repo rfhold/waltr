@@ -44,9 +44,21 @@ pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
             ClientUpdate::default()
         }
         ConfigEvent::WatchStarted => {
-            state.set_config_watch_opened();
+            if let Some(open_id) = state.config.watch.open_id {
+                state.set_config_watch_opened(open_id);
+            }
             ClientUpdate::default()
         }
+        ConfigEvent::WatchStartedForOpen { open_id } => {
+            state.set_config_watch_opened(open_id);
+            ClientUpdate::default()
+        }
+        ConfigEvent::WatchOpenFailed { open_id, error }
+            if state.config.watch.open_id == Some(open_id) =>
+        {
+            watch_failed(state, error.to_string())
+        }
+        ConfigEvent::WatchOpenFailed { .. } => ClientUpdate::default(),
         ConfigEvent::WatchChanged(update) => apply_watch_update(state, &update),
         ConfigEvent::WatchFailed(error) => watch_failed(state, error.to_string()),
         ConfigEvent::WatchEnded => watch_failed(state, "config watch ended".to_owned()),
@@ -71,8 +83,10 @@ pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
         return ClientUpdate::default();
     }
 
-    state.set_config_watch_loading();
-    ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::Watch))
+    let Some(open_id) = state.set_config_watch_loading() else {
+        return ClientUpdate::default();
+    };
+    ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::Watch { open_id }))
 }
 
 fn apply_watch_update(state: &mut ClientState, update: &ConfigWatchUpdate) -> ClientUpdate {

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use futures_channel::oneshot;
 use futures_util::{
     FutureExt, StreamExt,
-    future::{Either, LocalBoxFuture, select, select_all},
+    future::{Either, LocalBoxFuture, pending, select, select_all},
     pin_mut,
 };
 use serde::{Deserialize, Serialize};
@@ -19,12 +19,12 @@ use crate::executor::{
 };
 use crate::transport::SessionTimelineWatchUpdate;
 use crate::{
-    AuthAttemptState, AuthRequirement, AuthTarget, Client, ClientEffect, ClientError, ClientEvent,
-    ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
-    McpServerView, OperationKey, OperationStatus, ProviderView, RollbackTarget,
-    RuntimeDefaultsView, SessionEffect, SessionEvent, SessionRuntimeConfigRequest,
-    SessionTemplateKind, SessionTemplateOption, SessionTimelineView, SessionView,
-    StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
+    AccessAttemptId, AccessStatus, AuthAttemptState, AuthRequirement, AuthTarget, Client,
+    ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate, ConfigEffect,
+    ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey, OperationStatus,
+    ProviderView, RollbackTarget, RuntimeDefaultsView, SessionEffect, SessionEvent,
+    SessionRuntimeConfigRequest, SessionTemplateKind, SessionTemplateOption, SessionTimelineView,
+    SessionView, StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
     TimelineWatchKey, rollback_target,
 };
 
@@ -36,6 +36,37 @@ type ClientSleep = Rc<dyn Fn(u64) -> LocalBoxFuture<'static, ()>>;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ClientCommand {
+    /// Record the start of a platform-specific Waltr login flow.
+    StartWaltrLogin,
+    /// Record installed Waltr credentials and restart protected status checking.
+    CompleteWaltrLogin {
+        /// Attempt generation returned after starting login.
+        #[serde(rename = "attemptId")]
+        attempt_id: AccessAttemptId,
+    },
+    /// Record a failed platform-specific Waltr login flow.
+    FailWaltrLogin {
+        /// Attempt generation returned after starting login.
+        #[serde(rename = "attemptId")]
+        attempt_id: AccessAttemptId,
+        /// Safe failure text to present to the user.
+        error: String,
+    },
+    /// Record cancellation of a platform-specific Waltr login flow.
+    CancelWaltrLogin {
+        /// Attempt generation returned after starting login.
+        #[serde(rename = "attemptId")]
+        attempt_id: AccessAttemptId,
+    },
+    /// Reprobe anonymously after rejected native credentials were already cleared.
+    ReprobeWaltrAccess,
+    /// Clear protected state after the platform removes Waltr credentials.
+    LogoutWaltr,
+    /// Record proactive native token expiry or terminal refresh failure.
+    WaltrAccessExpired {
+        /// Safe expiry or refresh failure text.
+        error: String,
+    },
     /// Load secret-safe auth statuses.
     RequestAuthStatuses,
     /// Dismiss one queued auth requirement.
@@ -304,23 +335,21 @@ pub enum ClientSessionTemplateKind {
 /// Template search target requested by UI clients.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum ClientSessionTemplateSearchTarget {
     /// Search file and tool reference templates.
+    #[default]
     Resources,
     /// Search prompt templates such as skills or MCP prompts.
     Prompts,
-}
-
-impl Default for ClientSessionTemplateSearchTarget {
-    fn default() -> Self {
-        Self::Resources
-    }
 }
 
 /// Stable snapshot of shared client state.
 #[derive(Clone, Debug, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientSnapshot {
+    /// Waltr access authentication snapshot.
+    pub access: AccessSnapshot,
     /// Auth coordination snapshot.
     pub auth: AuthSnapshot,
     /// Command operation result snapshots.
@@ -333,7 +362,21 @@ pub struct ClientSnapshot {
     pub sessions: SessionSnapshot,
 }
 
+/// Stable Waltr access authentication snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessSnapshot {
+    /// Current Waltr access status.
+    pub status: AccessStatus,
+    /// Last safe login error, when present.
+    pub error: Option<String>,
+    /// Active platform login generation, when one is running.
+    #[serde(rename = "activeAttemptId")]
+    pub active_attempt_id: Option<AccessAttemptId>,
+}
+
 /// Stable auth coordination snapshot.
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, Debug, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthSnapshot {
@@ -355,7 +398,7 @@ pub struct AuthSnapshot {
 }
 
 /// One pending auth requirement.
-#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthRequirementSnapshot {
     /// Target that requires authentication.
@@ -368,7 +411,7 @@ pub struct AuthRequirementSnapshot {
 }
 
 /// Active manual auth attempt details.
-#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthAttemptSnapshot {
     /// Target being authenticated.
@@ -537,7 +580,7 @@ pub enum ClientOperationView {
 }
 
 /// Stable shell-facing rollback target view.
-#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct RollbackTargetView {
     /// Turn target, when continuing or rolling back by turn.
@@ -553,11 +596,10 @@ impl From<&RollbackTarget> for RollbackTargetView {
                 turn: Some(turn),
                 cursor: None,
             },
-            Some(rollback_target::Target::Cursor(cursor)) => Self {
-                turn: None,
-                cursor: Some(cursor),
-            },
-            Some(rollback_target::Target::BeforeCursor(cursor)) => Self {
+            Some(
+                rollback_target::Target::Cursor(cursor)
+                | rollback_target::Target::BeforeCursor(cursor),
+            ) => Self {
                 turn: None,
                 cursor: Some(cursor),
             },
@@ -675,7 +717,7 @@ pub struct OperationSnapshot {
 pub struct ClientRuntime {
     reducer: Client,
     executor: GrpcEffectExecutor,
-    status_watch: Option<StatusChangeStream>,
+    status_watch: Option<(u64, StatusChangeStream)>,
     config_watch: Option<ConfigWatchUpdateStream>,
     session_watch: Option<SessionWatchUpdateStream>,
     timeline_watches: BTreeMap<TimelineWatchKey, SessionTimelineWatchUpdateStream>,
@@ -690,8 +732,9 @@ enum WatchCandidate {
     Timeline(TimelineWatchKey),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum WatchResult {
-    Status(Option<Result<crate::SystemStatus, ClientError>>),
+    Status(u64, Option<Result<crate::SystemStatus, ClientError>>),
     Config(Option<Result<crate::ConfigWatchUpdate, ClientError>>),
     Session(Option<Result<crate::SessionWatchUpdate, ClientError>>),
     Timeline(
@@ -749,23 +792,34 @@ impl fmt::Debug for ClientRuntime {
             .field("config_watch_active", &self.config_watch.is_some())
             .field("session_watch_active", &self.session_watch.is_some())
             .field("timeline_watch_count", &self.timeline_watches.len())
+            .field("watch_poll_offset", &self.watch_poll_offset)
             .finish()
     }
 }
 
 impl ClientRuntime {
-    /// Create a runtime for an endpoint base URL.
+    /// Create a runtime from a runtime-owned default transport.
     #[must_use]
-    pub fn for_endpoint(endpoint: impl Into<String>) -> Self {
+    pub fn with_transport(transport: crate::DefaultGrpcTransport) -> Self {
+        Self::with_executor(GrpcEffectExecutor::with_transport(transport))
+    }
+
+    fn with_executor(executor: GrpcEffectExecutor) -> Self {
         Self {
             reducer: Client::new(),
-            executor: GrpcEffectExecutor::for_endpoint(endpoint),
+            executor,
             status_watch: None,
             config_watch: None,
             session_watch: None,
             timeline_watches: BTreeMap::new(),
             watch_poll_offset: 0,
         }
+    }
+
+    /// Create a runtime for an endpoint base URL.
+    #[must_use]
+    pub fn for_endpoint(endpoint: impl Into<String>) -> Self {
+        Self::with_executor(GrpcEffectExecutor::for_endpoint(endpoint))
     }
 
     /// Return the current reducer snapshot.
@@ -784,68 +838,7 @@ impl ClientRuntime {
         ClientStateStream::new(self, sleep)
     }
 
-    async fn execute_effect<Sleep, SleepFuture>(
-        &mut self,
-        effect: ClientEffect,
-        sleep: Sleep,
-    ) -> Vec<ClientEvent>
-    where
-        Sleep: FnOnce(u64) -> SleepFuture,
-        SleepFuture: Future<Output = ()>,
-    {
-        match effect {
-            ClientEffect::Status(StatusEffect::Watch) => match self.executor.watch_status().await {
-                Ok(stream) => {
-                    self.status_watch = Some(stream);
-                    vec![ClientEvent::Status(StatusEvent::WatchStarted)]
-                }
-                Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailed(error))],
-            },
-            ClientEffect::Config(ConfigEffect::Watch) => {
-                match self.executor.watch_config_updates().await {
-                    Ok(stream) => {
-                        self.config_watch = Some(stream);
-                        vec![ClientEvent::Config(ConfigEvent::WatchStarted)]
-                    }
-                    Err(error) => vec![ClientEvent::Config(ConfigEvent::WatchFailed(error))],
-                }
-            }
-            ClientEffect::Session(SessionEffect::Watch) => {
-                match self.executor.watch_session_updates().await {
-                    Ok(stream) => {
-                        self.session_watch = Some(stream);
-                        vec![ClientEvent::Session(SessionEvent::WatchStarted)]
-                    }
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
-                }
-            }
-            ClientEffect::Session(SessionEffect::WatchTimeline { key }) => {
-                match self
-                    .executor
-                    .watch_session_timeline_updates(
-                        key.session_id.clone(),
-                        key.after_cursor,
-                        key.channels.clone(),
-                        key.initial_limit,
-                    )
-                    .await
-                {
-                    Ok(stream) => {
-                        self.timeline_watches.insert(key.clone(), stream);
-                        vec![ClientEvent::Session(SessionEvent::TimelineWatchStarted {
-                            key,
-                        })]
-                    }
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineWatchFailed {
-                        key,
-                        error,
-                    })],
-                }
-            }
-            effect => self.executor.execute_effect(effect, sleep).await,
-        }
-    }
-
+    #[allow(clippy::future_not_send, reason = "watch streams are locally polled")]
     async fn next_watch_event(&mut self) -> ClientEvent {
         if let Some(result) = self.try_ready_watch_result() {
             return self.watch_result_event(result);
@@ -857,6 +850,10 @@ impl ClientRuntime {
 
     fn active_watch_candidates(&self) -> Vec<WatchCandidate> {
         let mut candidates = Vec::new();
+
+        if !self.reducer.state().permits_protected_requests() {
+            return candidates;
+        }
 
         if self.status_watch.is_some() {
             candidates.push(WatchCandidate::Status);
@@ -890,11 +887,12 @@ impl ClientRuntime {
     fn try_ready_watch_result(&mut self) -> Option<WatchResult> {
         for candidate in self.active_watch_candidates() {
             let result = match candidate {
-                WatchCandidate::Status => self
-                    .status_watch
-                    .as_mut()
-                    .and_then(|stream| stream.next().now_or_never())
-                    .map(WatchResult::Status),
+                WatchCandidate::Status => self.status_watch.as_mut().and_then(|(epoch, stream)| {
+                    stream
+                        .next()
+                        .now_or_never()
+                        .map(|result| WatchResult::Status(*epoch, result))
+                }),
                 WatchCandidate::Config => self
                     .config_watch
                     .as_mut()
@@ -921,13 +919,15 @@ impl ClientRuntime {
         None
     }
 
+    #[allow(clippy::future_not_send, reason = "watch streams are locally polled")]
     async fn next_pending_watch_result(&mut self) -> WatchResult {
         let mut futures: Vec<LocalBoxFuture<'_, WatchResult>> = Vec::new();
 
-        if let Some(stream) = &mut self.status_watch {
-            futures.push(Box::pin(
-                async move { WatchResult::Status(stream.next().await) },
-            ));
+        if let Some((epoch, stream)) = &mut self.status_watch {
+            let epoch = *epoch;
+            futures.push(Box::pin(async move {
+                WatchResult::Status(epoch, stream.next().await)
+            }));
         }
 
         if self.reducer.state().config.watch.interests > 0
@@ -964,7 +964,7 @@ impl ClientRuntime {
         }
 
         if futures.is_empty() {
-            return WatchResult::Status(Some(Ok(crate::SystemStatus::default())));
+            return WatchResult::Status(0, Some(Ok(crate::SystemStatus::default())));
         }
 
         let (result, index, _) = select_all(futures).await;
@@ -974,16 +974,16 @@ impl ClientRuntime {
 
     fn watch_result_event(&mut self, result: WatchResult) -> ClientEvent {
         match result {
-            WatchResult::Status(Some(Ok(status))) => {
-                ClientEvent::Status(StatusEvent::WatchChanged(status))
+            WatchResult::Status(epoch, Some(Ok(status))) => {
+                ClientEvent::Status(StatusEvent::WatchChangedForEpoch { epoch, status })
             }
-            WatchResult::Status(Some(Err(error))) => {
+            WatchResult::Status(epoch, Some(Err(error))) => {
                 self.status_watch = None;
-                ClientEvent::Status(StatusEvent::WatchFailed(error))
+                ClientEvent::Status(StatusEvent::WatchFailedForEpoch { epoch, error })
             }
-            WatchResult::Status(None) => {
+            WatchResult::Status(epoch, None) => {
                 self.status_watch = None;
-                ClientEvent::Status(StatusEvent::WatchEnded)
+                ClientEvent::Status(StatusEvent::WatchEndedForEpoch { epoch })
             }
             WatchResult::Config(Some(Ok(update))) => {
                 ClientEvent::Config(ConfigEvent::WatchChanged(update))
@@ -1020,14 +1020,58 @@ impl ClientRuntime {
             }
         }
     }
+
+    fn suspend_protected_watches(&mut self) {
+        if self.reducer.state().permits_protected_requests() {
+            return;
+        }
+        self.status_watch = None;
+        self.config_watch = None;
+        self.session_watch = None;
+        self.timeline_watches.clear();
+    }
 }
 
 /// Shared client state stream consumed by shell runtimes.
 pub struct ClientStateStream {
     runtime: ClientRuntime,
     phase: ClientStateStreamPhase,
-    effects: Vec<ClientEffect>,
+    effects: Vec<QueuedEffect>,
+    in_flight: Option<InFlightEffect>,
     sleep: ClientSleep,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedEffect {
+    access_generation: u64,
+    effect: ClientEffect,
+}
+
+struct InFlightEffect {
+    access_generation: u64,
+    effect: ClientEffect,
+    future: LocalBoxFuture<'static, ExecutedEffect>,
+}
+
+enum ExecutedEffect {
+    Events(Vec<ClientEvent>),
+    StatusWatch {
+        epoch: u64,
+        result: Result<StatusChangeStream, ClientError>,
+    },
+    ConfigWatch {
+        open_id: u64,
+        result: Result<ConfigWatchUpdateStream, ClientError>,
+    },
+    SessionWatch {
+        open_id: u64,
+        result: Result<SessionWatchUpdateStream, ClientError>,
+    },
+    TimelineWatch {
+        key: TimelineWatchKey,
+        open_id: u64,
+        result: Result<SessionTimelineWatchUpdateStream, ClientError>,
+    },
 }
 
 impl fmt::Debug for ClientStateStream {
@@ -1051,16 +1095,39 @@ impl ClientStateStream {
             runtime,
             phase: ClientStateStreamPhase::WaitForSystemReady,
             effects: Vec::new(),
+            in_flight: None,
             sleep: Rc::new(move |delay_ms| Box::pin(sleep(delay_ms))),
         }
     }
 
     /// Return the next state snapshot from shared startup/config orchestration.
+    #[allow(
+        clippy::future_not_send,
+        reason = "client state is locally polled by UI shells"
+    )]
     pub async fn next(&mut self) -> ClientSnapshot {
         loop {
-            if let Some(effect) = self.effects.pop() {
-                self.apply_effect(effect).await;
+            if self.in_flight.is_none()
+                && let Some(queued) = self.effects.pop()
+            {
+                self.in_flight = Some(self.start_effect(queued));
+            }
+            if let Some(in_flight) = self.in_flight.as_mut() {
+                let executed = in_flight.future.as_mut().await;
+                let access_generation = in_flight.access_generation;
+                let effect = in_flight.effect.clone();
+                self.in_flight = None;
+                self.complete_effect(access_generation, &effect, executed);
                 return self.snapshot();
+            }
+
+            if matches!(
+                self.runtime.reducer.state().access.status,
+                AccessStatus::LoginRequired
+                    | AccessStatus::LoginInProgress
+                    | AccessStatus::LoginFailed
+            ) {
+                pending::<()>().await;
             }
 
             match self.phase {
@@ -1119,6 +1186,10 @@ impl ClientStateStream {
     }
 
     /// Advance until either a client snapshot changes or a command arrives.
+    #[allow(
+        clippy::future_not_send,
+        reason = "client state is locally polled by UI shells"
+    )]
     pub async fn next_or_dispatch<CommandFuture>(
         &mut self,
         command: CommandFuture,
@@ -1163,7 +1234,29 @@ impl ClientStateStream {
     }
 
     fn begin_command(&mut self, command: ClientCommand) -> Result<(), ClientError> {
+        if !self.runtime.reducer.state().permits_protected_requests()
+            && !command_allowed_without_access(&command)
+        {
+            return Err(ClientError::waltr_login_required("Waltr login required"));
+        }
+
+        let access_generation = self.runtime.reducer.state().access_generation;
         let update = match command {
+            ClientCommand::StartWaltrLogin => self.runtime.reducer.start_waltr_login(),
+            ClientCommand::CompleteWaltrLogin { attempt_id } => {
+                self.runtime.reducer.complete_waltr_login(attempt_id)
+            }
+            ClientCommand::FailWaltrLogin { attempt_id, error } => {
+                self.runtime.reducer.fail_waltr_login(attempt_id, error)
+            }
+            ClientCommand::CancelWaltrLogin { attempt_id } => {
+                self.runtime.reducer.cancel_waltr_login(attempt_id)
+            }
+            ClientCommand::ReprobeWaltrAccess => self.runtime.reducer.reprobe_waltr_access(),
+            ClientCommand::LogoutWaltr => self.runtime.reducer.logout_waltr(),
+            ClientCommand::WaltrAccessExpired { error } => {
+                self.runtime.reducer.expire_waltr_access(error)
+            }
             ClientCommand::RequestAuthStatuses
             | ClientCommand::DismissAuthRequirement { .. }
             | ClientCommand::BeginAuth { .. }
@@ -1205,7 +1298,16 @@ impl ClientStateStream {
             ClientCommand::WaitForSystemReady => self.runtime.reducer.maintain_watches(),
         };
 
+        if self.runtime.reducer.state().access_generation != access_generation {
+            self.effects.clear();
+            self.in_flight = None;
+            self.runtime.status_watch = None;
+            self.runtime.config_watch = None;
+            self.runtime.session_watch = None;
+            self.runtime.timeline_watches.clear();
+        }
         self.extend_effects(&update);
+        self.suspend_if_access_lost();
         Ok(())
     }
 
@@ -1275,6 +1377,9 @@ impl ClientStateStream {
                 let update = self.runtime.reducer.release_config_watch_interest();
                 if self.runtime.reducer.state().config.watch.interests == 0 {
                     self.runtime.config_watch = None;
+                    self.cancel_effects(|effect| {
+                        matches!(effect, ClientEffect::Config(ConfigEffect::Watch { .. }))
+                    });
                 }
                 update
             }
@@ -1282,6 +1387,7 @@ impl ClientStateStream {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn begin_session_command(&mut self, command: ClientCommand) -> ClientUpdate {
         match command {
             ClientCommand::CreateSession => self.runtime.reducer.create_session(),
@@ -1319,6 +1425,9 @@ impl ClientStateStream {
                 let update = self.runtime.reducer.release_session_watch_interest();
                 if self.runtime.reducer.state().sessions.watch.interests == 0 {
                     self.runtime.session_watch = None;
+                    self.cancel_effects(|effect| {
+                        matches!(effect, ClientEffect::Session(SessionEffect::Watch { .. }))
+                    });
                 }
                 update
             }
@@ -1429,6 +1538,13 @@ impl ClientStateStream {
                     self.runtime
                         .timeline_watches
                         .retain(|key, _| key.session_id != session_id);
+                    self.cancel_effects(|effect| {
+                        matches!(
+                            effect,
+                            ClientEffect::Session(SessionEffect::WatchTimeline { key, .. })
+                                if key.session_id == session_id
+                        )
+                    });
                 }
                 update
             }
@@ -1436,28 +1552,278 @@ impl ClientStateStream {
         }
     }
 
-    async fn apply_effect(&mut self, effect: ClientEffect) {
+    fn start_effect(&self, queued: QueuedEffect) -> InFlightEffect {
+        let executor = self.runtime.executor.clone();
         let sleep = Rc::clone(&self.sleep);
-        let events = self
-            .runtime
-            .execute_effect(effect, move |delay_ms| sleep(delay_ms))
-            .await;
-
-        for event in events {
-            let update = self.runtime.reducer.apply(event);
-            self.extend_effects(&update);
+        let effect = queued.effect.clone();
+        let future = async move {
+            match queued.effect {
+                ClientEffect::Status(StatusEffect::Watch { epoch }) => {
+                    ExecutedEffect::StatusWatch {
+                        epoch,
+                        result: executor.watch_status().await,
+                    }
+                }
+                ClientEffect::Config(ConfigEffect::Watch { open_id }) => {
+                    ExecutedEffect::ConfigWatch {
+                        open_id,
+                        result: executor.watch_config_updates().await,
+                    }
+                }
+                ClientEffect::Session(SessionEffect::Watch { open_id }) => {
+                    ExecutedEffect::SessionWatch {
+                        open_id,
+                        result: executor.watch_session_updates().await,
+                    }
+                }
+                ClientEffect::Session(SessionEffect::WatchTimeline { key, open_id }) => {
+                    let result = executor
+                        .watch_session_timeline_updates(
+                            key.session_id.clone(),
+                            key.after_cursor,
+                            key.channels.clone(),
+                            key.initial_limit,
+                        )
+                        .await;
+                    ExecutedEffect::TimelineWatch {
+                        key,
+                        open_id,
+                        result,
+                    }
+                }
+                effect => ExecutedEffect::Events(
+                    executor
+                        .execute_effect(effect, move |delay_ms| sleep(delay_ms))
+                        .await,
+                ),
+            }
+        }
+        .boxed_local();
+        InFlightEffect {
+            access_generation: queued.access_generation,
+            effect,
+            future,
         }
     }
 
+    fn complete_effect(
+        &mut self,
+        access_generation: u64,
+        effect: &ClientEffect,
+        executed: ExecutedEffect,
+    ) {
+        if self.runtime.reducer.state().access_generation != access_generation
+            || !self.effect_completion_is_current(effect, &executed)
+        {
+            return;
+        }
+        let events = match executed {
+            ExecutedEffect::Events(events) => events,
+            ExecutedEffect::StatusWatch { epoch, result } => match result {
+                Ok(stream) => {
+                    self.runtime.status_watch = Some((epoch, stream));
+                    vec![ClientEvent::Status(StatusEvent::WatchStartedForEpoch {
+                        epoch,
+                    })]
+                }
+                Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailedForEpoch {
+                    epoch,
+                    error,
+                })],
+            },
+            ExecutedEffect::ConfigWatch { open_id, result } => match result {
+                Ok(stream) => {
+                    self.runtime.config_watch = Some(stream);
+                    vec![ClientEvent::Config(ConfigEvent::WatchStartedForOpen {
+                        open_id,
+                    })]
+                }
+                Err(error) => vec![ClientEvent::Config(ConfigEvent::WatchOpenFailed {
+                    open_id,
+                    error,
+                })],
+            },
+            ExecutedEffect::SessionWatch { open_id, result } => match result {
+                Ok(stream) => {
+                    self.runtime.session_watch = Some(stream);
+                    vec![ClientEvent::Session(SessionEvent::WatchStartedForOpen {
+                        open_id,
+                    })]
+                }
+                Err(error) => vec![ClientEvent::Session(SessionEvent::WatchOpenFailed {
+                    open_id,
+                    error,
+                })],
+            },
+            ExecutedEffect::TimelineWatch {
+                key,
+                open_id,
+                result,
+            } => match result {
+                Ok(stream) => {
+                    self.runtime.timeline_watches.insert(key.clone(), stream);
+                    vec![ClientEvent::Session(
+                        SessionEvent::TimelineWatchStartedForOpen { key, open_id },
+                    )]
+                }
+                Err(error) => vec![ClientEvent::Session(
+                    SessionEvent::TimelineWatchOpenFailed {
+                        key,
+                        open_id,
+                        error,
+                    },
+                )],
+            },
+        };
+
+        for event in events {
+            let update = self
+                .runtime
+                .reducer
+                .apply_for_access_generation(access_generation, event);
+            self.extend_effects(&update);
+            self.suspend_if_access_lost();
+        }
+    }
+
+    #[allow(clippy::future_not_send, reason = "watch streams are locally polled")]
     async fn apply_next_watch_event(&mut self) {
         let event = self.runtime.next_watch_event().await;
         let update = self.runtime.reducer.apply(event);
         self.extend_effects(&update);
+        self.suspend_if_access_lost();
     }
 
     fn extend_effects(&mut self, update: &ClientUpdate) {
-        self.effects.extend(update.effects().iter().cloned().rev());
+        let access_generation = self.runtime.reducer.state().access_generation;
+        self.effects.extend(
+            update
+                .effects()
+                .iter()
+                .cloned()
+                .rev()
+                .map(|effect| QueuedEffect {
+                    access_generation,
+                    effect,
+                }),
+        );
     }
+
+    fn cancel_effects(&mut self, matches: impl Fn(&ClientEffect) -> bool) {
+        self.effects.retain(|queued| !matches(&queued.effect));
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|in_flight| matches(&in_flight.effect))
+        {
+            self.in_flight = None;
+        }
+    }
+
+    fn effect_completion_is_current(
+        &self,
+        effect: &ClientEffect,
+        executed: &ExecutedEffect,
+    ) -> bool {
+        match (effect, executed) {
+            (
+                ClientEffect::Config(ConfigEffect::Watch {
+                    open_id: effect_open_id,
+                }),
+                ExecutedEffect::ConfigWatch {
+                    open_id: executed_open_id,
+                    ..
+                },
+            ) => {
+                effect_open_id == executed_open_id
+                    && self.runtime.reducer.state().config.watch.interests > 0
+                    && self.runtime.reducer.state().config.watch.open_id == Some(*effect_open_id)
+            }
+            (
+                ClientEffect::Session(SessionEffect::Watch {
+                    open_id: effect_open_id,
+                }),
+                ExecutedEffect::SessionWatch {
+                    open_id: executed_open_id,
+                    ..
+                },
+            ) => {
+                effect_open_id == executed_open_id
+                    && self.runtime.reducer.state().sessions.watch.interests > 0
+                    && self.runtime.reducer.state().sessions.watch.open_id == Some(*effect_open_id)
+            }
+            (
+                ClientEffect::Session(SessionEffect::WatchTimeline {
+                    key: effect_key,
+                    open_id: effect_open_id,
+                }),
+                ExecutedEffect::TimelineWatch {
+                    key: executed_key,
+                    open_id: executed_open_id,
+                    ..
+                },
+            ) => {
+                effect_key == executed_key
+                    && effect_open_id == executed_open_id
+                    && self
+                        .runtime
+                        .reducer
+                        .state()
+                        .session_timeline_watch_is_active(effect_key)
+                    && self
+                        .runtime
+                        .reducer
+                        .state()
+                        .sessions
+                        .timelines
+                        .get(&effect_key.session_id)
+                        .and_then(|timeline| timeline.watches.get(effect_key))
+                        .is_some_and(|watch| watch.open_id == Some(*effect_open_id))
+            }
+            (
+                ClientEffect::Status(StatusEffect::Watch {
+                    epoch: effect_epoch,
+                }),
+                ExecutedEffect::StatusWatch {
+                    epoch: executed_epoch,
+                    ..
+                },
+            ) => {
+                effect_epoch == executed_epoch
+                    && self.runtime.reducer.state().status.watch_epoch == *effect_epoch
+                    && self.runtime.reducer.state().status.watch.status == OperationStatus::Loading
+            }
+            (_, ExecutedEffect::Events(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn suspend_if_access_lost(&mut self) {
+        self.runtime.suspend_protected_watches();
+        if !self.runtime.reducer.state().permits_protected_requests() {
+            self.effects.clear();
+            self.in_flight = None;
+        }
+    }
+}
+
+const fn command_allowed_without_access(command: &ClientCommand) -> bool {
+    matches!(
+        command,
+        ClientCommand::StartWaltrLogin
+            | ClientCommand::CompleteWaltrLogin { .. }
+            | ClientCommand::FailWaltrLogin { .. }
+            | ClientCommand::CancelWaltrLogin { .. }
+            | ClientCommand::ReprobeWaltrAccess
+            | ClientCommand::LogoutWaltr
+            | ClientCommand::WaltrAccessExpired { .. }
+            | ClientCommand::RegisterConfigWatchInterest
+            | ClientCommand::ReleaseConfigWatchInterest
+            | ClientCommand::RegisterSessionWatchInterest
+            | ClientCommand::ReleaseSessionWatchInterest
+            | ClientCommand::RegisterSessionTimelineWatchInterest { .. }
+            | ClientCommand::ReleaseSessionTimelineWatchInterest { .. }
+    )
 }
 
 const fn timeline_direction(direction: ClientTimelineDirection) -> TimelineDirection {
@@ -1474,10 +1840,16 @@ enum ClientStateStreamPhase {
 }
 
 impl ClientSnapshot {
+    #[allow(clippy::too_many_lines)]
     fn from_client(client: &Client) -> Self {
         let state = client.state();
 
         Self {
+            access: AccessSnapshot {
+                status: state.access.status,
+                error: state.access.error.clone(),
+                active_attempt_id: state.access.active_attempt_id.clone(),
+            },
             auth: AuthSnapshot {
                 pending: state
                     .auth
@@ -1614,7 +1986,6 @@ impl From<SessionTemplateOption> for SessionTemplateOptionView {
 impl ClientAuthTarget {
     fn into_auth_target(self) -> AuthTarget {
         let target = match self.kind.as_str() {
-            "provider" => waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(self.key),
             "mcpServer" | "mcp_server" => {
                 waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(self.key)
             }
@@ -1672,6 +2043,7 @@ impl From<AuthAttemptState> for AuthAttemptSnapshot {
 }
 
 impl From<ClientOperationState> for ClientOperationView {
+    #[allow(clippy::too_many_lines)]
     fn from(operation: ClientOperationState) -> Self {
         match operation {
             ClientOperationState::AuthBegin {
@@ -1868,9 +2240,12 @@ mod tests {
         runtime
             .reducer
             .apply(ClientEvent::Config(ConfigEvent::WatchStarted));
-        runtime.status_watch = Some(Box::pin(stream::once(async {
-            Err(ClientError::new("status ended"))
-        })));
+        runtime.status_watch = Some((
+            0,
+            Box::pin(stream::once(async {
+                Err(ClientError::new("status ended"))
+            })),
+        ));
         runtime.config_watch = Some(Box::pin(stream::pending::<Result<ConfigWatchUpdate, _>>()));
 
         let event = runtime.next_watch_event().await;
@@ -1884,6 +2259,7 @@ mod tests {
             update.effects(),
             [ClientEffect::Status(StatusEffect::SleepReconnect {
                 delay_ms: 500,
+                ..
             })]
         ));
     }
@@ -1910,9 +2286,12 @@ mod tests {
             .apply(ClientEvent::Session(SessionEvent::TimelineWatchStarted {
                 key: key.clone(),
             }));
-        runtime.status_watch = Some(Box::pin(stream::once(async {
-            Err(ClientError::new("status transport lost"))
-        })));
+        runtime.status_watch = Some((
+            0,
+            Box::pin(stream::once(async {
+                Err(ClientError::new("status transport lost"))
+            })),
+        ));
         runtime.timeline_watches.insert(
             key,
             Box::pin(stream::iter((1..=16).map(|cursor| {
@@ -1998,7 +2377,7 @@ mod tests {
         runtime
             .reducer
             .apply(ClientEvent::Config(ConfigEvent::WatchStarted));
-        runtime.status_watch = Some(Box::pin(stream::pending::<Result<SystemStatus, _>>()));
+        runtime.status_watch = Some((0, Box::pin(stream::pending::<Result<SystemStatus, _>>())));
         runtime.config_watch = Some(Box::pin(stream::once(async {
             Err(ClientError::new("config transport lost"))
         })));
@@ -2018,6 +2397,212 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn logout_drops_runtime_watch_handles_and_queued_protected_effects() {
+        let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
+        runtime
+            .reducer
+            .apply(ClientEvent::Status(StatusEvent::WatchChanged(
+                SystemStatus { ready: true },
+            )));
+        runtime
+            .reducer
+            .apply(ClientEvent::Config(ConfigEvent::WatchInterestRegistered));
+        runtime.status_watch = Some((0, Box::pin(stream::pending())));
+        runtime.config_watch = Some(Box::pin(stream::pending()));
+        let mut stream = ClientStateStream {
+            runtime,
+            phase: ClientStateStreamPhase::Ready,
+            effects: vec![QueuedEffect {
+                access_generation: 0,
+                effect: ClientEffect::Config(ConfigEffect::Watch { open_id: 1 }),
+            }],
+            in_flight: None,
+            sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
+        };
+
+        stream
+            .begin_command(ClientCommand::LogoutWaltr)
+            .expect("logout fact should be accepted");
+
+        assert!(stream.runtime.status_watch.is_none());
+        assert!(stream.runtime.config_watch.is_none());
+        assert!(matches!(
+            stream.effects.as_slice(),
+            [QueuedEffect {
+                effect: ClientEffect::Status(StatusEffect::Watch { .. }),
+                ..
+            }]
+        ));
+        assert_eq!(
+            stream.snapshot().access.status,
+            AccessStatus::UnknownChecking
+        );
+        assert_eq!(stream.snapshot().config.watch.status, "idle");
+    }
+
+    #[test]
+    fn proactive_access_expiry_command_suspends_runtime_without_logging_out() {
+        let mut stream = ClientStateStream {
+            runtime: ClientRuntime::for_endpoint("http://127.0.0.1:0"),
+            phase: ClientStateStreamPhase::Ready,
+            effects: Vec::new(),
+            in_flight: None,
+            sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
+        };
+        stream.runtime.reducer.require_auth(
+            AuthTarget {
+                target: Some(
+                    waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
+                        "anthropic".to_owned(),
+                    ),
+                ),
+            },
+            "provider requirement",
+            None,
+        );
+        stream.runtime.status_watch = Some((0, Box::pin(stream::pending())));
+
+        stream
+            .begin_command(ClientCommand::WaltrAccessExpired {
+                error: "refresh failed".to_owned(),
+            })
+            .expect("platform expiry should be accepted");
+
+        assert!(stream.runtime.status_watch.is_none());
+        assert_eq!(stream.snapshot().access.status, AccessStatus::LoginRequired);
+        assert_eq!(
+            stream.snapshot().access.error.as_deref(),
+            Some("refresh failed")
+        );
+        assert_eq!(stream.snapshot().auth.pending.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn transient_reprobe_command_keeps_all_watch_interests() {
+        let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
+        runtime
+            .reducer
+            .apply(ClientEvent::Status(StatusEvent::WatchChanged(
+                SystemStatus { ready: true },
+            )));
+        drop(runtime.reducer.register_config_watch_interest());
+        drop(runtime.reducer.register_session_watch_interest());
+        drop(runtime.reducer.register_session_timeline_watch_interest(
+            "session",
+            Some(0),
+            Vec::new(),
+            None,
+        ));
+        runtime
+            .reducer
+            .apply(ClientEvent::Config(ConfigEvent::Loaded(
+                crate::Configuration {
+                    etag: "etag-1".to_owned(),
+                    ..crate::Configuration::default()
+                },
+            )));
+        runtime
+            .reducer
+            .apply(ClientEvent::Session(SessionEvent::Listed(vec![
+                crate::SessionSummary {
+                    id: "session".to_owned(),
+                    ..crate::SessionSummary::default()
+                },
+            ])));
+        runtime
+            .reducer
+            .apply(ClientEvent::Status(StatusEvent::WatchFailed(
+                ClientError::waltr_login_required("current credential rejected"),
+            )));
+        let mut stream = ClientStateStream {
+            runtime,
+            phase: ClientStateStreamPhase::Ready,
+            effects: Vec::new(),
+            in_flight: None,
+            sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
+        };
+
+        stream
+            .begin_command(ClientCommand::ReprobeWaltrAccess)
+            .expect("transient reprobe should be accepted without access");
+
+        let state = stream.runtime.reducer.state();
+        assert_eq!(state.access.status, AccessStatus::UnknownChecking);
+        assert_eq!(state.config.watch.interests, 1);
+        assert_eq!(state.sessions.watch.interests, 1);
+        assert_eq!(state.timeline_watch_keys().len(), 1);
+        assert!(state.access.reload_config);
+        assert!(state.access.reload_sessions);
+        assert!(matches!(
+            stream.effects.as_slice(),
+            [QueuedEffect {
+                effect: ClientEffect::Status(StatusEffect::Watch { .. }),
+                ..
+            }]
+        ));
+
+        stream.effects.clear();
+        let epoch = stream.runtime.reducer.state().status.watch_epoch;
+        let update =
+            stream
+                .runtime
+                .reducer
+                .apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+                    epoch,
+                    status: SystemStatus { ready: true },
+                }));
+        assert!(matches!(
+            update.effects(),
+            [
+                ClientEffect::Config(ConfigEffect::Watch { .. }),
+                ClientEffect::Session(SessionEffect::Watch { .. }),
+                ClientEffect::Config(ConfigEffect::Load),
+                ClientEffect::Session(SessionEffect::List),
+            ]
+        ));
+        stream.extend_effects(&update);
+        assert_eq!(stream.effects.len(), 4);
+        assert!(matches!(
+            stream.runtime.reducer.maintain_watches().effects(),
+            [ClientEffect::Session(SessionEffect::WatchTimeline { .. })]
+        ));
+        let state = stream.runtime.reducer.state();
+        assert_eq!(state.access.status, AccessStatus::Authenticated);
+        assert_eq!(state.config.watch.interests, 1);
+        assert_eq!(state.sessions.watch.interests, 1);
+        assert_eq!(state.timeline_watch_keys().len(), 1);
+        assert!(!state.access.reload_config);
+        assert!(!state.access.reload_sessions);
+    }
+
+    #[test]
+    fn proactive_access_expiry_command_has_stable_json_contract() {
+        let json = serde_json::to_value(ClientCommand::WaltrAccessExpired {
+            error: "token expired".to_owned(),
+        })
+        .expect("command should serialize");
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "waltrAccessExpired",
+                "error": "token expired",
+            })
+        );
+        assert!(ClientCommand::decl().contains("waltrAccessExpired"));
+    }
+
+    #[test]
+    fn transient_reprobe_command_has_stable_json_contract() {
+        let json = serde_json::to_value(ClientCommand::ReprobeWaltrAccess)
+            .expect("command should serialize");
+
+        assert_eq!(json, serde_json::json!({ "type": "reprobeWaltrAccess" }));
+        assert!(ClientCommand::decl().contains("reprobeWaltrAccess"));
+    }
+
     #[tokio::test]
     async fn ready_state_without_config_interest_yields_without_waiting_for_status_watch() {
         let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
@@ -2026,11 +2611,12 @@ mod tests {
             .apply(ClientEvent::Status(StatusEvent::WatchChanged(
                 SystemStatus { ready: true },
             )));
-        runtime.status_watch = Some(Box::pin(stream::pending::<Result<SystemStatus, _>>()));
+        runtime.status_watch = Some((0, Box::pin(stream::pending::<Result<SystemStatus, _>>())));
         let mut stream = ClientStateStream {
             runtime,
             phase: ClientStateStreamPhase::Ready,
             effects: Vec::new(),
+            in_flight: None,
             sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
         };
 
@@ -2042,12 +2628,329 @@ mod tests {
         assert_eq!(snapshot.config.watch.status, "idle");
     }
 
+    #[tokio::test]
+    async fn command_preemption_preserves_in_flight_effect() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let started_tx = Rc::new(std::cell::RefCell::new(Some(started_tx)));
+        let release_rx = Rc::new(std::cell::RefCell::new(Some(release_rx)));
+        let mut stream = ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream({
+            let started_tx = Rc::clone(&started_tx);
+            let release_rx = Rc::clone(&release_rx);
+            move |_| {
+                let started_tx = started_tx.borrow_mut().take();
+                let release_rx = release_rx.borrow_mut().take();
+                async move {
+                    started_tx.expect("sleep should start once").send(()).ok();
+                    release_rx
+                        .expect("sleep should wait once")
+                        .await
+                        .expect("sleep release should arrive");
+                }
+            }
+        });
+        stream.phase = ClientStateStreamPhase::Ready;
+        stream.effects.push(QueuedEffect {
+            access_generation: stream.runtime.reducer.state().access_generation,
+            effect: ClientEffect::Config(ConfigEffect::SleepReconnect { delay_ms: 1 }),
+        });
+
+        let event = stream
+            .next_or_dispatch(async move {
+                started_rx.await.ok()?;
+                Some(ClientCommandRequest::new(
+                    ClientCommand::RegisterConfigWatchInterest,
+                ))
+            })
+            .await;
+        assert!(matches!(event, ClientStateStreamEvent::Snapshot(_)));
+        assert!(stream.in_flight.is_some());
+
+        release_tx.send(()).expect("effect should still be alive");
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+            .await
+            .expect("preserved effect should complete");
+        assert!(stream.in_flight.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_config_interest_release_cancels_open_and_queues_one_fresh_reopen() {
+        let mut stream = ready_state_stream();
+        stream
+            .begin_command(ClientCommand::RegisterConfigWatchInterest)
+            .expect("config interest should register");
+        let queued = stream.effects.pop().expect("config open should queue");
+        let effect = queued.effect.clone();
+        let generation = queued.access_generation;
+        let ClientEffect::Config(ConfigEffect::Watch {
+            open_id: old_open_id,
+        }) = effect
+        else {
+            panic!("config open effect should carry identity");
+        };
+        stream.effects.push(queued.clone());
+        let (in_flight, started, release) = controlled_in_flight(
+            queued,
+            ExecutedEffect::ConfigWatch {
+                open_id: old_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        stream.in_flight = Some(in_flight);
+
+        stream
+            .next_or_dispatch(async move {
+                started.await.ok()?;
+                Some(ClientCommandRequest::new(
+                    ClientCommand::ReleaseConfigWatchInterest,
+                ))
+            })
+            .await;
+
+        assert!(release.send(()).is_err(), "open future should be canceled");
+        assert!(stream.in_flight.is_none());
+        assert!(stream.effects.is_empty());
+        assert!(stream.runtime.config_watch.is_none());
+        assert_eq!(stream.runtime.reducer.state().config.watch.interests, 0);
+        stream
+            .begin_command(ClientCommand::RegisterConfigWatchInterest)
+            .expect("config interest should reregister");
+        assert_eq!(stream.effects.len(), 1);
+        let fresh = stream.effects.pop().unwrap();
+        let ClientEffect::Config(ConfigEffect::Watch {
+            open_id: fresh_open_id,
+        }) = fresh.effect.clone()
+        else {
+            panic!("fresh config open should carry identity");
+        };
+        assert!(fresh_open_id > old_open_id);
+        stream.complete_effect(
+            generation,
+            &ClientEffect::Config(ConfigEffect::Watch {
+                open_id: old_open_id,
+            }),
+            ExecutedEffect::ConfigWatch {
+                open_id: old_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        assert!(stream.runtime.config_watch.is_none());
+        stream.complete_effect(
+            fresh.access_generation,
+            &fresh.effect,
+            ExecutedEffect::ConfigWatch {
+                open_id: fresh_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        assert!(stream.runtime.config_watch.is_some());
+    }
+
+    #[tokio::test]
+    async fn final_session_interest_release_cancels_open_and_queues_one_fresh_reopen() {
+        let mut stream = ready_state_stream();
+        stream
+            .begin_command(ClientCommand::RegisterSessionWatchInterest)
+            .expect("session interest should register");
+        let queued = stream.effects.pop().expect("session open should queue");
+        let effect = queued.effect.clone();
+        let generation = queued.access_generation;
+        let ClientEffect::Session(SessionEffect::Watch {
+            open_id: old_open_id,
+        }) = effect
+        else {
+            panic!("session open effect should carry identity");
+        };
+        stream.effects.push(queued.clone());
+        let (in_flight, started, release) = controlled_in_flight(
+            queued,
+            ExecutedEffect::SessionWatch {
+                open_id: old_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        stream.in_flight = Some(in_flight);
+
+        stream
+            .next_or_dispatch(async move {
+                started.await.ok()?;
+                Some(ClientCommandRequest::new(
+                    ClientCommand::ReleaseSessionWatchInterest,
+                ))
+            })
+            .await;
+
+        assert!(release.send(()).is_err(), "open future should be canceled");
+        assert!(stream.in_flight.is_none());
+        assert!(stream.effects.is_empty());
+        assert!(stream.runtime.session_watch.is_none());
+        assert_eq!(stream.runtime.reducer.state().sessions.watch.interests, 0);
+        stream
+            .begin_command(ClientCommand::RegisterSessionWatchInterest)
+            .expect("session interest should reregister");
+        assert_eq!(stream.effects.len(), 1);
+        let fresh = stream.effects.pop().unwrap();
+        let ClientEffect::Session(SessionEffect::Watch {
+            open_id: fresh_open_id,
+        }) = fresh.effect.clone()
+        else {
+            panic!("fresh session open should carry identity");
+        };
+        assert!(fresh_open_id > old_open_id);
+        stream.complete_effect(
+            generation,
+            &ClientEffect::Session(SessionEffect::Watch {
+                open_id: old_open_id,
+            }),
+            ExecutedEffect::SessionWatch {
+                open_id: old_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        assert!(stream.runtime.session_watch.is_none());
+        stream.complete_effect(
+            fresh.access_generation,
+            &fresh.effect,
+            ExecutedEffect::SessionWatch {
+                open_id: fresh_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        assert!(stream.runtime.session_watch.is_some());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn timeline_interest_replacement_cancels_old_open_and_queues_only_new_key() {
+        let mut stream = ready_state_stream();
+        let old_key = TimelineWatchKey::new(
+            "session".to_owned(),
+            Some(1),
+            vec!["old".to_owned()],
+            Some(5),
+        );
+        stream
+            .begin_command(ClientCommand::RegisterSessionTimelineWatchInterest {
+                session_id: old_key.session_id.clone(),
+                after_cursor: old_key.after_cursor,
+                channels: old_key.channels.clone(),
+                initial_limit: old_key.initial_limit,
+            })
+            .expect("old timeline interest should register");
+        let queued = stream.effects.pop().expect("timeline open should queue");
+        let effect = queued.effect.clone();
+        let generation = queued.access_generation;
+        let ClientEffect::Session(SessionEffect::WatchTimeline {
+            open_id: old_open_id,
+            ..
+        }) = effect
+        else {
+            panic!("timeline open effect should carry identity");
+        };
+        stream.effects.push(queued.clone());
+        let (in_flight, started, release) = controlled_in_flight(
+            queued,
+            ExecutedEffect::TimelineWatch {
+                key: old_key.clone(),
+                open_id: old_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        stream.in_flight = Some(in_flight);
+
+        stream
+            .next_or_dispatch(async move {
+                started.await.ok()?;
+                Some(ClientCommandRequest::new(
+                    ClientCommand::ReleaseSessionTimelineWatchInterest {
+                        session_id: "session".to_owned(),
+                    },
+                ))
+            })
+            .await;
+
+        assert!(release.send(()).is_err(), "old open should be canceled");
+        assert!(stream.in_flight.is_none());
+        assert!(stream.effects.is_empty());
+        assert!(stream.runtime.timeline_watches.is_empty());
+        let new_key = old_key.clone();
+        stream
+            .begin_command(ClientCommand::RegisterSessionTimelineWatchInterest {
+                session_id: new_key.session_id.clone(),
+                after_cursor: new_key.after_cursor,
+                channels: new_key.channels.clone(),
+                initial_limit: new_key.initial_limit,
+            })
+            .expect("replacement timeline interest should register");
+        assert_eq!(stream.effects.len(), 1);
+        let fresh = stream.effects.pop().unwrap();
+        let ClientEffect::Session(SessionEffect::WatchTimeline {
+            key: fresh_key,
+            open_id: fresh_open_id,
+        }) = fresh.effect.clone()
+        else {
+            panic!("fresh timeline open should carry identity");
+        };
+        assert_eq!(fresh_key, new_key);
+        assert!(fresh_open_id > old_open_id);
+        stream.complete_effect(
+            generation,
+            &ClientEffect::Session(SessionEffect::WatchTimeline {
+                key: old_key.clone(),
+                open_id: old_open_id,
+            }),
+            ExecutedEffect::TimelineWatch {
+                key: old_key,
+                open_id: old_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        assert!(stream.runtime.timeline_watches.is_empty());
+        stream.complete_effect(
+            fresh.access_generation,
+            &fresh.effect,
+            ExecutedEffect::TimelineWatch {
+                key: fresh_key.clone(),
+                open_id: fresh_open_id,
+                result: Ok(Box::pin(stream::pending())),
+            },
+        );
+        assert!(stream.runtime.timeline_watches.contains_key(&fresh_key));
+    }
+
+    #[tokio::test]
+    async fn denied_state_parks_but_commands_still_wake_stream() {
+        let mut stream =
+            ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream(no_sleep);
+        stream.runtime.reducer.expire_waltr_access("login required");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), stream.next())
+                .await
+                .is_err()
+        );
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            stream.next_or_dispatch(async {
+                Some(ClientCommandRequest::new(ClientCommand::StartWaltrLogin))
+            }),
+        )
+        .await
+        .expect("login command should wake parked stream");
+        let ClientStateStreamEvent::Snapshot(snapshot) = event else {
+            panic!("command should publish a snapshot");
+        };
+        assert_eq!(snapshot.access.status, AccessStatus::LoginInProgress);
+    }
+
     #[test]
     fn request_timeline_command_uses_requested_direction() {
         let mut runtime = ClientStateStream {
             runtime: ClientRuntime::for_endpoint("http://127.0.0.1:0"),
             phase: ClientStateStreamPhase::Ready,
             effects: Vec::new(),
+            in_flight: None,
             sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
         };
 
@@ -2072,6 +2975,46 @@ mod tests {
     }
 
     async fn no_sleep(_: u64) {}
+
+    fn ready_state_stream() -> ClientStateStream {
+        let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
+        runtime
+            .reducer
+            .apply(ClientEvent::Status(StatusEvent::WatchChanged(
+                SystemStatus { ready: true },
+            )));
+        ClientStateStream {
+            runtime,
+            phase: ClientStateStreamPhase::Ready,
+            effects: Vec::new(),
+            in_flight: None,
+            sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
+        }
+    }
+
+    fn controlled_in_flight(
+        queued: QueuedEffect,
+        executed: ExecutedEffect,
+    ) -> (InFlightEffect, oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let effect = queued.effect;
+        let future = async move {
+            started_tx.send(()).ok();
+            release_rx.await.ok();
+            executed
+        }
+        .boxed_local();
+        (
+            InFlightEffect {
+                access_generation: queued.access_generation,
+                effect,
+                future,
+            },
+            started_rx,
+            release_tx,
+        )
+    }
 
     fn register_timeline_watch(runtime: &mut ClientRuntime, key: &TimelineWatchKey) {
         runtime.reducer.apply(ClientEvent::Session(

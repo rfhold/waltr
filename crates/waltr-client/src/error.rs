@@ -4,11 +4,23 @@ use std::fmt;
 
 use crate::AuthTarget;
 
+/// Machine-readable category for a client error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientErrorKind {
+    /// A transport or operation error unrelated to authentication.
+    Other,
+    /// Waltr requires provider or upstream MCP credentials.
+    AuthorizationRequired,
+    /// The caller must authenticate for access to Waltr itself.
+    WaltrLoginRequired,
+}
+
 /// Error surfaced by client transports or state transitions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientError {
     message: String,
     auth_target: Option<AuthTarget>,
+    kind: ClientErrorKind,
 }
 
 impl ClientError {
@@ -18,6 +30,7 @@ impl ClientError {
         Self {
             message: message.into(),
             auth_target: None,
+            kind: ClientErrorKind::Other,
         }
     }
 
@@ -27,6 +40,17 @@ impl ClientError {
         Self {
             message: message.into(),
             auth_target: Some(target),
+            kind: ClientErrorKind::AuthorizationRequired,
+        }
+    }
+
+    /// Create an error indicating that Waltr access login is required.
+    #[must_use]
+    pub fn waltr_login_required(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            auth_target: None,
+            kind: ClientErrorKind::WaltrLoginRequired,
         }
     }
 
@@ -40,6 +64,18 @@ impl ClientError {
     #[must_use]
     pub const fn auth_target(&self) -> Option<&AuthTarget> {
         self.auth_target.as_ref()
+    }
+
+    /// Return the machine-readable error category.
+    #[must_use]
+    pub const fn kind(&self) -> ClientErrorKind {
+        self.kind
+    }
+
+    /// Return whether this error requires Waltr access login.
+    #[must_use]
+    pub const fn is_waltr_login_required(&self) -> bool {
+        matches!(self.kind, ClientErrorKind::WaltrLoginRequired)
     }
 }
 

@@ -56,12 +56,24 @@ pub struct GrpcEffectExecutor {
 }
 
 impl GrpcEffectExecutor {
+    /// Create an executor from a runtime-owned default transport.
+    #[must_use]
+    pub const fn with_transport(transport: DefaultGrpcTransport) -> Self {
+        Self { transport }
+    }
+
     /// Create a gRPC effect executor for an endpoint base URL.
     #[must_use]
     pub fn for_endpoint(endpoint: impl Into<String>) -> Self {
         Self {
             transport: DefaultGrpcTransport::new(endpoint),
         }
+    }
+
+    /// Return the underlying transport.
+    #[must_use]
+    pub const fn transport(&self) -> &DefaultGrpcTransport {
+        &self.transport
     }
 
     /// Load the current configuration as the stable shell-facing view model.
@@ -264,16 +276,26 @@ impl GrpcEffectExecutor {
                     error,
                 })],
             },
-            ClientEffect::Config(ConfigEffect::Watch) => {
+            ClientEffect::Config(ConfigEffect::Watch { open_id }) => {
                 match self.transport.watch_config().await {
-                    Ok(_) => vec![ClientEvent::Config(ConfigEvent::WatchStarted)],
-                    Err(error) => vec![ClientEvent::Config(ConfigEvent::WatchFailed(error))],
+                    Ok(_) => vec![ClientEvent::Config(ConfigEvent::WatchStartedForOpen {
+                        open_id,
+                    })],
+                    Err(error) => vec![ClientEvent::Config(ConfigEvent::WatchOpenFailed {
+                        open_id,
+                        error,
+                    })],
                 }
             }
-            ClientEffect::Status(StatusEffect::Watch) => {
+            ClientEffect::Status(StatusEffect::Watch { epoch }) => {
                 match self.transport.watch_status().await {
-                    Ok(_) => vec![ClientEvent::Status(StatusEvent::WatchStarted)],
-                    Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailed(error))],
+                    Ok(_) => vec![ClientEvent::Status(StatusEvent::WatchStartedForEpoch {
+                        epoch,
+                    })],
+                    Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailedForEpoch {
+                        epoch,
+                        error,
+                    })],
                 }
             }
             ClientEffect::Session(SessionEffect::Create { operation_key }) => {
@@ -389,13 +411,18 @@ impl GrpcEffectExecutor {
                     error,
                 })],
             },
-            ClientEffect::Session(SessionEffect::Watch) => {
+            ClientEffect::Session(SessionEffect::Watch { open_id }) => {
                 match self.transport.watch_sessions().await {
-                    Ok(_) => vec![ClientEvent::Session(SessionEvent::WatchStarted)],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::WatchFailed(error))],
+                    Ok(_) => vec![ClientEvent::Session(SessionEvent::WatchStartedForOpen {
+                        open_id,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::WatchOpenFailed {
+                        open_id,
+                        error,
+                    })],
                 }
             }
-            ClientEffect::Session(SessionEffect::WatchTimeline { key }) => {
+            ClientEffect::Session(SessionEffect::WatchTimeline { key, open_id }) => {
                 match self
                     .transport
                     .watch_timeline(
@@ -406,13 +433,16 @@ impl GrpcEffectExecutor {
                     )
                     .await
                 {
-                    Ok(_) => vec![ClientEvent::Session(SessionEvent::TimelineWatchStarted {
-                        key,
-                    })],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineWatchFailed {
-                        key,
-                        error,
-                    })],
+                    Ok(_) => vec![ClientEvent::Session(
+                        SessionEvent::TimelineWatchStartedForOpen { key, open_id },
+                    )],
+                    Err(error) => vec![ClientEvent::Session(
+                        SessionEvent::TimelineWatchOpenFailed {
+                            key,
+                            open_id,
+                            error,
+                        },
+                    )],
                 }
             }
             ClientEffect::Session(SessionEffect::SubmitUserMessage {
@@ -493,9 +523,11 @@ impl GrpcEffectExecutor {
                 sleep(delay_ms).await;
                 vec![ClientEvent::Config(ConfigEvent::ReconnectReady)]
             }
-            ClientEffect::Status(StatusEffect::SleepReconnect { delay_ms }) => {
+            ClientEffect::Status(StatusEffect::SleepReconnect { epoch, delay_ms }) => {
                 sleep(delay_ms).await;
-                vec![ClientEvent::Status(StatusEvent::ReconnectReady)]
+                vec![ClientEvent::Status(StatusEvent::ReconnectReadyForEpoch {
+                    epoch,
+                })]
             }
             ClientEffect::Session(SessionEffect::SleepReconnect { delay_ms }) => {
                 sleep(delay_ms).await;

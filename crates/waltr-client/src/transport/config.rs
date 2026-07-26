@@ -15,6 +15,10 @@ use crate::{ClientError, ConfigPatch, Configuration};
 /// Stream returned by configuration watch transports.
 pub type ConfigWatchStream = Pin<Box<dyn Stream<Item = Result<ConfigWatchUpdate, ClientError>>>>;
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn get_config<T>(transport: &T) -> Result<Configuration, ClientError>
 where
     T: RemoteTransport,
@@ -25,17 +29,22 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     let response = transport
-        .config_client()
+        .config_client(&credentials)
         .await?
         .get_config(GetConfigRequest::default())
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
     Ok(response.config.unwrap_or_default())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn patch_config<T>(
     transport: &T,
     patch: ConfigPatch,
@@ -50,8 +59,9 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     let response = transport
-        .config_client()
+        .config_client(&credentials)
         .await?
         .patch_config(PatchConfigRequest {
             expected_etag,
@@ -64,12 +74,16 @@ where
             runtime_defaults: patch.runtime_defaults,
         })
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
     Ok(response.config.unwrap_or_default())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn watch_config<T>(transport: &T) -> Result<ConfigWatchStream, ClientError>
 where
     T: RemoteTransport,
@@ -80,17 +94,19 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
+    let stream_credentials = credentials.clone();
     let stream = transport
-        .config_client()
+        .config_client(&credentials)
         .await?
         .watch_config(WatchConfigRequest::default())
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner()
-        .map(|response| {
+        .map(move |response| {
             response
                 .map(config_watch_update)
-                .map_err(|error| status_error(&error))
+                .map_err(|error| status_error(&error, &stream_credentials))
         });
 
     Ok(Box::pin(stream))

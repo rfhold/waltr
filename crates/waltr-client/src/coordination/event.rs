@@ -2,10 +2,10 @@
 
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
-    AuthStatus, AuthTarget, ClientError, Configuration, GenericAuthAttempt, OperationKey, Provider,
-    RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest, SessionSummary,
-    SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus,
-    TimelineEvent, TimelineQuery, TimelineWatchKey,
+    AccessAttemptId, AuthStatus, AuthTarget, ClientError, Configuration, GenericAuthAttempt,
+    OperationKey, Provider, RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest,
+    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
+    SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -15,6 +15,8 @@ pub type StreamId = u64;
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEvent {
+    /// Waltr access authentication event.
+    Access(AccessEvent),
     /// Auth coordination event.
     Auth(AuthEvent),
     /// Configuration coordination event.
@@ -25,6 +27,39 @@ pub enum ClientEvent {
     Session(SessionEvent),
     /// A model or tool stream coordination event.
     Stream(StreamEvent),
+}
+
+/// Waltr access authentication facts applied to the reducer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AccessEvent {
+    /// A protected endpoint rejected the current Waltr access credentials.
+    LoginRequired {
+        /// Optional safe error text to present to the user.
+        error: Option<String>,
+    },
+    /// A platform-specific login flow started.
+    LoginStarted,
+    /// A platform-specific login flow installed usable credentials.
+    LoginCompleted {
+        /// Attempt generation that installed credentials.
+        attempt_id: AccessAttemptId,
+    },
+    /// A platform-specific login flow failed.
+    LoginFailed {
+        /// Attempt generation that failed.
+        attempt_id: AccessAttemptId,
+        /// Safe failure text to present to the user.
+        error: String,
+    },
+    /// A platform-specific login flow was canceled.
+    LoginCanceled {
+        /// Attempt generation that was canceled.
+        attempt_id: AccessAttemptId,
+    },
+    /// Reprobe access after the current native credential was already cleared.
+    ReprobeRequested,
+    /// The platform removed the current Waltr access credentials.
+    LoggedOut,
 }
 
 /// Auth coordination event applied to the reducer.
@@ -171,6 +206,18 @@ pub enum ConfigEvent {
     WatchInterestReleased,
     /// The configuration watch stream opened.
     WatchStarted,
+    /// A generated configuration watch open completed.
+    WatchStartedForOpen {
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+    },
+    /// A generated configuration watch open failed.
+    WatchOpenFailed {
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+        /// Open failure.
+        error: ClientError,
+    },
     /// The configuration watch stream produced an update.
     WatchChanged(ConfigWatchUpdate),
     /// The configuration watch stream failed.
@@ -188,14 +235,43 @@ pub enum StatusEvent {
     WatchRequested,
     /// The status watch stream opened.
     WatchStarted,
+    /// A generated status watch stream opened.
+    WatchStartedForEpoch {
+        /// Status watch generation that opened.
+        epoch: u64,
+    },
     /// The status watch stream produced a status snapshot.
     WatchChanged(SystemStatus),
+    /// A generated status watch stream produced a protected status response.
+    WatchChangedForEpoch {
+        /// Status watch generation that produced the response.
+        epoch: u64,
+        /// Protected system status response.
+        status: SystemStatus,
+    },
     /// The status watch stream failed.
     WatchFailed(ClientError),
+    /// A generated status watch stream failed.
+    WatchFailedForEpoch {
+        /// Status watch generation that failed.
+        epoch: u64,
+        /// Transport failure.
+        error: ClientError,
+    },
     /// The status watch stream ended.
     WatchEnded,
+    /// A generated status watch stream ended.
+    WatchEndedForEpoch {
+        /// Status watch generation that ended.
+        epoch: u64,
+    },
     /// The status watch retry delay elapsed.
     ReconnectReady,
+    /// A generated status watch retry delay elapsed.
+    ReconnectReadyForEpoch {
+        /// Status watch generation whose retry delay elapsed.
+        epoch: u64,
+    },
 }
 
 /// Session coordination event applied to the reducer.
@@ -346,6 +422,22 @@ pub enum SessionEvent {
         /// Timeline watch identity that opened.
         key: TimelineWatchKey,
     },
+    /// A generated session timeline watch open completed.
+    TimelineWatchStartedForOpen {
+        /// Timeline watch identity.
+        key: TimelineWatchKey,
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+    },
+    /// A generated session timeline watch open failed.
+    TimelineWatchOpenFailed {
+        /// Timeline watch identity.
+        key: TimelineWatchKey,
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+        /// Open failure.
+        error: ClientError,
+    },
     /// A session timeline watch stream produced an update.
     TimelineWatchChanged {
         /// Timeline watch identity that produced the update.
@@ -492,6 +584,18 @@ pub enum SessionEvent {
     WatchInterestReleased,
     /// The session watch stream opened.
     WatchStarted,
+    /// A generated session watch open completed.
+    WatchStartedForOpen {
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+    },
+    /// A generated session watch open failed.
+    WatchOpenFailed {
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+        /// Open failure.
+        error: ClientError,
+    },
     /// The session watch stream produced an update.
     WatchChanged(SessionWatchUpdate),
     /// The session watch stream failed.
@@ -517,7 +621,7 @@ pub enum ClientEffect {
 }
 
 /// Auth side-effect intent emitted by the client.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthEffect {
     /// List secret-safe auth statuses.
     ListStatuses,
@@ -580,7 +684,10 @@ pub enum ConfigEffect {
         expected_etag: String,
     },
     /// Open or continue the configuration watch stream.
-    Watch,
+    Watch {
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+    },
     /// Sleep before attempting a configuration watch reconnect.
     SleepReconnect {
         /// Delay duration in milliseconds.
@@ -592,9 +699,14 @@ pub enum ConfigEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusEffect {
     /// Open or continue the status watch stream.
-    Watch,
+    Watch {
+        /// Monotonic status watch generation.
+        epoch: u64,
+    },
     /// Sleep before attempting a status watch reconnect.
     SleepReconnect {
+        /// Status watch generation being retried.
+        epoch: u64,
         /// Delay duration in milliseconds.
         delay_ms: u64,
     },
@@ -651,11 +763,16 @@ pub enum SessionEffect {
         cursor: Option<u32>,
     },
     /// Open or continue the session watch stream.
-    Watch,
+    Watch {
+        /// Monotonic open-attempt identity.
+        open_id: u64,
+    },
     /// Open or continue one session timeline watch stream.
     WatchTimeline {
         /// Timeline watch identity to open.
         key: TimelineWatchKey,
+        /// Monotonic identity for this open attempt.
+        open_id: u64,
     },
     /// Submit a user message to a session.
     SubmitUserMessage {
