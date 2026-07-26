@@ -1,70 +1,316 @@
 services:
   waltr:
+    profiles:
+      - dev
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${WALTR_SERVER_WEB_IMAGE:-waltr-server-web:local}
+      target: runtime
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
-      WALTR_AUTH_PATH: ${WALTR_AUTH_PATH:-/data/auth.json}
-      WALTR_SESSION_FILESYSTEM_ROOT: ${WALTR_SESSION_FILESYSTEM_ROOT:-/data/sessions}
-      WALTR_SESSION_STORE: ${WALTR_SESSION_STORE:-filesystem}
-      WALTR_MCP_OAUTH_CLIENT_ID: ${WALTR_MCP_OAUTH_CLIENT_ID:-waltr-test}
-      WALTR_MCP_OAUTH_REDIRECT_URI: ${WALTR_MCP_OAUTH_REDIRECT_URI:-http://waltr:14333/oauth/callback}
-    env_file:
-      - path: ${WALTR_COMPOSE_ENV_FILE:-./.dev/compose.env}
-        required: false
+      WALTR_AUTH_MODE: disabled
+      WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
+      WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
+      WALTR_AUTH_PATH: /data/auth.json
+      WALTR_SESSION_STORE: filesystem
+      WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
+      WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
     ports:
-      - "${WALTR_SERVER_WEB_PORT:-14333}:14333"
+      - "127.0.0.1:14333:14333"
     volumes:
-      - ${WALTR_DATA_ROOT:-waltr-data}:/data
+      - waltr-dev-data:/data
+      - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
 
-  k6:
+  waltr-test:
     profiles:
       - test
-    image: grafana/k6:1.3.0-with-browser
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test-runtime
     depends_on:
-      - waltr
-      - dex
-      - mcp
-    working_dir: /workspace
+      dex:
+        condition: service_healthy
+      mcp:
+        condition: service_healthy
     environment:
-      K6_BROWSER_HEADLESS: ${K6_BROWSER_HEADLESS:-true}
-      WALTR_WEB_BASE_URL: http://waltr:14333
-      WALTR_WEB_SCREENSHOTS: ${WALTR_WEB_SCREENSHOTS:-0}
-      WALTR_WEB_SCREENSHOTS_DIR: /screenshots
-      WALTR_AGENT_LIVE_GATEWAY: ${WALTR_AGENT_LIVE_GATEWAY:-0}
-      WALTR_OAUTH_AUTH_URL: ${WALTR_OAUTH_AUTH_URL:-}
-      WALTR_OAUTH_ISSUER: ${WALTR_OAUTH_ISSUER:-http://dex:5556/dex}
-      WALTR_OAUTH_CLIENT_ID: ${WALTR_OAUTH_CLIENT_ID:-waltr-test}
-      WALTR_OAUTH_REDIRECT_URI: ${WALTR_OAUTH_REDIRECT_URI:-http://127.0.0.1/oauth/callback}
-      WALTR_OAUTH_USERNAME: ${WALTR_OAUTH_USERNAME:-waltr@example.test}
-      WALTR_OAUTH_PASSWORD: ${WALTR_OAUTH_PASSWORD:-password}
+      WALTR_SERVER_ADDR: 0.0.0.0:14333
+      WALTR_AUTH_MODE: disabled
+      WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
+      WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
+      WALTR_AUTH_PATH: /data/auth.json
+      WALTR_SESSION_STORE: filesystem
+      WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
+      WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    tmpfs:
+      - /data
+    networks:
+      test:
+        aliases:
+          - waltr
     volumes:
-      - .:/workspace:ro
-      - ${WALTR_WEB_SCREENSHOTS_HOST_DIR:-/tmp/waltr-web-screenshots}:/screenshots:rw
+      - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
 
   dex:
     profiles:
       - test
     image: ghcr.io/dexidp/dex:v2.41.1
     command: ["dex", "serve", "/etc/dex/config.yaml"]
-    ports:
-      - "${WALTR_DEX_PORT:-5556}:5556"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:5556/dex/.well-known/openid-configuration"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - test
     volumes:
       - ./tests/web/k6/support/dex-config.yaml:/etc/dex/config.yaml:ro
 
   mcp:
     profiles:
       - test
-    image: ${WALTR_SERVER_WEB_IMAGE:-waltr-server-web:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test-runtime
     command: ["waltr-agent-test-mcp-server", "--http", "0.0.0.0:14666"]
     depends_on:
-      - dex
+      dex:
+        condition: service_healthy
     environment:
-      WALTR_TEST_MCP_OAUTH_ISSUER: ${WALTR_MCP_OAUTH_ISSUER:-http://dex:5556/dex}
-      WALTR_TEST_MCP_OAUTH_CLIENT_ID: ${WALTR_MCP_OAUTH_CLIENT_ID:-waltr-test}
+      WALTR_TEST_MCP_OAUTH_ISSUER: http://dex:5556/dex
+      WALTR_TEST_MCP_OAUTH_CLIENT_ID: waltr-test
       WALTR_TEST_MCP_RESOURCE: http://mcp:14666/mcp
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--show-error", "--max-time", "2", "--output", "/dev/null", "--request", "POST", "--header", "Content-Type: application/json", "--data", "{}", "http://127.0.0.1:14666/mcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      - test
+
+  k6:
+    profiles:
+      - test
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: k6-browser
+    depends_on:
+      dex:
+        condition: service_healthy
+      waltr-test:
+        condition: service_healthy
+      mcp:
+        condition: service_healthy
+    working_dir: /workspace
+    environment:
+      K6_BROWSER_HEADLESS: "true"
+      WALTR_WEB_ACCESS_AUTH: disabled
+      WALTR_WEB_BASE_URL: http://waltr-test:14333
+      WALTR_WEB_SCREENSHOTS: "0"
+      WALTR_WEB_SCREENSHOTS_DIR: /screenshots
+      WALTR_AGENT_LIVE_GATEWAY: "0"
+      WALTR_OAUTH_AUTH_URL: ""
+      WALTR_OAUTH_ISSUER: http://dex:5556/dex
+      WALTR_OAUTH_CLIENT_ID: waltr-test
+      WALTR_OAUTH_REDIRECT_URI: http://waltr:14333/oauth/callback
+      WALTR_OAUTH_USERNAME: waltr@example.test
+      WALTR_OAUTH_PASSWORD: password
+    networks:
+      - test
+    volumes:
+      - .:/workspace:ro
+
+  test-ca:
+    profiles:
+      - test-auth
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test-ca
+    network_mode: none
+    restart: "no"
+    volumes:
+      - test-ca-public:/test-ca-public
+      - test-ca-caddy:/test-ca-caddy
+
+  auth-proxy:
+    profiles:
+      - test-auth
+    image: caddy:2.10.2-alpine
+    depends_on:
+      test-ca:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:2015/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      test-auth:
+        aliases:
+          - waltr.test
+          - dex.test
+    volumes:
+      - ./tests/web/k6/support/Caddyfile.auth:/etc/caddy/Caddyfile:ro
+      - test-ca-caddy:/test-ca-caddy:ro
+
+  dex-auth:
+    profiles:
+      - test-auth
+    image: ghcr.io/dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:5556/.well-known/openid-configuration"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - test-auth
+    volumes:
+      - ./tests/web/k6/support/dex-auth-config.yaml:/etc/dex/config.yaml:ro
+
+  waltr-auth:
+    profiles:
+      - test-auth
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test-runtime
+    command:
+      - /bin/sh
+      - -c
+      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && KEY=$$(head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=') && printf '{"schema_version":1,"active":"compose-v1","keys":[{"id":"compose-v1","key":"%s"}]}' "$$KEY" > /run/waltr-mcp-oauth/keyring.json && chmod 0440 /run/waltr-mcp-oauth/keyring.json && chown 65532:65532 /run/waltr-mcp-oauth/keyring.json && exec waltr-server
+    depends_on:
+      auth-proxy:
+        condition: service_healthy
+      dex-auth:
+        condition: service_healthy
+      test-ca:
+        condition: service_completed_successfully
+    environment:
+      WALTR_SERVER_ADDR: 0.0.0.0:14333
+      WALTR_AUTH_MODE: oidc
+      WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
+      WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
+      WALTR_AUTH_PATH: /data/auth.json
+      WALTR_SESSION_STORE: filesystem
+      WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
+      WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
+      WALTR_MCP_REQUIRED_SCOPES: mcp:use
+      WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE: /run/waltr-mcp-oauth/keyring.json
+      WALTR_OIDC_ISSUER: https://dex.test
+      WALTR_OIDC_CLIENT_ID: waltr-access-test
+      WALTR_OIDC_CLIENT_SECRET: waltr-access-test-secret
+      WALTR_OIDC_REDIRECT_URI: https://waltr.test/oidc/callback
+      WALTR_PUBLIC_URL: https://waltr.test
+      WALTR_OIDC_AUDIENCE: waltr-access-test
+      WALTR_OIDC_SCOPES: openid email profile
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:14333/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    tmpfs:
+      - /data
+      - /run/waltr-mcp-oauth:mode=0750,uid=65532,gid=65532
+    networks:
+      - test-auth
+    volumes:
+      - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
+      - test-ca-public:/test-ca-public:ro
+
+  mcp-auth:
+    profiles:
+      - test-auth
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test-runtime
+    command:
+      - /bin/sh
+      - -c
+      - cp /test-ca-public/ca.crt /usr/local/share/ca-certificates/waltr-test.crt && update-ca-certificates >/dev/null && exec waltr-agent-test-mcp-server --http 0.0.0.0:14666
+    depends_on:
+      auth-proxy:
+        condition: service_healthy
+      dex-auth:
+        condition: service_healthy
+      test-ca:
+        condition: service_completed_successfully
+    environment:
+      WALTR_TEST_MCP_OAUTH_ISSUER: https://dex.test
+      WALTR_TEST_MCP_OAUTH_CLIENT_ID: waltr-test
+      WALTR_TEST_MCP_RESOURCE: http://mcp:14666/mcp
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--show-error", "--max-time", "2", "--output", "/dev/null", "--request", "POST", "--header", "Content-Type: application/json", "--data", "{}", "http://127.0.0.1:14666/mcp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      test-auth:
+        aliases:
+          - mcp
+    volumes:
+      - test-ca-public:/test-ca-public:ro
+
+  k6-auth:
+    profiles:
+      - test-auth
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: k6-browser
+    depends_on:
+      auth-proxy:
+        condition: service_healthy
+      dex-auth:
+        condition: service_healthy
+      waltr-auth:
+        condition: service_healthy
+      mcp-auth:
+        condition: service_healthy
+      test-ca:
+        condition: service_completed_successfully
+    working_dir: /workspace
+    environment:
+      K6_BROWSER_HEADLESS: "true"
+      WALTR_WEB_ACCESS_AUTH: oidc
+      WALTR_WEB_BASE_URL: https://waltr.test
+      WALTR_WEB_SCREENSHOTS: "0"
+      WALTR_WEB_SCREENSHOTS_DIR: /screenshots
+      WALTR_AGENT_LIVE_GATEWAY: "0"
+      WALTR_OAUTH_AUTH_URL: ""
+      WALTR_OAUTH_ISSUER: https://dex.test
+      WALTR_OAUTH_CLIENT_ID: waltr-test
+      WALTR_OAUTH_REDIRECT_URI: https://waltr.test/oauth/callback
+      WALTR_OAUTH_USERNAME: waltr@example.test
+      WALTR_OAUTH_PASSWORD: password
+      SSL_CERT_FILE: /test-ca-public/ca.crt
+    networks:
+      - test-auth
+    volumes:
+      - .:/workspace:ro
+      - test-ca-public:/test-ca-public:ro
 
 volumes:
-  waltr-data:
+  waltr-dev-data:
+  test-ca-public:
+  test-ca-caddy:
+
+networks:
+  test:
+    internal: true
+  test-auth:
+    internal: true

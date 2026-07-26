@@ -2,6 +2,17 @@ import { check, sleep } from "k6";
 
 import { includesText, normalizeWhitespace } from "./text.js";
 
+export async function gotoWithCertVerifierRetry(page, url, options) {
+  try {
+    return await page.goto(url, options);
+  } catch (error) {
+    if (!String(error).includes("ERR_CERT_VERIFIER_CHANGED")) {
+      throw error;
+    }
+    return page.goto(url, options);
+  }
+}
+
 export async function waitForButton(page, label) {
   const deadline = Date.now() + 10_000;
   let labels = [];
