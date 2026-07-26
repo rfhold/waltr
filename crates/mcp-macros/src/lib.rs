@@ -19,7 +19,7 @@ use syn::{
 pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ServerArgs);
     let input = parse_macro_input!(input as ItemImpl);
-    expand_mcp_server(args, input)
+    expand_mcp_server(&args, input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -33,12 +33,12 @@ pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
 pub fn progressive_server(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as progressive::ProgressiveArgs);
     let input = parse_macro_input!(input as ItemImpl);
-    progressive::expand_progressive_server(args, input)
+    progressive::expand_progressive_server(&args, input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
 
-fn expand_mcp_server(args: ServerArgs, mut input: ItemImpl) -> syn::Result<TokenStream2> {
+fn expand_mcp_server(args: &ServerArgs, mut input: ItemImpl) -> syn::Result<TokenStream2> {
     let self_ty = input.self_ty.clone();
     let generics = input.generics.clone();
     let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
@@ -91,24 +91,19 @@ fn expand_mcp_server(args: ServerArgs, mut input: ItemImpl) -> syn::Result<Token
         method.attrs = retained_attrs;
     }
 
-    let handler_impl = handler_impl(
-        &args,
-        &self_ty,
-        &impl_generics,
-        where_clause,
-        HandlerParts {
-            tools: &tools,
-            prompts: &prompts,
-            resources: &resources,
-            resource_templates: &resource_templates,
-            completion: completion.as_ref(),
-            log_level: log_level.as_ref(),
-            notifications: &notifications,
-            instructions: instructions.as_ref(),
-        },
-    );
+    let parts = HandlerParts {
+        tools: &tools,
+        prompts: &prompts,
+        resources: &resources,
+        resource_templates: &resource_templates,
+        completion: completion.as_ref(),
+        log_level: log_level.as_ref(),
+        notifications: &notifications,
+        instructions: instructions.as_ref(),
+    };
+    let handler_impl = handler_impl(args, &self_ty, &impl_generics, where_clause, &parts);
     let helpers_impl = helpers_impl(
-        &args,
+        args,
         &self_ty,
         &impl_generics,
         where_clause,
@@ -129,10 +124,10 @@ fn handler_impl(
     self_ty: &syn::Type,
     impl_generics: &syn::ImplGenerics<'_>,
     where_clause: Option<&syn::WhereClause>,
-    parts: HandlerParts<'_>,
+    parts: &HandlerParts<'_>,
 ) -> TokenStream2 {
     let server_info = server_info_impl(args);
-    let capabilities = capabilities_impl(args, &parts);
+    let capabilities = capabilities_impl(args, parts);
     let instructions = instructions_impl(parts.instructions);
     let list_tools = list_tools_impl(parts.tools, args.tools_next_cursor.as_ref());
     let call_tool = call_tool_impl(parts.tools);
@@ -271,7 +266,7 @@ fn call_tool_impl(tools: &[RegisteredMethod]) -> TokenStream2 {
     }
     let branches = tools.iter().map(|tool| {
         let name = tool.attr.required("name");
-        let call = boxed_method_call(&tool.method, quote! { call, context });
+        let call = boxed_method_call(&tool.method, &quote! { call, context });
         quote! {
             if call.name == #name {
                 return #call;
@@ -326,7 +321,7 @@ fn get_prompt_impl(prompts: &[RegisteredMethod]) -> TokenStream2 {
     }
     let branches = prompts.iter().map(|prompt| {
         let prompt_name = prompt.attr.required("name");
-        let call = boxed_method_call(&prompt.method, quote! { arguments, context });
+        let call = boxed_method_call(&prompt.method, &quote! { arguments, context });
         quote! {
             if name == #prompt_name {
                 return #call;
@@ -411,7 +406,7 @@ fn read_resource_impl(
     }
     let resource_branches = resources.iter().map(|resource| {
         let uri = resource.attr.required("uri");
-        let call = boxed_method_call(&resource.method, quote! { uri, context });
+        let call = boxed_method_call(&resource.method, &quote! { uri, context });
         quote! {
             if uri == #uri {
                 return #call;
@@ -420,7 +415,7 @@ fn read_resource_impl(
     });
     let template_branches = templates.iter().map(|template| {
         let definition = template.attr.required("definition");
-        let call = boxed_method_call(&template.method, quote! { uri, context });
+        let call = boxed_method_call(&template.method, &quote! { uri, context });
         quote! {
             if (#definition).matches_uri(&uri) {
                 return #call;
@@ -445,7 +440,7 @@ fn completion_impl(method: Option<&ImplItemFn>) -> TokenStream2 {
     let Some(method) = method else {
         return TokenStream2::new();
     };
-    let call = boxed_method_call(method, quote! { request, context });
+    let call = boxed_method_call(method, &quote! { request, context });
     quote! {
         fn complete(
             &self,
@@ -461,7 +456,7 @@ fn log_level_impl(method: Option<&ImplItemFn>) -> TokenStream2 {
     let Some(method) = method else {
         return TokenStream2::new();
     };
-    let call = boxed_method_call(method, quote! { level, context });
+    let call = boxed_method_call(method, &quote! { level, context });
     quote! {
         fn set_log_level(
             &self,
@@ -479,7 +474,7 @@ fn notifications_impl(notifications: &[NotificationMethod]) -> TokenStream2 {
     }
     let method_branches = notifications.iter().filter_map(|notification| {
         let method = notification.attr.method.as_ref()?;
-        let call = boxed_unit_method_call(&notification.method, quote! { notification, context });
+        let call = boxed_unit_method_call(&notification.method, &quote! { notification, context });
         Some(quote! {
             if notification.method == #method {
                 return #call;
@@ -492,7 +487,7 @@ fn notifications_impl(notifications: &[NotificationMethod]) -> TokenStream2 {
         .map_or_else(
             || quote! { Box::pin(async {}) },
             |notification| {
-                boxed_unit_method_call(&notification.method, quote! { notification, context })
+                boxed_unit_method_call(&notification.method, &quote! { notification, context })
             },
         );
 
@@ -529,6 +524,7 @@ fn helpers_impl(
 
 fn router_helpers_impl() -> TokenStream2 {
     quote! {
+        #[doc = "Build a Streamable HTTP router for this server."]
         pub fn streamable_http_router(self) -> ::mcp::server::StreamableHttpRouter
         where
             Self: Sized + ::mcp::server::ServerHandler,
@@ -562,6 +558,7 @@ fn auth_helpers_impl(args: &ServerArgs, method: &ImplItemFn) -> TokenStream2 {
     });
 
     quote! {
+        #[doc = "Build protected-resource metadata using this server's declared authorization settings."]
         pub fn protected_resource_metadata(
             resource: impl Into<String>,
             authorization_servers: impl IntoIterator<Item = impl Into<String>>,
@@ -572,6 +569,7 @@ fn auth_helpers_impl(args: &ServerArgs, method: &ImplItemFn) -> TokenStream2 {
             metadata
         }
 
+        #[doc = "Build Streamable HTTP options with this server's token validator."]
         pub fn streamable_http_options(
             &self,
             metadata: ::mcp::McpProtectedResourceMetadata,
@@ -585,6 +583,7 @@ fn auth_helpers_impl(args: &ServerArgs, method: &ImplItemFn) -> TokenStream2 {
             Ok(::mcp::server::StreamableHttpOptions::default().with_authorization(authorization))
         }
 
+        #[doc = "Build an authorized Streamable HTTP router for this server."]
         pub fn streamable_http_router_with_auth(
             self,
             metadata: ::mcp::McpProtectedResourceMetadata,
@@ -627,7 +626,7 @@ fn token_validator_closure(method: &ImplItemFn) -> TokenStream2 {
     }
 }
 
-fn boxed_method_call(method: &ImplItemFn, args: TokenStream2) -> TokenStream2 {
+fn boxed_method_call(method: &ImplItemFn, args: &TokenStream2) -> TokenStream2 {
     let ident = &method.sig.ident;
     let await_token = method.sig.asyncness.map(|_| quote! { .await });
     if has_receiver(method) {
@@ -644,7 +643,7 @@ fn boxed_method_call(method: &ImplItemFn, args: TokenStream2) -> TokenStream2 {
     }
 }
 
-fn boxed_unit_method_call(method: &ImplItemFn, args: TokenStream2) -> TokenStream2 {
+fn boxed_unit_method_call(method: &ImplItemFn, args: &TokenStream2) -> TokenStream2 {
     let ident = &method.sig.ident;
     let await_token = method.sig.asyncness.map(|_| quote! { .await });
     if has_receiver(method) {
@@ -876,6 +875,8 @@ fn path_is(path: &Path, ident: &str) -> bool {
 }
 
 #[derive(Default)]
+// These flags are independent declarations, not mutually exclusive states.
+#[allow(clippy::struct_excessive_bools)]
 struct ExplicitCapabilities {
     tools: bool,
     prompts: bool,
