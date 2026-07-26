@@ -301,6 +301,10 @@ async fn login_resume_and_consent_denial_use_opaque_transaction() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "DCR rejection, registration, and authorization form one end-to-end flow"
+)]
 async fn dcr_advertises_registers_and_completes_public_authorization_flow() {
     let store = Arc::new(InMemoryOAuthAuthorizationStore::default());
     let mut config = OAuthAuthorizationServerConfig::new(

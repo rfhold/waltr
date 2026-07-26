@@ -1429,6 +1429,10 @@ impl OAuthState {
         Ok(OAuthIssueGrantResult::Issued(Box::new(grant)))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "refresh rotation is one atomic validation and state transition"
+    )]
     fn rotate(
         &mut self,
         config: &OAuthAuthorizationStoreConfig,

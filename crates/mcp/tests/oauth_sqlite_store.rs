@@ -17,6 +17,10 @@ use sqlx::{
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "migration, reopen, locking, and storage assertions form one store contract"
+)]
 async fn sqlite_store_passes_contract_across_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let url = format!(
