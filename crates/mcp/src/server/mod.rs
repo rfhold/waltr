@@ -27,6 +27,26 @@ use tokio_stream as stream;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
+mod session;
+
+#[cfg(feature = "streamable-http-postgres")]
+pub use session::PostgresStreamableHttpSessionStore;
+#[cfg(feature = "streamable-http-sqlite")]
+pub use session::SqliteStreamableHttpSessionStore;
+pub use session::{
+    InMemoryStreamableHttpSessionStore, StreamableHttpAbandonInitialization,
+    StreamableHttpAbandonInitializationRequest, StreamableHttpAppendEvents,
+    StreamableHttpAppendEventsRequest, StreamableHttpClaimInitialization,
+    StreamableHttpCleanupExpired, StreamableHttpCompleteInitialization,
+    StreamableHttpCompleteInitializationRequest, StreamableHttpCreateSession,
+    StreamableHttpCreateSessionRequest, StreamableHttpDeleteSession, StreamableHttpEvent,
+    StreamableHttpEventId, StreamableHttpEventIdParseError, StreamableHttpInspectSession,
+    StreamableHttpPrepareDelivery, StreamableHttpPrepareDeliveryRequest, StreamableHttpSession,
+    StreamableHttpSessionKey, StreamableHttpSessionLifecycle, StreamableHttpSessionOwner,
+    StreamableHttpSessionRequest, StreamableHttpSessionStore, StreamableHttpSessionStoreConfig,
+    StreamableHttpSessionStoreError, StreamableHttpSessionStoreResult,
+};
+
 use crate::{
     Error, Result,
     oauth::{

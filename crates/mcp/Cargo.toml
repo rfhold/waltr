@@ -8,6 +8,8 @@ version.workspace = true
 default = ["macros"]
 macros = ["dep:mcp-macros"]
 progressive = ["macros", "dep:jaq-interpret", "dep:jaq-parse", "dep:schemars"]
+streamable-http-postgres = ["dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/postgres", "sqlx/runtime-tokio-rustls"]
+streamable-http-sqlite = ["dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite"]
 
 [dependencies]
 axum.workspace = true
@@ -20,6 +22,7 @@ opentelemetry.workspace = true
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util.workspace = true
@@ -30,11 +33,23 @@ uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
 rmcp = { version = "2.1.0", features = ["client", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+tempfile.workspace = true
+testcontainers.workspace = true
 
 [[test]]
 name = "progressive"
 path = "tests/progressive.rs"
 required-features = ["progressive"]
+
+[[test]]
+name = "streamable_http_sqlite_store"
+path = "tests/streamable_http_sqlite_store.rs"
+required-features = ["streamable-http-sqlite"]
+
+[[test]]
+name = "streamable_http_postgres_store"
+path = "tests/streamable_http_postgres_store.rs"
+required-features = ["streamable-http-postgres"]
 
 [lints]
 workspace = true
