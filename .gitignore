@@ -2,6 +2,8 @@ target/
 node_modules/
 dist/
 crates/waltr-web/generated/wasm/
+crates/waltr-web/generated/wasm-current
+crates/waltr-web/generated/.wasm-store/
 .dev/
 tests/web/k6/snapshots/
 .worktrees/
