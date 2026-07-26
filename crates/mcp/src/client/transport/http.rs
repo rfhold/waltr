@@ -27,7 +27,8 @@ use crate::{
 };
 
 use super::{
-    InboundSender, McpTransportError, McpTransportErrorKind, TransportInbound,
+    InboundSender, McpBearerProvider, McpBearerProviderError, McpTransportError,
+    McpTransportErrorKind, TransportInbound,
     sse::{SseDecoder, SseFrame},
 };
 
@@ -62,6 +63,7 @@ struct HttpSessionState {
 #[derive(Clone, Debug)]
 enum ShutdownFailure {
     Authorization(Box<McpAuthorizationError>),
+    BearerProvider(McpBearerProviderError),
     Protocol(String),
 }
 
@@ -69,6 +71,7 @@ impl ShutdownFailure {
     fn error(&self) -> Error {
         match self {
             Self::Authorization(error) => Error::Authorization(error.clone()),
+            Self::BearerProvider(error) => Error::BearerProvider(*error),
             Self::Protocol(message) => Error::protocol(message.clone()),
         }
     }
@@ -78,6 +81,7 @@ impl ShutdownFailure {
 pub struct StreamableHttpTransport {
     endpoint: String,
     bearer_token: Option<String>,
+    bearer_provider: Option<Arc<dyn McpBearerProvider>>,
     client: reqwest::Client,
     state: Arc<Mutex<HttpSessionState>>,
     inbound: InboundSender,
@@ -111,7 +115,12 @@ impl std::fmt::Debug for StreamableHttpTransport {
 impl StreamableHttpTransport {
     /// Create a Streamable HTTP transport.
     #[must_use]
-    pub fn new(endpoint: String, bearer_token: Option<String>, inbound: InboundSender) -> Self {
+    pub fn new(
+        endpoint: String,
+        bearer_token: Option<String>,
+        bearer_provider: Option<Arc<dyn McpBearerProvider>>,
+        inbound: InboundSender,
+    ) -> Self {
         let cancellation = CancellationToken::new();
         let tracked_readers = Arc::new(AtomicUsize::new(0));
         let reader_aborts = Arc::new(StdMutex::new(HashMap::new()));
@@ -127,6 +136,7 @@ impl StreamableHttpTransport {
         Self {
             endpoint,
             bearer_token,
+            bearer_provider,
             client: reqwest::Client::new(),
             state: Arc::new(Mutex::new(HttpSessionState::default())),
             inbound,
@@ -184,7 +194,7 @@ impl StreamableHttpTransport {
         let stateless_protocol_version = state.stateless_protocol_version.clone();
         drop(state);
         let mut builder = self
-            .request(reqwest::Method::POST)
+            .request(reqwest::Method::POST, request_cancellation)
             .await?
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
@@ -402,7 +412,7 @@ impl StreamableHttpTransport {
             .ok_or_else(|| Error::protocol("MCP initialize request omitted id"))
             .and_then(|id| serde_json::from_value::<JsonRpcId>(id).map_err(Error::from))?;
         let initialize_request = self
-            .request(reqwest::Method::POST)
+            .request(reqwest::Method::POST, request_cancellation)
             .await?
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
@@ -466,7 +476,7 @@ impl StreamableHttpTransport {
             ));
         }
         let mut initialized = self
-            .request(reqwest::Method::POST)
+            .request(reqwest::Method::POST, request_cancellation)
             .await?
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
@@ -584,6 +594,7 @@ impl StreamableHttpTransport {
         let task = tokio::spawn(poll_loop(PollContext {
             endpoint: self.endpoint.clone(),
             bearer_token: self.bearer_token.clone(),
+            bearer_provider: self.bearer_provider.clone(),
             client: self.client.clone(),
             state: Arc::clone(&self.state),
             inbound: self.inbound.clone(),
@@ -631,8 +642,32 @@ impl StreamableHttpTransport {
         clear_active_if_matches(&self.state, expected).await
     }
 
-    async fn request(&self, method: reqwest::Method) -> Result<reqwest::RequestBuilder> {
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        request_cancellation: Option<&CancellationToken>,
+    ) -> Result<reqwest::RequestBuilder> {
+        tokio::select! {
+            biased;
+            () = request_cancelled(request_cancellation) => {
+                Err(Error::protocol("MCP request canceled"))
+            }
+            () = self.cancellation.cancelled() => {
+                Err(Error::protocol("MCP HTTP transport is shutting down"))
+            }
+            request = self.authorized_request(method) => request,
+        }
+    }
+
+    async fn authorized_request(&self, method: reqwest::Method) -> Result<reqwest::RequestBuilder> {
         let request = self.client.request(method, &self.endpoint);
+        if let Some(provider) = &self.bearer_provider {
+            return provider
+                .bearer_token()
+                .await
+                .map(|token| request.bearer_auth(token))
+                .map_err(Error::BearerProvider);
+        }
         Ok(match &self.bearer_token {
             Some(token) => request.bearer_auth(token),
             None => request,
@@ -698,11 +733,19 @@ impl StreamableHttpTransport {
         session_id: &str,
         protocol_version: Option<&str>,
     ) -> std::result::Result<(), ShutdownFailure> {
-        let mut request = self
-            .request(reqwest::Method::DELETE)
-            .await
-            .map_err(|error| ShutdownFailure::Protocol(error.to_string()))?
-            .header("mcp-session-id", session_id);
+        let mut request = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.authorized_request(reqwest::Method::DELETE),
+        )
+        .await
+        .map_err(|_| {
+            ShutdownFailure::Protocol("MCP HTTP DELETE bearer resolution timed out".to_owned())
+        })?
+        .map_err(|error| match error {
+            Error::BearerProvider(error) => ShutdownFailure::BearerProvider(error),
+            _ => ShutdownFailure::Protocol(error.to_string()),
+        })?
+        .header("mcp-session-id", session_id);
         if let Some(protocol_version) = protocol_version {
             request = request.header("mcp-protocol-version", protocol_version);
         }
@@ -834,6 +877,7 @@ async fn clear_active_if_matches(
 struct PollContext {
     endpoint: String,
     bearer_token: Option<String>,
+    bearer_provider: Option<Arc<dyn McpBearerProvider>>,
     client: reqwest::Client,
     state: Arc<Mutex<HttpSessionState>>,
     inbound: InboundSender,
@@ -871,7 +915,23 @@ async fn poll_loop(context: PollContext) {
             .header("accept", "text/event-stream")
             .header("mcp-session-id", &session.session_id)
             .header("mcp-protocol-version", &session.protocol_version);
-        if let Some(token) = &context.bearer_token {
+        if let Some(provider) = &context.bearer_provider {
+            let token = tokio::select! {
+                () = context.cancellation.cancelled() => return,
+                token = provider.bearer_token() => token,
+            };
+            match token {
+                Ok(token) => request = request.bearer_auth(token),
+                Err(error) => {
+                    drop(
+                        context
+                            .inbound
+                            .send(TransportInbound::BearerProviderFailed(error)),
+                    );
+                    return;
+                }
+            }
+        } else if let Some(token) = &context.bearer_token {
             request = request.bearer_auth(token);
         }
         if let Some(last_event_id) = &session.last_event_id {
@@ -1335,7 +1395,7 @@ mod tests {
                 .unwrap();
         });
         let (inbound, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let transport = StreamableHttpTransport::new(endpoint, None, inbound);
+        let transport = StreamableHttpTransport::new(endpoint, None, None, inbound);
         for sequence in 0..100 {
             transport
                 .send(
@@ -1390,7 +1450,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let (inbound, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let transport = StreamableHttpTransport::new(endpoint, None, inbound);
+        let transport = StreamableHttpTransport::new(endpoint, None, None, inbound);
         let cancellation = CancellationToken::new();
         let send = transport.send(
             json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
@@ -1426,7 +1486,7 @@ mod tests {
 
         let (inbound, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let transport =
-            StreamableHttpTransport::new("http://127.0.0.1:1/mcp".to_owned(), None, inbound);
+            StreamableHttpTransport::new("http://127.0.0.1:1/mcp".to_owned(), None, None, inbound);
         let died = Arc::new(AtomicBool::new(false));
         let started = Arc::new(Notify::new());
         let reader = tokio::spawn({

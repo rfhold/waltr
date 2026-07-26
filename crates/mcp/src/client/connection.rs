@@ -10,7 +10,10 @@ use tracing::Instrument as _;
 
 use crate::{
     Error, McpAuthorizationError, McpTracePropagation, Result,
-    client::transport::{McpTransport, McpTransportConfig, McpTransportError, TransportInbound},
+    client::transport::{
+        McpBearerProvider, McpBearerProviderError, McpTransport, McpTransportConfig,
+        McpTransportError, TransportInbound,
+    },
     protocol::{
         JsonRpcId, JsonRpcInbound, JsonRpcNotification, JsonRpcRequest, cancellation_params,
         json_rpc_notification, json_rpc_request, json_rpc_result, next_id,
@@ -32,6 +35,8 @@ pub trait McpConnectionHandler: Send + Sync {
     fn sse_event_id(&self, id: String);
     /// Handle an authorization failure received from streamable HTTP.
     fn authorization_failed(&self, error: McpAuthorizationError);
+    /// Handle a dynamic bearer provider failure.
+    fn bearer_provider_failed(&self, error: McpBearerProviderError);
     /// Handle a classified background transport failure.
     fn transport_failed(&self, error: McpTransportError);
 }
@@ -58,8 +63,44 @@ impl McpConnection {
         transport: McpTransportConfig,
         handler: Arc<dyn McpConnectionHandler>,
     ) -> Result<Arc<Self>> {
+        Self::start_with_optional_bearer_provider(server_name, transport, handler, None).await
+    }
+
+    /// Start a connection with a dynamic Streamable HTTP bearer provider.
+    pub async fn start_with_bearer_provider(
+        server_name: String,
+        transport: McpTransportConfig,
+        handler: Arc<dyn McpConnectionHandler>,
+        bearer_provider: Arc<dyn McpBearerProvider>,
+    ) -> Result<Arc<Self>> {
+        Self::start_with_optional_bearer_provider(
+            server_name,
+            transport,
+            handler,
+            Some(bearer_provider),
+        )
+        .await
+    }
+
+    async fn start_with_optional_bearer_provider(
+        server_name: String,
+        transport: McpTransportConfig,
+        handler: Arc<dyn McpConnectionHandler>,
+        bearer_provider: Option<Arc<dyn McpBearerProvider>>,
+    ) -> Result<Arc<Self>> {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let transport = McpTransport::start(server_name, transport, inbound_tx).await?;
+        let transport = match bearer_provider {
+            Some(provider) => {
+                McpTransport::start_with_bearer_provider(
+                    server_name,
+                    transport,
+                    inbound_tx,
+                    provider,
+                )
+                .await?
+            }
+            None => McpTransport::start(server_name, transport, inbound_tx).await?,
+        };
         let connection = Arc::new(Self {
             transport,
             pending: Arc::new(Mutex::new(BTreeMap::new())),
@@ -235,12 +276,26 @@ async fn dispatch_loop(
                 fail_pending_with_authorization(&connection, &error).await;
                 handler.authorization_failed(error);
             }
+            TransportInbound::BearerProviderFailed(error) => {
+                fail_pending_with_bearer_provider(&connection, error).await;
+                handler.bearer_provider_failed(error);
+            }
             TransportInbound::TransportFailed(error) => handler.transport_failed(error),
             TransportInbound::Disconnected(error) => {
                 fail_pending(&connection, &error).await;
                 handler.disconnected(error);
             }
         }
+    }
+}
+
+async fn fail_pending_with_bearer_provider(
+    connection: &McpConnection,
+    error: McpBearerProviderError,
+) {
+    let pending = std::mem::take(&mut *connection.pending.lock().await);
+    for sender in pending.into_values() {
+        drop(sender.send(Err(Error::BearerProvider(error))));
     }
 }
 
