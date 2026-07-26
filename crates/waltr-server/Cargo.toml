@@ -20,8 +20,9 @@ waltr-agent = { path = "../waltr-agent", version = "0.1.0", default-features = f
 futures-util.workspace = true
 http-body.workspace = true
 jsonwebtoken.workspace = true
-mcp = { workspace = true, features = ["progressive", "streamable-http-postgres", "streamable-http-sqlite"] }
+mcp = { workspace = true, features = ["oauth-authorization-server-postgres", "oauth-authorization-server-sqlite", "progressive", "streamable-http-postgres", "streamable-http-sqlite"] }
 notify.workspace = true
+p256.workspace = true
 tokio-util.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true

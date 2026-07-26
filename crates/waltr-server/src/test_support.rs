@@ -6,10 +6,14 @@ use crate::{
         AccessAuthConfig, AccessAuthHttpClient, AccessAuthStore, AccessAuthenticator,
         BrowserSession, BrowserSessionTokenDigest, OidcConfig,
     },
-    app::build_app_with_catalog_loader_and_access_authenticator,
+    app::{
+        build_app_with_catalog_loader_and_access_authenticator,
+        build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth,
+    },
     build_app_with_catalog_loader,
     catalog::CatalogLoader,
     config_service::ConfigService,
+    mcp_oauth::{McpOAuthEnabledConfig, McpOAuthServer},
     persistence::{DatabaseConfig, Persistence},
     session,
 };
@@ -242,6 +246,7 @@ impl AccessAuthBrowserFixture {
             &self.database_url,
             session_ttl,
             false,
+            false,
         )
     }
 
@@ -258,6 +263,7 @@ impl AccessAuthBrowserFixture {
             None,
             &self.database_url,
             session_ttl,
+            false,
             false,
         )
     }
@@ -276,6 +282,7 @@ impl AccessAuthBrowserFixture {
             &self.database_url,
             session_ttl,
             false,
+            false,
         )
     }
 
@@ -292,6 +299,7 @@ impl AccessAuthBrowserFixture {
             None,
             &self.database_url,
             session_ttl,
+            false,
             false,
         )
     }
@@ -362,7 +370,106 @@ impl AccessAuthBrowserFixture {
             &self.database_url,
             session_ttl,
             true,
+            false,
         )
+    }
+
+    /// Start a reconstructed app with the local hosted MCP OAuth server enabled.
+    #[must_use]
+    pub fn start_server_with_mcp_oauth(
+        &self,
+        session_ttl: Duration,
+    ) -> RestartableAccessAuthServer {
+        start_restartable_auth_server(
+            &self.issuer,
+            "waltr-test-client",
+            None,
+            &self.database_url,
+            session_ttl,
+            false,
+            true,
+        )
+    }
+
+    /// Corrupt the active hosted OAuth public JWK while preserving its encrypted private key.
+    pub async fn corrupt_mcp_signing_public_key(&self) {
+        let waltr_path = PathBuf::from(
+            self.database_url
+                .strip_prefix("sqlite://")
+                .expect("test database uses sqlite://"),
+        );
+        let mcp_url = format!(
+            "sqlite://{}",
+            waltr_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("mcp.sqlite3")
+                .display()
+        );
+        let pool = sqlx::SqlitePool::connect(&mcp_url)
+            .await
+            .expect("MCP fixture database should connect");
+        sqlx::query("UPDATE mcp_oauth_signing_keys SET public_jwk = json_set(public_jwk, '$.x', 'invalid') WHERE state = 'active'")
+            .execute(&pool)
+            .await
+            .expect("active signing JWK should be corruptible");
+        pool.close().await;
+    }
+
+    /// Rotate the hosted OAuth signing key through a separate replica composition.
+    pub async fn rotate_mcp_signing_key(&self) {
+        let persistence = Persistence::initialize(
+            DatabaseConfig::from_url(&self.database_url).expect("fixture database URL is valid"),
+        )
+        .await
+        .expect("replica persistence should initialize");
+        let authenticator = AccessAuthenticator::initialize(
+            AccessAuthConfig::oidc(
+                OidcConfig::new(
+                    self.issuer.clone(),
+                    "waltr-test-client",
+                    None,
+                    "http://127.0.0.1/oidc/callback",
+                    "waltr-api",
+                    vec!["openid".to_owned()],
+                    Duration::from_hours(1),
+                    true,
+                    true,
+                )
+                .expect("fixture OIDC config is valid"),
+            ),
+            &persistence,
+            AccessAuthHttpClient::build(reqwest::Client::builder().timeout(Duration::from_secs(5)))
+                .expect("fixture OIDC client should build"),
+        )
+        .await
+        .expect("replica access authenticator should initialize");
+        let key_file = PathBuf::from(
+            self.database_url
+                .strip_prefix("sqlite://")
+                .expect("test database uses sqlite://"),
+        )
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("mcp-wrapping-keys.json");
+        let oauth = McpOAuthServer::initialize(
+            McpOAuthEnabledConfig::new(
+                "https://waltr.example",
+                "https://waltr.example/oauth",
+                vec!["mcp:use".to_owned()],
+                key_file,
+            )
+            .expect("fixture MCP OAuth config is valid")
+            .with_access_token_ttl(Duration::from_hours(1)),
+            &persistence,
+            authenticator,
+        )
+        .await
+        .expect("replica MCP OAuth should initialize");
+        oauth
+            .maintain(true)
+            .await
+            .expect("replica should rotate the signing key");
     }
 }
 
@@ -637,6 +744,7 @@ fn start_restartable_auth_server(
     database_url: &str,
     session_ttl: Duration,
     fail_callback_cleanup: bool,
+    enable_mcp_oauth: bool,
 ) -> RestartableAccessAuthServer {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -702,11 +810,71 @@ END
             }
             let config_service =
                 ConfigService::new(temp_root()).expect("browser flow config service should start");
-            let app = build_app_with_catalog_loader_and_access_authenticator(
+            let mcp_oauth = if enable_mcp_oauth {
+                let key_file = PathBuf::from(
+                    database_url
+                        .strip_prefix("sqlite://")
+                        .expect("test database uses sqlite://"),
+                )
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("mcp-wrapping-keys.json");
+                if !key_file.exists() {
+                    std::fs::write(
+                        &key_file,
+                        r#"{"schema_version":1,"active":"test","keys":[{"id":"test","key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}]}"#,
+                    )
+                    .expect("test wrapping key should be written");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o400))
+                            .expect("test wrapping key should be read-only");
+                    }
+                }
+                let oauth = McpOAuthServer::initialize(
+                    McpOAuthEnabledConfig::new(
+                        "https://waltr.example",
+                        "https://waltr.example/oauth",
+                        vec!["mcp:use".to_owned()],
+                        key_file,
+                    )
+                    .expect("test MCP OAuth config should be valid")
+                    .with_access_token_ttl(Duration::from_hours(1)),
+                    &persistence,
+                    authenticator.clone(),
+                )
+                .await
+                .expect("test MCP OAuth server should initialize");
+                oauth
+                    .register_client(mcp::oauth::OAuthClient {
+                        client_id: "test-mcp-client".to_owned(),
+                        registration_method: mcp::oauth::OAuthClientRegistrationMethod::Preconfigured,
+                        display_name: Some("Test MCP Client".to_owned()),
+                        client_secret_digest: None,
+                        redirect_uris: vec!["https://client.example/callback".to_owned()],
+                        created_at_ms: i64::try_from(
+                            SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .expect("current time")
+                                .as_millis(),
+                        )
+                        .expect("test timestamp should fit"),
+                        expires_at_ms: None,
+                        disabled_at_ms: None,
+                    })
+                    .await
+                    .expect("test MCP OAuth client should register");
+                Some(oauth)
+            } else {
+                None
+            };
+            let app = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
                 config_service,
                 persistence,
                 CatalogLoader::from_env(),
                 authenticator,
+                mcp_oauth,
                 |routes, config, credential_store| {
                     session::add_sessions_service(
                         routes,

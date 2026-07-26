@@ -6,6 +6,7 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod config_service;
+pub mod mcp_oauth;
 pub mod mcp_service;
 pub mod observability;
 pub mod persistence;
@@ -20,7 +21,8 @@ mod web_assets;
 
 pub use app::{
     BuildAppError, ServerApplication, build_app, build_app_with_access_authenticator,
-    build_app_with_catalog_loader, build_app_with_config_service, build_app_with_services,
+    build_app_with_access_authenticator_and_mcp_oauth, build_app_with_catalog_loader,
+    build_app_with_config_service, build_app_with_services,
 };
 
 /// Default address the server listens on when `WALTR_SERVER_ADDR` is unset.

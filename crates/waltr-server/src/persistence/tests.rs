@@ -475,6 +475,7 @@ async fn sqlite_files_keep_component_tables_and_histories_isolated() {
         [
             "_sqlx_migrations",
             "waltr_browser_sessions",
+            "waltr_mcp_oauth_login_continuations",
             "waltr_oidc_login_attempts"
         ]
     );
@@ -482,6 +483,20 @@ async fn sqlite_files_keep_component_tables_and_histories_isolated() {
         mcp_tables,
         [
             "_sqlx_migrations",
+            "mcp_oauth_access_tokens",
+            "mcp_oauth_authorization_codes",
+            "mcp_oauth_authorization_transactions",
+            "mcp_oauth_client_metadata_cache",
+            "mcp_oauth_client_redirect_uris",
+            "mcp_oauth_clients",
+            "mcp_oauth_consents",
+            "mcp_oauth_dynamic_clients",
+            "mcp_oauth_grants",
+            "mcp_oauth_refresh_families",
+            "mcp_oauth_refresh_tokens",
+            "mcp_oauth_registration_rates",
+            "mcp_oauth_revoked_clients",
+            "mcp_oauth_signing_keys",
             "mcp_streamable_http_events",
             "mcp_streamable_http_sessions"
         ]
@@ -606,7 +621,7 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .fetch_one(pool)
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (2, 1));
+    assert_eq!((waltr_count, mcp_count), (3, 3));
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT to_regclass('waltr.oidc_login_attempts')::text"
@@ -669,7 +684,7 @@ async fn assert_component_histories(persistence: &Persistence) {
         .fetch_one(persistence.mcp_sqlite_pool().expect("MCP pool"))
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (2, 1));
+    assert_eq!((waltr_count, mcp_count), (3, 3));
 }
 
 async fn sqlite_tables(pool: &SqlitePool) -> Vec<String> {

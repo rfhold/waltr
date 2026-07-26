@@ -39,6 +39,19 @@ impl LoginCorrelationDigest {
     }
 }
 
+/// Durable digest-only browser continuation for hosted MCP OAuth login.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpOAuthLoginContinuation {
+    /// Opaque transaction reference owned by the hosted authorization server.
+    pub transaction_id: String,
+    /// Digest of the random correlation retained by the browser.
+    pub correlation_digest: LoginCorrelationDigest,
+    /// Time at which the continuation was created.
+    pub created_at: SystemTime,
+    /// Time after which the continuation cannot be consumed.
+    pub expires_at: SystemTime,
+}
+
 /// SHA-256 digest used to identify an opaque browser session token.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BrowserSessionTokenDigest(String);
@@ -219,6 +232,128 @@ impl AccessAuthStore {
     ) -> Result<(), AccessAuthStoreError> {
         self.insert_login_attempt_with_limit(attempt, MAX_ACTIVE_LOGIN_ATTEMPTS)
             .await
+    }
+
+    /// Persist a digest-only hosted OAuth browser continuation idempotently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid records, conflicting transaction state, or database failures.
+    pub async fn insert_mcp_oauth_login_continuation(
+        &self,
+        continuation: &McpOAuthLoginContinuation,
+    ) -> Result<(), AccessAuthStoreError> {
+        if continuation.transaction_id.is_empty() {
+            return Err(AccessAuthStoreError::InvalidRecord(
+                "MCP OAuth transaction ID must not be empty",
+            ));
+        }
+        let created_at = system_time_to_millis(continuation.created_at)?;
+        let expires_at = system_time_to_millis(continuation.expires_at)?;
+        if expires_at <= created_at {
+            return Err(AccessAuthStoreError::InvalidRecord(
+                "MCP OAuth login continuation expiry must follow creation",
+            ));
+        }
+        let matched = match &self.pool {
+            AccessAuthPool::Sqlite(pool) => {
+                sqlx::query(
+                    r"
+INSERT INTO waltr_mcp_oauth_login_continuations
+    (transaction_id, correlation_digest, created_at_ms, expires_at_ms)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(transaction_id) DO NOTHING
+                    ",
+                )
+                .bind(&continuation.transaction_id)
+                .bind(&continuation.correlation_digest.0)
+                .bind(created_at)
+                .bind(expires_at)
+                .execute(pool)
+                .await
+                .map_err(|_| database_error(DatabaseBackend::Sqlite))?;
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM waltr_mcp_oauth_login_continuations WHERE transaction_id = ? AND correlation_digest = ? AND expires_at_ms = ?)",
+                )
+                .bind(&continuation.transaction_id)
+                .bind(&continuation.correlation_digest.0)
+                .bind(expires_at)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| database_error(DatabaseBackend::Sqlite))?
+            }
+            AccessAuthPool::PostgreSql(pool) => {
+                sqlx::query(
+                    r"
+INSERT INTO waltr.mcp_oauth_login_continuations
+    (transaction_id, correlation_digest, created_at_ms, expires_at_ms)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT(transaction_id) DO NOTHING
+                    ",
+                )
+                .bind(&continuation.transaction_id)
+                .bind(&continuation.correlation_digest.0)
+                .bind(created_at)
+                .bind(expires_at)
+                .execute(pool)
+                .await
+                .map_err(|_| database_error(DatabaseBackend::PostgreSql))?;
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM waltr.mcp_oauth_login_continuations WHERE transaction_id = $1 AND correlation_digest = $2 AND expires_at_ms = $3)",
+                )
+                .bind(&continuation.transaction_id)
+                .bind(&continuation.correlation_digest.0)
+                .bind(expires_at)
+                .fetch_one(pool)
+                .await
+                .map_err(|_| database_error(DatabaseBackend::PostgreSql))?
+            }
+        };
+        if matched {
+            Ok(())
+        } else {
+            Err(AccessAuthStoreError::InvalidRecord(
+                "MCP OAuth login continuation conflicts with existing state",
+            ))
+        }
+    }
+
+    /// Atomically consume one live hosted OAuth browser continuation matching its digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when time conversion or the database operation fails.
+    pub async fn consume_mcp_oauth_login_continuation(
+        &self,
+        transaction_id: &str,
+        correlation_digest: &LoginCorrelationDigest,
+        now: SystemTime,
+    ) -> Result<bool, AccessAuthStoreError> {
+        let now = system_time_to_millis(now)?;
+        let rows = match &self.pool {
+            AccessAuthPool::Sqlite(pool) => sqlx::query(
+                "DELETE FROM waltr_mcp_oauth_login_continuations WHERE transaction_id = ? AND correlation_digest = ? AND created_at_ms <= ? AND expires_at_ms > ?",
+            )
+            .bind(transaction_id)
+            .bind(&correlation_digest.0)
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await
+            .map_err(|_| database_error(DatabaseBackend::Sqlite))?
+            .rows_affected(),
+            AccessAuthPool::PostgreSql(pool) => sqlx::query(
+                "DELETE FROM waltr.mcp_oauth_login_continuations WHERE transaction_id = $1 AND correlation_digest = $2 AND created_at_ms <= $3 AND expires_at_ms > $3",
+            )
+            .bind(transaction_id)
+            .bind(&correlation_digest.0)
+            .bind(now)
+            .execute(pool)
+            .await
+            .map_err(|_| database_error(DatabaseBackend::PostgreSql))?
+            .rows_affected(),
+        };
+        Ok(rows == 1)
     }
 
     #[allow(
@@ -773,12 +908,29 @@ WHERE revoked_at_ms IS NULL
         let limit = i64::from(limit);
         match &self.pool {
             AccessAuthPool::Sqlite(pool) => {
-                let login_attempts = sqlx::query(
+                let mut login_attempts = sqlx::query(
                     r"
 DELETE FROM waltr_oidc_login_attempts
 WHERE state_digest IN (
     SELECT state_digest FROM waltr_oidc_login_attempts
     WHERE consumed_at_ms IS NOT NULL OR expires_at_ms <= ?
+    ORDER BY expires_at_ms
+    LIMIT ?
+)
+                    ",
+                )
+                .bind(now)
+                .bind(limit)
+                .execute(pool)
+                .await
+                .map_err(|_| database_error(DatabaseBackend::Sqlite))?
+                .rows_affected();
+                login_attempts += sqlx::query(
+                    r"
+DELETE FROM waltr_mcp_oauth_login_continuations
+WHERE transaction_id IN (
+    SELECT transaction_id FROM waltr_mcp_oauth_login_continuations
+    WHERE expires_at_ms <= ?
     ORDER BY expires_at_ms
     LIMIT ?
 )
@@ -813,12 +965,29 @@ WHERE token_digest IN (
                 })
             }
             AccessAuthPool::PostgreSql(pool) => {
-                let login_attempts = sqlx::query(
+                let mut login_attempts = sqlx::query(
                     r"
 DELETE FROM waltr.oidc_login_attempts
 WHERE state_digest IN (
     SELECT state_digest FROM waltr.oidc_login_attempts
     WHERE consumed_at_ms IS NOT NULL OR expires_at_ms <= $1
+    ORDER BY expires_at_ms
+    LIMIT $2
+)
+                    ",
+                )
+                .bind(now)
+                .bind(limit)
+                .execute(pool)
+                .await
+                .map_err(|_| database_error(DatabaseBackend::PostgreSql))?
+                .rows_affected();
+                login_attempts += sqlx::query(
+                    r"
+DELETE FROM waltr.mcp_oauth_login_continuations
+WHERE transaction_id IN (
+    SELECT transaction_id FROM waltr.mcp_oauth_login_continuations
+    WHERE expires_at_ms <= $1
     ORDER BY expires_at_ms
     LIMIT $2
 )
