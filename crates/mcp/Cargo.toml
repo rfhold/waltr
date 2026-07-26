@@ -7,18 +7,24 @@ version.workspace = true
 [features]
 default = ["macros"]
 macros = ["dep:mcp-macros"]
+oauth-authorization-server = ["dep:aes-gcm", "dep:base64", "dep:p256", "dep:zeroize"]
+oauth-authorization-server-postgres = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/postgres", "sqlx/runtime-tokio-rustls"]
+oauth-authorization-server-sqlite = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite"]
 progressive = ["macros", "dep:jaq-interpret", "dep:jaq-parse", "dep:schemars"]
 streamable-http-postgres = ["dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/postgres", "sqlx/runtime-tokio-rustls"]
 streamable-http-sqlite = ["dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite"]
 
 [dependencies]
+aes-gcm = { workspace = true, optional = true }
 axum.workspace = true
+base64 = { workspace = true, optional = true }
 futures-util.workspace = true
 jaq-interpret = { workspace = true, optional = true }
 jaq-parse = { workspace = true, optional = true }
 mcp-macros = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 opentelemetry.workspace = true
+p256 = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -31,11 +37,27 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v7"] }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 rmcp = { version = "2.1.0", features = ["client", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 tempfile.workspace = true
 testcontainers.workspace = true
+
+[[test]]
+name = "oauth_store"
+path = "tests/oauth_store.rs"
+required-features = ["oauth-authorization-server"]
+
+[[test]]
+name = "oauth_sqlite_store"
+path = "tests/oauth_sqlite_store.rs"
+required-features = ["oauth-authorization-server-sqlite"]
+
+[[test]]
+name = "oauth_postgres_store"
+path = "tests/oauth_postgres_store.rs"
+required-features = ["oauth-authorization-server-postgres"]
 
 [[test]]
 name = "progressive"

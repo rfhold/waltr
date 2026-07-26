@@ -30,18 +30,20 @@ pub use log::McpLogLevel;
 pub use mcp_macros::mcp_server;
 #[cfg(feature = "progressive")]
 pub use mcp_macros::progressive_server;
+#[cfg(feature = "oauth-authorization-server")]
+pub use oauth::server::*;
 pub use oauth::{
     McpAccessToken, McpAuthorizationCodeTokenRequest, McpAuthorizationError,
     McpAuthorizationErrorCode, McpAuthorizationErrorParameters, McpAuthorizationRequest,
     McpAuthorizationResponse, McpAuthorizationServerMetadata, McpAuthorizationSuccess,
     McpBearerChallenge, McpClientMetadataDocument, McpClientMetadataError,
-    McpOAuthDestinationPolicy, McpOAuthDiscoveryClient, McpOAuthEndpointPolicy, McpOAuthGrantType,
-    McpOAuthResponseType, McpOAuthSecret, McpOAuthTokenType, McpPkceChallengeMethod,
-    McpPrincipalId, McpProtectedResourceMetadata, McpPublicClientIdentity, McpRefreshTokenRequest,
-    McpTokenEndpointAuthMethod, McpTokenError, McpTokenErrorCode, McpTokenResponse,
-    McpTokenValidation, authorization_server_metadata_urls, discover_authorization_server_metadata,
-    discover_protected_resource_metadata, protected_resource_metadata_urls,
-    validate_public_redirect_uri,
+    McpOAuthDestinationPolicy, McpOAuthDiscoveryClient, McpOAuthEndpointPolicy, McpOAuthEntropy,
+    McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret, McpOAuthTokenType,
+    McpPkceChallengeMethod, McpPrincipalId, McpProtectedResourceMetadata, McpPublicClientIdentity,
+    McpRefreshTokenRequest, McpTokenEndpointAuthMethod, McpTokenError, McpTokenErrorCode,
+    McpTokenResponse, McpTokenValidation, authorization_server_metadata_urls,
+    discover_authorization_server_metadata, discover_protected_resource_metadata,
+    protected_resource_metadata_urls, validate_public_redirect_uri,
 };
 pub use prompt::{
     McpPromptArgument, McpPromptDefinition, format_prompt_result, parse_prompt_definition,

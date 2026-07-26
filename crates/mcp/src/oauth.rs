@@ -6,6 +6,8 @@ pub mod client;
 mod discovery;
 mod metadata;
 mod protocol;
+/// OAuth authorization-server seams.
+pub mod server;
 
 pub use challenge::{
     McpAccessToken, McpAuthorizationError, McpBearerChallenge, McpPrincipalId, McpTokenValidation,
@@ -24,3 +26,6 @@ pub use protocol::{
     McpRefreshTokenRequest, McpTokenEndpointAuthMethod, McpTokenError, McpTokenErrorCode,
     McpTokenResponse, validate_public_redirect_uri,
 };
+pub use server::McpOAuthEntropy;
+#[cfg(feature = "oauth-authorization-server")]
+pub use server::*;
