@@ -27,6 +27,15 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use waltr_agent::{MemorySessionStore, SessionCoordinator};
+use mcp::oauth::{
+    McpJwtAccessTokenHeader, OAuthEncryptedPrivateKey, OAuthKeyEncryption,
+    VersionedOAuthWrappingKeyring,
+};
+use p256::{
+    SecretKey,
+    ecdsa::{Signature, SigningKey, signature::Signer as _},
+    pkcs8::DecodePrivateKey as _,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -388,6 +397,115 @@ impl AccessAuthBrowserFixture {
             session_ttl,
             false,
             true,
+        )
+    }
+
+    /// Seed a browser session for an OIDC subject and return its cookie header value.
+    pub async fn browser_session_for_subject(&self, subject: &str) -> String {
+        let token = format!(
+            "test-browser-session-{}",
+            TEMP_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let now = SystemTime::now();
+        let persistence = Persistence::initialize(
+            DatabaseConfig::from_url(&self.database_url).expect("fixture database URL is valid"),
+        )
+        .await
+        .expect("fixture persistence should initialize");
+        AccessAuthStore::new(&persistence)
+            .insert_browser_session(&BrowserSession {
+                token_digest: BrowserSessionTokenDigest::from_token(&token),
+                issuer: self.issuer.clone(),
+                client_id: "waltr-test-client".to_owned(),
+                subject: subject.to_owned(),
+                created_at: now,
+                expires_at: now + Duration::from_hours(1),
+                last_seen_at: now,
+            })
+            .await
+            .expect("browser session should seed");
+        format!("waltr-session-local={token}")
+    }
+
+    /// Re-sign an issued hosted MCP token with a bounded lifetime.
+    pub async fn mcp_access_token_with_ttl(&self, access_token: &str, ttl: Duration) -> String {
+        let mut pieces = access_token.split('.');
+        let encoded_header = pieces.next().expect("access token should contain a header");
+        let encoded_claims = pieces.next().expect("access token should contain claims");
+        assert!(
+            pieces.next().is_some(),
+            "access token should contain a signature"
+        );
+        assert!(
+            pieces.next().is_none(),
+            "access token should have three parts"
+        );
+        let header: McpJwtAccessTokenHeader = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(encoded_header)
+                .expect("access token header should be base64url"),
+        )
+        .expect("access token header should decode");
+        let mut claims: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(encoded_claims)
+                .expect("access token claims should be base64url"),
+        )
+        .expect("access token claims should decode");
+        let now = jsonwebtoken::get_current_timestamp();
+        claims["iat"] = json!(now);
+        claims["nbf"] = json!(now.saturating_sub(30));
+        claims["exp"] = json!(now + ttl.as_secs());
+
+        let pool = sqlx::SqlitePool::connect(&self.mcp_database_url())
+            .await
+            .expect("MCP fixture database should connect");
+        let (ciphertext, wrapping_key_id, nonce): (Vec<u8>, String, Vec<u8>) = sqlx::query_as(
+            "SELECT encrypted_private_material, wrapping_key_id, encryption_nonce FROM mcp_oauth_signing_keys WHERE key_id = ? AND state = 'active'",
+        )
+        .bind(&header.kid)
+        .fetch_one(&pool)
+        .await
+        .expect("active MCP signing key should load");
+        pool.close().await;
+        let wrapping_key = URL_SAFE_NO_PAD
+            .decode("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc")
+            .expect("test wrapping key should decode");
+        let keyring =
+            VersionedOAuthWrappingKeyring::new("test", [("test".to_owned(), wrapping_key)])
+                .expect("test wrapping keyring should be valid");
+        let private = keyring
+            .decrypt(
+                "ES256",
+                &header.kid,
+                &OAuthEncryptedPrivateKey {
+                    wrapping_key_id,
+                    nonce,
+                    ciphertext,
+                },
+            )
+            .expect("MCP signing key should decrypt");
+        let secret = SecretKey::from_pkcs8_der(&private).expect("MCP signing key should parse");
+        let encoded_claims = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).expect("MCP access token claims should encode"));
+        let message = format!("{encoded_header}.{encoded_claims}");
+        let signature: Signature = SigningKey::from(secret).sign(message.as_bytes());
+        format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    fn mcp_database_url(&self) -> String {
+        let waltr_path = PathBuf::from(
+            self.database_url
+                .strip_prefix("sqlite://")
+                .expect("test database uses sqlite://"),
+        );
+        format!(
+            "sqlite://{}",
+            waltr_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("mcp.sqlite3")
+                .display()
         )
     }
 
