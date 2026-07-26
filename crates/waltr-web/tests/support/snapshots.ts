@@ -16,6 +16,7 @@ export function snapshotWithConfig(
   options: { ready?: boolean } = {},
 ): ClientSnapshot {
   return {
+    access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
     auth: emptyAuthSnapshot(),
     config: {

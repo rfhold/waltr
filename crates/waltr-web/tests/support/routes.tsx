@@ -47,11 +47,11 @@ export function ConfigRouteWithChildren() {
   );
 }
 
-export function ShellRouteWithChildren() {
+export function ShellRouteWithChildren(props: { reload?: () => void } = {}) {
   return (
     <AppLayout>
       <MemoryRouter history={currentHistory}>
-        <Route path="/" component={ShellLayout}>
+        <Route path="/" component={(routeProps) => <ShellLayout reload={props.reload}>{routeProps.children}</ShellLayout>}>
           <Route path="/" component={LandingRoute} />
           <Route path="/sessions" component={SessionsRoute}>
             <Route path="/" component={SessionsListRoute} />

@@ -43,6 +43,7 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
 
 function promptFixtureSnapshot(): ClientSnapshot {
   return {
+    access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
     auth: emptyAuthSnapshot(),
     config: {
