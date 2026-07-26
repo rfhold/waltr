@@ -236,6 +236,29 @@ impl GrpcEffectExecutor {
                     error,
                 })],
             },
+            ClientEffect::Auth(AuthEffect::Poll {
+                attempt_id,
+                poll_generation,
+                delay_ms,
+            }) => {
+                sleep(delay_ms).await;
+                match self
+                    .transport
+                    .get_auth_attempt_status(attempt_id.clone())
+                    .await
+                {
+                    Ok(response) => vec![ClientEvent::Auth(AuthEvent::Polled {
+                        attempt_id,
+                        poll_generation,
+                        response,
+                    })],
+                    Err(error) => vec![ClientEvent::Auth(AuthEvent::PollFailed {
+                        attempt_id,
+                        poll_generation,
+                        error,
+                    })],
+                }
+            }
             ClientEffect::Auth(AuthEffect::Cancel {
                 operation_key,
                 attempt_id,

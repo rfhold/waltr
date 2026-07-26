@@ -248,24 +248,13 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             error,
         } => {
             let session_id = operation_session_id(state, &operation_key);
-            let target = error.auth_target().cloned();
             let message = error.to_string();
             state.set_session_submit_user_message_failed(
                 operation_key,
                 session_id.clone(),
                 message.clone(),
             );
-            if let Some(target) = target {
-                return reduce(
-                    state,
-                    SessionEvent::AuthRequiredFromSession {
-                        target,
-                        message,
-                        session_id,
-                    },
-                );
-            }
-            ClientUpdate::default()
+            outbound_auth_update(state, &error, message, session_id)
         }
         SessionEvent::AuthRequiredFromSession {
             target,
@@ -277,6 +266,7 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
                 target,
                 message,
                 source_session_id: Some(session_id),
+                mcp_authorization: None,
             },
         ),
         SessionEvent::ExternalRequestRespondRequested {
@@ -311,11 +301,11 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             let (session_id, request_id) = operation_session_and_request_id(state, &operation_key);
             state.set_session_respond_external_request_failed(
                 operation_key,
-                session_id,
+                session_id.clone(),
                 request_id,
                 error.to_string(),
             );
-            ClientUpdate::default()
+            outbound_auth_update(state, &error, error.to_string(), session_id)
         }
         SessionEvent::InterruptRequested {
             operation_key,
@@ -394,10 +384,35 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             error,
         } => {
             let (session_id, target) = operation_session_and_target(state, &operation_key);
-            state.set_session_continue_failed(operation_key, session_id, target, error.to_string());
-            ClientUpdate::default()
+            state.set_session_continue_failed(
+                operation_key,
+                session_id.clone(),
+                target,
+                error.to_string(),
+            );
+            outbound_auth_update(state, &error, error.to_string(), session_id)
         }
     }
+}
+
+fn outbound_auth_update(
+    state: &mut ClientState,
+    error: &crate::ClientError,
+    message: String,
+    session_id: String,
+) -> ClientUpdate {
+    let Some(target) = error.auth_target().cloned() else {
+        return ClientUpdate::default();
+    };
+    crate::coordination::auth::reduce(
+        state,
+        AuthEvent::AuthorizationRequired {
+            target,
+            message,
+            source_session_id: Some(session_id),
+            mcp_authorization: error.mcp_authorization().cloned(),
+        },
+    )
 }
 
 pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
@@ -567,5 +582,90 @@ fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {
     } else {
         state.set_session_watch_waiting();
         ClientUpdate::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Client, ClientError, ClientEvent, McpAuthorizationRequirement, SessionEffect};
+    use waltr::grpc::waltr::auth::v1::auth_target;
+
+    fn target() -> crate::AuthTarget {
+        crate::AuthTarget {
+            target: Some(auth_target::Target::McpServerKey("github".to_owned())),
+        }
+    }
+
+    fn auth_error() -> ClientError {
+        ClientError::mcp_authorization_required(
+            "authorize MCP",
+            target(),
+            McpAuthorizationRequirement {
+                endpoint: Some("https://mcp.example/rpc".to_owned()),
+                http_status: 401,
+                scope: Some("repo:read".to_owned()),
+                ..McpAuthorizationRequirement::default()
+            },
+        )
+    }
+
+    #[test]
+    fn all_session_run_entry_points_enqueue_structured_outbound_auth() {
+        let mut submit = Client::new();
+        let update = submit.submit_user_message("submit-session", "hello");
+        let [ClientEffect::Session(SessionEffect::SubmitUserMessage { operation_key, .. })] =
+            update.effects()
+        else {
+            panic!("submit effect");
+        };
+        submit.apply(ClientEvent::Session(
+            SessionEvent::UserMessageSubmitFailed {
+                operation_key: operation_key.clone(),
+                error: auth_error(),
+            },
+        ));
+
+        let mut respond = Client::new();
+        let update = respond.respond_external_request("respond-session", "request", "{}");
+        let [ClientEffect::Session(SessionEffect::RespondExternalRequest { operation_key, .. })] =
+            update.effects()
+        else {
+            panic!("respond effect");
+        };
+        respond.apply(ClientEvent::Session(
+            SessionEvent::ExternalRequestRespondFailed {
+                operation_key: operation_key.clone(),
+                error: auth_error(),
+            },
+        ));
+
+        let mut continuation = Client::new();
+        let update = continuation.continue_session_from_turn("continue-session", 1);
+        let [ClientEffect::Session(SessionEffect::Continue { operation_key, .. })] =
+            update.effects()
+        else {
+            panic!("continue effect");
+        };
+        continuation.apply(ClientEvent::Session(SessionEvent::ContinueFailed {
+            operation_key: operation_key.clone(),
+            error: auth_error(),
+        }));
+
+        for (client, session_id) in [
+            (&submit, "submit-session"),
+            (&respond, "respond-session"),
+            (&continuation, "continue-session"),
+        ] {
+            let requirement = &client.state().auth.pending[0];
+            assert_eq!(requirement.source_session_id.as_deref(), Some(session_id));
+            assert_eq!(
+                requirement
+                    .mcp_authorization
+                    .as_ref()
+                    .and_then(|context| context.scope.as_deref()),
+                Some("repo:read")
+            );
+        }
     }
 }

@@ -139,6 +139,7 @@ impl Client {
             target,
             message: message.into(),
             source_session_id,
+            mcp_authorization: None,
         }))
     }
 
@@ -167,6 +168,13 @@ impl Client {
             operation_key,
             attempt_id: attempt_id.into(),
             input: input.into(),
+        }))
+    }
+
+    /// Start or restart polling for the active server-callback OAuth attempt.
+    pub fn poll_auth_attempt(&mut self, attempt_id: impl Into<String>) -> ClientUpdate {
+        self.apply(ClientEvent::Auth(AuthEvent::PollRequested {
+            attempt_id: attempt_id.into(),
         }))
     }
 
@@ -957,6 +965,18 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             AuthEvent::LoggedOut { operation_key, .. }
             | AuthEvent::LogoutFailed { operation_key, .. },
         ) => operation_is_current(state.auth.logout.key.as_ref(), operation_key),
+        ClientEvent::Auth(
+            AuthEvent::Polled {
+                attempt_id,
+                poll_generation,
+                ..
+            }
+            | AuthEvent::PollFailed {
+                attempt_id,
+                poll_generation,
+                ..
+            },
+        ) => state.auth_poll_is_current(attempt_id, *poll_generation),
         ClientEvent::Catalog(
             CatalogEvent::ModelsSearched { request_id, .. }
             | CatalogEvent::ModelsSearchFailed { request_id, .. },
