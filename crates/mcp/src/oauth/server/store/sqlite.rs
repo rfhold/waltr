@@ -121,13 +121,17 @@ impl OAuthAuthorizationStore for SqliteOAuthAuthorizationStore {
         self.config.clone()
     }
     sqlite_method!(register_client(client: OAuthClient) -> bool, |s: &mut OAuthState, c: &OAuthAuthorizationStoreConfig, v| s.register_client(c, v));
+    sqlite_method!(register_dynamic_client(request: OAuthDynamicClientRegistrationRequest) -> OAuthDynamicClientRegistrationResult, |s: &mut OAuthState, c: &OAuthAuthorizationStoreConfig, v| s.register_dynamic(c, v));
+    sqlite_method!(cache_client_metadata(metadata: OAuthCachedClientMetadata) -> (), |s: &mut OAuthState, c: &OAuthAuthorizationStoreConfig, v| s.cache_metadata(c, v));
+    sqlite_method!(client_metadata(client_id: String, now_ms: i64) -> Option<OAuthCachedClientMetadata>, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, n| { validate_time(n)?; Ok(s.current_metadata(&id, n)) });
     sqlite_method!(create_authorization_transaction(transaction: OAuthAuthorizationTransaction) -> bool, |s: &mut OAuthState, c: &OAuthAuthorizationStoreConfig, v| s.create_transaction(c, v));
     sqlite_method!(client(client_id: String, now_ms: i64) -> Option<OAuthClient>, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, n| { validate_time(n)?; Ok(s.client(&id, n)) });
     sqlite_method!(authorization_context(transaction_id: String, now_ms: i64) -> Option<OAuthAuthorizationContext>, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, n| { validate_time(n)?; Ok(s.authorization_context(&id, n)) });
     sqlite_method!(consume_browser_correlation(transaction_id: String, correlation_digest: Vec<u8>, now_ms: i64) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, d: Vec<u8>, n| s.consume_correlation(&id, &d, n));
-    sqlite_method!(authenticate_authorization_transaction(transaction_id: String, principal_id: McpPrincipalId, now_ms: i64) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, p, n| s.authenticate(&id, &p, n));
-    sqlite_method!(decide_authorization_transaction(transaction_id: String, decision: OAuthAuthorizationDecision, now_ms: i64) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, d, n| s.decide(&id, d, n));
-    sqlite_method!(remember_authorization_consent(transaction_id: String, now_ms: i64) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, n| s.remember_consent(&id, n));
+    sqlite_method!(authenticate_authorization_transaction(transaction_id: String, principal_id: McpPrincipalId, now_ms: i64) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, p, n| { validate_time(n)?; Ok(s.authenticate(&id, &p, n)) });
+    sqlite_method!(authenticate_and_promote_client(request: OAuthDynamicClientPromotionRequest) -> OAuthClientPromotionResult, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, v: OAuthDynamicClientPromotionRequest| { validate_time(v.now_ms)?; Ok(s.authenticate_and_promote(&v)) });
+    sqlite_method!(decide_authorization_transaction(transaction_id: String, decision: OAuthAuthorizationDecision, now_ms: i64) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, d, n| { validate_time(n)?; Ok(s.decide(&id, d, n)) });
+    sqlite_method!(remember_authorization_consent(transaction_id: String, now_ms: i64) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, id: String, n| { validate_time(n)?; Ok(s.remember_consent(&id, n)) });
     sqlite_method!(issue_authorization_code(code: OAuthAuthorizationCode) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, v| s.issue_code(v));
     sqlite_method!(authorization_code_context(code_digest: Vec<u8>, now_ms: i64) -> Option<OAuthAuthorizationCodeContext>, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, d: Vec<u8>, n| s.code_context(&d, n));
     sqlite_method!(redeem_authorization_code(request: OAuthIssueGrantRequest) -> OAuthIssueGrantResult, |s: &mut OAuthState, c: &OAuthAuthorizationStoreConfig, v| s.redeem(c, v));
@@ -154,16 +158,54 @@ impl OAuthAuthorizationStore for SqliteOAuthAuthorizationStore {
     sqlite_method!(active_signing_key(issuer: String) -> Option<OAuthSigningKey>, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, i| Ok(s.signing_keys.values().find(|k| k.issuer == i && k.state == OAuthSigningKeyState::Active).cloned()));
     sqlite_method!(verification_signing_keys(issuer: String, now_ms: i64) -> Vec<OAuthSigningKey>, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, i, n| { validate_time(n)?; Ok(s.signing_keys.values().filter(|k| k.issuer == i && (k.state == OAuthSigningKeyState::Active || k.state == OAuthSigningKeyState::Retired && k.verify_until_ms.is_some_and(|d| d > n))).cloned().collect()) });
     sqlite_method!(rewrap_signing_key(issuer: String, key_id: String, encrypted: OAuthEncryptedPrivateKey) -> bool, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, i: String, k: String, e| { validate_encrypted_private_key(&e)?; let Some(key) = s.signing_keys.get_mut(&signing_key_map_key(&i, &k)).filter(|key| key.encrypted_private_key.is_some()) else { return Ok(false); }; key.encrypted_private_key = Some(e); Ok(true) });
-    sqlite_method!(cleanup(now_ms: i64, limit: usize) -> OAuthCleanupResult, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, n, l| s.cleanup(n, l));
+    sqlite_method!(cleanup(now_ms: i64, limit: usize) -> OAuthCleanupResult, |s: &mut OAuthState, _c: &OAuthAuthorizationStoreConfig, n, l| { validate_time(n)?; Ok(s.cleanup(n, l)) });
 }
 
 #[allow(clippy::too_many_lines)]
 async fn load_state(tx: &mut Transaction<'_, Sqlite>) -> OAuthAuthorizationStoreResult<OAuthState> {
     let mut state = OAuthState::default();
-    for row in sqlx::query("SELECT client_id, display_metadata, client_secret_digest, created_at_ms, expires_at_ms, disabled_at_ms FROM mcp_oauth_clients").fetch_all(&mut **tx).await.map_err(unavailable)? {
+    for row in sqlx::query("SELECT client_id, registration_method, display_metadata, client_secret_digest, created_at_ms, expires_at_ms, disabled_at_ms FROM mcp_oauth_clients").fetch_all(&mut **tx).await.map_err(unavailable)? {
         let client_id: String = row.try_get("client_id").map_err(unavailable)?;
         let redirects = sqlx::query_scalar("SELECT redirect_uri FROM mcp_oauth_client_redirect_uris WHERE client_id = ? ORDER BY redirect_uri").bind(&client_id).fetch_all(&mut **tx).await.map_err(unavailable)?;
-        state.clients.insert(client_id.clone(), OAuthClient { client_id, display_name: row.try_get("display_metadata").map_err(unavailable)?, client_secret_digest: row.try_get("client_secret_digest").map_err(unavailable)?, redirect_uris: redirects, created_at_ms: row.try_get("created_at_ms").map_err(unavailable)?, expires_at_ms: row.try_get("expires_at_ms").map_err(unavailable)?, disabled_at_ms: row.try_get("disabled_at_ms").map_err(unavailable)? });
+        state.clients.insert(client_id.clone(), OAuthClient { client_id, registration_method: registration_method(&row.try_get::<String, _>("registration_method").map_err(unavailable)?)?, display_name: row.try_get("display_metadata").map_err(unavailable)?, client_secret_digest: row.try_get("client_secret_digest").map_err(unavailable)?, redirect_uris: redirects, created_at_ms: row.try_get("created_at_ms").map_err(unavailable)?, expires_at_ms: row.try_get("expires_at_ms").map_err(unavailable)?, disabled_at_ms: row.try_get("disabled_at_ms").map_err(unavailable)? });
+    }
+    for row in sqlx::query("SELECT * FROM mcp_oauth_dynamic_clients")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(unavailable)?
+    {
+        state.dynamic_clients.insert(
+            row.try_get("client_id").map_err(unavailable)?,
+            DynamicClientLifecycle {
+                provisional_expires_at_ms: row
+                    .try_get("provisional_expires_at_ms")
+                    .map_err(unavailable)?,
+                inactivity_lifetime_ms: row
+                    .try_get("inactivity_lifetime_ms")
+                    .map_err(unavailable)?,
+                promoted_principal_id: row.try_get("promoted_principal_id").map_err(unavailable)?,
+                promoted_at_ms: row.try_get("promoted_at_ms").map_err(unavailable)?,
+                last_used_at_ms: row.try_get("last_used_at_ms").map_err(unavailable)?,
+            },
+        );
+    }
+    for row in sqlx::query("SELECT * FROM mcp_oauth_client_metadata_cache")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(unavailable)?
+    {
+        let document: String = row.try_get("normalized_document").map_err(unavailable)?;
+        let value = OAuthCachedClientMetadata {
+            snapshot_id: row.try_get("snapshot_id").map_err(unavailable)?,
+            client_id: row.try_get("client_id").map_err(unavailable)?,
+            document: serde_json::from_str(&document)
+                .map_err(|_| OAuthAuthorizationStoreError::InvalidData)?,
+            document_digest: row.try_get("document_digest").map_err(unavailable)?,
+            retrieved_at_ms: row.try_get("retrieved_at_ms").map_err(unavailable)?,
+            expires_at_ms: row.try_get("expires_at_ms").map_err(unavailable)?,
+            retain_until_ms: row.try_get("retain_until_ms").map_err(unavailable)?,
+        };
+        state.metadata.insert(value.snapshot_id.clone(), value);
     }
     for row in sqlx::query("SELECT * FROM mcp_oauth_authorization_transactions")
         .fetch_all(&mut **tx)
@@ -175,6 +217,9 @@ async fn load_state(tx: &mut Transaction<'_, Sqlite>) -> OAuthAuthorizationStore
         let value = OAuthAuthorizationTransaction {
             transaction_id: row.try_get("transaction_id").map_err(unavailable)?,
             client_id: row.try_get("client_id").map_err(unavailable)?,
+            client_metadata_snapshot_id: row
+                .try_get("client_metadata_snapshot_id")
+                .map_err(unavailable)?,
             redirect_uri: row.try_get("redirect_uri").map_err(unavailable)?,
             resource: row.try_get("resource").map_err(unavailable)?,
             scopes: serde_json::from_str(&scopes)
@@ -341,6 +386,23 @@ async fn load_state(tx: &mut Transaction<'_, Sqlite>) -> OAuthAuthorizationStore
             .signing_keys
             .insert(signing_key_map_key(&value.issuer, &value.key_id), value);
     }
+    for row in sqlx::query("SELECT * FROM mcp_oauth_registration_rates")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(unavailable)?
+    {
+        let count: i64 = row.try_get("registration_count").map_err(unavailable)?;
+        state.registration_rates.insert(
+            row.try_get("rate_key").map_err(unavailable)?,
+            RegistrationRate {
+                window_started_at_ms: row.try_get("window_started_at_ms").map_err(unavailable)?,
+                window_expires_at_ms: row.try_get("window_expires_at_ms").map_err(unavailable)?,
+                count: count
+                    .try_into()
+                    .map_err(|_| OAuthAuthorizationStoreError::InvalidData)?,
+            },
+        );
+    }
     for row in sqlx::query("SELECT client_id, revoked_at_ms FROM mcp_oauth_revoked_clients")
         .fetch_all(&mut **tx)
         .await
@@ -376,7 +438,7 @@ async fn persist_changes(
         .iter()
         .filter(|(key, value)| old.clients.get(*key) != Some(*value))
     {
-        sqlx::query("INSERT INTO mcp_oauth_clients (client_id, display_metadata, client_secret_digest, created_at_ms, expires_at_ms, disabled_at_ms, redirect_limit) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET display_metadata=excluded.display_metadata, client_secret_digest=excluded.client_secret_digest, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms, disabled_at_ms=excluded.disabled_at_ms, redirect_limit=excluded.redirect_limit").bind(key).bind(&value.display_name).bind(&value.client_secret_digest).bind(value.created_at_ms).bind(value.expires_at_ms).bind(value.disabled_at_ms).bind(i64::try_from(value.redirect_uris.len()).map_err(|_| OAuthAuthorizationStoreError::InvalidData)?).execute(&mut **tx).await.map_err(unavailable)?;
+        sqlx::query("INSERT INTO mcp_oauth_clients (client_id, registration_method, display_metadata, client_secret_digest, created_at_ms, expires_at_ms, disabled_at_ms, redirect_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET registration_method=excluded.registration_method, display_metadata=excluded.display_metadata, client_secret_digest=excluded.client_secret_digest, created_at_ms=excluded.created_at_ms, expires_at_ms=excluded.expires_at_ms, disabled_at_ms=excluded.disabled_at_ms, redirect_limit=excluded.redirect_limit").bind(key).bind(registration_method_name(value.registration_method)).bind(&value.display_name).bind(&value.client_secret_digest).bind(value.created_at_ms).bind(value.expires_at_ms).bind(value.disabled_at_ms).bind(i64::try_from(value.redirect_uris.len()).map_err(|_| OAuthAuthorizationStoreError::InvalidData)?).execute(&mut **tx).await.map_err(unavailable)?;
         sqlx::query("DELETE FROM mcp_oauth_client_redirect_uris WHERE client_id = ?")
             .bind(key)
             .execute(&mut **tx)
@@ -411,6 +473,19 @@ async fn persist_simple_maps(
                 $upsert(tx, key, value).await?;
             }
         }};
+    }
+    sync_map!(
+        old.dynamic_clients,
+        new.dynamic_clients,
+        "DELETE FROM mcp_oauth_dynamic_clients WHERE client_id = ?",
+        upsert_dynamic
+    );
+    for (key, value) in new
+        .metadata
+        .iter()
+        .filter(|(key, value)| old.metadata.get(*key) != Some(*value))
+    {
+        upsert_metadata(tx, key, value).await?;
     }
     for (key, value) in new
         .transactions
@@ -459,13 +534,23 @@ async fn persist_simple_maps(
             .await
             .map_err(unavailable)?;
     }
-    for (key, value) in new
-        .grants
-        .iter()
-        .filter(|(key, value)| old.grants.get(*key) != Some(*value))
+    for key in old
+        .metadata
+        .keys()
+        .filter(|key| !new.metadata.contains_key(*key))
     {
-        upsert_grant(tx, key, value).await?;
+        sqlx::query("DELETE FROM mcp_oauth_client_metadata_cache WHERE snapshot_id = ?")
+            .bind(key)
+            .execute(&mut **tx)
+            .await
+            .map_err(unavailable)?;
     }
+    sync_map!(
+        old.grants,
+        new.grants,
+        "DELETE FROM mcp_oauth_grants WHERE grant_id = ?",
+        upsert_grant
+    );
     for (key, value) in new
         .families
         .iter()
@@ -506,17 +591,6 @@ async fn persist_simple_maps(
             .await
             .map_err(unavailable)?;
     }
-    for key in old
-        .grants
-        .keys()
-        .filter(|key| !new.grants.contains_key(*key))
-    {
-        sqlx::query("DELETE FROM mcp_oauth_grants WHERE grant_id = ?")
-            .bind(key)
-            .execute(&mut **tx)
-            .await
-            .map_err(unavailable)?;
-    }
     for (map_key, value) in &old.signing_keys {
         if !new.signing_keys.contains_key(map_key) {
             sqlx::query("DELETE FROM mcp_oauth_signing_keys WHERE issuer = ? AND key_id = ?")
@@ -535,6 +609,12 @@ async fn persist_simple_maps(
             upsert_signing(tx, key, value).await?;
         }
     }
+    sync_map!(
+        old.registration_rates,
+        new.registration_rates,
+        "DELETE FROM mcp_oauth_registration_rates WHERE rate_key = ?",
+        upsert_rate
+    );
     for (key, value) in new
         .revoked_clients
         .iter()
@@ -557,13 +637,29 @@ async fn persist_simple_maps(
     Ok(())
 }
 
+async fn upsert_dynamic(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &String,
+    v: &DynamicClientLifecycle,
+) -> OAuthAuthorizationStoreResult<()> {
+    sqlx::query("INSERT INTO mcp_oauth_dynamic_clients VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(client_id) DO UPDATE SET provisional_expires_at_ms=excluded.provisional_expires_at_ms, inactivity_lifetime_ms=excluded.inactivity_lifetime_ms, promoted_principal_id=excluded.promoted_principal_id, promoted_at_ms=excluded.promoted_at_ms, last_used_at_ms=excluded.last_used_at_ms").bind(key).bind(v.provisional_expires_at_ms).bind(v.inactivity_lifetime_ms).bind(&v.promoted_principal_id).bind(v.promoted_at_ms).bind(v.last_used_at_ms).execute(&mut **tx).await.map_err(unavailable)?;
+    Ok(())
+}
+async fn upsert_metadata(
+    tx: &mut Transaction<'_, Sqlite>,
+    _: &String,
+    v: &OAuthCachedClientMetadata,
+) -> OAuthAuthorizationStoreResult<()> {
+    sqlx::query("INSERT INTO mcp_oauth_client_metadata_cache VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(snapshot_id) DO UPDATE SET client_id=excluded.client_id, normalized_document=excluded.normalized_document, document_digest=excluded.document_digest, retrieved_at_ms=excluded.retrieved_at_ms, expires_at_ms=excluded.expires_at_ms, retain_until_ms=excluded.retain_until_ms").bind(&v.snapshot_id).bind(&v.client_id).bind(serde_json::to_string(&v.document).map_err(|_| OAuthAuthorizationStoreError::InvalidData)?).bind(&v.document_digest).bind(v.retrieved_at_ms).bind(v.expires_at_ms).bind(v.retain_until_ms).execute(&mut **tx).await.map_err(unavailable)?;
+    Ok(())
+}
 async fn upsert_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     _: &String,
     v: &OAuthAuthorizationTransaction,
     consumed: bool,
 ) -> OAuthAuthorizationStoreResult<()> {
-    sqlx::query("INSERT INTO mcp_oauth_authorization_transactions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(transaction_id) DO UPDATE SET principal_id=excluded.principal_id, decision=excluded.decision, browser_correlation_consumed_at_ms=excluded.browser_correlation_consumed_at_ms").bind(&v.transaction_id).bind(&v.client_id).bind(&v.redirect_uri).bind(&v.resource).bind(serde_json::to_string(&v.scopes).map_err(|_| OAuthAuthorizationStoreError::InvalidData)?).bind(&v.pkce_challenge).bind(&v.browser_correlation_digest).bind(consumed.then_some(v.created_at_ms)).bind(&v.state_reference).bind(&v.principal_id).bind(v.decision.map(authorization_decision_name)).bind(v.created_at_ms).bind(v.expires_at_ms).execute(&mut **tx).await.map_err(unavailable)?;
+    sqlx::query("INSERT INTO mcp_oauth_authorization_transactions (transaction_id,client_id,redirect_uri,resource,scopes,pkce_challenge,browser_correlation_digest,browser_correlation_consumed_at_ms,state_reference,principal_id,decision,created_at_ms,expires_at_ms,client_metadata_snapshot_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(transaction_id) DO UPDATE SET principal_id=excluded.principal_id, decision=excluded.decision, browser_correlation_consumed_at_ms=excluded.browser_correlation_consumed_at_ms").bind(&v.transaction_id).bind(&v.client_id).bind(&v.redirect_uri).bind(&v.resource).bind(serde_json::to_string(&v.scopes).map_err(|_| OAuthAuthorizationStoreError::InvalidData)?).bind(&v.pkce_challenge).bind(&v.browser_correlation_digest).bind(consumed.then_some(v.created_at_ms)).bind(&v.state_reference).bind(&v.principal_id).bind(v.decision.map(authorization_decision_name)).bind(v.created_at_ms).bind(v.expires_at_ms).bind(&v.client_metadata_snapshot_id).execute(&mut **tx).await.map_err(unavailable)?;
     Ok(())
 }
 async fn upsert_code(
@@ -614,6 +710,32 @@ async fn upsert_signing(
     let encrypted = v.encrypted_private_key.as_ref();
     sqlx::query("INSERT INTO mcp_oauth_signing_keys VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(issuer,key_id) DO UPDATE SET encrypted_private_material=excluded.encrypted_private_material, wrapping_key_id=excluded.wrapping_key_id, encryption_nonce=excluded.encryption_nonce, state=excluded.state, activated_at_ms=excluded.activated_at_ms, retired_at_ms=excluded.retired_at_ms, verify_until_ms=excluded.verify_until_ms, private_until_ms=excluded.private_until_ms").bind(&v.issuer).bind(&v.key_id).bind(&v.algorithm).bind(serde_json::to_string(&v.public_jwk).map_err(|_| OAuthAuthorizationStoreError::InvalidData)?).bind(encrypted.map(|e| &e.ciphertext)).bind(encrypted.map(|e| &e.wrapping_key_id)).bind(encrypted.map(|e| &e.nonce)).bind(signing_state_name(v.state)).bind(v.created_at_ms).bind(v.activated_at_ms).bind(v.retired_at_ms).bind(v.verify_until_ms).bind(v.private_until_ms).execute(&mut **tx).await.map_err(unavailable)?;
     Ok(())
+}
+async fn upsert_rate(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &String,
+    v: &RegistrationRate,
+) -> OAuthAuthorizationStoreResult<()> {
+    sqlx::query("INSERT INTO mcp_oauth_registration_rates VALUES (?, ?, ?, ?) ON CONFLICT(rate_key) DO UPDATE SET window_started_at_ms=excluded.window_started_at_ms, window_expires_at_ms=excluded.window_expires_at_ms, registration_count=excluded.registration_count").bind(key).bind(v.window_started_at_ms).bind(v.window_expires_at_ms).bind(i64::try_from(v.count).map_err(|_| OAuthAuthorizationStoreError::InvalidData)?).execute(&mut **tx).await.map_err(unavailable)?;
+    Ok(())
+}
+
+fn registration_method(
+    value: &str,
+) -> OAuthAuthorizationStoreResult<OAuthClientRegistrationMethod> {
+    match value {
+        "preconfigured" => Ok(OAuthClientRegistrationMethod::Preconfigured),
+        "dynamic" => Ok(OAuthClientRegistrationMethod::Dynamic),
+        "client_metadata_document" => Ok(OAuthClientRegistrationMethod::ClientMetadataDocument),
+        _ => Err(OAuthAuthorizationStoreError::InvalidData),
+    }
+}
+const fn registration_method_name(value: OAuthClientRegistrationMethod) -> &'static str {
+    match value {
+        OAuthClientRegistrationMethod::Preconfigured => "preconfigured",
+        OAuthClientRegistrationMethod::Dynamic => "dynamic",
+        OAuthClientRegistrationMethod::ClientMetadataDocument => "client_metadata_document",
+    }
 }
 fn authorization_decision(
     value: &str,

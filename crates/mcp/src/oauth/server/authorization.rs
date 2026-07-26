@@ -35,15 +35,20 @@ use url::Url;
 use super::{
     McpOAuthClock, McpOAuthEntropy, OAuthAuthorizationCode, OAuthAuthorizationDecision,
     OAuthAuthorizationStore, OAuthAuthorizationStoreError, OAuthAuthorizationStoreResult,
-    OAuthAuthorizationTransaction, OAuthCleanupResult, OAuthIssueGrantRequest,
-    OAuthIssueGrantResult, OAuthKeyEncryption, OAuthRefreshRotationRequest,
-    OAuthRefreshRotationResult, OAuthRevocationTarget, OAuthSigningKey, OAuthTokenMetadata,
-    OAuthValidateAccessTokenRequest, generate_es256_signing_key_candidate,
+    OAuthAuthorizationTransaction, OAuthCachedClientMetadata, OAuthCleanupResult, OAuthClient,
+    OAuthClientPromotionResult, OAuthClientRegistrationMethod, OAuthClientRegistrationOptions,
+    OAuthDynamicClientPromotionRequest, OAuthDynamicClientRegistrationRequest,
+    OAuthDynamicClientRegistrationResult, OAuthIssueGrantRequest, OAuthIssueGrantResult,
+    OAuthKeyEncryption, OAuthRefreshRotationRequest, OAuthRefreshRotationResult,
+    OAuthRegistrationOutcome, OAuthRevocationTarget, OAuthSigningKey, OAuthTokenMetadata,
+    OAuthValidateAccessTokenRequest, duration_ms, generate_es256_signing_key_candidate,
 };
 use crate::{
-    Error, McpAuthorizationServerMetadata, McpJwtAccessTokenClaims, McpJwtAccessTokenHeader,
-    McpJwtAudience, McpOAuthSecret, McpOAuthTokenType, McpPrincipalId, McpTokenError,
-    McpTokenErrorCode, McpTokenResponse, Result,
+    Error, McpAuthorizationServerMetadata, McpClientRegistrationError,
+    McpClientRegistrationErrorCode, McpClientRegistrationResponse, McpJwtAccessTokenClaims,
+    McpJwtAccessTokenHeader, McpJwtAudience, McpOAuthGrantType, McpOAuthResponseType,
+    McpOAuthSecret, McpOAuthTokenType, McpPrincipalId, McpPublicClientRegistrationRequest,
+    McpTokenEndpointAuthMethod, McpTokenError, McpTokenErrorCode, McpTokenResponse, Result,
     server::{BoxFuture, McpHostedTokenValidation, McpRevocationLease, McpTokenAuthorization},
 };
 
@@ -69,6 +74,8 @@ pub struct OAuthAuthorizationServerConfig {
     pub token_endpoint: String,
     /// Exact revocation endpoint.
     pub revocation_endpoint: String,
+    /// Dynamic client registration endpoint, when enabled.
+    pub registration_endpoint: Option<String>,
     /// Exact JWKS endpoint.
     pub jwks_uri: String,
     /// Supported resources.
@@ -104,6 +111,7 @@ impl OAuthAuthorizationServerConfig {
             authorization_decision_endpoint: format!("{base}/authorize/decision"),
             token_endpoint: format!("{base}/token"),
             revocation_endpoint: format!("{base}/revoke"),
+            registration_endpoint: None,
             jwks_uri: format!("{base}/jwks.json"),
             issuer,
             resources,
@@ -249,6 +257,7 @@ struct AuthorizationState {
     entropy: Arc<dyn McpOAuthEntropy>,
     encryption: Arc<dyn OAuthKeyEncryption>,
     revocations: watch::Sender<u64>,
+    registration: Option<OAuthClientRegistrationOptions>,
 }
 
 impl OAuthAuthorizationServer {
@@ -279,14 +288,86 @@ impl OAuthAuthorizationServer {
                 entropy,
                 encryption,
                 revocations,
+                registration: None,
             }),
         })
     }
 
-    /// Compose hosted authorization-server routes.
+    /// Install generic CIMD and/or dynamic registration policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when enabled DCR has no configured endpoint or a bound is invalid.
+    pub fn with_client_registration(
+        mut self,
+        options: OAuthClientRegistrationOptions,
+    ) -> Result<Self> {
+        if options.dynamic_registration && self.state.config.registration_endpoint.is_none() {
+            return Err(Error::protocol(
+                "OAuth dynamic registration requires registration_endpoint",
+            ));
+        }
+        if options.max_request_bytes == 0
+            || options.max_field_bytes == 0
+            || options.max_provisional_clients == 0
+            || options.max_active_dynamic_clients == 0
+            || options.max_clients_per_principal == 0
+            || options.global_rate_limit == 0
+            || options.source_rate_limit == 0
+            || options.provisional_lifetime.is_zero()
+            || options.inactive_client_lifetime.is_zero()
+            || options.rate_limit_window.is_zero()
+        {
+            return Err(Error::protocol("OAuth registration policy is invalid"));
+        }
+        duration_ms(options.provisional_lifetime)?;
+        duration_ms(options.inactive_client_lifetime)?;
+        duration_ms(options.rate_limit_window)?;
+        Arc::get_mut(&mut self.state)
+            .ok_or_else(|| Error::protocol("OAuth registration must be configured before cloning"))?
+            .registration = Some(options);
+        Ok(self)
+    }
+
+    /// Validate and atomically persist a preregistered public client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for confidential, malformed, duplicate, or over-quota clients.
+    pub async fn preregister_public_client(
+        &self,
+        client: OAuthClient,
+        allow_loopback_redirects: bool,
+    ) -> Result<()> {
+        if client.registration_method != OAuthClientRegistrationMethod::Preconfigured
+            || client.client_id.is_empty()
+            || client.client_id.len() > 2048
+            || client.display_name.as_ref().is_some_and(|name| {
+                name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+            })
+            || client.client_secret_digest.is_some()
+            || client.redirect_uris.is_empty()
+            || client.redirect_uris.len() > self.state.store.config().max_redirect_uris_per_client
+            || client.redirect_uris.iter().any(|redirect| {
+                crate::validate_public_redirect_uri(redirect, allow_loopback_redirects).is_err()
+            })
+        {
+            return Err(Error::protocol(
+                "OAuth preregistered public client is invalid",
+            ));
+        }
+        if !self.state.store.register_client(client).await? {
+            return Err(Error::protocol(
+                "OAuth preregistered client was not admitted",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compose hosted authorization-server and configured registration routes.
     pub fn router(&self) -> Router {
         let config = &self.state.config;
-        Router::new()
+        let mut router = Router::new()
             .route(&metadata_path(&config.issuer), get(metadata))
             .route(&endpoint_path(&config.jwks_uri), get(jwks))
             .route(
@@ -298,8 +379,17 @@ impl OAuthAuthorizationServer {
                 post(decide),
             )
             .route(&endpoint_path(&config.token_endpoint), post(token))
-            .route(&endpoint_path(&config.revocation_endpoint), post(revoke))
-            .with_state(self.state.clone())
+            .route(&endpoint_path(&config.revocation_endpoint), post(revoke));
+        if self
+            .state
+            .registration
+            .as_ref()
+            .is_some_and(|options| options.dynamic_registration)
+            && let Some(endpoint) = &config.registration_endpoint
+        {
+            router = router.route(&endpoint_path(endpoint), post(register));
+        }
+        router.with_state(self.state.clone())
     }
 
     /// Validate a hosted bearer token and create an active revocation lease.
@@ -470,13 +560,21 @@ async fn metadata(State(state): State<Arc<AuthorizationState>>) -> Response {
         token_endpoint: Some(state.config.token_endpoint.clone()),
         revocation_endpoint: Some(state.config.revocation_endpoint.clone()),
         jwks_uri: Some(state.config.jwks_uri.clone()),
-        registration_endpoint: None,
+        registration_endpoint: state.registration.as_ref().and_then(|options| {
+            options
+                .dynamic_registration
+                .then(|| state.config.registration_endpoint.clone())
+                .flatten()
+        }),
         scopes_supported: scopes,
         response_types_supported: vec!["code".to_owned()],
         grant_types_supported: vec!["authorization_code".to_owned(), "refresh_token".to_owned()],
         token_endpoint_auth_methods_supported: vec!["none".to_owned()],
         code_challenge_methods_supported: vec!["S256".to_owned()],
-        client_id_metadata_document_supported: None,
+        client_id_metadata_document_supported: state
+            .registration
+            .as_ref()
+            .and_then(|options| options.metadata_fetcher.as_ref().map(|_| true)),
         protected_resources: state
             .config
             .resources
@@ -509,6 +607,251 @@ async fn jwks(State(state): State<Arc<AuthorizationState>>) -> Response {
     }
 }
 
+async fn resolve_client(
+    state: &Arc<AuthorizationState>,
+    client_id: &str,
+    now: i64,
+) -> OAuthAuthorizationStoreResult<Option<(OAuthClient, Option<String>)>> {
+    if let Some(client) = state.store.client(client_id.to_owned(), now).await? {
+        return Ok(Some((client, None)));
+    }
+    let Some(options) = &state.registration else {
+        return Ok(None);
+    };
+    let Some(fetcher) = &options.metadata_fetcher else {
+        return Ok(None);
+    };
+    let metadata = if let Some(metadata) = state
+        .store
+        .client_metadata(client_id.to_owned(), now)
+        .await?
+    {
+        metadata
+    } else {
+        let Ok(retrieved) = fetcher.fetch(client_id.to_owned()).await else {
+            return Ok(None);
+        };
+        let snapshot_id = URL_SAFE_NO_PAD.encode(&retrieved.document_digest);
+        let expires_at_ms = add_ms(now, retrieved.freshness)?;
+        let retention = state
+            .config
+            .authorization_transaction_lifetime
+            .checked_add(state.config.authorization_code_lifetime)
+            .ok_or(OAuthAuthorizationStoreError::InvalidData)?;
+        let retain_until_ms = add_ms(expires_at_ms, retention)?;
+        let metadata = OAuthCachedClientMetadata {
+            snapshot_id,
+            client_id: client_id.to_owned(),
+            document: super::super::discovery::parse_unique_json(&retrieved.normalized_document)
+                .map_err(|_| OAuthAuthorizationStoreError::InvalidData)?,
+            document_digest: retrieved.document_digest,
+            retrieved_at_ms: now,
+            expires_at_ms,
+            retain_until_ms,
+        };
+        state.store.cache_client_metadata(metadata.clone()).await?;
+        metadata
+    };
+    let document: crate::McpClientMetadataDocument =
+        serde_json::from_value(metadata.document.clone())
+            .map_err(|_| OAuthAuthorizationStoreError::InvalidData)?;
+    document
+        .validate_public_client(client_id, options.allow_loopback_redirects)
+        .map_err(|_| OAuthAuthorizationStoreError::InvalidData)?;
+    Ok(Some((
+        OAuthClient {
+            client_id: client_id.to_owned(),
+            registration_method: OAuthClientRegistrationMethod::ClientMetadataDocument,
+            display_name: document.client_name,
+            client_secret_digest: None,
+            redirect_uris: document.redirect_uris,
+            created_at_ms: metadata.retrieved_at_ms,
+            expires_at_ms: None,
+            disabled_at_ms: None,
+        },
+        Some(metadata.snapshot_id),
+    )))
+}
+
+async fn register(
+    State(state): State<Arc<AuthorizationState>>,
+    request: Request<Body>,
+) -> Response {
+    let Some(options) = state
+        .registration
+        .as_ref()
+        .filter(|options| options.dynamic_registration)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_none_or(|value| !value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        observe_registration(options, OAuthRegistrationOutcome::Rejected);
+        return registration_error(McpClientRegistrationErrorCode::InvalidClientMetadata);
+    }
+    let trusted_source = options
+        .source_resolver
+        .as_ref()
+        .and_then(|resolver| resolver.trusted_source(request.headers()));
+    if trusted_source
+        .as_ref()
+        .is_some_and(|source| source.is_empty() || source.len() > options.max_field_bytes)
+    {
+        observe_registration(options, OAuthRegistrationOutcome::Rejected);
+        return registration_error(McpClientRegistrationErrorCode::InvalidClientMetadata);
+    }
+    let Ok(body) = to_bytes(request.into_body(), options.max_request_bytes).await else {
+        observe_registration(options, OAuthRegistrationOutcome::Rejected);
+        return registration_error(McpClientRegistrationErrorCode::InvalidClientMetadata);
+    };
+    let Ok(raw) = super::super::discovery::parse_unique_json::<serde_json::Value>(&body) else {
+        observe_registration(options, OAuthRegistrationOutcome::Rejected);
+        return registration_error(McpClientRegistrationErrorCode::InvalidClientMetadata);
+    };
+    if raw.get("software_statement").is_some() {
+        observe_registration(options, OAuthRegistrationOutcome::Rejected);
+        return registration_error(McpClientRegistrationErrorCode::InvalidSoftwareStatement);
+    }
+    if raw.get("client_secret").is_some()
+        || raw.get("client_secret_expires_at").is_some()
+        || raw.get("registration_access_token").is_some()
+        || raw.get("registration_client_uri").is_some()
+        || raw.get("client_id").is_some()
+    {
+        observe_registration(options, OAuthRegistrationOutcome::Rejected);
+        return registration_error(McpClientRegistrationErrorCode::InvalidClientMetadata);
+    }
+    let Ok(registration) = serde_json::from_value::<McpPublicClientRegistrationRequest>(raw) else {
+        observe_registration(options, OAuthRegistrationOutcome::Rejected);
+        return registration_error(McpClientRegistrationErrorCode::InvalidClientMetadata);
+    };
+    let registration = match registration.validate_and_normalize(
+        options.allow_loopback_redirects,
+        state.store.config().max_redirect_uris_per_client,
+        options.max_field_bytes,
+    ) {
+        Ok(registration) => registration,
+        Err(error) => {
+            observe_registration(options, OAuthRegistrationOutcome::Rejected);
+            return json_response(StatusCode::BAD_REQUEST, &error, true);
+        }
+    };
+    let now = match now_ms(state.clock.now()) {
+        Ok(now) => now,
+        Err(_) => return unavailable(),
+    };
+    for _ in 0..4 {
+        let client_id = match random_secret(state.entropy.as_ref(), 24) {
+            Ok(client_id) => client_id,
+            Err(_) => return unavailable(),
+        };
+        let admission = state
+            .store
+            .register_dynamic_client(OAuthDynamicClientRegistrationRequest {
+                client: OAuthClient {
+                    client_id: client_id.clone(),
+                    registration_method: OAuthClientRegistrationMethod::Dynamic,
+                    display_name: registration.client_name.clone(),
+                    client_secret_digest: None,
+                    redirect_uris: registration.redirect_uris.clone(),
+                    created_at_ms: now,
+                    expires_at_ms: None,
+                    disabled_at_ms: None,
+                },
+                provisional_expires_at_ms: match add_ms(now, options.provisional_lifetime) {
+                    Ok(value) => value,
+                    Err(_) => return unavailable(),
+                },
+                inactivity_lifetime_ms: match duration_ms(options.inactive_client_lifetime) {
+                    Ok(value) => value,
+                    Err(_) => return unavailable(),
+                },
+                max_provisional_clients: options.max_provisional_clients,
+                max_active_dynamic_clients: options.max_active_dynamic_clients,
+                global_rate_limit: options.global_rate_limit,
+                source_rate_limit: options.source_rate_limit,
+                rate_limit_window_ms: match duration_ms(options.rate_limit_window) {
+                    Ok(value) => value,
+                    Err(_) => return unavailable(),
+                },
+                trusted_source: trusted_source.clone(),
+            })
+            .await;
+        match admission {
+            Ok(OAuthDynamicClientRegistrationResult::Registered) => {
+                observe_registration(options, OAuthRegistrationOutcome::Accepted);
+                return json_response(
+                    StatusCode::CREATED,
+                    &McpClientRegistrationResponse {
+                        client_id,
+                        client_secret: None,
+                        client_secret_expires_at: None,
+                        registration_access_token: None,
+                        registration_client_uri: None,
+                        client_id_issued_at: u64::try_from(now / 1000).ok(),
+                        redirect_uris: registration.redirect_uris,
+                        grant_types: vec![
+                            McpOAuthGrantType::AuthorizationCode,
+                            McpOAuthGrantType::RefreshToken,
+                        ],
+                        response_types: vec![McpOAuthResponseType::Code],
+                        token_endpoint_auth_method: McpTokenEndpointAuthMethod::None,
+                        client_name: registration.client_name,
+                    },
+                    true,
+                );
+            }
+            Ok(OAuthDynamicClientRegistrationResult::Duplicate) => {}
+            Ok(OAuthDynamicClientRegistrationResult::RateLimited) => {
+                observe_registration(options, OAuthRegistrationOutcome::Limited);
+                return json_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &McpClientRegistrationError {
+                        error: McpClientRegistrationErrorCode::InvalidClientMetadata,
+                        error_description: None,
+                    },
+                    true,
+                );
+            }
+            Ok(
+                OAuthDynamicClientRegistrationResult::CapacityExceeded
+                | OAuthDynamicClientRegistrationResult::Disabled,
+            )
+            | Err(_) => {
+                observe_registration(options, OAuthRegistrationOutcome::CapacityBlocked);
+                return unavailable();
+            }
+        }
+    }
+    observe_registration(options, OAuthRegistrationOutcome::CapacityBlocked);
+    unavailable()
+}
+
+fn registration_error(error: McpClientRegistrationErrorCode) -> Response {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        &McpClientRegistrationError {
+            error,
+            error_description: None,
+        },
+        true,
+    )
+}
+
+fn observe_registration(
+    options: &OAuthClientRegistrationOptions,
+    outcome: OAuthRegistrationOutcome,
+) {
+    if let Some(observer) = &options.observer {
+        observer.dynamic_registration(outcome);
+    }
+}
+
 async fn authorize(
     State(state): State<Arc<AuthorizationState>>,
     request: Request<Body>,
@@ -530,13 +873,16 @@ async fn authorize(
         Ok(value) => value,
         Err(_) => return unavailable(),
     };
-    let Some(client) = (match state.store.client(parsed.client_id.clone(), now).await {
-        Ok(value) => value,
-        Err(_) => return unavailable(),
-    }) else {
+    let Some((client, client_metadata_snapshot_id)) =
+        (match resolve_client(&state, &parsed.client_id, now).await {
+            Ok(value) => value,
+            Err(_) => return unavailable(),
+        })
+    else {
         return local_authorization_error(StatusCode::BAD_REQUEST, "unauthorized_client");
     };
-    if !client.redirect_uris.contains(&parsed.redirect_uri) {
+    if client.client_secret_digest.is_some() || !client.redirect_uris.contains(&parsed.redirect_uri)
+    {
         return local_authorization_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     if let Err(error) = validate_authorization_bindings(&state.config, &parsed) {
@@ -559,6 +905,7 @@ async fn authorize(
     let transaction = OAuthAuthorizationTransaction {
         transaction_id: transaction_id.clone(),
         client_id: parsed.client_id,
+        client_metadata_snapshot_id,
         redirect_uri: parsed.redirect_uri,
         resource: parsed.resource,
         scopes: parsed.scopes,
@@ -655,10 +1002,28 @@ async fn authenticate_transaction(
                     Err(_) => return unavailable(),
                 }
             }
-            let authentication = state
-                .store
-                .authenticate_authorization_transaction(transaction_id.clone(), principal_id, now)
-                .await;
+            let authentication = if let Some(options) = &state.registration {
+                state
+                    .store
+                    .authenticate_and_promote_client(OAuthDynamicClientPromotionRequest {
+                        transaction_id: transaction_id.clone(),
+                        principal_id,
+                        now_ms: now,
+                        max_clients_per_principal: options.max_clients_per_principal,
+                        max_active_dynamic_clients: options.max_active_dynamic_clients,
+                    })
+                    .await
+                    .map(|result| result == OAuthClientPromotionResult::Authenticated)
+            } else {
+                state
+                    .store
+                    .authenticate_authorization_transaction(
+                        transaction_id.clone(),
+                        principal_id,
+                        now,
+                    )
+                    .await
+            };
             match authentication {
                 Ok(true) => consent_or_issue(state, transaction_id).await,
                 Ok(false) if resumed => consent_or_issue(state, transaction_id).await,
@@ -1061,6 +1426,7 @@ async fn refresh(state: Arc<AuthorizationState>, mut p: BTreeMap<String, String>
     let transaction = OAuthAuthorizationTransaction {
         transaction_id: String::new(),
         client_id: context.grant.client_id.clone(),
+        client_metadata_snapshot_id: None,
         redirect_uri: String::new(),
         resource: context.grant.resource.clone(),
         scopes: scopes.clone(),
@@ -1507,6 +1873,21 @@ fn validate_config(config: &OAuthAuthorizationServerConfig) -> Result<()> {
         {
             return Err(Error::protocol(
                 "OAuth endpoints must be same-host exact HTTPS URLs",
+            ));
+        }
+    }
+    if let Some(endpoint) = &config.registration_endpoint {
+        let url = Url::parse(endpoint).map_err(|_| Error::protocol("OAuth endpoint is invalid"))?;
+        if url.scheme() != "https"
+            || url.host_str() != issuer.host_str()
+            || url.port_or_known_default() != issuer.port_or_known_default()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(Error::protocol(
+                "OAuth endpoints must be same-origin exact HTTPS URLs",
             ));
         }
     }

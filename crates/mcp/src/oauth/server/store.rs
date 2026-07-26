@@ -37,6 +37,8 @@ pub struct OAuthAuthorizationStoreConfig {
     pub max_refresh_families: usize,
     /// Maximum retained access-token authorization records.
     pub max_access_tokens: usize,
+    /// Whether dynamically registered public clients are accepted.
+    pub allow_public_client_registration: bool,
 }
 
 impl Default for OAuthAuthorizationStoreConfig {
@@ -48,6 +50,7 @@ impl Default for OAuthAuthorizationStoreConfig {
             max_grants: 100_000,
             max_refresh_families: 100_000,
             max_access_tokens: 1_000_000,
+            allow_public_client_registration: true,
         }
     }
 }
@@ -80,11 +83,25 @@ impl std::error::Error for OAuthAuthorizationStoreError {}
 /// Result returned by authorization-store operations.
 pub type OAuthAuthorizationStoreResult<T> = Result<T, OAuthAuthorizationStoreError>;
 
+/// How a public client became known to the authorization server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthClientRegistrationMethod {
+    /// Statically provisioned client.
+    Preconfigured,
+    /// RFC 7591 dynamic registration.
+    Dynamic,
+    /// Client ID Metadata Document.
+    ClientMetadataDocument,
+}
+
 /// Persisted public OAuth client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthClient {
     /// Exact client identifier.
     pub client_id: String,
+    /// Registration source.
+    pub registration_method: OAuthClientRegistrationMethod,
     /// Untrusted display name.
     pub display_name: Option<String>,
     /// Digest of a confidential client secret, when one is provisioned.
@@ -97,6 +114,89 @@ pub struct OAuthClient {
     pub expires_at_ms: Option<i64>,
     /// Disablement time, when disabled.
     pub disabled_at_ms: Option<i64>,
+}
+
+/// Validated cached Client ID Metadata Document snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthCachedClientMetadata {
+    /// Immutable snapshot identifier.
+    pub snapshot_id: String,
+    /// Exact client metadata URL.
+    pub client_id: String,
+    /// Normalized metadata document.
+    pub document: serde_json::Value,
+    /// Digest of the fetched document.
+    pub document_digest: Vec<u8>,
+    /// Retrieval time.
+    pub retrieved_at_ms: i64,
+    /// Freshness expiry.
+    pub expires_at_ms: i64,
+    /// Deadline after which the snapshot may be deleted.
+    pub retain_until_ms: i64,
+}
+
+/// Atomic provisional dynamic registration request and abuse-control policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthDynamicClientRegistrationRequest {
+    /// Normalized dynamic public client.
+    pub client: OAuthClient,
+    /// Provisional expiry.
+    pub provisional_expires_at_ms: i64,
+    /// Inactivity lifetime applied after promotion.
+    pub inactivity_lifetime_ms: i64,
+    /// Maximum provisional registrations.
+    pub max_provisional_clients: usize,
+    /// Maximum promoted dynamic registrations.
+    pub max_active_dynamic_clients: usize,
+    /// Global fixed-window registration limit.
+    pub global_rate_limit: usize,
+    /// Trusted-source fixed-window registration limit.
+    pub source_rate_limit: usize,
+    /// Fixed-window duration.
+    pub rate_limit_window_ms: i64,
+    /// Optional host-validated source identity.
+    pub trusted_source: Option<String>,
+}
+
+/// Dynamic registration admission result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OAuthDynamicClientRegistrationResult {
+    /// Provisional client committed.
+    Registered,
+    /// Client identifier collision.
+    Duplicate,
+    /// Registration rate was exceeded.
+    RateLimited,
+    /// Dynamic registration capacity was exhausted.
+    CapacityExceeded,
+    /// Dynamic registration is disabled by store policy.
+    Disabled,
+}
+
+/// Atomic first-authorization promotion request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthDynamicClientPromotionRequest {
+    /// Authorization transaction receiving the principal.
+    pub transaction_id: String,
+    /// Authenticated principal.
+    pub principal_id: McpPrincipalId,
+    /// Operation time.
+    pub now_ms: i64,
+    /// Per-principal promoted dynamic-client limit.
+    pub max_clients_per_principal: usize,
+    /// Global promoted dynamic-client limit.
+    pub max_active_dynamic_clients: usize,
+}
+
+/// Authentication and dynamic promotion result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OAuthClientPromotionResult {
+    /// Principal attached and any provisional client promoted.
+    Authenticated,
+    /// Transaction was stale or already authenticated.
+    InvalidTransaction,
+    /// Principal or dynamic active-client quota was exhausted.
+    QuotaExceeded,
 }
 
 /// Consent decision recorded for an authorization transaction.
@@ -116,6 +216,8 @@ pub struct OAuthAuthorizationTransaction {
     pub transaction_id: String,
     /// Registered client identifier.
     pub client_id: String,
+    /// Optional CIMD snapshot binding.
+    pub client_metadata_snapshot_id: Option<String>,
     /// Exact redirect URI.
     pub redirect_uri: String,
     /// Exact resource identifier.
@@ -449,6 +551,26 @@ pub trait OAuthAuthorizationStore: Send + Sync + 'static {
         &self,
         client: OAuthClient,
     ) -> BoxFuture<OAuthAuthorizationStoreResult<bool>>;
+    /// Atomically admit one provisional dynamic public client.
+    fn register_dynamic_client(
+        &self,
+        _request: OAuthDynamicClientRegistrationRequest,
+    ) -> BoxFuture<OAuthAuthorizationStoreResult<OAuthDynamicClientRegistrationResult>> {
+        Box::pin(async { Ok(OAuthDynamicClientRegistrationResult::Disabled) })
+    }
+    /// Cache a validated CIMD snapshot.
+    fn cache_client_metadata(
+        &self,
+        metadata: OAuthCachedClientMetadata,
+    ) -> BoxFuture<OAuthAuthorizationStoreResult<()>>;
+    /// Resolve the current unexpired validated CIMD snapshot for a client ID.
+    fn client_metadata(
+        &self,
+        _client_id: String,
+        _now_ms: i64,
+    ) -> BoxFuture<OAuthAuthorizationStoreResult<Option<OAuthCachedClientMetadata>>> {
+        Box::pin(async { Ok(None) })
+    }
     /// Create a fully bound authorization transaction.
     fn create_authorization_transaction(
         &self,
@@ -480,6 +602,13 @@ pub trait OAuthAuthorizationStore: Send + Sync + 'static {
         principal_id: McpPrincipalId,
         now_ms: i64,
     ) -> BoxFuture<OAuthAuthorizationStoreResult<bool>>;
+    /// Attach a principal and atomically promote a provisional dynamic client.
+    fn authenticate_and_promote_client(
+        &self,
+        _request: OAuthDynamicClientPromotionRequest,
+    ) -> BoxFuture<OAuthAuthorizationStoreResult<OAuthClientPromotionResult>> {
+        Box::pin(async { Ok(OAuthClientPromotionResult::InvalidTransaction) })
+    }
     /// Record one approval or denial decision.
     fn decide_authorization_transaction(
         &self,
@@ -600,6 +729,9 @@ impl InMemoryOAuthAuthorizationStore {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct OAuthState {
     clients: BTreeMap<String, OAuthClient>,
+    #[serde(default)]
+    dynamic_clients: BTreeMap<String, DynamicClientLifecycle>,
+    metadata: BTreeMap<String, OAuthCachedClientMetadata>,
     transactions: BTreeMap<String, OAuthAuthorizationTransaction>,
     codes: BTreeMap<String, OAuthAuthorizationCode>,
     grants: BTreeMap<String, OAuthGrant>,
@@ -612,7 +744,25 @@ struct OAuthState {
     #[serde(default)]
     consumed_browser_correlations: BTreeSet<String>,
     #[serde(default)]
+    registration_rates: BTreeMap<String, RegistrationRate>,
+    #[serde(default)]
     revoked_clients: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DynamicClientLifecycle {
+    provisional_expires_at_ms: i64,
+    inactivity_lifetime_ms: i64,
+    promoted_principal_id: Option<String>,
+    promoted_at_ms: Option<i64>,
+    last_used_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RegistrationRate {
+    window_started_at_ms: i64,
+    window_expires_at_ms: i64,
+    count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +787,10 @@ impl OAuthState {
                 client.created_at_ms <= now
                     && client.disabled_at_ms.is_none()
                     && client.expires_at_ms.is_none_or(|expiry| expiry > now)
+                    && self.dynamic_clients.get(id).is_none_or(|lifecycle| {
+                        lifecycle.promoted_principal_id.is_some()
+                            || lifecycle.provisional_expires_at_ms > now
+                    })
             })
             .cloned()
     }
@@ -647,7 +801,13 @@ impl OAuthState {
             .get(id)
             .filter(|value| value.created_at_ms <= now && value.expires_at_ms > now)?
             .clone();
-        let client = self.client(&transaction.client_id, now)?;
+        let client = self.client(&transaction.client_id, now).or_else(|| {
+            transaction
+                .client_metadata_snapshot_id
+                .as_ref()
+                .and_then(|id| self.metadata.get(id))
+                .and_then(metadata_client)
+        })?;
         let consent_granted = transaction.principal_id.as_ref().is_some_and(|principal| {
             self.consents.contains(&consent_key(
                 principal,
@@ -687,17 +847,16 @@ impl OAuthState {
         Ok(true)
     }
 
-    fn remember_consent(&mut self, id: &str, now: i64) -> OAuthAuthorizationStoreResult<bool> {
-        validate_time(now)?;
+    fn remember_consent(&mut self, id: &str, now: i64) -> bool {
         let Some(transaction) = self.transactions.get(id).filter(|value| {
             value.created_at_ms <= now
                 && value.expires_at_ms > now
                 && value.decision == Some(OAuthAuthorizationDecision::Approved)
         }) else {
-            return Ok(false);
+            return false;
         };
         let Some(principal) = transaction.principal_id.as_ref() else {
-            return Ok(false);
+            return false;
         };
         self.consents.insert(consent_key(
             principal,
@@ -705,7 +864,7 @@ impl OAuthState {
             &transaction.resource,
             &transaction.scopes,
         ));
-        Ok(true)
+        true
     }
 
     fn code_context(
@@ -787,12 +946,175 @@ impl OAuthState {
         {
             return Err(OAuthAuthorizationStoreError::InvalidData);
         }
-        if self.clients.contains_key(&client.client_id) || self.clients.len() >= config.max_clients
+        if client.registration_method == OAuthClientRegistrationMethod::Dynamic
+            && !config.allow_public_client_registration
         {
+            return Ok(false);
+        }
+        let reserved_clients = self
+            .clients
+            .values()
+            .filter(|client| client.registration_method != OAuthClientRegistrationMethod::Dynamic)
+            .count();
+        if self.clients.contains_key(&client.client_id) || reserved_clients >= config.max_clients {
             return Ok(false);
         }
         self.clients.insert(client.client_id.clone(), client);
         Ok(true)
+    }
+
+    fn register_dynamic(
+        &mut self,
+        config: &OAuthAuthorizationStoreConfig,
+        request: OAuthDynamicClientRegistrationRequest,
+    ) -> OAuthAuthorizationStoreResult<OAuthDynamicClientRegistrationResult> {
+        let mut client = request.client;
+        canonical_strings(&mut client.redirect_uris)?;
+        if client.registration_method != OAuthClientRegistrationMethod::Dynamic
+            || client.client_secret_digest.is_some()
+            || client.created_at_ms < 0
+            || request.provisional_expires_at_ms <= client.created_at_ms
+            || request.inactivity_lifetime_ms <= 0
+            || request.rate_limit_window_ms <= 0
+            || client.redirect_uris.is_empty()
+            || client.redirect_uris.len() > config.max_redirect_uris_per_client
+            || client
+                .redirect_uris
+                .iter()
+                .any(|uri| crate::validate_public_redirect_uri(uri, true).is_err())
+        {
+            return Err(OAuthAuthorizationStoreError::InvalidData);
+        }
+        if !config.allow_public_client_registration {
+            return Ok(OAuthDynamicClientRegistrationResult::Disabled);
+        }
+        self.reclaim_dynamic_clients(client.created_at_ms, usize::MAX);
+        if self.clients.contains_key(&client.client_id) {
+            return Ok(OAuthDynamicClientRegistrationResult::Duplicate);
+        }
+        if !self.consume_registration_rate(
+            "global",
+            client.created_at_ms,
+            request.rate_limit_window_ms,
+            request.global_rate_limit,
+        ) || request.trusted_source.as_ref().is_some_and(|source| {
+            !self.consume_registration_rate(
+                &format!("source:{source}"),
+                client.created_at_ms,
+                request.rate_limit_window_ms,
+                request.source_rate_limit,
+            )
+        }) {
+            return Ok(OAuthDynamicClientRegistrationResult::RateLimited);
+        }
+        let provisional = self
+            .dynamic_clients
+            .values()
+            .filter(|value| value.promoted_principal_id.is_none())
+            .count();
+        let active = self
+            .dynamic_clients
+            .values()
+            .filter(|value| value.promoted_principal_id.is_some())
+            .count();
+        if provisional >= request.max_provisional_clients
+            || active >= request.max_active_dynamic_clients
+        {
+            return Ok(OAuthDynamicClientRegistrationResult::CapacityExceeded);
+        }
+        let client_id = client.client_id.clone();
+        self.dynamic_clients.insert(
+            client_id.clone(),
+            DynamicClientLifecycle {
+                provisional_expires_at_ms: request.provisional_expires_at_ms,
+                inactivity_lifetime_ms: request.inactivity_lifetime_ms,
+                promoted_principal_id: None,
+                promoted_at_ms: None,
+                last_used_at_ms: client.created_at_ms,
+            },
+        );
+        self.clients.insert(client_id, client);
+        Ok(OAuthDynamicClientRegistrationResult::Registered)
+    }
+
+    fn consume_registration_rate(
+        &mut self,
+        key: &str,
+        now: i64,
+        window_ms: i64,
+        limit: usize,
+    ) -> bool {
+        if limit == 0 {
+            return false;
+        }
+        let rate = self
+            .registration_rates
+            .entry(key.to_owned())
+            .or_insert_with(|| RegistrationRate {
+                window_started_at_ms: now,
+                window_expires_at_ms: now.saturating_add(window_ms),
+                count: 0,
+            });
+        if now.saturating_sub(rate.window_started_at_ms) >= window_ms {
+            rate.window_started_at_ms = now;
+            rate.window_expires_at_ms = now.saturating_add(window_ms);
+            rate.count = 0;
+        }
+        if rate.count >= limit {
+            return false;
+        }
+        rate.count += 1;
+        true
+    }
+
+    fn cache_metadata(
+        &mut self,
+        config: &OAuthAuthorizationStoreConfig,
+        metadata: OAuthCachedClientMetadata,
+    ) -> OAuthAuthorizationStoreResult<()> {
+        if metadata.snapshot_id.is_empty()
+            || metadata.client_id.is_empty()
+            || metadata.document_digest.is_empty()
+            || metadata.retrieved_at_ms < 0
+            || metadata.retrieved_at_ms > metadata.expires_at_ms
+            || metadata.expires_at_ms > metadata.retain_until_ms
+        {
+            return Err(OAuthAuthorizationStoreError::InvalidData);
+        }
+        let admitted_clients = self
+            .metadata
+            .values()
+            .map(|entry| &entry.client_id)
+            .collect::<BTreeSet<_>>();
+        if !admitted_clients.contains(&metadata.client_id)
+            && admitted_clients.len() >= config.max_clients
+        {
+            return Err(OAuthAuthorizationStoreError::Unavailable);
+        }
+        if self
+            .metadata
+            .get(&metadata.snapshot_id)
+            .is_some_and(|existing| {
+                existing.client_id != metadata.client_id
+                    || existing.document != metadata.document
+                    || existing.document_digest != metadata.document_digest
+            })
+        {
+            return Err(OAuthAuthorizationStoreError::InvalidData);
+        }
+        self.metadata.insert(metadata.snapshot_id.clone(), metadata);
+        Ok(())
+    }
+
+    fn current_metadata(&self, client_id: &str, now: i64) -> Option<OAuthCachedClientMetadata> {
+        if self.revoked_clients.contains_key(client_id) {
+            return None;
+        }
+        self.metadata
+            .values()
+            .filter(|entry| entry.client_id == client_id && entry.expires_at_ms > now)
+            .max_by_key(|entry| (entry.retrieved_at_ms, entry.snapshot_id.as_str()))
+            .cloned()
     }
 
     fn create_transaction(
@@ -807,6 +1129,16 @@ impl OAuthState {
                     .expires_at_ms
                     .is_none_or(|expiry| expiry > transaction.created_at_ms)
         });
+        let transaction_created_at = transaction.created_at_ms;
+        let metadata_exists = transaction
+            .client_metadata_snapshot_id
+            .as_ref()
+            .is_some_and(|id| {
+                self.metadata.get(id).is_some_and(|entry| {
+                    entry.client_id == transaction.client_id
+                        && entry.expires_at_ms > transaction_created_at
+                })
+            });
         if transaction.transaction_id.is_empty()
             || transaction.redirect_uri.is_empty()
             || transaction.resource.is_empty()
@@ -815,7 +1147,7 @@ impl OAuthState {
             || transaction.state_reference.is_empty()
             || transaction.created_at_ms < 0
             || transaction.expires_at_ms <= transaction.created_at_ms
-            || client.is_none()
+            || (client.is_none() && !metadata_exists)
         {
             return Err(OAuthAuthorizationStoreError::InvalidData);
         }
@@ -823,6 +1155,16 @@ impl OAuthState {
             && !client.redirect_uris.contains(&transaction.redirect_uri)
         {
             return Err(OAuthAuthorizationStoreError::InvalidData);
+        }
+        if let Some(snapshot_id) = &transaction.client_metadata_snapshot_id {
+            let metadata = self
+                .metadata
+                .get(snapshot_id)
+                .and_then(metadata_client)
+                .ok_or(OAuthAuthorizationStoreError::InvalidData)?;
+            if !metadata.redirect_uris.contains(&transaction.redirect_uri) {
+                return Err(OAuthAuthorizationStoreError::InvalidData);
+            }
         }
         let active = self
             .transactions
@@ -836,44 +1178,93 @@ impl OAuthState {
         }
         transaction.principal_id = None;
         transaction.decision = None;
+        let snapshot_id = transaction.client_metadata_snapshot_id.clone();
+        let transaction_expiry = transaction.expires_at_ms;
         self.transactions
             .insert(transaction.transaction_id.clone(), transaction);
+        if let Some(metadata) = snapshot_id.and_then(|id| self.metadata.get_mut(&id)) {
+            metadata.retain_until_ms = metadata.retain_until_ms.max(transaction_expiry);
+        }
         Ok(true)
     }
 
-    fn authenticate(
-        &mut self,
-        id: &str,
-        principal: &McpPrincipalId,
-        now: i64,
-    ) -> OAuthAuthorizationStoreResult<bool> {
-        validate_time(now)?;
+    fn authenticate(&mut self, id: &str, principal: &McpPrincipalId, now: i64) -> bool {
         let Some(transaction) = self.transactions.get_mut(id).filter(|entry| {
             entry.created_at_ms <= now && entry.expires_at_ms > now && entry.principal_id.is_none()
         }) else {
-            return Ok(false);
+            return false;
         };
         transaction.principal_id = Some(principal.as_str().to_owned());
-        Ok(true)
+        true
     }
 
-    fn decide(
+    fn authenticate_and_promote(
         &mut self,
-        id: &str,
-        decision: OAuthAuthorizationDecision,
-        now: i64,
-    ) -> OAuthAuthorizationStoreResult<bool> {
-        validate_time(now)?;
+        request: &OAuthDynamicClientPromotionRequest,
+    ) -> OAuthClientPromotionResult {
+        let Some(transaction) = self
+            .transactions
+            .get(&request.transaction_id)
+            .filter(|entry| {
+                entry.created_at_ms <= request.now_ms
+                    && entry.expires_at_ms > request.now_ms
+                    && entry.principal_id.is_none()
+            })
+        else {
+            return OAuthClientPromotionResult::InvalidTransaction;
+        };
+        let client_id = transaction.client_id.clone();
+        if self
+            .dynamic_clients
+            .get(&client_id)
+            .is_some_and(|lifecycle| lifecycle.promoted_principal_id.is_none())
+        {
+            if self.dynamic_clients[&client_id].provisional_expires_at_ms <= request.now_ms {
+                return OAuthClientPromotionResult::InvalidTransaction;
+            }
+            let active = self
+                .dynamic_clients
+                .values()
+                .filter(|value| value.promoted_principal_id.is_some())
+                .count();
+            let principal_clients = self
+                .dynamic_clients
+                .values()
+                .filter(|value| {
+                    value.promoted_principal_id.as_deref() == Some(request.principal_id.as_str())
+                })
+                .count();
+            if active >= request.max_active_dynamic_clients
+                || principal_clients >= request.max_clients_per_principal
+            {
+                return OAuthClientPromotionResult::QuotaExceeded;
+            }
+        }
+        self.transactions
+            .get_mut(&request.transaction_id)
+            .expect("validated transaction")
+            .principal_id = Some(request.principal_id.as_str().to_owned());
+        if let Some(lifecycle) = self.dynamic_clients.get_mut(&client_id) {
+            lifecycle
+                .promoted_principal_id
+                .get_or_insert_with(|| request.principal_id.as_str().to_owned());
+            lifecycle.promoted_at_ms.get_or_insert(request.now_ms);
+            lifecycle.last_used_at_ms = request.now_ms;
+        }
+        OAuthClientPromotionResult::Authenticated
+    }
+
+    fn decide(&mut self, id: &str, decision: OAuthAuthorizationDecision, now: i64) -> bool {
         let Some(transaction) = self.transactions.get_mut(id).filter(|entry| {
             entry.created_at_ms <= now
                 && entry.expires_at_ms > now
                 && entry.principal_id.is_some()
                 && entry.decision.is_none()
         }) else {
-            return Ok(false);
+            return false;
         };
         transaction.decision = Some(decision);
-        Ok(true)
+        true
     }
 
     fn issue_code(&mut self, code: OAuthAuthorizationCode) -> OAuthAuthorizationStoreResult<bool> {
@@ -892,7 +1283,10 @@ impl OAuthState {
             || self
                 .transactions
                 .get(&code.transaction_id)
-                .is_some_and(|transaction| code.created_at_ms < transaction.created_at_ms)
+                .is_none_or(|transaction| {
+                    code.created_at_ms < transaction.created_at_ms
+                        || code.expires_at_ms > transaction.expires_at_ms
+                })
             || code.consumed_at_ms.is_some()
         {
             return Err(OAuthAuthorizationStoreError::InvalidData);
@@ -900,12 +1294,13 @@ impl OAuthState {
         if self.codes.contains_key(&key) {
             return Ok(false);
         }
-        let transaction = self
+        if let Some(snapshot_id) = self
             .transactions
             .get(&code.transaction_id)
-            .ok_or(OAuthAuthorizationStoreError::InvalidData)?;
-        if code.expires_at_ms > transaction.expires_at_ms {
-            return Err(OAuthAuthorizationStoreError::InvalidData);
+            .and_then(|transaction| transaction.client_metadata_snapshot_id.as_ref())
+            && let Some(metadata) = self.metadata.get_mut(snapshot_id)
+        {
+            metadata.retain_until_ms = metadata.retain_until_ms.max(code.expires_at_ms);
         }
         self.codes.insert(key, code);
         Ok(true)
@@ -917,7 +1312,6 @@ impl OAuthState {
         config: &OAuthAuthorizationStoreConfig,
         request: OAuthIssueGrantRequest,
     ) -> OAuthAuthorizationStoreResult<OAuthIssueGrantResult> {
-        validate_time(request.now_ms)?;
         validate_token_metadata(&request.access_token, request.now_ms)?;
         let key = digest_key(&request.code_digest)?;
         let Some(code) = self.codes.get(&key) else {
@@ -926,6 +1320,17 @@ impl OAuthState {
         let Some(transaction) = self.transactions.get(&code.transaction_id) else {
             return Ok(OAuthIssueGrantResult::InvalidGrant);
         };
+        let snapshot_valid = transaction
+            .client_metadata_snapshot_id
+            .as_ref()
+            .is_none_or(|id| {
+                self.metadata.get(id).is_some_and(|metadata| {
+                    metadata.client_id == transaction.client_id
+                        && metadata_client(metadata).is_some_and(|client| {
+                            client.redirect_uris.contains(&transaction.redirect_uri)
+                        })
+                })
+            });
         let valid = code.consumed_at_ms.is_none()
             && code.created_at_ms <= request.now_ms
             && code.expires_at_ms > request.now_ms
@@ -940,6 +1345,7 @@ impl OAuthState {
                 request.pkce_challenge.as_bytes(),
             )
             && transaction.principal_id.is_some()
+            && snapshot_valid
             && self.clients.get(&request.client_id).is_none_or(|client| {
                 client.disabled_at_ms.is_none()
                     && client
@@ -1017,6 +1423,9 @@ impl OAuthState {
         self.refresh_tokens
             .insert(digest_key(&refresh.digest)?, refresh);
         self.access_tokens.insert(access.jti.clone(), access);
+        if let Some(lifecycle) = self.dynamic_clients.get_mut(&grant.client_id) {
+            lifecycle.last_used_at_ms = request.now_ms;
+        }
         Ok(OAuthIssueGrantResult::Issued(Box::new(grant)))
     }
 
@@ -1025,7 +1434,6 @@ impl OAuthState {
         config: &OAuthAuthorizationStoreConfig,
         mut request: OAuthRefreshRotationRequest,
     ) -> OAuthAuthorizationStoreResult<OAuthRefreshRotationResult> {
-        validate_time(request.now_ms)?;
         canonical_strings(&mut request.scopes)?;
         validate_token_metadata(&request.access_token, request.now_ms)?;
         let key = digest_key(&request.refresh_token_digest)?;
@@ -1086,6 +1494,7 @@ impl OAuthState {
             consumed_at_ms: None,
             replacement_generation: None,
         };
+        let dynamic_client_id = grant.client_id.clone();
         let access = OAuthAccessTokenRecord {
             jti: request.access_token.jti.clone(),
             signing_key_id: request.access_token.signing_key_id,
@@ -1104,6 +1513,9 @@ impl OAuthState {
         consumed.replacement_generation = Some(generation);
         self.refresh_tokens.insert(replacement_key, replacement);
         self.access_tokens.insert(access.jti.clone(), access);
+        if let Some(lifecycle) = self.dynamic_clients.get_mut(&dynamic_client_id) {
+            lifecycle.last_used_at_ms = request.now_ms;
+        }
         Ok(OAuthRefreshRotationResult::Rotated { generation })
     }
 
@@ -1211,10 +1623,10 @@ impl OAuthState {
             })
         });
         Ok(token.revoked_at_ms.is_none()
-            && token.expires_at_ms > request.now_ms
             && token.issued_at_ms <= request.now_ms
-            && grant.revoked_at_ms.is_none()
+            && token.expires_at_ms > request.now_ms
             && grant.created_at_ms <= request.now_ms
+            && grant.revoked_at_ms.is_none()
             && self.clients.get(&token.client_id).is_none_or(|client| {
                 client.disabled_at_ms.is_none()
                     && client
@@ -1313,29 +1725,38 @@ impl OAuthState {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn cleanup(
-        &mut self,
-        now: i64,
-        limit: usize,
-    ) -> OAuthAuthorizationStoreResult<OAuthCleanupResult> {
-        validate_time(now)?;
-        let mut result = OAuthCleanupResult::default();
+    fn cleanup(&mut self, now: i64, limit: usize) -> OAuthCleanupResult {
+        let mut result = OAuthCleanupResult {
+            records_deleted: self.reclaim_dynamic_clients(now, limit),
+            ..OAuthCleanupResult::default()
+        };
+        let expired_rates = self
+            .registration_rates
+            .iter()
+            .filter(|(_, rate)| rate.window_expires_at_ms <= now)
+            .map(|(key, _)| key.clone())
+            .take(limit.saturating_sub(result.records_deleted))
+            .collect::<Vec<_>>();
+        for key in expired_rates {
+            self.registration_rates.remove(&key);
+            result.records_deleted += 1;
+        }
         let mut transient = self
             .transactions
             .iter()
-            .filter(|(_, value)| {
-                value.expires_at_ms <= now
-                    && !self
-                        .codes
-                        .values()
-                        .any(|code| code.transaction_id == value.transaction_id)
-            })
-            .map(|(id, value)| (value.expires_at_ms, id.clone(), 1_u8))
+            .filter(|(_, value)| value.expires_at_ms <= now)
+            .map(|(id, value)| (value.expires_at_ms, id.clone(), 0_u8))
             .chain(
                 self.codes
                     .iter()
                     .filter(|(_, value)| value.expires_at_ms <= now)
-                    .map(|(id, value)| (value.expires_at_ms, id.clone(), 0_u8)),
+                    .map(|(id, value)| (value.expires_at_ms, id.clone(), 1_u8)),
+            )
+            .chain(
+                self.metadata
+                    .iter()
+                    .filter(|(_, value)| value.retain_until_ms <= now)
+                    .map(|(id, value)| (value.retain_until_ms, id.clone(), 2_u8)),
             )
             .collect::<Vec<_>>();
         transient.sort();
@@ -1345,12 +1766,14 @@ impl OAuthState {
         {
             match kind {
                 0 => {
-                    self.codes.remove(&id);
-                }
-                1 => {
                     self.transactions.remove(&id);
                 }
-                _ => unreachable!(),
+                1 => {
+                    self.codes.remove(&id);
+                }
+                _ => {
+                    self.metadata.remove(&id);
+                }
             }
             result.records_deleted += 1;
         }
@@ -1363,26 +1786,14 @@ impl OAuthState {
             .chain(
                 self.refresh_tokens
                     .iter()
-                    .filter(|(_, value)| {
-                        value.expires_at_ms <= now
-                            || self.families.get(&value.family_id).is_some_and(|family| {
-                                family.expires_at_ms <= now || family.revoked_at_ms.is_some()
-                            })
-                    })
+                    .filter(|(_, value)| value.expires_at_ms <= now)
                     .map(|(id, value)| (value.expires_at_ms, id.clone(), 1_u8)),
             )
             .chain(
                 self.families
                     .iter()
                     .filter(|(_, value)| {
-                        (value.expires_at_ms <= now || value.revoked_at_ms.is_some())
-                            && !self.access_tokens.values().any(|token| {
-                                token.refresh_family_id.as_deref() == Some(&value.family_id)
-                            })
-                            && !self
-                                .refresh_tokens
-                                .values()
-                                .any(|token| token.family_id == value.family_id)
+                        value.expires_at_ms <= now || value.revoked_at_ms.is_some()
                     })
                     .map(|(id, value)| (value.expires_at_ms, id.clone(), 2_u8)),
             )
@@ -1400,27 +1811,6 @@ impl OAuthState {
                     self.families.remove(&id);
                 }
             }
-            result.records_deleted += 1;
-        }
-        let grants = self
-            .grants
-            .iter()
-            .filter(|(_, grant)| {
-                grant.revoked_at_ms.is_some()
-                    && !self
-                        .families
-                        .values()
-                        .any(|family| family.grant_id == grant.grant_id)
-                    && !self
-                        .access_tokens
-                        .values()
-                        .any(|token| token.grant_id == grant.grant_id)
-            })
-            .map(|(id, _)| id.clone())
-            .take(limit.saturating_sub(result.records_deleted))
-            .collect::<Vec<_>>();
-        for id in grants {
-            self.grants.remove(&id);
             result.records_deleted += 1;
         }
         let mut keys = self
@@ -1446,7 +1836,53 @@ impl OAuthState {
                 result.signing_keys_deleted += 1;
             }
         }
-        Ok(result)
+        result
+    }
+
+    fn reclaim_dynamic_clients(&mut self, now: i64, limit: usize) -> usize {
+        let reclaimable = self
+            .dynamic_clients
+            .iter()
+            .filter(|(client_id, lifecycle)| {
+                let client_id = client_id.as_str();
+                let expired_provisional = lifecycle.promoted_principal_id.is_none()
+                    && lifecycle.provisional_expires_at_ms <= now;
+                let inactive = lifecycle.promoted_principal_id.is_some()
+                    && lifecycle
+                        .last_used_at_ms
+                        .saturating_add(lifecycle.inactivity_lifetime_ms)
+                        <= now
+                    && !self.grants.values().any(|grant| {
+                        grant.client_id == client_id
+                            && grant.revoked_at_ms.is_none()
+                            && (self.access_tokens.values().any(|token| {
+                                token.grant_id == grant.grant_id
+                                    && token.revoked_at_ms.is_none()
+                                    && token.expires_at_ms > now
+                            }) || self.families.values().any(|family| {
+                                family.grant_id == grant.grant_id
+                                    && family.revoked_at_ms.is_none()
+                                    && family.expires_at_ms > now
+                            }))
+                    })
+                    && !self.families.values().any(|family| {
+                        family.revoked_at_ms.is_none()
+                            && family.expires_at_ms > now
+                            && self
+                                .grants
+                                .get(&family.grant_id)
+                                .is_some_and(|grant| grant.client_id == client_id)
+                    });
+                expired_provisional || inactive
+            })
+            .map(|(client_id, _)| client_id.clone())
+            .take(limit)
+            .collect::<Vec<_>>();
+        for client_id in &reclaimable {
+            self.dynamic_clients.remove(client_id);
+            self.clients.remove(client_id);
+        }
+        reclaimable.len()
     }
 }
 
@@ -1464,13 +1900,17 @@ impl OAuthAuthorizationStore for InMemoryOAuthAuthorizationStore {
         self.config.clone()
     }
     memory_method!(register_client(client: OAuthClient) -> bool, |state: &mut OAuthState, config: &OAuthAuthorizationStoreConfig, client| state.register_client(config, client));
+    memory_method!(register_dynamic_client(request: OAuthDynamicClientRegistrationRequest) -> OAuthDynamicClientRegistrationResult, |state: &mut OAuthState, config: &OAuthAuthorizationStoreConfig, request| state.register_dynamic(config, request));
+    memory_method!(cache_client_metadata(metadata: OAuthCachedClientMetadata) -> (), |state: &mut OAuthState, config: &OAuthAuthorizationStoreConfig, metadata| state.cache_metadata(config, metadata));
+    memory_method!(client_metadata(client_id: String, now_ms: i64) -> Option<OAuthCachedClientMetadata>, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, client_id: String, now_ms| { validate_time(now_ms)?; Ok(state.current_metadata(&client_id, now_ms)) });
     memory_method!(create_authorization_transaction(transaction: OAuthAuthorizationTransaction) -> bool, |state: &mut OAuthState, config: &OAuthAuthorizationStoreConfig, transaction| state.create_transaction(config, transaction));
     memory_method!(client(client_id: String, now_ms: i64) -> Option<OAuthClient>, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, client_id: String, now_ms| { validate_time(now_ms)?; Ok(state.client(&client_id, now_ms)) });
     memory_method!(authorization_context(transaction_id: String, now_ms: i64) -> Option<OAuthAuthorizationContext>, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, now_ms| { validate_time(now_ms)?; Ok(state.authorization_context(&transaction_id, now_ms)) });
     memory_method!(consume_browser_correlation(transaction_id: String, correlation_digest: Vec<u8>, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, correlation_digest: Vec<u8>, now_ms| state.consume_correlation(&transaction_id, &correlation_digest, now_ms));
-    memory_method!(authenticate_authorization_transaction(transaction_id: String, principal_id: McpPrincipalId, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, principal_id, now_ms| state.authenticate(&transaction_id, &principal_id, now_ms));
-    memory_method!(decide_authorization_transaction(transaction_id: String, decision: OAuthAuthorizationDecision, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, decision, now_ms| state.decide(&transaction_id, decision, now_ms));
-    memory_method!(remember_authorization_consent(transaction_id: String, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, now_ms| state.remember_consent(&transaction_id, now_ms));
+    memory_method!(authenticate_authorization_transaction(transaction_id: String, principal_id: McpPrincipalId, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, principal_id, now_ms| { validate_time(now_ms)?; Ok(state.authenticate(&transaction_id, &principal_id, now_ms)) });
+    memory_method!(authenticate_and_promote_client(request: OAuthDynamicClientPromotionRequest) -> OAuthClientPromotionResult, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, request: OAuthDynamicClientPromotionRequest| { validate_time(request.now_ms)?; Ok(state.authenticate_and_promote(&request)) });
+    memory_method!(decide_authorization_transaction(transaction_id: String, decision: OAuthAuthorizationDecision, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, decision, now_ms| { validate_time(now_ms)?; Ok(state.decide(&transaction_id, decision, now_ms)) });
+    memory_method!(remember_authorization_consent(transaction_id: String, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, now_ms| { validate_time(now_ms)?; Ok(state.remember_consent(&transaction_id, now_ms)) });
     memory_method!(issue_authorization_code(code: OAuthAuthorizationCode) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, code| state.issue_code(code));
     memory_method!(authorization_code_context(code_digest: Vec<u8>, now_ms: i64) -> Option<OAuthAuthorizationCodeContext>, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, code_digest: Vec<u8>, now_ms| state.code_context(&code_digest, now_ms));
     memory_method!(redeem_authorization_code(request: OAuthIssueGrantRequest) -> OAuthIssueGrantResult, |state: &mut OAuthState, config: &OAuthAuthorizationStoreConfig, request| state.redeem(config, request));
@@ -1483,7 +1923,7 @@ impl OAuthAuthorizationStore for InMemoryOAuthAuthorizationStore {
     memory_method!(active_signing_key(issuer: String) -> Option<OAuthSigningKey>, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, issuer| Ok(state.signing_keys.values().find(|key| key.issuer == issuer && key.state == OAuthSigningKeyState::Active).cloned()));
     memory_method!(verification_signing_keys(issuer: String, now_ms: i64) -> Vec<OAuthSigningKey>, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, issuer, now_ms| { validate_time(now_ms)?; Ok(state.signing_keys.values().filter(|key| key.issuer == issuer && (key.state == OAuthSigningKeyState::Active || key.state == OAuthSigningKeyState::Retired && key.verify_until_ms.is_some_and(|deadline| deadline > now_ms))).cloned().collect()) });
     memory_method!(rewrap_signing_key(issuer: String, key_id: String, encrypted: OAuthEncryptedPrivateKey) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, issuer: String, key_id: String, encrypted| { validate_encrypted_private_key(&encrypted)?; let Some(key) = state.signing_keys.get_mut(&signing_key_map_key(&issuer, &key_id)).filter(|key| key.encrypted_private_key.is_some()) else { return Ok(false); }; key.encrypted_private_key = Some(encrypted); Ok(true) });
-    memory_method!(cleanup(now_ms: i64, limit: usize) -> OAuthCleanupResult, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, now_ms, limit| state.cleanup(now_ms, limit));
+    memory_method!(cleanup(now_ms: i64, limit: usize) -> OAuthCleanupResult, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, now_ms, limit| { validate_time(now_ms)?; Ok(state.cleanup(now_ms, limit)) });
 }
 
 fn canonical_strings(values: &mut Vec<String>) -> OAuthAuthorizationStoreResult<()> {
@@ -1494,11 +1934,35 @@ fn canonical_strings(values: &mut Vec<String>) -> OAuthAuthorizationStoreResult<
     values.dedup();
     Ok(())
 }
+fn metadata_client(metadata: &OAuthCachedClientMetadata) -> Option<OAuthClient> {
+    let document: crate::McpClientMetadataDocument =
+        serde_json::from_value(metadata.document.clone()).ok()?;
+    document
+        .validate_public_client(&metadata.client_id, true)
+        .ok()?;
+    Some(OAuthClient {
+        client_id: metadata.client_id.clone(),
+        registration_method: OAuthClientRegistrationMethod::ClientMetadataDocument,
+        display_name: document.client_name,
+        client_secret_digest: None,
+        redirect_uris: document.redirect_uris,
+        created_at_ms: metadata.retrieved_at_ms,
+        expires_at_ms: None,
+        disabled_at_ms: None,
+    })
+}
 fn digest_key(digest: &[u8]) -> OAuthAuthorizationStoreResult<String> {
     if digest.len() < 16 {
         return Err(OAuthAuthorizationStoreError::InvalidData);
     }
     Ok(URL_SAFE_NO_PAD.encode(digest))
+}
+const fn validate_time(value: i64) -> OAuthAuthorizationStoreResult<()> {
+    if value < 0 {
+        Err(OAuthAuthorizationStoreError::InvalidData)
+    } else {
+        Ok(())
+    }
 }
 fn signing_key_map_key(issuer: &str, key_id: &str) -> String {
     format!("{}:{issuer}{key_id}", issuer.len())
@@ -1514,13 +1978,6 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
         );
     }
     difference == 0
-}
-const fn validate_time(value: i64) -> OAuthAuthorizationStoreResult<()> {
-    if value < 0 {
-        Err(OAuthAuthorizationStoreError::InvalidData)
-    } else {
-        Ok(())
-    }
 }
 const fn validate_token_metadata(
     token: &OAuthTokenMetadata,

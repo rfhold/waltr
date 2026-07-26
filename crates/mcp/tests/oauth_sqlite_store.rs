@@ -2,13 +2,19 @@
 
 mod oauth_store_support;
 
-use std::sync::Arc;
+use std::{borrow::Cow, str::FromStr as _, sync::Arc};
 
 use mcp::oauth::{
     McpPrincipalId, OAuthAuthorizationStore, OAuthAuthorizationStoreError,
     OAuthValidateAccessTokenRequest, SqliteOAuthAuthorizationStore,
 };
-use sqlx::{Connection as _, SqliteConnection, SqlitePool};
+use sqlx::{
+    Connection as _, SqliteConnection, SqlitePool,
+    migrate::Migrator,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
+
+static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
 #[tokio::test]
 async fn sqlite_store_passes_contract_across_reopen() {
@@ -17,6 +23,20 @@ async fn sqlite_store_passes_contract_across_reopen() {
         "sqlite://{}",
         directory.path().join("mcp.sqlite3").display()
     );
+    let options = SqliteConnectOptions::from_str(&url)
+        .unwrap()
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    legacy_migrator().run(&pool).await.unwrap();
+    sqlx::query("INSERT INTO mcp_oauth_clients (client_id,display_metadata,created_at_ms,redirect_limit) VALUES ('legacy-client','legacy metadata',1,4)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
     let first = Arc::new(
         SqliteOAuthAuthorizationStore::connect_with_config(&url, oauth_store_support::config())
             .await
@@ -48,14 +68,23 @@ async fn sqlite_store_passes_contract_across_reopen() {
             .fetch_one(&pool)
             .await
             .unwrap(),
-        2
+        3
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT display_metadata,registration_method,redirect_limit FROM mcp_oauth_clients WHERE client_id = 'legacy-client'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("legacy metadata".to_owned(), "preconfigured".to_owned(), 4)
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mcp_oauth_grants")
             .fetch_one(&pool)
             .await
             .unwrap(),
-        0
+        2
     );
     assert_eq!(
         sqlx::query_scalar::<_, Vec<u8>>(
@@ -100,6 +129,19 @@ async fn sqlite_store_passes_contract_across_reopen() {
         SqliteOAuthAuthorizationStore::connect(&url).await,
         Err(OAuthAuthorizationStoreError::InvalidData)
     ));
+}
+
+fn legacy_migrator() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 2)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    }
 }
 
 fn missing_validation() -> OAuthValidateAccessTokenRequest {

@@ -9,7 +9,7 @@ use std::{
 use futures_util::StreamExt;
 use reqwest::{Url, header::CONTENT_TYPE, redirect::Policy};
 use serde::{
-    Deserializer as _,
+    Deserializer as _, Serialize,
     de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map, Number, Value};
@@ -178,6 +178,36 @@ impl McpOAuthDiscoveryClient {
         let client = build_http_client(Some((&url, &addresses)))?;
         let response = client
             .get(url.clone())
+            .send()
+            .await
+            .map_err(|_| Error::protocol("OAuth HTTP request failed"))?;
+        parse_json_response(
+            response,
+            &url,
+            &addresses,
+            self.destination_policy.as_ref(),
+            self.max_response_bytes,
+        )
+        .await
+    }
+
+    /// Send bounded JSON after validating, resolving, and pinning the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized error for unsafe destinations, DNS, HTTP, peer, content, or JSON.
+    pub async fn post_json<T: Serialize + Sync + ?Sized, R: DeserializeOwned>(
+        &self,
+        destination: &str,
+        value: &T,
+    ) -> Result<R> {
+        let url = validate_endpoint("HTTP destination", destination, self.endpoint_policy)?;
+        self.destination_policy.validate(&url)?;
+        let addresses = resolve_destination(&url, self.destination_policy.as_ref()).await?;
+        let client = build_http_client(Some((&url, &addresses)))?;
+        let response = client
+            .post(url.clone())
+            .json(value)
             .send()
             .await
             .map_err(|_| Error::protocol("OAuth HTTP request failed"))?;
@@ -404,7 +434,11 @@ async fn parse_json_response<T: DeserializeOwned>(
         }
         body.extend_from_slice(&chunk);
     }
-    let mut deserializer = serde_json::Deserializer::from_slice(&body);
+    parse_unique_json(&body)
+}
+
+pub(super) fn parse_unique_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
     let value = deserializer
         .deserialize_any(UniqueValueVisitor)
         .map_err(|_| Error::protocol("OAuth HTTP response JSON is invalid"))?;

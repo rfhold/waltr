@@ -21,12 +21,14 @@ pub use metadata::{McpAuthorizationServerMetadata, McpProtectedResourceMetadata}
 pub use protocol::{
     McpAuthorizationCodeTokenRequest, McpAuthorizationErrorCode, McpAuthorizationErrorParameters,
     McpAuthorizationRequest, McpAuthorizationResponse, McpAuthorizationSuccess,
-    McpClientMetadataDocument, McpClientMetadataError, McpJwtAccessTokenClaims,
+    McpClientMetadataDocument, McpClientMetadataError, McpClientRegistrationError,
+    McpClientRegistrationErrorCode, McpClientRegistrationResponse, McpJwtAccessTokenClaims,
     McpJwtAccessTokenHeader, McpJwtAudience, McpOAuthGrantType, McpOAuthResponseType,
     McpOAuthSecret, McpOAuthTokenType, McpPkceChallengeMethod, McpPublicClientIdentity,
-    McpRefreshTokenRequest, McpRevocationError, McpRevocationErrorCode, McpRevocationRequest,
-    McpRevocationResponse, McpRevocationTokenTypeHint, McpTokenEndpointAuthMethod, McpTokenError,
-    McpTokenErrorCode, McpTokenResponse, validate_public_redirect_uri,
+    McpPublicClientRegistrationRequest, McpRefreshTokenRequest, McpRevocationError,
+    McpRevocationErrorCode, McpRevocationRequest, McpRevocationResponse,
+    McpRevocationTokenTypeHint, McpTokenEndpointAuthMethod, McpTokenError, McpTokenErrorCode,
+    McpTokenResponse, validate_public_redirect_uri,
 };
 #[cfg(feature = "oauth-authorization-server")]
 pub use server::*;

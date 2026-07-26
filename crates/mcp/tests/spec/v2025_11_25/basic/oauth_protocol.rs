@@ -8,8 +8,9 @@ use axum::{
 };
 use mcp::{
     McpAuthorizationResponse, McpAuthorizationServerMetadata, McpClientMetadataDocument,
-    McpOAuthDestinationPolicy, McpOAuthDiscoveryClient, McpOAuthEndpointPolicy, McpOAuthGrantType,
-    McpOAuthResponseType, McpOAuthSecret, McpTokenEndpointAuthMethod, McpTokenResponse,
+    McpClientRegistrationResponse, McpOAuthDestinationPolicy, McpOAuthDiscoveryClient,
+    McpOAuthEndpointPolicy, McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret,
+    McpPublicClientRegistrationRequest, McpTokenEndpointAuthMethod, McpTokenResponse,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -183,7 +184,55 @@ fn client_metadata_requires_exact_client_id_and_preserves_extensions() {
 }
 
 #[test]
-fn client_metadata_validation_requires_exact_public_client_profile() {
+fn public_registration_normalizes_redirects_and_rejects_unsafe_metadata() {
+    let request = McpPublicClientRegistrationRequest {
+        redirect_uris: vec![
+            "https://client.example/callback".to_owned(),
+            "https://client.example/callback".to_owned(),
+        ],
+        grant_types: vec![
+            McpOAuthGrantType::RefreshToken,
+            McpOAuthGrantType::AuthorizationCode,
+        ],
+        response_types: vec![McpOAuthResponseType::Code],
+        token_endpoint_auth_method: McpTokenEndpointAuthMethod::None,
+        client_name: Some("Client".to_owned()),
+    };
+    let normalized = request
+        .validate_and_normalize(false, 4, 256)
+        .expect("valid public registration");
+    assert_eq!(normalized.redirect_uris.len(), 1);
+    assert_eq!(
+        normalized.grant_types,
+        [
+            McpOAuthGrantType::AuthorizationCode,
+            McpOAuthGrantType::RefreshToken
+        ]
+    );
+
+    for redirect in [
+        "http://client.example/callback",
+        "https://user:password@client.example/callback",
+        "https://*.example/callback",
+        "https://client.example/callback#fragment",
+    ] {
+        let mut invalid = normalized.clone();
+        invalid.redirect_uris = vec![redirect.to_owned()];
+        assert!(invalid.validate_and_normalize(false, 4, 256).is_err());
+    }
+    let mut loopback = normalized;
+    loopback.redirect_uris = vec!["http://127.0.0.1:49152/callback".to_owned()];
+    assert!(
+        loopback
+            .clone()
+            .validate_and_normalize(false, 4, 256)
+            .is_err()
+    );
+    assert!(loopback.validate_and_normalize(true, 4, 256).is_ok());
+}
+
+#[test]
+fn cimd_and_dcr_validation_require_exact_public_client_profile() {
     let mut document = McpClientMetadataDocument {
         client_id: "https://client.example/metadata".to_owned(),
         redirect_uris: vec!["https://client.example/callback".to_owned()],
@@ -207,6 +256,40 @@ fn client_metadata_validation_requires_exact_public_client_profile() {
             .validate_public_client("https://client.example/metadata", false)
             .is_err()
     );
+
+    let request = McpPublicClientRegistrationRequest {
+        redirect_uris: vec!["https://client.example/callback".to_owned()],
+        grant_types: vec![
+            McpOAuthGrantType::AuthorizationCode,
+            McpOAuthGrantType::RefreshToken,
+        ],
+        response_types: vec![McpOAuthResponseType::Code],
+        token_endpoint_auth_method: McpTokenEndpointAuthMethod::None,
+        client_name: None,
+    };
+    let mut response = McpClientRegistrationResponse {
+        client_id: "opaque-client".to_owned(),
+        client_secret: None,
+        client_secret_expires_at: None,
+        registration_access_token: None,
+        registration_client_uri: None,
+        client_id_issued_at: Some(1),
+        redirect_uris: request.redirect_uris.clone(),
+        grant_types: request.grant_types.clone(),
+        response_types: request.response_types.clone(),
+        token_endpoint_auth_method: McpTokenEndpointAuthMethod::None,
+        client_name: None,
+    };
+    response
+        .validate_public_response(&request)
+        .expect("public response");
+    response.registration_access_token = Some(McpOAuthSecret::new("must-be-rejected"));
+    assert!(response.validate_public_response(&request).is_err());
+    assert!(!format!("{response:?}").contains("must-be-rejected"));
+    response.registration_access_token = None;
+    response.client_secret = Some(McpOAuthSecret::new("client-secret-must-be-rejected"));
+    assert!(response.validate_public_response(&request).is_err());
+    assert!(!format!("{response:?}").contains("client-secret-must-be-rejected"));
 }
 
 #[test]

@@ -425,6 +425,205 @@ pub struct McpRevocationError {
     pub error_uri: Option<String>,
 }
 
+/// Public OAuth client registration metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPublicClientRegistrationRequest {
+    /// Registered redirect URIs.
+    pub redirect_uris: Vec<String>,
+    /// Requested grant types.
+    pub grant_types: Vec<McpOAuthGrantType>,
+    /// Requested response types.
+    pub response_types: Vec<McpOAuthResponseType>,
+    /// Public-client token endpoint authentication method.
+    pub token_endpoint_auth_method: McpTokenEndpointAuthMethod,
+    /// Human-readable client name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+}
+
+impl McpPublicClientRegistrationRequest {
+    /// Validate and normalize an RFC 7591 public-client request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a standards-shaped registration error for unsupported metadata.
+    pub fn validate_and_normalize(
+        mut self,
+        allow_loopback_http: bool,
+        max_redirect_uris: usize,
+        max_field_bytes: usize,
+    ) -> std::result::Result<Self, McpClientRegistrationError> {
+        let submitted_redirect_count = self.redirect_uris.len();
+        self.redirect_uris.sort();
+        self.redirect_uris.dedup();
+        let invalid_redirect = self.redirect_uris.is_empty()
+            || submitted_redirect_count > max_redirect_uris
+            || self.redirect_uris.len() > max_redirect_uris
+            || self.redirect_uris.iter().any(|redirect| {
+                redirect.len() > max_field_bytes
+                    || validate_public_redirect_uri(redirect, allow_loopback_http).is_err()
+            });
+        if invalid_redirect {
+            return Err(McpClientRegistrationError {
+                error: McpClientRegistrationErrorCode::InvalidRedirectUri,
+                error_description: None,
+            });
+        }
+        if self.client_name.as_ref().is_some_and(|name| {
+            name.is_empty() || name.len() > max_field_bytes || name.chars().any(char::is_control)
+        }) || self.grant_types.len() > 8
+            || self.response_types.len() > 8
+            || self.token_endpoint_auth_method != McpTokenEndpointAuthMethod::None
+            || self.response_types != [McpOAuthResponseType::Code]
+            || self
+                .grant_types
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                != std::collections::BTreeSet::from([
+                    McpOAuthGrantType::AuthorizationCode,
+                    McpOAuthGrantType::RefreshToken,
+                ])
+        {
+            return Err(McpClientRegistrationError {
+                error: McpClientRegistrationErrorCode::InvalidClientMetadata,
+                error_description: None,
+            });
+        }
+        self.grant_types = vec![
+            McpOAuthGrantType::AuthorizationCode,
+            McpOAuthGrantType::RefreshToken,
+        ];
+        Ok(self)
+    }
+}
+
+/// Dynamic client registration response.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpClientRegistrationResponse {
+    /// Issued client identifier.
+    pub client_id: String,
+    /// Issued client secret, which public-client helpers reject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<McpOAuthSecret>,
+    /// Client secret expiration as Unix seconds, when a secret is issued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret_expires_at: Option<u64>,
+    /// Registration access token, when issued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_access_token: Option<McpOAuthSecret>,
+    /// Registration management URI, when issued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_client_uri: Option<String>,
+    /// Client identifier issue time as Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id_issued_at: Option<u64>,
+    /// Registered redirect URIs.
+    pub redirect_uris: Vec<String>,
+    /// Registered grant types.
+    pub grant_types: Vec<McpOAuthGrantType>,
+    /// Registered response types.
+    pub response_types: Vec<McpOAuthResponseType>,
+    /// Registered token endpoint authentication method.
+    pub token_endpoint_auth_method: McpTokenEndpointAuthMethod,
+    /// Human-readable client name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+}
+
+impl fmt::Debug for McpClientRegistrationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpClientRegistrationResponse")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret)
+            .field("client_secret_expires_at", &self.client_secret_expires_at)
+            .field("registration_access_token", &self.registration_access_token)
+            .field("registration_client_uri", &self.registration_client_uri)
+            .field("client_id_issued_at", &self.client_id_issued_at)
+            .field("redirect_uris", &self.redirect_uris)
+            .field("grant_types", &self.grant_types)
+            .field("response_types", &self.response_types)
+            .field(
+                "token_endpoint_auth_method",
+                &self.token_endpoint_auth_method,
+            )
+            .field("client_name", &self.client_name)
+            .finish()
+    }
+}
+
+impl McpClientRegistrationResponse {
+    /// Validate that a DCR response registered the requested public client
+    /// without issuing registration credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, confidential, or mismatched responses.
+    pub fn validate_public_response(
+        &self,
+        request: &McpPublicClientRegistrationRequest,
+    ) -> Result<()> {
+        let canonical = |values: &[String]| {
+            let mut values = values.to_vec();
+            values.sort();
+            values.dedup();
+            values
+        };
+        let response_grants = self
+            .grant_types
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let request_grants = request
+            .grant_types
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if self.client_id.is_empty()
+            || self.client_id.len() > 2048
+            || self.client_secret.is_some()
+            || self.client_secret_expires_at.is_some()
+            || self.registration_access_token.is_some()
+            || self.registration_client_uri.is_some()
+            || canonical(&self.redirect_uris) != canonical(&request.redirect_uris)
+            || response_grants != request_grants
+            || self.response_types != request.response_types
+            || self.token_endpoint_auth_method != McpTokenEndpointAuthMethod::None
+            || self.client_name != request.client_name
+        {
+            return Err(Error::protocol(
+                "OAuth dynamic registration response is not a matching public client",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// RFC 7591 dynamic client registration error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpClientRegistrationErrorCode {
+    /// A redirect URI is invalid.
+    InvalidRedirectUri,
+    /// Client metadata is invalid.
+    InvalidClientMetadata,
+    /// A software statement is invalid.
+    InvalidSoftwareStatement,
+    /// A software statement is valid but not approved.
+    UnapprovedSoftwareStatement,
+}
+
+/// RFC 7591 dynamic client registration error response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpClientRegistrationError {
+    /// Standard registration error code.
+    pub error: McpClientRegistrationErrorCode,
+    /// Human-readable diagnostic text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_description: Option<String>,
+}
+
 /// OAuth Client ID Metadata Document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpClientMetadataDocument {
@@ -630,4 +829,26 @@ pub struct McpJwtAccessTokenHeader {
     pub typ: String,
     /// Signing key identifier.
     pub kid: String,
+}
+
+impl McpJwtAccessTokenHeader {
+    /// Validate the JOSE header for an RFC 9068 access token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing key ID, wrong type, or symmetric/unsigned algorithm.
+    pub fn validate(&self) -> Result<()> {
+        if self.typ != "at+jwt" {
+            return Err(Error::protocol("OAuth access token JWT typ must be at+jwt"));
+        }
+        if self.kid.is_empty() {
+            return Err(Error::protocol("OAuth access token JWT requires kid"));
+        }
+        if self.alg == "none" || self.alg.starts_with("HS") {
+            return Err(Error::protocol(
+                "OAuth access token JWT requires asymmetric signing",
+            ));
+        }
+        Ok(())
+    }
 }
