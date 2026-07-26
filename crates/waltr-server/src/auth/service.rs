@@ -124,7 +124,7 @@ where
                     ..AuthStatus::default()
                 })
             }
-            None => Ok(AuthStatus {
+            Some(StoredCredential::McpOAuth(_)) | None => Ok(AuthStatus {
                 target: Some(proto_provider_target(provider_key)),
                 kind: AuthStatusKind::NotConfigured as i32,
                 supported_methods,
@@ -157,6 +157,12 @@ where
                 },
                 expires_at_ms: credential.expires_at_ms,
                 metadata: credential.metadata.into_iter().collect(),
+                ..AuthStatus::default()
+            }),
+            Some(StoredCredential::McpOAuth(credential)) => Ok(AuthStatus {
+                target: Some(proto_mcp_target(server_key)),
+                kind: mcp_oauth_status_kind(credential.token.expires_at_ms, now_ms()) as i32,
+                expires_at_ms: credential.token.expires_at_ms,
                 ..AuthStatus::default()
             }),
             None => Ok(AuthStatus {
@@ -277,6 +283,32 @@ where
             .await
             .map_err(|error| Status::internal(format!("failed to store credential: {error}")))?;
         self.status_for(target).await
+    }
+}
+
+const fn mcp_oauth_status_kind(expires_at_ms: i64, now_ms: i64) -> AuthStatusKind {
+    if expires_at_ms >= 0 && expires_at_ms <= now_ms {
+        AuthStatusKind::Expired
+    } else {
+        AuthStatusKind::OauthConfigured
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_mcp_status_handles_expired_and_unknown_expiry() {
+        assert_eq!(mcp_oauth_status_kind(10, 10), AuthStatusKind::Expired);
+        assert_eq!(
+            mcp_oauth_status_kind(11, 10),
+            AuthStatusKind::OauthConfigured
+        );
+        assert_eq!(
+            mcp_oauth_status_kind(-1, 10),
+            AuthStatusKind::OauthConfigured
+        );
     }
 }
 

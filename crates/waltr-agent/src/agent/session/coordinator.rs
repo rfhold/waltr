@@ -861,10 +861,43 @@ where
             McpClientRuntime::start(config, factory.mcp_root_uri(), CancellationToken::new())
                 .await
                 .map_err(|error| match error.error {
+                    crate::LlmError::McpAuthorization {
+                        status,
+                        challenge,
+                        message,
+                    } => {
+                        let endpoint = settings
+                            .mcp_servers
+                            .iter()
+                            .find(|server| server.key == error.server_key)
+                            .map_or_else(String::new, |server| server.url.clone());
+                        let mcp_authorization = Some(Box::new(crate::McpAuthorizationContext {
+                            endpoint,
+                            http_status: status,
+                            resource_metadata_url: challenge
+                                .as_ref()
+                                .and_then(|value| value.resource_metadata.clone()),
+                            scope: challenge.as_ref().and_then(|value| value.scope.clone()),
+                            error: challenge.as_ref().and_then(|value| value.error.clone()),
+                            error_description: challenge
+                                .as_ref()
+                                .and_then(|value| value.error_description.clone()),
+                            error_uri: challenge.as_ref().and_then(|value| value.error_uri.clone()),
+                            realm: challenge.as_ref().and_then(|value| value.realm.clone()),
+                        }));
+                        super::AgentSessionRuntimeError::AuthorizationRequired {
+                            target: crate::AuthTarget::mcp_server(error.server_key),
+                            message,
+                            reason: crate::AuthenticationFailureReason::CredentialRequired,
+                            mcp_authorization,
+                        }
+                    }
                     crate::LlmError::Authorization { message, .. } => {
                         super::AgentSessionRuntimeError::AuthorizationRequired {
                             target: crate::AuthTarget::mcp_server(error.server_key),
                             message,
+                            reason: crate::AuthenticationFailureReason::CredentialRequired,
+                            mcp_authorization: None,
                         }
                     }
                     error => super::AgentSessionRuntimeError::from(error),

@@ -4,7 +4,9 @@ use std::{error::Error, fmt};
 
 use tokio::sync::oneshot;
 
-use crate::{AuthTarget, LlmError, ToolResult};
+use crate::{
+    AuthTarget, AuthenticationFailureReason, LlmError, McpAuthorizationContext, ToolResult,
+};
 
 use super::{ExternalRequestId, ExternalResponse, SessionId, SessionStatus};
 
@@ -26,6 +28,10 @@ pub enum AgentSessionRuntimeError {
         target: AuthTarget,
         /// Human-readable reason.
         message: String,
+        /// Machine-readable reason for the failure.
+        reason: AuthenticationFailureReason,
+        /// Sanitized MCP challenge context, when the target is an MCP server.
+        mcp_authorization: Option<Box<McpAuthorizationContext>>,
     },
 }
 
@@ -36,7 +42,9 @@ impl fmt::Display for AgentSessionRuntimeError {
                 formatter.write_str(message)
             }
             Self::Agent(error) => write!(formatter, "{error}"),
-            Self::AuthorizationRequired { target, message } => {
+            Self::AuthorizationRequired {
+                target, message, ..
+            } => {
                 write!(
                     formatter,
                     "authentication required for {target:?}: {message}"

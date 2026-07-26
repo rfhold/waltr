@@ -1,4 +1,4 @@
-pub use mcp::client::McpTransportConfig;
+pub use mcp::client::{McpBearerProvider, McpTransportConfig};
 use mcp::{McpLogLevel, McpTracePropagation};
 
 use std::time::Duration;
@@ -78,10 +78,22 @@ impl Default for McpConfig {
 }
 
 /// One configured MCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpServerConfig {
     pub(in crate::mcp) name: String,
     pub(in crate::mcp) transport: McpTransportConfig,
+    pub(in crate::mcp) bearer_provider: Option<std::sync::Arc<dyn McpBearerProvider>>,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("bearer_provider", &self.bearer_provider.is_some())
+            .finish()
+    }
 }
 
 impl McpServerConfig {
@@ -98,6 +110,7 @@ impl McpServerConfig {
                 command: command.into(),
                 args: args.into_iter().map(Into::into).collect(),
             },
+            bearer_provider: None,
         }
     }
 
@@ -120,6 +133,24 @@ impl McpServerConfig {
                 endpoint: endpoint.into(),
                 bearer_token,
             },
+            bearer_provider: None,
+        }
+    }
+
+    /// Create a Streamable HTTP server using a token provider on every request.
+    #[must_use]
+    pub fn streamable_http_with_bearer_provider(
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        bearer_provider: std::sync::Arc<dyn McpBearerProvider>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            transport: McpTransportConfig::StreamableHttp {
+                endpoint: endpoint.into(),
+                bearer_token: None,
+            },
+            bearer_provider: Some(bearer_provider),
         }
     }
 }
