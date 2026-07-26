@@ -5,7 +5,7 @@ use waltr_server::{
     config_service::ConfigService,
     persistence::{DatabaseConfig, Persistence},
     session,
-    test_support::{setup_server, temp_root},
+    test_support::{blocked_cleanup_application, setup_server, temp_root},
 };
 use mcp::server::{
     StreamableHttpInspectSession, StreamableHttpSessionKey, StreamableHttpSessionOwner,
@@ -13,7 +13,7 @@ use mcp::server::{
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use std::{io, net::SocketAddr, time::SystemTime};
+use std::{io, net::SocketAddr, sync::atomic::Ordering, time::SystemTime};
 use tokio::sync::oneshot;
 
 #[tokio::test]
@@ -130,7 +130,11 @@ struct TestRouter {
 
 impl TestRouter {
     async fn start(app: ServerApplication) -> io::Result<Self> {
-        let (app, listener, addr) = app.bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        Self::start_at(app, SocketAddr::from(([127, 0, 0, 1], 0))).await
+    }
+
+    async fn start_at(app: ServerApplication, addr: SocketAddr) -> io::Result<Self> {
+        let (app, listener, addr) = app.bind(addr).await?;
         let (shutdown, receiver) = oneshot::channel();
         let server = tokio::spawn(app.serve_with_shutdown(listener, async move {
             let _ = receiver.await;
@@ -148,6 +152,44 @@ impl TestRouter {
             .await
             .map_err(|error| io::Error::other(format!("test router task failed: {error}")))?
     }
+}
+
+#[tokio::test]
+async fn start_router_bind_failure_cancels_and_joins_cleanup() {
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = occupied.local_addr().unwrap();
+    let (app, probe) = blocked_cleanup_application();
+    probe.cleanup_started.notified().await;
+
+    let startup = tokio::spawn(TestRouter::start_at(app, addr));
+    probe.shutdown_observed.notified().await;
+    assert!(probe.cleanup_dropped.load(Ordering::SeqCst));
+    assert!(!startup.is_finished());
+    probe.release_cleanup.notify_one();
+
+    let error = match startup.await.expect("router startup should join") {
+        Ok(_) => panic!("occupied port should fail router startup"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+}
+
+#[tokio::test]
+async fn test_router_shutdown_cancels_and_joins_cleanup() {
+    let (app, probe) = blocked_cleanup_application();
+    let router = TestRouter::start(app).await.unwrap();
+    probe.cleanup_started.notified().await;
+
+    let shutdown = tokio::spawn(router.shutdown());
+    probe.shutdown_observed.notified().await;
+    assert!(probe.cleanup_dropped.load(Ordering::SeqCst));
+    assert!(!shutdown.is_finished());
+    probe.release_cleanup.notify_one();
+
+    shutdown
+        .await
+        .expect("router shutdown should join")
+        .expect("router shutdown should succeed");
 }
 
 async fn call_exec(endpoint: &str, arguments: Value) -> Result<Value, Box<dyn std::error::Error>> {
