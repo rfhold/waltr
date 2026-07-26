@@ -2,13 +2,20 @@ use crate::support::{
     grpc::{config_client_for_addr, config_with_provider, get_config},
     server::{temp_root, wait_for_health},
 };
+use axum::{Json, Router, extract::State, routing::get};
 use waltr::grpc::waltr::config::v1::{PatchConfigRequest, ProviderMapPatch};
+use waltr_server::persistence::{DatabaseConfig, Persistence};
+use serde_json::{Value, json};
 use sqlx::Connection as _;
 use std::{
     fs,
     io::{self, Read as _},
     net::TcpListener,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -59,6 +66,62 @@ async fn server_process_boots_and_serves_health() -> Result<(), Box<dyn std::err
     server.kill()?;
     server.wait()?;
     assert_process_database_isolation(&waltr_database, &mcp_database).await?;
+    fs::remove_dir_all(root)?;
+    result
+}
+
+#[tokio::test]
+async fn server_process_publishes_valid_outbound_client_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (addr, root, database_url) = process_test_inputs()?;
+    let issuer = start_process_oidc_issuer().await?;
+    let wrapping_keys = root.join("mcp-wrapping-keys.json");
+    fs::write(
+        &wrapping_keys,
+        r#"{"schema_version":1,"active":"one","keys":[{"id":"one","key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}]}"#,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&wrapping_keys, fs::Permissions::from_mode(0o400))?;
+    }
+    let mut command = isolated_server_command(addr, &root, &database_url);
+    command
+        .env("WALTR_AUTH_MODE", "oidc")
+        .env("WALTR_OIDC_ISSUER", &issuer.url)
+        .env("WALTR_OIDC_CLIENT_ID", "waltr-process-test")
+        .env(
+            "WALTR_OIDC_REDIRECT_URI",
+            format!("http://{addr}/oidc/callback"),
+        )
+        .env("WALTR_PUBLIC_URL", "https://waltr.example")
+        .env("WALTR_MCP_REQUIRED_SCOPES", "mcp:use")
+        .env("WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE", &wrapping_keys)
+        .env("WALTR_OIDC_AUDIENCE", "waltr-api")
+        .env("WALTR_OIDC_SCOPES", "openid")
+        .env("WALTR_AUTH_ALLOW_INSECURE_COOKIE", "true")
+        .env("WALTR_OIDC_ALLOW_INSECURE_HTTP", "true");
+    let mut server = command.spawn()?;
+
+    let result = async {
+        wait_for_health(addr).await?;
+        let client_id = "https://waltr.example/.well-known/oauth-client/waltr";
+        let metadata = reqwest::Client::new()
+            .get(format!("http://{addr}/.well-known/oauth-client/waltr"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<mcp::McpClientMetadataDocument>()
+            .await?;
+        metadata.validate_public_client(client_id, false)?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    server.kill()?;
+    server.wait()?;
+    issuer.task.abort();
+    drop(issuer.task.await);
     fs::remove_dir_all(root)?;
     result
 }
@@ -171,6 +234,130 @@ async fn server_process_fails_closed_for_unreachable_oidc_discovery()
 
     fs::remove_dir_all(root)?;
     Ok(())
+}
+
+#[tokio::test]
+async fn server_process_discovers_oidc_before_configuration_revocation_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (addr, root, database_url) = process_test_inputs()?;
+    let persistence = Persistence::initialize(DatabaseConfig::from_url(&database_url)?).await?;
+    let pool = persistence.sqlite_pool().expect("SQLite process database");
+    sqlx::query(
+        "INSERT INTO waltr_browser_sessions (token_digest, issuer, client_id, subject, created_at_ms, expires_at_ms, last_seen_at_ms) VALUES (?, 'old-issuer', 'old-client', 'subject', 0, 4102444800000, 0)",
+    )
+    .bind("a".repeat(64))
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_configuration_revocation BEFORE UPDATE OF revoked_at_ms ON waltr_browser_sessions BEGIN SELECT RAISE(ABORT, 'forced persistent revocation failure'); END",
+    )
+    .execute(pool)
+    .await?;
+    drop(persistence);
+
+    let issuer = start_process_oidc_issuer().await?;
+    let mut command = isolated_server_command(addr, &root, &database_url);
+    command
+        .env("WALTR_AUTH_MODE", "oidc")
+        .env("WALTR_OIDC_ISSUER", &issuer.url)
+        .env("WALTR_OIDC_CLIENT_ID", "current-client")
+        .env(
+            "WALTR_OIDC_REDIRECT_URI",
+            format!("http://{addr}/oidc/callback"),
+        )
+        .env("WALTR_PUBLIC_URL", "https://waltr.example")
+        .env("WALTR_MCP_REQUIRED_SCOPES", "mcp:use")
+        .env(
+            "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
+            root.join("unused-wrapping-keys.json"),
+        )
+        .env("WALTR_OIDC_AUDIENCE", "waltr-api")
+        .env("WALTR_OIDC_SCOPES", "openid")
+        .env("WALTR_AUTH_ALLOW_INSECURE_COOKIE", "true")
+        .env("WALTR_OIDC_ALLOW_INSECURE_HTTP", "true");
+    let mut server = command.spawn()?;
+
+    let status = wait_for_exit(&mut server, Duration::from_secs(5)).await?;
+    let output = captured_output(&mut server)?;
+    assert!(!status.success(), "server unexpectedly started: {output}");
+    assert!(
+        output.contains("failed to initialize access authentication persistence"),
+        "startup did not return the access-auth store error: {output}"
+    );
+    assert_eq!(issuer.discovery_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(issuer.jwks_requests.load(Ordering::SeqCst), 1);
+    assert_listener_unused(addr).await?;
+
+    issuer.task.abort();
+    drop(issuer.task.await);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+struct ProcessOidcIssuer {
+    url: String,
+    discovery_requests: Arc<AtomicUsize>,
+    jwks_requests: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+#[derive(Clone)]
+struct ProcessOidcState {
+    issuer: String,
+    discovery_requests: Arc<AtomicUsize>,
+    jwks_requests: Arc<AtomicUsize>,
+}
+
+async fn start_process_oidc_issuer() -> io::Result<ProcessOidcIssuer> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let discovery_requests = Arc::new(AtomicUsize::new(0));
+    let jwks_requests = Arc::new(AtomicUsize::new(0));
+    let state = ProcessOidcState {
+        issuer: url.clone(),
+        discovery_requests: Arc::clone(&discovery_requests),
+        jwks_requests: Arc::clone(&jwks_requests),
+    };
+    let app = Router::new()
+        .route("/.well-known/openid-configuration", get(process_discovery))
+        .route("/jwks", get(process_jwks))
+        .with_state(state);
+    let task =
+        tokio::spawn(async move { axum::serve(listener, app).await.map_err(io::Error::other) });
+    Ok(ProcessOidcIssuer {
+        url,
+        discovery_requests,
+        jwks_requests,
+        task,
+    })
+}
+
+async fn process_discovery(State(state): State<ProcessOidcState>) -> Json<Value> {
+    state.discovery_requests.fetch_add(1, Ordering::SeqCst);
+    let issuer = state.issuer;
+    Json(json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "jwks_uri": format!("{issuer}/jwks"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "id_token_signing_alg_values_supported": ["RS256"]
+    }))
+}
+
+async fn process_jwks(State(state): State<ProcessOidcState>) -> Json<Value> {
+    state.jwks_requests.fetch_add(1, Ordering::SeqCst);
+    Json(json!({"keys": [{
+        "kty": "RSA",
+        "kid": "process-test-key",
+        "use": "sig",
+        "alg": "RS256",
+        "n": "jTXRkLxK45qmKMMdODisx4iMHYQbwI_WncwB-9usF31IUewAgcVtRMWpW9YJRkA713NsP-cfs4NyurzloJ955iwNGJmzBF6_E515c-QFyAAEyyFptkpFqcgZBFUZGHslz8AlgUysSyshjOCNG15VEg-gjdLwDJW1RrvQQC-w1YHj3sgZV_XWfYWy401T5Gc7OdxstVK1uIj2Lg5xusvKGCEBuDdYZmTjgzuQqF2rGFWVC7r4ag3C8xxBfwApRZtk7XvZac3kAtYDCVlHyFbtkmapONybuDijJXzwVfS96x0I7PoXc-c6tSPf-7WpNtIDoLxHcI5Qv66tfsOdfPCc8w",
+        "e": "AQAB"
+    }]}))
 }
 
 async fn patch_config(addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
