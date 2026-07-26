@@ -10,14 +10,13 @@ path = "src/main.rs"
 
 [features]
 default = []
-server = ["dep:axum", "dep:waltr-server", "dep:tracing"]
+server = ["dep:waltr-server", "dep:tracing"]
 web = ["server", "waltr-server/web"]
 default-server = ["server"]
 bundled-server = ["server", "default-server"]
 bundled = ["web", "default-server"]
 
 [dependencies]
-axum = { workspace = true, optional = true }
 base64.workspace = true
 waltr-client.workspace = true
 waltr-server = { workspace = true, optional = true }
