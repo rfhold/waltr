@@ -7,6 +7,7 @@ pub mod config;
 pub mod config_service;
 pub mod mcp_service;
 pub mod observability;
+pub mod persistence;
 pub mod profiling;
 pub mod session;
 pub mod status_service;
@@ -17,8 +18,8 @@ pub mod test_support;
 mod web_assets;
 
 pub use app::{
-    build_app, build_app_with_catalog_loader, build_app_with_config_service,
-    build_app_with_services,
+    BuildAppError, ServerApplication, build_app, build_app_with_catalog_loader,
+    build_app_with_config_service, build_app_with_services,
 };
 
 /// Default address the server listens on when `WALTR_SERVER_ADDR` is unset.
