@@ -18,6 +18,8 @@ pub enum Error {
     Hyper(axum::BoxError),
     /// OAuth authorization failure.
     Authorization(Box<crate::oauth::McpAuthorizationError>),
+    /// Dynamic bearer provider failure.
+    BearerProvider(crate::client::McpBearerProviderError),
 }
 
 impl Error {
@@ -37,6 +39,7 @@ impl fmt::Display for Error {
             Self::Http(error) => write!(formatter, "{error}"),
             Self::Hyper(error) => write!(formatter, "{error}"),
             Self::Authorization(error) => write!(formatter, "{error}"),
+            Self::BearerProvider(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -50,6 +53,7 @@ impl error::Error for Error {
             Self::Http(error) => Some(error),
             Self::Hyper(error) => Some(error.as_ref()),
             Self::Authorization(error) => Some(error),
+            Self::BearerProvider(error) => Some(error),
         }
     }
 }

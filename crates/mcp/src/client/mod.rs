@@ -5,5 +5,6 @@ pub mod transport;
 
 pub use api::{McpClient, McpClientHandler, McpClientOptions};
 pub use transport::{
-    McpTransport, McpTransportConfig, McpTransportError, McpTransportErrorKind, TransportInbound,
+    McpBearerProvider, McpBearerProviderError, McpTransport, McpTransportConfig, McpTransportError,
+    McpTransportErrorKind, TransportInbound,
 };

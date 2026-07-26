@@ -2,7 +2,7 @@ mod http;
 mod sse;
 mod stdio;
 
-use std::fmt;
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -24,6 +24,8 @@ pub enum TransportInbound {
     SseEventId(String),
     /// Streamable HTTP authorization failure.
     AuthorizationFailed(McpAuthorizationError),
+    /// Dynamic bearer provider failure.
+    BearerProviderFailed(McpBearerProviderError),
     /// Recoverable or terminal transport-layer failure.
     TransportFailed(McpTransportError),
     /// Transport disconnection.
@@ -52,6 +54,50 @@ pub struct McpTransportError {
     pub message: String,
     /// Whether the transport will retry automatically.
     pub retrying: bool,
+}
+
+/// Failure returned by a dynamic Streamable HTTP bearer provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpBearerProviderError {
+    /// The caller must obtain new authorization before requests can continue.
+    Authorization,
+    /// A current credential could not be obtained because its source is unavailable.
+    Unavailable,
+}
+
+impl fmt::Display for McpBearerProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Authorization => formatter.write_str("MCP bearer authorization is required"),
+            Self::Unavailable => formatter.write_str("MCP bearer provider is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for McpBearerProviderError {}
+
+/// Asynchronous source of current Streamable HTTP bearer tokens.
+pub trait McpBearerProvider: Send + Sync + 'static {
+    /// Resolve the bearer token for one HTTP request.
+    fn bearer_token(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = std::result::Result<String, McpBearerProviderError>> + Send + '_>,
+    >;
+}
+
+impl<F, Fut> McpBearerProvider for F
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = std::result::Result<String, McpBearerProviderError>> + Send + 'static,
+{
+    fn bearer_token(
+        &self,
+    ) -> Pin<
+        Box<dyn Future<Output = std::result::Result<String, McpBearerProviderError>> + Send + '_>,
+    > {
+        Box::pin(self())
+    }
 }
 
 /// MCP client transport configuration.
@@ -115,6 +161,37 @@ impl McpTransport {
         config: McpTransportConfig,
         inbound: InboundSender,
     ) -> Result<Self> {
+        Self::start_with_optional_bearer_provider(server_name, config, inbound, None).await
+    }
+
+    /// Start a transport with a dynamic Streamable HTTP bearer provider.
+    ///
+    /// The provider supersedes the static token in Streamable HTTP configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured transport cannot start.
+    pub async fn start_with_bearer_provider(
+        server_name: String,
+        config: McpTransportConfig,
+        inbound: InboundSender,
+        bearer_provider: Arc<dyn McpBearerProvider>,
+    ) -> Result<Self> {
+        Self::start_with_optional_bearer_provider(
+            server_name,
+            config,
+            inbound,
+            Some(bearer_provider),
+        )
+        .await
+    }
+
+    async fn start_with_optional_bearer_provider(
+        server_name: String,
+        config: McpTransportConfig,
+        inbound: InboundSender,
+        bearer_provider: Option<Arc<dyn McpBearerProvider>>,
+    ) -> Result<Self> {
         match config {
             McpTransportConfig::Stdio { command, args } => Ok(Self::Stdio(Box::new(
                 StdioTransport::start(server_name, command, args, inbound).await?,
@@ -125,6 +202,7 @@ impl McpTransport {
             } => Ok(Self::StreamableHttp(StreamableHttpTransport::new(
                 endpoint,
                 bearer_token,
+                bearer_provider,
                 inbound,
             ))),
         }

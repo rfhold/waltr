@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     connection::McpConnection,
-    transport::{McpTransportConfig, McpTransportError},
+    transport::{McpBearerProvider, McpBearerProviderError, McpTransportConfig, McpTransportError},
 };
 
 #[derive(Debug, Clone)]
@@ -89,6 +89,9 @@ pub trait McpClientHandler: Send + Sync + 'static {
     /// Called when Streamable HTTP authorization fails after connection startup.
     fn authorization_failed(&self, _error: McpAuthorizationError) {}
 
+    /// Called when a dynamic Streamable HTTP bearer provider fails in the background.
+    fn bearer_provider_failed(&self, _error: McpBearerProviderError) {}
+
     /// Called when a background transport operation fails.
     fn transport_failed(&self, _error: McpTransportError) {}
 }
@@ -118,6 +121,41 @@ impl McpClient {
     ) -> Result<Self> {
         let handler = Arc::new(ClientHandlerAdapter { inner: handler });
         let connection = McpConnection::start(server_name.into(), transport, handler).await?;
+        Self::initialize(connection, options, cancellation_token).await
+    }
+
+    /// Connect using a dynamic bearer provider for every Streamable HTTP request.
+    ///
+    /// The provider supersedes the static token in Streamable HTTP configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when token resolution, transport startup, or initialization fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_bearer_provider(
+        server_name: impl Into<String>,
+        transport: McpTransportConfig,
+        bearer_provider: Arc<dyn McpBearerProvider>,
+        handler: Arc<dyn McpClientHandler>,
+        options: McpClientOptions,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
+        let handler = Arc::new(ClientHandlerAdapter { inner: handler });
+        let connection = McpConnection::start_with_bearer_provider(
+            server_name.into(),
+            transport,
+            handler,
+            bearer_provider,
+        )
+        .await?;
+        Self::initialize(connection, options, cancellation_token).await
+    }
+
+    async fn initialize(
+        connection: Arc<McpConnection>,
+        options: McpClientOptions,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
         let trace_propagation = options.trace_propagation;
         let initialize_cancellation = cancellation_token.clone();
         let initialize = match connection
@@ -563,6 +601,10 @@ impl super::connection::McpConnectionHandler for ClientHandlerAdapter {
 
     fn authorization_failed(&self, error: McpAuthorizationError) {
         self.inner.authorization_failed(error);
+    }
+
+    fn bearer_provider_failed(&self, error: McpBearerProviderError) {
+        self.inner.bearer_provider_failed(error);
     }
 
     fn transport_failed(&self, error: McpTransportError) {

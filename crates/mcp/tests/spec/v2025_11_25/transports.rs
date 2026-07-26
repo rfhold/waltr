@@ -1,3 +1,6 @@
+// Linear transport probes and one-field config variants are clearer in-place.
+#![allow(clippy::field_reassign_with_default, clippy::too_many_lines)]
+
 use std::{
     convert::Infallible,
     future::Future,
@@ -13,8 +16,8 @@ use futures_util::StreamExt;
 use mcp::{
     McpToolCall, McpToolDefinition, McpToolResult,
     client::{
-        McpClient, McpClientHandler, McpClientOptions, McpTransportConfig, McpTransportError,
-        McpTransportErrorKind,
+        McpBearerProvider, McpBearerProviderError, McpClient, McpClientHandler, McpClientOptions,
+        McpTransportConfig, McpTransportError, McpTransportErrorKind,
     },
     protocol::MCP_PROTOCOL_VERSION,
     server::{
@@ -337,6 +340,270 @@ async fn client_transport_probe(
         }
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
+}
+
+#[tokio::test]
+async fn dynamic_bearer_provider_supplies_each_post_get_reconnect_and_delete() -> mcp::Result<()> {
+    let probe = Arc::new(ClientTransportProbe {
+        retry_ms: Some(20),
+        ..ClientTransportProbe::new(StatusCode::ACCEPTED)
+    });
+    let (endpoint, task) = start_client_transport_probe(probe.clone()).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_calls = calls.clone();
+    let provider: Arc<dyn McpBearerProvider> = Arc::new(move || {
+        let sequence = provider_calls.fetch_add(1, Ordering::SeqCst);
+        async move { Ok(format!("rotating-{sequence}")) }
+    });
+    let client = McpClient::connect_with_bearer_provider(
+        "dynamic-bearer-probe",
+        McpTransportConfig::StreamableHttp {
+            endpoint,
+            bearer_token: Some("static-token-must-not-be-used".to_owned()),
+        },
+        provider,
+        Arc::new(RecordingClient {
+            tx: mpsc::unbounded_channel().0,
+        }),
+        McpClientOptions::new("probe-client", "1", Duration::from_secs(2)),
+        CancellationToken::new(),
+    )
+    .await?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while probe.get_attempts.lock().await.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("GET reconnect uses the provider");
+    client.shutdown().await?;
+
+    let requests = probe.request_bearers.lock().await;
+    assert!(
+        requests
+            .iter()
+            .filter(|(method, _)| *method == axum::http::Method::POST)
+            .count()
+            >= 2
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|(method, _)| *method == axum::http::Method::GET)
+            .count()
+            >= 2
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|(method, _)| *method == axum::http::Method::DELETE)
+    );
+    assert_eq!(requests.len(), calls.load(Ordering::SeqCst));
+    for (sequence, (_, bearer)) in requests.iter().enumerate() {
+        assert_eq!(bearer, &format!("Bearer rotating-{sequence}"));
+    }
+    drop(requests);
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dynamic_bearer_resolution_honors_request_cancellation() -> mcp::Result<()> {
+    let probe = Arc::new(ClientTransportProbe::new(StatusCode::ACCEPTED));
+    let (endpoint, task) = start_client_transport_probe(probe.clone()).await?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider_started = Arc::new(Notify::new());
+    let provider: Arc<dyn McpBearerProvider> = Arc::new({
+        let calls = calls.clone();
+        let provider_started = provider_started.clone();
+        move || {
+            let sequence = calls.fetch_add(1, Ordering::SeqCst);
+            let provider_started = provider_started.clone();
+            async move {
+                if sequence == 3 {
+                    provider_started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                Ok(format!("dynamic-{sequence}"))
+            }
+        }
+    });
+    let client = Arc::new(
+        McpClient::connect_with_bearer_provider(
+            "cancelled-bearer-probe",
+            McpTransportConfig::StreamableHttp {
+                endpoint,
+                bearer_token: None,
+            },
+            provider,
+            Arc::new(RecordingClient {
+                tx: mpsc::unbounded_channel().0,
+            }),
+            McpClientOptions::new("probe-client", "1", Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await?,
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while probe.get_attempts.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("GET starts before the request probe");
+
+    let cancellation = CancellationToken::new();
+    let request = tokio::spawn({
+        let client = client.clone();
+        let cancellation = cancellation.clone();
+        async move { client.list_tools(cancellation).await }
+    });
+    provider_started.notified().await;
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .expect("request cancellation interrupts bearer resolution")
+        .expect("request task")
+        .expect_err("cancelled request fails");
+    assert!(matches!(error, mcp::Error::Protocol(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        probe
+            .request_bearers
+            .lock()
+            .await
+            .iter()
+            .filter(|(method, _)| *method == axum::http::Method::POST)
+            .count(),
+        2
+    );
+
+    client.shutdown().await?;
+    task.abort();
+    Ok(())
+}
+
+struct BearerFailureClient {
+    failures: mpsc::UnboundedSender<McpBearerProviderError>,
+}
+
+impl McpClientHandler for BearerFailureClient {
+    fn bearer_provider_failed(&self, error: McpBearerProviderError) {
+        self.failures
+            .send(error)
+            .expect("bearer failure receiver remains open");
+    }
+}
+
+#[tokio::test]
+async fn bearer_provider_failures_are_structured_for_post_get_and_delete() -> mcp::Result<()> {
+    let probe = Arc::new(ClientTransportProbe::new(StatusCode::ACCEPTED));
+    let (endpoint, task) = start_client_transport_probe(probe.clone()).await?;
+    let post_error = McpClient::connect_with_bearer_provider(
+        "provider-post-failure",
+        McpTransportConfig::StreamableHttp {
+            endpoint: endpoint.clone(),
+            bearer_token: Some("secret-static-token".to_owned()),
+        },
+        Arc::new(|| async { Err(McpBearerProviderError::Authorization) }),
+        Arc::new(RecordingClient {
+            tx: mpsc::unbounded_channel().0,
+        }),
+        McpClientOptions::new("probe-client", "1", Duration::from_secs(2)),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("POST token resolution fails");
+    assert!(matches!(
+        post_error,
+        mcp::Error::BearerProvider(McpBearerProviderError::Authorization)
+    ));
+    let rendered = format!("{post_error:?} {post_error}");
+    assert!(!rendered.contains("secret-static-token"));
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let get_provider_started = Arc::new(Notify::new());
+    let release_get_provider = Arc::new(Notify::new());
+    let provider: Arc<dyn McpBearerProvider> = Arc::new({
+        let calls = calls.clone();
+        let get_provider_started = get_provider_started.clone();
+        let release_get_provider = release_get_provider.clone();
+        move || {
+            let sequence = calls.fetch_add(1, Ordering::SeqCst);
+            let get_provider_started = get_provider_started.clone();
+            let release_get_provider = release_get_provider.clone();
+            async move {
+                if sequence == 2 {
+                    get_provider_started.notify_one();
+                    release_get_provider.notified().await;
+                    return Err(McpBearerProviderError::Unavailable);
+                }
+                if sequence == 4 {
+                    return Err(McpBearerProviderError::Unavailable);
+                }
+                Ok(format!("initial-{sequence}"))
+            }
+        }
+    });
+    let (failure_tx, mut failure_rx) = mpsc::unbounded_channel();
+    let client = Arc::new(
+        McpClient::connect_with_bearer_provider(
+            "provider-background-failure",
+            McpTransportConfig::StreamableHttp {
+                endpoint,
+                bearer_token: None,
+            },
+            provider,
+            Arc::new(BearerFailureClient {
+                failures: failure_tx,
+            }),
+            McpClientOptions::new("probe-client", "1", Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await?,
+    );
+    get_provider_started.notified().await;
+    let pending = tokio::spawn({
+        let client = client.clone();
+        async move { client.list_tools(CancellationToken::new()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while calls.load(Ordering::SeqCst) < 4 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("pending POST obtains its bearer");
+    release_get_provider.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), failure_rx.recv())
+            .await
+            .expect("GET provider failure callback")
+            .expect("GET provider failure value"),
+        McpBearerProviderError::Unavailable
+    );
+    assert!(matches!(
+        pending.await.expect("pending request task"),
+        Err(mcp::Error::BearerProvider(
+            McpBearerProviderError::Unavailable
+        ))
+    ));
+    assert!(matches!(
+        client.shutdown().await,
+        Err(mcp::Error::BearerProvider(
+            McpBearerProviderError::Unavailable
+        ))
+    ));
+    assert!(matches!(
+        client.shutdown().await,
+        Err(mcp::Error::BearerProvider(
+            McpBearerProviderError::Unavailable
+        ))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_eq!(probe.deletes.load(Ordering::SeqCst), 0);
+    task.abort();
+    Ok(())
 }
 
 #[tokio::test]
