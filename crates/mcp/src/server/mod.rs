@@ -50,8 +50,8 @@ pub use session::{
 use crate::{
     Error, Result,
     oauth::{
-        McpAccessToken, McpBearerChallenge, McpProtectedResourceMetadata, McpTokenValidation,
-        protected_resource_metadata_urls,
+        McpAccessToken, McpBearerChallenge, McpPrincipalId, McpProtectedResourceMetadata,
+        McpTokenValidation, protected_resource_metadata_urls,
     },
     protocol::{
         JsonRpcId, JsonRpcInbound, JsonRpcNotification, JsonRpcRequest, MCP_PROTOCOL_VERSION,
@@ -546,6 +546,100 @@ type TokenValidator = Arc<
     dyn Fn(McpAccessToken, McpAuthorizationContext) -> BoxFuture<McpTokenValidation> + Send + Sync,
 >;
 
+type HostedTokenAuthorizer = Arc<
+    dyn Fn(McpAccessToken, McpAuthorizationContext) -> BoxFuture<McpHostedTokenValidation>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+enum HttpTokenAuthorizer {
+    External(TokenValidator),
+    Hosted(HostedTokenAuthorizer),
+}
+
+/// Hosted access-token authorization with an optional active revocation lease.
+#[derive(Clone)]
+pub struct McpTokenAuthorization {
+    /// Stable session owner.
+    pub principal_id: McpPrincipalId,
+    /// Credential expiry.
+    pub expires_at: Option<SystemTime>,
+    /// Active revocation and authoritative revalidation lease.
+    pub revocation: Option<McpRevocationLease>,
+}
+
+impl std::fmt::Debug for McpTokenAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpTokenAuthorization")
+            .field("principal_id", &self.principal_id)
+            .field("expires_at", &self.expires_at)
+            .field("revocation", &self.revocation.is_some())
+            .finish()
+    }
+}
+
+/// Hosted token authorization result.
+#[derive(Clone, Debug)]
+pub enum McpHostedTokenValidation {
+    /// Token is currently authorized.
+    Authorized(McpTokenAuthorization),
+    /// Token is invalid or revoked.
+    Unauthorized {
+        /// Optional safe bearer diagnostic.
+        error_description: Option<String>,
+    },
+    /// Required scopes are absent.
+    InsufficientScope {
+        /// Scopes required by this resource operation.
+        required_scopes: Vec<String>,
+        /// Optional safe bearer diagnostic.
+        error_description: Option<String>,
+    },
+    /// Authorization state could not be checked.
+    Unavailable,
+}
+
+type LeaseValidator = Arc<dyn Fn() -> BoxFuture<std::result::Result<bool, ()>> + Send + Sync>;
+
+/// Cloneable stream lease invalidated by local events and bounded authoritative checks.
+#[derive(Clone)]
+pub struct McpRevocationLease {
+    validator: LeaseValidator,
+    poll_interval: Duration,
+    notifications: tokio::sync::watch::Receiver<u64>,
+}
+
+impl std::fmt::Debug for McpRevocationLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpRevocationLease")
+            .field("poll_interval", &self.poll_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+impl McpRevocationLease {
+    /// Create a lease from an authoritative validator and process-local event receiver.
+    #[cfg(feature = "oauth-authorization-server")]
+    pub fn new(
+        validator: impl Fn() -> BoxFuture<std::result::Result<bool, ()>> + Send + Sync + 'static,
+        poll_interval: Duration,
+        notifications: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        Self {
+            validator: Arc::new(validator),
+            poll_interval,
+            notifications,
+        }
+    }
+
+    async fn validate(&self) -> bool {
+        matches!((self.validator)().await, Ok(true))
+    }
+}
+
 /// Streamable HTTP authorization context passed to token validators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpAuthorizationContext {
@@ -561,7 +655,7 @@ pub struct StreamableHttpAuthorization {
     metadata: McpProtectedResourceMetadata,
     required_scopes: Vec<String>,
     realm: Option<String>,
-    validator: TokenValidator,
+    validator: HttpTokenAuthorizer,
 }
 
 impl std::fmt::Debug for StreamableHttpAuthorization {
@@ -594,7 +688,31 @@ impl StreamableHttpAuthorization {
             metadata,
             required_scopes: Vec::new(),
             realm: None,
-            validator: Arc::new(validator),
+            validator: HttpTokenAuthorizer::External(Arc::new(validator)),
+        })
+    }
+
+    /// Create authorization backed by hosted token validation and active revocation leases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the protected-resource metadata is invalid.
+    pub fn hosted(
+        metadata: McpProtectedResourceMetadata,
+        authorizer: impl Fn(
+            McpAccessToken,
+            McpAuthorizationContext,
+        ) -> BoxFuture<McpHostedTokenValidation>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<Self> {
+        metadata.validate_for_mcp_resource(&metadata.resource)?;
+        Ok(Self {
+            metadata,
+            required_scopes: Vec::new(),
+            realm: None,
+            validator: HttpTokenAuthorizer::Hosted(Arc::new(authorizer)),
         })
     }
 
@@ -1217,11 +1335,13 @@ async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Respons
         }
         return (StatusCode::OK, headers, Body::empty()).into_response();
     }
+    let mut revocation = authorization.revocation;
     let initial = match prepare_delivery_before_expiry(
         &state,
         &session_request,
         last_event_id.clone(),
         authorization.expires_at,
+        &mut revocation,
     )
     .await
     {
@@ -1280,6 +1400,7 @@ async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Respons
         initial,
         prime: last_event_id.is_none(),
         credential_expires_at: authorization.expires_at,
+        revocation,
         sender,
     }));
     (
@@ -1319,19 +1440,31 @@ async fn prepare_delivery_before_expiry(
     session: &StreamableHttpSessionRequest,
     acknowledged_event_id: Option<StreamableHttpEventId>,
     credential_expires_at: Option<SystemTime>,
+    revocation: &mut Option<McpRevocationLease>,
 ) -> PrepareBeforeExpiry {
     if credential_expired(credential_expires_at) {
         return PrepareBeforeExpiry::Expired;
     }
-    let prepare = prepare_delivery(state, session, acknowledged_event_id);
-    if let Some(delay) = credential_expires_at.map(credential_expiry_delay) {
+    loop {
+        let prepare = prepare_delivery(state, session, acknowledged_event_id.clone());
+        let poll_interval = revocation
+            .as_ref()
+            .map_or(Duration::MAX, |lease| lease.poll_interval);
         tokio::select! {
             biased;
-            () = tokio::time::sleep(delay) => PrepareBeforeExpiry::Expired,
-            result = prepare => PrepareBeforeExpiry::Store(result),
+            () = tokio::time::sleep(credential_expires_at.map_or(Duration::MAX, credential_expiry_delay)), if credential_expires_at.is_some() => return PrepareBeforeExpiry::Expired,
+            result = async { revocation.as_mut().expect("guarded by branch").notifications.changed().await }, if revocation.is_some() => {
+                if result.is_err() || !revocation.as_ref().expect("lease exists").validate().await {
+                    return PrepareBeforeExpiry::Expired;
+                }
+            }
+            () = tokio::time::sleep(poll_interval), if revocation.is_some() => {
+                if !revocation.as_ref().expect("lease exists").validate().await {
+                    return PrepareBeforeExpiry::Expired;
+                }
+            }
+            result = prepare => return PrepareBeforeExpiry::Store(result),
         }
-    } else {
-        PrepareBeforeExpiry::Store(prepare.await)
     }
 }
 
@@ -1341,6 +1474,7 @@ struct GetStreamContext {
     initial: StreamStart,
     prime: bool,
     credential_expires_at: Option<SystemTime>,
+    revocation: Option<McpRevocationLease>,
     sender: mpsc::Sender<std::result::Result<String, Infallible>>,
 }
 
@@ -1353,27 +1487,41 @@ async fn run_get_stream(context: GetStreamContext) {
         initial,
         prime,
         credential_expires_at,
+        mut revocation,
         sender,
     } = context;
-    if !send_before_expiry(&sender, "retry: 1000\n\n".to_owned(), credential_expires_at).await {
+    if !send_with_authorization(
+        &sender,
+        "retry: 1000\n\n".to_owned(),
+        credential_expires_at,
+        &mut revocation,
+    )
+    .await
+    {
         return;
     }
     match initial {
         StreamStart::Events(events) => {
             if prime
                 && let Some(first) = events.first()
-                && !send_before_expiry(
+                && !send_with_authorization(
                     &sender,
                     format!("id: {}:0\n\n", first.id.stream_id),
                     credential_expires_at,
+                    &mut revocation,
                 )
                 .await
             {
                 return;
             }
             for event in events {
-                if !send_before_expiry(&sender, format_sse_event(&event), credential_expires_at)
-                    .await
+                if !send_with_authorization(
+                    &sender,
+                    format_sse_event(&event),
+                    credential_expires_at,
+                    &mut revocation,
+                )
+                .await
                 {
                     return;
                 }
@@ -1381,10 +1529,11 @@ async fn run_get_stream(context: GetStreamContext) {
             return;
         }
         StreamStart::Idle(priming_event_id) if prime => {
-            if !send_before_expiry(
+            if !send_with_authorization(
                 &sender,
                 format!("id: {priming_event_id}\n\n"),
                 credential_expires_at,
+                &mut revocation,
             )
             .await
             {
@@ -1398,13 +1547,22 @@ async fn run_get_stream(context: GetStreamContext) {
     let keepalive = tokio::time::sleep(Duration::from_secs(15));
     tokio::pin!(idle, keepalive);
     loop {
+        let revocation_poll = revocation
+            .as_ref()
+            .map_or(Duration::MAX, |lease| lease.poll_interval);
         tokio::select! {
             biased;
             () = tokio::time::sleep(credential_expires_at.map_or(Duration::MAX, credential_expiry_delay)), if credential_expires_at.is_some() => return,
+            result = async { revocation.as_mut().expect("guarded by branch").notifications.changed().await }, if revocation.is_some() => {
+                if result.is_err() || !revocation.as_ref().expect("lease exists").validate().await { return; }
+            }
+            () = tokio::time::sleep(revocation_poll), if revocation.is_some() => {
+                if !revocation.as_ref().expect("lease exists").validate().await { return; }
+            }
             () = state.delivery_notify.notified() => {}
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
             () = &mut keepalive => {
-                if !send_before_expiry(&sender, ": keepalive\n\n".to_owned(), credential_expires_at).await {
+                if !send_with_authorization(&sender, ": keepalive\n\n".to_owned(), credential_expires_at, &mut revocation).await {
                     return;
                 }
                 keepalive.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
@@ -1413,16 +1571,27 @@ async fn run_get_stream(context: GetStreamContext) {
             () = &mut idle => return,
         }
 
-        match prepare_delivery_before_expiry(&state, &session_request, None, credential_expires_at)
-            .await
+        match prepare_delivery_before_expiry(
+            &state,
+            &session_request,
+            None,
+            credential_expires_at,
+            &mut revocation,
+        )
+        .await
         {
             PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::Events {
                 events,
                 ..
             })) => {
                 for event in events {
-                    if !send_before_expiry(&sender, format_sse_event(&event), credential_expires_at)
-                        .await
+                    if !send_with_authorization(
+                        &sender,
+                        format_sse_event(&event),
+                        credential_expires_at,
+                        &mut revocation,
+                    )
+                    .await
                     {
                         return;
                     }
@@ -1470,6 +1639,59 @@ async fn send_before_expiry(
         }
     } else {
         sender.send(Ok(frame)).await.is_ok()
+    }
+}
+
+async fn send_with_authorization(
+    sender: &mpsc::Sender<std::result::Result<String, Infallible>>,
+    frame: String,
+    credential_expires_at: Option<SystemTime>,
+    revocation: &mut Option<McpRevocationLease>,
+) -> bool {
+    let Some(lease) = revocation.as_mut() else {
+        return send_before_expiry(sender, frame, credential_expires_at).await;
+    };
+    loop {
+        if credential_expired(credential_expires_at) {
+            return false;
+        }
+        let validator = lease.validator.clone();
+        let validation = validator();
+        tokio::pin!(validation);
+        let valid = tokio::select! {
+            biased;
+            () = tokio::time::sleep(credential_expires_at.map_or(Duration::MAX, credential_expiry_delay)), if credential_expires_at.is_some() => return false,
+            result = lease.notifications.changed() => {
+                if result.is_err() { return false; }
+                continue;
+            }
+            result = &mut validation => matches!(result, Ok(true)),
+        };
+        if !valid {
+            return false;
+        }
+        let reserve = sender.reserve();
+        tokio::pin!(reserve);
+        let permit = tokio::select! {
+            biased;
+            () = tokio::time::sleep(credential_expires_at.map_or(Duration::MAX, credential_expiry_delay)), if credential_expires_at.is_some() => return false,
+            result = lease.notifications.changed() => {
+                if result.is_err() { return false; }
+                continue;
+            }
+            () = tokio::time::sleep(lease.poll_interval) => continue,
+            result = &mut reserve => match result {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            },
+        };
+        match lease.notifications.has_changed() {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+        permit.send(Ok(frame));
+        return true;
     }
 }
 
@@ -1570,6 +1792,7 @@ async fn authorize_http_request(
         return Ok(AuthorizedHttpRequest {
             owner: StreamableHttpSessionOwner::Anonymous,
             expires_at: None,
+            revocation: None,
         });
     };
     let Some(token) = bearer_token(headers) else {
@@ -1584,16 +1807,44 @@ async fn authorize_http_request(
         resource: authorization.metadata.resource.clone(),
         required_scopes: authorization.required_scopes.clone(),
     };
-    match (authorization.validator)(token, context).await {
-        McpTokenValidation::Authorized {
+    let validation = match &authorization.validator {
+        HttpTokenAuthorizer::External(validator) => match validator(token, context).await {
+            McpTokenValidation::Authorized {
+                principal_id,
+                expires_at,
+            } => McpHostedTokenValidation::Authorized(McpTokenAuthorization {
+                principal_id,
+                expires_at,
+                revocation: None,
+            }),
+            McpTokenValidation::Unavailable => McpHostedTokenValidation::Unavailable,
+            McpTokenValidation::Unauthorized { error_description } => {
+                McpHostedTokenValidation::Unauthorized { error_description }
+            }
+            McpTokenValidation::InsufficientScope {
+                required_scopes,
+                error_description,
+            } => McpHostedTokenValidation::InsufficientScope {
+                required_scopes,
+                error_description,
+            },
+        },
+        HttpTokenAuthorizer::Hosted(authorizer) => authorizer(token, context).await,
+    };
+    match validation {
+        McpHostedTokenValidation::Authorized(McpTokenAuthorization {
             principal_id,
             expires_at,
-        } => Ok(AuthorizedHttpRequest {
+            revocation,
+        }) => Ok(AuthorizedHttpRequest {
             owner: StreamableHttpSessionOwner::Authenticated(principal_id),
             expires_at,
+            revocation,
         }),
-        McpTokenValidation::Unavailable => Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
-        McpTokenValidation::Unauthorized { error_description } => {
+        McpHostedTokenValidation::Unavailable => {
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+        }
+        McpHostedTokenValidation::Unauthorized { error_description } => {
             Err(authorization_challenge_response(
                 authorization,
                 StatusCode::UNAUTHORIZED,
@@ -1601,7 +1852,7 @@ async fn authorize_http_request(
                 error_description.as_deref(),
             ))
         }
-        McpTokenValidation::InsufficientScope {
+        McpHostedTokenValidation::InsufficientScope {
             required_scopes,
             error_description,
         } => Err(insufficient_scope_response(
@@ -1615,6 +1866,7 @@ async fn authorize_http_request(
 struct AuthorizedHttpRequest {
     owner: StreamableHttpSessionOwner,
     expires_at: Option<SystemTime>,
+    revocation: Option<McpRevocationLease>,
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<McpAccessToken> {
@@ -2375,6 +2627,12 @@ pub fn method_not_found(request: JsonRpcRequest) -> Value {
 
 #[cfg(test)]
 mod transport_tests {
+    #[cfg(feature = "oauth-authorization-server")]
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use super::*;
 
     #[test]
@@ -2414,5 +2672,76 @@ mod transport_tests {
             credential_expiry_delay(SystemTime::UNIX_EPOCH),
             Duration::ZERO
         );
+    }
+
+    #[cfg(feature = "oauth-authorization-server")]
+    #[tokio::test]
+    async fn queued_initial_event_is_not_emitted_after_revocation() {
+        let valid = Arc::new(AtomicBool::new(true));
+        let (notifications, receiver) = tokio::sync::watch::channel(0_u64);
+        let lease_valid = valid.clone();
+        let mut lease = Some(McpRevocationLease::new(
+            move || {
+                let valid = lease_valid.clone();
+                Box::pin(async move { Ok(valid.load(Ordering::SeqCst)) })
+            },
+            Duration::from_mins(1),
+            receiver,
+        ));
+        let (sender, mut events) = mpsc::channel(1);
+        sender.send(Ok("retry: 1000\n\n".to_owned())).await.unwrap();
+        let task = tokio::spawn(async move {
+            send_with_authorization(
+                &sender,
+                "data: revoked-initial-event\n\n".to_owned(),
+                None,
+                &mut lease,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        valid.store(false, Ordering::SeqCst);
+        notifications.send_modify(|generation| *generation += 1);
+        assert_eq!(events.recv().await.unwrap().unwrap(), "retry: 1000\n\n");
+        assert!(!task.await.unwrap());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[cfg(feature = "oauth-authorization-server")]
+    #[tokio::test]
+    async fn retry_frame_is_not_emitted_after_lease_failure_or_expiry() {
+        let (_notifications, receiver) = tokio::sync::watch::channel(0_u64);
+        let mut failed_lease = Some(McpRevocationLease::new(
+            || Box::pin(async { Err(()) }),
+            Duration::from_mins(1),
+            receiver,
+        ));
+        let (sender, mut events) = mpsc::channel(1);
+        assert!(
+            !send_with_authorization(
+                &sender,
+                "retry: 1000\n\n".to_owned(),
+                None,
+                &mut failed_lease,
+            )
+            .await
+        );
+
+        let (_notifications, receiver) = tokio::sync::watch::channel(0_u64);
+        let mut valid_lease = Some(McpRevocationLease::new(
+            || Box::pin(async { Ok(true) }),
+            Duration::from_mins(1),
+            receiver,
+        ));
+        assert!(
+            !send_with_authorization(
+                &sender,
+                "retry: 1000\n\n".to_owned(),
+                Some(SystemTime::UNIX_EPOCH),
+                &mut valid_lease,
+            )
+            .await
+        );
+        assert!(events.try_recv().is_err());
     }
 }

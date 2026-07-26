@@ -363,6 +363,68 @@ pub struct McpTokenError {
     pub error_uri: Option<String>,
 }
 
+/// Revocation token type hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpRevocationTokenTypeHint {
+    /// Access token hint.
+    AccessToken,
+    /// Refresh token hint.
+    RefreshToken,
+}
+
+/// RFC 7009 token revocation request.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRevocationRequest {
+    /// Token to revoke. Revocation is idempotent even when this token is unknown.
+    pub token: McpOAuthSecret,
+    /// Optional token type hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_type_hint: Option<McpRevocationTokenTypeHint>,
+    /// Public client identifier.
+    pub client_id: String,
+}
+
+impl fmt::Debug for McpRevocationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpRevocationRequest")
+            .field("token", &self.token)
+            .field("token_type_hint", &self.token_type_hint)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+/// Successful RFC 7009 revocation response, whose HTTP body is empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpRevocationResponse;
+
+/// Standard token revocation endpoint error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpRevocationErrorCode {
+    /// Request is malformed.
+    InvalidRequest,
+    /// Client authentication failed.
+    InvalidClient,
+    /// The token type cannot be revoked by this server.
+    UnsupportedTokenType,
+}
+
+/// Token revocation endpoint error response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRevocationError {
+    /// Standard error code.
+    pub error: McpRevocationErrorCode,
+    /// Human-readable diagnostic text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_description: Option<String>,
+    /// Error documentation URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_uri: Option<String>,
+}
+
 /// OAuth Client ID Metadata Document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpClientMetadataDocument {
@@ -519,4 +581,53 @@ pub fn validate_public_redirect_uri(
         return Err(McpClientMetadataError::InvalidRedirectUri);
     }
     Ok(())
+}
+
+/// JWT audience claim in its permitted single-string or string-array form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpJwtAudience {
+    /// One audience.
+    One(String),
+    /// Multiple audiences.
+    Many(Vec<String>),
+}
+
+/// RFC 9068 JWT access-token claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpJwtAccessTokenClaims {
+    /// Token issuer.
+    pub iss: String,
+    /// Subject identifier.
+    pub sub: String,
+    /// Intended audience.
+    pub aud: McpJwtAudience,
+    /// Expiration time as Unix seconds.
+    pub exp: u64,
+    /// Issued-at time as Unix seconds.
+    pub iat: u64,
+    /// Not-before time as Unix seconds.
+    pub nbf: u64,
+    /// JWT identifier.
+    pub jti: String,
+    /// Space-delimited granted scopes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Client identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// Authorization grant linked to the persisted token record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+}
+
+/// JOSE header fields required by the RFC 9068 access-token profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpJwtAccessTokenHeader {
+    /// Asymmetric signing algorithm.
+    pub alg: String,
+    /// JWT type, expected to be `at+jwt`.
+    pub typ: String,
+    /// Signing key identifier.
+    pub kid: String,
 }
