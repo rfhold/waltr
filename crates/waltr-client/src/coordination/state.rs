@@ -917,7 +917,7 @@ impl ClientState {
     pub(crate) fn enqueue_auth_requirement(
         &mut self,
         target: AuthTarget,
-        message: String,
+        message: &str,
         source_session_id: Option<String>,
         mcp_authorization: Option<McpAuthorizationRequirement>,
     ) {
@@ -987,13 +987,13 @@ impl ClientState {
             attempt_id: attempt.attempt_id,
             auth_url: safe_http_url(&attempt.auth_url).unwrap_or_default(),
             verification_url: safe_http_url(&attempt.verification_url).unwrap_or_default(),
-            user_code: safe_text(attempt.user_code, 256),
+            user_code: safe_text(&attempt.user_code, 256),
             expires_at_ms: attempt.expires_at_ms,
             poll_interval_seconds: attempt.poll_interval_seconds,
             messages: attempt
                 .messages
                 .into_iter()
-                .map(|message| safe_text(message, 1_024))
+                .map(|message| safe_text(&message, 1_024))
                 .collect(),
             completion_mode,
             registration_method: attempt.registration_method,
@@ -1083,14 +1083,14 @@ impl ClientState {
             != waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
         {
             attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
-            attempt.failure_reason = "Authorization callback status was invalid.".to_owned();
+            "Authorization callback status was invalid.".clone_into(&mut attempt.failure_reason);
             return None;
         }
         attempt.lifecycle = status.lifecycle;
         attempt.completion_mode = status.completion_mode;
         attempt.registration_method = status.registration_method;
         attempt.expires_at_ms = status.expires_at_ms;
-        attempt.failure_reason = auth_lifecycle_failure(lifecycle).to_owned();
+        auth_lifecycle_failure(lifecycle).clone_into(&mut attempt.failure_reason);
         attempt.poll_count = attempt.poll_count.saturating_add(1);
         attempt.poll_failures = 0;
 
@@ -1107,8 +1107,8 @@ impl ClientState {
                     .insert(auth_target_key(&target), auth_status);
             } else {
                 attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
-                attempt.failure_reason =
-                    "Authorization completion status was unavailable.".to_owned();
+                "Authorization completion status was unavailable."
+                    .clone_into(&mut attempt.failure_reason);
             }
             return None;
         }
@@ -1121,7 +1121,7 @@ impl ClientState {
         }
         if attempt.poll_count >= MAX_AUTH_POLLS {
             attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
-            attempt.failure_reason = "Authorization status polling limit reached.".to_owned();
+            "Authorization status polling limit reached.".clone_into(&mut attempt.failure_reason);
             return None;
         }
         Some(auth_poll_delay_ms(attempt.poll_interval_seconds))
@@ -1138,10 +1138,10 @@ impl ClientState {
         let attempt = self.auth.active_attempt.as_mut().expect("poll was current");
         attempt.poll_count = attempt.poll_count.saturating_add(1);
         attempt.poll_failures = attempt.poll_failures.saturating_add(1);
-        attempt.failure_reason = "Unable to check authorization status; retrying.".to_owned();
+        "Unable to check authorization status; retrying.".clone_into(&mut attempt.failure_reason);
         if attempt.poll_count >= MAX_AUTH_POLLS || attempt.poll_failures >= MAX_AUTH_POLL_FAILURES {
             attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
-            attempt.failure_reason = "Authorization status could not be confirmed.".to_owned();
+            "Authorization status could not be confirmed.".clone_into(&mut attempt.failure_reason);
             return None;
         }
         Some(
@@ -2376,7 +2376,7 @@ const fn auth_lifecycle_failure(
     }
 }
 
-pub(crate) fn safe_http_url(value: &str) -> Option<String> {
+pub fn safe_http_url(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
@@ -2392,7 +2392,7 @@ pub(crate) fn safe_http_url(value: &str) -> Option<String> {
     Some(parsed.into())
 }
 
-pub(crate) fn safe_text(value: String, max_chars: usize) -> String {
+pub fn safe_text(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 

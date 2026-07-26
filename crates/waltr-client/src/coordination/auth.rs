@@ -2,6 +2,10 @@
 
 use crate::{AuthEffect, AuthEvent, ClientEffect, ClientState, ClientUpdate};
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the auth event state machine exhaustive in one match"
+)]
 pub fn reduce(state: &mut ClientState, event: AuthEvent) -> ClientUpdate {
     match event {
         AuthEvent::ListRequested => {
@@ -22,7 +26,7 @@ pub fn reduce(state: &mut ClientState, event: AuthEvent) -> ClientUpdate {
             source_session_id,
             mcp_authorization,
         } => {
-            state.enqueue_auth_requirement(target, message, source_session_id, mcp_authorization);
+            state.enqueue_auth_requirement(target, &message, source_session_id, mcp_authorization);
             ClientUpdate::default()
         }
         AuthEvent::Dismissed { target } => {

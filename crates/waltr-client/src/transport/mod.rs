@@ -1064,19 +1064,19 @@ fn sanitize_mcp_authorization(
             .and_then(|value| crate::coordination::state::safe_http_url(&value)),
         scope: context
             .scope
-            .map(|value| crate::coordination::state::safe_text(value, 1_024)),
+            .map(|value| crate::coordination::state::safe_text(&value, 1_024)),
         error: context
             .error
-            .map(|value| crate::coordination::state::safe_text(value, 256)),
+            .map(|value| crate::coordination::state::safe_text(&value, 256)),
         error_description: context
             .error_description
-            .map(|value| crate::coordination::state::safe_text(value, 1_024)),
+            .map(|value| crate::coordination::state::safe_text(&value, 1_024)),
         error_uri: context
             .error_uri
             .and_then(|value| crate::coordination::state::safe_http_url(&value)),
         realm: context
             .realm
-            .map(|value| crate::coordination::state::safe_text(value, 256)),
+            .map(|value| crate::coordination::state::safe_text(&value, 256)),
     }
 }
 

@@ -1933,6 +1933,10 @@ impl ClientStateStream {
         });
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep effect and completion identity checks in one exhaustive match"
+    )]
     fn effect_completion_is_current(
         &self,
         effect: &ClientEffect,
