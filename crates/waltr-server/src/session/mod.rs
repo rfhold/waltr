@@ -43,6 +43,9 @@ pub fn add_service_from_env(
                 credential_store,
             );
         }
+        SessionStorageConfig::S3(s3_config) => {
+            add_store_service(routes, s3_config.into_store(), config, credential_store);
+        }
     }
 
     Ok(())

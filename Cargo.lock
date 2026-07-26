@@ -3027,6 +3027,7 @@ dependencies = [
 name = "waltr-server"
 version = "0.1.0"
 dependencies = [
+ "aws-sdk-s3",
  "axum",
  "base64",
  "futures-util",
@@ -3059,6 +3060,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
