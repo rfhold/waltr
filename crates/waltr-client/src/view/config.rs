@@ -146,11 +146,11 @@ pub enum ProviderKindView {
     Unspecified,
     /// Anthropic Messages API provider.
     AnthropicMessages,
-    /// OpenAI Chat Completions API provider.
+    /// `OpenAI` Chat Completions API provider.
     OpenAiChatCompletions,
-    /// OpenAI Responses API provider over HTTP.
+    /// `OpenAI` Responses API provider over HTTP.
     OpenAiResponses,
-    /// OpenAI Responses API provider over WebSocket.
+    /// `OpenAI` Responses API provider over WebSocket.
     OpenAiResponsesWebsocket,
     /// Provider kind is unknown to this client version.
     Unknown,

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "preserve the established ClientError API and payloads"
+)]
+
 //! Shared Waltr shell client reducer, executor, and stable view models.
 
 mod client;

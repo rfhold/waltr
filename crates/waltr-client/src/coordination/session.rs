@@ -363,11 +363,7 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             session_id,
             target,
         } => {
-            state.set_session_continue_loading(
-                operation_key.clone(),
-                session_id.clone(),
-                target.clone(),
-            );
+            state.set_session_continue_loading(operation_key.clone(), session_id.clone(), target);
             ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Continue {
                 operation_key,
                 session_id,
@@ -539,7 +535,7 @@ fn operation_session_and_target(
     match state.operations.get(operation_key) {
         Some(crate::ClientOperationState::SessionContinue {
             session_id, target, ..
-        }) => (session_id.clone(), target.clone()),
+        }) => (session_id.clone(), *target),
         _ => (String::new(), crate::RollbackTarget { target: None }),
     }
 }
