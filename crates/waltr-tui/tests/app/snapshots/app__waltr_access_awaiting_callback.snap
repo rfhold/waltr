@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/basic.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        Waltr sign in                                                            "
+"                                                                                "
+"        login required                                                          "
+"                                                                                "
+"        Status  Waiting for browser callback                                    "
+"                                                                                "
+"        Authorization URL                                                       "
+"        https://id.example/authorize?client_id=waltr-native&state=redacte        "
+"        d                                                                       "
+"                                                                                "
+"        Expires in 300s                                                         "
+"                                                                                "
+"        c copy URL    Esc cancel                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

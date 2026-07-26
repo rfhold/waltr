@@ -10,7 +10,7 @@ use ratatui::{
 use crate::{theme::THEME, ui};
 
 /// Render the ready landing screen.
-pub fn draw_landing(frame: &mut Frame<'_>, area: Rect, show_palette: bool) {
+pub fn draw_landing(frame: &mut Frame<'_>, area: Rect, show_palette: bool, can_logout: bool) {
     let modal_height = if show_palette { 10 } else { 8 };
     let modal_area = ui::centered_rect(area, 60, modal_height);
     frame.render_widget(Clear, modal_area);
@@ -36,7 +36,7 @@ pub fn draw_landing(frame: &mut Frame<'_>, area: Rect, show_palette: bool) {
 
     if show_palette {
         render_gap(frame, footer_gap);
-        render_landing_footer(frame, footer_area);
+        render_landing_footer(frame, footer_area, can_logout);
     }
 }
 
@@ -74,18 +74,22 @@ fn landing_body_widget() -> Paragraph<'static> {
         .style(THEME.panel_style())
 }
 
-fn render_landing_footer(frame: &mut Frame<'_>, area: Rect) {
+fn render_landing_footer(frame: &mut Frame<'_>, area: Rect, can_logout: bool) {
     frame.render_widget(
-        Paragraph::new(landing_footer_line()).style(THEME.panel_style()),
+        Paragraph::new(landing_footer_line(can_logout)).style(THEME.panel_style()),
         area,
     );
 }
 
-fn landing_footer_line() -> Line<'static> {
+fn landing_footer_line(can_logout: bool) -> Line<'static> {
     Line::from(vec![
         Span::styled(" ", THEME.panel_style()),
         Span::styled(
-            "Ctrl-X c config  Ctrl-X s sessions  Ctrl-X q quit",
+            if can_logout {
+                "C-x c config  C-x s sessions  C-x l logout  C-x q quit"
+            } else {
+                "C-x c config  C-x s sessions  C-x q quit"
+            },
             THEME.panel_muted_style(),
         ),
     ])

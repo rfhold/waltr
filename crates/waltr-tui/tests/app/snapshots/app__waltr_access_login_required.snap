@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/basic.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        Waltr sign in                                                            "
+"                                                                                "
+"        session expired                                                         "
+"                                                                                "
+"        Status  Signed out                                                      "
+"                                                                                "
+"        Enter sign in    r retry    Ctrl-C Ctrl-C quit                          "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

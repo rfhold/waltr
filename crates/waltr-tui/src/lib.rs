@@ -7,6 +7,7 @@ pub mod event;
 pub mod input;
 mod keys;
 mod markdown;
+pub mod native_auth;
 pub mod runtime;
 pub mod screens;
 pub mod theme;

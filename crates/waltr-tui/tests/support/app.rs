@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use waltr_client::{
-    AuthSnapshot, CatalogMatchSourceView, ClientCommand, ClientOperationView, ClientSnapshot,
-    ConfigSnapshot, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,
-    ModelCapabilitiesView, ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView,
-    ModelView, OperationCollectionSnapshot, OperationSnapshot, ProviderKindView, ProviderView,
-    SessionPhaseView, SessionSnapshot, SessionStatusView, SessionTimelineView, SessionView,
-    StatusSnapshot, TimelineContentView, TimelineEventKindView, TimelineEventView,
-    TimelineStatusView, TimestampView,
+    AccessSnapshot, AccessStatus, AuthSnapshot, CatalogMatchSourceView, ClientCommand,
+    ClientOperationView, ClientSnapshot, ConfigSnapshot, ConfigView, ExternalRequestView,
+    McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
+    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
+    OperationSnapshot, ProviderKindView, ProviderView, SessionPhaseView, SessionSnapshot,
+    SessionStatusView, SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView,
+    TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction},
@@ -585,6 +585,11 @@ pub(crate) fn session_with_phase(
 
 pub(crate) const fn ready_snapshot() -> ClientSnapshot {
     ClientSnapshot {
+        access: AccessSnapshot {
+            status: AccessStatus::Authenticated,
+            error: None,
+            active_attempt_id: None,
+        },
         auth: AuthSnapshot {
             pending: Vec::new(),
             active_attempt: None,
@@ -699,6 +704,15 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
             template_searches: BTreeMap::new(),
         },
     }
+}
+
+pub(crate) fn login_required_snapshot(reason: &str) -> ClientSnapshot {
+    let mut snapshot = ready_snapshot();
+    snapshot.access.status = AccessStatus::LoginRequired;
+    snapshot.access.error = Some(reason.to_owned());
+    snapshot.status.ready = false;
+    snapshot.status.watch.status = "error";
+    snapshot
 }
 
 pub(crate) fn loaded_config_snapshot() -> ClientSnapshot {

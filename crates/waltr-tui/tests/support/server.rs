@@ -196,6 +196,7 @@ async fn apply_snapshot(stream: &mut ClientStateStream, app: &mut App, snapshot:
     let commands = match action {
         AppAction::ClientCommand(command) => vec![command],
         AppAction::ClientCommands(commands) => commands,
+        AppAction::NativeAuth(action) => panic!("unexpected native auth action: {action:?}"),
         AppAction::Continue => Vec::new(),
         AppAction::Exit => panic!("unexpected exit while applying snapshot"),
     };

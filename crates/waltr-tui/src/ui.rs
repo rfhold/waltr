@@ -35,19 +35,20 @@ impl<'a> Notice<'a> {
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_wrapper(frame, app.notice(), |frame, area| match app.screen() {
         AppScreen::Waiting => screens::draw_splash(frame, area, app.client_snapshot()),
+        AppScreen::Access => screens::draw_access(frame, area, app),
         AppScreen::Landing => draw_app_shell(frame, area, app, false, |frame, area| {
-            screens::draw_landing(frame, area, true);
+            screens::draw_landing(frame, area, true, app.can_logout());
         }),
         AppScreen::Config => {
             draw_app_shell(frame, area, app, true, |frame, area| {
-                screens::draw_landing(frame, area, false);
+                screens::draw_landing(frame, area, false, app.can_logout());
             });
             screens::draw_config(frame, area, app);
         }
         AppScreen::Sessions => {
             draw_app_shell(frame, area, app, true, |frame, area| {
                 if !app.sessions_section().in_detail() {
-                    screens::draw_landing(frame, area, false);
+                    screens::draw_landing(frame, area, false, app.can_logout());
                 }
                 screens::draw_sessions(frame, area, app.sessions_section(), app.client_snapshot());
             });
@@ -58,6 +59,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
+    if app.screen() == AppScreen::Access {
+        return;
+    }
     let snapshot = match app.client_snapshot() {
         Some(snapshot) => snapshot,
         None => return,

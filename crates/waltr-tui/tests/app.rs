@@ -19,7 +19,7 @@ use waltr_tui::{
     ui,
 };
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent},
+    crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::Rect,
     style::{Color, Modifier, Style},
 };
