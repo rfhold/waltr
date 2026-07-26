@@ -7,13 +7,17 @@ use waltr::grpc::waltr::{
         OAuthProvider, OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, Provider,
     },
 };
-use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use tonic::Status;
 use uuid::Uuid;
 
-use super::{AuthTarget, OAuthCredential};
+use super::{
+    AuthTarget, OAuthCredential,
+    outbound_http::{
+        OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body, validate_response_peer,
+    },
+};
 
 /// Resolved provider OAuth definition.
 #[derive(Debug, Clone)]
@@ -23,7 +27,7 @@ pub(crate) struct ProviderOAuthDefinition {
 }
 
 /// Pending manual OAuth attempt.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthAttempt {
     /// Target this attempt belongs to.
     target: AuthTarget,
@@ -33,6 +37,18 @@ pub struct OAuthAttempt {
     expires_at_ms: i64,
 }
 
+impl std::fmt::Debug for OAuthAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthAttempt")
+            .field("target", &self.target)
+            .field("definition", &"<redacted>")
+            .field("verifier", &"<redacted>")
+            .field("state", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
 impl OAuthAttempt {
     /// Return the owning target.
     #[must_use]
@@ -116,7 +132,8 @@ pub fn begin_manual(
         auth_url,
         expires_at_ms,
         messages: vec![
-            "Open the URL, approve access, then paste the final redirect URL or code.".to_owned(),
+            "Open the URL, approve access, then paste the final redirect URL including state."
+                .to_owned(),
         ],
         ..BeginProviderAuthResponse::default()
     };
@@ -129,12 +146,21 @@ pub async fn complete_manual(
     input: &str,
     now_ms: i64,
 ) -> Result<OAuthCredential, Status> {
+    complete_manual_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production()).await
+}
+
+async fn complete_manual_with_policy(
+    attempt: &OAuthAttempt,
+    input: &str,
+    now_ms: i64,
+    policy: OutboundHttpPolicy,
+) -> Result<OAuthCredential, Status> {
     if now_ms > attempt.expires_at_ms {
         return Err(Status::deadline_exceeded("OAuth attempt expired"));
     }
     let (code, state) = parse_manual_input(input);
     let code = code.ok_or_else(|| Status::invalid_argument("OAuth code is required"))?;
-    if state.as_deref().is_some_and(|value| value != attempt.state) {
+    if state.as_deref() != Some(attempt.state.as_str()) {
         return Err(Status::invalid_argument("OAuth state does not match"));
     }
     exchange_code(
@@ -142,6 +168,7 @@ pub async fn complete_manual(
         &code,
         &attempt.verifier,
         &attempt.state,
+        policy,
     )
     .await
 }
@@ -151,6 +178,7 @@ async fn exchange_code(
     code: &str,
     verifier: &str,
     state: &str,
+    policy: OutboundHttpPolicy,
 ) -> Result<OAuthCredential, Status> {
     request_token(
         definition,
@@ -159,6 +187,7 @@ async fn exchange_code(
             verifier,
             state,
         },
+        policy,
     )
     .await
 }
@@ -174,15 +203,18 @@ enum TokenRequest<'a> {
 async fn request_token(
     definition: &OAuthProvider,
     token_request: TokenRequest<'_>,
+    policy: OutboundHttpPolicy,
 ) -> Result<OAuthCredential, Status> {
     let pairs = token_request_pairs(definition, token_request);
-    let builder = Client::new().post(&definition.token_url);
+    let (token_url, client) = policy.client_for(&definition.token_url).await?;
+    let builder = client.post(token_url);
     let response = match request_style(definition)? {
         OauthTokenRequestStyle::Json => builder.json(&pairs_to_json(&pairs)).send().await,
         OauthTokenRequestStyle::FormUrlencoded => builder.form(&pairs).send().await,
         OauthTokenRequestStyle::Unspecified => unreachable!("validated request style"),
     }
-    .map_err(|error| Status::unauthenticated(format!("OAuth token request failed: {error}")))?;
+    .map_err(|error| Status::unavailable(format!("OAuth token request failed: {error}")))?;
+    validate_response_peer(policy, &response)?;
     token_response_to_credential(definition, response).await
 }
 
@@ -342,22 +374,27 @@ async fn token_response_to_credential(
     response: reqwest::Response,
 ) -> Result<OAuthCredential, Status> {
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = read_json_body(response, OAUTH_RESPONSE_LIMIT).await?;
     if !status.is_success() {
         return Err(Status::unauthenticated(format!(
-            "OAuth token endpoint returned {status}: {text}"
+            "OAuth token endpoint returned {status}"
         )));
     }
-    let token: TokenResponse = serde_json::from_str(&text).map_err(|error| {
-        Status::unauthenticated(format!("OAuth token response was invalid: {error}"))
-    })?;
+    let token: TokenResponse = serde_json::from_slice(&text)
+        .map_err(|error| Status::data_loss(format!("OAuth token response was invalid: {error}")))?;
     let metadata = extract_metadata(definition, &token)?;
     Ok(OAuthCredential {
         access: token.access_token,
         refresh: token.refresh_token.unwrap_or_default(),
-        expires_at_ms: now_ms() + token.expires_in.unwrap_or(3600) * 1000 - 5 * 60 * 1000,
+        expires_at_ms: credential_expiry_ms(now_ms(), token.expires_in),
         metadata,
     })
+}
+
+fn credential_expiry_ms(now_ms: i64, expires_in: Option<i64>) -> i64 {
+    now_ms
+        .saturating_add(expires_in.unwrap_or(3600).saturating_mul(1000))
+        .saturating_sub(5 * 60 * 1000)
 }
 
 fn extract_metadata(
@@ -431,6 +468,24 @@ fn validate_definition(definition: &OAuthProvider) -> Result<(), Status> {
         ));
     }
     request_style(definition)?;
+    validate_front_channel_url(&definition.authorize_url)?;
+    validate_front_channel_url(&definition.token_url)?;
+    Ok(())
+}
+
+fn validate_front_channel_url(value: &str) -> Result<(), Status> {
+    let url = url::Url::parse(value)
+        .map_err(|_| Status::failed_precondition("OAuth endpoint URL is invalid"))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Status::failed_precondition(
+            "OAuth endpoints must be absolute HTTPS URLs without credentials or fragments",
+        ));
+    }
     Ok(())
 }
 
@@ -447,14 +502,83 @@ fn request_style(definition: &OAuthProvider) -> Result<OauthTokenRequestStyle, S
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as i64)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
     use crate::config::defaults::openai_codex_oauth_settings;
+    use axum::{
+        Json, Router,
+        http::{StatusCode, header},
+        response::IntoResponse,
+        routing::post,
+    };
     use serde_json::json;
+
+    async fn malicious_token_server(oversized: bool) -> (String, Arc<AtomicUsize>) {
+        let redirected_requests = Arc::new(AtomicUsize::new(0));
+        let redirected = Arc::clone(&redirected_requests);
+        let app = if oversized {
+            Router::new().route(
+                "/token",
+                post(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        "x".repeat(OAUTH_RESPONSE_LIMIT + 1),
+                    )
+                }),
+            )
+        } else {
+            Router::new()
+                .route(
+                    "/token",
+                    post(|| async {
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(header::LOCATION, "/secret-sink")],
+                        )
+                            .into_response()
+                    }),
+                )
+                .route(
+                    "/secret-sink",
+                    post(move || {
+                        let redirected = Arc::clone(&redirected);
+                        async move {
+                            redirected.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"access_token": "stolen"}))
+                        }
+                    }),
+                )
+        };
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/token"), redirected_requests)
+    }
+
+    fn loopback_provider_attempt(token_url: String) -> OAuthAttempt {
+        let mut definition = openai_codex_oauth_settings();
+        definition.token_url = token_url;
+        OAuthAttempt {
+            target: AuthTarget::provider("openai-codex"),
+            definition,
+            verifier: "verifier".to_owned(),
+            state: "state".to_owned(),
+            expires_at_ms: 10_000,
+        }
+    }
 
     #[test]
     fn jwt_claim_string_reads_nested_url_claim_path() {
@@ -489,5 +613,61 @@ mod tests {
             extract_metadata(&openai_codex_oauth_settings(), &token).expect("metadata extracts");
 
         assert_eq!(metadata.get("account_id"), Some(&"account-123".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn provider_manual_completion_requires_state() {
+        let (attempt, _) = begin_manual(
+            AuthTarget::provider("openai-codex"),
+            openai_codex_oauth_settings(),
+            1_000,
+        )
+        .unwrap();
+
+        let error = complete_manual(&attempt, "code=secret", 1_001)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn provider_code_exchange_refuses_redirect_without_replaying_code() {
+        let (token_url, redirected_requests) = malicious_token_server(false).await;
+        let attempt = loopback_provider_attempt(token_url);
+        let error = complete_manual_with_policy(
+            &attempt,
+            "code=code-secret&state=state",
+            1_001,
+            OutboundHttpPolicy::loopback_test(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_code_exchange_rejects_oversized_token_response() {
+        let (token_url, _) = malicious_token_server(true).await;
+        let attempt = loopback_provider_attempt(token_url);
+        let error = complete_manual_with_policy(
+            &attempt,
+            "code=code-secret&state=state",
+            1_001,
+            OutboundHttpPolicy::loopback_test(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn provider_expiry_arithmetic_saturates() {
+        assert_eq!(
+            credential_expiry_ms(i64::MAX, Some(i64::MAX)),
+            i64::MAX - 300_000
+        );
     }
 }
