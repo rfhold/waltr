@@ -1,5 +1,7 @@
 //! Ignored live prompt-cache tests across provider wire formats.
 
+use std::fmt::Write as _;
+
 use futures_util::StreamExt;
 use waltr_agent::{
     CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream, PromptTurn,
@@ -8,9 +10,9 @@ use waltr_agent::{
 
 use crate::live_provider;
 
-const FIRST_PROMPT: &str = r#"Reply with exactly: cache-alpha"#;
+const FIRST_PROMPT: &str = r"Reply with exactly: cache-alpha";
 const SECOND_PROMPT: &str =
-    r#"The previous assistant response is part of this session. Reply with exactly: cache-beta"#;
+    r"The previous assistant response is part of this session. Reply with exactly: cache-beta";
 
 #[tokio::test]
 #[ignore = "requires live provider API keys or WALTR_AGENT_LIVE_GATEWAY=1"]
@@ -88,7 +90,7 @@ async fn assert_multi_turn_session_is_cached(provider: impl LlmStream) -> waltr_
     ))
 }
 
-fn first_turn_request<'a>(system_prompt: &'a str) -> CompletionRequest<'a> {
+const fn first_turn_request(system_prompt: &str) -> CompletionRequest<'_> {
     let mut request = CompletionRequest::new(FIRST_PROMPT);
     request.system_prompt = Some(system_prompt);
     request
@@ -125,9 +127,11 @@ fn stable_cache_prompt() -> String {
          Follow the latest user instruction exactly and keep replies short.\n",
     );
     for index in 0..260 {
-        prompt.push_str(&format!(
-            "Stable cache prefix line {index}: deterministic instructions, examples, and policy text remain identical across turns.\n"
-        ));
+        writeln!(
+            prompt,
+            "Stable cache prefix line {index}: deterministic instructions, examples, and policy text remain identical across turns."
+        )
+        .expect("writing to a string cannot fail");
     }
     prompt
 }

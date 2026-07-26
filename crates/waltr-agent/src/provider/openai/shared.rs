@@ -13,7 +13,7 @@ pub(super) const CHAT_COMPLETIONS_NAME: &str = "openai_chat_completions";
 pub(super) const RESPONSES_NAME: &str = "openai_responses";
 pub(super) const RESPONSES_WEBSOCKET_NAME: &str = "openai_responses_websocket";
 
-pub(super) fn chargeable_input_tokens(
+pub(super) const fn chargeable_input_tokens(
     input_tokens: Option<u64>,
     cached_tokens: Option<u64>,
 ) -> Option<u64> {
@@ -24,6 +24,7 @@ pub(super) fn chargeable_input_tokens(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn stream_openai_http(
     provider: &'static str,
     url: &str,
@@ -110,7 +111,7 @@ pub(super) async fn stream_openai_http(
                                     chunk_count,
                                     event_count,
                                     "provider stream completed"
-                                )
+                                );
                             });
                             return Some((
                                 Ok(CompletionEvent::Finished),
@@ -204,7 +205,7 @@ pub(super) async fn stream_openai_http(
                         stream_span.record("chunk_count", chunk_count);
                         stream_span.record("event_count", event_count);
                         stream_span.in_scope(|| {
-                            tracing::info!(chunk_count, event_count, "provider stream ended")
+                            tracing::info!(chunk_count, event_count, "provider stream ended");
                         });
                         return None;
                     }

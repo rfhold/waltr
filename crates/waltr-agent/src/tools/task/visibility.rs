@@ -7,6 +7,7 @@ use super::{TASK_TOOL_NAME, metadata::metadata_depth};
 
 /// Hides the provider-facing task tool once a session reaches the configured depth.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct TaskVisibilityMiddleware {
     pub(super) max_subagent_depth: usize,
 }

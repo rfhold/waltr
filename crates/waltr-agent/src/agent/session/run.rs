@@ -10,7 +10,9 @@ use crate::{
 
 use super::{ExternalRequestId, ExternalResponse, SessionId, SessionStatus};
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) type RunResult = std::result::Result<AgentSessionRunOutcome, AgentSessionRunError>;
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) type RunOutcomeSender = oneshot::Sender<RunResult>;
 
 /// Error returned while resolving a session runtime.
@@ -103,7 +105,7 @@ pub enum AgentSessionRunInput {
 }
 
 impl AgentSessionRunInput {
-    pub(super) fn kind(&self) -> &'static str {
+    pub(super) const fn kind(&self) -> &'static str {
         match self {
             Self::Continue => "continue",
             Self::Prompt(_) | Self::Prompts(_) => "prompt",
@@ -306,8 +308,8 @@ impl From<LlmError> for AgentSessionRunError {
 impl From<AgentSessionRunError> for LlmError {
     fn from(error: AgentSessionRunError) -> Self {
         match error {
-            AgentSessionRunError::Agent(error) => error,
-            AgentSessionRunError::Runtime(AgentSessionRuntimeError::Agent(error)) => error,
+            AgentSessionRunError::Agent(error)
+            | AgentSessionRunError::Runtime(AgentSessionRuntimeError::Agent(error)) => error,
             error => Self::Protocol {
                 provider: "session-run",
                 message: error.to_string(),

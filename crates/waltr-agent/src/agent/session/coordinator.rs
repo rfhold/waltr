@@ -128,6 +128,10 @@ where
     }
 
     /// Create a new durable session with runtime settings and generated id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session store rejects the new record.
     pub async fn create_with_runtime_settings(
         &self,
         runtime_settings: Option<SessionRuntimeSettings>,
@@ -142,6 +146,10 @@ where
     }
 
     /// Create a new durable session with caller-provided id and runtime settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session store rejects the new record.
     pub async fn create_with_id_and_runtime_settings(
         &self,
         id: SessionId,
@@ -404,6 +412,10 @@ where
     }
 
     /// Set runtime settings and publish an updated session summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
     pub async fn set_runtime_settings(
         &self,
         id: &SessionId,
@@ -424,6 +436,10 @@ where
     }
 
     /// Submit a prompt run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when runtime resolution or run admission fails.
     pub async fn submit_prompt(
         &self,
         session_id: SessionId,
@@ -439,6 +455,10 @@ where
     }
 
     /// Submit an external-response resume run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when runtime resolution or run admission fails.
     pub async fn resume_external_response(
         &self,
         session_id: SessionId,
@@ -458,6 +478,10 @@ where
     }
 
     /// Roll back a session to the end of a visible provider turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint is invalid or persistence fails.
     pub async fn rollback_to_turn(&self, session_id: SessionId, turn: u64) -> Result<AgentSession> {
         self.interrupt_active_run(&session_id).await;
         let output = AgentSessionRuntime::new(&self.store)
@@ -470,6 +494,10 @@ where
     }
 
     /// Roll back a session to a visible timeline cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint is invalid or persistence fails.
     pub async fn rollback_to_cursor(
         &self,
         session_id: SessionId,
@@ -486,6 +514,10 @@ where
     }
 
     /// Roll back a session to immediately before a visible timeline cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint is invalid or persistence fails.
     pub async fn rollback_before_cursor(
         &self,
         session_id: SessionId,
@@ -502,6 +534,10 @@ where
     }
 
     /// Roll back to the end of a turn and continue from that durable checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when rollback, runtime resolution, or run admission fails.
     pub async fn continue_from_turn(
         &self,
         session_id: SessionId,
@@ -517,6 +553,10 @@ where
     }
 
     /// Roll back to a timeline cursor and continue from that durable checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when rollback, runtime resolution, or run admission fails.
     pub async fn continue_from_cursor(
         &self,
         session_id: SessionId,
@@ -532,6 +572,11 @@ where
     }
 
     /// Submit a session run or resume input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when conflict policy rejects the run or runtime resolution fails.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub async fn submit(
         &self,
         session_id: SessionId,
@@ -573,11 +618,7 @@ where
                         );
                         if let Some(previous) = previous {
                             previous.token.cancel();
-                            cancel_queued(
-                                session_id.clone(),
-                                previous.queued,
-                                "replaced by a new run",
-                            );
+                            cancel_queued(&session_id, previous.queued, "replaced by a new run");
                         }
                         start = Some(SessionRunStart {
                             id,
@@ -647,7 +688,7 @@ where
         if let Some(active) = active {
             active.token.cancel();
             tracing::info!(session_id = %id.as_str(), run_id = active.id, "active session run cancellation requested");
-            cancel_queued(id.clone(), active.queued, "session interrupted");
+            cancel_queued(id, active.queued, "session interrupted");
         } else {
             tracing::debug!(session_id = %id.as_str(), "no active session run to cancel");
         }
@@ -688,6 +729,7 @@ where
         );
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     async fn finish_active_run(
         &self,
         session_id: &SessionId,
@@ -768,6 +810,10 @@ where
     }
 
     /// Search prompt-template resources available to a durable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no runtime factory exists or runtime/template search fails.
     pub async fn search_templates(
         &self,
         session_id: &SessionId,
@@ -859,7 +905,8 @@ where
         if settings.mcp_servers.is_empty() {
             return Ok(None);
         }
-        if let Some(runtime) = self.mcp_sessions.lock().await.get(session_id).cloned() {
+        let runtime = self.mcp_sessions.lock().await.get(session_id).cloned();
+        if let Some(runtime) = runtime {
             return Ok(Some(runtime));
         }
         let config = factory.mcp_config(settings).await?;
@@ -916,6 +963,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_run<S>(
     coordinator: SessionCoordinator<S>,
     runtime: Option<AgentRuntime>,
@@ -989,7 +1037,7 @@ fn is_assistant_text_delta(event: &AgentTimelineEvent) -> bool {
         && matches!(event.content, TimelineContent::TextDelta { .. })
 }
 
-fn cancel_queued(session_id: SessionId, queued: VecDeque<QueuedSessionRun>, reason: &'static str) {
+fn cancel_queued(session_id: &SessionId, queued: VecDeque<QueuedSessionRun>, reason: &'static str) {
     for queued in queued {
         drop(queued.outcome_tx.send(Err(AgentSessionRunError::canceled(
             session_id.clone(),
@@ -1024,10 +1072,9 @@ fn send_run_outcome(outcome_txs: Vec<(u64, RunOutcomeSender)>, outcome: RunResul
     }
 }
 
-fn terminal_state(outcome: &RunResult) -> &'static str {
+const fn terminal_state(outcome: &RunResult) -> &'static str {
     match outcome {
         Ok(outcome) => match &outcome.status {
-            SessionStatus::Finished => "finished",
             SessionStatus::Failed { .. } => "error",
             SessionStatus::Suspended(super::Suspension::AwaitingExternalInput { .. }) => {
                 "external_request"
@@ -1036,7 +1083,8 @@ fn terminal_state(outcome: &RunResult) -> &'static str {
                 "awaiting_tool_results"
             }
             SessionStatus::Suspended(super::Suspension::Interrupted { .. }) => "interrupted",
-            SessionStatus::Idle
+            SessionStatus::Finished
+            | SessionStatus::Idle
             | SessionStatus::BuildingRequest
             | SessionStatus::StreamingProvider
             | SessionStatus::RetryingProvider { .. }
@@ -1044,10 +1092,12 @@ fn terminal_state(outcome: &RunResult) -> &'static str {
             | SessionStatus::RunningTool => "finished",
         },
         Err(AgentSessionRunError::Canceled { .. }) => "interrupted",
-        Err(AgentSessionRunError::AlreadyRunning { .. })
-        | Err(AgentSessionRunError::OutcomeDropped { .. })
-        | Err(AgentSessionRunError::Runtime(_))
-        | Err(AgentSessionRunError::Agent(_)) => "error",
+        Err(
+            AgentSessionRunError::AlreadyRunning { .. }
+            | AgentSessionRunError::OutcomeDropped { .. }
+            | AgentSessionRunError::Runtime(_)
+            | AgentSessionRunError::Agent(_),
+        ) => "error",
     }
 }
 
@@ -1163,7 +1213,7 @@ mod tests {
                 url: String::new(),
                 model_id: "test-model".to_owned(),
                 model_cost: None,
-                headers: Default::default(),
+                headers: BTreeMap::default(),
                 oauth: None,
                 reasoning_effort: None,
             },

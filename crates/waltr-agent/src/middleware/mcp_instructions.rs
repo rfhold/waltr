@@ -7,12 +7,13 @@ use crate::{Result, mcp::McpClientRuntime};
 use super::{AgentMiddleware, HookOutcome, context::RequestContext, context::SystemPromptParts};
 
 #[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpInstructionsMiddleware {
     runtime: Arc<McpClientRuntime>,
 }
 
 impl McpInstructionsMiddleware {
-    pub(crate) fn new(runtime: Arc<McpClientRuntime>) -> Self {
+    pub(crate) const fn new(runtime: Arc<McpClientRuntime>) -> Self {
         Self { runtime }
     }
 }

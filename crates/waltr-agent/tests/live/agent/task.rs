@@ -66,7 +66,7 @@ async fn run_live_task_tool_visibility(
             .create_with_id_and_runtime_settings(
                 session_id.clone(),
                 Some(runtime_settings(&model)),
-                Default::default(),
+                std::collections::BTreeMap::default(),
             )
             .await?;
         let submission = sessions
@@ -112,7 +112,7 @@ struct RequestLimitProvider<P> {
 }
 
 impl<P> RequestLimitProvider<P> {
-    fn new(inner: P, max_requests: usize) -> Self {
+    const fn new(inner: P, max_requests: usize) -> Self {
         Self {
             inner,
             max_requests,
@@ -161,6 +161,7 @@ struct ToolVisibilityCase {
 }
 
 impl ToolVisibilityCase {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn run_error<P: LlmStream, E: std::fmt::Display>(
         &self,
         provider: &CapturingProvider<P>,
@@ -176,6 +177,7 @@ impl ToolVisibilityCase {
         }
     }
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn timeout_error<P: LlmStream>(&self, provider: &CapturingProvider<P>) -> LlmError {
         LlmError::Protocol {
             provider: provider.name(),
@@ -188,6 +190,7 @@ impl ToolVisibilityCase {
         }
     }
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn context<P: LlmStream>(
         &self,
         provider: &CapturingProvider<P>,
@@ -236,7 +239,7 @@ fn runtime_settings(model: &ModelRef) -> SessionRuntimeSettings {
             url: String::new(),
             model_id: model.model.as_str().to_owned(),
             model_cost: None,
-            headers: Default::default(),
+            headers: std::collections::BTreeMap::default(),
             oauth: None,
             reasoning_effort: None,
         },
@@ -260,7 +263,7 @@ fn marker_tool() -> AgentTool {
     )
 }
 
-fn tool_names_system_prompt() -> &'static str {
+const fn tool_names_system_prompt() -> &'static str {
     r#"This is a live test for tool visibility. Follow these rules exactly:
 - If the user asks you to use the task tool, call the task tool exactly once with the prompt exactly "return a comma separated list of your tool names".
 - After a task result arrives, never call the task tool again in that turn. Extract the JSON result field and answer with only that bare value.

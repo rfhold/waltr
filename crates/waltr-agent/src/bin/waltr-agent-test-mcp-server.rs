@@ -88,8 +88,7 @@ impl EchoMarkerServer {
     fn is_cancelled(&self, id: &str) -> bool {
         self.cancelled
             .lock()
-            .map(|cancelled| cancelled.contains(id))
-            .unwrap_or(false)
+            .is_ok_and(|cancelled| cancelled.contains(id))
     }
 
     async fn delay_until_done_or_cancelled(&self, request_id: &str, delay_ms: u64) -> bool {
@@ -142,8 +141,7 @@ impl EchoMarkerServer {
             "delayed_write_marker" => {
                 let request_id = context
                     .request_id()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| call.name.clone());
+                    .map_or_else(|| call.name.clone(), ToString::to_string);
                 match serde_json::from_value::<DelayedWriteRequest>(call.arguments) {
                     Ok(arguments) => {
                         if !self
@@ -206,11 +204,13 @@ impl EchoMarkerServer {
     }
 
     #[log_level]
+    #[allow(clippy::needless_pass_by_value)]
     fn set_log_level(level: String, _context: ServerContext) -> ServerResult<()> {
         set_log_level(&level)
     }
 
     #[prompt(name = "status_prompt", definition = status_prompt_definition())]
+    #[allow(clippy::needless_pass_by_value)]
     fn status_prompt(
         arguments: Option<Value>,
         context: ServerContext,
@@ -219,6 +219,7 @@ impl EchoMarkerServer {
     }
 
     #[prompt(name = "greet_prompt", definition = greet_prompt_definition())]
+    #[allow(clippy::needless_pass_by_value)]
     fn greet_prompt(
         arguments: Option<Value>,
         context: ServerContext,
@@ -227,6 +228,7 @@ impl EchoMarkerServer {
     }
 
     #[prompt(name = "review.code", definition = review_code_prompt_definition())]
+    #[allow(clippy::needless_pass_by_value)]
     fn review_code_prompt(
         arguments: Option<Value>,
         context: ServerContext,
@@ -239,11 +241,13 @@ impl EchoMarkerServer {
         uri_template = "test://items/{id}",
         definition = item_resource_template_definition()
     )]
+    #[allow(clippy::needless_pass_by_value)]
     fn read_resource(uri: String, context: ServerContext) -> ServerResult<McpResourceResult> {
         read_resource(&uri, &context)
     }
 
     #[complete]
+    #[allow(clippy::needless_pass_by_value)]
     fn complete(
         request: McpCompletionRequest,
         context: ServerContext,
@@ -252,6 +256,7 @@ impl EchoMarkerServer {
     }
 
     #[notification(method = "notifications/cancelled")]
+    #[allow(clippy::needless_pass_by_value)]
     fn handle_cancelled(&self, notification: JsonRpcNotification, _context: ServerContext) {
         if let Some(id) = notification
             .params
@@ -264,6 +269,7 @@ impl EchoMarkerServer {
     }
 
     #[token_validator]
+    #[allow(clippy::needless_pass_by_value)]
     fn validate_token(
         &self,
         token: McpAccessToken,
@@ -501,10 +507,10 @@ fn trace_marker(context: &ServerContext, label: &str) -> Option<String> {
 }
 
 fn set_log_level(level: &str) -> ServerResult<()> {
-    if let Ok(path) = std::env::var("WALTR_TEST_MCP_LOG_LEVEL_FILE") {
-        if let Err(error) = std::fs::write(path, level) {
-            return Err(ServerError::internal(error.to_string()));
-        }
+    if let Ok(path) = std::env::var("WALTR_TEST_MCP_LOG_LEVEL_FILE")
+        && let Err(error) = std::fs::write(path, level)
+    {
+        return Err(ServerError::internal(error.to_string()));
     }
     Ok(())
 }
@@ -619,6 +625,7 @@ fn read_resource(uri: &str, context: &ServerContext) -> ServerResult<McpResource
     Ok(McpResourceResult::text(uri, "text/plain", text))
 }
 
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
 fn complete(
     request: McpCompletionRequest,
     context: &ServerContext,
@@ -646,6 +653,5 @@ fn complete(
 fn request_id_string(value: &Value) -> String {
     value
         .as_str()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| value.to_string())
+        .map_or_else(|| value.to_string(), ToOwned::to_owned)
 }

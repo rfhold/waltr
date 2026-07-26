@@ -47,14 +47,14 @@ impl OpenAiChatCompletions {
         self
     }
 
-    /// Set the OpenAI prompt cache retention hint for outgoing requests.
+    /// Set the `OpenAI` prompt cache retention hint for outgoing requests.
     #[must_use]
     pub fn with_prompt_cache_retention(mut self, retention: impl Into<String>) -> Self {
         self.prompt_cache_retention = Some(retention.into());
         self
     }
 
-    /// Disable OpenAI prompt cache routing hints on outgoing requests.
+    /// Disable `OpenAI` prompt cache routing hints on outgoing requests.
     #[must_use]
     pub const fn without_prompt_cache(mut self) -> Self {
         self.prompt_cache = false;

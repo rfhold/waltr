@@ -133,10 +133,11 @@ where
 {
     pub(super) fn from_ephemeral_session(run: EphemeralSessionRun<S>) -> Self {
         let prompt = match &run.input {
-            ResumeInput::Continue => "",
             ResumeInput::Prompt(prompt) => prompt,
             ResumeInput::Prompts(prompts) => prompts.last().map_or("", String::as_str),
-            ResumeInput::ToolResults(_) | ResumeInput::ExternalResponse { .. } => "",
+            ResumeInput::Continue
+            | ResumeInput::ToolResults(_)
+            | ResumeInput::ExternalResponse { .. } => "",
         }
         .to_owned();
         let permission_policy = run.permission_policy;
@@ -370,7 +371,7 @@ where
                                 tracing::info!(
                                     tool_count = streaming.tool_calls.len(),
                                     "provider turn requested tools"
-                                )
+                                );
                             });
                             self.phase = AgentLoopPhase::ExecuteTools(ToolBatch {
                                 calls: streaming.tool_calls.into(),
@@ -539,7 +540,9 @@ where
                 self.suspend_from_hook(suspension).await?;
                 return Ok(None);
             }
-            outcome => return Err(unsupported_build_system_prompt_outcome(&outcome)),
+            outcome @ HookOutcome::ReplaceToolResult(_) => {
+                return Err(unsupported_build_system_prompt_outcome(&outcome));
+            }
         }
 
         let mut tools = ToolDraft::default();
@@ -922,9 +925,8 @@ where
                 ));
             }
         };
-        let prompts = match self.render_prompt_templates(prompts).await? {
-            Some(prompts) => prompts,
-            None => return Ok(false),
+        let Some(prompts) = self.render_prompt_templates(prompts).await? else {
+            return Ok(false);
         };
         self.prompt = prompts.last().cloned().unwrap_or_default();
         let record = self
@@ -965,6 +967,7 @@ where
         Ok(true)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn apply_resume_input(&mut self, record: SessionRecord) -> Result<bool> {
         let Some(input) = self.input.take() else {
             self.hydrate_from_record(&record);
@@ -997,9 +1000,8 @@ where
                 }
             }
             ResumeInput::Prompts(prompts) => {
-                let prompts = match self.render_prompt_templates(prompts).await? {
-                    Some(prompts) => prompts,
-                    None => return Ok(false),
+                let Some(prompts) = self.render_prompt_templates(prompts).await? else {
+                    return Ok(false);
                 };
                 match self
                     .session_runtime()
@@ -1083,6 +1085,7 @@ where
         }
     }
 
+    #[allow(clippy::option_if_let_else)]
     async fn render_prompt_templates(
         &mut self,
         prompts: Vec<String>,
@@ -1323,7 +1326,7 @@ where
         delay: Duration,
         message: String,
     ) -> Result<AgentTimelineEvent> {
-        let delay_ms = delay.as_millis().min(u128::from(u64::MAX)) as u64;
+        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         let mut event = PendingTimelineEvent::new(
             self.session_id.clone(),
             self.turn as u64,

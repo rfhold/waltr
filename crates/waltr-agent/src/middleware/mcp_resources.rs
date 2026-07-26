@@ -18,17 +18,19 @@ use crate::{
 use super::{AgentMiddleware, context::TemplateRenderContext, context::TemplateSearchContext};
 
 #[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpResourcesMiddleware {
     runtime: Arc<McpClientRuntime>,
 }
 
 impl McpResourcesMiddleware {
-    pub(crate) fn new(runtime: Arc<McpClientRuntime>) -> Self {
+    pub(crate) const fn new(runtime: Arc<McpClientRuntime>) -> Self {
         Self { runtime }
     }
 }
 
 impl AgentMiddleware for McpResourcesMiddleware {
+    #[allow(clippy::too_many_lines)]
     async fn search_templates(
         &self,
         ctx: &TemplateSearchContext<'_>,

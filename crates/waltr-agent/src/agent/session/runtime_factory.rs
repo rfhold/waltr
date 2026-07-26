@@ -122,6 +122,10 @@ impl AgentSessionRuntimeFactory {
     }
 
     /// Build a runtime builder from session settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provider, credential, MCP, or runtime construction fails.
     pub async fn runtime_builder(
         &self,
         settings: &SessionRuntimeSettings,
@@ -206,6 +210,7 @@ impl AgentSessionRuntimeFactory {
         format!("file://{}", self.root.display())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn provider_builder(
         &self,
         settings: &SessionRuntimeSettings,
@@ -1059,6 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     async fn runtime_builder_resolves_headers_at_agent_boundary() {
         let factory = AgentSessionRuntimeFactory::new(
             std::env::temp_dir(),

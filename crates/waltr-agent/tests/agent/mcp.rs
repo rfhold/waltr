@@ -310,7 +310,10 @@ async fn mcp_progress_notifications_are_forwarded_to_timeline() -> waltr_agent::
     assert!(
         session.timeline.iter().any(|event| {
             crate::session::channel_is(event, CHANNEL_TOOL_PROGRESS_INFO)
-                && event.parent_id.as_ref().map(|id| id.as_str())
+                && event
+                    .parent_id
+                    .as_ref()
+                    .map(waltr_agent::TimelineItemId::as_str)
                     == Some("tool-call:call_direct_progress")
                 && matches!(
                     &event.content,
@@ -554,9 +557,10 @@ async fn mcp_cancellation_cancels_tool_work_and_preserves_stdio_runtime() -> wal
         let waltr_agent::SessionTimelineEvent::Event(event) = update.event else {
             continue;
         };
-        if crate::session::channel_is(&event, CHANNEL_TOOL_RESULT) {
-            panic!("MCP tool finished before cancellation: {event:#?}");
-        }
+        assert!(
+            !crate::session::channel_is(&event, CHANNEL_TOOL_RESULT),
+            "MCP tool finished before cancellation: {event:#?}"
+        );
         if crate::session::channel_is(&event, CHANNEL_TOOL_CALL) {
             break;
         }
@@ -1201,7 +1205,7 @@ fn test_runtime_settings(
             url: String::new(),
             model_id: OPENAI_TEST_MODEL.to_owned(),
             model_cost: None,
-            headers: Default::default(),
+            headers: std::collections::BTreeMap::default(),
             oauth: None,
             reasoning_effort: None,
         },

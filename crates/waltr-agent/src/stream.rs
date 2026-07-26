@@ -16,6 +16,7 @@ pub type BoxStreamFuture<'a> =
 pub type BoxCompletionStream = Pin<Box<dyn Stream<Item = Result<CompletionEvent>> + Send>>;
 
 /// Provider-neutral completion stream event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionEvent {
     /// A text delta emitted by the provider.
@@ -158,6 +159,11 @@ impl ModelCost {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn rate_cost_micros(tokens: Option<u64>, per_million_tokens: Option<f64>) -> u64 {
     let Some(tokens) = tokens else { return 0 };
     let Some(rate) = per_million_tokens else {
@@ -169,6 +175,11 @@ fn rate_cost_micros(tokens: Option<u64>, per_million_tokens: Option<f64>) -> u64
     ((tokens as f64) * rate).round() as u64
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn image_cost_micros(images: Option<u64>, per_image: Option<f64>) -> u64 {
     let Some(images) = images else { return 0 };
     let Some(rate) = per_image else { return 0 };

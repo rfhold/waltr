@@ -453,6 +453,7 @@ impl SessionRecord {
     }
 
     /// Journal events visible after applying append-only rollback barriers.
+    #[must_use]
     pub fn effective_journal_events(&self) -> Vec<&SessionJournalEvent> {
         let mut events: Vec<(usize, &SessionJournalEvent)> = Vec::new();
         for (index, event) in self.journal.iter().enumerate() {

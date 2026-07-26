@@ -101,7 +101,7 @@ pub enum SessionTimelineEvent {
 }
 
 impl SessionTimelineEvent {
-    fn session_id(&self) -> &SessionId {
+    const fn session_id(&self) -> &SessionId {
         match self {
             Self::Event(event) => &event.session_id,
             Self::Truncated { session_id, .. } => session_id,

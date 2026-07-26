@@ -88,6 +88,7 @@ impl AgentRuntime {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl fmt::Debug for AgentRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

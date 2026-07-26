@@ -74,6 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn resolves_whole_and_embedded_env_header_templates() {
         let headers = BTreeMap::from([
             (
@@ -98,6 +99,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn missing_env_header_template_fails_runtime_resolution() {
         let headers = BTreeMap::from([(
             "Authorization".to_owned(),

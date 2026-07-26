@@ -47,7 +47,7 @@ pub(in crate::mcp) struct McpServerRuntime {
     state: Mutex<McpServerState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct McpServerState {
     initialized: bool,
     capabilities: McpServerCapabilities,
@@ -58,20 +58,6 @@ struct McpServerState {
     last_sse_event_id: Option<String>,
 }
 
-impl Default for McpServerState {
-    fn default() -> Self {
-        Self {
-            initialized: false,
-            capabilities: McpServerCapabilities::default(),
-            instructions: None,
-            tools: McpToolRegistry::default(),
-            prompts: McpPromptRegistry::default(),
-            resources: McpResourceRegistry::default(),
-            last_sse_event_id: None,
-        }
-    }
-}
-
 struct ServerHandler {
     name: String,
     root_uri: String,
@@ -80,6 +66,7 @@ struct ServerHandler {
     refresh: Mutex<Option<Arc<McpServerRuntime>>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl McpServerRuntime {
     pub(in crate::mcp) async fn start(
         config: McpServerConfig,
@@ -383,6 +370,7 @@ impl McpServerRuntime {
         let mut state = self.state.lock().await;
         state.prompts.prompts = prompts;
         state.prompts.generation += 1;
+        drop(state);
         Ok(())
     }
 
@@ -424,6 +412,7 @@ impl McpServerRuntime {
         let mut state = self.state.lock().await;
         state.resources.resource_templates = resource_templates;
         state.resources.generation += 1;
+        drop(state);
         Ok(())
     }
 
@@ -546,6 +535,7 @@ impl McpClientHandler for ServerHandler {
 }
 
 impl ServerHandler {
+    #[allow(clippy::needless_pass_by_value)]
     fn log_message(&self, params: Value) {
         let raw_level = params
             .get("level")
@@ -628,6 +618,7 @@ fn render_progress_message(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn trace_mcp_log(
     server: &str,
     transport: &'static str,

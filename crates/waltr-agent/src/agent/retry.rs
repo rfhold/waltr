@@ -22,6 +22,7 @@ pub struct ProviderRetryConfig {
 }
 
 impl Default for ProviderRetryConfig {
+    #[allow(clippy::duration_suboptimal_units)]
     fn default() -> Self {
         Self {
             enabled: true,
@@ -50,6 +51,7 @@ pub struct ProviderRetryDecision {
 impl ProviderRetryConfig {
     /// Decide whether a provider failure should be retried.
     #[must_use]
+    #[allow(clippy::map_unwrap_or)]
     pub fn classify(&self, error: &LlmError, attempt: u32) -> Option<ProviderRetryDecision> {
         if !self.enabled || attempt >= self.max_attempts || !is_retryable(error) {
             return None;
@@ -64,6 +66,7 @@ impl ProviderRetryConfig {
         })
     }
 
+    #[allow(clippy::cast_possible_wrap)]
     fn fallback_delay(&self, attempt: u32) -> Duration {
         let exponent = attempt.saturating_sub(1) as i32;
         let seconds = self.initial_delay.as_secs_f64() * self.backoff_factor.powi(exponent);

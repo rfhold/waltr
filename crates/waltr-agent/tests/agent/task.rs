@@ -17,6 +17,7 @@ use tokio::time::{Duration, timeout};
 
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn task_tool_sync_mode_returns_child_assistant_text() -> waltr_agent::Result<()> {
     let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
         "task_sync_provider",
@@ -55,7 +56,7 @@ async fn task_tool_sync_mode_returns_child_assistant_text() -> waltr_agent::Resu
     runs.create_with_id_and_runtime_settings(
         parent_id.clone(),
         Some(test_runtime_settings()),
-        Default::default(),
+        std::collections::BTreeMap::default(),
     )
     .await?;
 
@@ -159,7 +160,7 @@ async fn task_tool_default_depth_blocks_subagents_from_spawning_tasks() -> waltr
     runs.create_with_id_and_runtime_settings(
         parent_id.clone(),
         Some(test_runtime_settings()),
-        Default::default(),
+        std::collections::BTreeMap::default(),
     )
     .await?;
 
@@ -240,7 +241,7 @@ async fn task_tool_max_depth_allows_configured_nested_subagent() -> waltr_agent:
     runs.create_with_id_and_runtime_settings(
         parent_id.clone(),
         Some(test_runtime_settings()),
-        Default::default(),
+        std::collections::BTreeMap::default(),
     )
     .await?;
 
@@ -269,6 +270,7 @@ async fn task_tool_max_depth_allows_configured_nested_subagent() -> waltr_agent:
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Result<()> {
     let provider = Arc::new(AsyncTaskProvider::new());
     let runs = task_sessions(provider.clone(), 1);
@@ -277,7 +279,7 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
     runs.create_with_id_and_runtime_settings(
         parent_id.clone(),
         Some(test_runtime_settings()),
-        Default::default(),
+        std::collections::BTreeMap::default(),
     )
     .await?;
     let parent_run = runs
@@ -388,6 +390,7 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn async_task_callbacks_coalesce_while_parent_is_active() -> waltr_agent::Result<()> {
     let provider = Arc::new(AsyncTaskProvider::new());
     let runs = task_sessions(provider.clone(), 1);
@@ -396,7 +399,7 @@ async fn async_task_callbacks_coalesce_while_parent_is_active() -> waltr_agent::
     runs.create_with_id_and_runtime_settings(
         parent_id.clone(),
         Some(test_runtime_settings()),
-        Default::default(),
+        std::collections::BTreeMap::default(),
     )
     .await?;
     let parent_run = runs
@@ -537,7 +540,7 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             url: String::new(),
             model_id: "test-model".to_owned(),
             model_cost: None,
-            headers: Default::default(),
+            headers: std::collections::BTreeMap::default(),
             oauth: None,
             reasoning_effort: None,
         },
