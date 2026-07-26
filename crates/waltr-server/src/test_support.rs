@@ -1,28 +1,50 @@
 //! Shared integration test server setup.
 
 use crate::{
-    ServerApplication, build_app_with_catalog_loader,
+    ServerApplication,
+    access_auth::{
+        AccessAuthConfig, AccessAuthHttpClient, AccessAuthStore, AccessAuthenticator,
+        BrowserSession, BrowserSessionTokenDigest, OidcConfig,
+    },
+    app::build_app_with_catalog_loader_and_access_authenticator,
+    build_app_with_catalog_loader,
     catalog::CatalogLoader,
     config_service::ConfigService,
     persistence::{DatabaseConfig, Persistence},
     session,
 };
+use axum::{
+    Form, Json, Router,
+    extract::{Query, State},
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use waltr_agent::{MemorySessionStore, SessionCoordinator};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::{
+    collections::HashMap,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     thread,
+    time::{Duration, SystemTime},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Observability and join controls for an application with blocked cleanup.
+/// Observability and join controls for a server application with blocked cleanup.
 #[derive(Debug)]
 pub struct BlockedCleanupProbe {
     /// Notified after the blocked cleanup future starts.
@@ -78,6 +100,36 @@ pub fn blocked_cleanup_application() -> (ServerApplication, BlockedCleanupProbe)
     )
 }
 
+const TEST_KEY_ID: &str = "waltr-access-test-key";
+const TEST_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCNNdGQvErjmqYo
+wx04OKzHiIwdhBvAj9adzAH726wXfUhR7ACBxW1Exalb1glGQDvXc2w/5x+zg3K6
+vOWgn3nmLA0YmbMEXr8TnXlz5AXIAATLIWm2SkWpyBkEVRkYeyXPwCWBTKxLKyGM
+4I0bXlUSD6CN0vAMlbVGu9BAL7DVgePeyBlX9dZ9hbLjTVPkZzs53Gy1UrW4iPYu
+DnG6y8oYIQG4N1hmZOODO5CoXasYVZULuvhqDcLzHEF/AClFm2Tte9lpzeQC1gMJ
+WUfIVu2SZqk43Ju4OKMlfPBV9L3rHQjs+hdz5zq1I9/7tak20gOgvEdwjlC/rq1+
+w5188JzzAgMBAAECggEAAq1rU1etZHJ3mUt9eZJYS7SKUlgGccKNWX8NhQnCoMxP
+x83dlnDuyP30mri0DJ9BAzcWHtCtXB9giatriaUymboveuvGg8hjziqi+m3b7FtU
+9wMtewWoQvJ32+Lc3n0xHKbXQHA1ut3nkRnwP0wjDMrs6D6UGf8jc2LPo5HD64EG
+Ye973DBz/tqIiRYviBYOgD1dgQR0ZqM6QHbVkQ0IJbB3wQNR8zDlubShCHk1ccwz
+O1k3CNYI41+r6OQ46yW9KmYyztgzMiep0/lE4C9Qqq+OQyyPG8/F0+qvUKXsJjwx
+F/ddPM6VN4iaP8QzwS8ajtm5enVc5Mo0lGZDrQkJcQKBgQDBVaD3Kd+UdpympajV
+YcfPru66ZqIm+FUcIjIEyWINCSg90z4w+zzz4ajnB9YktMGRlKgHz95mUm72W2iZ
+SAd13HixLlvVWWKYTQH9mdJ+bWzUhzP3XzhO94s3S3oS2Unj3vewKnvwLVKbm54x
+VyqF0yldNFbMJYrb/J9T+BXqRwKBgQC6+w9vpXsKm8yd1J2NagyFF1U7uJ9nWc8y
+EDOMcJOdPyXrHOpYH5xidubh4Vvt+4iU2QOt15yDOifAfAaAjuP2ZCcCTORXQ+nV
+Lb3GUQaGYGvlT2zm9RuAlavV1KDKmvY+F8WueFU5/lSPgu0w2FB6hCRTtcCKuC6h
+JOE8ovnh9QKBgQCwhz8yb0l2hdcDUr+WFnIbb98K1Cu66YTM62xAcqDUxke4K+nd
+T4mYJbPTP5SIb4NPKi1C9MpdI2euCki3rM0jEOwi2/F+HN+psKbgqFNKnR+B7vHE
+LW18rQqwsnoEO+L77dq7QA9qffevnagT5UMubmCWefPG84CW3VOdmChqgQKBgEpe
+JKuRM7jqcp2rvOZL8aLVvu675Zqjm8cbroUDGZMHVLuIiqR2HisDg5z/lyK2UoJx
+NgdkpDmFXd4u9h8Xtg9/kgxWLNOQjWZehQZln6S+oOtZhcTuY/vmi6vGoBU1QQ89
+QUC9V5hzUYqq1lABGTFBcXlh5qzFyLYLBxKo954pAoGAUtBAanvamVMGl0x3HYa9
+BHysmfq4utptmwJp6bCV0oqunuJqhSwIyGPlTxkoJKDwfXgSsWoEDePd6nHrm4TG
+HpmPp186M8HC6SSmdVh3CSIuSzO3DzHyDCV9k8UzzVZiCqBVm5Vv3m5w2SAQPduP
+ZbAq2L8jXEetO4oBq+h/bLE=
+-----END PRIVATE KEY-----";
+
 /// Shared test server for integration tests in one test binary.
 #[derive(Debug)]
 pub struct TestServer {
@@ -96,6 +148,336 @@ impl TestServer {
     #[must_use]
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+}
+
+/// Auth-enabled integration server and credentials issued by its local fixture.
+#[derive(Debug)]
+pub struct AccessAuthTestServer {
+    /// Running Waltr server.
+    pub server: &'static TestServer,
+    /// Valid API bearer token.
+    pub access_token: String,
+    /// Seeded browser session cookie header value.
+    pub session_cookie: String,
+    /// Issuer identifier used by the OIDC fixture.
+    pub issuer: String,
+    _issuer_thread: thread::JoinHandle<()>,
+}
+
+impl AccessAuthTestServer {
+    /// Sign a valid API token with a bounded lifetime.
+    #[must_use]
+    pub fn access_token_with_ttl(&self, ttl: Duration) -> String {
+        sign_access_token_with_ttl(&self.issuer, "waltr:read", ttl)
+    }
+}
+
+/// File-backed access-auth fixture that can reconstruct the application.
+#[derive(Debug)]
+pub struct AccessAuthBrowserFixture {
+    issuer: String,
+    database_url: String,
+    _root: PathBuf,
+    _issuer_thread: thread::JoinHandle<()>,
+}
+
+/// Restartable auth-enabled server for browser flow tests.
+#[derive(Debug)]
+pub struct RestartableAccessAuthServer {
+    addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl RestartableAccessAuthServer {
+    /// Build an absolute URL for a server path.
+    #[must_use]
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.addr, path)
+    }
+
+    /// Return the base URL for tonic clients.
+    #[must_use]
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Stop this server and wait for its listener to close.
+    pub fn stop(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("auth test server should stop cleanly");
+        }
+    }
+}
+
+impl Drop for RestartableAccessAuthServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("auth test server should stop cleanly");
+        }
+    }
+}
+
+impl AccessAuthBrowserFixture {
+    /// Sign a bearer token from this fixture's issuer with a short lifetime.
+    #[must_use]
+    pub fn access_token(&self, ttl: Duration) -> String {
+        sign_access_token_with_ttl(&self.issuer, "waltr:read", ttl)
+    }
+
+    /// Start a newly constructed app over this fixture's persistent database.
+    #[must_use]
+    pub fn start_server(&self, session_ttl: Duration) -> RestartableAccessAuthServer {
+        start_restartable_auth_server(
+            &self.issuer,
+            "waltr-test-client",
+            None,
+            &self.database_url,
+            session_ttl,
+            false,
+        )
+    }
+
+    /// Start a reconstructed app with a different browser client ID.
+    #[must_use]
+    pub fn start_server_with_client_id(
+        &self,
+        session_ttl: Duration,
+        client_id: &str,
+    ) -> RestartableAccessAuthServer {
+        start_restartable_auth_server(
+            &self.issuer,
+            client_id,
+            None,
+            &self.database_url,
+            session_ttl,
+            false,
+        )
+    }
+
+    /// Start a reconstructed app with a confidential browser client secret.
+    #[must_use]
+    pub fn start_server_with_client_secret(
+        &self,
+        session_ttl: Duration,
+        client_secret: &str,
+    ) -> RestartableAccessAuthServer {
+        start_restartable_auth_server(
+            &self.issuer,
+            "waltr-test-client",
+            Some(client_secret),
+            &self.database_url,
+            session_ttl,
+            false,
+        )
+    }
+
+    /// Start a reconstructed app against a different discovered issuer.
+    #[must_use]
+    pub fn start_server_with_new_issuer(
+        &self,
+        session_ttl: Duration,
+    ) -> RestartableAccessAuthServer {
+        let issuer = start_fake_issuer();
+        start_restartable_auth_server(
+            &issuer.url,
+            "waltr-test-client",
+            None,
+            &self.database_url,
+            session_ttl,
+            false,
+        )
+    }
+
+    /// Count browser sessions revoked in this fixture's durable database.
+    pub async fn revoked_browser_session_count(&self) -> i64 {
+        let pool = sqlx::SqlitePool::connect(&self.database_url)
+            .await
+            .expect("browser fixture database should connect");
+        sqlx::query_scalar(
+            "SELECT count(*) FROM waltr_browser_sessions WHERE revoked_at_ms IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("browser fixture revocation count should load")
+    }
+
+    /// Load the persisted expiry for an issued browser-session cookie.
+    pub async fn browser_session_expiry(&self, session_cookie: &str) -> SystemTime {
+        use std::fmt::Write as _;
+
+        let token = session_cookie
+            .split_once('=')
+            .map(|(_, token)| token)
+            .expect("session cookie should contain a token");
+        let mut digest = String::with_capacity(64);
+        for byte in Sha256::digest(token.as_bytes()) {
+            write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        let pool = sqlx::SqlitePool::connect(&self.database_url)
+            .await
+            .expect("browser fixture database should connect");
+        let expires_at_ms: i64 = sqlx::query_scalar(
+            "SELECT expires_at_ms FROM waltr_browser_sessions WHERE token_digest = ?",
+        )
+        .bind(digest)
+        .fetch_one(&pool)
+        .await
+        .expect("browser session expiry should load");
+        SystemTime::UNIX_EPOCH
+            + Duration::from_millis(
+                u64::try_from(expires_at_ms).expect("browser session expiry should be positive"),
+            )
+    }
+
+    /// Make subsequent browser-session revalidation fail at the store boundary.
+    pub async fn break_browser_session_revalidation(&self) {
+        let pool = sqlx::SqlitePool::connect(&self.database_url)
+            .await
+            .expect("browser fixture database should connect");
+        sqlx::query("DROP TABLE waltr_browser_sessions")
+            .execute(&pool)
+            .await
+            .expect("browser session table should be removable for failure testing");
+        pool.close().await;
+    }
+
+    /// Start an app whose post-session-insert advisory cleanup is forced to fail.
+    #[must_use]
+    pub fn start_server_with_callback_cleanup_failure(
+        &self,
+        session_ttl: Duration,
+    ) -> RestartableAccessAuthServer {
+        start_restartable_auth_server(
+            &self.issuer,
+            "waltr-test-client",
+            None,
+            &self.database_url,
+            session_ttl,
+            true,
+        )
+    }
+}
+
+/// Create a full browser-flow fixture with durable `SQLite` persistence.
+#[must_use]
+pub fn setup_access_auth_browser_fixture() -> AccessAuthBrowserFixture {
+    let issuer = start_fake_issuer();
+    let root = temp_root();
+    let database_url = format!("sqlite://{}", root.join("access-auth.sqlite3").display());
+    AccessAuthBrowserFixture {
+        issuer: issuer.url,
+        database_url,
+        _root: root,
+        _issuer_thread: issuer.thread,
+    }
+}
+
+/// Start an auth-enabled server backed by a deterministic loopback OIDC issuer.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture owns one complete server lifecycle"
+)]
+pub fn setup_access_auth_server() -> AccessAuthTestServer {
+    let fake_issuer = start_fake_issuer();
+    let issuer = fake_issuer.url;
+    let issuer_thread = fake_issuer.thread;
+    let access_token = sign_access_token(&issuer, "waltr:read");
+    let browser_token = "deterministic-browser-session";
+    let session_cookie = format!("waltr-session-local={browser_token}");
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let issuer_for_server = issuer.clone();
+    let server_thread = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("auth test server runtime should start");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("auth test server should bind");
+            let addr = listener.local_addr().expect("bound address should exist");
+            let persistence = test_persistence().await;
+            let config = OidcConfig::new(
+                &issuer_for_server,
+                "waltr-test-client",
+                None,
+                format!("http://{addr}/oidc/callback"),
+                "waltr-api",
+                vec!["openid".to_owned()],
+                Duration::from_hours(1),
+                true,
+                true,
+            )
+            .expect("auth test config should be valid");
+            let authenticator = AccessAuthenticator::initialize(
+                AccessAuthConfig::oidc(config),
+                &persistence,
+                AccessAuthHttpClient::build(
+                    reqwest::Client::builder().timeout(Duration::from_secs(5)),
+                )
+                .expect("auth test client should build"),
+            )
+            .await
+            .expect("auth test provider should initialize");
+            let now = SystemTime::now();
+            AccessAuthStore::new(&persistence)
+                .insert_browser_session(&BrowserSession {
+                    token_digest: BrowserSessionTokenDigest::from_token(browser_token),
+                    issuer: issuer_for_server,
+                    client_id: "waltr-test-client".to_owned(),
+                    subject: "browser-subject".to_owned(),
+                    created_at: now,
+                    expires_at: now + Duration::from_hours(1),
+                    last_seen_at: now,
+                })
+                .await
+                .expect("browser session should seed");
+            let config_service =
+                ConfigService::new(temp_root()).expect("auth test config service should start");
+            let app = build_app_with_catalog_loader_and_access_authenticator(
+                config_service,
+                persistence,
+                CatalogLoader::from_env(),
+                authenticator,
+                |routes, config, credential_store| {
+                    session::add_sessions_service(
+                        routes,
+                        SessionCoordinator::new(MemorySessionStore::new()),
+                        config,
+                        credential_store,
+                    );
+                },
+            );
+            ready_tx
+                .send(addr)
+                .expect("auth test server should report ready");
+            app.serve_with_shutdown(listener, std::future::pending())
+                .await
+                .expect("auth test server should run");
+        });
+    });
+    let addr = ready_rx
+        .recv()
+        .expect("auth test server should initialize before serving");
+    let server = Box::leak(Box::new(TestServer {
+        addr,
+        _thread: server_thread,
+    }));
+    AccessAuthTestServer {
+        server,
+        access_token,
+        session_cookie,
+        issuer,
+        _issuer_thread: issuer_thread,
     }
 }
 
@@ -234,6 +616,354 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
         addr,
         _thread: server_thread,
     }))
+}
+async fn test_persistence() -> Persistence {
+    Persistence::initialize(
+        DatabaseConfig::for_tests().expect("test persistence config should be valid"),
+    )
+    .await
+    .expect("test persistence should initialize")
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the fixture exposes independent authentication server settings"
+)]
+fn start_restartable_auth_server(
+    issuer: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    database_url: &str,
+    session_ttl: Duration,
+    fail_callback_cleanup: bool,
+) -> RestartableAccessAuthServer {
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let issuer = issuer.to_owned();
+    let client_id = client_id.to_owned();
+    let client_secret = client_secret.map(ToOwned::to_owned);
+    let database_url = database_url.to_owned();
+    let thread = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("restartable auth test runtime should start");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("restartable auth test server should bind");
+            let addr = listener.local_addr().expect("bound address should exist");
+            let persistence = Persistence::initialize(
+                DatabaseConfig::from_url(&database_url)
+                    .expect("file-backed test persistence URL should be valid"),
+            )
+            .await
+            .expect("file-backed test persistence should initialize");
+            let config = OidcConfig::new(
+                issuer,
+                client_id,
+                client_secret,
+                format!("http://{addr}/oidc/callback"),
+                "waltr-api",
+                vec!["openid".to_owned()],
+                session_ttl,
+                true,
+                true,
+            )
+            .expect("browser flow config should be valid");
+            let authenticator = AccessAuthenticator::initialize(
+                AccessAuthConfig::oidc(config),
+                &persistence,
+                AccessAuthHttpClient::build(
+                    reqwest::Client::builder().timeout(Duration::from_secs(5)),
+                )
+                .expect("browser flow client should build"),
+            )
+            .await
+            .expect("browser flow authenticator should initialize");
+            if fail_callback_cleanup {
+                sqlx::query(
+                    r"
+CREATE TRIGGER fail_callback_cleanup
+BEFORE DELETE ON waltr_oidc_login_attempts
+WHEN EXISTS (
+    SELECT 1 FROM waltr_browser_sessions
+    WHERE subject = 'browser-subject' AND revoked_at_ms IS NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'cleanup failed');
+END
+                    ",
+                )
+                .execute(persistence.sqlite_pool().expect("SQLite test persistence"))
+                .await
+                .expect("callback cleanup failure trigger should install");
+            }
+            let config_service =
+                ConfigService::new(temp_root()).expect("browser flow config service should start");
+            let app = build_app_with_catalog_loader_and_access_authenticator(
+                config_service,
+                persistence,
+                CatalogLoader::from_env(),
+                authenticator,
+                |routes, config, credential_store| {
+                    session::add_sessions_service(
+                        routes,
+                        SessionCoordinator::new(MemorySessionStore::new()),
+                        config,
+                        credential_store,
+                    );
+                },
+            );
+            ready_tx.send(addr).expect("server should report ready");
+            app.serve_with_shutdown(listener, async move {
+                drop(shutdown_rx.await);
+            })
+            .await
+            .expect("restartable auth test server should run");
+        });
+    });
+    RestartableAccessAuthServer {
+        addr: ready_rx.recv().expect("server should initialize"),
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    }
+}
+
+struct FakeIssuerHandle {
+    url: String,
+    thread: thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct FakeIssuerState {
+    issuer: String,
+    pending: Mutex<HashMap<String, PendingAuthorization>>,
+}
+
+#[derive(Debug)]
+struct PendingAuthorization {
+    nonce: String,
+    challenge: String,
+    redirect_uri: String,
+}
+
+fn start_fake_issuer() -> FakeIssuerHandle {
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake issuer runtime should start");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("fake issuer should bind");
+            let issuer = format!(
+                "http://{}",
+                listener.local_addr().expect("issuer address should exist")
+            );
+            let state = Arc::new(FakeIssuerState {
+                issuer: issuer.clone(),
+                pending: Mutex::new(HashMap::new()),
+            });
+            let app = Router::new()
+                .route("/.well-known/openid-configuration", get(discovery))
+                .route("/jwks", get(jwks))
+                .route("/authorize", get(authorize))
+                .route("/token", post(token))
+                .with_state(state);
+            ready_tx
+                .send(issuer)
+                .expect("fake issuer should report ready");
+            axum::serve(listener, app)
+                .await
+                .expect("fake issuer should run");
+        });
+    });
+    FakeIssuerHandle {
+        url: ready_rx.recv().expect("fake issuer should initialize"),
+        thread,
+    }
+}
+
+async fn discovery(State(state): State<Arc<FakeIssuerState>>) -> Json<Value> {
+    let issuer = &state.issuer;
+    Json(json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "jwks_uri": format!("{issuer}/jwks"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "id_token_signing_alg_values_supported": ["RS256"]
+    }))
+}
+
+async fn jwks() -> Json<Value> {
+    Json(json!({"keys": [{
+        "kty": "RSA",
+        "kid": TEST_KEY_ID,
+        "use": "sig",
+        "alg": "RS256",
+        "n": "jTXRkLxK45qmKMMdODisx4iMHYQbwI_WncwB-9usF31IUewAgcVtRMWpW9YJRkA713NsP-cfs4NyurzloJ955iwNGJmzBF6_E515c-QFyAAEyyFptkpFqcgZBFUZGHslz8AlgUysSyshjOCNG15VEg-gjdLwDJW1RrvQQC-w1YHj3sgZV_XWfYWy401T5Gc7OdxstVK1uIj2Lg5xusvKGCEBuDdYZmTjgzuQqF2rGFWVC7r4ag3C8xxBfwApRZtk7XvZac3kAtYDCVlHyFbtkmapONybuDijJXzwVfS96x0I7PoXc-c6tSPf-7WpNtIDoLxHcI5Qv66tfsOdfPCc8w",
+        "e": "AQAB"
+    }]}))
+}
+
+#[derive(Deserialize)]
+struct AuthorizationQuery {
+    response_type: String,
+    client_id: String,
+    redirect_uri: String,
+    scope: String,
+    state: String,
+    nonce: String,
+    code_challenge: String,
+    code_challenge_method: String,
+}
+
+async fn authorize(
+    State(issuer): State<Arc<FakeIssuerState>>,
+    Query(query): Query<AuthorizationQuery>,
+) -> Response {
+    if query.response_type != "code"
+        || query.client_id != "waltr-test-client"
+        || query.scope != "openid"
+        || query.code_challenge_method != "S256"
+        || query.state.is_empty()
+        || query.nonce.is_empty()
+        || query.code_challenge.is_empty()
+        || Url::parse(&query.redirect_uri).is_err()
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let code = "deterministic-authorization-code".to_owned();
+    issuer.pending.lock().await.insert(
+        code.clone(),
+        PendingAuthorization {
+            nonce: query.nonce,
+            challenge: query.code_challenge,
+            redirect_uri: query.redirect_uri.clone(),
+        },
+    );
+    let mut callback =
+        Url::parse(&query.redirect_uri).expect("validated redirect URI should parse");
+    callback
+        .query_pairs_mut()
+        .append_pair("code", &code)
+        .append_pair("state", &query.state);
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(callback.as_str()).expect("callback location should be valid"),
+    );
+    response
+}
+
+#[derive(Deserialize)]
+struct TokenRequest {
+    grant_type: String,
+    code: String,
+    redirect_uri: String,
+    code_verifier: String,
+    client_id: String,
+    client_secret: Option<String>,
+}
+
+async fn token(
+    State(issuer): State<Arc<FakeIssuerState>>,
+    Form(request): Form<TokenRequest>,
+) -> Response {
+    let Some(pending) = issuer.pending.lock().await.remove(&request.code) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(request.code_verifier.as_bytes()));
+    if request.grant_type != "authorization_code"
+        || request.client_id != "waltr-test-client"
+        || request.client_secret.as_deref().is_some_and(str::is_empty)
+        || request.redirect_uri != pending.redirect_uri
+        || challenge != pending.challenge
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let access_token = sign_access_token(&issuer.issuer, "waltr:read");
+    let id_token = sign_id_token(&issuer.issuer, &pending.nonce, &access_token);
+    Json(json!({
+        "access_token": access_token,
+        "id_token": id_token,
+        "token_type": "Bearer",
+        "expires_in": 3600
+    }))
+    .into_response()
+}
+
+fn sign_access_token(issuer: &str, scope: &str) -> String {
+    sign_access_token_with_ttl(issuer, scope, Duration::from_hours(1))
+}
+
+fn sign_access_token_with_ttl(issuer: &str, scope: &str, ttl: Duration) -> String {
+    sign_access_token_for_subject_with_ttl(issuer, "api-subject", scope, ttl)
+}
+
+fn sign_access_token_for_subject_with_ttl(
+    issuer: &str,
+    subject: &str,
+    scope: &str,
+    ttl: Duration,
+) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(TEST_KEY_ID.to_owned());
+    header.typ = Some("at+jwt".to_owned());
+    sign_token(
+        header,
+        json!({
+            "iss": issuer,
+            "sub": subject,
+            "aud": "waltr-api",
+            "iat": jsonwebtoken::get_current_timestamp(),
+            "nbf": jsonwebtoken::get_current_timestamp(),
+            "exp": jsonwebtoken::get_current_timestamp() + ttl.as_secs(),
+            "scope": scope
+        }),
+    )
+}
+
+fn sign_id_token(issuer: &str, nonce: &str, access_token: &str) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(TEST_KEY_ID.to_owned());
+    header.typ = Some("JWT".to_owned());
+    let digest = Sha256::digest(access_token.as_bytes());
+    sign_token(
+        header,
+        json!({
+            "iss": issuer,
+            "sub": "browser-subject",
+            "aud": "waltr-test-client",
+            "iat": jsonwebtoken::get_current_timestamp(),
+            "nbf": jsonwebtoken::get_current_timestamp(),
+            "exp": jsonwebtoken::get_current_timestamp() + 3600,
+            "nonce": nonce,
+            "at_hash": URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }),
+    )
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "test token components are consumed as complete signing inputs"
+)]
+fn sign_token(header: Header, claims: Value) -> String {
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY.as_bytes())
+            .expect("test private key should parse"),
+    )
+    .expect("test access token should encode")
 }
 
 #[must_use]

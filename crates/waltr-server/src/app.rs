@@ -1,6 +1,10 @@
 //! HTTP and gRPC router construction.
 
 use crate::{
+    access_auth::{
+        AccessAuthConfig, AccessAuthConfigError, AccessAuthError, AccessAuthHttpClient,
+        AccessAuthenticator, GrpcAccessAuthLayer, GrpcTransportLayer,
+    },
     auth::{AuthService, FileCredentialStore},
     catalog::{CatalogLoader, CatalogService},
     config::{ConfigError, ConfigHandle},
@@ -10,7 +14,14 @@ use crate::{
     session,
     status_service::StatusService,
 };
-use axum::{Json, Router, response::IntoResponse as _, routing::get};
+#[cfg(feature = "web")]
+use axum::middleware;
+use axum::{
+    Json, Router,
+    http::Request,
+    response::IntoResponse as _,
+    routing::{any, get},
+};
 use waltr::grpc::waltr::auth::v1::auth_service_server::AuthServiceServer;
 use waltr::grpc::waltr::catalog::v1::catalog_service_server::CatalogServiceServer;
 use waltr::grpc::waltr::config::v1::config_service_server::ConfigServiceServer;
@@ -134,12 +145,15 @@ impl ServerApplication {
             mcp_cleanup,
         } = self;
         let cancellation = mcp_cleanup.cancellation.clone();
-        let result = axum::serve(listener, router.into_make_service())
-            .with_graceful_shutdown(async move {
-                shutdown.await;
-                cancellation.cancel();
-            })
-            .await;
+        let result = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            cancellation.cancel();
+        })
+        .await;
         mcp_cleanup.shutdown().await;
         result
     }
@@ -210,6 +224,14 @@ pub enum BuildAppError {
     Persistence(PersistenceError),
     /// Agent session storage configuration is invalid.
     SessionStorage(session::SessionStorageConfigError),
+    /// Access-authentication environment configuration is invalid.
+    AccessAuthConfig(AccessAuthConfigError),
+    /// The bounded OIDC HTTP client could not be constructed.
+    AccessAuthClient(reqwest::Error),
+    /// OIDC discovery or initial key loading failed.
+    AccessAuthDiscovery(AccessAuthError),
+    /// Access-authentication persistence could not initialize.
+    AccessAuthStore(AccessAuthError),
 }
 
 impl fmt::Debug for BuildAppError {
@@ -224,6 +246,18 @@ impl fmt::Display for BuildAppError {
             Self::Config(error) => write!(formatter, "failed to initialize server config: {error}"),
             Self::Persistence(error) => error.fmt(formatter),
             Self::SessionStorage(error) => error.fmt(formatter),
+            Self::AccessAuthConfig(_) => {
+                formatter.write_str("access authentication configuration is invalid")
+            }
+            Self::AccessAuthClient(_) => {
+                formatter.write_str("failed to initialize access authentication HTTP client")
+            }
+            Self::AccessAuthDiscovery(_) => {
+                formatter.write_str("failed to initialize OIDC provider discovery")
+            }
+            Self::AccessAuthStore(_) => {
+                formatter.write_str("failed to initialize access authentication persistence")
+            }
         }
     }
 }
@@ -234,6 +268,9 @@ impl Error for BuildAppError {
             Self::Config(error) => Some(error),
             Self::Persistence(error) => Some(error),
             Self::SessionStorage(error) => Some(error),
+            Self::AccessAuthConfig(error) => Some(error),
+            Self::AccessAuthClient(error) => Some(error),
+            Self::AccessAuthDiscovery(error) | Self::AccessAuthStore(error) => Some(error),
         }
     }
 }
@@ -242,17 +279,33 @@ impl Error for BuildAppError {
 ///
 /// # Errors
 ///
-/// Returns an error when persistence, config, or agent session storage cannot initialize.
+/// Returns an error when persistence, config, authentication, or agent session storage cannot initialize.
 pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
     tracing::debug!("building app with config service from current directory");
     let persistence = Persistence::from_env()
         .await
         .map_err(BuildAppError::Persistence)?;
     let config_service = ConfigService::from_current_dir().map_err(BuildAppError::Config)?;
+    let access_auth_config =
+        AccessAuthConfig::from_env().map_err(BuildAppError::AccessAuthConfig)?;
+    let access_auth_client = AccessAuthHttpClient::build(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10)),
+    )
+    .map_err(BuildAppError::AccessAuthClient)?;
+    let access_authenticator =
+        AccessAuthenticator::initialize(access_auth_config, &persistence, access_auth_client)
+            .await
+            .map_err(|error| match error {
+                AccessAuthError::Persistence(_) => BuildAppError::AccessAuthStore(error),
+                _ => BuildAppError::AccessAuthDiscovery(error),
+            })?;
     let mut session_storage = Ok(());
-    let app = build_app_with_services(
+    let app = build_app_with_access_authenticator(
         config_service,
         persistence,
+        access_authenticator,
         |grpc_routes, config, credential_store| {
             session_storage = session::add_service_from_env(grpc_routes, config, credential_store);
         },
@@ -290,10 +343,30 @@ pub fn build_app_with_services<F>(
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
-    build_app_with_catalog_loader(
+    build_app_with_catalog_loader_and_access_authenticator(
         config_service,
         persistence,
         CatalogLoader::from_env(),
+        AccessAuthenticator::disabled(),
+        add_session_service,
+    )
+}
+
+/// Build the Axum application with an initialized access authenticator.
+pub fn build_app_with_access_authenticator<F>(
+    config_service: Arc<ConfigService>,
+    persistence: Persistence,
+    access_authenticator: AccessAuthenticator,
+    add_session_service: F,
+) -> ServerApplication
+where
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+{
+    build_app_with_catalog_loader_and_access_authenticator(
+        config_service,
+        persistence,
+        CatalogLoader::from_env(),
+        access_authenticator,
         add_session_service,
     )
 }
@@ -303,6 +376,31 @@ pub fn build_app_with_catalog_loader<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     catalog_loader: CatalogLoader,
+    add_session_service: F,
+) -> ServerApplication
+where
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+{
+    build_app_with_catalog_loader_and_access_authenticator(
+        config_service,
+        persistence,
+        catalog_loader,
+        AccessAuthenticator::disabled(),
+        add_session_service,
+    )
+}
+
+/// Build the Axum application using explicit services, catalog, and access authentication.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    reason = "router assembly consumes initialized services in dependency order"
+)]
+pub fn build_app_with_catalog_loader_and_access_authenticator<F>(
+    config_service: Arc<ConfigService>,
+    persistence: Persistence,
+    catalog_loader: CatalogLoader,
+    access_authenticator: AccessAuthenticator,
     add_session_service: F,
 ) -> ServerApplication
 where
@@ -318,11 +416,15 @@ where
     let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
     let mcp_session_store = persistence.mcp_session_store();
     let readiness = Readiness(persistence);
-    let mcp_router = mcp::server::streamable_http_router_with_options(
-        Arc::new(WaltrMcpServer::new(Arc::clone(&config_service))),
-        mcp::server::StreamableHttpOptions::default()
-            .with_session_store(Arc::clone(&mcp_session_store)),
-    );
+    let mcp_router = if access_authenticator.enabled() {
+        Router::new().route("/mcp", any(service_unavailable))
+    } else {
+        mcp::server::streamable_http_router_with_options(
+            Arc::new(WaltrMcpServer::new(Arc::clone(&config_service))),
+            mcp::server::StreamableHttpOptions::default()
+                .with_session_store(Arc::clone(&mcp_session_store)),
+        )
+    };
     let mut grpc_routes = Routes::builder();
     grpc_routes.add_service(ConfigServiceServer::from_arc(config_service));
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
@@ -333,7 +435,12 @@ where
     let grpc = ServiceBuilder::new()
         .layer(OtelGrpcLayer::default())
         .layer(MetricsLayerBuilder::new().build())
-        .layer(GrpcWebLayer::new())
+        .layer(
+            ServiceBuilder::new()
+                .layer(GrpcTransportLayer)
+                .layer(GrpcWebLayer::new())
+                .layer(GrpcAccessAuthLayer::new(access_authenticator.clone())),
+        )
         .service(grpc_routes);
 
     let router = Router::new()
@@ -345,21 +452,69 @@ where
                 async move { readiness.response().await }
             }),
         )
+        .merge(access_authenticator.router())
         .merge(mcp_router);
     #[cfg(feature = "web")]
-    let router = router.route("/", get(crate::web_assets::serve_root)).route(
-        "/{*path}",
-        get(crate::web_assets::serve_path).fallback_service(grpc.clone()),
-    );
+    let router = {
+        let browser_auth = middleware::from_fn_with_state(
+            access_authenticator.clone(),
+            crate::access_auth::require_browser_session,
+        );
+        router
+            .route(
+                "/",
+                get(crate::web_assets::serve_root)
+                    .layer(browser_auth.clone())
+                    .fallback_service(grpc.clone()),
+            )
+            .route(
+                "/{*path}",
+                get(crate::web_assets::serve_path)
+                    .layer(browser_auth)
+                    .fallback_service(grpc.clone()),
+            )
+    };
 
     let router = router
         .fallback_service(grpc)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http().make_span_with(request_span));
     ServerApplication::new(router, mcp_session_store)
+}
+
+fn request_span<B>(request: &Request<B>) -> tracing::Span {
+    let (method, path) = request_trace_fields(request);
+    tracing::debug_span!("request", method = %method, path = %path)
+}
+
+fn request_trace_fields<B>(request: &Request<B>) -> (&axum::http::Method, &str) {
+    (request.method(), request.uri().path())
 }
 
 #[tracing::instrument(name = "health_check")]
 async fn health() -> Json<HealthResponse> {
     tracing::trace!("health check requested");
     Json(HealthResponse { status: "ok" })
+}
+
+async fn service_unavailable() -> axum::response::Response {
+    axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_trace_path_excludes_query_parameters() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/oidc/callback?code=secret-code&state=secret-state")
+            .body(())
+            .unwrap();
+
+        let (method, path) = request_trace_fields(&request);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/oidc/callback");
+        drop(request_span(&request));
+    }
 }

@@ -2,8 +2,11 @@ use serde::Deserialize;
 use std::{
     fs,
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
+
+static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize)]
 pub struct HealthResponse {
@@ -31,11 +34,9 @@ pub async fn wait_for_health(addr: std::net::SocketAddr) -> Result<(), Box<dyn s
 }
 
 pub fn temp_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let root = std::env::temp_dir().join(format!(
-        "waltr-server-boot-{}-{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
+    let counter = TEMP_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root =
+        std::env::temp_dir().join(format!("waltr-server-boot-{}-{counter}", std::process::id()));
     fs::create_dir_all(&root)?;
     Ok(root)
 }

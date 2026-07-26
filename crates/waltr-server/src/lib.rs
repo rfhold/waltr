@@ -1,5 +1,6 @@
 //! Reusable Waltr server components.
 
+pub mod access_auth;
 pub mod app;
 pub mod auth;
 pub mod catalog;
@@ -18,8 +19,8 @@ pub mod test_support;
 mod web_assets;
 
 pub use app::{
-    BuildAppError, ServerApplication, build_app, build_app_with_catalog_loader,
-    build_app_with_config_service, build_app_with_services,
+    BuildAppError, ServerApplication, build_app, build_app_with_access_authenticator,
+    build_app_with_catalog_loader, build_app_with_config_service, build_app_with_services,
 };
 
 /// Default address the server listens on when `WALTR_SERVER_ADDR` is unset.

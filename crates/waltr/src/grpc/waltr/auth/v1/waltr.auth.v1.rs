@@ -89,6 +89,16 @@ pub mod auth_target {
         McpServerKey(::prost::alloc::string::String),
     }
 }
+/// Versioned machine-readable authentication failure carried in gRPC status details.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AuthenticationFailure {
+    #[prost(uint32, tag="1")]
+    pub version: u32,
+    #[prost(enumeration="AuthenticationDomain", tag="2")]
+    pub domain: i32,
+    #[prost(enumeration="AuthenticationFailureReason", tag="3")]
+    pub reason: i32,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AuthStatus {
     #[prost(message, optional, tag="1")]
@@ -192,6 +202,64 @@ pub struct ProviderAuthStatus {
     pub metadata: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(string, tag="6")]
     pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AuthenticationDomain {
+    Unspecified = 0,
+    WaltrAccess = 1,
+}
+impl AuthenticationDomain {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AUTHENTICATION_DOMAIN_UNSPECIFIED",
+            Self::WaltrAccess => "AUTHENTICATION_DOMAIN_WALTR_ACCESS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AUTHENTICATION_DOMAIN_UNSPECIFIED" => Some(Self::Unspecified),
+            "AUTHENTICATION_DOMAIN_WALTR_ACCESS" => Some(Self::WaltrAccess),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AuthenticationFailureReason {
+    Unspecified = 0,
+    CredentialRequired = 1,
+    CredentialRejected = 2,
+    NetworkFailed = 3,
+}
+impl AuthenticationFailureReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AUTHENTICATION_FAILURE_REASON_UNSPECIFIED",
+            Self::CredentialRequired => "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REQUIRED",
+            Self::CredentialRejected => "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REJECTED",
+            Self::NetworkFailed => "AUTHENTICATION_FAILURE_REASON_NETWORK_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AUTHENTICATION_FAILURE_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REQUIRED" => Some(Self::CredentialRequired),
+            "AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REJECTED" => Some(Self::CredentialRejected),
+            "AUTHENTICATION_FAILURE_REASON_NETWORK_FAILED" => Some(Self::NetworkFailed),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

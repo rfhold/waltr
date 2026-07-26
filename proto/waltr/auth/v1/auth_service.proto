@@ -77,6 +77,25 @@ message AuthTarget {
   }
 }
 
+// Versioned machine-readable authentication failure carried in gRPC status details.
+message AuthenticationFailure {
+  uint32 version = 1;
+  AuthenticationDomain domain = 2;
+  AuthenticationFailureReason reason = 3;
+}
+
+enum AuthenticationDomain {
+  AUTHENTICATION_DOMAIN_UNSPECIFIED = 0;
+  AUTHENTICATION_DOMAIN_WALTR_ACCESS = 1;
+}
+
+enum AuthenticationFailureReason {
+  AUTHENTICATION_FAILURE_REASON_UNSPECIFIED = 0;
+  AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REQUIRED = 1;
+  AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REJECTED = 2;
+  AUTHENTICATION_FAILURE_REASON_NETWORK_FAILED = 3;
+}
+
 message AuthStatus {
   AuthTarget target = 1;
   AuthStatusKind kind = 2;
