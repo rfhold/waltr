@@ -25,7 +25,7 @@ struct PaginatedServer {
 }
 
 impl PaginatedServer {
-    fn new(seen: Arc<Mutex<SeenCursors>>) -> Self {
+    const fn new(seen: Arc<Mutex<SeenCursors>>) -> Self {
         Self { seen }
     }
 }
@@ -119,6 +119,7 @@ impl ServerHandler for PaginatedServer {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn paginated_operations_accept_optional_cursor_and_return_next_cursor() -> mcp::Result<()> {
     let seen = Arc::new(Mutex::new(SeenCursors::default()));
     let server = SpecServer::start(Arc::new(PaginatedServer::new(Arc::clone(&seen)))).await?;
@@ -208,6 +209,7 @@ async fn paginated_operations_accept_optional_cursor_and_return_next_cursor() ->
         seen.resource_templates,
         vec![Some("opaque-next-template-cursor".to_owned())]
     );
+    drop(seen);
 
     Ok(())
 }

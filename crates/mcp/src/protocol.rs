@@ -112,6 +112,10 @@ struct OutboundJsonRpcResponse {
 }
 
 /// Build a JSON-RPC request value.
+///
+/// # Panics
+///
+/// Panics only if the internal JSON-RPC request representation cannot serialize.
 #[must_use]
 pub fn json_rpc_request(id: JsonRpcId, method: &str, params: Option<Value>) -> Value {
     serde_json::to_value(OutboundJsonRpcRequest {
@@ -124,6 +128,10 @@ pub fn json_rpc_request(id: JsonRpcId, method: &str, params: Option<Value>) -> V
 }
 
 /// Build a JSON-RPC notification value.
+///
+/// # Panics
+///
+/// Panics only if the internal JSON-RPC notification representation cannot serialize.
 #[must_use]
 pub fn json_rpc_notification(method: &str, params: Option<Value>) -> Value {
     serde_json::to_value(OutboundJsonRpcNotification {
@@ -135,6 +143,10 @@ pub fn json_rpc_notification(method: &str, params: Option<Value>) -> Value {
 }
 
 /// Build a JSON-RPC success response value.
+///
+/// # Panics
+///
+/// Panics only if the internal JSON-RPC response representation cannot serialize.
 #[must_use]
 pub fn json_rpc_success(id: JsonRpcId, result: Value) -> Value {
     serde_json::to_value(OutboundJsonRpcResponse {
@@ -147,6 +159,10 @@ pub fn json_rpc_success(id: JsonRpcId, result: Value) -> Value {
 }
 
 /// Build a JSON-RPC error response value.
+///
+/// # Panics
+///
+/// Panics only if the internal JSON-RPC response representation cannot serialize.
 #[must_use]
 pub fn json_rpc_error(id: JsonRpcId, code: i64, message: impl Into<String>) -> Value {
     serde_json::to_value(OutboundJsonRpcResponse {
@@ -169,6 +185,10 @@ pub fn json_rpc_method_not_found(id: JsonRpcId, method: &str) -> Value {
 }
 
 /// Extract the result value or convert JSON-RPC error into protocol error.
+///
+/// # Errors
+///
+/// Returns an error when the response contains a JSON-RPC error object.
 pub fn json_rpc_result(response: JsonRpcResponse) -> Result<Value> {
     if let Some(error) = response.error {
         return Err(Error::protocol(format!(
@@ -180,6 +200,12 @@ pub fn json_rpc_result(response: JsonRpcResponse) -> Result<Value> {
 }
 
 /// Parse a JSON-RPC message from a value.
+///
+/// # Errors
+///
+/// Returns an error when the value is not a valid JSON-RPC 2.0 message.
+// Retain ownership in the public parser API so callers can hand off decoded values.
+#[allow(clippy::needless_pass_by_value)]
 pub fn parse_json_rpc_message(value: Value) -> Result<JsonRpcInbound> {
     let object = value
         .as_object()
@@ -247,6 +273,10 @@ fn parse_json_rpc_id(value: Option<&Value>) -> Result<JsonRpcId> {
 }
 
 /// Parse a JSON-RPC message from a string.
+///
+/// # Errors
+///
+/// Returns an error when the string is not valid JSON or JSON-RPC 2.0.
 pub fn parse_json_rpc_str(message: &str) -> Result<JsonRpcInbound> {
     parse_json_rpc_message(serde_json::from_str(message)?)
 }

@@ -1,3 +1,6 @@
+// This interoperability fixture intentionally verifies deprecated roots and logging support.
+#![allow(deprecated)]
+
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::Router;
@@ -166,7 +169,7 @@ impl ServerHandler for StandardRmcpServer {
         params: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, ErrorData> {
-        complete(params)
+        complete(&params)
     }
 }
 
@@ -241,7 +244,7 @@ fn read_resource(uri: &str) -> Result<ReadResourceResult, ErrorData> {
     ]))
 }
 
-fn complete(params: CompleteRequestParams) -> Result<CompleteResult, ErrorData> {
+fn complete(params: &CompleteRequestParams) -> Result<CompleteResult, ErrorData> {
     let values =
         if params.r#ref.as_resource_uri() == Some(ITEM_TEMPLATE) && params.argument.name == "id" {
             item_completions(&params.argument.value)
@@ -250,7 +253,9 @@ fn complete(params: CompleteRequestParams) -> Result<CompleteResult, ErrorData> 
         };
     let mut completion =
         CompletionInfo::new(values).map_err(|error| ErrorData::internal_error(error, None))?;
-    completion.total = Some(completion.values.len() as u32);
+    #[allow(clippy::cast_possible_truncation)]
+    let total = completion.values.len() as u32;
+    completion.total = Some(total);
     completion.has_more = Some(false);
     Ok(CompleteResult::new(completion))
 }

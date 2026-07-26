@@ -75,6 +75,10 @@ pub struct ProgressiveWorkflowHelp {
 }
 
 /// Parse the `exec` tool arguments.
+///
+/// # Errors
+///
+/// Returns invalid parameters when the arguments are malformed or omit the action name.
 pub fn parse_exec_arguments(arguments: Value) -> ServerResult<ExecRequest> {
     let request = serde_json::from_value::<ExecRequest>(arguments)
         .map_err(|error| ServerError::invalid_params(format!("invalid exec arguments: {error}")))?;
@@ -87,6 +91,10 @@ pub fn parse_exec_arguments(arguments: Value) -> ServerResult<ExecRequest> {
 }
 
 /// Deserialize action input with a help-oriented error message.
+///
+/// # Errors
+///
+/// Returns invalid parameters when input is absent or does not deserialize as `T`.
 pub fn deserialize_action_input<T>(
     action: &str,
     namespace: &str,
@@ -108,6 +116,10 @@ where
 }
 
 /// Reject input supplied to a no-input action.
+///
+/// # Errors
+///
+/// Returns invalid parameters when non-empty input is supplied.
 pub fn ensure_no_action_input(action: &str, input: Option<Value>) -> ServerResult<()> {
     match input {
         None | Some(Value::Null) => Ok(()),
@@ -287,6 +299,10 @@ pub fn workflows_help(workflow_uri_template: &str, workflows: &[ProgressiveWorkf
 }
 
 /// Convert an action JSON value into an MCP tool result, applying an optional jq filter.
+///
+/// # Errors
+///
+/// Returns invalid parameters when the jq filter cannot be compiled or evaluated.
 pub fn tool_result(output: Value, filter: Option<&str>) -> ServerResult<McpToolResult> {
     let output = match filter.map(str::trim).filter(|filter| !filter.is_empty()) {
         Some(filter) => apply_filter(output, filter)?,
@@ -300,6 +316,11 @@ pub fn tool_result(output: Value, filter: Option<&str>) -> ServerResult<McpToolR
 }
 
 /// Convert workflow Markdown into an MCP tool result with object-shaped structured content.
+///
+/// # Errors
+///
+/// Returns invalid parameters when the jq filter cannot be compiled or evaluated.
+#[allow(clippy::needless_pass_by_value)]
 pub fn workflow_tool_result(
     workflow: &str,
     markdown: String,
@@ -337,6 +358,7 @@ pub fn workflow_resource_result(uri: String, markdown: String) -> McpResourceRes
 
 /// Convert action JSON into an MCP resource result.
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn json_resource_result(uri: String, value: Value) -> McpResourceResult {
     McpResourceResult::text(uri, "application/json", text_for_value(&value))
 }
@@ -410,6 +432,7 @@ pub fn workflow_resource_template_definition(uri_template: &str) -> McpResourceT
 
 /// Render the workflow URI from the configured template.
 #[must_use]
+#[allow(clippy::literal_string_with_formatting_args)]
 pub fn workflow_uri(template: &str, workflow: &str) -> String {
     template.replace("{workflow}", workflow)
 }
@@ -429,7 +452,7 @@ pub fn template_bindings(template: &str, uri: &str) -> Option<serde_json::Map<St
         remaining_uri = &remaining_uri[literal.len()..];
 
         let close = remaining_template[open + 1..].find('}')?;
-        let name = &remaining_template[open + 1..open + close + 1];
+        let name = &remaining_template[(open + 1)..=(open + close)];
         if name.is_empty() {
             return None;
         }
@@ -477,6 +500,10 @@ pub fn workflow_load_input_schema(workflows: &[&str]) -> Value {
 }
 
 /// Parse the `workflows.load` input.
+///
+/// # Errors
+///
+/// Returns invalid parameters when input is absent or does not contain a workflow name.
 pub fn workflow_load_input(input: Option<Value>) -> ServerResult<String> {
     #[derive(Deserialize)]
     struct Input {

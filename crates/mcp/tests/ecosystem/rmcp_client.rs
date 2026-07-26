@@ -1,3 +1,6 @@
+// This interoperability fixture intentionally verifies deprecated roots and logging support.
+#![allow(deprecated)]
+
 use std::sync::{Arc, Mutex};
 
 use mcp::client::McpTransportConfig;
@@ -18,6 +21,7 @@ use super::standard_surface::{
     ECHO_TOOL, GREET_PROMPT, ITEM_42, ITEM_TEMPLATE, LOG_TOOL, PROGRESS_TOOL, STATUS_RESOURCE,
 };
 
+#[allow(clippy::too_many_lines)]
 pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Result<()> {
     let McpTransportConfig::StreamableHttp { endpoint, .. } = transport else {
         return Err(mcp::Error::protocol(
@@ -44,7 +48,7 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
     let echo = peer
         .call_tool(call_tool_params(
             ECHO_TOOL,
-            json!({ "value": "ecosystem-tool-marker-707" }),
+            &json!({ "value": "ecosystem-tool-marker-707" }),
         ))
         .await
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
@@ -53,7 +57,7 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
     let log = peer
         .call_tool(call_tool_params(
             LOG_TOOL,
-            json!({ "message": "ecosystem-log-marker-818" }),
+            &json!({ "message": "ecosystem-log-marker-818" }),
         ))
         .await
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
@@ -61,7 +65,7 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
 
     let mut progress_call = call_tool_params(
         PROGRESS_TOOL,
-        json!({ "value": "ecosystem-progress-result-919" }),
+        &json!({ "value": "ecosystem-progress-result-919" }),
     );
     progress_call.meta = Some(Meta::with_progress_token(ProgressToken(
         NumberOrString::String("ecosystem-progress-token".into()),
@@ -82,7 +86,7 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
     let prompt = peer
         .get_prompt(
             rmcp::model::GetPromptRequestParams::new(GREET_PROMPT)
-                .with_arguments(json_object(json!({ "name": "ecosystem" }))?),
+                .with_arguments(json_object(&json!({ "name": "ecosystem" }))?),
         )
         .await
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
@@ -117,12 +121,12 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
     assert_resource_contains(&resource.contents, "ecosystem-resource-status-616")?;
 
-    let templated = peer
+    let item_resource = peer
         .read_resource(ReadResourceRequestParams::new(ITEM_42))
         .await
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
     assert_resource_contains(
-        &templated.contents,
+        &item_resource.contents,
         "ecosystem-resource-template-item-42-717",
     )?;
 
@@ -193,12 +197,12 @@ impl ClientHandler for RmcpTestClientHandler {
     }
 }
 
-fn call_tool_params(name: &'static str, arguments: Value) -> CallToolRequestParams {
+fn call_tool_params(name: &'static str, arguments: &Value) -> CallToolRequestParams {
     CallToolRequestParams::new(name)
         .with_arguments(json_object(arguments).expect("object arguments"))
 }
 
-fn json_object(value: Value) -> mcp::Result<JsonObject> {
+fn json_object(value: &Value) -> mcp::Result<JsonObject> {
     value
         .as_object()
         .cloned()
@@ -239,6 +243,7 @@ fn assert_resource_contains(
     contents: &[rmcp::model::ResourceContents],
     needle: &str,
 ) -> mcp::Result<()> {
+    #[allow(clippy::match_same_arms)]
     if contents.iter().any(|content| match content {
         rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.contains(needle),
         rmcp::model::ResourceContents::BlobResourceContents { .. } => false,

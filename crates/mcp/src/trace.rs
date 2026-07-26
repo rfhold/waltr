@@ -16,7 +16,7 @@ pub enum McpTracePropagation {
     TraceContext,
 }
 
-pub(crate) fn inject_request_context(
+pub fn inject_request_context(
     params: Option<Value>,
     propagation: McpTracePropagation,
 ) -> Option<Value> {
@@ -28,25 +28,25 @@ pub(crate) fn inject_request_context(
         return params;
     };
 
-    merge_trace_context(params, &context)
+    Some(merge_trace_context(params, &context))
 }
 
-pub(crate) fn request_meta(params: Option<&Value>) -> Option<&Map<String, Value>> {
+pub fn request_meta(params: Option<&Value>) -> Option<&Map<String, Value>> {
     params
         .and_then(Value::as_object)
         .and_then(|params| params.get("_meta"))
         .and_then(Value::as_object)
 }
 
-pub(crate) fn request_method(message: &Value) -> Option<&str> {
+pub fn request_method(message: &Value) -> Option<&str> {
     message.get("method").and_then(Value::as_str)
 }
 
-pub(crate) fn request_id(message: &Value) -> Option<String> {
+pub fn request_id(message: &Value) -> Option<String> {
     message.get("id").and_then(safe_id)
 }
 
-pub(crate) fn safe_id(id: &Value) -> Option<String> {
+pub fn safe_id(id: &Value) -> Option<String> {
     match id {
         Value::String(id) => Some(id.clone()),
         Value::Number(id) => Some(id.to_string()),
@@ -54,14 +54,14 @@ pub(crate) fn safe_id(id: &Value) -> Option<String> {
     }
 }
 
-pub(crate) fn trace_propagation_name(propagation: McpTracePropagation) -> &'static str {
+pub const fn trace_propagation_name(propagation: McpTracePropagation) -> &'static str {
     match propagation {
         McpTracePropagation::Disabled => "disabled",
         McpTracePropagation::TraceContext => "tracecontext",
     }
 }
 
-pub(crate) fn set_span_parent_from_meta(span: &Span, meta: Option<&Map<String, Value>>) {
+pub fn set_span_parent_from_meta(span: &Span, meta: Option<&Map<String, Value>>) {
     if let Some(parent) = extract_parent_context(meta) {
         drop(span.set_parent(parent));
     }
@@ -119,17 +119,17 @@ fn parse_traceparent(traceparent: &str, tracestate: Option<&str>) -> Option<Span
         return None;
     }
     let trace_flags = TraceFlags::new(u8::from_str_radix(flags, 16).ok()?);
-    let trace_state = tracestate
+    let parsed_state = tracestate
         .and_then(|state| state.parse::<TraceState>().ok())
         .unwrap_or_default();
-    let span_context = SpanContext::new(trace_id, span_id, trace_flags, true, trace_state);
+    let span_context = SpanContext::new(trace_id, span_id, trace_flags, true, parsed_state);
     span_context.is_valid().then_some(span_context)
 }
 
-fn merge_trace_context(params: Option<Value>, context: &Map<String, Value>) -> Option<Value> {
+fn merge_trace_context(params: Option<Value>, context: &Map<String, Value>) -> Value {
     let mut params = params.unwrap_or_else(|| Value::Object(Map::new()));
     let Some(params_object) = params.as_object_mut() else {
-        return Some(params);
+        return params;
     };
 
     match params_object.get_mut("_meta") {
@@ -144,7 +144,7 @@ fn merge_trace_context(params: Option<Value>, context: &Map<String, Value>) -> O
         }
     }
 
-    Some(params)
+    params
 }
 
 #[cfg(test)]
@@ -178,7 +178,7 @@ mod tests {
             "_meta": { "progressToken": 7, "other": true }
         }));
 
-        let injected = merge_trace_context(params, &context).expect("params are returned");
+        let injected = merge_trace_context(params, &context);
 
         assert_eq!(injected["_meta"]["progressToken"], 7);
         assert_eq!(injected["_meta"]["other"], true);

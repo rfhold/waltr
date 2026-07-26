@@ -46,7 +46,7 @@ pub struct McpProgressNotification {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Typed MCP tool call request.
 pub struct McpToolCall {
     /// Tool name.
@@ -57,21 +57,21 @@ pub struct McpToolCall {
     pub progress_token: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// MCP tool result.
 pub struct McpToolResult {
     /// Raw MCP result payload.
     pub raw: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// MCP prompt result.
 pub struct McpPromptResult {
     /// Raw MCP result payload.
     pub raw: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// MCP resource read result.
 pub struct McpResourceResult {
     /// Raw MCP result payload.
@@ -91,7 +91,7 @@ pub struct McpCompletionRequest {
     pub context_arguments: serde_json::Map<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Page of MCP tools.
 pub struct McpToolList {
     /// Tools in this page.
@@ -100,7 +100,7 @@ pub struct McpToolList {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Page of MCP prompts.
 pub struct McpPromptList {
     /// Prompts in this page.
@@ -109,7 +109,7 @@ pub struct McpPromptList {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Page of MCP resources.
 pub struct McpResourceList {
     /// Resources in this page.
@@ -118,7 +118,7 @@ pub struct McpResourceList {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Page of MCP resource templates.
 pub struct McpResourceTemplateList {
     /// Resource templates in this page.
@@ -161,7 +161,7 @@ impl McpIcon {
     }
 }
 
-pub(crate) fn parse_icons(value: &Value) -> Vec<McpIcon> {
+pub fn parse_icons(value: &Value) -> Vec<McpIcon> {
     value
         .get("icons")
         .and_then(Value::as_array)
@@ -189,15 +189,15 @@ fn parse_icon(value: &Value) -> Option<McpIcon> {
     })
 }
 
-pub(crate) fn icons_to_value(icons: &[McpIcon]) -> Value {
+pub fn icons_to_value(icons: &[McpIcon]) -> Value {
     Value::Array(icons.iter().map(icon_to_value).collect())
 }
 
 fn icon_to_value(icon: &McpIcon) -> Value {
     let mut value = json!({ "src": icon.src });
-    optional_string(&mut value, "mimeType", &icon.mime_type);
-    optional_string(&mut value, "sizes", &icon.sizes);
-    optional_string(&mut value, "theme", &icon.theme);
+    optional_string(&mut value, "mimeType", icon.mime_type.as_ref());
+    optional_string(&mut value, "sizes", icon.sizes.as_ref());
+    optional_string(&mut value, "theme", icon.theme.as_ref());
     value
 }
 
@@ -230,6 +230,10 @@ impl McpToolCall {
     }
 
     /// Parse a tool call from MCP request params.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the required tool name is absent or invalid.
     pub fn from_params(value: &Value) -> std::result::Result<Self, String> {
         let name = value
             .get("name")
@@ -252,7 +256,7 @@ impl McpToolCall {
 impl McpToolResult {
     /// Wrap a raw MCP tool result.
     #[must_use]
-    pub fn new(raw: Value) -> Self {
+    pub const fn new(raw: Value) -> Self {
         Self { raw }
     }
 
@@ -272,7 +276,7 @@ impl McpToolResult {
 impl McpPromptResult {
     /// Wrap a raw MCP prompt result.
     #[must_use]
-    pub fn new(raw: Value) -> Self {
+    pub const fn new(raw: Value) -> Self {
         Self { raw }
     }
 
@@ -294,7 +298,7 @@ impl McpPromptResult {
 impl McpResourceResult {
     /// Wrap a raw MCP resource result.
     #[must_use]
-    pub fn new(raw: Value) -> Self {
+    pub const fn new(raw: Value) -> Self {
         Self { raw }
     }
 
@@ -349,6 +353,10 @@ impl McpCompletionRequest {
 
 impl McpToolList {
     /// Parse a tool-list page from an MCP response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response page cannot be parsed.
     pub fn parse(value: &Value) -> Result<Self> {
         let tools = value
             .get("tools")
@@ -368,13 +376,17 @@ impl McpToolList {
     pub fn to_value(&self) -> Value {
         let mut value =
             json!({ "tools": self.tools.iter().map(tool_to_value).collect::<Vec<_>>() });
-        add_cursor(&mut value, &self.next_cursor);
+        add_cursor(&mut value, self.next_cursor.as_ref());
         value
     }
 }
 
 impl McpPromptList {
     /// Parse a prompt-list page from an MCP response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response page cannot be parsed.
     pub fn parse(value: &Value) -> Result<Self> {
         let prompts = value
             .get("prompts")
@@ -394,13 +406,17 @@ impl McpPromptList {
     pub fn to_value(&self) -> Value {
         let mut value =
             json!({ "prompts": self.prompts.iter().map(prompt_to_value).collect::<Vec<_>>() });
-        add_cursor(&mut value, &self.next_cursor);
+        add_cursor(&mut value, self.next_cursor.as_ref());
         value
     }
 }
 
 impl McpResourceList {
     /// Parse a resource-list page from an MCP response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response page cannot be parsed.
     pub fn parse(value: &Value) -> Result<Self> {
         let resources = value
             .get("resources")
@@ -419,13 +435,17 @@ impl McpResourceList {
     #[must_use]
     pub fn to_value(&self) -> Value {
         let mut value = json!({ "resources": self.resources.iter().map(resource_to_value).collect::<Vec<_>>() });
-        add_cursor(&mut value, &self.next_cursor);
+        add_cursor(&mut value, self.next_cursor.as_ref());
         value
     }
 }
 
 impl McpResourceTemplateList {
     /// Parse a resource-template-list page from an MCP response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the response page cannot be parsed.
     pub fn parse(value: &Value) -> Result<Self> {
         let resource_templates = value
             .get("resourceTemplates")
@@ -446,7 +466,7 @@ impl McpResourceTemplateList {
         let mut value = json!({
             "resourceTemplates": self.resource_templates.iter().map(resource_template_to_value).collect::<Vec<_>>()
         });
-        add_cursor(&mut value, &self.next_cursor);
+        add_cursor(&mut value, self.next_cursor.as_ref());
         value
     }
 }
@@ -463,7 +483,7 @@ fn next_cursor(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn add_cursor(value: &mut Value, cursor: &Option<String>) {
+fn add_cursor(value: &mut Value, cursor: Option<&String>) {
     if let Some(cursor) = cursor {
         value["nextCursor"] = json!(cursor);
     }
@@ -471,23 +491,23 @@ fn add_cursor(value: &mut Value, cursor: &Option<String>) {
 
 fn tool_to_value(tool: &McpToolDefinition) -> Value {
     let mut value = json!({ "name": tool.name, "inputSchema": tool.input_schema });
-    optional_string(&mut value, "title", &tool.title);
-    optional_string(&mut value, "description", &tool.description);
+    optional_string(&mut value, "title", tool.title.as_ref());
+    optional_string(&mut value, "description", tool.description.as_ref());
     if !tool.icons.is_empty() {
         value["icons"] = icons_to_value(&tool.icons);
     }
-    optional_value(&mut value, "outputSchema", &tool.output_schema);
+    optional_value(&mut value, "outputSchema", tool.output_schema.as_ref());
     if let Some(task_support) = &tool.task_support {
         value["execution"] = json!({ "taskSupport": task_support.as_str() });
     }
-    optional_value(&mut value, "annotations", &tool.annotations);
+    optional_value(&mut value, "annotations", tool.annotations.as_ref());
     value
 }
 
 fn prompt_to_value(prompt: &McpPromptDefinition) -> Value {
     let mut value = json!({ "name": prompt.name });
-    optional_string(&mut value, "title", &prompt.title);
-    optional_string(&mut value, "description", &prompt.description);
+    optional_string(&mut value, "title", prompt.title.as_ref());
+    optional_string(&mut value, "description", prompt.description.as_ref());
     if !prompt.icons.is_empty() {
         value["icons"] = icons_to_value(&prompt.icons);
     }
@@ -498,29 +518,29 @@ fn prompt_to_value(prompt: &McpPromptDefinition) -> Value {
                 .iter()
                 .map(|argument| {
                     let mut value = json!({ "name": argument.name, "required": argument.required });
-                    optional_string(&mut value, "description", &argument.description);
+                    optional_string(&mut value, "description", argument.description.as_ref());
                     value
                 })
                 .collect::<Vec<_>>()
         );
     }
-    optional_value(&mut value, "_meta", &prompt.meta);
+    optional_value(&mut value, "_meta", prompt.meta.as_ref());
     value
 }
 
 fn resource_to_value(resource: &McpResourceDefinition) -> Value {
     let mut value = json!({ "uri": resource.uri, "name": resource.name });
-    optional_string(&mut value, "title", &resource.title);
-    optional_string(&mut value, "description", &resource.description);
-    optional_string(&mut value, "mimeType", &resource.mime_type);
+    optional_string(&mut value, "title", resource.title.as_ref());
+    optional_string(&mut value, "description", resource.description.as_ref());
+    optional_string(&mut value, "mimeType", resource.mime_type.as_ref());
     if !resource.icons.is_empty() {
         value["icons"] = icons_to_value(&resource.icons);
     }
     if let Some(size) = resource.size {
         value["size"] = json!(size);
     }
-    optional_value(&mut value, "annotations", &resource.annotations);
-    optional_value(&mut value, "_meta", &resource.meta);
+    optional_value(&mut value, "annotations", resource.annotations.as_ref());
+    optional_value(&mut value, "_meta", resource.meta.as_ref());
     value
 }
 
@@ -529,24 +549,32 @@ fn resource_template_to_value(resource_template: &McpResourceTemplateDefinition)
         "uriTemplate": resource_template.uri_template,
         "name": resource_template.name,
     });
-    optional_string(&mut value, "title", &resource_template.title);
-    optional_string(&mut value, "description", &resource_template.description);
-    optional_string(&mut value, "mimeType", &resource_template.mime_type);
+    optional_string(&mut value, "title", resource_template.title.as_ref());
+    optional_string(
+        &mut value,
+        "description",
+        resource_template.description.as_ref(),
+    );
+    optional_string(&mut value, "mimeType", resource_template.mime_type.as_ref());
     if !resource_template.icons.is_empty() {
         value["icons"] = icons_to_value(&resource_template.icons);
     }
-    optional_value(&mut value, "annotations", &resource_template.annotations);
-    optional_value(&mut value, "_meta", &resource_template.meta);
+    optional_value(
+        &mut value,
+        "annotations",
+        resource_template.annotations.as_ref(),
+    );
+    optional_value(&mut value, "_meta", resource_template.meta.as_ref());
     value
 }
 
-fn optional_string(value: &mut Value, key: &str, item: &Option<String>) {
+fn optional_string(value: &mut Value, key: &str, item: Option<&String>) {
     if let Some(item) = item {
         value[key] = json!(item);
     }
 }
 
-fn optional_value(value: &mut Value, key: &str, item: &Option<Value>) {
+fn optional_value(value: &mut Value, key: &str, item: Option<&Value>) {
     if let Some(item) = item {
         value[key] = item.clone();
     }
