@@ -3075,6 +3075,7 @@ dependencies = [
  "tonic",
  "tonic-web-wasm-client",
  "ts-rs",
+ "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]

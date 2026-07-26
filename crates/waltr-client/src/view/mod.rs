@@ -37,10 +37,10 @@ mod tests {
         CatalogModelSearchSnapshot, CatalogModelSummaryView, CatalogSnapshot, ClientAuthTarget,
         ClientCommand, ClientOperationView, ClientSessionTemplateKind,
         ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection, ConfigSnapshot,
-        Configuration, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits, ModelOptions,
-        ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType,
-        RollbackTargetView, SessionSnapshot, SessionTemplateOptionView,
-        SessionTemplateSearchSnapshot, StatusSnapshot,
+        Configuration, McpAuthorizationRequirementSnapshot, Model, ModelCapabilities,
+        ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
+        OperationSnapshot, Provider, ProviderType, RollbackTargetView, SessionSnapshot,
+        SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -199,6 +199,7 @@ mod tests {
             AccessSnapshot::decl(),
             ClientAuthTarget::decl(),
             AuthAttemptSnapshot::decl(),
+            McpAuthorizationRequirementSnapshot::decl(),
             AuthRequirementSnapshot::decl(),
             AuthSnapshot::decl(),
             ClientOperationView::decl(),
@@ -216,6 +217,7 @@ mod tests {
         .join("\n\n")
         .lines()
         .map(|line| {
+            let line = line.trim_end();
             line.strip_prefix("type ").map_or_else(
                 || line.to_owned(),
                 |declaration| format!("export type {declaration}"),

@@ -658,6 +658,7 @@ fn explicit_logout_clears_mcp_defaults_auth_and_notices() {
         },
         message: "authorization required".to_owned(),
         source_session_id: None,
+        mcp_authorization: None,
     });
     protected.auth.active_attempt = Some(waltr_client::AuthAttemptSnapshot {
         target: waltr_client::ClientAuthTarget {
@@ -671,6 +672,10 @@ fn explicit_logout_clears_mcp_defaults_auth_and_notices() {
         expires_at_ms: 0,
         poll_interval_seconds: 0,
         messages: Vec::new(),
+        completion_mode: "manual".to_owned(),
+        registration_method: "unknown".to_owned(),
+        lifecycle: "pending".to_owned(),
+        failure_reason: String::new(),
     });
     let mut auth_app = App::new();
     drop(auth_app.handle_event(&AppEvent::Client(Box::new(protected)), now));
@@ -743,6 +748,7 @@ fn provider_oauth_modal_remains_separate_from_waltr_access() {
         },
         message: "provider credentials required".to_owned(),
         source_session_id: None,
+        mcp_authorization: None,
     });
     let mut app = App::new();
     drop(app.handle_event(

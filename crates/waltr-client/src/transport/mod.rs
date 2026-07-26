@@ -114,6 +114,12 @@ pub trait WaltrTransport {
         input: String,
     ) -> impl Future<Output = Result<AuthStatus, ClientError>>;
 
+    /// Read sanitized durable callback completion state.
+    fn get_auth_attempt_status(
+        &self,
+        attempt_id: String,
+    ) -> impl Future<Output = Result<GenericAuthAttemptStatus, ClientError>>;
+
     /// Cancel an auth attempt.
     fn cancel_auth(&self, attempt_id: String) -> impl Future<Output = Result<(), ClientError>>;
 
@@ -355,6 +361,13 @@ where
         input: String,
     ) -> Result<AuthStatus, ClientError> {
         auth::complete_auth(self, attempt_id, input).await
+    }
+
+    async fn get_auth_attempt_status(
+        &self,
+        attempt_id: String,
+    ) -> Result<GenericAuthAttemptStatus, ClientError> {
+        auth::get_auth_attempt_status(self, attempt_id).await
     }
 
     async fn cancel_auth(&self, attempt_id: String) -> Result<(), ClientError> {
@@ -982,15 +995,36 @@ fn status_error(error: &tonic::Status, credentials: &RequestCredentials) -> Clie
         waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::try_from(failure.reason).ok()
     });
 
+    if matches!(
+        domain,
+        Some(
+            waltr::grpc::waltr::auth::v1::AuthenticationDomain::OutboundProvider
+                | waltr::grpc::waltr::auth::v1::AuthenticationDomain::OutboundMcp
+        )
+    ) && matches!(
+        reason,
+        Some(
+            waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRequired
+                | waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRejected
+        )
+    ) && let Some(failure) = failure
+        && let Some(target) = failure.target
+        && auth_target_is_valid(&target)
+    {
+        let message = match reason {
+            Some(waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRejected) => {
+                "Outbound authorization credentials were rejected."
+            }
+            _ => "Outbound authorization is required.",
+        };
+        if let Some(context) = failure.mcp_authorization.map(sanitize_mcp_authorization) {
+            return ClientError::mcp_authorization_required(message, target, context);
+        }
+        return ClientError::authorization_required(message, target);
+    }
+
     if error.code() == Code::Unauthenticated
         && domain == Some(waltr::grpc::waltr::auth::v1::AuthenticationDomain::WaltrAccess)
-        && matches!(
-            reason,
-            Some(
-                waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRequired
-                    | waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRejected
-            )
-        )
     {
         #[cfg(not(target_arch = "wasm32"))]
         if !credentials.provider.clear_bearer_token_if_current(
@@ -1012,21 +1046,38 @@ fn status_error(error: &tonic::Status, credentials: &RequestCredentials) -> Clie
         ));
     }
 
-    if error.code() == Code::Unauthenticated
-        && let Ok(target) = AuthTarget::decode(error.details())
-        && auth_target_is_valid(&target)
-    {
-        return ClientError::authorization_required(
-            format!("{}: {}", status_code_name(error.code()), error.message()),
-            target,
-        );
-    }
-
     ClientError::new(format!(
         "{}: {}",
         status_code_name(error.code()),
         error.message()
     ))
+}
+
+fn sanitize_mcp_authorization(
+    context: waltr::grpc::waltr::auth::v1::McpAuthorizationContext,
+) -> crate::McpAuthorizationRequirement {
+    crate::McpAuthorizationRequirement {
+        endpoint: crate::coordination::state::safe_http_url(&context.endpoint),
+        http_status: context.http_status,
+        resource_metadata_url: context
+            .resource_metadata_url
+            .and_then(|value| crate::coordination::state::safe_http_url(&value)),
+        scope: context
+            .scope
+            .map(|value| crate::coordination::state::safe_text(value, 1_024)),
+        error: context
+            .error
+            .map(|value| crate::coordination::state::safe_text(value, 256)),
+        error_description: context
+            .error_description
+            .map(|value| crate::coordination::state::safe_text(value, 1_024)),
+        error_uri: context
+            .error_uri
+            .and_then(|value| crate::coordination::state::safe_http_url(&value)),
+        realm: context
+            .realm
+            .map(|value| crate::coordination::state::safe_text(value, 256)),
+    }
 }
 
 fn auth_target_is_valid(target: &AuthTarget) -> bool {
@@ -1060,7 +1111,9 @@ const fn status_code_name(code: Code) -> &'static str {
         Code::Unauthenticated => "unauthenticated",
     }
 }
-pub use auth::{AuthAttempt, AuthStatus, GenericAuthAttempt, ProviderAuthStatus};
+pub use auth::{
+    AuthAttempt, AuthStatus, GenericAuthAttempt, GenericAuthAttemptStatus, ProviderAuthStatus,
+};
 pub use waltr::grpc::waltr::auth::v1::AuthTarget;
 use waltr::grpc::waltr::auth::v1::auth_service_client::AuthServiceClient;
 
@@ -1217,10 +1270,18 @@ mod tests {
         let target = AuthTarget {
             target: Some(auth_target::Target::ProviderKey("anthropic".to_owned())),
         };
+        let failure = waltr::grpc::waltr::auth::v1::AuthenticationFailure {
+            version: 1,
+            domain: waltr::grpc::waltr::auth::v1::AuthenticationDomain::OutboundProvider as i32,
+            reason: waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRequired
+                as i32,
+            target: Some(target.clone()),
+            mcp_authorization: None,
+        };
         let status = tonic::Status::with_details(
             Code::Unauthenticated,
             "provider login required",
-            Bytes::from(target.encode_to_vec()),
+            Bytes::from(failure.encode_to_vec()),
         );
 
         let credentials = RequestCredentials::default();
@@ -1236,10 +1297,27 @@ mod tests {
         let target = AuthTarget {
             target: Some(auth_target::Target::McpServerKey("github".to_owned())),
         };
+        let failure = waltr::grpc::waltr::auth::v1::AuthenticationFailure {
+            version: 1,
+            domain: waltr::grpc::waltr::auth::v1::AuthenticationDomain::OutboundMcp as i32,
+            reason: waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRequired
+                as i32,
+            target: Some(target.clone()),
+            mcp_authorization: Some(waltr::grpc::waltr::auth::v1::McpAuthorizationContext {
+                endpoint: "https://mcp.example/rpc".to_owned(),
+                http_status: 401,
+                resource_metadata_url: Some("javascript:alert(1)".to_owned()),
+                scope: Some("repo:read".to_owned()),
+                error: Some("invalid_token".to_owned()),
+                error_description: None,
+                error_uri: None,
+                realm: None,
+            }),
+        };
         let status = tonic::Status::with_details(
             Code::Unauthenticated,
             "MCP login required",
-            Bytes::from(target.encode_to_vec()),
+            Bytes::from(failure.encode_to_vec()),
         );
 
         let credentials = RequestCredentials::default();
@@ -1247,6 +1325,10 @@ mod tests {
 
         assert_eq!(error.kind(), crate::ClientErrorKind::AuthorizationRequired);
         assert_eq!(error.auth_target(), Some(&target));
+        let context = error.mcp_authorization().expect("MCP challenge context");
+        assert_eq!(context.endpoint.as_deref(), Some("https://mcp.example/rpc"));
+        assert_eq!(context.scope.as_deref(), Some("repo:read"));
+        assert!(context.resource_metadata_url.is_none());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -1,8 +1,8 @@
 use waltr::grpc::waltr::auth::v1::{
     AuthMethod, AuthTarget, BeginAuthRequest, BeginProviderAuthRequest, CancelAuthRequest,
     CancelProviderAuthRequest, CompleteAuthRequest, CompleteProviderAuthRequest,
-    ListAuthStatusesRequest, ListProviderAuthStatusesRequest, LogoutProviderRequest, LogoutRequest,
-    ProviderAuthMethod,
+    GetAuthAttemptStatusRequest, ListAuthStatusesRequest, ListProviderAuthStatusesRequest,
+    LogoutProviderRequest, LogoutRequest, ProviderAuthMethod,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
@@ -10,7 +10,7 @@ use crate::{ClientError, transport::RemoteTransport};
 
 pub use waltr::grpc::waltr::auth::v1::{
     AuthStatus, BeginAuthResponse as GenericAuthAttempt, BeginProviderAuthResponse as AuthAttempt,
-    ProviderAuthStatus,
+    GetAuthAttemptStatusResponse as GenericAuthAttemptStatus, ProviderAuthStatus,
 };
 
 #[allow(
@@ -34,6 +34,32 @@ where
         .await
         .map_err(|error| super::status_error(&error, &credentials))?;
     Ok(response.into_inner().statuses)
+}
+
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
+pub(super) async fn get_auth_attempt_status<T>(
+    transport: &T,
+    attempt_id: String,
+) -> Result<GenericAuthAttemptStatus, ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    let credentials = transport.request_credentials();
+    let mut client = transport.auth_client(&credentials).await?;
+    client
+        .get_auth_attempt_status(GetAuthAttemptStatusRequest { attempt_id })
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|error| super::status_error(&error, &credentials))
 }
 
 #[allow(

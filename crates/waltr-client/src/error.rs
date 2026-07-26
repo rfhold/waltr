@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::AuthTarget;
+use crate::{AuthTarget, McpAuthorizationRequirement};
 
 /// Machine-readable category for a client error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +20,7 @@ pub enum ClientErrorKind {
 pub struct ClientError {
     message: String,
     auth_target: Option<AuthTarget>,
+    mcp_authorization: Option<McpAuthorizationRequirement>,
     kind: ClientErrorKind,
 }
 
@@ -30,6 +31,7 @@ impl ClientError {
         Self {
             message: message.into(),
             auth_target: None,
+            mcp_authorization: None,
             kind: ClientErrorKind::Other,
         }
     }
@@ -40,6 +42,22 @@ impl ClientError {
         Self {
             message: message.into(),
             auth_target: Some(target),
+            mcp_authorization: None,
+            kind: ClientErrorKind::AuthorizationRequired,
+        }
+    }
+
+    /// Create an authorization-required error with sanitized MCP challenge context.
+    #[must_use]
+    pub fn mcp_authorization_required(
+        message: impl Into<String>,
+        target: AuthTarget,
+        authorization: McpAuthorizationRequirement,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            auth_target: Some(target),
+            mcp_authorization: Some(authorization),
             kind: ClientErrorKind::AuthorizationRequired,
         }
     }
@@ -50,6 +68,7 @@ impl ClientError {
         Self {
             message: message.into(),
             auth_target: None,
+            mcp_authorization: None,
             kind: ClientErrorKind::WaltrLoginRequired,
         }
     }
@@ -64,6 +83,12 @@ impl ClientError {
     #[must_use]
     pub const fn auth_target(&self) -> Option<&AuthTarget> {
         self.auth_target.as_ref()
+    }
+
+    /// Return sanitized MCP authorization context, when supplied.
+    #[must_use]
+    pub const fn mcp_authorization(&self) -> Option<&McpAuthorizationRequirement> {
+        self.mcp_authorization.as_ref()
     }
 
     /// Return the machine-readable error category.

@@ -22,8 +22,8 @@ use crate::{
     AccessAttemptId, AccessStatus, AuthAttemptState, AuthRequirement, AuthTarget, CatalogEffect,
     CatalogMatchView, CatalogModelSummaryView, Client, ClientEffect, ClientError, ClientEvent,
     ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
-    McpServerView, OperationKey, OperationStatus, ProviderView, RollbackTarget,
-    RuntimeDefaultsView, SessionEffect, SessionEvent, SessionRuntimeConfigRequest,
+    McpAuthorizationRequirement, McpServerView, OperationKey, OperationStatus, ProviderView,
+    RollbackTarget, RuntimeDefaultsView, SessionEffect, SessionEvent, SessionRuntimeConfigRequest,
     SessionTemplateKind, SessionTemplateOption, SessionTimelineView, SessionView,
     StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
     TimelineWatchKey, rollback_target,
@@ -87,6 +87,12 @@ pub enum ClientCommand {
         attempt_id: String,
         /// Pasted redirect URL or code.
         input: String,
+    },
+    /// Start or restart polling for a server-owned OAuth callback attempt.
+    PollAuthAttempt {
+        /// Attempt id returned by begin.
+        #[serde(rename = "attemptId")]
+        attempt_id: String,
     },
     /// Cancel a manual OAuth attempt.
     CancelAuth {
@@ -484,6 +490,31 @@ pub struct AuthRequirementSnapshot {
     /// Session whose work reported the requirement.
     #[serde(rename = "sourceSessionId")]
     pub source_session_id: Option<String>,
+    /// Sanitized upstream MCP bearer challenge context.
+    #[serde(rename = "mcpAuthorization")]
+    pub mcp_authorization: Option<McpAuthorizationRequirementSnapshot>,
+}
+
+/// Sanitized upstream MCP bearer challenge context.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAuthorizationRequirementSnapshot {
+    /// Protected MCP endpoint, when safe.
+    pub endpoint: Option<String>,
+    /// HTTP status associated with the challenge.
+    pub http_status: u32,
+    /// Protected-resource metadata URL, when safe.
+    pub resource_metadata_url: Option<String>,
+    /// Requested OAuth scope.
+    pub scope: Option<String>,
+    /// OAuth bearer error code.
+    pub error: Option<String>,
+    /// OAuth bearer error description.
+    pub error_description: Option<String>,
+    /// OAuth bearer error documentation URL, when safe.
+    pub error_uri: Option<String>,
+    /// Bearer challenge realm.
+    pub realm: Option<String>,
 }
 
 /// Active manual auth attempt details.
@@ -512,6 +543,17 @@ pub struct AuthAttemptSnapshot {
     pub poll_interval_seconds: i32,
     /// User-facing instructions returned by the server.
     pub messages: Vec<String>,
+    /// Server-selected completion mode.
+    #[serde(rename = "completionMode")]
+    pub completion_mode: String,
+    /// Non-secret registration selection.
+    #[serde(rename = "registrationMethod")]
+    pub registration_method: String,
+    /// Durable callback lifecycle.
+    pub lifecycle: String,
+    /// Sanitized callback failure reason.
+    #[serde(rename = "failureReason")]
+    pub failure_reason: String,
 }
 
 /// Stable snapshot of command operation results.
@@ -1337,6 +1379,7 @@ impl ClientStateStream {
             | ClientCommand::DismissAuthRequirement { .. }
             | ClientCommand::BeginAuth { .. }
             | ClientCommand::CompleteAuth { .. }
+            | ClientCommand::PollAuthAttempt { .. }
             | ClientCommand::CancelAuth { .. }
             | ClientCommand::LogoutAuth { .. } => self.begin_auth_command(command),
             ClientCommand::RequestConfig
@@ -1392,21 +1435,51 @@ impl ClientStateStream {
     fn begin_auth_command(&mut self, command: ClientCommand) -> ClientUpdate {
         match command {
             ClientCommand::RequestAuthStatuses => self.runtime.reducer.request_auth_statuses(),
-            ClientCommand::DismissAuthRequirement { target } => self
-                .runtime
-                .reducer
-                .dismiss_auth_requirement(target.into_auth_target()),
+            ClientCommand::DismissAuthRequirement { target } => {
+                let target = target.into_auth_target();
+                if self
+                    .runtime
+                    .reducer
+                    .state()
+                    .auth
+                    .active_attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.target == target)
+                {
+                    self.cancel_auth_poll_effects(None);
+                }
+                self.runtime.reducer.dismiss_auth_requirement(target)
+            }
             ClientCommand::BeginAuth { target } => {
+                self.cancel_auth_poll_effects(None);
                 self.runtime.reducer.begin_auth(target.into_auth_target())
             }
             ClientCommand::CompleteAuth { attempt_id, input } => {
+                self.cancel_auth_poll_effects(Some(&attempt_id));
                 self.runtime.reducer.complete_auth(attempt_id, input)
             }
+            ClientCommand::PollAuthAttempt { attempt_id } => {
+                self.cancel_auth_poll_effects(Some(&attempt_id));
+                self.runtime.reducer.poll_auth_attempt(attempt_id)
+            }
             ClientCommand::CancelAuth { attempt_id } => {
+                self.cancel_auth_poll_effects(Some(&attempt_id));
                 self.runtime.reducer.cancel_auth(attempt_id)
             }
             ClientCommand::LogoutAuth { target } => {
-                self.runtime.reducer.logout_auth(target.into_auth_target())
+                let target = target.into_auth_target();
+                if self
+                    .runtime
+                    .reducer
+                    .state()
+                    .auth
+                    .active_attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.target == target)
+                {
+                    self.cancel_auth_poll_effects(None);
+                }
+                self.runtime.reducer.logout_auth(target)
             }
             _ => unreachable!("non-auth command routed to auth handler"),
         }
@@ -1850,6 +1923,16 @@ impl ClientStateStream {
         }
     }
 
+    fn cancel_auth_poll_effects(&mut self, attempt_id: Option<&str>) {
+        self.cancel_effects(|effect| {
+            matches!(
+                effect,
+                ClientEffect::Auth(crate::AuthEffect::Poll { attempt_id: pending, .. })
+                    if attempt_id.is_none_or(|attempt_id| pending == attempt_id)
+            )
+        });
+    }
+
     fn effect_completion_is_current(
         &self,
         effect: &ClientEffect,
@@ -1923,6 +2006,18 @@ impl ClientStateStream {
                     && self.runtime.reducer.state().status.watch_epoch == *effect_epoch
                     && self.runtime.reducer.state().status.watch.status == OperationStatus::Loading
             }
+            (
+                ClientEffect::Auth(crate::AuthEffect::Poll {
+                    attempt_id,
+                    poll_generation,
+                    ..
+                }),
+                ExecutedEffect::Events(_),
+            ) => self
+                .runtime
+                .reducer
+                .state()
+                .auth_poll_is_current(attempt_id, *poll_generation),
             (_, ExecutedEffect::Events(_)) => true,
             _ => false,
         }
@@ -2184,6 +2279,24 @@ impl From<AuthRequirement> for AuthRequirementSnapshot {
             target: ClientAuthTarget::from(requirement.target),
             message: requirement.message,
             source_session_id: requirement.source_session_id,
+            mcp_authorization: requirement
+                .mcp_authorization
+                .map(McpAuthorizationRequirementSnapshot::from),
+        }
+    }
+}
+
+impl From<McpAuthorizationRequirement> for McpAuthorizationRequirementSnapshot {
+    fn from(requirement: McpAuthorizationRequirement) -> Self {
+        Self {
+            endpoint: requirement.endpoint,
+            http_status: requirement.http_status,
+            resource_metadata_url: requirement.resource_metadata_url,
+            scope: requirement.scope,
+            error: requirement.error,
+            error_description: requirement.error_description,
+            error_uri: requirement.error_uri,
+            realm: requirement.realm,
         }
     }
 }
@@ -2199,6 +2312,45 @@ impl From<AuthAttemptState> for AuthAttemptSnapshot {
             expires_at_ms: attempt.expires_at_ms,
             poll_interval_seconds: attempt.poll_interval_seconds,
             messages: attempt.messages,
+            completion_mode: match waltr::grpc::waltr::auth::v1::AuthCompletionMode::try_from(
+                attempt.completion_mode,
+            ) {
+                Ok(waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback) => {
+                    "serverCallback"
+                }
+                Ok(waltr::grpc::waltr::auth::v1::AuthCompletionMode::Manual) => "manual",
+                _ => "unknown",
+            }
+            .to_owned(),
+            registration_method:
+                match waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::try_from(
+                    attempt.registration_method,
+                ) {
+                    Ok(waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::Preregistered) => {
+                        "preregistered"
+                    }
+                    Ok(waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::ClientMetadata) => {
+                        "clientMetadata"
+                    }
+                    Ok(waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::Dynamic) => {
+                        "dynamic"
+                    }
+                    _ => "unknown",
+                }
+                .to_owned(),
+            lifecycle: match waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::try_from(
+                attempt.lifecycle,
+            ) {
+                Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending) => "pending",
+                Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Completing) => "completing",
+                Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Succeeded) => "succeeded",
+                Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed) => "failed",
+                Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Canceled) => "canceled",
+                Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Expired) => "expired",
+                _ => "unknown",
+            }
+            .to_owned(),
+            failure_reason: attempt.failure_reason,
         }
     }
 }
@@ -2396,6 +2548,58 @@ mod tests {
         );
         assert_eq!(snapshot.catalog.suggestions.request_id, "suggest-1");
         assert_eq!(snapshot.catalog.suggestions.status, "loading");
+    }
+
+    #[test]
+    fn replacing_callback_attempt_cancels_queued_poll_timer() {
+        let mut stream = ready_state_stream();
+        let target = ClientAuthTarget {
+            kind: "mcpServer".to_owned(),
+            key: "github".to_owned(),
+        };
+        stream
+            .begin_command(ClientCommand::BeginAuth {
+                target: target.clone(),
+            })
+            .expect("begin should queue");
+        let queued = stream.effects.pop().expect("begin effect");
+        let ClientEffect::Auth(crate::AuthEffect::Begin {
+            operation_key,
+            target: auth_target,
+        }) = queued.effect.clone()
+        else {
+            panic!("begin effect");
+        };
+        stream.complete_effect(
+            queued.access_generation,
+            &queued.effect,
+            ExecutedEffect::Events(vec![ClientEvent::Auth(crate::AuthEvent::Begun {
+                operation_key,
+                target: auth_target,
+                attempt: crate::GenericAuthAttempt {
+                    attempt_id: "attempt-1".to_owned(),
+                    completion_mode: waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback
+                        as i32,
+                    poll_interval_seconds: 1,
+                    ..crate::GenericAuthAttempt::default()
+                },
+            })]),
+        );
+        assert!(matches!(
+            stream.effects.as_slice(),
+            [QueuedEffect {
+                effect: ClientEffect::Auth(crate::AuthEffect::Poll { .. }),
+                ..
+            }]
+        ));
+
+        stream
+            .begin_command(ClientCommand::BeginAuth { target })
+            .expect("replacement begin should queue");
+        assert!(stream.effects.iter().all(|queued| !matches!(
+            queued.effect,
+            ClientEffect::Auth(crate::AuthEffect::Poll { .. })
+        )));
     }
 
     #[tokio::test]

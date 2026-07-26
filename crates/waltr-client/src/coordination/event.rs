@@ -3,9 +3,10 @@
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
     AccessAttemptId, AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientError,
-    Configuration, GenericAuthAttempt, OperationKey, Provider, RollbackTarget, RuntimeDefaults,
-    SessionRuntimeConfigRequest, SessionSummary, SessionTemplateKind, SessionTemplateOption,
-    SessionTemplateSearchTarget, SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
+    Configuration, GenericAuthAttempt, GenericAuthAttemptStatus, McpAuthorizationRequirement,
+    OperationKey, Provider, RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest,
+    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
+    SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -140,6 +141,8 @@ pub enum AuthEvent {
         message: String,
         /// Session whose work reported the requirement.
         source_session_id: Option<String>,
+        /// Sanitized upstream MCP bearer challenge context.
+        mcp_authorization: Option<McpAuthorizationRequirement>,
     },
     /// A caller dismissed one queued auth requirement.
     Dismissed {
@@ -161,6 +164,29 @@ pub enum AuthEvent {
         target: AuthTarget,
         /// Attempt details returned by the server.
         attempt: GenericAuthAttempt,
+    },
+    /// A caller requested polling of the active server-callback attempt.
+    PollRequested {
+        /// Durable attempt identifier.
+        attempt_id: String,
+    },
+    /// Durable callback completion state was loaded.
+    Polled {
+        /// Durable attempt identifier requested by the client.
+        attempt_id: String,
+        /// Runtime-local polling generation.
+        poll_generation: u64,
+        /// Secret-safe server response.
+        response: GenericAuthAttemptStatus,
+    },
+    /// Durable callback completion state could not be loaded.
+    PollFailed {
+        /// Durable attempt identifier requested by the client.
+        attempt_id: String,
+        /// Runtime-local polling generation.
+        poll_generation: u64,
+        /// Transport failure.
+        error: ClientError,
     },
     /// A manual OAuth attempt failed to start.
     BeginFailed {
@@ -730,6 +756,15 @@ pub enum AuthEffect {
         attempt_id: String,
         /// Pasted code or final redirect URL.
         input: String,
+    },
+    /// Poll sanitized durable callback state after a delay.
+    Poll {
+        /// Durable attempt identifier.
+        attempt_id: String,
+        /// Runtime-local polling generation.
+        poll_generation: u64,
+        /// Delay before issuing this status request.
+        delay_ms: u64,
     },
     /// Cancel a manual OAuth attempt.
     Cancel {

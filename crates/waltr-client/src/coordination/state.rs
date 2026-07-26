@@ -65,6 +65,9 @@ pub fn watch_reconnect_delay_ms(attempt: usize) -> u64 {
     RETRY_DELAYS_MS.get(attempt).copied().unwrap_or(5_000)
 }
 
+const MAX_AUTH_POLLS: u16 = 300;
+const MAX_AUTH_POLL_FAILURES: u8 = 5;
+
 /// Full headless state for Waltr shells.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClientState {
@@ -90,6 +93,7 @@ pub struct ClientState {
     next_status_watch_epoch: u64,
     next_watch_open_id: u64,
     next_operation_id: u64,
+    next_auth_poll_generation: u64,
 }
 
 /// Model catalog coordination state.
@@ -193,6 +197,29 @@ pub struct AuthRequirement {
     pub message: String,
     /// Session whose work reported the requirement.
     pub source_session_id: Option<String>,
+    /// Sanitized upstream MCP bearer challenge context.
+    pub mcp_authorization: Option<McpAuthorizationRequirement>,
+}
+
+/// Sanitized upstream MCP authorization requirement safe for shell presentation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpAuthorizationRequirement {
+    /// Protected MCP endpoint, when it is a safe HTTP(S) URL.
+    pub endpoint: Option<String>,
+    /// HTTP response status associated with the challenge.
+    pub http_status: u32,
+    /// Protected-resource metadata URL, when safe.
+    pub resource_metadata_url: Option<String>,
+    /// Requested OAuth scope.
+    pub scope: Option<String>,
+    /// OAuth bearer error code.
+    pub error: Option<String>,
+    /// OAuth bearer error description.
+    pub error_description: Option<String>,
+    /// OAuth bearer error documentation URL, when safe.
+    pub error_uri: Option<String>,
+    /// Bearer challenge realm.
+    pub realm: Option<String>,
 }
 
 /// Active OAuth attempt details safe to show in clients.
@@ -214,6 +241,17 @@ pub struct AuthAttemptState {
     pub poll_interval_seconds: i32,
     /// User-facing instructions returned by the server.
     pub messages: Vec<String>,
+    /// Server-selected completion mode.
+    pub completion_mode: i32,
+    /// Non-secret MCP registration method.
+    pub registration_method: i32,
+    /// Durable attempt lifecycle.
+    pub lifecycle: i32,
+    /// Sanitized callback failure reason.
+    pub failure_reason: String,
+    pub(crate) poll_generation: u64,
+    pub(crate) poll_count: u16,
+    pub(crate) poll_failures: u8,
 }
 
 /// Configuration coordination state.
@@ -881,20 +919,25 @@ impl ClientState {
         target: AuthTarget,
         message: String,
         source_session_id: Option<String>,
+        mcp_authorization: Option<McpAuthorizationRequirement>,
     ) {
-        if self
+        if let Some(requirement) = self
             .auth
             .pending
-            .iter()
-            .any(|requirement| requirement.target == target)
+            .iter_mut()
+            .find(|requirement| requirement.target == target)
         {
+            requirement.message = safe_text(message, 1_024);
+            requirement.source_session_id = source_session_id;
+            requirement.mcp_authorization = mcp_authorization;
             return;
         }
 
         self.auth.pending.push(AuthRequirement {
             target,
-            message,
+            message: safe_text(message, 1_024),
             source_session_id,
+            mcp_authorization,
         });
     }
 
@@ -914,6 +957,7 @@ impl ClientState {
     }
 
     pub(crate) fn set_auth_begin_loading(&mut self, key: OperationKey, target: AuthTarget) {
+        self.auth.active_attempt = None;
         self.auth.begin.status = OperationStatus::Loading;
         self.auth.begin.error = None;
         self.auth.begin.key = Some(key.clone());
@@ -933,16 +977,31 @@ impl ClientState {
         key: OperationKey,
         target: AuthTarget,
         attempt: GenericAuthAttempt,
-    ) {
+    ) -> Option<(String, u64, u64)> {
+        self.next_auth_poll_generation = self.next_auth_poll_generation.saturating_add(1);
+        let poll_generation = self.next_auth_poll_generation;
+        let completion_mode = attempt.completion_mode;
+        let delay_ms = auth_poll_delay_ms(attempt.poll_interval_seconds);
         let attempt = AuthAttemptState {
             target: target.clone(),
             attempt_id: attempt.attempt_id,
-            auth_url: attempt.auth_url,
-            verification_url: attempt.verification_url,
-            user_code: attempt.user_code,
+            auth_url: safe_http_url(&attempt.auth_url).unwrap_or_default(),
+            verification_url: safe_http_url(&attempt.verification_url).unwrap_or_default(),
+            user_code: safe_text(attempt.user_code, 256),
             expires_at_ms: attempt.expires_at_ms,
             poll_interval_seconds: attempt.poll_interval_seconds,
-            messages: attempt.messages,
+            messages: attempt
+                .messages
+                .into_iter()
+                .map(|message| safe_text(message, 1_024))
+                .collect(),
+            completion_mode,
+            registration_method: attempt.registration_method,
+            lifecycle: waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending as i32,
+            failure_reason: String::new(),
+            poll_generation,
+            poll_count: 0,
+            poll_failures: 0,
         };
 
         self.auth.begin.status = OperationStatus::Ready;
@@ -958,6 +1017,138 @@ impl ClientState {
                 attempt: Some(attempt),
             },
         );
+        (completion_mode == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32)
+            .then(|| {
+                (
+                    self.auth
+                        .active_attempt
+                        .as_ref()
+                        .expect("attempt was installed")
+                        .attempt_id
+                        .clone(),
+                    poll_generation,
+                    delay_ms,
+                )
+            })
+    }
+
+    pub(crate) fn request_auth_poll(&mut self, attempt_id: &str) -> Option<(u64, u64)> {
+        let attempt = self.auth.active_attempt.as_mut()?;
+        if attempt.attempt_id != attempt_id || !auth_attempt_is_pollable(attempt) {
+            return None;
+        }
+        attempt.poll_generation = attempt.poll_generation.saturating_add(1);
+        attempt.poll_failures = 0;
+        Some((
+            attempt.poll_generation,
+            auth_poll_delay_ms(attempt.poll_interval_seconds),
+        ))
+    }
+
+    pub(crate) fn auth_poll_is_current(&self, attempt_id: &str, poll_generation: u64) -> bool {
+        self.auth.active_attempt.as_ref().is_some_and(|attempt| {
+            attempt.attempt_id == attempt_id
+                && attempt.poll_generation == poll_generation
+                && auth_attempt_is_pollable(attempt)
+        })
+    }
+
+    pub(crate) fn set_auth_attempt_polled(
+        &mut self,
+        attempt_id: &str,
+        poll_generation: u64,
+        response: crate::GenericAuthAttemptStatus,
+    ) -> Option<u64> {
+        if !self.auth_poll_is_current(attempt_id, poll_generation) {
+            return None;
+        }
+        let Some(status) = response.attempt else {
+            return self.set_auth_poll_failed(attempt_id, poll_generation);
+        };
+        if status.attempt_id != attempt_id
+            || !self
+                .auth
+                .active_attempt
+                .as_ref()
+                .is_some_and(|attempt| status.target.as_ref() == Some(&attempt.target))
+        {
+            return self.set_auth_poll_failed(attempt_id, poll_generation);
+        }
+
+        let lifecycle =
+            waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::try_from(status.lifecycle)
+                .unwrap_or(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Unspecified);
+        let attempt = self.auth.active_attempt.as_mut().expect("poll was current");
+        if status.completion_mode
+            != waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
+        {
+            attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
+            attempt.failure_reason = "Authorization callback status was invalid.".to_owned();
+            return None;
+        }
+        attempt.lifecycle = status.lifecycle;
+        attempt.completion_mode = status.completion_mode;
+        attempt.registration_method = status.registration_method;
+        attempt.expires_at_ms = status.expires_at_ms;
+        attempt.failure_reason = auth_lifecycle_failure(lifecycle).to_owned();
+        attempt.poll_count = attempt.poll_count.saturating_add(1);
+        attempt.poll_failures = 0;
+
+        if lifecycle == waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Succeeded {
+            if let Some(auth_status) = response.status
+                && auth_status.target.as_ref() == Some(&attempt.target)
+            {
+                let target = attempt.target.clone();
+                self.auth
+                    .pending
+                    .retain(|requirement| requirement.target != target);
+                self.auth
+                    .statuses
+                    .insert(auth_target_key(&target), auth_status);
+            } else {
+                attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
+                attempt.failure_reason =
+                    "Authorization completion status was unavailable.".to_owned();
+            }
+            return None;
+        }
+        if !matches!(
+            lifecycle,
+            waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending
+                | waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Completing
+        ) {
+            return None;
+        }
+        if attempt.poll_count >= MAX_AUTH_POLLS {
+            attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
+            attempt.failure_reason = "Authorization status polling limit reached.".to_owned();
+            return None;
+        }
+        Some(auth_poll_delay_ms(attempt.poll_interval_seconds))
+    }
+
+    pub(crate) fn set_auth_poll_failed(
+        &mut self,
+        attempt_id: &str,
+        poll_generation: u64,
+    ) -> Option<u64> {
+        if !self.auth_poll_is_current(attempt_id, poll_generation) {
+            return None;
+        }
+        let attempt = self.auth.active_attempt.as_mut().expect("poll was current");
+        attempt.poll_count = attempt.poll_count.saturating_add(1);
+        attempt.poll_failures = attempt.poll_failures.saturating_add(1);
+        attempt.failure_reason = "Unable to check authorization status; retrying.".to_owned();
+        if attempt.poll_count >= MAX_AUTH_POLLS || attempt.poll_failures >= MAX_AUTH_POLL_FAILURES {
+            attempt.lifecycle = waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed as i32;
+            attempt.failure_reason = "Authorization status could not be confirmed.".to_owned();
+            return None;
+        }
+        Some(
+            auth_poll_delay_ms(attempt.poll_interval_seconds)
+                .saturating_mul(1_u64 << attempt.poll_failures.min(3))
+                .min(10_000),
+        )
     }
 
     pub(crate) fn set_auth_begin_failed(
@@ -2046,6 +2237,26 @@ impl ClientState {
     fn remove_session(&mut self, id: &str) {
         self.sessions.current.remove(id);
         self.sessions.timelines.remove(id);
+        let removed_targets = self
+            .auth
+            .pending
+            .iter()
+            .filter(|requirement| requirement.source_session_id.as_deref() == Some(id))
+            .map(|requirement| requirement.target.clone())
+            .collect::<Vec<_>>();
+        self.auth
+            .pending
+            .retain(|requirement| requirement.source_session_id.as_deref() != Some(id));
+        if self.auth.active_attempt.as_ref().is_some_and(|attempt| {
+            removed_targets.contains(&attempt.target)
+                && !self
+                    .auth
+                    .pending
+                    .iter()
+                    .any(|requirement| requirement.target == attempt.target)
+        }) {
+            self.auth.active_attempt = None;
+        }
     }
 
     fn session_timeline_mut(&mut self, session_id: &str) -> &mut SessionTimelineState {
@@ -2139,6 +2350,50 @@ pub fn auth_target_key(target: &AuthTarget) -> String {
         }
         None => "unknown:".to_owned(),
     }
+}
+
+fn auth_attempt_is_pollable(attempt: &AuthAttemptState) -> bool {
+    attempt.completion_mode == waltr::grpc::waltr::auth::v1::AuthCompletionMode::ServerCallback as i32
+        && matches!(
+            waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::try_from(attempt.lifecycle),
+            Ok(waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Pending
+                | waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Completing)
+        )
+}
+
+fn auth_poll_delay_ms(seconds: i32) -> u64 {
+    u64::try_from(seconds).unwrap_or(1).clamp(1, 10) * 1_000
+}
+
+const fn auth_lifecycle_failure(
+    lifecycle: waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle,
+) -> &'static str {
+    match lifecycle {
+        waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Failed => "Authorization failed.",
+        waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Canceled => "Authorization was canceled.",
+        waltr::grpc::waltr::auth::v1::AuthAttemptLifecycle::Expired => "Authorization expired.",
+        _ => "",
+    }
+}
+
+pub(crate) fn safe_http_url(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.has_host()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    parsed.set_fragment(None);
+    Some(parsed.into())
+}
+
+pub(crate) fn safe_text(value: String, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 /// Status for a tracked stream.

@@ -6,133 +6,133 @@ export type ModelTypeView = "unspecified" | "llm" | "embedding" | "stt" | "tts" 
 
 export type CatalogMatchSourceView = "unspecified" | "auto" | "manual" | "applied" | "unknown";
 
-export type ModelOptionsView = { 
+export type ModelOptionsView = {
 /**
  * Sampling temperature, when set.
  */
-temperature: number | null, 
+temperature: number | null,
 /**
  * Nucleus sampling probability, when set.
  */
-topP: number | null, 
+topP: number | null,
 /**
  * Top-k sampling cutoff, when set.
  */
-topK: number | null, 
+topK: number | null,
 /**
  * Minimum probability cutoff, when set.
  */
-minP: number | null, 
+minP: number | null,
 /**
  * Presence penalty, when set.
  */
-presencePenalty: number | null, 
+presencePenalty: number | null,
 /**
  * Repetition penalty, when set.
  */
-repetitionPenalty: number | null, 
+repetitionPenalty: number | null,
 /**
  * Supported reasoning effort levels configured for this model.
  */
 reasoningEfforts: Array<string>, };
 
-export type ModelLimitsView = { 
+export type ModelLimitsView = {
 /**
  * Maximum context window size, when set.
  */
-context: number | null, 
+context: number | null,
 /**
  * Maximum output token count, when set.
  */
 output: number | null, };
 
-export type ModelCapabilitiesView = { 
+export type ModelCapabilitiesView = {
 /**
  * Whether the model supports tool calling.
  */
-tools: boolean, 
+tools: boolean,
 /**
  * Whether the model supports image input.
  */
 image: boolean, };
 
-export type ModelCostView = { 
+export type ModelCostView = {
 /**
  * Input token price per million tokens.
  */
-inputPerMillionTokens: number | null, 
+inputPerMillionTokens: number | null,
 /**
  * Output token price per million tokens.
  */
-outputPerMillionTokens: number | null, 
+outputPerMillionTokens: number | null,
 /**
  * Cache-read token price per million tokens.
  */
-cacheReadPerMillionTokens: number | null, 
+cacheReadPerMillionTokens: number | null,
 /**
  * Cache-write token price per million tokens.
  */
-cacheWritePerMillionTokens: number | null, 
+cacheWritePerMillionTokens: number | null,
 /**
  * Image input token price per million tokens.
  */
-imageInputPerMillionTokens: number | null, 
+imageInputPerMillionTokens: number | null,
 /**
  * Image input price per image.
  */
-imageInputPerImage: number | null, 
+imageInputPerImage: number | null,
 /**
  * Currency code for configured rates.
  */
 currency: string, };
 
-export type ModelCatalogMatchView = { 
+export type ModelCatalogMatchView = {
 /**
  * Matched models.dev serving provider id.
  */
-providerId: string, 
+providerId: string,
 /**
  * Matched models.dev serving model id.
  */
-modelId: string, 
+modelId: string,
 /**
  * Optional upstream provider identity for display and drift checks.
  */
-upstreamProviderId: string | null, 
+upstreamProviderId: string | null,
 /**
  * Optional upstream model identity for display and drift checks.
  */
-upstreamModelId: string | null, 
+upstreamModelId: string | null,
 /**
  * How this linkage was selected.
  */
 source: CatalogMatchSourceView, };
 
-export type ModelView = { 
+export type ModelView = {
 /**
  * Model display name.
  */
-name: string, 
+name: string,
 /**
  * Model type as a shell-friendly enum.
  */
-kind: ModelTypeView, 
+kind: ModelTypeView,
 /**
  * Model sampling options.
  */
-options: ModelOptionsView, 
+options: ModelOptionsView,
 /**
  * Model context and output limits.
  */
-limits: ModelLimitsView, 
+limits: ModelLimitsView,
 /**
  * Model capabilities.
  */
-capabilities: ModelCapabilitiesView, 
+capabilities: ModelCapabilitiesView,
 /**
  * Optional models.dev catalog linkage.
  */
-catalogMatch: ModelCatalogMatchView | null, 
+catalogMatch: ModelCatalogMatchView | null,
 /**
  * Optional model pricing used for session cost tracking.
  */
@@ -140,11 +140,11 @@ cost: ModelCostView | null, };
 
 export type OAuthTokenRequestStyleView = "unspecified" | "json" | "formUrlencoded" | "unknown";
 
-export type OAuthUrlParamView = { 
+export type OAuthUrlParamView = {
 /**
  * Query parameter key.
  */
-key: string, 
+key: string,
 /**
  * Query parameter value.
  */
@@ -152,61 +152,61 @@ value: string, };
 
 export type OAuthTokenFieldView = "unspecified" | "access" | "id" | "unknown";
 
-export type OAuthJwtMetadataView = { 
+export type OAuthJwtMetadataView = {
 /**
  * Token to decode.
  */
-token: OAuthTokenFieldView, 
+token: OAuthTokenFieldView,
 /**
  * Metadata key to store.
  */
-metadataKey: string, 
+metadataKey: string,
 /**
  * JWT claim names to try in order.
  */
-claimNames: Array<string>, 
+claimNames: Array<string>,
 /**
  * Whether this metadata is required for login success.
  */
 required: boolean, };
 
-export type OAuthProviderView = { 
+export type OAuthProviderView = {
 /**
  * OAuth provider display name.
  */
-name: string, 
+name: string,
 /**
  * Authorization endpoint URL.
  */
-authorizeUrl: string, 
+authorizeUrl: string,
 /**
  * Token endpoint URL.
  */
-tokenUrl: string, 
+tokenUrl: string,
 /**
  * Public OAuth client id.
  */
-clientId: string, 
+clientId: string,
 /**
  * Redirect URI shown to the provider.
  */
-redirectUri: string, 
+redirectUri: string,
 /**
  * OAuth scopes.
  */
-scopes: Array<string>, 
+scopes: Array<string>,
 /**
  * Token request encoding style.
  */
-tokenRequestStyle: OAuthTokenRequestStyleView, 
+tokenRequestStyle: OAuthTokenRequestStyleView,
 /**
  * Additional authorization URL parameters.
  */
-authUrlParams: Array<OAuthUrlParamView>, 
+authUrlParams: Array<OAuthUrlParamView>,
 /**
  * JWT metadata extraction rules.
  */
-jwtMetadata: Array<OAuthJwtMetadataView>, 
+jwtMetadata: Array<OAuthJwtMetadataView>,
 /**
  * Whether authorization-code exchange sends the state value.
  */
@@ -214,205 +214,205 @@ sendStateInTokenRequest: boolean, };
 
 export type McpServerTypeView = "unspecified" | "stdio" | "sse" | "unknown";
 
-export type McpServerView = { 
+export type McpServerView = {
 /**
  * MCP server display name.
  */
-name: string, 
+name: string,
 /**
  * MCP server type as a shell-friendly enum.
  */
-kind: McpServerTypeView, 
+kind: McpServerTypeView,
 /**
  * Command to launch the server (stdio servers).
  */
-command: string, 
+command: string,
 /**
  * Endpoint URL for the server (SSE servers).
  */
 url: string, };
 
-export type RuntimeDefaultsView = { 
+export type RuntimeDefaultsView = {
 /**
  * Default provider key.
  */
-providerKey: string, 
+providerKey: string,
 /**
  * Default model id within the selected provider.
  */
-modelId: string, 
+modelId: string,
 /**
  * Whether all configured MCP servers are enabled by default.
  */
-mcpDefaultEnabled: boolean, 
+mcpDefaultEnabled: boolean,
 /**
  * Explicit MCP server keys enabled by default.
  */
-enabledMcpServerKeys: Array<string>, 
+enabledMcpServerKeys: Array<string>,
 /**
  * Default reasoning effort for newly created sessions.
  */
 reasoningEffort: string | null, };
 
-export type ProviderView = { 
+export type ProviderView = {
 /**
  * Provider type as a shell-friendly enum.
  */
-kind: ProviderKindView, 
+kind: ProviderKindView,
 /**
  * Provider display/configuration name.
  */
-name: string, 
+name: string,
 /**
  * Provider endpoint URL.
  */
-url: string, 
+url: string,
 /**
  * Provider-specific request headers.
  */
-headers: { [key in string]?: string }, 
+headers: { [key in string]?: string },
 /**
  * Whether this provider can authenticate with OAuth.
  */
-oauthCompatible: boolean, 
+oauthCompatible: boolean,
 /**
  * Inline OAuth settings for custom OAuth-compatible providers.
  */
-oauthSettings: OAuthProviderView | null, 
+oauthSettings: OAuthProviderView | null,
 /**
  * Models offered by this provider, keyed by stable id.
  */
 models: { [key in string]?: ModelView }, };
 
-export type ConfigView = { 
+export type ConfigView = {
 /**
  * Configuration version used for optimistic concurrency.
  */
-etag: string, 
+etag: string,
 /**
  * Configured model providers.
  */
-providers: { [key in string]?: ProviderView }, 
+providers: { [key in string]?: ProviderView },
 /**
  * Configured MCP servers.
  */
-mcpServers: { [key in string]?: McpServerView }, 
+mcpServers: { [key in string]?: McpServerView },
 /**
  * Default runtime selection for newly created sessions.
  */
 runtimeDefaults: RuntimeDefaultsView | null, };
 
-export type CatalogModelRefView = { 
+export type CatalogModelRefView = {
 /**
  * Catalog provider identity.
  */
-providerId: string, 
+providerId: string,
 /**
  * Catalog model identity.
  */
 modelId: string, };
 
-export type CatalogModelLimitsSummaryView = { 
+export type CatalogModelLimitsSummaryView = {
 /**
  * Maximum context tokens.
  */
-context: number | null, 
+context: number | null,
 /**
  * Maximum output tokens.
  */
 output: number | null, };
 
-export type CatalogModelCostSummaryView = { 
+export type CatalogModelCostSummaryView = {
 /**
  * Input cost per million tokens.
  */
-inputPerMillionTokens: number | null, 
+inputPerMillionTokens: number | null,
 /**
  * Output cost per million tokens.
  */
-outputPerMillionTokens: number | null, 
+outputPerMillionTokens: number | null,
 /**
  * Cache-read cost per million tokens.
  */
-cacheReadPerMillionTokens: number | null, 
+cacheReadPerMillionTokens: number | null,
 /**
  * Cache-write cost per million tokens.
  */
-cacheWritePerMillionTokens: number | null, 
+cacheWritePerMillionTokens: number | null,
 /**
  * Image-input cost per million tokens.
  */
-imageInputPerMillionTokens: number | null, 
+imageInputPerMillionTokens: number | null,
 /**
  * Image-input cost per image.
  */
-imageInputPerImage: number | null, 
+imageInputPerImage: number | null,
 /**
  * Cost currency.
  */
 currency: string, };
 
-export type CatalogModelCapabilitySummaryView = { 
+export type CatalogModelCapabilitySummaryView = {
 /**
  * Whether tools are supported.
  */
-tools: boolean, 
+tools: boolean,
 /**
  * Whether image input is supported.
  */
-image: boolean, 
+image: boolean,
 /**
  * Whether audio input is supported.
  */
 audio: boolean, };
 
-export type CatalogModelReasoningSummaryView = { 
+export type CatalogModelReasoningSummaryView = {
 /**
  * Whether reasoning is supported.
  */
-supported: boolean, 
+supported: boolean,
 /**
  * Default reasoning effort.
  */
-effort: string | null, 
+effort: string | null,
 /**
  * Available reasoning efforts.
  */
 efforts: Array<string>, };
 
-export type CatalogModelSummaryView = { 
+export type CatalogModelSummaryView = {
 /**
  * Catalog model identity.
  */
-model: CatalogModelRefView | null, 
+model: CatalogModelRefView | null,
 /**
  * Provider display name.
  */
-providerName: string, 
+providerName: string,
 /**
  * Model display name.
  */
-modelName: string, 
+modelName: string,
 /**
  * Model family.
  */
-family: string | null, 
+family: string | null,
 /**
  * Catalog lifecycle status.
  */
-status: string | null, 
+status: string | null,
 /**
  * Token limits.
  */
-limits: CatalogModelLimitsSummaryView | null, 
+limits: CatalogModelLimitsSummaryView | null,
 /**
  * Token and image costs.
  */
-cost: CatalogModelCostSummaryView | null, 
+cost: CatalogModelCostSummaryView | null,
 /**
  * Input and tool capabilities.
  */
-capabilities: CatalogModelCapabilitySummaryView | null, 
+capabilities: CatalogModelCapabilitySummaryView | null,
 /**
  * Reasoning support.
  */
@@ -420,95 +420,95 @@ reasoning: CatalogModelReasoningSummaryView | null, };
 
 export type CatalogMatchConfidenceView = "unspecified" | "exact" | "high" | "suggested" | "unknown";
 
-export type CatalogMatchView = { 
+export type CatalogMatchView = {
 /**
  * Matched catalog model.
  */
-model: CatalogModelRefView | null, 
+model: CatalogModelRefView | null,
 /**
  * Provider display name.
  */
-providerName: string, 
+providerName: string,
 /**
  * Model display name.
  */
-modelName: string, 
+modelName: string,
 /**
  * Match confidence.
  */
-confidence: CatalogMatchConfidenceView, 
+confidence: CatalogMatchConfidenceView,
 /**
  * Human-readable match reasons.
  */
-reasons: Array<string>, 
+reasons: Array<string>,
 /**
  * Upstream model identity when a gateway model was matched.
  */
 upstreamModel: CatalogModelRefView | null, };
 
-export type CatalogModelSearchSnapshot = { 
+export type CatalogModelSearchSnapshot = {
 /**
  * Runtime-local request identity.
  */
-requestId: string, 
+requestId: string,
 /**
  * Search query.
  */
-query: string, 
+query: string,
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last search error.
  */
-error: string | null, 
+error: string | null,
 /**
  * Whether cached data is stale.
  */
-stale: boolean, 
+stale: boolean,
 /**
  * Matching models.
  */
 models: Array<CatalogModelSummaryView>, };
 
-export type CatalogMatchSuggestionSnapshot = { 
+export type CatalogMatchSuggestionSnapshot = {
 /**
  * Runtime-local request identity.
  */
-requestId: string, 
+requestId: string,
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last suggestion error.
  */
-error: string | null, 
+error: string | null,
 /**
  * Whether cached data is stale.
  */
-stale: boolean, 
+stale: boolean,
 /**
  * Suggested matches.
  */
 matches: Array<CatalogMatchView>, };
 
-export type CatalogSnapshot = { 
+export type CatalogSnapshot = {
 /**
  * Latest model search.
  */
-search: CatalogModelSearchSnapshot, 
+search: CatalogModelSearchSnapshot,
 /**
  * Latest match suggestions.
  */
 suggestions: CatalogMatchSuggestionSnapshot, };
 
-export type TimestampView = { 
+export type TimestampView = {
 /**
  * Seconds since the Unix epoch.
  */
-seconds: bigint, 
+seconds: bigint,
 /**
  * Nanoseconds within the second.
  */
@@ -516,11 +516,11 @@ nanos: number, };
 
 export type SessionPhaseView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool" | "suspended" | "finished" | "failed" | "unknown";
 
-export type SessionStatusView = { 
+export type SessionStatusView = {
 /**
  * Session phase as a shell-friendly enum.
  */
-phase: SessionPhaseView, 
+phase: SessionPhaseView,
 /**
  * Failure message, when phase is failed.
  */
@@ -528,143 +528,143 @@ failedMessage: string, };
 
 export type RuntimeConfigMatchView = "unspecified" | "configured" | "missing" | "changed" | "unknown";
 
-export type SessionProviderRuntimeView = { 
+export type SessionProviderRuntimeView = {
 /**
  * Provider key selected when runtime config was stored.
  */
-key: string, 
+key: string,
 /**
  * Provider type selected when runtime config was stored.
  */
-kind: ProviderKindView, 
+kind: ProviderKindView,
 /**
  * Provider URL selected when runtime config was stored.
  */
-url: string, 
+url: string,
 /**
  * Exact provider model id selected when runtime config was stored.
  */
-modelId: string, 
+modelId: string,
 /**
  * Per-session reasoning effort, when configured.
  */
-reasoningEffort: string | null, 
+reasoningEffort: string | null,
 /**
  * Whether the stored provider/model still matches current config.
  */
 matchStatus: RuntimeConfigMatchView, };
 
-export type SessionMcpServerRuntimeView = { 
+export type SessionMcpServerRuntimeView = {
 /**
  * MCP server key selected when runtime config was stored.
  */
-key: string, 
+key: string,
 /**
  * MCP server type selected when runtime config was stored.
  */
-kind: McpServerTypeView, 
+kind: McpServerTypeView,
 /**
  * MCP command selected when runtime config was stored.
  */
-command: string, 
+command: string,
 /**
  * MCP URL selected when runtime config was stored.
  */
-url: string, 
+url: string,
 /**
  * Whether the stored MCP server still matches current config.
  */
 matchStatus: RuntimeConfigMatchView, };
 
-export type SessionRuntimeConfigView = { 
+export type SessionRuntimeConfigView = {
 /**
  * Stored provider runtime snapshot.
  */
-provider: SessionProviderRuntimeView | null, 
+provider: SessionProviderRuntimeView | null,
 /**
  * Stored MCP server runtime snapshots.
  */
 mcpServers: Array<SessionMcpServerRuntimeView>, };
 
-export type SessionMetricsView = { 
+export type SessionMetricsView = {
 /**
  * Non-cache/base-priced input tokens consumed by provider requests.
  */
-inputTokens: bigint, 
+inputTokens: bigint,
 /**
  * Output/completion tokens produced by provider responses.
  */
-outputTokens: bigint, 
+outputTokens: bigint,
 /**
  * Input tokens served from provider cache.
  */
-cacheReadTokens: bigint, 
+cacheReadTokens: bigint,
 /**
  * Input tokens written to provider cache.
  */
-cacheWriteTokens: bigint, 
+cacheWriteTokens: bigint,
 /**
  * Image input tokens consumed by provider requests.
  */
-imageInputTokens: bigint, 
+imageInputTokens: bigint,
 /**
  * Image count consumed by provider requests.
  */
-imageInputCount: bigint, 
+imageInputCount: bigint,
 /**
  * Total billable/token-counted input and output tokens.
  */
-totalTokens: bigint, 
+totalTokens: bigint,
 /**
  * Full input tokens represented by provider usage reports, including cache reads and writes.
  */
-totalInputTokens: bigint, 
+totalInputTokens: bigint,
 /**
  * Full context tokens represented by provider usage reports, including cache reads, writes, and output.
  */
-contextTokens: bigint, 
+contextTokens: bigint,
 /**
  * Currency for total cost, or `mixed` when journaled turns differ.
  */
-costCurrency: string | null, 
+costCurrency: string | null,
 /**
  * Total cost in currency micro-units.
  */
 totalCostMicros: bigint, };
 
-export type SessionView = { 
+export type SessionView = {
 /**
  * Server-assigned session id.
  */
-id: string, 
+id: string,
 /**
  * Session revision.
  */
-revision: bigint, 
+revision: bigint,
 /**
  * Current session status.
  */
-status: SessionStatusView, 
+status: SessionStatusView,
 /**
  * Current prompt, when the session has one.
  */
-currentPrompt: string | null, 
+currentPrompt: string | null,
 /**
  * Creation timestamp, when supplied by the server.
  */
-createdAt: TimestampView | null, 
+createdAt: TimestampView | null,
 /**
  * Last update timestamp, when supplied by the server.
  */
-updatedAt: TimestampView | null, 
+updatedAt: TimestampView | null,
 /**
  * Last activity timestamp, when supplied by the server.
  */
-lastActivityAt: TimestampView | null, 
+lastActivityAt: TimestampView | null,
 /**
  * Runtime configuration snapshot stored with the session.
  */
-runtimeConfig: SessionRuntimeConfigView | null, 
+runtimeConfig: SessionRuntimeConfigView | null,
 /**
  * Aggregate usage and cost derived from journaled provider turns.
  */
@@ -678,111 +678,111 @@ export type ExternalRequestView = { id: string, kind: number, payloadJson: strin
 
 export type TimelineContentView = { "kind": "empty" } | { "kind": "textDelta", delta: string, } | { "kind": "textSnapshot", text: string, } | { "kind": "toolCall", id: string, name: string, arguments_json: string, } | { "kind": "toolResult", id: string, name: string, content: string, error: boolean, } | { "kind": "externalRequest", request: ExternalRequestView | null, } | { "kind": "contentRef", content_id: string, bytes: bigint, } | { "kind": "json", value_json: string, } | { "kind": "unknown" };
 
-export type TimelineEventView = { 
+export type TimelineEventView = {
 /**
  * Durable timeline cursor.
  */
-cursor: bigint, 
+cursor: bigint,
 /**
  * Session id that owns the event.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Turn number that produced the event.
  */
-turn: bigint, 
+turn: bigint,
 /**
  * Timeline item id.
  */
-itemId: string, 
+itemId: string,
 /**
  * Parent timeline item id, when present.
  */
-parentId: string | null, 
+parentId: string | null,
 /**
  * Event kind.
  */
-kind: TimelineEventKindView, 
+kind: TimelineEventKindView,
 /**
  * Display channel, when present.
  */
-channel: string | null, 
+channel: string | null,
 /**
  * Event content.
  */
-content: TimelineContentView, 
+content: TimelineContentView,
 /**
  * Event status, when present.
  */
-status: TimelineStatusView | null, 
+status: TimelineStatusView | null,
 /**
  * JSON metadata object as returned by the server.
  */
 metadataJson: string, };
 
-export type SessionTimelineView = { 
+export type SessionTimelineView = {
 /**
  * Persisted timeline events ordered by cursor.
  */
-events: Array<TimelineEventView>, 
+events: Array<TimelineEventView>,
 /**
  * Timeline page load operation snapshot.
  */
-load: OperationSnapshot, 
+load: OperationSnapshot,
 /**
  * Timeline watch operation snapshot.
  */
 watch: OperationSnapshot, };
 
-export type SessionTemplateOptionView = { 
+export type SessionTemplateOptionView = {
 /**
  * Template kind name.
  */
-kind: string, 
+kind: string,
 /**
  * Human-readable option label.
  */
-label: string, 
+label: string,
 /**
  * Human-readable option detail.
  */
-detail: string, 
+detail: string,
 /**
  * Template text to insert when selected.
  */
 template: string, };
 
-export type SessionTemplateSearchSnapshot = { 
+export type SessionTemplateSearchSnapshot = {
 /**
  * Runtime-local caller request id.
  */
-requestId: string, 
+requestId: string,
 /**
  * Session id searched.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Search query.
  */
-query: string, 
+query: string,
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last search error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Search options returned by the server.
  */
 options: Array<SessionTemplateOptionView>, };
 
-export type RollbackTargetView = { 
+export type RollbackTargetView = {
 /**
  * Turn target, when continuing or rolling back by turn.
  */
-turn: bigint | null, 
+turn: bigint | null,
 /**
  * Timeline cursor target, when continuing or rolling back by cursor.
  */
@@ -790,401 +790,455 @@ cursor: bigint | null, };
 
 export type AccessStatus = "unknownChecking" | "loginRequired" | "loginInProgress" | "authenticated" | "loginFailed";
 
-export type AccessSnapshot = { 
+export type AccessSnapshot = {
 /**
  * Current Waltr access status.
  */
-status: AccessStatus, 
+status: AccessStatus,
 /**
  * Last safe login error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Active platform login generation, when one is running.
  */
 activeAttemptId: string | null, };
 
-export type ClientAuthTarget = { 
+export type ClientAuthTarget = {
 /**
  * Target kind, currently `provider` or `mcpServer`.
  */
-kind: string, 
+kind: string,
 /**
  * Config key for the target.
  */
 key: string, };
 
-export type AuthAttemptSnapshot = { 
+export type AuthAttemptSnapshot = {
 /**
  * Target being authenticated.
  */
-target: ClientAuthTarget, 
+target: ClientAuthTarget,
 /**
  * Attempt id returned by the server.
  */
-attemptId: string, 
+attemptId: string,
 /**
  * URL to open for browser-based auth.
  */
-authUrl: string, 
+authUrl: string,
 /**
  * Verification URL for device-style auth, when supplied.
  */
-verificationUrl: string, 
+verificationUrl: string,
 /**
  * User code for device-style auth, when supplied.
  */
-userCode: string, 
+userCode: string,
 /**
  * Attempt expiration timestamp in milliseconds since epoch.
  */
-expiresAtMs: bigint, 
+expiresAtMs: bigint,
 /**
  * Poll interval for device-style auth.
  */
-pollIntervalSeconds: number, 
+pollIntervalSeconds: number,
 /**
  * User-facing instructions returned by the server.
  */
-messages: Array<string>, };
+messages: Array<string>,
+/**
+ * Server-selected completion mode.
+ */
+completionMode: string,
+/**
+ * Non-secret registration selection.
+ */
+registrationMethod: string,
+/**
+ * Durable callback lifecycle.
+ */
+lifecycle: string,
+/**
+ * Sanitized callback failure reason.
+ */
+failureReason: string, };
 
-export type AuthRequirementSnapshot = { 
+export type McpAuthorizationRequirementSnapshot = {
+/**
+ * Protected MCP endpoint, when safe.
+ */
+endpoint: string | null,
+/**
+ * HTTP status associated with the challenge.
+ */
+httpStatus: number,
+/**
+ * Protected-resource metadata URL, when safe.
+ */
+resourceMetadataUrl: string | null,
+/**
+ * Requested OAuth scope.
+ */
+scope: string | null,
+/**
+ * OAuth bearer error code.
+ */
+error: string | null,
+/**
+ * OAuth bearer error description.
+ */
+errorDescription: string | null,
+/**
+ * OAuth bearer error documentation URL, when safe.
+ */
+errorUri: string | null,
+/**
+ * Bearer challenge realm.
+ */
+realm: string | null, };
+
+export type AuthRequirementSnapshot = {
 /**
  * Target that requires authentication.
  */
-target: ClientAuthTarget, 
+target: ClientAuthTarget,
 /**
  * Human-readable reason.
  */
-message: string, 
+message: string,
 /**
  * Session whose work reported the requirement.
  */
-sourceSessionId: string | null, };
+sourceSessionId: string | null,
+/**
+ * Sanitized upstream MCP bearer challenge context.
+ */
+mcpAuthorization: McpAuthorizationRequirementSnapshot | null, };
 
-export type AuthSnapshot = { 
+export type AuthSnapshot = {
 /**
  * Pending auth requirements in modal display order.
  */
-pending: Array<AuthRequirementSnapshot>, 
+pending: Array<AuthRequirementSnapshot>,
 /**
  * Active manual auth attempt, when one has started.
  */
-activeAttempt: AuthAttemptSnapshot | null, 
+activeAttempt: AuthAttemptSnapshot | null,
 /**
  * Auth status list operation state.
  */
-list: OperationSnapshot, 
+list: OperationSnapshot,
 /**
  * Begin auth operation state.
  */
-begin: OperationSnapshot, 
+begin: OperationSnapshot,
 /**
  * Complete auth operation state.
  */
-complete: OperationSnapshot, 
+complete: OperationSnapshot,
 /**
  * Cancel auth operation state.
  */
-cancel: OperationSnapshot, 
+cancel: OperationSnapshot,
 /**
  * Logout operation state.
  */
 logout: OperationSnapshot, };
 
-export type ClientOperationView = { "kind": "authBegin", 
+export type ClientOperationView = { "kind": "authBegin",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Target being authenticated.
  */
-target: ClientAuthTarget, 
+target: ClientAuthTarget,
 /**
  * Attempt details returned by the server.
  */
-attempt: AuthAttemptSnapshot | null, } | { "kind": "authComplete", 
+attempt: AuthAttemptSnapshot | null, } | { "kind": "authComplete",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, } | { "kind": "authCancel", 
+error: string | null, } | { "kind": "authCancel",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, } | { "kind": "authLogout", 
+error: string | null, } | { "kind": "authLogout",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Target logged out.
  */
-target: ClientAuthTarget, } | { "kind": "configPatch", 
+target: ClientAuthTarget, } | { "kind": "configPatch",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Patched configuration, when the operation completed successfully.
  */
-config: ConfigView | null, } | { "kind": "sessionCreate", 
+config: ConfigView | null, } | { "kind": "sessionCreate",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Created session, when the operation completed successfully.
  */
-session: SessionView | null, } | { "kind": "sessionDelete", 
+session: SessionView | null, } | { "kind": "sessionDelete",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Deleted session id.
  */
-id: string, } | { "kind": "sessionRuntimeConfigUpdate", 
+id: string, } | { "kind": "sessionRuntimeConfigUpdate",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Updated session, when the operation completed successfully.
  */
-session: SessionView | null, } | { "kind": "sessionSubmitUserMessage", 
+session: SessionView | null, } | { "kind": "sessionSubmitUserMessage",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Session id submitted to.
  */
-sessionId: string, } | { "kind": "sessionRespondExternalRequest", 
+sessionId: string, } | { "kind": "sessionRespondExternalRequest",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Session id responded to.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * External request id.
  */
-requestId: string, } | { "kind": "sessionInterrupt", 
+requestId: string, } | { "kind": "sessionInterrupt",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Session id interrupted.
  */
-sessionId: string, } | { "kind": "sessionRollback", 
+sessionId: string, } | { "kind": "sessionRollback",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Session id rolled back.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Updated session, when the operation completed successfully.
  */
-session: SessionView | null, } | { "kind": "sessionContinue", 
+session: SessionView | null, } | { "kind": "sessionContinue",
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Session id continued.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Rollback target continued from.
  */
 target: RollbackTargetView, };
 
-export type OperationCollectionSnapshot = { 
+export type OperationCollectionSnapshot = {
 /**
  * Operation results by runtime-local operation key.
  */
 current: { [key in string]?: ClientOperationView }, };
 
-export type OperationSnapshot = { 
+export type OperationSnapshot = {
 /**
  * Stable operation status name.
  */
-status: string, 
+status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, 
+error: string | null,
 /**
  * Runtime-local key for the latest operation of this kind.
  */
 key: string | null, };
 
-export type ConfigSnapshot = { 
+export type ConfigSnapshot = {
 /**
  * Last known configuration snapshot.
  */
-current: ConfigView | null, 
+current: ConfigView | null,
 /**
  * Configuration load operation snapshot.
  */
-load: OperationSnapshot, 
+load: OperationSnapshot,
 /**
  * Configuration patch operation snapshot.
  */
-patch: OperationSnapshot, 
+patch: OperationSnapshot,
 /**
  * Configuration watch operation snapshot.
  */
 watch: OperationSnapshot, };
 
-export type StatusSnapshot = { 
+export type StatusSnapshot = {
 /**
  * Whether the last known system status is ready.
  */
-ready: boolean, 
+ready: boolean,
 /**
  * Status watch operation snapshot.
  */
 watch: OperationSnapshot, };
 
-export type SessionSnapshot = { 
+export type SessionSnapshot = {
 /**
  * Last known sessions.
  */
-current: Array<SessionView>, 
+current: Array<SessionView>,
 /**
  * Session create operation snapshot.
  */
-create: OperationSnapshot, 
+create: OperationSnapshot,
 /**
  * Session list operation snapshot.
  */
-list: OperationSnapshot, 
+list: OperationSnapshot,
 /**
  * Session delete operation snapshot.
  */
-delete: OperationSnapshot, 
+delete: OperationSnapshot,
 /**
  * Session runtime metadata update operation snapshot.
  */
-runtimeConfigUpdate: OperationSnapshot, 
+runtimeConfigUpdate: OperationSnapshot,
 /**
  * User message submit operation snapshot.
  */
-submitUserMessage: OperationSnapshot, 
+submitUserMessage: OperationSnapshot,
 /**
  * External request response operation snapshot.
  */
-respondExternalRequest: OperationSnapshot, 
+respondExternalRequest: OperationSnapshot,
 /**
  * Session interrupt operation snapshot.
  */
-interrupt: OperationSnapshot, 
+interrupt: OperationSnapshot,
 /**
  * Session rollback operation snapshot.
  */
-rollback: OperationSnapshot, 
+rollback: OperationSnapshot,
 /**
  * Session continue operation snapshot.
  */
-continueSession: OperationSnapshot, 
+continueSession: OperationSnapshot,
 /**
  * Session watch operation snapshot.
  */
-watch: OperationSnapshot, 
+watch: OperationSnapshot,
 /**
  * Session timelines by session id.
  */
-timelines: { [key in string]?: SessionTimelineView }, 
+timelines: { [key in string]?: SessionTimelineView },
 /**
  * Latest resource search state by session id.
  */
 templateSearches: { [key in string]?: SessionTemplateSearchSnapshot }, };
 
-export type ClientSnapshot = { 
+export type ClientSnapshot = {
 /**
  * Waltr access authentication snapshot.
  */
-access: AccessSnapshot, 
+access: AccessSnapshot,
 /**
  * Auth coordination snapshot.
  */
-auth: AuthSnapshot, 
+auth: AuthSnapshot,
 /**
  * Model catalog coordination snapshot.
  */
-catalog: CatalogSnapshot, 
+catalog: CatalogSnapshot,
 /**
  * Command operation result snapshots.
  */
-operations: OperationCollectionSnapshot, 
+operations: OperationCollectionSnapshot,
 /**
  * Configuration coordination snapshot.
  */
-config: ConfigSnapshot, 
+config: ConfigSnapshot,
 /**
  * System status coordination snapshot.
  */
-status: StatusSnapshot, 
+status: StatusSnapshot,
 /**
  * Session coordination snapshot.
  */
@@ -1196,271 +1250,275 @@ export type ClientSessionTemplateSearchTarget = "resources" | "prompts";
 
 export type ClientTimelineDirection = "forward" | "backward";
 
-export type ClientCommand = { "type": "startWaltrLogin" } | { "type": "completeWaltrLogin", 
+export type ClientCommand = { "type": "startWaltrLogin" } | { "type": "completeWaltrLogin",
 /**
  * Attempt generation returned after starting login.
  */
-attemptId: string, } | { "type": "failWaltrLogin", 
+attemptId: string, } | { "type": "failWaltrLogin",
 /**
  * Attempt generation returned after starting login.
  */
-attemptId: string, 
+attemptId: string,
 /**
  * Safe failure text to present to the user.
  */
-error: string, } | { "type": "cancelWaltrLogin", 
+error: string, } | { "type": "cancelWaltrLogin",
 /**
  * Attempt generation returned after starting login.
  */
-attemptId: string, } | { "type": "reprobeWaltrAccess" } | { "type": "logoutWaltr" } | { "type": "waltrAccessExpired", 
+attemptId: string, } | { "type": "reprobeWaltrAccess" } | { "type": "logoutWaltr" } | { "type": "waltrAccessExpired",
 /**
  * Safe expiry or refresh failure text.
  */
-error: string, } | { "type": "requestAuthStatuses" } | { "type": "dismissAuthRequirement", 
+error: string, } | { "type": "requestAuthStatuses" } | { "type": "dismissAuthRequirement",
 /**
  * Target to dismiss from the queue.
  */
-target: ClientAuthTarget, } | { "type": "beginAuth", 
+target: ClientAuthTarget, } | { "type": "beginAuth",
 /**
  * Target to authenticate.
  */
-target: ClientAuthTarget, } | { "type": "completeAuth", 
+target: ClientAuthTarget, } | { "type": "completeAuth",
 /**
  * Attempt id returned by begin.
  */
-attemptId: string, 
+attemptId: string,
 /**
  * Pasted redirect URL or code.
  */
-input: string, } | { "type": "cancelAuth", 
+input: string, } | { "type": "pollAuthAttempt",
 /**
  * Attempt id returned by begin.
  */
-attemptId: string, } | { "type": "logoutAuth", 
+attemptId: string, } | { "type": "cancelAuth",
+/**
+ * Attempt id returned by begin.
+ */
+attemptId: string, } | { "type": "logoutAuth",
 /**
  * Target to log out.
  */
-target: ClientAuthTarget, } | { "type": "requestConfig" } | { "type": "searchCatalogModels", 
+target: ClientAuthTarget, } | { "type": "requestConfig" } | { "type": "searchCatalogModels",
 /**
  * Runtime-local request identity.
  */
-requestId: string, 
+requestId: string,
 /**
  * Search query.
  */
-query: string, 
+query: string,
 /**
  * Optional provider filter.
  */
-providerId: string | null, 
+providerId: string | null,
 /**
  * Maximum results.
  */
-limit: number, } | { "type": "suggestCatalogMatches", 
+limit: number, } | { "type": "suggestCatalogMatches",
 /**
  * Runtime-local request identity.
  */
-requestId: string, 
+requestId: string,
 /**
  * Configured provider key.
  */
-providerKey: string, 
+providerKey: string,
 /**
  * Configured model key.
  */
-modelKey: string, 
+modelKey: string,
 /**
  * Maximum suggestions.
  */
-limit: number, } | { "type": "addProvider", 
+limit: number, } | { "type": "addProvider",
 /**
  * Provider to add.
  */
-provider: ProviderView, } | { "type": "updateProvider", 
+provider: ProviderView, } | { "type": "updateProvider",
 /**
  * Current provider name.
  */
-originalName: string, 
+originalName: string,
 /**
  * Replacement provider definition.
  */
-provider: ProviderView, } | { "type": "deleteProvider", 
+provider: ProviderView, } | { "type": "deleteProvider",
 /**
  * Provider name to delete.
  */
-name: string, } | { "type": "addMcpServer", 
+name: string, } | { "type": "addMcpServer",
 /**
  * MCP server to add.
  */
-server: McpServerView, } | { "type": "updateMcpServer", 
+server: McpServerView, } | { "type": "updateMcpServer",
 /**
  * Current MCP server key.
  */
-originalName: string, 
+originalName: string,
 /**
  * Replacement MCP server definition.
  */
-server: McpServerView, } | { "type": "deleteMcpServer", 
+server: McpServerView, } | { "type": "deleteMcpServer",
 /**
  * MCP server key to delete.
  */
-name: string, } | { "type": "setRuntimeDefaults", 
+name: string, } | { "type": "setRuntimeDefaults",
 /**
  * Runtime defaults to store, or null to clear defaults.
  */
-defaults: RuntimeDefaultsView | null, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "deleteSession", 
+defaults: RuntimeDefaultsView | null, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "deleteSession",
 /**
  * Session id to delete.
  */
-id: string, } | { "type": "updateSessionRuntimeConfig", 
+id: string, } | { "type": "updateSessionRuntimeConfig",
 /**
  * Session id to update.
  */
-id: string, 
+id: string,
 /**
  * Provider key to use on subsequent prompts.
  */
-providerKey: string, 
+providerKey: string,
 /**
  * Model id to use on subsequent prompts.
  */
-modelId: string, 
+modelId: string,
 /**
  * MCP server keys enabled for subsequent prompts.
  */
-enabledMcpServerKeys: Array<string>, 
+enabledMcpServerKeys: Array<string>,
 /**
  * Optional per-session reasoning effort.
  */
-reasoningEffort: string | null, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "requestSessionTimeline", 
+reasoningEffort: string | null, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "requestSessionTimeline",
 /**
  * Session id whose timeline should load.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Direction from the exclusive cursor boundary.
  */
-direction: ClientTimelineDirection, 
+direction: ClientTimelineDirection,
 /**
  * Exclusive cursor boundary.
  */
-cursor: bigint | null, 
+cursor: bigint | null,
 /**
  * Maximum events to return.
  */
-limit: number, 
+limit: number,
 /**
  * Display-channel filter.
  */
-channels: Array<string>, } | { "type": "searchSessionTemplates", 
+channels: Array<string>, } | { "type": "searchSessionTemplates",
 /**
  * Runtime-local caller request id.
  */
-requestId: string, 
+requestId: string,
 /**
  * Session id whose visible templates should be searched.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Search query.
  */
-query: string, 
+query: string,
 /**
  * Maximum templates to return.
  */
-limit: number, 
+limit: number,
 /**
  * Template kinds to include.
  */
-kinds: Array<ClientSessionTemplateKind>, 
+kinds: Array<ClientSessionTemplateKind>,
 /**
  * Template search target.
  */
-target: ClientSessionTemplateSearchTarget, 
+target: ClientSessionTemplateSearchTarget,
 /**
  * Cursor byte offset relative to query for context-aware completions.
  */
-cursor: number | null, } | { "type": "registerSessionTimelineWatchInterest", 
+cursor: number | null, } | { "type": "registerSessionTimelineWatchInterest",
 /**
  * Session id whose timeline should be watched.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Optional cursor boundary for replay.
  */
-afterCursor: bigint | null, 
+afterCursor: bigint | null,
 /**
  * Display-channel filter.
  */
-channels: Array<string>, 
+channels: Array<string>,
 /**
  * Optional history batch size.
  */
-initialLimit: number | null, } | { "type": "releaseSessionTimelineWatchInterest", 
+initialLimit: number | null, } | { "type": "releaseSessionTimelineWatchInterest",
 /**
  * Session id whose timeline watch interest should be released.
  */
-sessionId: string, } | { "type": "submitUserMessage", 
+sessionId: string, } | { "type": "submitUserMessage",
 /**
  * Session id to submit to.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * User message text.
  */
-text: string, } | { "type": "respondExternalRequest", 
+text: string, } | { "type": "respondExternalRequest",
 /**
  * Session id to respond to.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * External request id.
  */
-requestId: string, 
+requestId: string,
 /**
  * JSON response payload.
  */
-responseJson: string, } | { "type": "interruptSession", 
+responseJson: string, } | { "type": "interruptSession",
 /**
  * Session id to interrupt.
  */
-sessionId: string, } | { "type": "rollbackSessionToTurn", 
+sessionId: string, } | { "type": "rollbackSessionToTurn",
 /**
  * Session id to roll back.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Turn to preserve.
  */
-turn: bigint, } | { "type": "rollbackSessionToCursor", 
+turn: bigint, } | { "type": "rollbackSessionToCursor",
 /**
  * Session id to roll back.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Cursor to preserve.
  */
-cursor: bigint, } | { "type": "rollbackSessionBeforeCursor", 
+cursor: bigint, } | { "type": "rollbackSessionBeforeCursor",
 /**
  * Session id to roll back.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Cursor to remove.
  */
-cursor: bigint, } | { "type": "continueSessionFromTurn", 
+cursor: bigint, } | { "type": "continueSessionFromTurn",
 /**
  * Session id to continue.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Turn to continue from.
  */
-turn: bigint, } | { "type": "continueSessionFromCursor", 
+turn: bigint, } | { "type": "continueSessionFromCursor",
 /**
  * Session id to continue.
  */
-sessionId: string, 
+sessionId: string,
 /**
  * Cursor to continue from.
  */
