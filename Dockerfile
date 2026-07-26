@@ -2,6 +2,7 @@
 
 ARG NODE_VERSION=24.18.0
 ARG RUST_VERSION=1.96.0
+ARG REVISION=unknown
 
 FROM node:${NODE_VERSION}-bookworm-slim AS node
 
@@ -9,6 +10,7 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build
 
 ARG PNPM_VERSION=11.5.0
 ARG WASM_BINDGEN_VERSION=0.2.122
+ARG REVISION
 
 ENV PNPM_HOME=/pnpm
 ENV PATH=${PNPM_HOME}:/usr/local/bin:${PATH}
@@ -37,7 +39,7 @@ RUN --mount=type=cache,id=waltr-cargo-registry,target=/usr/local/cargo/registry 
     --mount=type=cache,id=waltr-pnpm-store,target=/pnpm/store \
     pnpm install --frozen-lockfile --store-dir /pnpm/store --config.dangerouslyAllowAllBuilds=true && \
     pnpm --filter @rfhold/waltr-web build && \
-    cargo build -p waltr-server --features web --locked --release && \
+    WALTR_BUILD_REVISION="${REVISION}" cargo build -p waltr-server --features web --locked --release && \
     cargo build -p waltr-agent --bin waltr-agent-test-mcp-server --locked --release && \
     cp /workspace/target/release/waltr-server /usr/local/bin/waltr-server && \
     cp /workspace/target/release/waltr-agent-test-mcp-server /usr/local/bin/waltr-agent-test-mcp-server

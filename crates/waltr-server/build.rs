@@ -4,6 +4,7 @@ use std::{env, fs, io, path::Path};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WEB");
+    println!("cargo:rerun-if-env-changed=WALTR_BUILD_REVISION");
 
     if env::var_os("CARGO_FEATURE_WEB").is_none() {
         return;
