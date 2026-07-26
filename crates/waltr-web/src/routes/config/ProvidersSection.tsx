@@ -12,8 +12,11 @@ import {
 import type { Accessor, ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { clientRequestId } from "../../app/requestId";
 import { ActionList, ActionRow, ConfirmAction, Dialog, Field, InlineAlert } from "../../components/ui";
 import type {
+  CatalogMatchView,
+  CatalogModelSummaryView,
   ClientCommand,
   ConfigView,
   ModelCatalogMatchView,
@@ -22,7 +25,6 @@ import type {
   ProviderKindView,
   ProviderView,
 } from "../../generated/waltr-client";
-import type { CatalogMatch, CatalogModelSummary } from "../../wasm/client";
 
 type FormMode = "create" | "edit";
 
@@ -501,10 +503,8 @@ function ModelFormPanel(props: {
   const app = useAppState();
   const [form, setForm] = createSignal(initialModelForm(props.form));
   const [catalogQuery, setCatalogQuery] = createSignal("");
-  const [catalogStale, setCatalogStale] = createSignal(false);
-  const [catalogError, setCatalogError] = createSignal<string>();
-  const [catalogMatches, setCatalogMatches] = createSignal<CatalogMatch[]>([]);
-  const [catalogResults, setCatalogResults] = createSignal<CatalogModelSummary[]>([]);
+  const [catalogSearchRequestId, setCatalogSearchRequestId] = createSignal<string>();
+  const [catalogSuggestionRequestId, setCatalogSuggestionRequestId] = createSignal<string>();
   const update = (patch: Partial<ModelForm>) => setForm({ ...form(), ...patch });
   const title = () => form().mode === "create" ? "Create model" : "Edit model";
   const typeMissing = createMemo(() => {
@@ -512,33 +512,51 @@ function ModelFormPanel(props: {
     return kind === "" || kind === "unspecified";
   });
   const currentCatalogMatch = createMemo(() => form().catalogMatch);
-  const suggestCatalogMatches = async () => {
-    setCatalogError(undefined);
-    const response = await app.suggestCatalogMatches({ providerKey: props.providerKey, modelKey: form().key });
-    setCatalogStale(response.stale);
-    setCatalogMatches(response.matches);
+  const catalogSearch = () => {
+    const requestId = catalogSearchRequestId();
+    const search = app.snapshot()?.catalog.search;
+    return requestId && search?.requestId === requestId ? search : undefined;
   };
-  const searchCatalog = async () => {
-    setCatalogError(undefined);
-    const response = await app.searchCatalogModels({ query: catalogQuery() });
-    setCatalogStale(response.stale);
-    setCatalogResults(response.models);
+  const catalogSuggestions = () => {
+    const requestId = catalogSuggestionRequestId();
+    const suggestions = app.snapshot()?.catalog.suggestions;
+    return requestId && suggestions?.requestId === requestId ? suggestions : undefined;
   };
-  const runCatalogAction = (action: () => Promise<void>) => {
-    action().catch((error) => setCatalogError(errorMessage(error)));
+  const catalogLoading = () => catalogSearch()?.status === "loading" || catalogSuggestions()?.status === "loading";
+  const catalogStale = () => Boolean(catalogSearch()?.stale || catalogSuggestions()?.stale);
+  const suggestCatalogMatches = () => {
+    const requestId = clientRequestId("catalog-suggest");
+    setCatalogSuggestionRequestId(requestId);
+    return app.dispatch({
+      type: "suggestCatalogMatches",
+      requestId,
+      providerKey: props.providerKey,
+      modelKey: form().key,
+      limit: 5,
+    });
   };
-  const clearCatalogResults = () => {
-    setCatalogMatches([]);
-    setCatalogResults([]);
+  const searchCatalog = () => {
+    const requestId = clientRequestId("catalog-search");
+    setCatalogSearchRequestId(requestId);
+    return app.dispatch({
+      type: "searchCatalogModels",
+      requestId,
+      query: catalogQuery(),
+      providerId: null,
+      limit: 10,
+    });
   };
-  const applySuggestedMatch = (match: CatalogMatch) => {
+  const runCatalogAction = (action: () => Promise<unknown>) => {
+    void action().catch(() => {});
+  };
+  const applySuggestedMatch = (match: CatalogMatchView) => {
     update({ catalogMatch: catalogMatchFromMatch(match, "manual") });
-    clearCatalogResults();
+    setCatalogSuggestionRequestId(undefined);
   };
-  const applyCatalogModel = (model: CatalogModelSummary) => {
+  const applyCatalogModel = (model: CatalogModelSummaryView) => {
     update(modelFormWithCatalogModel(form(), model));
     setCatalogQuery("");
-    clearCatalogResults();
+    setCatalogSearchRequestId(undefined);
   };
 
   return (
@@ -581,7 +599,7 @@ function ModelFormPanel(props: {
               <h3>Catalog match</h3>
               <p>Use catalog facts to fill limits, reasoning, and capabilities.</p>
             </div>
-            <button type="button" onClick={() => runCatalogAction(suggestCatalogMatches)}>Suggest</button>
+            <button type="button" disabled={catalogLoading()} onClick={() => runCatalogAction(suggestCatalogMatches)}>Suggest</button>
           </header>
           <div class="catalog-panel__current" aria-label="Current catalog match">
             <span class="catalog-panel__current-label">Current</span>
@@ -604,14 +622,20 @@ function ModelFormPanel(props: {
           <Show when={catalogStale()}>
             <p class="catalog-panel__notice">Catalog data is from a stale cache.</p>
           </Show>
-          <Show when={catalogError()}>
+          <Show when={catalogSearch()?.error}>
             {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
           </Show>
-          <Show when={catalogMatches().length > 0}>
+          <Show when={catalogSuggestions()?.error}>
+            {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
+          </Show>
+          <Show when={catalogLoading()}>
+            <p class="catalog-panel__notice">Loading catalog…</p>
+          </Show>
+          <Show when={(catalogSuggestions()?.matches.length ?? 0) > 0}>
             <div class="catalog-panel__results-group">
               <p>Suggested matches</p>
               <div class="catalog-panel__results" aria-label="Suggested catalog matches">
-                <For each={catalogMatches()}>
+                <For each={catalogSuggestions()?.matches ?? []}>
                   {(match) => (
                     <button type="button" class="catalog-panel__result" onClick={() => applySuggestedMatch(match)}>
                       <strong>{match.modelName || match.model!.modelId}</strong>
@@ -626,13 +650,13 @@ function ModelFormPanel(props: {
             <Field id="model-catalog-search" label="Search catalog">
               {(field) => <input name="catalogSearch" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} value={catalogQuery()} onInput={(event) => setCatalogQuery(event.currentTarget.value)} />}
             </Field>
-            <button type="button" onClick={() => runCatalogAction(searchCatalog)}>Search</button>
+            <button type="button" disabled={catalogLoading()} onClick={() => runCatalogAction(searchCatalog)}>Search</button>
           </div>
-          <Show when={catalogResults().length > 0}>
+          <Show when={(catalogSearch()?.models.length ?? 0) > 0}>
             <div class="catalog-panel__results-group">
               <p>Search results</p>
               <div class="catalog-panel__results" aria-label="Catalog search results">
-                <For each={catalogResults()}>
+                <For each={catalogSearch()?.models ?? []}>
                   {(model) => (
                     <button type="button" class="catalog-panel__result" onClick={() => applyCatalogModel(model)}>
                       <strong>{model.modelName || model.model!.modelId}</strong>
@@ -916,7 +940,7 @@ function splitReasoningEfforts(value: string): string[] {
     .filter((item) => item.length > 0);
 }
 
-function catalogMatchFromMatch(match: CatalogMatch, source: ModelCatalogMatchView["source"]): ModelCatalogMatchView {
+function catalogMatchFromMatch(match: CatalogMatchView, source: ModelCatalogMatchView["source"]): ModelCatalogMatchView {
   return {
     providerId: match.model!.providerId,
     modelId: match.model!.modelId,
@@ -926,7 +950,7 @@ function catalogMatchFromMatch(match: CatalogMatch, source: ModelCatalogMatchVie
   };
 }
 
-function catalogMatchFromSummary(model: CatalogModelSummary, source: ModelCatalogMatchView["source"]): ModelCatalogMatchView {
+function catalogMatchFromSummary(model: CatalogModelSummaryView, source: ModelCatalogMatchView["source"]): ModelCatalogMatchView {
   const upstream = upstreamModelFromCatalogModel(model);
   return {
     providerId: model.model!.providerId,
@@ -937,7 +961,7 @@ function catalogMatchFromSummary(model: CatalogModelSummary, source: ModelCatalo
   };
 }
 
-function upstreamModelFromCatalogModel(model: CatalogModelSummary) {
+function upstreamModelFromCatalogModel(model: CatalogModelSummaryView) {
   const slash = model.model!.modelId.indexOf("/");
   if (slash <= 0 || slash === model.model!.modelId.length - 1) {
     return undefined;
@@ -949,7 +973,7 @@ function upstreamModelFromCatalogModel(model: CatalogModelSummary) {
   };
 }
 
-function modelFormWithCatalogModel(form: ModelForm, model: CatalogModelSummary): Partial<ModelForm> {
+function modelFormWithCatalogModel(form: ModelForm, model: CatalogModelSummaryView): Partial<ModelForm> {
   const patch: Partial<ModelForm> = {
     catalogMatch: catalogMatchFromSummary(model, "applied"),
     cost: model.cost ? {

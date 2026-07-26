@@ -28,8 +28,6 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
     systemReady: () => true,
     dispatch: async (_command: ClientCommand) => props.snapshot,
     dispatchConfigPatch: async (_command: ClientCommand) => props.snapshot,
-    searchCatalogModels: async () => ({ models: [], stale: false }),
-    suggestCatalogMatches: async () => ({ matches: [], stale: false }),
     dispatchCreateSession: async () => props.snapshot,
     dispatchDeleteSession: async (_id: string) => props.snapshot,
     dispatchUpdateSessionRuntimeConfig: async (_command) => props.snapshot,
@@ -46,6 +44,10 @@ function promptFixtureSnapshot(): ClientSnapshot {
     access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
     auth: emptyAuthSnapshot(),
+    catalog: {
+      search: { requestId: "", query: "", status: "idle", error: null, stale: false, models: [] },
+      suggestions: { requestId: "", status: "idle", error: null, stale: false, matches: [] },
+    },
     config: {
       current: { etag: "fixture", providers: {}, mcpServers: {}, runtimeDefaults: null },
       load: operationSnapshot("idle"),

@@ -4,7 +4,6 @@ import { afterEach } from "vitest";
 
 import { AppStateContextProvider } from "../../src/app/context";
 import type { ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
-import type { CatalogSearchResponse, CatalogSuggestResponse } from "../../src/wasm/client";
 import { resetTestHistory } from "./routes";
 import { emptyConfig, snapshotWithConfig } from "./snapshots";
 
@@ -29,8 +28,6 @@ export function renderWithAppState(
     submitUserMessageError?: string;
     respondExternalRequestError?: string;
     interruptSessionError?: string;
-    searchCatalogModels?: (request: { query: string; providerId?: string; limit?: number }) => Promise<CatalogSearchResponse>;
-    suggestCatalogMatches?: (request: { providerKey: string; modelKey: string; limit?: number }) => Promise<CatalogSuggestResponse>;
     onDispatch?: (
       command: ClientCommand,
       snapshot: ClientSnapshot | undefined,
@@ -358,8 +355,6 @@ export function renderWithAppState(
           systemReady,
           dispatch,
           dispatchConfigPatch,
-          searchCatalogModels: options.searchCatalogModels ?? (async () => ({ models: [], stale: false })),
-          suggestCatalogMatches: options.suggestCatalogMatches ?? (async () => ({ matches: [], stale: false })),
           dispatchCreateSession,
           dispatchDeleteSession,
           dispatchUpdateSessionRuntimeConfig,

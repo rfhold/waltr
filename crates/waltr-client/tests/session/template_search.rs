@@ -1,38 +1,60 @@
-use waltr::grpc::waltr::session::v1::{
-    SearchSessionTemplatesRequest, SessionTemplateKind, SessionTemplateSearchTarget,
-    search_session_templates_response,
-};
+#![allow(clippy::default_trait_access)]
+
 use waltr_agent::{ModelApi, SessionProviderRuntimeSettings, SessionRuntimeSettings};
-use waltr_client::{DefaultGrpcTransport, WaltrTransport};
+use waltr_client::{
+    ClientCommand, ClientRuntime, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget,
+};
+
+use crate::support::snapshots::{dispatch_stream_command, next_snapshot_until, no_sleep};
 
 #[tokio::test]
-async fn transport_returns_session_template_search_results()
+async fn client_runtime_returns_session_template_search_results()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (server, sessions) = waltr_server::test_support::setup_server_with_sessions();
+    let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
     let session_id = sessions
         .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
         .await?
         .id()
         .as_str()
         .to_owned();
+    let server = waltr_server::test_support::setup_server_with_seeded_sessions(sessions);
 
-    let response = DefaultGrpcTransport::new(server.base_url())
-        .search_session_templates(SearchSessionTemplatesRequest {
-            request_id: "tool".to_owned(),
-            session_id,
+    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
+    next_snapshot_until(&mut stream, |snapshot| snapshot.status.ready).await;
+
+    let started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::SearchSessionTemplates {
+            request_id: "tool-search-1".to_owned(),
+            session_id: session_id.clone(),
             query: "rea".to_owned(),
             limit: 10,
-            kinds: vec![SessionTemplateKind::Tool as i32],
-            target: SessionTemplateSearchTarget::Resources as i32,
+            kinds: vec![ClientSessionTemplateKind::Tool],
+            target: ClientSessionTemplateSearchTarget::Resources,
             cursor: None,
-        })
-        .await?;
-    assert_eq!(response.request_id, "tool");
-    let Some(search_session_templates_response::Result::Options(options)) = response.result else {
-        panic!("expected options response");
-    };
-    assert!(options.options.iter().any(|option| {
-        option.kind == SessionTemplateKind::Tool as i32
+        },
+    )
+    .await?;
+    let started_search = started
+        .sessions
+        .template_searches
+        .get(&session_id)
+        .expect("template search should be exposed immediately");
+    assert_eq!(started_search.request_id, "tool-search-1");
+    assert_eq!(started_search.status, "loading");
+
+    let completed = next_snapshot_until(&mut stream, |snapshot| {
+        snapshot
+            .sessions
+            .template_searches
+            .get(&session_id)
+            .is_some_and(|search| search.request_id == "tool-search-1" && search.status == "ready")
+    })
+    .await;
+    let search = &completed.sessions.template_searches[&session_id];
+    assert!(search.error.is_none());
+    assert!(search.options.iter().any(|option| {
+        option.kind == "tool"
             && option.label == "read"
             && option.template == "@tool(read, {\"filePath\":\"\"})"
     }));

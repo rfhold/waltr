@@ -1,5 +1,6 @@
 import type {
   AuthSnapshot,
+  CatalogSnapshot,
   ClientSnapshot,
   ConfigView,
   McpServerView,
@@ -19,6 +20,7 @@ export function snapshotWithConfig(
     access: { status: "authenticated", error: null, activeAttemptId: null },
     operations: { current: {} },
     auth: emptyAuthSnapshot(),
+    catalog: emptyCatalogSnapshot(),
     config: {
       current: config,
       load: operationSnapshot("idle"),
@@ -30,6 +32,26 @@ export function snapshotWithConfig(
       watch: operationSnapshot("ready"),
     },
     sessions: emptySessionSnapshot(),
+  };
+}
+
+export function emptyCatalogSnapshot(): CatalogSnapshot {
+  return {
+    search: {
+      requestId: "",
+      query: "",
+      status: "idle",
+      error: null,
+      stale: false,
+      models: [],
+    },
+    suggestions: {
+      requestId: "",
+      status: "idle",
+      error: null,
+      stale: false,
+      matches: [],
+    },
   };
 }
 

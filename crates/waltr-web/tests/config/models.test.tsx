@@ -1,7 +1,7 @@
-import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
+import { fireEvent, screen, waitFor, within } from "@solidjs/testing-library";
 import { describe, expect, test } from "vitest";
 
-import type { ClientCommand } from "../../src/generated/waltr-client";
+import type { ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { ConfigRouteWithChildren, testHistory } from "../support/routes";
 import { claudeConfig, modelView, snapshotWithConfig } from "../support/snapshots";
@@ -151,28 +151,45 @@ describe("provider models sub-editor", () => {
       commands,
       routePath: "/config/provider/edit/claude/models/edit/sonnet",
       snapshot: snapshotWithConfig(configWithModel()),
-      suggestCatalogMatches: async (request) => {
-        expect(request).toMatchObject({ providerKey: "claude", modelKey: "sonnet" });
-        return {
-          stale: false,
-          matches: [{
+      onDispatch: (command, snapshot, setSnapshot) => {
+        if (command.type !== "suggestCatalogMatches") {
+          return snapshot!;
+        }
+        expect(command).toMatchObject({ providerKey: "claude", modelKey: "sonnet", limit: 5 });
+        const next = {
+          ...snapshot!,
+          catalog: {
+            ...snapshot!.catalog,
+            suggestions: {
+              requestId: command.requestId,
+              status: "ready",
+              error: null,
+              stale: true,
+              matches: [{
             model: { providerId: "gateway", modelId: "anthropic/claude-sonnet-4-5" },
             providerName: "Gateway",
             modelName: "Claude Sonnet 4.5",
             confidence: "high",
             reasons: ["upstream model id"],
             upstreamModel: { providerId: "anthropic", modelId: "claude-sonnet-4-5" },
-          }],
-        };
+              }],
+            },
+          },
+        } satisfies ClientSnapshot;
+        setSnapshot(next);
+        return next;
       },
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Suggest" }));
     await waitFor(() => expect(screen.getByRole("button", { name: /Claude Sonnet 4\.5/ })).toBeTruthy());
+    expect(screen.getByText("Catalog data is from a stale cache.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /Claude Sonnet 4\.5/ }));
 
     expect(screen.getAllByText("gateway/anthropic/claude-sonnet-4-5").length).toBeGreaterThan(0);
     expect(screen.getByText("anthropic/claude-sonnet-4-5")).toBeTruthy();
+    expect(screen.queryByLabelText("Suggested catalog matches")).toBeNull();
+    expect(screen.queryByText("Catalog data is from a stale cache.")).toBeNull();
 
     fireEvent.submit(screen.getByLabelText("Edit model"));
     await waitFor(() => expect(testHistory().get()).toBe("/config/provider/edit/claude"));
@@ -198,11 +215,22 @@ describe("provider models sub-editor", () => {
       commands,
       routePath: "/config/provider/edit/claude/models/create",
       snapshot: snapshotWithConfig(configWithModel()),
-      searchCatalogModels: async (request) => {
-        expect(request.query).toBe("haiku");
-        return {
-          stale: true,
-          models: [{
+      onDispatch: (command, snapshot, setSnapshot) => {
+        if (command.type !== "searchCatalogModels") {
+          return snapshot!;
+        }
+        expect(command).toMatchObject({ query: "haiku", providerId: null, limit: 10 });
+        const next = {
+          ...snapshot!,
+          catalog: {
+            ...snapshot!.catalog,
+            search: {
+              requestId: command.requestId,
+              query: command.query,
+              status: "ready",
+              error: null,
+              stale: true,
+              models: [{
             model: { providerId: "anthropic", modelId: "claude-haiku-4-5" },
             providerName: "Anthropic",
             modelName: "Claude Haiku 4.5",
@@ -220,8 +248,12 @@ describe("provider models sub-editor", () => {
             },
             capabilities: { tools: true, image: true, audio: false },
             reasoning: { supported: true, effort: "effort", efforts: ["low", "medium", "high"] },
-          }],
-        };
+              }],
+            },
+          },
+        } satisfies ClientSnapshot;
+        setSnapshot(next);
+        return next;
       },
     });
 
@@ -238,6 +270,8 @@ describe("provider models sub-editor", () => {
     expect(screen.getByLabelText("Reasoning efforts")).toHaveProperty("value", "low, medium, high");
     expect(screen.getByLabelText("Supports tools")).toHaveProperty("checked", true);
     expect(screen.getByLabelText("Supports image input")).toHaveProperty("checked", true);
+    expect(screen.queryByLabelText("Catalog search results")).toBeNull();
+    expect(screen.queryByText("Catalog data is from a stale cache.")).toBeNull();
 
     fireEvent.submit(screen.getByLabelText("Create model"));
     await waitFor(() => expect(testHistory().get()).toBe("/config/provider/edit/claude"));
@@ -269,9 +303,21 @@ describe("provider models sub-editor", () => {
       commands,
       routePath: "/config/provider/edit/claude/models/edit/sonnet",
       snapshot: snapshotWithConfig(configWithModel()),
-      searchCatalogModels: async () => ({
-        stale: false,
-        models: [{
+      onDispatch: (command, snapshot, setSnapshot) => {
+        if (command.type !== "searchCatalogModels") {
+          return snapshot!;
+        }
+        const next = {
+          ...snapshot!,
+          catalog: {
+            ...snapshot!.catalog,
+            search: {
+              requestId: command.requestId,
+              query: command.query,
+              status: "ready",
+              error: null,
+              stale: false,
+              models: [{
           model: { providerId: "gateway", modelId: "anthropic/claude-sonnet-4-5" },
           providerName: "Gateway",
           modelName: "Claude Sonnet 4.5",
@@ -281,8 +327,13 @@ describe("provider models sub-editor", () => {
           cost: null,
           capabilities: { tools: true, image: true, audio: false },
           reasoning: null,
-        }],
-      }),
+              }],
+            },
+          },
+        } satisfies ClientSnapshot;
+        setSnapshot(next);
+        return next;
+      },
     });
 
     expect(screen.getByLabelText("Supports tools")).toHaveProperty("checked", false);
@@ -311,6 +362,139 @@ describe("provider models sub-editor", () => {
         source: "applied",
       });
     }
+  });
+
+  test("renders catalog loading and errors from shared snapshots", async () => {
+    const commands: ClientCommand[] = [];
+    const initial = snapshotWithConfig(configWithModel());
+    let setSnapshot!: (snapshot: ClientSnapshot) => void;
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      routePath: "/config/provider/edit/claude/models/create",
+      snapshot: initial,
+      onSnapshotSetter: (setter) => { setSnapshot = setter; },
+    });
+
+    fireEvent.input(screen.getByLabelText("Search catalog"), { target: { value: "haiku" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const command = commands.find((candidate) => candidate.type === "searchCatalogModels");
+    expect(command).toBeTruthy();
+    if (!command || command.type !== "searchCatalogModels") {
+      return;
+    }
+
+    setSnapshot({
+      ...initial,
+      catalog: {
+        ...initial.catalog,
+        search: {
+          requestId: command.requestId,
+          query: command.query,
+          status: "loading",
+          error: null,
+          stale: false,
+          models: [],
+        },
+      },
+    });
+    await waitFor(() => expect(screen.getByText("Loading catalog…")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Search" })).toHaveProperty("disabled", true);
+
+    setSnapshot({
+      ...initial,
+      catalog: {
+        ...initial.catalog,
+        search: {
+          requestId: command.requestId,
+          query: command.query,
+          status: "failed",
+          error: "catalog unavailable",
+          stale: false,
+          models: [],
+        },
+      },
+    });
+    await waitFor(() => expect(screen.getByText("catalog unavailable")).toBeTruthy());
+  });
+
+  test("ignores catalog snapshots that predate the dialog request", () => {
+    const snapshot = snapshotWithConfig(configWithModel());
+    snapshot.catalog.search = {
+      requestId: "earlier-search",
+      query: "old",
+      status: "ready",
+      error: null,
+      stale: true,
+      models: [catalogModel("old-model", "Old Model")],
+    };
+    snapshot.catalog.suggestions = {
+      requestId: "earlier-suggestion",
+      status: "failed",
+      error: "earlier suggestion failed",
+      stale: false,
+      matches: [],
+    };
+
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      routePath: "/config/provider/edit/claude/models/create",
+      snapshot,
+    });
+
+    expect(screen.queryByText("Old Model")).toBeNull();
+    expect(screen.queryByText("earlier suggestion failed")).toBeNull();
+    expect(screen.queryByText("Catalog data is from a stale cache.")).toBeNull();
+  });
+
+  test("does not alias an old catalog completion after the dialog remounts", async () => {
+    const commands: ClientCommand[] = [];
+    const initial = snapshotWithConfig(configWithModel());
+    let setSnapshot!: (snapshot: ClientSnapshot) => void;
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      routePath: "/config/provider/edit/claude/models/edit/sonnet",
+      snapshot: initial,
+      onSnapshotSetter: (setter) => { setSnapshot = setter; },
+      onDispatch: (command, snapshot, publish) => {
+        if (command.type !== "searchCatalogModels") {
+          return snapshot!;
+        }
+        const loading = catalogSearchSnapshot(snapshot!, command.requestId, command.query, {
+          status: "loading",
+        });
+        publish(loading);
+        return loading;
+      },
+    });
+
+    fireEvent.input(screen.getByLabelText("Search catalog"), { target: { value: "old" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const oldCommand = catalogSearchCommands(commands)[0]!;
+
+    const firstDialog = screen.getByRole("dialog", { name: "Edit model dialog" });
+    fireEvent.click(within(firstDialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(testHistory().get()).toBe("/config/provider/edit/claude"));
+    fireEvent.click(screen.getByLabelText("Edit model sonnet"));
+    await waitFor(() => expect(testHistory().get()).toBe("/config/provider/edit/claude/models/edit/sonnet"));
+
+    fireEvent.input(screen.getByLabelText("Search catalog"), { target: { value: "new" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search" }));
+    const newCommand = catalogSearchCommands(commands)[1]!;
+    expect(newCommand.requestId).not.toBe(oldCommand.requestId);
+
+    setSnapshot(catalogSearchSnapshot(initial, oldCommand.requestId, oldCommand.query, {
+      status: "ready",
+      stale: true,
+      models: [catalogModel("old-model", "Old Model")],
+    }));
+    await Promise.resolve();
+    expect(screen.queryByText("Old Model")).toBeNull();
+    expect(screen.queryByText("Catalog data is from a stale cache.")).toBeNull();
+
+    setSnapshot(catalogSearchSnapshot(initial, newCommand.requestId, newCommand.query, {
+      status: "ready",
+      models: [catalogModel("new-model", "New Model")],
+    }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /New Model/ })).toBeTruthy());
   });
 
   test("deletes a model in the provider draft and dispatches only when the provider saves", async () => {
@@ -374,3 +558,46 @@ describe("provider models sub-editor", () => {
     }
   });
 });
+
+type CatalogSearchCommand = Extract<ClientCommand, { type: "searchCatalogModels" }>;
+
+function catalogSearchCommands(commands: ClientCommand[]): CatalogSearchCommand[] {
+  return commands.filter((command): command is CatalogSearchCommand => command.type === "searchCatalogModels");
+}
+
+function catalogModel(modelId: string, modelName: string) {
+  return {
+    model: { providerId: "test", modelId },
+    providerName: "Test",
+    modelName,
+    family: null,
+    status: null,
+    limits: null,
+    cost: null,
+    capabilities: null,
+    reasoning: null,
+  };
+}
+
+function catalogSearchSnapshot(
+  snapshot: ClientSnapshot,
+  requestId: string,
+  query: string,
+  overrides: Partial<ClientSnapshot["catalog"]["search"]>,
+): ClientSnapshot {
+  return {
+    ...snapshot,
+    catalog: {
+      ...snapshot.catalog,
+      search: {
+        requestId,
+        query,
+        status: "idle",
+        error: null,
+        stale: false,
+        models: [],
+        ...overrides,
+      },
+    },
+  };
+}

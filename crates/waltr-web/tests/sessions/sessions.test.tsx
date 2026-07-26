@@ -312,6 +312,61 @@ describe("sessions route", () => {
     }
   });
 
+  test("session detail template search does not reuse an unresolved request after remount", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands: ClientCommand[] = [];
+      let setSnapshot!: (snapshot: ClientSnapshot) => void;
+      const snapshot = snapshotWithSessions([
+        sessionWithRuntime("session-resource-remount"),
+      ]);
+      snapshot.sessions.timelines["session-resource-remount"] = readySessionTimeline();
+
+      renderWithAppState(() => <SessionsRouteWithRouter />, {
+        commands,
+        routePath: "/sessions/session-resource-remount",
+        snapshot,
+        onSnapshotSetter: (setter) => {
+          setSnapshot = setter;
+        },
+      });
+
+      await typeComposerText(screen.getByLabelText("Session message") as HTMLTextAreaElement, "open @old");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(1));
+      const oldCommand = latestTemplateSearchCommand(commands);
+      expect(screen.getByText("Searching resources...")).toBeTruthy();
+
+      testHistory().set({ value: "/sessions", replace: false, scroll: false });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(screen.getByLabelText("Session list")).toBeTruthy();
+      fireEvent.click(screen.getByLabelText("Open session session-resource-remount"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(testHistory().get()).toBe("/sessions/session-resource-remount");
+
+      await typeComposerText(screen.getByLabelText("Session message") as HTMLTextAreaElement, "open @new");
+      await vi.advanceTimersByTimeAsync(RESOURCE_TEST_DEBOUNCE_MS);
+      await waitFor(() => expect(templateSearchCommands(commands)).toHaveLength(2));
+      const newCommand = latestTemplateSearchCommand(commands);
+      expect(newCommand.requestId).not.toBe(oldCommand.requestId);
+
+      publishTemplateSearch(snapshot, setSnapshot, oldCommand, "ready", [
+        { kind: "file", label: "old-result", detail: "old", template: "@old-result" },
+      ]);
+      await Promise.resolve();
+      expect(screen.queryByText("old-result")).toBeNull();
+      expect(screen.getByText("Searching resources...")).toBeTruthy();
+
+      publishTemplateSearch(snapshot, setSnapshot, newCommand, "ready", [
+        { kind: "file", label: "new-result", detail: "new", template: "@new-result" },
+      ]);
+      await waitFor(() => expect(screen.getByRole("option", { name: /new-result/ })).toBeTruthy());
+      expect(screen.queryByText("Searching resources...")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("session detail resource autocomplete accepts keyboard selection", async () => {
     vi.useFakeTimers();
     try {

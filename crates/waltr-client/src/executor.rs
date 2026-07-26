@@ -11,9 +11,10 @@ use crate::transport::{
     SessionWatchStream, StatusWatchStream,
 };
 use crate::{
-    AuthEffect, AuthEvent, ClientEffect, ClientError, ClientEvent, ConfigEffect, ConfigEvent,
-    ConfigPatch, ConfigView, SearchSessionTemplatesRequest, SessionEffect, SessionEvent,
-    SessionSummary, StatusEffect, StatusEvent, search_session_templates_response,
+    AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientError, ClientEvent,
+    ConfigEffect, ConfigEvent, ConfigPatch, ConfigView, SearchCatalogModelsRequest,
+    SearchSessionTemplatesRequest, SessionEffect, SessionEvent, SessionSummary, StatusEffect,
+    StatusEvent, SuggestCatalogMatchesRequest, search_session_templates_response,
 };
 
 /// Stream of configuration changes observed through the gRPC executor.
@@ -255,6 +256,54 @@ impl GrpcEffectExecutor {
                 })],
                 Err(error) => vec![ClientEvent::Auth(AuthEvent::LogoutFailed {
                     operation_key,
+                    error,
+                })],
+            },
+            ClientEffect::Catalog(CatalogEffect::SearchModels {
+                request_id,
+                query,
+                provider_id,
+                limit,
+            }) => match self
+                .transport
+                .search_catalog_models(SearchCatalogModelsRequest {
+                    query,
+                    provider_id: provider_id.unwrap_or_default(),
+                    limit,
+                })
+                .await
+            {
+                Ok(response) => vec![ClientEvent::Catalog(CatalogEvent::ModelsSearched {
+                    request_id,
+                    models: response.models,
+                    stale: response.stale,
+                })],
+                Err(error) => vec![ClientEvent::Catalog(CatalogEvent::ModelsSearchFailed {
+                    request_id,
+                    error,
+                })],
+            },
+            ClientEffect::Catalog(CatalogEffect::SuggestMatches {
+                request_id,
+                provider_key,
+                model_key,
+                limit,
+            }) => match self
+                .transport
+                .suggest_catalog_matches(SuggestCatalogMatchesRequest {
+                    provider_key,
+                    model_key,
+                    limit,
+                })
+                .await
+            {
+                Ok(response) => vec![ClientEvent::Catalog(CatalogEvent::MatchesSuggested {
+                    request_id,
+                    matches: response.matches,
+                    stale: response.stale,
+                })],
+                Err(error) => vec![ClientEvent::Catalog(CatalogEvent::MatchesSuggestFailed {
+                    request_id,
                     error,
                 })],
             },
