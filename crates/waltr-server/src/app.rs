@@ -99,10 +99,13 @@ impl ServerApplication {
 
     /// Cancel and join all server-owned background work.
     pub async fn shutdown(self) {
-        self.mcp_cleanup.shutdown().await;
-        if let Some(task) = self.oauth_maintenance {
-            task.shutdown().await;
-        }
+        let Self {
+            router,
+            mcp_cleanup,
+            oauth_maintenance,
+        } = self;
+        shutdown_background_tasks(mcp_cleanup, oauth_maintenance).await;
+        drop(router);
     }
 
     /// Bind the server listener, shutting down background work if startup fails.
@@ -180,11 +183,23 @@ impl ServerApplication {
             }
         })
         .await;
-        mcp_cleanup.shutdown().await;
-        if let Some(task) = oauth_maintenance {
-            task.shutdown().await;
-        }
+        shutdown_background_tasks(mcp_cleanup, oauth_maintenance).await;
         result
+    }
+}
+
+async fn shutdown_background_tasks(
+    mcp_cleanup: McpSessionCleanupTask,
+    oauth_maintenance: Option<McpOAuthMaintenanceTask>,
+) {
+    mcp_cleanup.cancellation.cancel();
+    if let Some(task) = &oauth_maintenance {
+        task.cancellation.cancel();
+    }
+    if let Some(oauth_maintenance) = oauth_maintenance {
+        tokio::join!(mcp_cleanup.shutdown(), oauth_maintenance.shutdown());
+    } else {
+        mcp_cleanup.shutdown().await;
     }
 }
 
@@ -710,6 +725,10 @@ async fn service_unavailable() -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::{Notify, oneshot};
+
     use super::*;
 
     #[test]
@@ -724,5 +743,46 @@ mod tests {
         assert_eq!(method, "GET");
         assert_eq!(path, "/oidc/callback");
         drop(request_span(&request));
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_joins_cleanup_and_stops_future_activity() {
+        tokio::time::pause();
+        let cancellation = CancellationToken::new();
+        let activity = Arc::new(AtomicUsize::new(0));
+        let cleanup_started = Arc::new(Notify::new());
+        let task = {
+            let cancellation = cancellation.clone();
+            let activity = Arc::clone(&activity);
+            let cleanup_started = Arc::clone(&cleanup_started);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return,
+                        _ = interval.tick() => {
+                            activity.fetch_add(1, Ordering::SeqCst);
+                            cleanup_started.notify_one();
+                        }
+                    }
+                }
+            })
+        };
+        let app = ServerApplication::with_cleanup_task_for_test(cancellation, task);
+        cleanup_started.notified().await;
+        assert_eq!(activity.load(Ordering::SeqCst), 1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(app.serve_with_shutdown(listener, async move {
+            drop(shutdown_rx.await);
+        }));
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(activity.load(Ordering::SeqCst), 1);
     }
 }
