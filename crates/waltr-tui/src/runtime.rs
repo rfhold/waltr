@@ -126,6 +126,15 @@ async fn run_with_events(
                     return Ok(());
                 }
             }
+            AppAction::CopyAuthUrl(url) => {
+                if native_auth
+                    .send(NativeAuthAction::CopyUrl(url))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
         }
 
         let _ = terminal.draw(|frame| app.draw(frame))?;

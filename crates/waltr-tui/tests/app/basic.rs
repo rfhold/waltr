@@ -769,6 +769,140 @@ fn provider_oauth_modal_remains_separate_from_waltr_access() {
 }
 
 #[test]
+fn outbound_oauth_callback_renders_shared_lifecycle_without_local_polling() {
+    let mut app = App::new();
+    let now = Instant::now();
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(outbound_auth_snapshot(
+            "pending",
+            "serverCallback",
+            "https://auth.example/authorize",
+        ))),
+        now,
+    ));
+
+    let rendered = render_app(&app);
+    assert!(rendered.contains("MCP server remote"));
+    assert!(rendered.contains("Status: Pending · Completion: Server callback"));
+    assert!(rendered.contains("Registration: Dynamic"));
+    assert!(rendered.contains("Waiting for the server callback."));
+    assert_eq!(
+        app.handle_event(&AppEvent::Tick(now + Duration::from_secs(1)), now),
+        AppAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(&char_press('C'), now),
+        AppAction::CopyAuthUrl("https://auth.example/authorize".to_owned())
+    );
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&escape_press(), now),
+        AppAction::ClientCommand(ClientCommand::CancelAuth {
+            attempt_id: "attempt-1".to_owned(),
+        })
+    );
+
+    insta::assert_snapshot!("outbound_oauth_callback_pending", rendered);
+}
+
+#[test]
+fn outbound_oauth_terminal_lifecycles_dismiss_without_canceling_or_changing_route() {
+    let now = Instant::now();
+    for (lifecycle, message) in [
+        ("succeeded", "Authorization succeeded."),
+        ("failed", "Authorization failed."),
+        ("expired", "Authorization expired."),
+        ("canceled", "Authorization canceled."),
+    ] {
+        let mut app = App::new();
+        drop(app.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now));
+        assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+        drop(app.handle_event(&char_press('s'), now));
+        assert_eq!(app.screen(), AppScreen::Sessions);
+        drop(app.handle_event(
+            &AppEvent::Client(Box::new(outbound_auth_snapshot(
+                lifecycle,
+                "serverCallback",
+                "https://auth.example/authorize",
+            ))),
+            now,
+        ));
+
+        assert!(render_app(&app).contains(message));
+        assert_eq!(
+            app.handle_event(&escape_press(), now),
+            AppAction::ClientCommand(ClientCommand::DismissAuthRequirement {
+                target: waltr_client::ClientAuthTarget {
+                    kind: "mcpServer".to_owned(),
+                    key: "remote".to_owned(),
+                },
+            })
+        );
+        assert_eq!(app.screen(), AppScreen::Sessions);
+    }
+}
+
+#[test]
+fn outbound_oauth_manual_input_tracks_attempt_identity_and_unsafe_urls_are_hidden() {
+    let now = Instant::now();
+    let mut app = App::new();
+    let mut first = outbound_auth_snapshot("pending", "manual", "https://auth.example/authorize");
+    first.auth.active_attempt.as_mut().unwrap().attempt_id = "attempt-1".to_owned();
+    drop(app.handle_event(&AppEvent::Client(Box::new(first)), now));
+    drop(app.handle_event(&char_press('x'), now));
+    assert_eq!(app.auth_input(), "x");
+
+    let mut replacement = outbound_auth_snapshot("pending", "manual", "https://user:secret@auth.example/authorize");
+    replacement.auth.active_attempt.as_mut().unwrap().attempt_id = "attempt-2".to_owned();
+    drop(app.handle_event(&AppEvent::Client(Box::new(replacement)), now));
+    assert!(app.auth_input().is_empty());
+    assert!(!render_app(&app).contains("user:secret"));
+    assert_eq!(app.handle_event(&char_press('C'), now), AppAction::Continue);
+    assert_eq!(app.auth_input(), "C");
+    drop(app.handle_event(&backspace_press(), now));
+
+    for character in "code".chars() {
+        drop(app.handle_event(&char_press(character), now));
+    }
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::CompleteAuth {
+            attempt_id: "attempt-2".to_owned(),
+            input: "code".to_owned(),
+        })
+    );
+}
+
+fn outbound_auth_snapshot(lifecycle: &str, completion_mode: &str, auth_url: &str) -> ClientSnapshot {
+    let mut snapshot = ready_snapshot();
+    let target = waltr_client::ClientAuthTarget {
+        kind: "mcpServer".to_owned(),
+        key: "remote".to_owned(),
+    };
+    snapshot.auth.pending.push(waltr_client::AuthRequirementSnapshot {
+        target: target.clone(),
+        message: "MCP authorization required".to_owned(),
+        source_session_id: Some("session-a".to_owned()),
+        mcp_authorization: None,
+    });
+    snapshot.auth.active_attempt = Some(waltr_client::AuthAttemptSnapshot {
+        target,
+        attempt_id: "attempt-1".to_owned(),
+        auth_url: auth_url.to_owned(),
+        verification_url: String::new(),
+        user_code: String::new(),
+        expires_at_ms: 1_800_000_000_000,
+        poll_interval_seconds: 1,
+        messages: vec!["Open the authorization page.".to_owned()],
+        completion_mode: completion_mode.to_owned(),
+        registration_method: "dynamic".to_owned(),
+        lifecycle: lifecycle.to_owned(),
+        failure_reason: (lifecycle == "failed").then(|| "safe failure".to_owned()).unwrap_or_default(),
+    });
+    snapshot
+}
+
+#[test]
 fn leader_l_logs_out_through_native_runtime() {
     let mut app = App::new();
     let now = Instant::now();

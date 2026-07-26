@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import type { ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
+import type { AuthAttemptSnapshot, ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
 import { AccessRoute, waltrLoginUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
 import { renderWithAppState } from "../support/render";
 import { ShellRouteWithChildren, testHistory } from "../support/routes";
@@ -141,6 +141,7 @@ describe("Waltr access", () => {
       target: { kind: "provider", key: "claude" },
       message: "Authorize Claude",
       sourceSessionId: null,
+      mcpAuthorization: null,
     }];
     renderWithAppState(() => <ShellRouteWithChildren />, {
       routePath: "/",
@@ -154,6 +155,68 @@ describe("Waltr access", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "Sign in to continue" })).toBeTruthy());
     expect(screen.queryByLabelText("Primary navigation")).toBeNull();
     expect(screen.queryByRole("dialog", { name: "OAuth required" })).toBeNull();
+  });
+
+  test.each([
+    ["pending", "Waiting for the server callback. This dialog updates automatically."],
+    ["completing", "Completing authorization."],
+    ["succeeded", "Authorization succeeded."],
+    ["failed", "Authorization failed."],
+    ["expired", "Authorization expired."],
+    ["canceled", "Authorization canceled."],
+  ])("renders the shared outbound OAuth %s lifecycle", (lifecycle, message) => {
+    const commands: ClientCommand[] = [];
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions",
+      snapshot: outboundAuthSnapshot({ lifecycle, failureReason: lifecycle === "failed" ? "safe failure" : "" }),
+      commands,
+    });
+
+    expect(screen.getByText(message)).toBeTruthy();
+    expect(screen.getByText("Server callback")).toBeTruthy();
+    expect(screen.getByText("Dynamic")).toBeTruthy();
+    expect(screen.getByText("Open authorization URL").getAttribute("href")).toBe("https://auth.example/authorize");
+    expect(screen.queryByPlaceholderText("Paste the final redirect URL or authorization code")).toBeNull();
+    expect(commands.some((command) => command.type === "pollAuthAttempt")).toBe(false);
+  });
+
+  test("cancels live attempts and dismisses terminal attempts with snapshot identity", async () => {
+    const commands: ClientCommand[] = [];
+    let setSnapshot!: (snapshot: ClientSnapshot) => void;
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      snapshot: outboundAuthSnapshot({ lifecycle: "pending", attemptId: "attempt-live" }),
+      commands,
+      onSnapshotSetter: (setter) => { setSnapshot = setter; },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(commands).toContainEqual({ type: "cancelAuth", attemptId: "attempt-live" }));
+
+    setSnapshot(outboundAuthSnapshot({ lifecycle: "failed", attemptId: "attempt-terminal" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(commands).toContainEqual({
+      type: "dismissAuthRequirement",
+      target: { kind: "mcpServer", key: "remote" },
+    }));
+    expect(commands).not.toContainEqual({ type: "cancelAuth", attemptId: "attempt-terminal" });
+  });
+
+  test("rejects unsafe authorization URLs and bounds sanitized failure text", () => {
+    const failure = `line\u0000break${"x".repeat(600)}`;
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      snapshot: outboundAuthSnapshot({
+        lifecycle: "failed",
+        authUrl: "javascript:alert(document.domain)",
+        failureReason: failure,
+      }),
+    });
+
+    expect(screen.queryByRole("link", { name: "Open authorization URL" })).toBeNull();
+    expect(screen.getByText("Authorization URL unavailable.")).toBeTruthy();
+    expect(screen.queryByText("javascript:alert(document.domain)")).toBeNull();
+    const renderedFailure = screen.getAllByRole("alert").map((alert) => alert.textContent).find((text) => text?.startsWith("line break"));
+    expect(renderedFailure).not.toContain("\u0000");
+    expect(renderedFailure!.length).toBe(500);
   });
 
   test("does not flash the protected shell while access is unresolved", () => {
@@ -270,4 +333,30 @@ function accessSnapshot(
 
 function locationParts(pathname: string, search = "", hash = "") {
   return { pathname, search, hash };
+}
+
+function outboundAuthSnapshot(overrides: Partial<AuthAttemptSnapshot> = {}) {
+  const snapshot = accessSnapshot("authenticated");
+  snapshot.auth.pending = [{
+    target: { kind: "mcpServer", key: "remote" },
+    message: "Authorize remote MCP",
+    sourceSessionId: "session-a",
+    mcpAuthorization: null,
+  }];
+  snapshot.auth.activeAttempt = {
+    target: { kind: "mcpServer", key: "remote" },
+    attemptId: "attempt-1",
+    authUrl: "https://auth.example/authorize",
+    verificationUrl: "",
+    userCode: "",
+    expiresAtMs: 1_800_000_000_000n,
+    pollIntervalSeconds: 1,
+    messages: ["Open the authorization page."],
+    completionMode: "serverCallback",
+    registrationMethod: "dynamic",
+    lifecycle: "pending",
+    failureReason: "",
+    ...overrides,
+  };
+  return snapshot;
 }

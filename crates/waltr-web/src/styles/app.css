@@ -220,6 +220,33 @@
   color: var(--color-text-muted);
 }
 
+.oauth-dialog__metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3) var(--space-5);
+  margin: 0;
+}
+
+.oauth-dialog__metadata div {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.oauth-dialog__metadata dt {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.oauth-dialog__metadata dd {
+  margin: 0;
+  font-weight: 700;
+}
+
+.oauth-dialog__url {
+  overflow-wrap: anywhere;
+  color: var(--color-text-muted);
+}
+
 .oauth-dialog__open {
   width: fit-content;
   text-decoration: none;

@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/basic.rs
+expression: rendered
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"             OAuth required                                                     "
+"                                                                                "
+"            Target: MCP server remote                                           "
+"            MCP authorization required                                          "
+"                                                                                "
+"            Status: Pending · Completion: Server callback                       "
+"            Registration: Dynamic                                               "
+"            Waiting for the server callback. This dialog updates                "
+"            automatically.                                                      "
+"            Open the authorization page.                                        "
+"            URL: https://auth.example/authorize                                 "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"             C copy URL · Esc cancel                                            "
+"                                                                                "
+" Ctrl-X q  quit                                                     Waltr  ready "
+"                                                                                "
