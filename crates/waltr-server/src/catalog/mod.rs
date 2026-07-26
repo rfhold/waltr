@@ -7,7 +7,7 @@ use waltr::grpc::waltr::{catalog::v1 as catalog_proto, config::v1 as config_prot
 use std::{
     fmt,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -54,6 +54,9 @@ pub struct CatalogLoader {
     cache_path: PathBuf,
     client: reqwest::Client,
     cached: Arc<Mutex<Option<CachedCatalog>>>,
+    refresh: Arc<CatalogRefreshCoordinator>,
+    #[cfg(test)]
+    refresh_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl CatalogLoader {
@@ -85,38 +88,73 @@ impl CatalogLoader {
             cache_path,
             client: reqwest::Client::new(),
             cached: Arc::new(Mutex::new(None)),
+            refresh: Arc::new(CatalogRefreshCoordinator::default()),
+            #[cfg(test)]
+            refresh_barrier: None,
         }
     }
 
     /// Load the catalog, refreshing stale in-memory entries on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured source and any cache fallback cannot be loaded.
     pub async fn load(&self) -> Result<LoadedCatalog, CatalogLoadError> {
-        let mut cached = self.cached.lock().await;
-        if let Some(cached_catalog) = cached.as_ref()
-            && cached_catalog.loaded_at.elapsed() < CATALOG_FRESHNESS
-        {
-            return Ok(cached_catalog.loaded.clone());
+        if let Some(loaded) = self.fresh_cached().await {
+            return Ok(loaded);
         }
 
-        let loaded = match &self.source {
-            CatalogSource::Path(path) => self.load_path(path).await?,
-            CatalogSource::Url(url) => self.load_url(url).await?,
-        };
-        *cached = Some(CachedCatalog {
-            loaded: loaded.clone(),
-            loaded_at: Instant::now(),
-        });
+        #[cfg(test)]
+        if let Some(barrier) = &self.refresh_barrier {
+            barrier.wait().await;
+        }
 
-        Ok(loaded)
+        match self.refresh.join_or_start() {
+            CatalogRefreshRole::Follower(generation) => generation.wait().await.into_result(),
+            CatalogRefreshRole::Leader(generation) => self.run_refresh_generation(generation).await,
+        }
+    }
+
+    async fn fresh_cached(&self) -> Option<LoadedCatalog> {
+        self.cached
+            .lock()
+            .await
+            .as_ref()
+            .filter(|cached| cached.loaded_at.elapsed() < CATALOG_FRESHNESS)
+            .map(|cached| cached.loaded.clone())
+    }
+
+    async fn run_refresh_generation(
+        &self,
+        generation: Arc<CatalogRefreshGeneration>,
+    ) -> Result<LoadedCatalog, CatalogLoadError> {
+        let leader = CatalogRefreshLeader::new(Arc::clone(&self.refresh), generation);
+        if let Some(loaded) = self.fresh_cached().await {
+            return leader.complete(SharedCatalogRefreshOutcome::Success(loaded));
+        }
+
+        let outcome = match &self.source {
+            CatalogSource::Path(path) => self.load_path(path).await,
+            CatalogSource::Url(url) => self.load_url(url).await,
+        };
+        let shared = match outcome {
+            Ok(loaded) => {
+                *self.cached.lock().await = Some(CachedCatalog {
+                    loaded: loaded.clone(),
+                    loaded_at: Instant::now(),
+                });
+                SharedCatalogRefreshOutcome::Success(loaded)
+            }
+            Err(error) => SharedCatalogRefreshOutcome::Failure(error.into_failure()),
+        };
+        leader.complete(shared)
     }
 
     async fn load_path(&self, path: &PathBuf) -> Result<LoadedCatalog, CatalogLoadError> {
-        let data = tokio::fs::read_to_string(path).await.map_err(|error| {
-            CatalogLoadError::new(format!(
-                "failed to read catalog fixture '{}': {error}",
-                path.display()
-            ))
-        })?;
-        parse_catalog(data, false)
+        let data = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|_| CatalogLoadError::new("read catalog fixture", CatalogFailureKind::Io))?;
+        parse_catalog(&data, false)
     }
 
     async fn load_url(&self, url: &str) -> Result<LoadedCatalog, CatalogLoadError> {
@@ -125,77 +163,679 @@ impl CatalogLoader {
             Err(fetch_error) => match self.load_cached_file().await {
                 Ok(Some(loaded)) => Ok(loaded),
                 Ok(None) => Err(fetch_error),
-                Err(cache_error) => Err(CatalogLoadError::new(format!(
-                    "{fetch_error}; cache fallback failed: {cache_error}"
-                ))),
+                Err(cache_error) => Err(fetch_error.with_fallback(cache_error)),
             },
         }
     }
 
     async fn fetch_and_cache(&self, url: &str) -> Result<LoadedCatalog, CatalogLoadError> {
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| {
-                CatalogLoadError::new(format!("failed to fetch models.dev catalog: {error}"))
-            })?;
-        let data = response.text().await.map_err(|error| {
-            CatalogLoadError::new(format!(
-                "failed to read models.dev catalog response: {error}"
-            ))
+        let endpoint = sanitized_endpoint(url);
+        let response = self.client.get(url).send().await.map_err(|error| {
+            CatalogLoadError::request("fetch models.dev catalog", endpoint.clone(), &error)
         })?;
-        let loaded = parse_catalog(data.clone(), false)?;
+        if !response.status().is_success() {
+            return Err(CatalogLoadError::http(
+                "fetch models.dev catalog",
+                endpoint,
+                response.status().as_u16(),
+            ));
+        }
+        let data = response.text().await.map_err(|_| {
+            CatalogLoadError::endpoint(
+                "read models.dev catalog response",
+                CatalogFailureKind::Body,
+                endpoint,
+            )
+        })?;
+        let loaded = parse_catalog(&data, false)?;
         if let Err(error) = self.write_cache(&data).await {
-            tracing::warn!(%error, path = %self.cache_path.display(), "failed to write catalog cache");
+            tracing::warn!(%error, "failed to write catalog cache");
         }
         Ok(loaded)
     }
 
     async fn load_cached_file(&self) -> Result<Option<LoadedCatalog>, CatalogLoadError> {
         match tokio::fs::read_to_string(&self.cache_path).await {
-            Ok(data) => parse_catalog(data, true).map(Some),
+            Ok(data) => parse_catalog(&data, true).map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(CatalogLoadError::new(format!(
-                "failed to read catalog cache '{}': {error}",
-                self.cache_path.display()
-            ))),
+            Err(_) => Err(CatalogLoadError::new(
+                "read catalog cache",
+                CatalogFailureKind::Io,
+            )),
         }
     }
 
     async fn write_cache(&self, data: &str) -> Result<(), CatalogLoadError> {
         if let Some(parent) = self.cache_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                CatalogLoadError::new(format!(
-                    "failed to create catalog cache directory '{}': {error}",
-                    parent.display()
-                ))
+            tokio::fs::create_dir_all(parent).await.map_err(|_| {
+                CatalogLoadError::new("create catalog cache directory", CatalogFailureKind::Io)
             })?;
         }
 
         let tmp = self.cache_path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, data).await.map_err(|error| {
-            CatalogLoadError::new(format!(
-                "failed to write catalog cache '{}': {error}",
-                tmp.display()
-            ))
-        })?;
+        tokio::fs::write(&tmp, data)
+            .await
+            .map_err(|_| CatalogLoadError::new("write catalog cache", CatalogFailureKind::Io))?;
         tokio::fs::rename(&tmp, &self.cache_path)
             .await
-            .map_err(|error| {
-                CatalogLoadError::new(format!(
-                    "failed to replace catalog cache '{}': {error}",
-                    self.cache_path.display()
-                ))
-            })
+            .map_err(|_| CatalogLoadError::new("replace catalog cache", CatalogFailureKind::Io))
     }
 }
 
-fn parse_catalog(data: String, stale: bool) -> Result<LoadedCatalog, CatalogLoadError> {
-    let catalog = models_dev::ModelCatalog::from_json_str(&data)
-        .map_err(|error| CatalogLoadError::new(format!("failed to parse catalog: {error}")))?;
+#[derive(Debug, Default)]
+struct CatalogRefreshCoordinator {
+    state: StdMutex<CatalogRefreshState>,
+}
+
+#[derive(Debug, Default)]
+struct CatalogRefreshState {
+    next_generation: u64,
+    active: Option<Arc<CatalogRefreshGeneration>>,
+}
+
+impl CatalogRefreshCoordinator {
+    fn join_or_start(&self) -> CatalogRefreshRole {
+        let mut state = self.state.lock().expect("catalog refresh state lock");
+        if let Some(generation) = state.active.clone() {
+            drop(state);
+            return CatalogRefreshRole::Follower(generation);
+        }
+        let id = state.next_generation;
+        state.next_generation = state.next_generation.wrapping_add(1);
+        let generation = Arc::new(CatalogRefreshGeneration::new(id));
+        state.active = Some(Arc::clone(&generation));
+        drop(state);
+        CatalogRefreshRole::Leader(generation)
+    }
+
+    fn complete(
+        &self,
+        generation: &CatalogRefreshGeneration,
+        outcome: SharedCatalogRefreshOutcome,
+    ) {
+        generation.publish(outcome);
+        let mut state = self.state.lock().expect("catalog refresh state lock");
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == generation.id)
+        {
+            state.active = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn active_generation(&self) -> Option<Arc<CatalogRefreshGeneration>> {
+        self.state
+            .lock()
+            .expect("catalog refresh state lock")
+            .active
+            .clone()
+    }
+}
+
+enum CatalogRefreshRole {
+    Leader(Arc<CatalogRefreshGeneration>),
+    Follower(Arc<CatalogRefreshGeneration>),
+}
+
+#[derive(Debug)]
+struct CatalogRefreshGeneration {
+    id: u64,
+    outcome: StdMutex<Option<SharedCatalogRefreshOutcome>>,
+    completed: tokio::sync::Notify,
+    #[cfg(test)]
+    follower_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    follower_joined: tokio::sync::Notify,
+}
+
+impl CatalogRefreshGeneration {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            outcome: StdMutex::new(None),
+            completed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            follower_count: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            follower_joined: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait(&self) -> SharedCatalogRefreshOutcome {
+        #[cfg(test)]
+        {
+            self.follower_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.follower_joined.notify_waiters();
+        }
+        loop {
+            let completed = self.completed.notified();
+            let outcome = self
+                .outcome
+                .lock()
+                .expect("catalog refresh outcome lock")
+                .clone();
+            if let Some(outcome) = outcome {
+                return outcome;
+            }
+            completed.await;
+        }
+    }
+
+    fn publish(&self, outcome: SharedCatalogRefreshOutcome) {
+        let mut published = self.outcome.lock().expect("catalog refresh outcome lock");
+        if published.is_none() {
+            *published = Some(outcome);
+            drop(published);
+            self.completed.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    async fn wait_for_followers(&self, count: usize) {
+        loop {
+            let joined = self.follower_joined.notified();
+            if self
+                .follower_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= count
+            {
+                return;
+            }
+            joined.await;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SharedCatalogRefreshOutcome {
+    Success(LoadedCatalog),
+    Failure(Arc<CatalogFailure>),
+}
+
+impl SharedCatalogRefreshOutcome {
+    fn into_result(self) -> Result<LoadedCatalog, CatalogLoadError> {
+        match self {
+            Self::Success(loaded) => Ok(loaded),
+            Self::Failure(failure) => Err(CatalogLoadError::from_failure(failure)),
+        }
+    }
+}
+
+struct CatalogRefreshLeader {
+    coordinator: Arc<CatalogRefreshCoordinator>,
+    generation: Arc<CatalogRefreshGeneration>,
+    completed: bool,
+}
+
+impl CatalogRefreshLeader {
+    const fn new(
+        coordinator: Arc<CatalogRefreshCoordinator>,
+        generation: Arc<CatalogRefreshGeneration>,
+    ) -> Self {
+        Self {
+            coordinator,
+            generation,
+            completed: false,
+        }
+    }
+
+    fn complete(
+        mut self,
+        outcome: SharedCatalogRefreshOutcome,
+    ) -> Result<LoadedCatalog, CatalogLoadError> {
+        self.coordinator.complete(&self.generation, outcome.clone());
+        self.completed = true;
+        outcome.into_result()
+    }
+}
+
+impl Drop for CatalogRefreshLeader {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.coordinator.complete(
+                &self.generation,
+                SharedCatalogRefreshOutcome::Failure(Arc::new(CatalogFailure::new(
+                    "refresh catalog",
+                    CatalogFailureKind::Canceled,
+                ))),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod loader_tests {
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{Router, extract::State, http::StatusCode, routing::get};
+    use tokio::{
+        sync::{Barrier, Semaphore, mpsc},
+        task::JoinHandle,
+    };
+
+    use super::*;
+
+    const CATALOG: &str = r#"{
+        "test": {
+            "id": "test",
+            "name": "Test Provider",
+            "models": {
+                "model": {
+                    "id": "model",
+                    "name": "Test Model",
+                    "limit": {"context": 1024, "output": 256},
+                    "cost": {"input": 1, "output": 2},
+                    "modalities": {"input": ["text"], "output": ["text"]}
+                }
+            }
+        }
+    }"#;
+
+    #[derive(Clone)]
+    struct CatalogHttpState {
+        count: Arc<AtomicUsize>,
+        entered: mpsc::UnboundedSender<usize>,
+        responses: Arc<Mutex<VecDeque<CatalogHttpResponse>>>,
+    }
+
+    struct CatalogHttpResponse {
+        status: StatusCode,
+        body: &'static str,
+        release: Option<Arc<Semaphore>>,
+    }
+
+    struct CatalogHttpServer {
+        url: String,
+        count: Arc<AtomicUsize>,
+        entered: mpsc::UnboundedReceiver<usize>,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for CatalogHttpServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn catalog_response(State(state): State<CatalogHttpState>) -> (StatusCode, &'static str) {
+        let request = state.count.fetch_add(1, Ordering::SeqCst) + 1;
+        state
+            .entered
+            .send(request)
+            .expect("test receiver remains open");
+        let response = state
+            .responses
+            .lock()
+            .await
+            .pop_front()
+            .expect("test response is configured");
+        if let Some(release) = response.release {
+            release
+                .acquire()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+        }
+        (response.status, response.body)
+    }
+
+    async fn start_catalog_server(responses: Vec<CatalogHttpResponse>) -> CatalogHttpServer {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered) = mpsc::unbounded_channel();
+        let state = CatalogHttpState {
+            count: Arc::clone(&count),
+            entered: entered_tx,
+            responses: Arc::new(Mutex::new(responses.into())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind catalog fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let app = Router::new()
+            .route("/catalog", get(catalog_response))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve catalog fixture");
+        });
+        CatalogHttpServer {
+            url: format!("http://{address}/catalog"),
+            count,
+            entered,
+            task,
+        }
+    }
+
+    async fn concurrent_results(
+        loader: &CatalogLoader,
+        callers: usize,
+    ) -> Vec<Result<LoadedCatalog, CatalogLoadError>> {
+        let mut tasks = Vec::new();
+        for _ in 0..callers {
+            let loader = loader.clone();
+            tasks.push(tokio::spawn(async move { loader.load().await }));
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.expect("join catalog load"));
+        }
+        results
+    }
+
+    fn successful_snapshots(
+        results: Vec<Result<LoadedCatalog, CatalogLoadError>>,
+    ) -> Vec<LoadedCatalog> {
+        results
+            .into_iter()
+            .map(|result| result.expect("load catalog"))
+            .collect()
+    }
+
+    fn assert_same_snapshot(loaded: &[LoadedCatalog], stale: bool) {
+        let first = loaded.first().expect("at least one catalog result");
+        assert!(loaded.iter().all(|loaded| {
+            Arc::ptr_eq(&first.catalog, &loaded.catalog) && first.stale == loaded.stale
+        }));
+        assert_eq!(first.stale, stale);
+    }
+
+    fn assert_equivalent_errors(results: Vec<Result<LoadedCatalog, CatalogLoadError>>) -> String {
+        let errors = results
+            .into_iter()
+            .map(|result| result.expect_err("catalog refresh should fail").to_string())
+            .collect::<Vec<_>>();
+        let first = errors.first().expect("at least one catalog error");
+        assert!(errors.iter().all(|error| error == first));
+        first.clone()
+    }
+
+    async fn wait_for_followers(loader: &CatalogLoader, count: usize) {
+        loader
+            .refresh
+            .active_generation()
+            .expect("active refresh generation")
+            .wait_for_followers(count)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_loads_share_one_refresh() {
+        const CALLERS: usize = 8;
+        let release = Arc::new(Semaphore::new(0));
+        let responses = (0..CALLERS)
+            .map(|index| CatalogHttpResponse {
+                status: StatusCode::OK,
+                body: CATALOG,
+                release: (index == 0).then(|| Arc::clone(&release)),
+            })
+            .collect();
+        let mut server = start_catalog_server(responses).await;
+        let arrivals = Arc::new(Barrier::new(CALLERS + 1));
+        let mut loader = CatalogLoader::new(
+            CatalogSource::Url(server.url.clone()),
+            crate::test_support::temp_root().join("catalog.json"),
+        );
+        loader.refresh_barrier = Some(Arc::clone(&arrivals));
+
+        let loads = tokio::spawn({
+            let loader = loader.clone();
+            async move { concurrent_results(&loader, CALLERS).await }
+        });
+        arrivals.wait().await;
+        assert_eq!(server.entered.recv().await, Some(1));
+        wait_for_followers(&loader, CALLERS - 1).await;
+        release.add_permits(1);
+
+        let snapshots = successful_snapshots(loads.await.expect("join concurrent loads"));
+        assert_same_snapshot(&snapshots, false);
+        assert_eq!(server.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_failures_share_one_error_and_a_later_burst_retries_once() {
+        const CALLERS: usize = 8;
+        let failed_release = Arc::new(Semaphore::new(0));
+        let success_release = Arc::new(Semaphore::new(0));
+        let mut server = start_catalog_server(vec![
+            CatalogHttpResponse {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: "failed",
+                release: Some(Arc::clone(&failed_release)),
+            },
+            CatalogHttpResponse {
+                status: StatusCode::OK,
+                body: CATALOG,
+                release: Some(Arc::clone(&success_release)),
+            },
+        ])
+        .await;
+        let sensitive_url = format!(
+            "{}?token=SENTINEL_QUERY#SENTINEL_FRAGMENT",
+            server
+                .url
+                .replacen("http://", "http://catalog-user:SENTINEL_PASSWORD@", 1)
+        );
+        let arrivals = Arc::new(Barrier::new(CALLERS + 1));
+        let mut loader = CatalogLoader::new(
+            CatalogSource::Url(sensitive_url),
+            crate::test_support::temp_root().join("catalog.json"),
+        );
+        loader.refresh_barrier = Some(Arc::clone(&arrivals));
+
+        let failures = tokio::spawn({
+            let loader = loader.clone();
+            async move { concurrent_results(&loader, CALLERS).await }
+        });
+        arrivals.wait().await;
+        assert_eq!(server.entered.recv().await, Some(1));
+        wait_for_followers(&loader, CALLERS - 1).await;
+        failed_release.add_permits(1);
+        let message = assert_equivalent_errors(failures.await.expect("join failed loads"));
+        assert!(message.contains("failed to fetch models.dev catalog"));
+        assert!(message.contains("(http), HTTP 500"));
+        assert!(message.contains(&server.url));
+        assert!(!message.contains("catalog-user"));
+        assert!(!message.contains("SENTINEL_PASSWORD"));
+        assert!(!message.contains("SENTINEL_QUERY"));
+        assert!(!message.contains("SENTINEL_FRAGMENT"));
+        assert_eq!(server.count.load(Ordering::SeqCst), 1);
+
+        let successes = tokio::spawn({
+            let loader = loader.clone();
+            async move { concurrent_results(&loader, CALLERS).await }
+        });
+        arrivals.wait().await;
+        assert_eq!(server.entered.recv().await, Some(2));
+        wait_for_followers(&loader, CALLERS - 1).await;
+        success_release.add_permits(1);
+        let snapshots = successful_snapshots(successes.await.expect("join successful loads"));
+        assert_same_snapshot(&snapshots, false);
+        assert_eq!(server.count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn leader_cancellation_releases_waiters_without_retry_fanout() {
+        const WAITERS: usize = 8;
+        let canceled_release = Arc::new(Semaphore::new(0));
+        let mut server = start_catalog_server(vec![
+            CatalogHttpResponse {
+                status: StatusCode::OK,
+                body: CATALOG,
+                release: Some(Arc::clone(&canceled_release)),
+            },
+            CatalogHttpResponse {
+                status: StatusCode::OK,
+                body: CATALOG,
+                release: None,
+            },
+        ])
+        .await;
+        let loader = CatalogLoader::new(
+            CatalogSource::Url(server.url.clone()),
+            crate::test_support::temp_root().join("catalog.json"),
+        );
+
+        let leader_task = tokio::spawn({
+            let loader = loader.clone();
+            async move { loader.load().await }
+        });
+        assert_eq!(server.entered.recv().await, Some(1));
+        let waiters = tokio::spawn({
+            let loader = loader.clone();
+            async move { concurrent_results(&loader, WAITERS).await }
+        });
+        wait_for_followers(&loader, WAITERS).await;
+        leader_task.abort();
+        assert!(
+            leader_task
+                .await
+                .expect_err("leader task is canceled")
+                .is_cancelled()
+        );
+
+        let message = assert_equivalent_errors(waiters.await.expect("join waiting loads"));
+        assert_eq!(message, "failed to refresh catalog (canceled)");
+        assert_eq!(server.count.load(Ordering::SeqCst), 1);
+
+        let retried = loader.load().await.expect("retry canceled refresh");
+        assert_eq!(server.entered.recv().await, Some(2));
+        assert!(!retried.stale);
+        canceled_release.add_permits(1);
+        assert_eq!(server.count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_cache_file_fallback_is_shared_by_one_failed_upstream_refresh() {
+        const CALLERS: usize = 8;
+        let release = Arc::new(Semaphore::new(0));
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "failed",
+            release: Some(Arc::clone(&release)),
+        }])
+        .await;
+        let root = crate::test_support::temp_root();
+        let cache_path = root.join("catalog.json");
+        tokio::fs::write(&cache_path, CATALOG)
+            .await
+            .expect("write stale catalog cache");
+        let arrivals = Arc::new(Barrier::new(CALLERS + 1));
+        let mut loader = CatalogLoader::new(CatalogSource::Url(server.url.clone()), cache_path);
+        loader.refresh_barrier = Some(Arc::clone(&arrivals));
+
+        let loads = tokio::spawn({
+            let loader = loader.clone();
+            async move { concurrent_results(&loader, CALLERS).await }
+        });
+        arrivals.wait().await;
+        assert_eq!(server.entered.recv().await, Some(1));
+        wait_for_followers(&loader, CALLERS - 1).await;
+        release.add_permits(1);
+
+        let snapshots = successful_snapshots(loads.await.expect("join fallback loads"));
+        assert_same_snapshot(&snapshots, true);
+        assert_eq!(server.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_cache_hits_bypass_refresh_coordination_and_source() {
+        const CALLERS: usize = 8;
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::OK,
+            body: CATALOG,
+            release: None,
+        }])
+        .await;
+        let loader = CatalogLoader::new(
+            CatalogSource::Url(server.url.clone()),
+            crate::test_support::temp_root().join("catalog.json"),
+        );
+        let primed = loader.load().await.expect("prime catalog cache");
+        assert_eq!(server.entered.recv().await, Some(1));
+
+        let snapshots = successful_snapshots(concurrent_results(&loader, CALLERS).await);
+        assert_same_snapshot(&snapshots, false);
+        assert!(
+            snapshots
+                .iter()
+                .all(|loaded| Arc::ptr_eq(&primed.catalog, &loaded.catalog))
+        );
+        assert_eq!(server.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_file_read_failure_is_shared_without_source_fanout() {
+        const CALLERS: usize = 8;
+        let release = Arc::new(Semaphore::new(0));
+        let mut server = start_catalog_server(vec![CatalogHttpResponse {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: "failed",
+            release: Some(Arc::clone(&release)),
+        }])
+        .await;
+        let root = crate::test_support::temp_root().join("SENTINEL_CACHE_PATH");
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create sensitive cache root");
+        let cache_path = root.join("cache-directory");
+        tokio::fs::create_dir(&cache_path)
+            .await
+            .expect("create cache directory");
+        let arrivals = Arc::new(Barrier::new(CALLERS + 1));
+        let mut loader = CatalogLoader::new(CatalogSource::Url(server.url.clone()), cache_path);
+        loader.refresh_barrier = Some(Arc::clone(&arrivals));
+
+        let loads = tokio::spawn({
+            let loader = loader.clone();
+            async move { concurrent_results(&loader, CALLERS).await }
+        });
+        arrivals.wait().await;
+        assert_eq!(server.entered.recv().await, Some(1));
+        wait_for_followers(&loader, CALLERS - 1).await;
+        release.add_permits(1);
+
+        let message = assert_equivalent_errors(loads.await.expect("join failed cache loads"));
+        assert!(message.contains("cache fallback failed"));
+        assert!(!message.contains("SENTINEL_CACHE_PATH"));
+        assert_eq!(server.count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fixture_read_and_decode_failures_do_not_expose_paths_or_input() {
+        let missing = crate::test_support::temp_root().join("SENTINEL_FIXTURE_PATH/catalog.json");
+        let error = CatalogLoader::from_path(missing)
+            .load()
+            .await
+            .expect_err("missing fixture should fail")
+            .to_string();
+        assert_eq!(error, "failed to read catalog fixture (io)");
+        assert!(!error.contains("SENTINEL_FIXTURE_PATH"));
+
+        let root = crate::test_support::temp_root();
+        let fixture = root.join("catalog.json");
+        tokio::fs::write(&fixture, r#"{"SENTINEL_CATALOG_BODY": }"#)
+            .await
+            .expect("write malformed fixture");
+        let error = CatalogLoader::from_path(fixture)
+            .load()
+            .await
+            .expect_err("malformed fixture should fail")
+            .to_string();
+        assert_eq!(error, "failed to decode catalog (decode)");
+        assert!(!error.contains("SENTINEL_CATALOG_BODY"));
+    }
+}
+
+fn parse_catalog(data: &str, stale: bool) -> Result<LoadedCatalog, CatalogLoadError> {
+    let catalog = models_dev::ModelCatalog::from_json_str(data)
+        .map_err(|_| CatalogLoadError::new("decode catalog", CatalogFailureKind::Decode))?;
     Ok(LoadedCatalog {
         catalog: Arc::new(catalog),
         stale,
@@ -219,25 +859,176 @@ enum CatalogSource {
     Path(PathBuf),
 }
 
+fn sanitized_endpoint(value: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return None;
+    }
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.into())
+}
+
 /// Catalog load failure.
 #[derive(Debug)]
 pub struct CatalogLoadError {
-    message: String,
+    failure: Arc<CatalogFailure>,
 }
 
 impl CatalogLoadError {
-    fn new(message: String) -> Self {
-        Self { message }
+    fn new(operation: &'static str, kind: CatalogFailureKind) -> Self {
+        Self {
+            failure: Arc::new(CatalogFailure::new(operation, kind)),
+        }
+    }
+
+    fn endpoint(
+        operation: &'static str,
+        kind: CatalogFailureKind,
+        endpoint: Option<String>,
+    ) -> Self {
+        Self {
+            failure: Arc::new(CatalogFailure::Detail(CatalogFailureDetail {
+                operation,
+                kind,
+                status: None,
+                endpoint,
+            })),
+        }
+    }
+
+    fn request(operation: &'static str, endpoint: Option<String>, error: &reqwest::Error) -> Self {
+        let kind = if error.is_timeout() {
+            CatalogFailureKind::Timeout
+        } else if error.is_connect() {
+            CatalogFailureKind::Connect
+        } else if error.is_body() {
+            CatalogFailureKind::Body
+        } else if error.is_decode() {
+            CatalogFailureKind::Decode
+        } else {
+            CatalogFailureKind::Request
+        };
+        Self::endpoint(operation, kind, endpoint)
+    }
+
+    fn http(operation: &'static str, endpoint: Option<String>, status: u16) -> Self {
+        Self {
+            failure: Arc::new(CatalogFailure::Detail(CatalogFailureDetail {
+                operation,
+                kind: CatalogFailureKind::Http,
+                status: Some(status),
+                endpoint,
+            })),
+        }
+    }
+
+    fn with_fallback(self, fallback: Self) -> Self {
+        Self {
+            failure: Arc::new(CatalogFailure::Fallback {
+                primary: self.failure,
+                fallback: fallback.failure,
+            }),
+        }
+    }
+
+    fn into_failure(self) -> Arc<CatalogFailure> {
+        self.failure
+    }
+
+    const fn from_failure(failure: Arc<CatalogFailure>) -> Self {
+        Self { failure }
     }
 }
 
 impl fmt::Display for CatalogLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        self.failure.fmt(formatter)
     }
 }
 
 impl std::error::Error for CatalogLoadError {}
+
+#[derive(Debug)]
+enum CatalogFailure {
+    Detail(CatalogFailureDetail),
+    Fallback {
+        primary: Arc<Self>,
+        fallback: Arc<Self>,
+    },
+}
+
+impl CatalogFailure {
+    const fn new(operation: &'static str, kind: CatalogFailureKind) -> Self {
+        Self::Detail(CatalogFailureDetail {
+            operation,
+            kind,
+            status: None,
+            endpoint: None,
+        })
+    }
+}
+
+impl fmt::Display for CatalogFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Detail(detail) => detail.fmt(formatter),
+            Self::Fallback { primary, fallback } => {
+                write!(formatter, "{primary}; cache fallback failed: {fallback}")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CatalogFailureDetail {
+    operation: &'static str,
+    kind: CatalogFailureKind,
+    status: Option<u16>,
+    endpoint: Option<String>,
+}
+
+impl fmt::Display for CatalogFailureDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "failed to {} ({})", self.operation, self.kind)?;
+        if let Some(status) = self.status {
+            write!(formatter, ", HTTP {status}")?;
+        }
+        if let Some(endpoint) = &self.endpoint {
+            write!(formatter, " at {endpoint}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum CatalogFailureKind {
+    Timeout,
+    Connect,
+    Request,
+    Http,
+    Body,
+    Decode,
+    Io,
+    Canceled,
+}
+
+impl fmt::Display for CatalogFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Request => "request",
+            Self::Http => "http",
+            Self::Body => "body",
+            Self::Decode => "decode",
+            Self::Io => "io",
+            Self::Canceled => "canceled",
+        })
+    }
+}
 
 /// gRPC catalog service backed by the shared configuration store.
 #[derive(Debug)]
