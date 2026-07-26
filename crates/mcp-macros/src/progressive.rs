@@ -7,8 +7,9 @@ use syn::{
     parse::Parser as _, punctuated::Punctuated,
 };
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn expand_progressive_server(
-    args: ProgressiveArgs,
+    args: &ProgressiveArgs,
     mut input: ItemImpl,
 ) -> syn::Result<TokenStream2> {
     let self_ty = input.self_ty.clone();
@@ -36,18 +37,20 @@ pub(crate) fn expand_progressive_server(
         method.attrs = retained_attrs;
     }
 
-    validate_progressive_parts(&args, &actions, &workflows)?;
+    validate_progressive_parts(args, &actions, &workflows)?;
 
     let handler_impl = handler_impl(
-        &args,
+        args,
         &self_ty,
         &impl_generics,
         where_clause,
-        &actions,
-        &workflows,
+        ProgressiveParts {
+            actions: &actions,
+            workflows: &workflows,
+        },
     );
     let helpers_impl = helpers_impl(
-        &args,
+        args,
         &self_ty,
         &impl_generics,
         where_clause,
@@ -68,9 +71,9 @@ fn handler_impl(
     self_ty: &Type,
     impl_generics: &syn::ImplGenerics<'_>,
     where_clause: Option<&syn::WhereClause>,
-    actions: &[ProgressiveAction],
-    workflows: &[ProgressiveWorkflow],
+    parts: ProgressiveParts<'_>,
 ) -> TokenStream2 {
+    let ProgressiveParts { actions, workflows } = parts;
     let server_info = server_info_impl(args);
     let capabilities = capabilities_impl(actions, workflows);
     let instructions = instructions_impl(args);
@@ -362,7 +365,7 @@ fn read_resource_impl(
 ) -> TokenStream2 {
     let resource_branches = actions.iter().filter_map(|action| {
         let uri = action.attr.resource.as_ref()?;
-        let call = action_resource_call(action, quote! { uri.clone() });
+        let call = action_resource_call(action, &quote! { uri.clone() });
         Some(quote! {
             if uri == #uri {
                 return #call;
@@ -371,7 +374,7 @@ fn read_resource_impl(
     });
     let template_branches = actions.iter().filter_map(|action| {
         let uri_template = action.attr.resource_template.as_ref()?;
-        let call = action_template_resource_call(action, uri_template, quote! { uri.clone() });
+        let call = action_template_resource_call(action, uri_template, &quote! { uri.clone() });
         Some(quote! {
             if ::mcp::progressive::template_bindings(#uri_template, &uri).is_some() {
                 return #call;
@@ -415,6 +418,7 @@ fn helpers_impl(
 
 fn router_helpers_impl() -> TokenStream2 {
     quote! {
+        #[doc = "Build a Streamable HTTP router for this progressive server."]
         pub fn streamable_http_router(self) -> ::mcp::server::StreamableHttpRouter
         where
             Self: Sized + ::mcp::server::ServerHandler,
@@ -448,6 +452,7 @@ fn auth_helpers_impl(args: &ProgressiveArgs, method: &ImplItemFn) -> TokenStream
     });
 
     quote! {
+        #[doc = "Build protected-resource metadata using this server's declared authorization settings."]
         pub fn protected_resource_metadata(
             resource: impl Into<String>,
             authorization_servers: impl IntoIterator<Item = impl Into<String>>,
@@ -458,6 +463,7 @@ fn auth_helpers_impl(args: &ProgressiveArgs, method: &ImplItemFn) -> TokenStream
             metadata
         }
 
+        #[doc = "Build Streamable HTTP options with this server's token validator."]
         pub fn streamable_http_options(
             &self,
             metadata: ::mcp::McpProtectedResourceMetadata,
@@ -471,6 +477,7 @@ fn auth_helpers_impl(args: &ProgressiveArgs, method: &ImplItemFn) -> TokenStream
             Ok(::mcp::server::StreamableHttpOptions::default().with_authorization(authorization))
         }
 
+        #[doc = "Build an authorized Streamable HTTP router for this server."]
         pub fn streamable_http_router_with_auth(
             self,
             metadata: ::mcp::McpProtectedResourceMetadata,
@@ -495,20 +502,24 @@ fn exec_input_schema_expr(
     let workflow_names = workflows.iter().map(|workflow| &workflow.name);
     let inputs = actions.iter().map(|action| {
         let name = &action.name;
-        match &action.call.input_ty {
-            Some(input_ty) => quote! {
-                ::mcp::progressive::ActionInputSchema {
-                    action: #name,
-                    schema: Some(::mcp::progressive::json_schema_for::<#input_ty>()),
+        action.call.input_ty.as_ref().map_or_else(
+            || {
+                quote! {
+                    ::mcp::progressive::ActionInputSchema {
+                        action: #name,
+                        schema: None,
+                    }
                 }
             },
-            None => quote! {
-                ::mcp::progressive::ActionInputSchema {
-                    action: #name,
-                    schema: None,
+            |input_ty| {
+                quote! {
+                    ::mcp::progressive::ActionInputSchema {
+                        action: #name,
+                        schema: Some(::mcp::progressive::json_schema_for::<#input_ty>()),
+                    }
                 }
             },
-        }
+        )
     });
     quote! {
         ::mcp::progressive::exec_input_schema(
@@ -543,7 +554,7 @@ fn namespace_help_expr(
     let namespace_value = namespace_expr(namespace);
     let action_values = actions
         .iter()
-        .filter(|action| action.namespace == namespace.name.to_string())
+        .filter(|action| namespace.name == action.namespace)
         .map(action_help_expr);
     quote! {
         {
@@ -588,10 +599,10 @@ fn action_help_expr(action: &ProgressiveAction) -> TokenStream2 {
     let guidance = &action.docs.guidance;
     let resource = optional_litstr_expr(action.attr.resource.as_ref());
     let resource_template = optional_litstr_expr(action.attr.resource_template.as_ref());
-    let input_schema = match &action.call.input_ty {
-        Some(input_ty) => quote! { Some(::mcp::progressive::json_schema_for::<#input_ty>()) },
-        None => quote! { None },
-    };
+    let input_schema = action.call.input_ty.as_ref().map_or_else(
+        || quote! { None },
+        |input_ty| quote! { Some(::mcp::progressive::json_schema_for::<#input_ty>()) },
+    );
     quote! {
         ::mcp::progressive::ProgressiveActionHelp {
             name: #name,
@@ -622,8 +633,8 @@ fn workflows_help_vec_expr(workflows: &[ProgressiveWorkflow]) -> TokenStream2 {
 }
 
 fn action_tool_call(action: &ProgressiveAction) -> TokenStream2 {
-    let invocation = action_invocation(action, quote! { input }, quote! { context });
-    let input_prepare = action_input_prepare(action, quote! { request.input });
+    let invocation = action_invocation(action, &quote! { input }, &quote! { context });
+    let input_prepare = action_input_prepare(action, &quote! { request.input });
     quote! {
         {
             #input_prepare
@@ -636,8 +647,8 @@ fn action_tool_call(action: &ProgressiveAction) -> TokenStream2 {
     }
 }
 
-fn action_resource_call(action: &ProgressiveAction, uri: TokenStream2) -> TokenStream2 {
-    let invocation = action_invocation(action, quote! { () }, quote! { context });
+fn action_resource_call(action: &ProgressiveAction, uri: &TokenStream2) -> TokenStream2 {
+    let invocation = action_invocation(action, &quote! { () }, &quote! { context });
     let input_prepare = quote! { let input = (); };
     quote! {
         {
@@ -654,13 +665,14 @@ fn action_resource_call(action: &ProgressiveAction, uri: TokenStream2) -> TokenS
 fn action_template_resource_call(
     action: &ProgressiveAction,
     uri_template: &LitStr,
-    uri: TokenStream2,
+    uri: &TokenStream2,
 ) -> TokenStream2 {
     let action_name = action.name.value();
     let namespace = &action.namespace;
-    let invocation = action_invocation(action, quote! { input }, quote! { context });
-    let input_prepare = match &action.call.input_ty {
-        Some(input_ty) => quote! {
+    let invocation = action_invocation(action, &quote! { input }, &quote! { context });
+    let input_prepare = action.call.input_ty.as_ref().map_or_else(
+        || quote! { let input = (); },
+        |input_ty| quote! {
             let Some(bindings) = ::mcp::progressive::template_bindings(#uri_template, &uri) else {
                 return Box::pin(async move { Err(::mcp::server::ServerError::resource_not_found(uri)) });
             };
@@ -673,8 +685,7 @@ fn action_template_resource_call(
                 Err(error) => return Box::pin(async move { Err(error) }),
             };
         },
-        None => quote! { let input = (); },
-    };
+    );
     quote! {
         {
             #input_prepare
@@ -690,7 +701,7 @@ fn action_template_resource_call(
 fn workflow_load_call(workflows: &[ProgressiveWorkflow]) -> TokenStream2 {
     let branches = workflows.iter().map(|workflow| {
         let name = &workflow.name;
-        let call = workflow_string_future(workflow, quote! { context });
+        let call = workflow_string_future(workflow, &quote! { context });
         quote! {
             #name => {
                 let future = #call;
@@ -717,7 +728,7 @@ fn workflow_load_call(workflows: &[ProgressiveWorkflow]) -> TokenStream2 {
 }
 
 fn workflow_prompt_call(workflow: &ProgressiveWorkflow) -> TokenStream2 {
-    let call = workflow_string_future(workflow, quote! { context });
+    let call = workflow_string_future(workflow, &quote! { context });
     quote! {
         {
             let future = #call;
@@ -735,7 +746,7 @@ fn workflow_resource_call(
 ) -> TokenStream2 {
     let branches = workflows.iter().map(|workflow| {
         let name = &workflow.name;
-        let call = workflow_string_future(workflow, quote! { context });
+        let call = workflow_string_future(workflow, &quote! { context });
         quote! {
             #name => {
                 let future = #call;
@@ -757,11 +768,17 @@ fn workflow_resource_call(
     }
 }
 
-fn action_input_prepare(action: &ProgressiveAction, input: TokenStream2) -> TokenStream2 {
+fn action_input_prepare(action: &ProgressiveAction, input: &TokenStream2) -> TokenStream2 {
     let action_name = action.name.value();
     let namespace = &action.namespace;
-    match &action.call.input_ty {
-        Some(input_ty) => quote! {
+    action.call.input_ty.as_ref().map_or_else(
+        || quote! {
+            if let Err(error) = ::mcp::progressive::ensure_no_action_input(#action_name, #input) {
+                return Box::pin(async move { Err(error) });
+            }
+            let input = ();
+        },
+        |input_ty| quote! {
             let input = match ::mcp::progressive::deserialize_action_input::<#input_ty>(
                 #action_name,
                 #namespace,
@@ -771,19 +788,13 @@ fn action_input_prepare(action: &ProgressiveAction, input: TokenStream2) -> Toke
                 Err(error) => return Box::pin(async move { Err(error) }),
             };
         },
-        None => quote! {
-            if let Err(error) = ::mcp::progressive::ensure_no_action_input(#action_name, #input) {
-                return Box::pin(async move { Err(error) });
-            }
-            let input = ();
-        },
-    }
+    )
 }
 
 fn action_invocation(
     action: &ProgressiveAction,
-    input: TokenStream2,
-    context: TokenStream2,
+    input: &TokenStream2,
+    context: &TokenStream2,
 ) -> TokenStream2 {
     let ident = &action.method.sig.ident;
     let await_token = action.method.sig.asyncness.map(|_| quote! { .await });
@@ -802,10 +813,10 @@ fn action_invocation(
     }
 }
 
-fn workflow_string_future(workflow: &ProgressiveWorkflow, context: TokenStream2) -> TokenStream2 {
+fn workflow_string_future(workflow: &ProgressiveWorkflow, context: &TokenStream2) -> TokenStream2 {
     let ident = &workflow.method.sig.ident;
     let await_token = workflow.method.sig.asyncness.map(|_| quote! { .await });
-    let args = method_call_args(&workflow.call, quote! { () }, context);
+    let args = method_call_args(&workflow.call, &quote! { () }, context);
     if workflow.call.has_receiver {
         quote! {
             {
@@ -820,7 +831,11 @@ fn workflow_string_future(workflow: &ProgressiveWorkflow, context: TokenStream2)
     }
 }
 
-fn method_call_args(call: &MethodCall, input: TokenStream2, context: TokenStream2) -> TokenStream2 {
+fn method_call_args(
+    call: &MethodCall,
+    input: &TokenStream2,
+    context: &TokenStream2,
+) -> TokenStream2 {
     match (call.input_ty.is_some(), call.takes_context) {
         (true, true) => quote! { #input, #context },
         (true, false) => quote! { #input },
@@ -856,17 +871,14 @@ fn token_validator_closure(method: &ImplItemFn) -> TokenStream2 {
 }
 
 fn optional_string_expr(expr: Option<&Expr>) -> TokenStream2 {
-    match expr {
-        Some(expr) => quote! { Some(::std::string::String::from(#expr)) },
-        None => quote! { None::<String> },
-    }
+    expr.map_or_else(
+        || quote! { None::<String> },
+        |expr| quote! { Some(::std::string::String::from(#expr)) },
+    )
 }
 
 fn optional_litstr_expr(value: Option<&LitStr>) -> TokenStream2 {
-    match value {
-        Some(value) => quote! { Some(#value) },
-        None => quote! { None },
-    }
+    value.map_or_else(|| quote! { None }, |value| quote! { Some(#value) })
 }
 
 fn helper_attr_name(attr: &Attribute) -> Option<String> {
@@ -942,6 +954,12 @@ struct ProgressiveAction {
     call: MethodCall,
 }
 
+#[derive(Clone, Copy)]
+struct ProgressiveParts<'a> {
+    actions: &'a [ProgressiveAction],
+    workflows: &'a [ProgressiveWorkflow],
+}
+
 impl ProgressiveAction {
     fn from_method(method: &ImplItemFn, attr: &Attribute) -> syn::Result<Self> {
         let attr = ActionAttr::from_attr(attr)?;
@@ -970,7 +988,7 @@ impl ProgressiveAction {
         })
     }
 
-    fn exposes_resource(&self) -> bool {
+    const fn exposes_resource(&self) -> bool {
         self.attr.resource.is_some() || self.attr.resource_template.is_some()
     }
 }
@@ -1168,6 +1186,7 @@ impl DocComment {
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct ProgressiveArgs {
     name: Expr,
     version: Expr,
