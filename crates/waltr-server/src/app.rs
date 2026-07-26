@@ -9,6 +9,7 @@ use crate::{
     catalog::{CatalogLoader, CatalogService},
     config::{ConfigError, ConfigHandle},
     config_service::ConfigService,
+    mcp_oauth::{McpOAuthConfig, McpOAuthConfigError, McpOAuthError, McpOAuthServer},
     mcp_service::WaltrMcpServer,
     persistence::{Persistence, PersistenceError},
     session,
@@ -42,11 +43,19 @@ struct HealthResponse {
 }
 
 #[derive(Clone, Debug)]
-struct Readiness(Persistence);
+struct Readiness {
+    persistence: Persistence,
+    oauth: Option<McpOAuthServer>,
+}
 
 impl Readiness {
     async fn response(self) -> axum::response::Response {
-        if self.0.ready().await.is_ok() {
+        let ready = self.persistence.ready().await.is_ok()
+            && match self.oauth {
+                Some(oauth) => oauth.ready().await.is_ok(),
+                None => true,
+            };
+        if ready {
             Json(HealthResponse { status: "ready" }).into_response()
         } else {
             axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -58,6 +67,7 @@ impl Readiness {
 pub struct ServerApplication {
     router: Router,
     mcp_cleanup: McpSessionCleanupTask,
+    oauth_maintenance: Option<McpOAuthMaintenanceTask>,
 }
 
 impl fmt::Debug for ServerApplication {
@@ -69,10 +79,15 @@ impl fmt::Debug for ServerApplication {
 }
 
 impl ServerApplication {
-    fn new(router: Router, store: Arc<dyn mcp::server::StreamableHttpSessionStore>) -> Self {
+    fn new(
+        router: Router,
+        store: Arc<dyn mcp::server::StreamableHttpSessionStore>,
+        oauth: Option<McpOAuthServer>,
+    ) -> Self {
         Self {
             router,
             mcp_cleanup: McpSessionCleanupTask::spawn(store, MCP_CLEANUP_INTERVAL),
+            oauth_maintenance: oauth.map(McpOAuthMaintenanceTask::spawn),
         }
     }
 
@@ -85,9 +100,12 @@ impl ServerApplication {
     /// Cancel and join all server-owned background work.
     pub async fn shutdown(self) {
         self.mcp_cleanup.shutdown().await;
+        if let Some(task) = self.oauth_maintenance {
+            task.shutdown().await;
+        }
     }
 
-    /// Bind the listener, shutting down background work if startup fails.
+    /// Bind the server listener, shutting down background work if startup fails.
     ///
     /// # Errors
     ///
@@ -124,10 +142,11 @@ impl ServerApplication {
                 cancellation,
                 task: Some(task),
             },
+            oauth_maintenance: None,
         }
     }
 
-    /// Serve until the listener fails or shutdown resolves, then join background work.
+    /// Serve until the listener fails or the shutdown signal resolves, then join background work.
     ///
     /// # Errors
     ///
@@ -143,8 +162,12 @@ impl ServerApplication {
         let Self {
             router,
             mcp_cleanup,
+            oauth_maintenance,
         } = self;
         let cancellation = mcp_cleanup.cancellation.clone();
+        let oauth_cancellation = oauth_maintenance
+            .as_ref()
+            .map(|task| task.cancellation.clone());
         let result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -152,9 +175,15 @@ impl ServerApplication {
         .with_graceful_shutdown(async move {
             shutdown.await;
             cancellation.cancel();
+            if let Some(cancellation) = oauth_cancellation {
+                cancellation.cancel();
+            }
         })
         .await;
         mcp_cleanup.shutdown().await;
+        if let Some(task) = oauth_maintenance {
+            task.shutdown().await;
+        }
         result
     }
 }
@@ -216,6 +245,64 @@ impl Drop for McpSessionCleanupTask {
     }
 }
 
+struct McpOAuthMaintenanceTask {
+    cancellation: CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl McpOAuthMaintenanceTask {
+    fn spawn(server: McpOAuthServer) -> Self {
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let health_server = server.clone();
+        let task = tokio::spawn(async move {
+            struct HealthGuard(McpOAuthServer);
+            impl Drop for HealthGuard {
+                fn drop(&mut self) {
+                    self.0.mark_maintenance_unhealthy();
+                }
+            }
+            let _health = HealthGuard(health_server);
+            let mut cleanup = tokio::time::interval(crate::mcp_oauth::oauth_cleanup_interval());
+            cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut rotation = tokio::time::interval(crate::mcp_oauth::signing_rotation_interval());
+            rotation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            cleanup.tick().await;
+            rotation.tick().await;
+            loop {
+                let rotate = tokio::select! {
+                    biased;
+                    () = task_cancellation.cancelled() => return,
+                    _ = rotation.tick() => true,
+                    _ = cleanup.tick() => false,
+                };
+                if let Err(error) = server.maintain(rotate).await {
+                    tracing::warn!(%error, rotate, "MCP OAuth maintenance failed");
+                }
+            }
+        });
+        Self {
+            cancellation,
+            task: Some(task),
+        }
+    }
+
+    async fn shutdown(mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take()
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "MCP OAuth maintenance task failed to join");
+        }
+    }
+}
+
+impl Drop for McpOAuthMaintenanceTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
 /// Failure to construct the environment-owned application.
 pub enum BuildAppError {
     /// Filesystem-backed configuration could not start.
@@ -232,6 +319,10 @@ pub enum BuildAppError {
     AccessAuthDiscovery(AccessAuthError),
     /// Access-authentication persistence could not initialize.
     AccessAuthStore(AccessAuthError),
+    /// MCP OAuth environment configuration is invalid.
+    McpOAuthConfig(McpOAuthConfigError),
+    /// MCP OAuth persistence, wrapping keys, or signing state could not initialize.
+    McpOAuth(McpOAuthError),
 }
 
 impl fmt::Debug for BuildAppError {
@@ -258,6 +349,8 @@ impl fmt::Display for BuildAppError {
             Self::AccessAuthStore(_) => {
                 formatter.write_str("failed to initialize access authentication persistence")
             }
+            Self::McpOAuthConfig(_) => formatter.write_str("MCP OAuth configuration is invalid"),
+            Self::McpOAuth(_) => formatter.write_str("failed to initialize MCP OAuth server"),
         }
     }
 }
@@ -271,6 +364,8 @@ impl Error for BuildAppError {
             Self::AccessAuthConfig(error) => Some(error),
             Self::AccessAuthClient(error) => Some(error),
             Self::AccessAuthDiscovery(error) | Self::AccessAuthStore(error) => Some(error),
+            Self::McpOAuthConfig(error) => Some(error),
+            Self::McpOAuth(error) => Some(error),
         }
     }
 }
@@ -288,6 +383,8 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
     let config_service = ConfigService::from_current_dir().map_err(BuildAppError::Config)?;
     let access_auth_config =
         AccessAuthConfig::from_env().map_err(BuildAppError::AccessAuthConfig)?;
+    let mcp_oauth_config =
+        McpOAuthConfig::from_env(&access_auth_config).map_err(BuildAppError::McpOAuthConfig)?;
     let access_auth_client = AccessAuthHttpClient::build(
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -301,17 +398,26 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
                 AccessAuthError::Persistence(_) => BuildAppError::AccessAuthStore(error),
                 _ => BuildAppError::AccessAuthDiscovery(error),
             })?;
+    let mcp_oauth = match mcp_oauth_config {
+        McpOAuthConfig::Disabled => None,
+        McpOAuthConfig::Enabled(config) => Some(
+            McpOAuthServer::initialize(config, &persistence, access_authenticator.clone())
+                .await
+                .map_err(BuildAppError::McpOAuth)?,
+        ),
+    };
     let mut session_storage = Ok(());
-    let app = build_app_with_access_authenticator(
+    let router = build_app_with_access_authenticator_and_mcp_oauth(
         config_service,
         persistence,
         access_authenticator,
+        mcp_oauth,
         |grpc_routes, config, credential_store| {
             session_storage = session::add_service_from_env(grpc_routes, config, credential_store);
         },
     );
     session_storage.map_err(BuildAppError::SessionStorage)?;
-    Ok(app)
+    Ok(router)
 }
 
 /// Build the Axum application using an explicit config service.
@@ -362,11 +468,33 @@ pub fn build_app_with_access_authenticator<F>(
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
-    build_app_with_catalog_loader_and_access_authenticator(
+    build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
         persistence,
         CatalogLoader::from_env(),
         access_authenticator,
+        None,
+        add_session_service,
+    )
+}
+
+/// Build the application with initialized access authentication and hosted MCP OAuth.
+pub fn build_app_with_access_authenticator_and_mcp_oauth<F>(
+    config_service: Arc<ConfigService>,
+    persistence: Persistence,
+    access_authenticator: AccessAuthenticator,
+    mcp_oauth: Option<McpOAuthServer>,
+    add_session_service: F,
+) -> ServerApplication
+where
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+{
+    build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
+        config_service,
+        persistence,
+        CatalogLoader::from_env(),
+        access_authenticator,
+        mcp_oauth,
         add_session_service,
     )
 }
@@ -391,6 +519,10 @@ where
 }
 
 /// Build the Axum application using explicit services, catalog, and access authentication.
+///
+/// # Panics
+///
+/// Panics if enabled access authentication produces invalid MCP authorization metadata.
 #[allow(
     clippy::needless_pass_by_value,
     clippy::too_many_lines,
@@ -406,6 +538,38 @@ pub fn build_app_with_catalog_loader_and_access_authenticator<F>(
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
+    build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
+        config_service,
+        persistence,
+        catalog_loader,
+        access_authenticator,
+        None,
+        add_session_service,
+    )
+}
+
+/// Build the application with explicit catalog, access auth, and hosted MCP OAuth.
+///
+/// # Panics
+///
+/// Panics only if initialized hosted OAuth metadata violates the generic MCP contract.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "router assembly consumes initialized services in dependency order"
+)]
+pub fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth<F>(
+    config_service: Arc<ConfigService>,
+    persistence: Persistence,
+    catalog_loader: CatalogLoader,
+    access_authenticator: AccessAuthenticator,
+    mcp_oauth: Option<McpOAuthServer>,
+    add_session_service: F,
+) -> ServerApplication
+where
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+{
     tracing::debug!("building app router");
     let config = ConfigHandle::watching(
         config_service.store().clone(),
@@ -415,14 +579,36 @@ where
     let auth_service = AuthService::new(config_service.store().clone(), credential_store.clone());
     let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
     let mcp_session_store = persistence.mcp_session_store();
-    let readiness = Readiness(persistence);
-    let mcp_router = if access_authenticator.enabled() {
-        Router::new().route("/mcp", any(service_unavailable))
+    let readiness = Readiness {
+        persistence: persistence.clone(),
+        oauth: mcp_oauth.clone(),
+    };
+    // Waltr has no browser MCP client, so the generic empty Origin allowlist stays in force.
+    let mut mcp_options = mcp::server::StreamableHttpOptions::default()
+        .with_session_store(Arc::clone(&mcp_session_store))
+        .without_root_protected_resource_metadata();
+    if let Some(oauth) = &mcp_oauth {
+        let required_scopes = oauth.required_scopes().to_vec();
+        let metadata = mcp::McpProtectedResourceMetadata::new(oauth.resource(), [oauth.issuer()])
+            .with_scopes(required_scopes.clone())
+            .with_resource_name("Waltr MCP");
+        let hosted = oauth.authorization().clone();
+        let authorization =
+            mcp::server::StreamableHttpAuthorization::hosted(metadata, move |token, context| {
+                hosted.authorize_token(token, context)
+            })
+            .expect("hosted OAuth should produce valid MCP metadata")
+            .with_required_scopes(required_scopes);
+        mcp_options = mcp_options.with_authorization(authorization);
+    }
+    let mcp_router = if access_authenticator.enabled() && mcp_oauth.is_none() {
+        Router::new()
+            .route("/mcp", any(service_unavailable))
+            .route("/.well-known/oauth-protected-resource/mcp", get(not_found))
     } else {
         mcp::server::streamable_http_router_with_options(
             Arc::new(WaltrMcpServer::new(Arc::clone(&config_service))),
-            mcp::server::StreamableHttpOptions::default()
-                .with_session_store(Arc::clone(&mcp_session_store)),
+            mcp_options,
         )
     };
     let mut grpc_routes = Routes::builder();
@@ -454,6 +640,16 @@ where
         )
         .merge(access_authenticator.router())
         .merge(mcp_router);
+    let router = if let Some(oauth) = &mcp_oauth {
+        router.merge(oauth.router())
+    } else {
+        router
+            .route(
+                "/.well-known/oauth-authorization-server/oauth",
+                get(not_found),
+            )
+            .route("/oauth/{*path}", any(not_found))
+    };
     #[cfg(feature = "web")]
     let router = {
         let browser_auth = middleware::from_fn_with_state(
@@ -478,7 +674,7 @@ where
     let router = router
         .fallback_service(grpc)
         .layer(TraceLayer::new_for_http().make_span_with(request_span));
-    ServerApplication::new(router, mcp_session_store)
+    ServerApplication::new(router, mcp_session_store, mcp_oauth)
 }
 
 fn request_span<B>(request: &Request<B>) -> tracing::Span {
@@ -494,6 +690,10 @@ fn request_trace_fields<B>(request: &Request<B>) -> (&axum::http::Method, &str) 
 async fn health() -> Json<HealthResponse> {
     tracing::trace!("health check requested");
     Json(HealthResponse { status: "ok" })
+}
+
+async fn not_found() -> axum::response::Response {
+    axum::http::StatusCode::NOT_FOUND.into_response()
 }
 
 async fn service_unavailable() -> axum::response::Response {

@@ -22,5 +22,5 @@ pub use service::{AccessAuthError, AccessAuthenticator, RequestAuthFailure};
 pub use store::{
     AccessAuthStore, AccessAuthStoreError, ActiveBrowserSession, BrowserSession,
     BrowserSessionTokenDigest, CleanupResult, ConsumedLoginAttempt, LoginAttempt,
-    LoginCorrelationDigest, LoginStateDigest, MAX_ACTIVE_LOGIN_ATTEMPTS,
+    LoginCorrelationDigest, LoginStateDigest, MAX_ACTIVE_LOGIN_ATTEMPTS, McpOAuthLoginContinuation,
 };

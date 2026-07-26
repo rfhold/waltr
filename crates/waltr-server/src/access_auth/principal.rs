@@ -1,5 +1,8 @@
 use std::{collections::BTreeSet, fmt, time::SystemTime};
 
+use mcp::McpPrincipalId;
+use sha2::{Digest as _, Sha256};
+
 use super::{
     AccessAuthStore, BrowserSessionTokenDigest,
     lease::{LeaseMonitor, PrincipalLease, RevocationSignal},
@@ -148,11 +151,36 @@ impl AuthenticatedPrincipal {
         self.scopes.contains(scope)
     }
 
+    /// Derive the stable, domain-separated owner used for MCP sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a fixed-format SHA-256 identifier violates the MCP identifier contract.
+    #[must_use]
+    pub fn mcp_principal_id(&self) -> McpPrincipalId {
+        use fmt::Write as _;
+
+        let mut digest = Sha256::new();
+        digest.update(b"waltr:mcp-principal:v1\0");
+        update_length_prefixed(&mut digest, self.issuer.as_bytes());
+        update_length_prefixed(&mut digest, self.subject.as_bytes());
+        let mut principal_id = String::from("waltr-v1:");
+        for byte in digest.finalize() {
+            write!(&mut principal_id, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        McpPrincipalId::new(principal_id).expect("SHA-256 principal identifiers are always valid")
+    }
+
     /// Return the validated bearer-token expiry, when this is bearer evidence.
     #[must_use]
     pub const fn bearer_expires_at(&self) -> Option<SystemTime> {
         self.lease.bearer_expires_at()
     }
+}
+
+fn update_length_prefixed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
 }
 
 #[cfg(test)]
@@ -177,6 +205,45 @@ mod tests {
         assert_eq!(principal.scopes().collect::<Vec<_>>(), ["read", "write"]);
         assert!(principal.has_scope("read"));
         assert!(principal.lease_monitor().is_none());
+    }
+
+    #[test]
+    fn mcp_principal_is_stable_and_unambiguous_for_issuer_and_subject() {
+        let principal = AuthenticatedPrincipal::bearer(
+            "https://issuer.example",
+            "subject",
+            ["mcp:use".to_owned()],
+            SystemTime::UNIX_EPOCH,
+        );
+        let refreshed = AuthenticatedPrincipal::bearer(
+            "https://issuer.example",
+            "subject",
+            ["step-up".to_owned()],
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60),
+        );
+        let different_issuer = AuthenticatedPrincipal::bearer(
+            "https://other.example",
+            "subject",
+            Vec::<String>::new(),
+            SystemTime::UNIX_EPOCH,
+        );
+        let ambiguous_pair = AuthenticatedPrincipal::bearer(
+            "https://issuer.example/subject",
+            "",
+            Vec::<String>::new(),
+            SystemTime::UNIX_EPOCH,
+        );
+
+        assert_eq!(principal.mcp_principal_id(), refreshed.mcp_principal_id());
+        assert_ne!(
+            principal.mcp_principal_id(),
+            different_issuer.mcp_principal_id()
+        );
+        assert_ne!(
+            principal.mcp_principal_id(),
+            ambiguous_pair.mcp_principal_id()
+        );
+        assert_eq!(principal.bearer_expires_at(), Some(SystemTime::UNIX_EPOCH));
     }
 
     #[tokio::test]

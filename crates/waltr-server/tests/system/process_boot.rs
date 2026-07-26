@@ -24,6 +24,16 @@ const OIDC_ENVIRONMENT: &[&str] = &[
     "WALTR_API_REQUIRED_SCOPES",
     "WALTR_OIDC_AUDIENCE",
     "WALTR_OIDC_SCOPES",
+    "WALTR_MCP_REQUIRED_SCOPES",
+    "WALTR_MCP_OAUTH_ISSUER",
+    "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
+    "WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL",
+    "WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL",
+    "WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL",
+    "WALTR_MCP_OAUTH_CODE_TTL",
+    "WALTR_MCP_OAUTH_ALLOW_DCR",
+    "WALTR_MCP_OAUTH_ALLOW_CIMD",
+    "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS",
     "WALTR_AUTH_SESSION_TTL",
     "WALTR_AUTH_ALLOW_INSECURE_COOKIE",
     "WALTR_OIDC_ALLOW_INSECURE_HTTP",
@@ -140,6 +150,11 @@ async fn server_process_fails_closed_for_unreachable_oidc_discovery()
             format!("http://{addr}/oidc/callback"),
         )
         .env("WALTR_PUBLIC_URL", "https://waltr.example")
+        .env("WALTR_MCP_REQUIRED_SCOPES", "mcp:use")
+        .env(
+            "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
+            root.join("unused-wrapping-keys.json"),
+        )
         .env("WALTR_OIDC_AUDIENCE", "waltr-api")
         .env("WALTR_OIDC_SCOPES", "openid")
         .env("WALTR_AUTH_ALLOW_INSECURE_COOKIE", "true")
@@ -292,6 +307,7 @@ async fn assert_process_database_isolation(
         [
             "_sqlx_migrations",
             "waltr_browser_sessions",
+            "waltr_mcp_oauth_login_continuations",
             "waltr_oidc_login_attempts"
         ]
     );
@@ -299,6 +315,20 @@ async fn assert_process_database_isolation(
         mcp_tables,
         [
             "_sqlx_migrations",
+            "mcp_oauth_access_tokens",
+            "mcp_oauth_authorization_codes",
+            "mcp_oauth_authorization_transactions",
+            "mcp_oauth_client_metadata_cache",
+            "mcp_oauth_client_redirect_uris",
+            "mcp_oauth_clients",
+            "mcp_oauth_consents",
+            "mcp_oauth_dynamic_clients",
+            "mcp_oauth_grants",
+            "mcp_oauth_refresh_families",
+            "mcp_oauth_refresh_tokens",
+            "mcp_oauth_registration_rates",
+            "mcp_oauth_revoked_clients",
+            "mcp_oauth_signing_keys",
             "mcp_streamable_http_events",
             "mcp_streamable_http_sessions"
         ]
