@@ -46,7 +46,7 @@ pub async fn assert_standard_surface(
         .any(|item| item.to_string().contains("ecosystem-progress-marker"));
     assert!(has_progress);
 
-    client.shutdown().await;
+    client.shutdown().await?;
     Ok(())
 }
 

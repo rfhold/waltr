@@ -6,6 +6,7 @@ use std::fmt;
 
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{McpAuthorizationError, Result, protocol::JsonRpcInbound};
 use http::StreamableHttpTransport;
@@ -23,8 +24,34 @@ pub enum TransportInbound {
     SseEventId(String),
     /// Streamable HTTP authorization failure.
     AuthorizationFailed(McpAuthorizationError),
+    /// Recoverable or terminal transport-layer failure.
+    TransportFailed(McpTransportError),
     /// Transport disconnection.
     Disconnected(String),
+}
+
+/// Classification for an HTTP transport failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpTransportErrorKind {
+    /// HTTP request could not be completed.
+    Network,
+    /// HTTP response status rejected the transport operation.
+    HttpStatus,
+    /// SSE response body failed while streaming.
+    SseBody,
+    /// SSE framing or JSON-RPC decoding failed.
+    SseDecode,
+}
+
+/// Failure surfaced by a transport background task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpTransportError {
+    /// Stable failure class.
+    pub kind: McpTransportErrorKind,
+    /// Human-readable detail.
+    pub message: String,
+    /// Whether the transport will retry automatically.
+    pub retrying: bool,
 }
 
 /// MCP client transport configuration.
@@ -58,6 +85,8 @@ impl McpTransportConfig {
 }
 
 /// MCP client transport.
+// Boxing this public enum's HTTP variant would break the transport API.
+#[allow(clippy::large_enum_variant)]
 pub enum McpTransport {
     /// Stdio subprocess transport.
     Stdio(Box<StdioTransport>),
@@ -77,6 +106,10 @@ impl fmt::Debug for McpTransport {
 
 impl McpTransport {
     /// Start a transport from config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured transport cannot start.
     pub async fn start(
         server_name: String,
         config: McpTransportConfig,
@@ -98,10 +131,36 @@ impl McpTransport {
     }
 
     /// Send one JSON-RPC message.
-    pub async fn send(&self, message: Value, initialized: bool) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when sending fails or the request is canceled.
+    pub async fn send(
+        &self,
+        message: Value,
+        initialized: bool,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<()> {
         match self {
-            Self::Stdio(transport) => transport.send(message).await,
-            Self::StreamableHttp(transport) => transport.send(message, initialized).await,
+            Self::Stdio(transport) => tokio::select! {
+                () = request_cancelled(cancellation) => Err(crate::Error::protocol("MCP request canceled")),
+                result = transport.send(message) => result,
+            },
+            Self::StreamableHttp(transport) => {
+                transport.send(message, initialized, cancellation).await
+            }
+        }
+    }
+
+    /// Promote transport session state after initialize result validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the initialized state cannot be committed.
+    pub async fn mark_initialized(&self, protocol_version: &str) -> Result<()> {
+        match self {
+            Self::Stdio(_) => Ok(()),
+            Self::StreamableHttp(transport) => transport.mark_initialized(protocol_version).await,
         }
     }
 
@@ -115,7 +174,11 @@ impl McpTransport {
     }
 
     /// Shutdown the transport.
-    pub async fn shutdown(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when graceful transport shutdown fails.
+    pub async fn shutdown(&self) -> Result<()> {
         match self {
             Self::Stdio(transport) => transport.shutdown().await,
             Self::StreamableHttp(transport) => transport.shutdown().await,
@@ -123,4 +186,11 @@ impl McpTransport {
     }
 }
 
-pub use sse::{SseJsonRpcEvent, parse_sse_response};
+async fn request_cancelled(cancellation: Option<&CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+pub use sse::{SseDecoder, SseFrame, SseJsonRpcEvent, parse_sse_response};

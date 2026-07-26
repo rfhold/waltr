@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::SystemTime};
 
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -266,8 +266,14 @@ impl Default for McpBearerChallenge {
 }
 
 /// Access token extracted from an HTTP Authorization header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct McpAccessToken(pub String);
+
+impl std::fmt::Debug for McpAccessToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("McpAccessToken([REDACTED])")
+    }
+}
 
 /// Stable identity associated with an authorized MCP access token.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -306,7 +312,12 @@ impl std::fmt::Display for McpPrincipalId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTokenValidation {
     /// Token is valid for this resource and request.
-    Authorized,
+    Authorized {
+        /// Stable identity used to bind Streamable HTTP sessions.
+        principal_id: McpPrincipalId,
+        /// Credential expiry used to bound active streams.
+        expires_at: Option<SystemTime>,
+    },
     /// Token is absent, invalid, expired, or not audience-bound to this resource.
     Unauthorized {
         /// Optional human-readable reason.
@@ -319,6 +330,8 @@ pub enum McpTokenValidation {
         /// Optional human-readable reason.
         error_description: Option<String>,
     },
+    /// Authorization state could not be checked.
+    Unavailable,
 }
 
 /// OAuth authorization failure returned by HTTP clients.

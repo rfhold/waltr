@@ -29,6 +29,7 @@ tokio-util.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
+url.workspace = true
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]

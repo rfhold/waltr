@@ -170,12 +170,12 @@ async fn client_exposes_server_instructions() -> mcp::Result<()> {
         Some("Prefer lifecycle-marker tools.")
     );
 
-    client.shutdown().await;
+    client.shutdown().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn feature_requests_before_initialization_are_rejected() -> mcp::Result<()> {
+async fn feature_requests_without_a_session_are_rejected() -> mcp::Result<()> {
     let server = SpecServer::start(Arc::new(LifecycleServer::default())).await?;
 
     let response = reqwest::Client::new()
@@ -188,24 +188,13 @@ async fn feature_requests_before_initialization_are_rejected() -> mcp::Result<()
         }))
         .send()
         .await?;
-    let status = response.status();
-    let body = response.json::<serde_json::Value>().await?;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["id"], "pre-init-tools");
-    assert_eq!(body["error"]["code"], -32600);
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("not completed initialization")
-    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn repeated_initialize_on_same_session_is_rejected() -> mcp::Result<()> {
+async fn initialize_with_a_session_id_is_rejected() -> mcp::Result<()> {
     let server = SpecServer::start(Arc::new(LifecycleServer::default())).await?;
     let client = reqwest::Client::new();
 
@@ -250,10 +239,42 @@ async fn repeated_initialize_on_same_session_is_rejected() -> mcp::Result<()> {
         .send()
         .await?;
 
-    assert_eq!(second.status(), StatusCode::OK);
-    let body = second.json::<serde_json::Value>().await?;
-    assert_eq!(body["id"], "initialize-2");
-    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn initialized_notification_requires_a_known_pending_session() -> mcp::Result<()> {
+    let handler = Arc::new(LifecycleServer::default());
+    let server = SpecServer::start(handler.clone()).await?;
+    let client = reqwest::Client::new();
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    });
+
+    let unknown = client
+        .post(server.endpoint())
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", "unknown-session")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .json(&notification)
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let session_id = crate::spec::support::initialized_session(&server.endpoint()).await?;
+    let duplicate = client
+        .post(server.endpoint())
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .json(&notification)
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), StatusCode::ACCEPTED);
+    assert_eq!(handler.notifications.lock().await.len(), 1);
 
     Ok(())
 }
@@ -278,7 +299,8 @@ async fn initialized_notification_is_sent_after_client_initializes() -> mcp::Res
     let notifications = handler.notifications.lock().await;
     assert_eq!(notifications.len(), 1);
     assert_eq!(notifications[0], "notifications/initialized");
+    drop(notifications);
 
-    client.shutdown().await;
+    client.shutdown().await?;
     Ok(())
 }

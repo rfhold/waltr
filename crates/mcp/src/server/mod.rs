@@ -1,19 +1,18 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashSet,
+    convert::Infallible,
     future::Future,
     net::SocketAddr,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::State,
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -21,10 +20,11 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Notify, mpsc, oneshot},
 };
 use tokio_stream as stream;
 use tracing::Instrument as _;
+use url::Url;
 use uuid::Uuid;
 
 mod session;
@@ -258,6 +258,7 @@ pub struct ServerContext {
     sender: NotificationSender,
     request_id: Option<JsonRpcId>,
     request_meta: Option<serde_json::Map<String, Value>>,
+    idempotency_key: Option<String>,
 }
 
 impl std::fmt::Debug for ServerContext {
@@ -265,24 +266,31 @@ impl std::fmt::Debug for ServerContext {
         formatter
             .debug_struct("ServerContext")
             .field("request_id", &self.request_id)
+            .field("idempotency_key", &self.idempotency_key)
             .field(
                 "request_meta_keys",
                 &self.request_meta.as_ref().map(serde_json::Map::len),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl ServerContext {
     /// Return the current request id, if this context belongs to a request.
     #[must_use]
-    pub fn request_id(&self) -> Option<&JsonRpcId> {
+    pub const fn request_id(&self) -> Option<&JsonRpcId> {
         self.request_id.as_ref()
+    }
+
+    /// Return the durable operation key for an idempotent handler invocation.
+    #[must_use]
+    pub fn idempotency_key(&self) -> Option<&str> {
+        self.idempotency_key.as_deref()
     }
 
     /// Return request `_meta`, if present and object-shaped.
     #[must_use]
-    pub fn request_meta(&self) -> Option<&serde_json::Map<String, Value>> {
+    pub const fn request_meta(&self) -> Option<&serde_json::Map<String, Value>> {
         self.request_meta.as_ref()
     }
 
@@ -293,6 +301,10 @@ impl ServerContext {
     }
 
     /// Send a notification to the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the peer notification channel is closed.
     pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
         self.sender
             .send(json_rpc_notification(method, params))
@@ -300,6 +312,10 @@ impl ServerContext {
     }
 
     /// Send a logging notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the peer notification channel is closed.
     pub async fn log(&self, level: &str, logger: Option<&str>, data: Value) -> Result<()> {
         let mut params = serde_json::Map::from_iter([
             ("level".to_owned(), Value::String(level.to_owned())),
@@ -313,6 +329,10 @@ impl ServerContext {
     }
 
     /// Send a progress notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the peer notification channel is closed.
     pub async fn progress(
         &self,
         token: Value,
@@ -453,12 +473,17 @@ pub trait ServerHandler: Send + Sync + 'static {
 }
 
 /// Serve MCP over stdin/stdout newline-delimited JSON-RPC.
+///
+/// # Errors
+///
+/// Returns an error when stdin cannot be read or a response cannot be written.
 pub async fn serve_stdio(handler: Arc<dyn ServerHandler>) -> Result<()> {
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let context = ServerContext {
         sender: NotificationSender::Stdio(Arc::clone(&stdout)),
         request_id: None,
         request_meta: None,
+        idempotency_key: None,
     };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
@@ -517,7 +542,6 @@ pub fn streamable_http_router(handler: Arc<dyn ServerHandler>) -> Router {
     streamable_http_router_with_options(handler, StreamableHttpOptions::default())
 }
 
-type OriginPolicy = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 type TokenValidator = Arc<
     dyn Fn(McpAccessToken, McpAuthorizationContext) -> BoxFuture<McpTokenValidation> + Send + Sync,
 >;
@@ -554,6 +578,10 @@ impl std::fmt::Debug for StreamableHttpAuthorization {
 
 impl StreamableHttpAuthorization {
     /// Create OAuth authorization config with protected resource metadata and a validator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the protected-resource metadata is invalid.
     pub fn new(
         metadata: McpProtectedResourceMetadata,
         validator: impl Fn(McpAccessToken, McpAuthorizationContext) -> BoxFuture<McpTokenValidation>
@@ -589,37 +617,76 @@ impl StreamableHttpAuthorization {
 }
 
 /// Streamable HTTP server options.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct StreamableHttpOptions {
-    origin_policy: Option<OriginPolicy>,
+    allowed_origins: Arc<HashSet<CanonicalOrigin>>,
     authorization: Option<StreamableHttpAuthorization>,
+    session_store: Arc<dyn StreamableHttpSessionStore>,
+    serve_root_protected_resource_metadata: bool,
+}
+
+impl Default for StreamableHttpOptions {
+    fn default() -> Self {
+        Self {
+            allowed_origins: Arc::new(HashSet::new()),
+            authorization: None,
+            session_store: Arc::new(InMemoryStreamableHttpSessionStore::default()),
+            serve_root_protected_resource_metadata: true,
+        }
+    }
 }
 
 impl std::fmt::Debug for StreamableHttpOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StreamableHttpOptions")
-            .field("origin_policy", &self.origin_policy.is_some())
+            .field("allowed_origins", &self.allowed_origins)
             .field("authorization", &self.authorization)
+            .field("session_store", &true)
+            .field(
+                "serve_root_protected_resource_metadata",
+                &self.serve_root_protected_resource_metadata,
+            )
             .finish()
     }
 }
 
 impl StreamableHttpOptions {
-    /// Set an Origin validation policy. Invalid origins are rejected with 403.
-    #[must_use]
-    pub fn with_origin_policy(
+    /// Allow canonical HTTP Origins. Present Origins are denied by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an origin is not a canonical HTTP or HTTPS origin.
+    pub fn try_with_allowed_origins(
         mut self,
-        policy: impl Fn(&str) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        self.origin_policy = Some(Arc::new(policy));
-        self
+        origins: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self> {
+        let allowed_origins = origins
+            .into_iter()
+            .map(|origin| canonical_origin(origin.as_ref()))
+            .collect::<Result<HashSet<_>>>()?;
+        self.allowed_origins = Arc::new(allowed_origins);
+        Ok(self)
     }
 
     /// Set OAuth protected resource authorization for Streamable HTTP requests.
     #[must_use]
     pub fn with_authorization(mut self, authorization: StreamableHttpAuthorization) -> Self {
         self.authorization = Some(authorization);
+        self
+    }
+
+    /// Set the persistence store for Streamable HTTP sessions and queued events.
+    #[must_use]
+    pub fn with_session_store(mut self, store: Arc<dyn StreamableHttpSessionStore>) -> Self {
+        self.session_store = store;
+        self
+    }
+
+    /// Relinquish the root protected-resource metadata route to an integrating host.
+    #[must_use]
+    pub const fn without_root_protected_resource_metadata(mut self) -> Self {
+        self.serve_root_protected_resource_metadata = false;
         self
     }
 }
@@ -629,25 +696,35 @@ pub fn streamable_http_router_with_options(
     handler: Arc<dyn ServerHandler>,
     options: StreamableHttpOptions,
 ) -> Router {
-    Router::new()
+    let serve_root_metadata = options.serve_root_protected_resource_metadata;
+    let router = Router::new()
         .route("/mcp", post(http_post).get(http_get).delete(http_delete))
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(http_protected_resource_metadata),
-        )
         .route(
             "/.well-known/oauth-protected-resource/{*resource_path}",
             get(http_protected_resource_metadata),
+        );
+    let router = if serve_root_metadata {
+        router.route(
+            "/.well-known/oauth-protected-resource",
+            get(http_protected_resource_metadata),
         )
-        .with_state(HttpState {
-            handler,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            origin_policy: options.origin_policy,
-            authorization: options.authorization,
-        })
+    } else {
+        router
+    };
+    router.with_state(HttpState {
+        handler,
+        session_store: options.session_store,
+        allowed_origins: options.allowed_origins,
+        authorization: options.authorization,
+        delivery_notify: Arc::new(Notify::new()),
+    })
 }
 
 /// Serve Streamable HTTP MCP at `/mcp` on the supplied listener.
+///
+/// # Errors
+///
+/// Returns an error when the listener address is unavailable or serving fails.
 pub async fn serve_streamable_http(
     listener: TcpListener,
     handler: Arc<dyn ServerHandler>,
@@ -662,40 +739,21 @@ pub async fn serve_streamable_http(
 #[derive(Clone)]
 struct HttpState {
     handler: Arc<dyn ServerHandler>,
-    sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
-    origin_policy: Option<OriginPolicy>,
+    session_store: Arc<dyn StreamableHttpSessionStore>,
+    allowed_origins: Arc<HashSet<CanonicalOrigin>>,
     authorization: Option<StreamableHttpAuthorization>,
+    delivery_notify: Arc<Notify>,
 }
 
-#[derive(Debug, Default)]
-struct HttpSession {
-    lifecycle: HttpSessionLifecycle,
-    events: VecDeque<SseEvent>,
-}
-
-#[derive(Clone, Debug)]
-struct SseEvent {
-    id: String,
-    message: Value,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum HttpSessionLifecycle {
-    #[default]
-    Uninitialized,
-    InitializeResponded,
-    Initialized,
-}
-
-async fn http_post(
-    State(state): State<HttpState>,
-    headers: HeaderMap,
-    axum::Json(value): axum::Json<Value>,
-) -> Response {
+// Keeping the ordered validation and session transition pipeline together makes fail-closed review easier.
+#[allow(clippy::too_many_lines)]
+async fn http_post(State(state): State<HttpState>, request: Request<Body>) -> Response {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !accepts_streamable_http_post(&headers) {
+    if !accepts_streamable_http_post(&headers) || !has_json_content_type(&headers) {
         tracing::warn!(
             mcp.transport = "streamable_http",
             "MCP HTTP request rejected due to invalid Accept header"
@@ -706,31 +764,53 @@ async fn http_post(
         )
             .into_response();
     }
-    if let Some(version) = headers
-        .get("mcp-protocol-version")
-        .and_then(|value| value.to_str().ok())
-        && version != MCP_PROTOCOL_VERSION
-    {
-        tracing::warn!(
-            mcp.transport = "streamable_http",
-            mcp.protocol_version = %version,
-            "MCP HTTP request rejected due to unsupported protocol version"
-        );
-        return (StatusCode::BAD_REQUEST, "unsupported MCP protocol version").into_response();
-    }
-    if let Some(response) = authorize_http_request(&state, &headers).await {
-        return response;
-    }
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| Uuid::now_v7().to_string());
-    let (tx, rx) = mpsc::channel(16);
-    let context = ServerContext {
-        sender: NotificationSender::Channel(tx),
-        request_id: None,
-        request_meta: None,
+    let authorization = match authorize_http_request(&state, &headers).await {
+        Ok(authorization) => authorization,
+        Err(response) => return response,
+    };
+    let session_header = match single_header(&headers, "mcp-session-id") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let presented_protocol_version = match single_header(&headers, "mcp-protocol-version") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let prevalidated_session = if let Some(session_id) = &session_header {
+        match state
+            .session_store
+            .inspect_session(StreamableHttpSessionRequest {
+                key: StreamableHttpSessionKey {
+                    session_id: session_id.clone(),
+                    owner: authorization.owner.clone(),
+                },
+                presented_protocol_version: presented_protocol_version.clone(),
+                now: SystemTime::now(),
+            })
+            .await
+        {
+            Ok(StreamableHttpInspectSession::Session(session)) => Some(session),
+            Ok(StreamableHttpInspectSession::NotFound) => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Ok(StreamableHttpInspectSession::ProtocolVersionMismatch) => {
+                return (StatusCode::BAD_REQUEST, "MCP protocol version mismatch").into_response();
+            }
+            Err(error) => return session_store_error_response(error),
+        }
+    } else {
+        None
+    };
+    let Ok(body) = to_bytes(body, 1024 * 1024).await else {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "MCP request body is too large",
+        )
+            .into_response();
+    };
+    let value = match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
     let inbound = match parse_json_rpc_message(value) {
         Ok(inbound) => inbound,
@@ -743,70 +823,249 @@ async fn http_post(
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
     };
+    let is_initialize = matches!(
+        &inbound,
+        JsonRpcInbound::Request(request) if request.method == "initialize"
+    );
+    let mut session_id = match (is_initialize, session_header) {
+        (true, None) => String::new(),
+        (true, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "MCP initialize request must not include a session id",
+            )
+                .into_response();
+        }
+        (false, Some(session_id)) => session_id,
+        (false, None) => {
+            return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response();
+        }
+    };
+    if is_initialize {
+        let JsonRpcInbound::Request(initialize) = &inbound else {
+            unreachable!()
+        };
+        if let Err(message) = validate_initialize_params(initialize.params.as_ref()) {
+            return initialize_error_response(initialize.id.clone(), -32602, message);
+        }
+        let negotiated = initialize_result(&state.handler)["protocolVersion"]
+            .as_str()
+            .expect("initialize result has protocolVersion")
+            .to_owned();
+        let mut created = false;
+        for _ in 0..3 {
+            session_id = Uuid::now_v7().to_string();
+            let request = StreamableHttpCreateSessionRequest {
+                key: StreamableHttpSessionKey {
+                    session_id: session_id.clone(),
+                    owner: authorization.owner.clone(),
+                },
+                protocol_version: negotiated.clone(),
+                now: SystemTime::now(),
+            };
+            match state.session_store.create_session(request).await {
+                Ok(StreamableHttpCreateSession::Created(_)) => {
+                    created = true;
+                    break;
+                }
+                Ok(StreamableHttpCreateSession::AlreadyExists) => {}
+                Ok(StreamableHttpCreateSession::CapacityExceeded) => {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                }
+                Err(error) => return session_store_error_response(error),
+            }
+        }
+        if !created {
+            return session_store_server_error_response();
+        }
+    }
+    let session_request = StreamableHttpSessionRequest {
+        key: StreamableHttpSessionKey {
+            session_id: session_id.clone(),
+            owner: authorization.owner.clone(),
+        },
+        presented_protocol_version,
+        now: SystemTime::now(),
+    };
+    let (tx, rx) = mpsc::channel(16);
+    let mut context = ServerContext {
+        sender: NotificationSender::Channel(tx),
+        request_id: None,
+        request_meta: None,
+        idempotency_key: None,
+    };
     let span = http_server_request_span(&inbound, &session_id);
     set_span_parent_from_meta(&span, inbound_meta(&inbound));
     async move {
-        let lifecycle_error = lifecycle_error(&state, &session_id, &inbound).await;
-        if let Some(response) = lifecycle_error {
-            tracing::Span::current().record("mcp.outcome", "error");
-            record_response_error(&response);
-            tracing::debug!(mcp.outcome = "error", "MCP HTTP lifecycle rejected request");
-            let mut headers = HeaderMap::new();
-            if let Ok(value) = HeaderValue::from_str(&session_id) {
-                headers.insert("mcp-session-id", value);
+        let is_initialized_notification = matches!(
+            &inbound,
+            JsonRpcInbound::Notification(notification)
+                if notification.method == "notifications/initialized"
+        );
+        let initialization_claim_id = if is_initialized_notification {
+            Some(
+                match state
+                    .session_store
+                    .claim_initialization(session_request.clone())
+                    .await
+                {
+                    Ok(StreamableHttpClaimInitialization::Claimed {
+                        claim_id,
+                        operation_id,
+                    }) => (claim_id, operation_id),
+                    Ok(StreamableHttpClaimInitialization::NotFound) => {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    Ok(StreamableHttpClaimInitialization::ProtocolVersionMismatch) => {
+                        return (StatusCode::BAD_REQUEST, "MCP protocol version mismatch")
+                            .into_response();
+                    }
+                    Ok(StreamableHttpClaimInitialization::LifecycleMismatch) => {
+                        if matches!(
+                            state
+                                .session_store
+                                .inspect_session(refreshed_session_request(&session_request))
+                                .await,
+                            Ok(StreamableHttpInspectSession::Session(session))
+                                if session.lifecycle == StreamableHttpSessionLifecycle::Initialized
+                        ) {
+                            return StatusCode::ACCEPTED.into_response();
+                        }
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "MCP session is not awaiting the initialized notification",
+                        )
+                            .into_response();
+                    }
+                    Ok(StreamableHttpClaimInitialization::InitializationInProgress {
+                        retry_after,
+                    }) => {
+                        return retry_after_response(StatusCode::SERVICE_UNAVAILABLE, retry_after);
+                    }
+                    Err(error) => return session_store_error_response(error),
+                },
+            )
+        } else if !is_initialize {
+            let lifecycle = prevalidated_session
+                .as_ref()
+                .expect("non-initialize session was prevalidated")
+                .lifecycle;
+            if let Some(response) = lifecycle_error(lifecycle, &inbound) {
+                return lifecycle_error_response(&session_id, response);
             }
-            headers.insert(
-                "mcp-protocol-version",
-                HeaderValue::from_static(MCP_PROTOCOL_VERSION),
-            );
-            headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            return (StatusCode::OK, headers, axum::Json(response)).into_response();
-        }
+            None
+        } else {
+            None
+        };
+        let (handler_done, handler_completion) = oneshot::channel();
+        let notification_collector = tokio::spawn(collect_notifications(
+            rx,
+            handler_completion,
+            state.session_store.config(),
+        ));
         let response = match inbound {
             JsonRpcInbound::Request(request) => {
-                let is_initialize = request.method == "initialize";
                 let mut context = context;
                 context.request_id = Some(request.id.clone());
                 context.request_meta = request_meta(request.params.as_ref()).cloned();
                 let response = handle_request(Arc::clone(&state.handler), request, context).await;
-                if is_initialize {
-                    state
-                        .sessions
-                        .lock()
-                        .await
-                        .entry(session_id.clone())
-                        .or_default()
-                        .lifecycle = HttpSessionLifecycle::InitializeResponded;
-                }
                 Some(response)
             }
             JsonRpcInbound::Notification(notification) => {
-                if notification.method == "notifications/initialized" {
+                if is_initialized_notification {
+                    let (claim_id, operation_id) = initialization_claim_id
+                        .as_ref()
+                        .expect("initialized notification has a claim");
+                    context.idempotency_key = Some(operation_id.clone());
+                    let handler = Arc::clone(&state.handler);
+                    if tokio::time::timeout(Duration::from_secs(30), async move {
+                        handler.handle_notification(notification, context).await;
+                    })
+                    .await
+                    .is_err()
+                    {
+                        match state
+                            .session_store
+                            .abandon_initialization(StreamableHttpAbandonInitializationRequest {
+                                session: refreshed_session_request(&session_request),
+                                claim_id: claim_id.clone(),
+                            })
+                            .await
+                        {
+                            Ok(StreamableHttpAbandonInitialization::Abandoned) => {}
+                            Ok(_) => return session_store_server_error_response(),
+                            Err(error) => return session_store_error_response(error),
+                        }
+                        return session_store_server_error_response();
+                    }
+                } else {
                     state
-                        .sessions
-                        .lock()
-                        .await
-                        .entry(session_id.clone())
-                        .or_default()
-                        .lifecycle = HttpSessionLifecycle::Initialized;
+                        .handler
+                        .handle_notification(notification, context)
+                        .await;
                 }
-                state
-                    .handler
-                    .handle_notification(notification, context)
-                    .await;
                 None
             }
-            JsonRpcInbound::Response(_) => None,
+            JsonRpcInbound::Response(_) => {
+                drop(context);
+                None
+            }
         };
+        drop(handler_done);
 
-        let mut notifications = Vec::new();
-        let mut rx = rx;
-        rx.close();
-        while let Some(notification) = rx.recv().await {
-            notifications.push(notification);
+        let Ok(collected) = notification_collector.await else {
+            return session_store_server_error_response();
+        };
+        if collected.capacity_exceeded {
+            if let Some((claim_id, _)) = initialization_claim_id.clone() {
+                match state
+                    .session_store
+                    .abandon_initialization(StreamableHttpAbandonInitializationRequest {
+                        session: refreshed_session_request(&session_request),
+                        claim_id,
+                    })
+                    .await
+                {
+                    Ok(StreamableHttpAbandonInitialization::Abandoned) => {}
+                    Ok(_) => return session_store_server_error_response(),
+                    Err(error) => return session_store_error_response(error),
+                }
+            }
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        let notifications = collected.messages;
+
+        if is_initialized_notification {
+            let (claim_id, _) =
+                initialization_claim_id.expect("initialized notification has a claim");
+            match state
+                .session_store
+                .complete_initialization(StreamableHttpCompleteInitializationRequest {
+                    session: refreshed_session_request(&session_request),
+                    claim_id,
+                    messages: notifications,
+                })
+                .await
+            {
+                Ok(StreamableHttpCompleteInitialization::Completed(_)) => {
+                    state.delivery_notify.notify_waiters();
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                Ok(StreamableHttpCompleteInitialization::AlreadyCompleted) => {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                Ok(StreamableHttpCompleteInitialization::NotFound) => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                Ok(StreamableHttpCompleteInitialization::CapacityExceeded) => {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                }
+                Ok(_) => {
+                    return (StatusCode::BAD_REQUEST, "MCP initialization claim failed")
+                        .into_response();
+                }
+                Err(error) => return session_store_error_response(error),
+            }
         }
 
         let mut headers = HeaderMap::new();
@@ -820,7 +1079,28 @@ async fn http_post(
 
         let Some(response) = response else {
             if !notifications.is_empty() {
-                queue_sse_events(&state, &session_id, notifications).await;
+                match state
+                    .session_store
+                    .append_events(StreamableHttpAppendEventsRequest {
+                        session: refreshed_session_request(&session_request),
+                        messages: notifications,
+                    })
+                    .await
+                {
+                    Ok(StreamableHttpAppendEvents::Events(_)) => {}
+                    Ok(StreamableHttpAppendEvents::NotFound) => {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    Ok(StreamableHttpAppendEvents::CapacityExceeded) => {
+                        return StatusCode::TOO_MANY_REQUESTS.into_response();
+                    }
+                    Ok(_) => {
+                        return (StatusCode::BAD_REQUEST, "MCP session state mismatch")
+                            .into_response();
+                    }
+                    Err(error) => return session_store_error_response(error),
+                }
+                state.delivery_notify.notify_waiters();
             }
             tracing::Span::current().record("mcp.outcome", "success");
             return (StatusCode::ACCEPTED, headers).into_response();
@@ -840,9 +1120,8 @@ async fn http_post(
         let mut messages = notifications;
         messages.push(response);
         let stream = stream::iter(messages.into_iter().map(|message| {
-            let id = next_sse_id();
             let data = serde_json::to_string(&message).expect("json-rpc message serializes");
-            Ok::<_, std::convert::Infallible>(format!("id: {id}\ndata: {data}\n\n"))
+            Ok::<_, std::convert::Infallible>(format!("data: {data}\n\n"))
         }));
         (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
     }
@@ -850,6 +1129,8 @@ async fn http_post(
     .await
 }
 
+// This is one ordered authorization, session validation, and stream-start pipeline.
+#[allow(clippy::too_many_lines)]
 async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
@@ -861,41 +1142,124 @@ async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Respons
         )
             .into_response();
     }
-    if let Some(response) = unsupported_version_response(&headers) {
-        return response;
-    }
-    if let Some(response) = authorize_http_request(&state, &headers).await {
-        return response;
-    }
-    let Some(session_id) = session_id_header(&headers) else {
-        return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response();
+    let authorization = match authorize_http_request(&state, &headers).await {
+        Ok(authorization) => authorization,
+        Err(response) => return response,
     };
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned);
-    let mut sessions = state.sessions.lock().await;
-    let Some(session) = sessions.get_mut(&session_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let session_id = match single_header(&headers, "mcp-session-id") {
+        Ok(Some(value)) if !value.is_empty() => value,
+        Ok(_) => return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response(),
+        Err(response) => return response,
     };
-    if session.lifecycle != HttpSessionLifecycle::Initialized {
-        return (
-            StatusCode::BAD_REQUEST,
-            "MCP session has not completed initialization",
-        )
-            .into_response();
-    }
-    if let Some(last_event_id) = last_event_id {
-        while session
-            .events
-            .front()
-            .is_some_and(|event| event.id <= last_event_id)
+    let presented_protocol_version = match single_header(&headers, "mcp-protocol-version") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let last_event_id = match single_header(&headers, "last-event-id") {
+        Ok(Some(value)) => match value.parse().ok() {
+            Some(id) => Some(id),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid Last-Event-ID; expected an MCP stream event ID",
+                )
+                    .into_response();
+            }
+        },
+        Ok(None) => None,
+        Err(response) => return response,
+    };
+    let session_request = StreamableHttpSessionRequest {
+        key: StreamableHttpSessionKey {
+            session_id: session_id.clone(),
+            owner: authorization.owner,
+        },
+        presented_protocol_version,
+        now: SystemTime::now(),
+    };
+    if authorization
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= SystemTime::now())
+    {
+        match state
+            .session_store
+            .inspect_session(refreshed_session_request(&session_request))
+            .await
         {
-            session.events.pop_front();
+            Ok(StreamableHttpInspectSession::Session(session))
+                if session.lifecycle == StreamableHttpSessionLifecycle::Initialized => {}
+            Ok(StreamableHttpInspectSession::Session(_)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "MCP session has not completed initialization",
+                )
+                    .into_response();
+            }
+            Ok(StreamableHttpInspectSession::NotFound) => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Ok(StreamableHttpInspectSession::ProtocolVersionMismatch) => {
+                return (StatusCode::BAD_REQUEST, "MCP protocol version mismatch").into_response();
+            }
+            Err(error) => return session_store_error_response(error),
         }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static(MCP_PROTOCOL_VERSION),
+        );
+        if let Ok(value) = HeaderValue::from_str(&session_id) {
+            headers.insert("mcp-session-id", value);
+        }
+        return (StatusCode::OK, headers, Body::empty()).into_response();
     }
-    let events = session.events.drain(..).collect::<Vec<_>>();
-    drop(sessions);
+    let initial = match prepare_delivery_before_expiry(
+        &state,
+        &session_request,
+        last_event_id.clone(),
+        authorization.expires_at,
+    )
+    .await
+    {
+        PrepareBeforeExpiry::Expired => {
+            return empty_get_response(&session_id);
+        }
+        PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::NotFound)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::LifecycleMismatch)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "MCP session has not completed initialization",
+            )
+                .into_response();
+        }
+        PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::ProtocolVersionMismatch)) => {
+            return (StatusCode::BAD_REQUEST, "MCP protocol version mismatch").into_response();
+        }
+        PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::InvalidCursor)) => {
+            return (StatusCode::BAD_REQUEST, "invalid Last-Event-ID cursor").into_response();
+        }
+        PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::DeliveryBusy {
+            retry_after,
+        })) => {
+            return retry_after_response(StatusCode::CONFLICT, retry_after);
+        }
+        PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::Idle {
+            priming_event_id,
+        })) => StreamStart::Idle(priming_event_id),
+        PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::Events {
+            events, ..
+        })) => StreamStart::Events(events),
+        PrepareBeforeExpiry::Store(Err(error)) => return session_store_error_response(error),
+    };
+    if credential_expired(authorization.expires_at) {
+        return empty_get_response(&session_id);
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -909,28 +1273,272 @@ async fn http_get(State(state): State<HttpState>, headers: HeaderMap) -> Respons
     if let Ok(value) = HeaderValue::from_str(&session_id) {
         headers.insert("mcp-session-id", value);
     }
-    let stream = stream::iter(events.into_iter().map(|event| {
-        let data = serde_json::to_string(&event.message).expect("json-rpc message serializes");
-        Ok::<_, std::convert::Infallible>(format!("id: {}\ndata: {data}\n\n", event.id))
+    let (sender, receiver) = mpsc::channel(2);
+    tokio::spawn(run_get_stream(GetStreamContext {
+        state,
+        session_request,
+        initial,
+        prime: last_event_id.is_none(),
+        credential_expires_at: authorization.expires_at,
+        sender,
     }));
-    (StatusCode::OK, headers, Body::from_stream(stream)).into_response()
+    (
+        StatusCode::OK,
+        headers,
+        Body::from_stream(stream::wrappers::ReceiverStream::new(receiver)),
+    )
+        .into_response()
+}
+
+enum StreamStart {
+    Idle(StreamableHttpEventId),
+    Events(Vec<StreamableHttpEvent>),
+}
+
+async fn prepare_delivery(
+    state: &HttpState,
+    session: &StreamableHttpSessionRequest,
+    acknowledged_event_id: Option<StreamableHttpEventId>,
+) -> StreamableHttpSessionStoreResult<StreamableHttpPrepareDelivery> {
+    state
+        .session_store
+        .prepare_delivery(StreamableHttpPrepareDeliveryRequest {
+            session: refreshed_session_request(session),
+            acknowledged_event_id,
+        })
+        .await
+}
+
+enum PrepareBeforeExpiry {
+    Expired,
+    Store(StreamableHttpSessionStoreResult<StreamableHttpPrepareDelivery>),
+}
+
+async fn prepare_delivery_before_expiry(
+    state: &HttpState,
+    session: &StreamableHttpSessionRequest,
+    acknowledged_event_id: Option<StreamableHttpEventId>,
+    credential_expires_at: Option<SystemTime>,
+) -> PrepareBeforeExpiry {
+    if credential_expired(credential_expires_at) {
+        return PrepareBeforeExpiry::Expired;
+    }
+    let prepare = prepare_delivery(state, session, acknowledged_event_id);
+    if let Some(delay) = credential_expires_at.map(credential_expiry_delay) {
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(delay) => PrepareBeforeExpiry::Expired,
+            result = prepare => PrepareBeforeExpiry::Store(result),
+        }
+    } else {
+        PrepareBeforeExpiry::Store(prepare.await)
+    }
+}
+
+struct GetStreamContext {
+    state: HttpState,
+    session_request: StreamableHttpSessionRequest,
+    initial: StreamStart,
+    prime: bool,
+    credential_expires_at: Option<SystemTime>,
+    sender: mpsc::Sender<std::result::Result<String, Infallible>>,
+}
+
+// Stream priming, keepalive, expiry, and delivery ordering form one state machine.
+#[allow(clippy::too_many_lines)]
+async fn run_get_stream(context: GetStreamContext) {
+    let GetStreamContext {
+        state,
+        session_request,
+        initial,
+        prime,
+        credential_expires_at,
+        sender,
+    } = context;
+    if !send_before_expiry(&sender, "retry: 1000\n\n".to_owned(), credential_expires_at).await {
+        return;
+    }
+    match initial {
+        StreamStart::Events(events) => {
+            if prime
+                && let Some(first) = events.first()
+                && !send_before_expiry(
+                    &sender,
+                    format!("id: {}:0\n\n", first.id.stream_id),
+                    credential_expires_at,
+                )
+                .await
+            {
+                return;
+            }
+            for event in events {
+                if !send_before_expiry(&sender, format_sse_event(&event), credential_expires_at)
+                    .await
+                {
+                    return;
+                }
+            }
+            return;
+        }
+        StreamStart::Idle(priming_event_id) if prime => {
+            if !send_before_expiry(
+                &sender,
+                format!("id: {priming_event_id}\n\n"),
+                credential_expires_at,
+            )
+            .await
+            {
+                return;
+            }
+        }
+        StreamStart::Idle(_) => {}
+    }
+
+    let idle = tokio::time::sleep(Duration::from_secs(30));
+    let keepalive = tokio::time::sleep(Duration::from_secs(15));
+    tokio::pin!(idle, keepalive);
+    loop {
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(credential_expires_at.map_or(Duration::MAX, credential_expiry_delay)), if credential_expires_at.is_some() => return,
+            () = state.delivery_notify.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+            () = &mut keepalive => {
+                if !send_before_expiry(&sender, ": keepalive\n\n".to_owned(), credential_expires_at).await {
+                    return;
+                }
+                keepalive.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
+                continue;
+            }
+            () = &mut idle => return,
+        }
+
+        match prepare_delivery_before_expiry(&state, &session_request, None, credential_expires_at)
+            .await
+        {
+            PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::Events {
+                events,
+                ..
+            })) => {
+                for event in events {
+                    if !send_before_expiry(&sender, format_sse_event(&event), credential_expires_at)
+                        .await
+                    {
+                        return;
+                    }
+                }
+                return;
+            }
+            PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::Idle { .. })) => {}
+            PrepareBeforeExpiry::Store(Ok(StreamableHttpPrepareDelivery::DeliveryBusy {
+                retry_after,
+            })) => {
+                tokio::time::sleep(retry_after.min(Duration::from_secs(1))).await;
+            }
+            PrepareBeforeExpiry::Expired
+            | PrepareBeforeExpiry::Store(
+                Ok(
+                    StreamableHttpPrepareDelivery::NotFound
+                    | StreamableHttpPrepareDelivery::ProtocolVersionMismatch
+                    | StreamableHttpPrepareDelivery::LifecycleMismatch
+                    | StreamableHttpPrepareDelivery::InvalidCursor,
+                )
+                | Err(_),
+            ) => return,
+        }
+    }
+}
+
+fn format_sse_event(event: &StreamableHttpEvent) -> String {
+    let data = serde_json::to_string(&event.message).expect("json-rpc message serializes");
+    format!("id: {}\ndata: {data}\n\n", event.id)
+}
+
+async fn send_before_expiry(
+    sender: &mpsc::Sender<std::result::Result<String, Infallible>>,
+    frame: String,
+    credential_expires_at: Option<SystemTime>,
+) -> bool {
+    if credential_expired(credential_expires_at) {
+        return false;
+    }
+    if let Some(delay) = credential_expires_at.map(credential_expiry_delay) {
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep(delay) => false,
+            result = sender.send(Ok(frame)) => result.is_ok(),
+        }
+    } else {
+        sender.send(Ok(frame)).await.is_ok()
+    }
+}
+
+fn credential_expiry_delay(expires_at: SystemTime) -> Duration {
+    expires_at
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO)
+}
+
+fn credential_expired(expires_at: Option<SystemTime>) -> bool {
+    expires_at
+        .map(credential_expiry_delay)
+        .is_some_and(|delay| delay.is_zero())
+}
+
+fn empty_get_response(session_id: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static(MCP_PROTOCOL_VERSION),
+    );
+    if let Ok(value) = HeaderValue::from_str(session_id) {
+        headers.insert("mcp-session-id", value);
+    }
+    (StatusCode::OK, headers, Body::empty()).into_response()
 }
 
 async fn http_delete(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if !origin_allowed(&state, &headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if let Some(response) = unsupported_version_response(&headers) {
-        return response;
-    }
-    if let Some(response) = authorize_http_request(&state, &headers).await {
-        return response;
-    }
-    let Some(session_id) = session_id_header(&headers) else {
-        return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response();
+    let authorization = match authorize_http_request(&state, &headers).await {
+        Ok(authorization) => authorization,
+        Err(response) => return response,
     };
-    let removed = state.sessions.lock().await.remove(&session_id).is_some();
+    let session_id = match single_header(&headers, "mcp-session-id") {
+        Ok(Some(value)) if !value.is_empty() => value,
+        Ok(_) => return (StatusCode::BAD_REQUEST, "missing MCP session id").into_response(),
+        Err(response) => return response,
+    };
+    let presented_protocol_version = match single_header(&headers, "mcp-protocol-version") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let removed = match state
+        .session_store
+        .delete_session(StreamableHttpSessionRequest {
+            key: StreamableHttpSessionKey {
+                session_id,
+                owner: authorization.owner,
+            },
+            presented_protocol_version,
+            now: SystemTime::now(),
+        })
+        .await
+    {
+        Ok(StreamableHttpDeleteSession::Deleted) => true,
+        Ok(StreamableHttpDeleteSession::NotFound) => false,
+        Ok(StreamableHttpDeleteSession::ProtocolVersionMismatch) => {
+            return (StatusCode::BAD_REQUEST, "MCP protocol version mismatch").into_response();
+        }
+        Err(error) => return session_store_error_response(error),
+    };
     if removed {
+        state.delivery_notify.notify_waiters();
         StatusCode::ACCEPTED.into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
@@ -954,12 +1562,18 @@ async fn http_protected_resource_metadata(State(state): State<HttpState>) -> Res
         .into_response()
 }
 
-async fn authorize_http_request(state: &HttpState, headers: &HeaderMap) -> Option<Response> {
+async fn authorize_http_request(
+    state: &HttpState,
+    headers: &HeaderMap,
+) -> std::result::Result<AuthorizedHttpRequest, Response> {
     let Some(authorization) = &state.authorization else {
-        return None;
+        return Ok(AuthorizedHttpRequest {
+            owner: StreamableHttpSessionOwner::Anonymous,
+            expires_at: None,
+        });
     };
     let Some(token) = bearer_token(headers) else {
-        return Some(authorization_challenge_response(
+        return Err(authorization_challenge_response(
             authorization,
             StatusCode::UNAUTHORIZED,
             None,
@@ -971,9 +1585,16 @@ async fn authorize_http_request(state: &HttpState, headers: &HeaderMap) -> Optio
         required_scopes: authorization.required_scopes.clone(),
     };
     match (authorization.validator)(token, context).await {
-        McpTokenValidation::Authorized => None,
+        McpTokenValidation::Authorized {
+            principal_id,
+            expires_at,
+        } => Ok(AuthorizedHttpRequest {
+            owner: StreamableHttpSessionOwner::Authenticated(principal_id),
+            expires_at,
+        }),
+        McpTokenValidation::Unavailable => Err(StatusCode::SERVICE_UNAVAILABLE.into_response()),
         McpTokenValidation::Unauthorized { error_description } => {
-            Some(authorization_challenge_response(
+            Err(authorization_challenge_response(
                 authorization,
                 StatusCode::UNAUTHORIZED,
                 Some("invalid_token"),
@@ -983,7 +1604,7 @@ async fn authorize_http_request(state: &HttpState, headers: &HeaderMap) -> Optio
         McpTokenValidation::InsufficientScope {
             required_scopes,
             error_description,
-        } => Some(insufficient_scope_response(
+        } => Err(insufficient_scope_response(
             authorization,
             &required_scopes,
             error_description.as_deref(),
@@ -991,15 +1612,24 @@ async fn authorize_http_request(state: &HttpState, headers: &HeaderMap) -> Optio
     }
 }
 
+struct AuthorizedHttpRequest {
+    owner: StreamableHttpSessionOwner,
+    expires_at: Option<SystemTime>,
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<McpAccessToken> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if values.next().is_some() {
+        return None;
+    }
     let split = value.find(char::is_whitespace)?;
     let (scheme, token) = value.split_at(split);
     if !scheme.eq_ignore_ascii_case("Bearer") {
         return None;
     }
     let token = token.trim();
-    if token.is_empty() {
+    if token.is_empty() || token.contains(char::is_whitespace) || token.contains(',') {
         return None;
     }
     Some(McpAccessToken(token.to_owned()))
@@ -1040,7 +1670,7 @@ fn insufficient_scope_response(
 
 fn base_challenge(authorization: &StreamableHttpAuthorization) -> McpBearerChallenge {
     let mut challenge = McpBearerChallenge::new();
-    challenge.realm = authorization.realm.clone();
+    challenge.realm.clone_from(&authorization.realm);
     challenge.resource_metadata =
         protected_resource_metadata_urls(&authorization.metadata.resource)
             .into_iter()
@@ -1057,85 +1687,268 @@ fn scope_value(scopes: &[String]) -> Option<String> {
     }
 }
 
-async fn lifecycle_error(
-    state: &HttpState,
-    session_id: &str,
+fn lifecycle_error(
+    lifecycle: StreamableHttpSessionLifecycle,
     inbound: &JsonRpcInbound,
 ) -> Option<Value> {
     match inbound {
-        JsonRpcInbound::Request(request) => {
-            let session_state = state
-                .sessions
-                .lock()
-                .await
-                .get(session_id)
-                .map(|session| session.lifecycle)
-                .unwrap_or_default();
-            match request.method.as_str() {
-                "initialize" if session_state != HttpSessionLifecycle::Uninitialized => {
-                    Some(json_rpc_error(
-                        request.id.clone(),
-                        -32600,
-                        "MCP session is already initialized",
-                    ))
-                }
-                "initialize" | "ping" => None,
-                _ if session_state == HttpSessionLifecycle::Initialized => None,
-                _ => Some(json_rpc_error(
-                    request.id.clone(),
-                    -32600,
-                    "MCP session has not completed initialization",
-                )),
-            }
-        }
-        JsonRpcInbound::Notification(notification)
-            if notification.method == "notifications/initialized" =>
-        {
-            None
-        }
+        JsonRpcInbound::Request(request) => match request.method.as_str() {
+            "initialize" => Some(json_rpc_error(
+                request.id.clone(),
+                -32600,
+                "MCP session is already initialized",
+            )),
+            "ping" => None,
+            _ if lifecycle == StreamableHttpSessionLifecycle::Initialized => None,
+            _ => Some(json_rpc_error(
+                request.id.clone(),
+                -32600,
+                "MCP session has not completed initialization",
+            )),
+        },
         JsonRpcInbound::Notification(_) | JsonRpcInbound::Response(_) => None,
     }
 }
 
-async fn queue_sse_events(state: &HttpState, session_id: &str, messages: Vec<Value>) {
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions.entry(session_id.to_owned()).or_default();
-    for message in messages {
-        session.events.push_back(SseEvent {
-            id: next_sse_id().to_string(),
+fn lifecycle_error_response(session_id: &str, response: Value) -> Response {
+    tracing::Span::current().record("mcp.outcome", "error");
+    record_response_error(&response);
+    tracing::debug!(mcp.outcome = "error", "MCP HTTP lifecycle rejected request");
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(session_id) {
+        headers.insert("mcp-session-id", value);
+    }
+    headers.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static(MCP_PROTOCOL_VERSION),
+    );
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    (StatusCode::OK, headers, axum::Json(response)).into_response()
+}
+
+fn session_store_error_response(error: StreamableHttpSessionStoreError) -> Response {
+    tracing::error!(
+        %error,
+        mcp.transport = "streamable_http",
+        "MCP HTTP session store operation failed"
+    );
+    session_store_server_error_response()
+}
+
+fn session_store_server_error_response() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "MCP Streamable HTTP session storage error",
+    )
+        .into_response()
+}
+
+fn retry_after_response(status: StatusCode, retry_after: std::time::Duration) -> Response {
+    let seconds = retry_after.as_secs().max(1);
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+        headers.insert(header::RETRY_AFTER, value);
+    }
+    (status, headers).into_response()
+}
+
+fn refreshed_session_request(
+    request: &StreamableHttpSessionRequest,
+) -> StreamableHttpSessionRequest {
+    StreamableHttpSessionRequest {
+        key: request.key.clone(),
+        presented_protocol_version: request.presented_protocol_version.clone(),
+        now: SystemTime::now(),
+    }
+}
+
+struct CollectedNotifications {
+    messages: Vec<Value>,
+    capacity_exceeded: bool,
+}
+
+async fn collect_notifications(
+    mut receiver: mpsc::Receiver<Value>,
+    handler_completion: oneshot::Receiver<()>,
+    config: StreamableHttpSessionStoreConfig,
+) -> CollectedNotifications {
+    let mut messages = Vec::new();
+    let mut pending_bytes = 0_usize;
+    let mut capacity_exceeded = false;
+    let mut handler_completion = std::pin::pin!(handler_completion);
+    loop {
+        tokio::select! {
+            _ = &mut handler_completion => {
+                receiver.close();
+                break;
+            }
+            message = receiver.recv() => {
+                let Some(message) = message else {
+                    return CollectedNotifications { messages, capacity_exceeded };
+                };
+                collect_notification(
+                    message,
+                    &config,
+                    &mut messages,
+                    &mut pending_bytes,
+                    &mut capacity_exceeded,
+                );
+            }
+        }
+    }
+    while let Some(message) = receiver.recv().await {
+        collect_notification(
             message,
-        });
+            &config,
+            &mut messages,
+            &mut pending_bytes,
+            &mut capacity_exceeded,
+        );
+    }
+    CollectedNotifications {
+        messages,
+        capacity_exceeded,
     }
 }
 
-fn session_id_header(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
+fn collect_notification(
+    message: Value,
+    config: &StreamableHttpSessionStoreConfig,
+    messages: &mut Vec<Value>,
+    pending_bytes: &mut usize,
+    capacity_exceeded: &mut bool,
+) {
+    let message_bytes = serialized_size_bounded(&message, config.max_event_bytes);
+    let fits = message_bytes.is_some_and(|message_bytes| {
+        messages.len() < config.max_events_per_session
+            && pending_bytes
+                .checked_add(message_bytes)
+                .is_some_and(|total| total <= config.max_pending_bytes_per_session)
+    });
+    if fits {
+        *pending_bytes += message_bytes.expect("checked bounded message size");
+        messages.push(message);
+    } else {
+        *capacity_exceeded = true;
+    }
 }
 
-fn unsupported_version_response(headers: &HeaderMap) -> Option<Response> {
-    let version = headers
-        .get("mcp-protocol-version")
-        .and_then(|value| value.to_str().ok())?;
-    if version == MCP_PROTOCOL_VERSION {
-        return None;
+fn serialized_size_bounded(message: &Value, limit: usize) -> Option<usize> {
+    let mut counter = BoundedSizeCounter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, message)
+        .ok()
+        .map(|()| counter.bytes)
+}
+
+struct BoundedSizeCounter {
+    bytes: usize,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedSizeCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .filter(|bytes| *bytes <= self.limit)
+            .ok_or_else(|| std::io::Error::other("serialized MCP notification exceeds capacity"))?;
+        self.bytes = bytes;
+        Ok(buffer.len())
     }
-    Some((StatusCode::BAD_REQUEST, "unsupported MCP protocol version").into_response())
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn origin_allowed(state: &HttpState, headers: &HeaderMap) -> bool {
-    let Some(policy) = &state.origin_policy else {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(origin) = origins.next() else {
         return true;
     };
-    let Some(origin) = headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return true;
+    if origins.next().is_some() {
+        return false;
+    }
+    origin
+        .to_str()
+        .ok()
+        .and_then(|origin| canonical_origin(origin).ok())
+        .is_some_and(|origin| state.allowed_origins.contains(&origin))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CanonicalOrigin {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+fn canonical_origin(value: &str) -> Result<CanonicalOrigin> {
+    if value == "null" || value.trim() != value {
+        return Err(Error::protocol("invalid MCP allowed Origin"));
+    }
+    let (_, authority) = value
+        .split_once("://")
+        .ok_or_else(|| Error::protocol("invalid MCP allowed Origin"))?;
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#'))
+    {
+        return Err(Error::protocol("invalid MCP allowed Origin"));
+    }
+    let url = Url::parse(value).map_err(|_| Error::protocol("invalid MCP allowed Origin"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::protocol("invalid MCP allowed Origin"));
+    }
+    Ok(CanonicalOrigin {
+        scheme: url.scheme().to_owned(),
+        host: url
+            .host_str()
+            .ok_or_else(|| Error::protocol("invalid MCP allowed Origin"))?
+            .to_ascii_lowercase(),
+        port: url
+            .port_or_known_default()
+            .ok_or_else(|| Error::protocol("invalid MCP allowed Origin"))?,
+    })
+}
+
+// Axum responses are returned directly to keep rejection paths allocation-free.
+#[allow(clippy::result_large_err)]
+fn single_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> std::result::Result<Option<String>, Response> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
     };
-    policy(origin)
+    if values.next().is_some() {
+        return Err((StatusCode::BAD_REQUEST, format!("duplicate {name} header")).into_response());
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid {name} header")).into_response())?;
+    if value.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, format!("invalid {name} header")).into_response());
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    single_header(headers, "content-type")
+        .ok()
+        .flatten()
+        .and_then(|value| value.split(';').next().map(str::trim).map(str::to_owned))
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/json"))
 }
 
 fn accepts_streamable_http_post(headers: &HeaderMap) -> bool {
@@ -1168,36 +1981,87 @@ fn accepts_streamable_http_get(headers: &HeaderMap) -> bool {
         .any(|value| value == "text/event-stream" || value == "*/*")
 }
 
+fn validate_initialize_params(params: Option<&Value>) -> std::result::Result<(), String> {
+    let params = params
+        .and_then(Value::as_object)
+        .ok_or_else(|| "initialize params must be an object".to_owned())?;
+    let version = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "initialize protocolVersion must be a string".to_owned())?;
+    if version != MCP_PROTOCOL_VERSION {
+        return Err(format!("unsupported MCP protocol version `{version}`"));
+    }
+    params
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "initialize capabilities must be an object".to_owned())?;
+    let client_info = params
+        .get("clientInfo")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "initialize clientInfo must be an object".to_owned())?;
+    for field in ["name", "version"] {
+        if client_info
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "initialize clientInfo.{field} must be a nonempty string"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn initialize_result(handler: &Arc<dyn ServerHandler>) -> Value {
+    let server_info = handler.server_info();
+    let mut result = json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": handler.capabilities().to_value(),
+        "serverInfo": {
+            "name": server_info.name,
+            "version": server_info.version,
+        }
+    });
+    if let Some(description) = server_info.description {
+        result["serverInfo"]["description"] = Value::String(description);
+    }
+    if !server_info.icons.is_empty() {
+        result["serverInfo"]["icons"] = icons_to_value(&server_info.icons);
+    }
+    if let Some(instructions) = handler
+        .instructions()
+        .filter(|instructions| !instructions.trim().is_empty())
+    {
+        result["instructions"] = Value::String(instructions);
+    }
+    result
+}
+
+fn initialize_error_response(id: JsonRpcId, code: i64, message: String) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    (
+        StatusCode::OK,
+        headers,
+        axum::Json(json_rpc_error(id, code, message)),
+    )
+        .into_response()
+}
+
+// Keeping the complete method dispatch table together makes protocol coverage auditable.
+#[allow(clippy::too_many_lines)]
 async fn handle_request(
     handler: Arc<dyn ServerHandler>,
     request: JsonRpcRequest,
     context: ServerContext,
 ) -> Value {
     match request.method.as_str() {
-        "initialize" => {
-            let server_info = handler.server_info();
-            let mut result = json!({
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": handler.capabilities().to_value(),
-                "serverInfo": {
-                    "name": server_info.name,
-                    "version": server_info.version,
-                }
-            });
-            if let Some(description) = server_info.description {
-                result["serverInfo"]["description"] = Value::String(description);
-            }
-            if !server_info.icons.is_empty() {
-                result["serverInfo"]["icons"] = icons_to_value(&server_info.icons);
-            }
-            if let Some(instructions) = handler
-                .instructions()
-                .filter(|instructions| !instructions.trim().is_empty())
-            {
-                result["instructions"] = Value::String(instructions);
-            }
-            json_rpc_success(request.id, result)
-        }
+        "initialize" => json_rpc_success(request.id, initialize_result(&handler)),
         "ping" => json_rpc_success(request.id, json!({})),
         method if method.starts_with("notifications/") => {
             tracing::debug!(
@@ -1408,7 +2272,7 @@ fn completion_request(params: Option<&Value>) -> std::result::Result<McpCompleti
         .and_then(|context| context.get("arguments"))
         .and_then(Value::as_object)
     {
-        request.context_arguments = arguments.clone();
+        request.context_arguments.clone_from(arguments);
     }
     Ok(request)
 }
@@ -1499,16 +2363,56 @@ async fn write_json_line(stdout: &Arc<Mutex<tokio::io::Stdout>>, message: &Value
     stdout.write_all(line.as_bytes()).await?;
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
+    drop(stdout);
     Ok(())
-}
-
-fn next_sse_id() -> u64 {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Convenience fallback for handlers.
 #[must_use]
 pub fn method_not_found(request: JsonRpcRequest) -> Value {
     json_rpc_method_not_found(request.id, &request.method)
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn bearer_token_rejects_duplicate_or_combined_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first"),
+        );
+        headers.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer second"),
+        );
+        assert!(bearer_token(&headers).is_none());
+
+        headers.clear();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer first, Bearer second"),
+        );
+        assert!(bearer_token(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn elapsed_expiry_wins_against_ready_event_sender() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert!(
+            !send_before_expiry(
+                &sender,
+                "data: must-not-send\n\n".to_owned(),
+                Some(SystemTime::UNIX_EPOCH),
+            )
+            .await
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            credential_expiry_delay(SystemTime::UNIX_EPOCH),
+            Duration::ZERO
+        );
+    }
 }

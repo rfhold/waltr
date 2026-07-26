@@ -172,7 +172,11 @@ impl ReleaseServer {
                 context.required_scopes.join(" ")
             ));
         if token.0 == "release-desk-secret" {
-            McpTokenValidation::Authorized
+            McpTokenValidation::Authorized {
+                principal_id: mcp::McpPrincipalId::new("progressive-test")
+                    .expect("valid principal"),
+                expires_at: None,
+            }
         } else {
             McpTokenValidation::Unauthorized {
                 error_description: Some("invalid release desk token".to_owned()),

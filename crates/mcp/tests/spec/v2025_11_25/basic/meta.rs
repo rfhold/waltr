@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use mcp::{
-    protocol::{JsonRpcId, JsonRpcInbound, json_rpc_success, parse_json_rpc_message},
+    protocol::{
+        JsonRpcId, JsonRpcInbound, MCP_PROTOCOL_VERSION, json_rpc_success, parse_json_rpc_message,
+    },
     server::ServerContext,
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::spec::support::SpecServer;
+use crate::spec::support::{SpecServer, initialized_session};
 
 #[derive(Clone)]
 struct MetaServer {
@@ -70,13 +72,16 @@ fn result_meta_is_preserved_in_json_rpc_success_response() -> mcp::Result<()> {
 async fn notification_params_meta_is_preserved_for_receiver() -> mcp::Result<()> {
     let handler = Arc::new(MetaServer::default());
     let server = SpecServer::start(handler.clone()).await?;
+    let session_id = initialized_session(&server.endpoint()).await?;
 
     let response = reqwest::Client::new()
         .post(server.endpoint())
         .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
         .json(&json!({
             "jsonrpc": "2.0",
-            "method": "notifications/initialized",
+            "method": "notifications/example",
             "params": {
                 "_meta": {
                     "example.com/trace-id": "trace-1",

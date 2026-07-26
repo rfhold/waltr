@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use mcp::protocol::MCP_PROTOCOL_VERSION;
-use mcp::server::ServerHandler;
+use mcp::server::{ServerHandler, StreamableHttpOptions};
 use reqwest::{StatusCode, header::HeaderMap};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -13,9 +13,16 @@ pub struct SpecServer {
 
 impl SpecServer {
     pub async fn start(handler: Arc<dyn ServerHandler>) -> mcp::Result<Self> {
+        Self::start_with_options(handler, StreamableHttpOptions::default()).await
+    }
+
+    pub async fn start_with_options(
+        handler: Arc<dyn ServerHandler>,
+        options: StreamableHttpOptions,
+    ) -> mcp::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let router = mcp::server::streamable_http_router(handler);
+        let router = mcp::server::streamable_http_router_with_options(handler, options);
         let task = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, router).await {
                 tracing::debug!(%error, "mcp spec server stopped");
@@ -112,8 +119,5 @@ pub async fn post_json(endpoint: &str, body: Value) -> mcp::Result<JsonResponse>
 }
 
 fn should_initialize_before_post(body: &Value) -> bool {
-    let Some(method) = body.get("method").and_then(Value::as_str) else {
-        return false;
-    };
-    !matches!(method, "initialize" | "ping") && !method.starts_with("notifications/")
+    body.get("method").and_then(Value::as_str) != Some("initialize")
 }
