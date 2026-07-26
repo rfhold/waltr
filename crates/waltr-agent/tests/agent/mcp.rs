@@ -1,6 +1,15 @@
 //! MCP agent integration tests.
 
-use std::{collections::HashMap, fs, process::Child, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    process::Child,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use waltr_agent::{
@@ -19,7 +28,10 @@ use opentelemetry_sdk::{
     trace::{InMemorySpanExporter, SdkTracerProvider, SpanData},
 };
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::{Notify, Semaphore},
+};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::{Registry, prelude::*};
 
@@ -194,6 +206,75 @@ async fn mcp_streamable_http_auth_failure_is_reported_as_auth_required() -> walt
         "unexpected error: {error:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_shutdown_releases_coordinator_lock_attempts_all_servers_and_propagates_failure()
+-> waltr_agent::Result<()> {
+    let failing = Arc::new(ShutdownProbe::new(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        true,
+    ));
+    let succeeding = Arc::new(ShutdownProbe::new(axum::http::StatusCode::ACCEPTED, false));
+    let (failing_endpoint, failing_task) = start_shutdown_probe(failing.clone()).await?;
+    let (succeeding_endpoint, succeeding_task) = start_shutdown_probe(succeeding.clone()).await?;
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_shutdown_provider",
+        vec![vec![CompletionEvent::Finished]],
+    ));
+    let sessions = mcp_sessions(provider);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![
+                http_runtime_endpoint("a_failing", failing_endpoint),
+                http_runtime_endpoint("b_succeeding", succeeding_endpoint),
+            ])),
+        )
+        .await?;
+    let submission = sessions
+        .submit_prompt(
+            session_id.clone(),
+            "start MCP runtimes",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?;
+    submission.handle.wait().await?;
+
+    let shutdown_sessions = sessions.clone();
+    let shutdown_session_id = session_id.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_sessions
+            .set_runtime_settings(&shutdown_session_id, None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), failing.delete_started.notified())
+        .await
+        .expect("first MCP shutdown starts");
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        sessions.set_runtime_settings(&session_id, None),
+    )
+    .await
+    .expect("coordinator MCP runtime lock is released before shutdown")?;
+    failing.release_delete.add_permits(1);
+
+    let error = shutdown
+        .await
+        .expect("shutdown task completes")
+        .expect_err("failed MCP shutdown is propagated");
+    assert!(
+        error.to_string().contains("500"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(failing.deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(succeeding.deletes.load(Ordering::SeqCst), 1);
+
+    failing_task.abort();
+    succeeding_task.abort();
     Ok(())
 }
 
@@ -1035,6 +1116,15 @@ fn http_runtime_server_with_key(
     }
 }
 
+fn http_runtime_endpoint(key: &str, endpoint: String) -> SessionMcpServerRuntimeSettings {
+    SessionMcpServerRuntimeSettings {
+        key: key.to_owned(),
+        kind: SessionMcpServerRuntimeKind::StreamableHttp,
+        command: String::new(),
+        url: endpoint,
+    }
+}
+
 fn mcp_sessions(provider: Arc<impl LlmStream + 'static>) -> SessionCoordinator<MemorySessionStore> {
     mcp_sessions_with_instructions_enabled(provider, true)
 }
@@ -1341,6 +1431,102 @@ async fn wait_for_http_address(
         "mcp",
         "MCP HTTP test server did not report an address",
     ))
+}
+
+#[derive(Debug)]
+struct ShutdownProbe {
+    deletes: AtomicUsize,
+    delete_status: axum::http::StatusCode,
+    block_delete: bool,
+    delete_started: Notify,
+    release_delete: Semaphore,
+}
+
+impl ShutdownProbe {
+    fn new(delete_status: axum::http::StatusCode, block_delete: bool) -> Self {
+        Self {
+            deletes: AtomicUsize::new(0),
+            delete_status,
+            block_delete,
+            delete_started: Notify::new(),
+            release_delete: Semaphore::new(0),
+        }
+    }
+}
+
+async fn start_shutdown_probe(
+    probe: Arc<ShutdownProbe>,
+) -> waltr_agent::Result<(String, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let router = axum::Router::new()
+        .route("/mcp", axum::routing::any(shutdown_probe))
+        .with_state(probe);
+    let task = tokio::spawn(async move {
+        drop(axum::serve(listener, router).await);
+    });
+    Ok((format!("http://{address}/mcp"), task))
+}
+
+async fn shutdown_probe(
+    axum::extract::State(probe): axum::extract::State<Arc<ShutdownProbe>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    match *request.method() {
+        axum::http::Method::DELETE => {
+            probe.deletes.fetch_add(1, Ordering::SeqCst);
+            probe.delete_started.notify_one();
+            if probe.block_delete {
+                let permit = probe
+                    .release_delete
+                    .acquire()
+                    .await
+                    .expect("shutdown probe semaphore remains open");
+                permit.forget();
+            }
+            probe.delete_status.into_response()
+        }
+        axum::http::Method::GET => {
+            let stream = futures_util::stream::pending::<Result<String, std::io::Error>>();
+            (
+                axum::http::StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        axum::http::Method::POST => {
+            let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                .await
+                .expect("bounded probe request body");
+            let message: serde_json::Value =
+                serde_json::from_slice(&body).expect("probe JSON-RPC request");
+            if message["method"] == "initialize" {
+                return (
+                    axum::http::StatusCode::OK,
+                    [
+                        ("content-type", "application/json"),
+                        ("mcp-session-id", "shutdown-probe-session"),
+                        ("mcp-protocol-version", MCP_PROTOCOL_VERSION),
+                    ],
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {
+                            "protocolVersion": MCP_PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": { "name": "shutdown-probe", "version": "1" }
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            axum::http::StatusCode::ACCEPTED.into_response()
+        }
+        _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
 }
 
 fn tool_result_text(session: &AgentTestSession) -> String {

@@ -427,8 +427,9 @@ impl McpServerRuntime {
         Ok(())
     }
 
-    pub(in crate::mcp) async fn shutdown(&self) {
-        drop(self.client.shutdown().await);
+    pub(in crate::mcp) async fn shutdown(&self) -> Result<()> {
+        self.client.shutdown().await?;
+        Ok(())
     }
 }
 
