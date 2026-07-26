@@ -58,17 +58,19 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     render_auth_modal(frame, app);
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "modal rendering keeps OAuth status and controls in presentation order"
+)]
 fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
     if app.screen() == AppScreen::Access {
         return;
     }
-    let snapshot = match app.client_snapshot() {
-        Some(snapshot) => snapshot,
-        None => return,
+    let Some(snapshot) = app.client_snapshot() else {
+        return;
     };
-    let requirement = match snapshot.auth.pending.first() {
-        Some(requirement) => requirement,
-        None => return,
+    let Some(requirement) = snapshot.auth.pending.first() else {
+        return;
     };
     let attempt = snapshot.auth.active_attempt.as_ref().filter(|attempt| {
         attempt.target.kind == requirement.target.kind
@@ -253,7 +255,7 @@ pub fn draw_wrapper(
 
 pub(crate) fn global_content_area(area: Rect) -> Rect {
     let horizontal_padding = area.width.min(2);
-    let left_padding = if horizontal_padding == 0 { 0 } else { 1 };
+    let left_padding = u16::from(horizontal_padding != 0);
 
     Rect::new(
         area.x.saturating_add(left_padding),

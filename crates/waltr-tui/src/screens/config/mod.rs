@@ -129,7 +129,7 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
+const fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
     match active_tab {
         ConfigTab::Providers | ConfigTab::Mcp => {
             "Esc back  Tab switch  C-x c create  Enter edit  Del delete"

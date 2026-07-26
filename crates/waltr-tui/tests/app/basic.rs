@@ -897,7 +897,11 @@ fn outbound_auth_snapshot(lifecycle: &str, completion_mode: &str, auth_url: &str
         completion_mode: completion_mode.to_owned(),
         registration_method: "dynamic".to_owned(),
         lifecycle: lifecycle.to_owned(),
-        failure_reason: (lifecycle == "failed").then(|| "safe failure".to_owned()).unwrap_or_default(),
+        failure_reason: if lifecycle == "failed" {
+            "safe failure".to_owned()
+        } else {
+            String::new()
+        },
     });
     snapshot
 }

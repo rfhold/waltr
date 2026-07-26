@@ -84,19 +84,19 @@ impl TerminalModeGuard {
         let mut error = None;
 
         if self.enhanced_keyboard {
-            if let Err(restore_error) = execute!(io::stdout(), PopKeyboardEnhancementFlags) {
-                if error.is_none() {
-                    error = Some(restore_error);
-                }
+            if let Err(restore_error) = execute!(io::stdout(), PopKeyboardEnhancementFlags)
+                && error.is_none()
+            {
+                error = Some(restore_error);
             }
             self.enhanced_keyboard = false;
         }
 
         if self.mouse_capture {
-            if let Err(restore_error) = execute!(io::stdout(), DisableMouseCapture) {
-                if error.is_none() {
-                    error = Some(restore_error);
-                }
+            if let Err(restore_error) = execute!(io::stdout(), DisableMouseCapture)
+                && error.is_none()
+            {
+                error = Some(restore_error);
             }
             self.mouse_capture = false;
         }
@@ -175,7 +175,7 @@ async fn runtime_startup(options: &CliOptions) -> io::Result<RuntimeStartup> {
     #[cfg(feature = "server")]
     {
         let embedded_server = start_embedded_server(options.server_addr).await?;
-        return Ok(RuntimeStartup {
+        Ok(RuntimeStartup {
             runtime_options: runtime::RuntimeOptions {
                 client_endpoint: Some(format!(
                     "http://{}",
@@ -183,7 +183,7 @@ async fn runtime_startup(options: &CliOptions) -> io::Result<RuntimeStartup> {
                 )),
             },
             embedded_server: Some(embedded_server),
-        });
+        })
     }
 
     #[cfg(not(feature = "server"))]
@@ -289,7 +289,7 @@ fn embedded_server_addr() -> io::Result<SocketAddr> {
 }
 
 #[cfg(feature = "server")]
-fn client_addr_for_server(addr: SocketAddr) -> SocketAddr {
+const fn client_addr_for_server(addr: SocketAddr) -> SocketAddr {
     if addr.ip().is_unspecified() {
         SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -327,6 +327,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::type_complexity,
+        reason = "fixture returns each independent shutdown synchronization point"
+    )]
     fn blocked_server() -> (
         EmbeddedServer,
         Arc<Notify>,
@@ -462,9 +466,8 @@ mod tests {
         assert!(!startup.is_finished());
         probe.release_cleanup.notify_one();
 
-        let error = match startup.await.expect("startup should join") {
-            Ok(_) => panic!("occupied port should fail startup"),
-            Err(error) => error,
+        let Err(error) = startup.await.expect("startup should join") else {
+            panic!("occupied port should fail startup");
         };
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }

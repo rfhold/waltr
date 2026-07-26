@@ -1488,6 +1488,10 @@ fn runtime_mcp_server(name: &str) -> McpServerView {
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "fixture consumes freshly constructed app events"
+)]
 fn key_event(event: AppEvent) -> KeyEvent {
     let AppEvent::Input(InputEvent::Key(key)) = event else {
         panic!("expected key event");

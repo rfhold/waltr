@@ -46,6 +46,10 @@ use self::{
     },
 };
 
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "runtime wiring consumes this helper through the crate boundary"
+)]
 pub(crate) use self::timeline::register_timeline_watch_command;
 
 const TIMELINE_PAGE_SIZE: u32 = 64;
@@ -274,6 +278,10 @@ impl SessionsSection {
     }
 
     /// Reconcile submitted create/delete operations against shared reducer state.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "operation reconciliation is one ordered snapshot transition"
+    )]
     pub fn reconcile_operations(&mut self, snapshot: &ClientSnapshot) {
         if let Some(Ok(Some(session))) = self.create.reconcile(
             &snapshot.sessions.create,
@@ -739,6 +747,10 @@ impl SessionsSection {
         SectionAction::ClientCommand(ClientCommand::SubmitUserMessage { session_id, text })
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "composer positions are constrained by the protocol's u32 cursor field"
+    )]
     fn update_resource_autocomplete(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
         let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
             self.clear_resource_autocomplete();
@@ -773,7 +785,7 @@ impl SessionsSection {
         );
         self.resource_autocomplete.request_id = Some(request_id.clone());
         self.resource_autocomplete.session_id = Some(session_id.clone());
-        self.resource_autocomplete.query = token.query.clone();
+        self.resource_autocomplete.query.clone_from(&token.query);
         self.resource_autocomplete.cursor = token.cursor;
         self.resource_autocomplete.token_start = token.start;
         self.resource_autocomplete.token_end = token.end;
@@ -968,6 +980,10 @@ impl SessionsSection {
         })
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "callers construct response values for immediate command serialization"
+    )]
     fn respond_external_request(
         &mut self,
         session_id: &str,
@@ -982,6 +998,10 @@ impl SessionsSection {
         })
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "callers construct denial values for immediate command serialization"
+    )]
     fn deny_permission_and_interrupt(
         &mut self,
         session_id: &str,
@@ -1101,7 +1121,7 @@ impl SessionsSection {
                     turn: *turn,
                 })
             }
-            (_, RollbackModalAction::Cancel) | _ => {
+            _ => {
                 self.rollback_modal = None;
                 SectionAction::Continue
             }
@@ -1242,7 +1262,7 @@ impl SessionsSection {
         SectionAction::Continue
     }
 
-    fn request_older_timeline(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+    fn request_older_timeline(&self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
         let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
             return SectionAction::Continue;
         };
@@ -1267,7 +1287,7 @@ impl SessionsSection {
         })
     }
 
-    fn has_pending_operation(&self) -> bool {
+    const fn has_pending_operation(&self) -> bool {
         self.create.is_pending()
             || self.delete.is_pending()
             || self.runtime_update.is_pending()
@@ -1692,7 +1712,7 @@ fn rollback_modal_height(modal: &RollbackModal) -> u16 {
     u16::try_from(action_count.saturating_add(5)).unwrap_or(8)
 }
 
-fn rollback_modal_title(target: &RollbackModalTarget) -> &'static str {
+const fn rollback_modal_title(target: &RollbackModalTarget) -> &'static str {
     match target {
         RollbackModalTarget::UserMessage { .. } => " Message actions ",
         RollbackModalTarget::ExternalRequest { .. } => " Prompt actions ",
@@ -1746,7 +1766,7 @@ fn rollback_modal_action_line(action: RollbackModalAction, selected: bool) -> Li
     ])
 }
 
-fn rollback_modal_action_label(action: RollbackModalAction) -> &'static str {
+const fn rollback_modal_action_label(action: RollbackModalAction) -> &'static str {
     match action {
         RollbackModalAction::Rerun => "Rerun",
         RollbackModalAction::Edit => "Edit",
@@ -1958,6 +1978,10 @@ fn format_count(value: u64) -> String {
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only compact count formatting"
+)]
 fn format_suffix(value: u64, divisor: u64, suffix: &str) -> String {
     let scaled = value as f64 / divisor as f64;
     let text = if scaled < 10.0 {
@@ -1968,6 +1992,10 @@ fn format_suffix(value: u64, divisor: u64, suffix: &str) -> String {
     format!("{}{suffix}", text.trim_end_matches(".0"))
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only percentage formatting"
+)]
 fn cache_rate(part: u64, total: u64) -> String {
     if total == 0 {
         return "0%".to_owned();
@@ -1975,6 +2003,10 @@ fn cache_rate(part: u64, total: u64) -> String {
     format!("{:.1}%", (part as f64 / total as f64) * 100.0)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only currency formatting"
+)]
 fn format_compact_cost(micros: u64) -> String {
     if micros == 0 {
         return "$-".to_owned();
@@ -1982,6 +2014,10 @@ fn format_compact_cost(micros: u64) -> String {
     format!("${:.6}", micros as f64 / 1_000_000.0)
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-only currency formatting"
+)]
 fn format_compact_currency_cost(micros: u64, currency: Option<&str>) -> String {
     if micros == 0 {
         return "$-".to_owned();
@@ -2051,7 +2087,7 @@ fn session_option_focus_style(selected: bool) -> Style {
     THEME.focus_style().bg(session_option_bg(selected))
 }
 
-fn session_option_bg(selected: bool) -> ratatui::style::Color {
+const fn session_option_bg(selected: bool) -> ratatui::style::Color {
     if selected {
         THEME.dim_accent()
     } else {

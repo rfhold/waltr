@@ -27,6 +27,10 @@ use super::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "timeline variants retain render-ready event data"
+)]
 enum TimelineItemModel {
     Text {
         item_id: String,
@@ -141,7 +145,7 @@ pub(super) fn timeline_widget(
         width,
     ))
     .style(THEME.text_style())
-    .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+    .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
 }
 
 pub(super) fn timeline_rendered_line_count(
@@ -208,30 +212,30 @@ pub(super) fn timeline_click_target_at_row(
     row: usize,
     expanded_shell_tools: &BTreeSet<String>,
 ) -> Option<TimelineClickTarget> {
-    timeline_item_at_row(timeline, width, row, expanded_shell_tools).and_then(|item| match item {
+    timeline_item_at_row(timeline, width, row, expanded_shell_tools).map(|item| match item {
         TimelineItemModel::Text {
             cursor,
             text,
             label: "user",
             ..
-        } => Some(TimelineClickTarget::UserMessage { cursor, text }),
+        } => TimelineClickTarget::UserMessage { cursor, text },
         TimelineItemModel::External {
             open_cursor,
             request,
             resolved: true,
             ..
-        } => Some(TimelineClickTarget::ExternalRequest {
+        } => TimelineClickTarget::ExternalRequest {
             cursor: open_cursor,
             label: request.as_ref().map_or_else(
                 || "external request".to_owned(),
                 |request| external_request_kind_label(request.kind).to_owned(),
             ),
-        }),
+        },
         TimelineItemModel::Text { turn, .. }
         | TimelineItemModel::Tool { turn, .. }
         | TimelineItemModel::External { turn, .. }
         | TimelineItemModel::Metrics { turn, .. }
-        | TimelineItemModel::Event { turn, .. } => Some(TimelineClickTarget::Turn { turn }),
+        | TimelineItemModel::Event { turn, .. } => TimelineClickTarget::Turn { turn },
     })
 }
 
@@ -456,7 +460,7 @@ fn upsert_tool_call_item(
         *cursor = event.cursor;
         *turn = event.turn;
         if !name.is_empty() {
-            *item_name = name.clone();
+            item_name.clone_from(name);
         }
         *item_input = input;
         *item_input_entries = input_entries;
@@ -523,9 +527,9 @@ fn upsert_tool_result_item(
         *cursor = event.cursor;
         *turn = event.turn;
         if !name.is_empty() {
-            *item_name = name.clone();
+            item_name.clone_from(name);
         }
-        *result_content = content.clone();
+        result_content.clone_from(content);
         *state = if *error {
             ToolState::Error
         } else {
@@ -554,7 +558,7 @@ fn upsert_tool_result_item(
 }
 
 fn append_tool_progress(
-    items: &mut Vec<TimelineItemModel>,
+    items: &mut [TimelineItemModel],
     tool_id_by_item_id: &BTreeMap<String, String>,
     event: &TimelineEventView,
     error: bool,
@@ -592,7 +596,7 @@ fn append_tool_progress(
 }
 
 fn append_task_progress(
-    items: &mut Vec<TimelineItemModel>,
+    items: &mut [TimelineItemModel],
     tool_id_by_item_id: &BTreeMap<String, String>,
     event: &TimelineEventView,
 ) -> bool {
@@ -902,7 +906,7 @@ pub(super) fn accent_border_span() -> Span<'static> {
     Span::styled("▎", Style::default().fg(THEME.accent()))
 }
 
-fn span_with_panel_bg(mut span: Span<'static>) -> Span<'static> {
+const fn span_with_panel_bg(mut span: Span<'static>) -> Span<'static> {
     span.style = span.style.bg(THEME.panel());
     span
 }
@@ -968,7 +972,7 @@ fn split_line_prefix(spans: Vec<Span<'static>>) -> (Vec<Span<'static>>, Vec<Span
         if prefix_len == 0 {
             rest.push(span);
         } else {
-            let (prefix_span, rest_span) = split_span_at_chars(span, prefix_len);
+            let (prefix_span, rest_span) = split_span_at_chars(&span, prefix_len);
             if let Some(prefix_span) = prefix_span {
                 prefix.push(prefix_span);
             }
@@ -1004,7 +1008,7 @@ fn take_spans_width(
         }
 
         let available = width.saturating_sub(used);
-        let (left, right) = split_span_at_chars(span, available);
+        let (left, right) = split_span_at_chars(&span, available);
         if let Some(left) = left {
             taken.push(left);
         }
@@ -1018,7 +1022,7 @@ fn take_spans_width(
 }
 
 fn split_span_at_chars(
-    span: Span<'static>,
+    span: &Span<'static>,
     chars: usize,
 ) -> (Option<Span<'static>>, Option<Span<'static>>) {
     let content = span.content.to_string();
@@ -1030,6 +1034,10 @@ fn split_span_at_chars(
     (left, right)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "tool variants provide distinct render fields to one dispatcher"
+)]
 fn append_tool_lines(
     lines: &mut Vec<Line<'static>>,
     id: &str,
@@ -1062,6 +1070,10 @@ fn append_tool_lines(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "render helper arguments are independent layout inputs"
+)]
 fn append_task_tool_lines(
     lines: &mut Vec<Line<'static>>,
     input: &Value,
@@ -1123,6 +1135,10 @@ fn append_generic_tool_lines(
     lines.push(Line::from(spans));
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "render helper arguments are independent shell panel inputs"
+)]
 fn append_shell_tool_lines(
     lines: &mut Vec<Line<'static>>,
     input: &Value,
@@ -1462,15 +1478,15 @@ fn metrics_line(event: &TimelineEventView) -> Option<String> {
         return None;
     }
 
-    metrics_text_from_value(&value, value_json)
+    Some(metrics_text_from_value(&value, value_json))
 }
 
-fn metrics_text_from_value(value: &Value, fallback: &str) -> Option<String> {
+fn metrics_text_from_value(value: &Value, fallback: &str) -> String {
     let input = usage_total_input_tokens(value);
-    let output = json_u64_path(&value, &["usage", "output_tokens"])
-        .or_else(|| json_u64_path(&value, &["usage", "outputTokens"]));
-    let cost = json_u64_path(&value, &["cost", "total_micros"])
-        .or_else(|| json_u64_path(&value, &["cost", "totalMicros"]));
+    let output = json_u64_path(value, &["usage", "output_tokens"])
+        .or_else(|| json_u64_path(value, &["usage", "outputTokens"]));
+    let cost = json_u64_path(value, &["cost", "total_micros"])
+        .or_else(|| json_u64_path(value, &["cost", "totalMicros"]));
 
     let mut parts = Vec::new();
     if input > 0 {
@@ -1484,9 +1500,9 @@ fn metrics_text_from_value(value: &Value, fallback: &str) -> Option<String> {
     }
 
     if parts.is_empty() {
-        Some(fallback.to_owned())
+        fallback.to_owned()
     } else {
-        Some(parts.join("  "))
+        parts.join("  ")
     }
 }
 
@@ -1498,7 +1514,7 @@ fn task_progress_model(value_json: &str) -> Option<TaskProgressModel> {
     let metrics = value
         .get("metrics")
         .filter(|metrics| metrics.is_object())
-        .and_then(|metrics| metrics_text_from_value(metrics, &metrics.to_string()));
+        .map(|metrics| metrics_text_from_value(metrics, &metrics.to_string()));
     Some(TaskProgressModel {
         description: value
             .get("description")
@@ -1558,9 +1574,9 @@ fn usage_total_input_tokens(value: &Value) -> u64 {
 fn metrics_item_line(metrics: &str, width: Option<u16>) -> Line<'static> {
     let text = format!("· {metrics}");
     let text_width = text.chars().count();
-    let leading = width
-        .map(|width| usize::from(width).saturating_sub(text_width))
-        .unwrap_or(TIMELINE_TEXT_PREFIX.len());
+    let leading = width.map_or(TIMELINE_TEXT_PREFIX.len(), |width| {
+        usize::from(width).saturating_sub(text_width)
+    });
     Line::from(vec![Span::styled(
         format!("{}{text}", " ".repeat(leading)),
         THEME.muted_text_style(),
@@ -1784,6 +1800,10 @@ pub(super) fn timeline_channels() -> Vec<String> {
         .collect()
 }
 
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "watch construction is intentionally exposed only within the crate"
+)]
 pub(crate) fn register_timeline_watch_command(session_id: String) -> ClientCommand {
     ClientCommand::RegisterSessionTimelineWatchInterest {
         session_id,

@@ -1,5 +1,10 @@
 //! Terminal-native Markdown and syntax highlighting helpers.
 
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "markdown helpers are intentionally limited to the crate boundary"
+)]
+
 use std::sync::LazyLock;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -106,22 +111,17 @@ pub(crate) fn normalize_language(language: &str) -> Option<&'static str> {
     Some(match language.as_str() {
         "bash" | "console" | "shell" | "sh" | "terminal" | "zsh" => "bash",
         "diff" | "patch" => "diff",
-        "js" => "javascript",
+        "js" | "javascript" => "javascript",
         "jsx" => "jsx",
-        "md" => "markdown",
-        "rs" => "rust",
-        "ts" => "typescript",
+        "md" | "markdown" => "markdown",
+        "rs" | "rust" => "rust",
+        "ts" | "typescript" => "typescript",
         "tsx" => "tsx",
-        "yml" => "yaml",
+        "yml" | "yaml" => "yaml",
         "css" => "css",
         "html" => "html",
-        "javascript" => "javascript",
         "json" => "json",
-        "markdown" => "markdown",
-        "rust" => "rust",
         "toml" => "toml",
-        "typescript" => "typescript",
-        "yaml" => "yaml",
         _ => return None,
     })
 }
@@ -203,7 +203,7 @@ impl MarkdownRenderer {
             Event::End(tag) => self.end_tag(tag),
             Event::Text(text) => self.push_text(&text),
             Event::Code(code) => {
-                self.push_styled_text(&code, inline_code_style(self.current_style()))
+                self.push_styled_text(&code, inline_code_style(self.current_style()));
             }
             Event::SoftBreak => self.push_text(" "),
             Event::HardBreak => self.flush_line(),
@@ -214,7 +214,7 @@ impl MarkdownRenderer {
             }
             Event::Html(html) | Event::InlineHtml(html) => self.push_text(&html),
             Event::FootnoteReference(reference) => {
-                self.push_styled_text(&format!("[{reference}]"), THEME.muted_text_style())
+                self.push_styled_text(&format!("[{reference}]"), THEME.muted_text_style());
             }
             Event::TaskListMarker(checked) => self.push_text(if checked { "[x] " } else { "[ ] " }),
             Event::InlineMath(math) | Event::DisplayMath(math) => self.push_text(&math),
@@ -251,18 +251,19 @@ impl MarkdownRenderer {
             }
             Tag::Item => {
                 self.flush_line();
-                let marker = if let Some(list) = self.list_stack.last_mut() {
-                    match &mut list.next {
-                        Some(next) => {
-                            let marker = format!("{next}. ");
-                            *next += 1;
-                            marker
-                        }
-                        None => "- ".to_owned(),
-                    }
-                } else {
-                    "- ".to_owned()
-                };
+                let marker = self.list_stack.last_mut().map_or_else(
+                    || "- ".to_owned(),
+                    |list| {
+                        list.next.as_mut().map_or_else(
+                            || "- ".to_owned(),
+                            |next| {
+                                let marker = format!("{next}. ");
+                                *next += 1;
+                                marker
+                            },
+                        )
+                    },
+                );
                 self.push_styled_text(&marker, THEME.muted_text_style());
                 self.strong_index = 0;
             }
@@ -272,20 +273,24 @@ impl MarkdownRenderer {
                 self.push_style(style);
             }
             Tag::Strikethrough => {
-                self.push_style(self.current_style().add_modifier(Modifier::CROSSED_OUT))
+                self.push_style(self.current_style().add_modifier(Modifier::CROSSED_OUT));
             }
             Tag::Link { .. } => self.push_style(THEME.focus_style()),
             Tag::Image { dest_url, .. } => {
-                self.push_styled_text(&format!("image: {dest_url}"), THEME.muted_text_style())
+                self.push_styled_text(&format!("image: {dest_url}"), THEME.muted_text_style());
             }
-            Tag::Superscript | Tag::Subscript => {}
-            Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
-            Tag::FootnoteDefinition(_)
+            Tag::Superscript
+            | Tag::Subscript
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::FootnoteDefinition(_)
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
-            | Tag::DefinitionListDefinition => {}
-            Tag::HtmlBlock => {}
-            Tag::MetadataBlock(_) => {}
+            | Tag::DefinitionListDefinition
+            | Tag::HtmlBlock
+            | Tag::MetadataBlock(_) => {}
         }
     }
 
@@ -447,16 +452,15 @@ fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
 }
 
 fn heading_style(level: HeadingLevel) -> Style {
-    let style = match level {
+    match level {
         HeadingLevel::H1 | HeadingLevel::H2 => THEME.accent_bold(),
         HeadingLevel::H3 | HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => {
             THEME.text_style().add_modifier(Modifier::BOLD)
         }
-    };
-    style
+    }
 }
 
-fn inline_code_style(base_style: Style) -> Style {
+const fn inline_code_style(base_style: Style) -> Style {
     base_style.fg(THEME.accent()).add_modifier(Modifier::BOLD)
 }
 
@@ -512,7 +516,7 @@ fn highlight_theme() -> &'static Theme {
         .expect("syntect default themes include at least one theme")
 }
 
-fn syntect_style(style: SyntectStyle, base_style: Style) -> Style {
+const fn syntect_style(style: SyntectStyle, base_style: Style) -> Style {
     base_style.fg(Color::Rgb(
         style.foreground.r,
         style.foreground.g,

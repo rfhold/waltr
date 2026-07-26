@@ -1,3 +1,9 @@
+#![allow(
+    clippy::future_not_send,
+    clippy::unused_async,
+    reason = "server-backed fixtures intentionally drive a local non-Send client stream"
+)]
+
 use std::{collections::BTreeMap, time::Duration};
 
 use waltr_client::{

@@ -112,7 +112,7 @@ impl ProviderForm {
                 self.arm_model_delete();
             }
             KeyCode::Backspace if matches!(self.field, 0 | 2) => {
-                self.active_text_mut().pop().map_or((), drop)
+                let _ = self.active_text_mut().pop();
             }
             KeyCode::Left | KeyCode::Right if self.field == 1 => self.toggle_kind(),
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.field == 3 => {

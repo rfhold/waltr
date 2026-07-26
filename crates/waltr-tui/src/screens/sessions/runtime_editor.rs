@@ -179,7 +179,8 @@ impl SessionsSection {
         let Some(entry) = filtered_model_entries(snapshot, "")
             .into_iter()
             .find(|entry| {
-                entry.provider_key == provider.key && entry.model_id == provider.model_id
+                (entry.provider_key.as_str(), entry.model_id.as_str())
+                    == (provider.key.as_str(), provider.model_id.as_str())
             })
         else {
             return SectionAction::Continue;
@@ -347,6 +348,10 @@ fn handle_provider_runtime_editor_key(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "key routing mutates independent MCP editor fields"
+)]
 fn handle_mcp_runtime_editor_key(
     snapshot: Option<&ClientSnapshot>,
     detail_session: Option<&SessionView>,
@@ -514,9 +519,13 @@ pub(super) fn render_runtime_editor(
             enabled,
         ),
         None => {}
-    };
+    }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "render helper receives independent provider editor inputs"
+)]
 fn render_provider_editor(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -550,6 +559,10 @@ fn render_provider_editor(
     runtime_selector::render_model_selector(frame, body_area, "Models", &selector_entries);
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "render helper receives independent MCP editor inputs"
+)]
 fn render_mcp_editor(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -597,8 +610,10 @@ fn model_selector_entries(
                 .and_then(|session| session.runtime_config.as_ref())
                 .and_then(|runtime| runtime.provider.as_ref())
                 .is_some_and(|runtime_provider| {
-                    runtime_provider.key == entry.provider_key
-                        && runtime_provider.model_id == entry.model_id
+                    (
+                        runtime_provider.key.as_str(),
+                        runtime_provider.model_id.as_str(),
+                    ) == (entry.provider_key.as_str(), entry.model_id.as_str())
                 });
             ModelSelectorEntry {
                 provider_key: entry.provider_key.clone(),

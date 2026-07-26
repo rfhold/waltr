@@ -240,7 +240,7 @@ fn option_danger_style(focused: bool) -> Style {
     THEME.danger_style().bg(option_bg(focused))
 }
 
-fn option_bg(focused: bool) -> ratatui::style::Color {
+const fn option_bg(focused: bool) -> ratatui::style::Color {
     if focused {
         THEME.dim_accent()
     } else {

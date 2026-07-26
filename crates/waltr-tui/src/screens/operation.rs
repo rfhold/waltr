@@ -8,6 +8,10 @@ use waltr_client::{
 
 /// Outcome of routing an input event into a screen section.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "screen routing directly carries shared client commands"
+)]
 pub enum SectionAction {
     /// The section handled the event; keep running.
     Continue,
