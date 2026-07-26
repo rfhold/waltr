@@ -586,6 +586,22 @@ turn: bigint | null,
  */
 cursor: bigint | null, };
 
+export type AccessStatus = "unknownChecking" | "loginRequired" | "loginInProgress" | "authenticated" | "loginFailed";
+
+export type AccessSnapshot = { 
+/**
+ * Current Waltr access status.
+ */
+status: AccessStatus, 
+/**
+ * Last safe login error, when present.
+ */
+error: string | null, 
+/**
+ * Active platform login generation, when one is running.
+ */
+activeAttemptId: string | null, };
+
 export type ClientAuthTarget = { 
 /**
  * Target kind, currently `provider` or `mcpServer`.
@@ -944,6 +960,10 @@ templateSearches: { [key in string]?: SessionTemplateSearchSnapshot }, };
 
 export type ClientSnapshot = { 
 /**
+ * Waltr access authentication snapshot.
+ */
+access: AccessSnapshot, 
+/**
  * Auth coordination snapshot.
  */
 auth: AuthSnapshot, 
@@ -970,7 +990,27 @@ export type ClientSessionTemplateSearchTarget = "resources" | "prompts";
 
 export type ClientTimelineDirection = "forward" | "backward";
 
-export type ClientCommand = { "type": "requestAuthStatuses" } | { "type": "dismissAuthRequirement", 
+export type ClientCommand = { "type": "startWaltrLogin" } | { "type": "completeWaltrLogin", 
+/**
+ * Attempt generation returned after starting login.
+ */
+attemptId: string, } | { "type": "failWaltrLogin", 
+/**
+ * Attempt generation returned after starting login.
+ */
+attemptId: string, 
+/**
+ * Safe failure text to present to the user.
+ */
+error: string, } | { "type": "cancelWaltrLogin", 
+/**
+ * Attempt generation returned after starting login.
+ */
+attemptId: string, } | { "type": "reprobeWaltrAccess" } | { "type": "logoutWaltr" } | { "type": "waltrAccessExpired", 
+/**
+ * Safe expiry or refresh failure text.
+ */
+error: string, } | { "type": "requestAuthStatuses" } | { "type": "dismissAuthRequirement", 
 /**
  * Target to dismiss from the queue.
  */

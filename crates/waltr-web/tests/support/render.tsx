@@ -31,6 +31,11 @@ export function renderWithAppState(
     interruptSessionError?: string;
     searchCatalogModels?: (request: { query: string; providerId?: string; limit?: number }) => Promise<CatalogSearchResponse>;
     suggestCatalogMatches?: (request: { providerKey: string; modelKey: string; limit?: number }) => Promise<CatalogSuggestResponse>;
+    onDispatch?: (
+      command: ClientCommand,
+      snapshot: ClientSnapshot | undefined,
+      setSnapshot: (snapshot: ClientSnapshot) => void,
+    ) => Promise<ClientSnapshot> | ClientSnapshot;
     onSnapshotSetter?: (setSnapshot: (snapshot: ClientSnapshot) => void) => void;
   } = {},
 ) {
@@ -47,6 +52,9 @@ export function renderWithAppState(
     const phase = createMemo(() => systemReady() ? "ready" : "splash");
     const dispatch = async (command: ClientCommand) => {
       commands.push(command);
+      if (options.onDispatch) {
+        return options.onDispatch(command, snapshot(), setSnapshot);
+      }
       return snapshot() ?? snapshotWithConfig(emptyConfig(""));
     };
 

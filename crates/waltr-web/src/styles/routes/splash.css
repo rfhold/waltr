@@ -30,3 +30,60 @@
   letter-spacing: 0.16em;
   text-transform: uppercase;
 }
+
+.access {
+  position: fixed;
+  inset: 0;
+  z-index: 110;
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: clamp(1rem, 5vw, 4rem);
+  background:
+    linear-gradient(135deg, transparent 48%, rgba(190, 132, 242, 0.08) 48%, rgba(190, 132, 242, 0.08) 52%, transparent 52%),
+    radial-gradient(circle at 65% 35%, rgba(190, 132, 242, 0.2), transparent 30rem),
+    var(--color-bg);
+}
+
+.access__panel {
+  display: grid;
+  gap: var(--space-4);
+  width: min(34rem, 100%);
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-md);
+  padding: clamp(1.5rem, 6vw, 3.5rem);
+  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+  box-shadow: var(--shadow-dialog);
+}
+
+.access__panel h1 {
+  margin: 0;
+  font-size: clamp(2.25rem, 8vw, 4.5rem);
+  line-height: 0.95;
+  letter-spacing: -0.06em;
+}
+
+.access__copy,
+.access__progress {
+  margin: 0;
+  color: var(--color-text-muted);
+  line-height: 1.6;
+}
+
+.access__login {
+  width: fit-content;
+  text-decoration: none;
+}
+
+.access__progress {
+  color: var(--color-accent);
+  font-weight: 700;
+}
+
+.access__progress-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}

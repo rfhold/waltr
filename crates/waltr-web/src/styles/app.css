@@ -300,6 +300,34 @@
   background: var(--color-accent-soft);
 }
 
+.shell__logout {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 0.55rem 0.7rem;
+  color: var(--color-text-muted);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.shell__logout:not(:disabled):hover {
+  border-color: var(--border-accent);
+  color: var(--color-text);
+  background: var(--color-accent-soft);
+}
+
+.shell__logout:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.shell__logout-error {
+  margin: 0;
+  color: var(--color-danger-text);
+  font-size: 0.82rem;
+}
+
 .shell__status {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
