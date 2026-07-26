@@ -74,17 +74,9 @@ fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
         attempt.target.kind == requirement.target.kind
             && attempt.target.key == requirement.target.key
     });
-    let area = centered_percent_rect(frame.area(), 78, if attempt.is_some() { 16 } else { 10 });
-    let body = render_modal_frame(
-        frame,
-        area,
-        "OAuth required",
-        if attempt.is_some() {
-            "type/paste URL or code · Enter complete · Esc cancel"
-        } else {
-            "Enter begin OAuth · Esc dismiss"
-        },
-    );
+    let area = centered_percent_rect(frame.area(), 78, if attempt.is_some() { 20 } else { 10 });
+    frame.render_widget(Clear, area);
+    let body = render_modal_frame(frame, area, "OAuth required", auth_footer(attempt));
 
     let mut lines = vec![
         Line::from(vec![
@@ -92,27 +84,63 @@ fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
             Span::styled(auth_target_label(&requirement.target), THEME.accent_bold()),
         ]),
         Line::from(Span::styled(
-            requirement.message.clone(),
+            display_text(&requirement.message),
             THEME.accent_bold(),
         )),
     ];
 
     if let Some(attempt) = attempt {
         lines.push(Line::from(""));
-        for message in &attempt.messages {
+        lines.push(Line::from(vec![
+            Span::styled("Status: ", THEME.muted_text_style()),
+            Span::styled(lifecycle_label(&attempt.lifecycle), THEME.text_style()),
+            Span::styled(" · Completion: ", THEME.muted_text_style()),
+            Span::styled(
+                completion_mode_label(&attempt.completion_mode),
+                THEME.text_style(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Registration: ", THEME.muted_text_style()),
+            Span::styled(
+                registration_method_label(&attempt.registration_method),
+                THEME.text_style(),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            lifecycle_message(attempt),
+            THEME.muted_text_style(),
+        )));
+        for message in attempt.messages.iter().take(4) {
             lines.push(Line::from(Span::styled(
-                message.clone(),
+                display_text(message),
                 THEME.muted_text_style(),
             )));
         }
         lines.push(Line::from(vec![
             Span::styled("URL: ", THEME.muted_text_style()),
-            Span::styled(attempt.auth_url.clone(), THEME.text_style()),
+            Span::styled(
+                app.outbound_auth_url().unwrap_or("unavailable").to_owned(),
+                THEME.text_style(),
+            ),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled("Input: ", THEME.muted_text_style()),
-            Span::styled(app.auth_input().to_owned(), THEME.text_style()),
-        ]));
+        if attempt.completion_mode == "manual" && attempt.lifecycle == "pending" {
+            lines.push(Line::from(vec![
+                Span::styled("Input: ", THEME.muted_text_style()),
+                Span::styled(app.auth_input().to_owned(), THEME.text_style()),
+            ]));
+        }
+        if !attempt.failure_reason.is_empty() {
+            lines.push(error_line(&display_text(&attempt.failure_reason)));
+        }
+        if let Some(error) = snapshot.auth.complete.error.as_ref().or(snapshot
+            .auth
+            .cancel
+            .error
+            .as_ref())
+        {
+            lines.push(error_line(&display_text(error)));
+        }
     } else if let Some(error) = snapshot.auth.begin.error.as_ref() {
         lines.push(Line::from(""));
         lines.push(error_line(error));
@@ -124,6 +152,78 @@ fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
             .wrap(Wrap { trim: false }),
         body,
     );
+}
+
+fn auth_footer(attempt: Option<&waltr_client::AuthAttemptSnapshot>) -> &'static str {
+    let Some(attempt) = attempt else {
+        return "Enter begin OAuth · Esc dismiss";
+    };
+    if matches!(
+        attempt.lifecycle.as_str(),
+        "succeeded" | "failed" | "expired" | "canceled"
+    ) {
+        return "C copy URL · Esc dismiss";
+    }
+    if attempt.completion_mode == "manual" && attempt.lifecycle == "pending" {
+        "type/paste URL or code · C copy URL · Enter complete · Esc cancel"
+    } else {
+        "C copy URL · Esc cancel"
+    }
+}
+
+fn completion_mode_label(mode: &str) -> &'static str {
+    match mode {
+        "serverCallback" => "Server callback",
+        "manual" => "Manual",
+        _ => "Unknown",
+    }
+}
+
+fn registration_method_label(method: &str) -> &'static str {
+    match method {
+        "dynamic" => "Dynamic",
+        "clientMetadata" => "Client metadata",
+        "static" => "Static",
+        _ => "Unknown",
+    }
+}
+
+fn lifecycle_label(lifecycle: &str) -> String {
+    let mut characters = lifecycle.chars();
+    characters.next().map_or_else(
+        || "Unknown".to_owned(),
+        |first| first.to_uppercase().chain(characters).collect(),
+    )
+}
+
+fn lifecycle_message(attempt: &waltr_client::AuthAttemptSnapshot) -> &'static str {
+    match attempt.lifecycle.as_str() {
+        "pending" if attempt.completion_mode == "serverCallback" => {
+            "Waiting for the server callback. This dialog updates automatically."
+        }
+        "pending" => "Waiting for the final redirect URL or authorization code.",
+        "completing" => "Completing authorization.",
+        "succeeded" => "Authorization succeeded.",
+        "failed" => "Authorization failed.",
+        "expired" => "Authorization expired.",
+        "canceled" => "Authorization canceled.",
+        _ => "Authorization status is unknown.",
+    }
+}
+
+fn display_text(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(500)
+        .collect();
+    sanitized.trim().to_owned()
 }
 
 fn auth_target_label(target: &waltr_client::ClientAuthTarget) -> String {

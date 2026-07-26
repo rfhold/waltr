@@ -43,6 +43,8 @@ pub enum AppAction {
     ClientCommands(Vec<ClientCommand>),
     /// Ask the platform runtime to perform a native authentication side effect.
     NativeAuth(NativeAuthAction),
+    /// Copy a provider or upstream MCP authorization URL.
+    CopyAuthUrl(String),
 }
 
 /// The currently armed close confirmation, if any.
@@ -372,6 +374,9 @@ impl App {
     }
 
     fn handle_auth_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        if key.kind != KeyEventKind::Press {
+            return AppAction::Continue;
+        }
         let snapshot = match self.client_snapshot() {
             Some(snapshot) => snapshot,
             None => return AppAction::Continue,
@@ -381,24 +386,36 @@ impl App {
             None => return AppAction::Continue,
         };
         let target = requirement.target.clone();
-        let active_attempt_id = snapshot
+        let attempt = snapshot
             .auth
             .active_attempt
             .as_ref()
             .filter(|attempt| auth_targets_match(&attempt.target, &target))
-            .map(|attempt| attempt.attempt_id.clone());
+            .cloned();
+        let cancellable = attempt
+            .as_ref()
+            .is_some_and(|attempt| matches!(attempt.lifecycle.as_str(), "pending" | "completing"));
+        let manual_input = attempt.as_ref().is_some_and(|attempt| {
+            attempt.completion_mode == "manual" && attempt.lifecycle == "pending"
+        });
 
         match key.code {
             KeyCode::Esc => {
                 self.auth_input.clear();
-                if let Some(attempt_id) = active_attempt_id.clone() {
-                    return AppAction::ClientCommand(ClientCommand::CancelAuth { attempt_id });
+                if cancellable {
+                    return AppAction::ClientCommand(ClientCommand::CancelAuth {
+                        attempt_id: attempt
+                            .as_ref()
+                            .expect("cancellable attempt")
+                            .attempt_id
+                            .clone(),
+                    });
                 }
 
                 AppAction::ClientCommand(ClientCommand::DismissAuthRequirement { target })
             }
             KeyCode::Enter => {
-                if let Some(attempt_id) = active_attempt_id.clone() {
+                if manual_input {
                     let input = self.auth_input.trim().to_owned();
                     if input.is_empty() {
                         self.notice = Some(TransientNotice {
@@ -408,17 +425,28 @@ impl App {
                         return AppAction::Continue;
                     }
 
+                    let attempt_id = attempt.as_ref().expect("manual attempt").attempt_id.clone();
                     self.auth_input.clear();
                     AppAction::ClientCommand(ClientCommand::CompleteAuth { attempt_id, input })
-                } else {
+                } else if attempt.is_none() {
                     AppAction::ClientCommand(ClientCommand::BeginAuth { target })
+                } else {
+                    AppAction::Continue
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::Char('C')
+                if attempt
+                    .as_ref()
+                    .and_then(|attempt| safe_auth_url(&attempt.auth_url))
+                    .is_some() =>
+            {
+                AppAction::CopyAuthUrl(attempt.as_ref().expect("safe URL attempt").auth_url.clone())
+            }
+            KeyCode::Backspace if manual_input => {
                 self.auth_input.pop();
                 AppAction::Continue
             }
-            KeyCode::Char(character) if active_attempt_id.is_some() => {
+            KeyCode::Char(character) if manual_input => {
                 self.auth_input.push(character);
                 AppAction::Continue
             }
@@ -523,6 +551,19 @@ impl App {
     fn auth_requirement(&self) -> Option<&waltr_client::AuthRequirementSnapshot> {
         self.client_snapshot()
             .and_then(|snapshot| snapshot.auth.pending.first())
+    }
+
+    /// Validated provider or upstream MCP authorization URL for presentation.
+    #[must_use]
+    pub fn outbound_auth_url(&self) -> Option<&str> {
+        let requirement = self.auth_requirement()?;
+        let attempt = self
+            .client_snapshot()?
+            .auth
+            .active_attempt
+            .as_ref()
+            .filter(|attempt| auth_targets_match(&attempt.target, &requirement.target))?;
+        safe_auth_url(&attempt.auth_url)
     }
 
     #[allow(
@@ -786,6 +827,20 @@ impl App {
             LogoutSnapshotBarrier::None | LogoutSnapshotBarrier::AwaitingAnonymousReprobe => {}
         }
 
+        let previous_attempt_id = self
+            .client_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.auth.active_attempt.as_ref())
+            .map(|attempt| attempt.attempt_id.as_str());
+        let next_attempt_id = snapshot
+            .auth
+            .active_attempt
+            .as_ref()
+            .map(|attempt| attempt.attempt_id.as_str());
+        if previous_attempt_id != next_attempt_id {
+            self.auth_input.clear();
+        }
+
         let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
         let mut commands = Vec::new();
 
@@ -999,6 +1054,20 @@ impl App {
             SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
         }
     }
+}
+
+fn safe_auth_url(value: &str) -> Option<&str> {
+    if value.len() > 4096 {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Some(value)
 }
 
 fn sessions_body_area() -> Rect {
