@@ -7,8 +7,9 @@
     "dev": "pnpm wasm:build && pnpm dev:vite",
     "dev:vite": "vite --host 0.0.0.0",
     "build": "pnpm wasm:build && tsc --noEmit && vite build",
-    "test": "vitest run --environment happy-dom",
-    "wasm:build": "node scripts/build-wasm.mjs"
+    "test": "node --test scripts/build-wasm.contract.mjs && vitest run --environment happy-dom",
+    "wasm:build": "node scripts/build-wasm.mjs",
+    "wasm:cleanup": "node scripts/build-wasm.mjs --cleanup"
   },
   "dependencies": {
     "@shikijs/core": "^4.2.0",

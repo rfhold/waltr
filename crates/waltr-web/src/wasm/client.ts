@@ -1,4 +1,4 @@
-import init, { WaltrClient } from "../../generated/wasm/waltr_client";
+import init, { WaltrClient } from "../../generated/wasm-current/waltr_client";
 
 export type {
   ClientCommand,
