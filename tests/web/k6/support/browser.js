@@ -1,6 +1,8 @@
 import { browser } from "k6/browser";
 import { check } from "k6";
 
+import { signInToWaltr } from "./access-auth.js";
+
 export const options = {
   scenarios: {
     browser: {
@@ -24,18 +26,38 @@ export const directConfigUrl = `${baseUrl.replace(/\/$/, "")}/config`;
 const screenshotsEnabled = __ENV.WALTR_WEB_SCREENSHOTS === "1";
 const screenshotsDir = __ENV.WALTR_WEB_SCREENSHOTS_DIR ?? "/screenshots";
 
-export async function withPage(test) {
+export async function withPage(test, { authenticate = true } = {}) {
   const page = await browser.newPage();
+  let testError;
 
   try {
+    if (authenticate && __ENV.WALTR_WEB_ACCESS_AUTH === "oidc") {
+      await signInToWaltr(page, baseUrl);
+    }
     await test(page);
   } catch (error) {
+    testError = error;
+    try {
+      await screenshot(page, "browser-smoke-failed");
+    } catch (screenshotError) {
+      console.warn(`failed to capture browser failure screenshot: ${screenshotError}`);
+    }
     check(null, {
       "browser smoke completed": () => false,
     });
-    throw error;
-  } finally {
+  }
+
+  try {
     await page.close();
+  } catch (closeError) {
+    if (!testError) {
+      throw closeError;
+    }
+    console.warn(`failed to close browser page after test failure: ${closeError}`);
+  }
+
+  if (testError) {
+    throw testError;
   }
 }
 

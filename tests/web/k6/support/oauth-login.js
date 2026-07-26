@@ -5,14 +5,18 @@ import { screenshot } from "./browser.js";
 
 export async function completeDexLogin(page, { authUrl, username, password, failureScreenshot = "oauth-login-failed" }) {
   await page.goto(authUrl, { waitUntil: "domcontentloaded" });
+  return completeDexLoginOnPage(page, { username, password, failureScreenshot });
+}
+
+export async function completeDexLoginOnPage(
+  page,
+  { username, password, failureScreenshot = "oauth-login-failed", isComplete },
+) {
+  await page.locator('input[name="login"]').waitFor({ timeout: 10_000 });
   await page.locator('input[name="login"]').type(username);
   await page.locator('input[name="password"]').type(password);
   await page.locator('button[type="submit"], input[type="submit"]').click();
-  const approval = page.locator('button[type="submit"], input[type="submit"]');
-  if (await approval.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await approval.click();
-  }
-  return await waitForCodeRedirect(page, failureScreenshot);
+  return await waitForCodeRedirect(page, failureScreenshot, isComplete);
 }
 
 export function completeDexLoginViaHttp({ authUrl, username, password }) {
@@ -27,11 +31,11 @@ export function completeDexLoginViaHttp({ authUrl, username, password }) {
   throw new Error(`Dex HTTP login did not reach authorization code redirect at ${redirectUrl}: ${loginResponse.body}`);
 }
 
-async function waitForCodeRedirect(page, failureScreenshot) {
+async function waitForCodeRedirect(page, failureScreenshot, isComplete) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     const url = page.url();
-    if (url.includes("code=") && url.includes("state=")) {
+    if ((url.includes("code=") && url.includes("state=")) || isComplete?.(url)) {
       return url;
     }
 

@@ -1,0 +1,17 @@
+{
+	auto_https disable_redirects
+}
+
+https://waltr.test {
+	tls /test-ca-caddy/tls.crt /test-ca-caddy/tls.key
+	reverse_proxy waltr-auth:14333
+}
+
+https://dex.test {
+	tls /test-ca-caddy/tls.crt /test-ca-caddy/tls.key
+	reverse_proxy dex-auth:5556
+}
+
+http://127.0.0.1:2015 {
+	respond /health 200
+}
