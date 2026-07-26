@@ -19,6 +19,10 @@ static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgresql");
 
 #[tokio::test]
 #[ignore = "requires Docker"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "migration, reopen, locking, and storage assertions form one store contract"
+)]
 async fn postgres_store_passes_contract_across_reopen() {
     let image = GenericImage::new("postgres", "16-alpine")
         .with_exposed_port(5432.tcp())
