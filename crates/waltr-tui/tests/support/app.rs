@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use waltr_client::{
-    AccessSnapshot, AccessStatus, AuthSnapshot, CatalogMatchSourceView, ClientCommand,
+    AccessSnapshot, AccessStatus, AuthSnapshot, CatalogMatchSourceView,
+    CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot, CatalogSnapshot, ClientCommand,
     ClientOperationView, ClientSnapshot, ConfigSnapshot, ConfigView, ExternalRequestView,
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
@@ -621,6 +622,23 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
         },
         operations: OperationCollectionSnapshot {
             current: BTreeMap::new(),
+        },
+        catalog: CatalogSnapshot {
+            search: CatalogModelSearchSnapshot {
+                request_id: String::new(),
+                query: String::new(),
+                status: "idle",
+                error: None,
+                stale: false,
+                models: Vec::new(),
+            },
+            suggestions: CatalogMatchSuggestionSnapshot {
+                request_id: String::new(),
+                status: "idle",
+                error: None,
+                stale: false,
+                matches: Vec::new(),
+            },
         },
         config: ConfigSnapshot {
             current: None,
