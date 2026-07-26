@@ -269,6 +269,39 @@ impl Default for McpBearerChallenge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpAccessToken(pub String);
 
+/// Stable identity associated with an authorized MCP access token.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct McpPrincipalId(String);
+
+impl McpPrincipalId {
+    /// Create a nonempty principal identifier no larger than 256 UTF-8 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identifier is empty or exceeds 256 UTF-8 bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 256 {
+            return Err(Error::protocol(
+                "MCP principal identifier must contain 1 to 256 UTF-8 bytes",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the principal identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for McpPrincipalId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Result returned by a Streamable HTTP bearer token validator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTokenValidation {

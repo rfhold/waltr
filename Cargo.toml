@@ -65,6 +65,7 @@ scylla = "1.6.0"
 tempfile = "3.23.0"
 testcontainers = "0.25.2"
 tokio = "1.52.3"
+sqlx = { version = "0.8.6", default-features = false }
 tokio-postgres = "0.7.15"
 tokio-stream = "0.1.18"
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
