@@ -198,6 +198,8 @@ fn access_auth_status(
         version: 1,
         domain: AuthenticationDomain::WaltrAccess as i32,
         reason: reason as i32,
+        target: None,
+        mcp_authorization: None,
     };
     tonic::Status::with_details(code, message, failure.encode_to_vec().into())
 }

@@ -1162,6 +1162,8 @@ mod tests {
             domain: waltr::grpc::waltr::auth::v1::AuthenticationDomain::WaltrAccess as i32,
             reason: waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRequired
                 as i32,
+            target: None,
+            mcp_authorization: None,
         };
         tonic::Status::with_details(
             Code::Unauthenticated,

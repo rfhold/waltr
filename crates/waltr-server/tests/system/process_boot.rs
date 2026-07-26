@@ -308,7 +308,9 @@ async fn assert_process_database_isolation(
             "_sqlx_migrations",
             "waltr_browser_sessions",
             "waltr_mcp_oauth_login_continuations",
-            "waltr_oidc_login_attempts"
+            "waltr_oidc_login_attempts",
+            "outbound_oauth_attempts",
+            "outbound_oauth_credentials"
         ]
     );
     assert_eq!(

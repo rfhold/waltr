@@ -575,8 +575,15 @@ where
         config_service.store().clone(),
         config_service.pubsub().clone(),
     );
-    let credential_store = FileCredentialStore::from_env();
-    let auth_service = AuthService::new(config_service.store().clone(), credential_store.clone());
+    let outbound_oauth_store = persistence.outbound_oauth_store();
+    let credential_store =
+        FileCredentialStore::from_env().with_mcp_store(outbound_oauth_store.clone());
+    let auth_service = AuthService::new(
+        config_service.store().clone(),
+        credential_store.clone(),
+        outbound_oauth_store,
+    );
+    let outbound_oauth_router = auth_service.router();
     let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
     let mcp_session_store = persistence.mcp_session_store();
     let readiness = Readiness {
@@ -638,6 +645,7 @@ where
                 async move { readiness.response().await }
             }),
         )
+        .merge(outbound_oauth_router)
         .merge(access_authenticator.router())
         .merge(mcp_router);
     let router = if let Some(oauth) = &mcp_oauth {

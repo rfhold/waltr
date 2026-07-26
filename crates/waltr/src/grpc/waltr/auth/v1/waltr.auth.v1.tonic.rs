@@ -175,6 +175,32 @@ pub mod auth_service_client {
                 .insert(GrpcMethod::new("waltr.auth.v1.AuthService", "CompleteAuth"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_auth_attempt_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetAuthAttemptStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetAuthAttemptStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.auth.v1.AuthService/GetAuthAttemptStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("waltr.auth.v1.AuthService", "GetAuthAttemptStatus"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn cancel_auth(
             &mut self,
             request: impl tonic::IntoRequest<super::CancelAuthRequest>,
@@ -418,6 +444,13 @@ pub mod auth_service_server {
             request: tonic::Request<super::CompleteAuthRequest>,
         ) -> std::result::Result<
             tonic::Response<super::CompleteAuthResponse>,
+            tonic::Status,
+        >;
+        async fn get_auth_attempt_status(
+            &self,
+            request: tonic::Request<super::GetAuthAttemptStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetAuthAttemptStatusResponse>,
             tonic::Status,
         >;
         async fn cancel_auth(
@@ -716,6 +749,52 @@ pub mod auth_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = CompleteAuthSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.auth.v1.AuthService/GetAuthAttemptStatus" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetAuthAttemptStatusSvc<T: AuthService>(pub Arc<T>);
+                    impl<
+                        T: AuthService,
+                    > tonic::server::UnaryService<super::GetAuthAttemptStatusRequest>
+                    for GetAuthAttemptStatusSvc<T> {
+                        type Response = super::GetAuthAttemptStatusResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetAuthAttemptStatusRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AuthService>::get_auth_attempt_status(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetAuthAttemptStatusSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

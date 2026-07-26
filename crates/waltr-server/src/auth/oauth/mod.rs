@@ -7,7 +7,11 @@ use waltr::grpc::waltr::{
         OAuthProvider, OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, Provider,
     },
 };
-use serde::Deserialize;
+use waltr_agent::{
+    McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod, McpOAuthState,
+    McpOAuthToken,
+};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tonic::Status;
 use uuid::Uuid;
@@ -21,7 +25,7 @@ use super::{
 
 /// Resolved provider OAuth definition.
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderOAuthDefinition {
+pub struct ProviderOAuthDefinition {
     /// OAuth provider definition to use for login and refresh.
     pub definition: OAuthProvider,
 }
@@ -49,16 +53,97 @@ impl std::fmt::Debug for OAuthAttempt {
             .finish()
     }
 }
+
+/// Pending MCP authorization-code attempt.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct McpOAuthAttempt {
+    target: AuthTarget,
+    issuer: String,
+    authorization_url: String,
+    token_url: String,
+    revocation_url: Option<String>,
+    registration: McpOAuthRegistration,
+    scopes: Vec<String>,
+    resource: String,
+    verifier: String,
+    state: String,
+    response_issuer_required: bool,
+    expires_at_ms: i64,
+}
+
+impl std::fmt::Debug for McpOAuthAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpOAuthAttempt")
+            .field("target", &self.target)
+            .field("issuer", &self.issuer)
+            .field("authorization_url", &self.authorization_url)
+            .field("token_url", &self.token_url)
+            .field("revocation_url", &self.revocation_url)
+            .field("registration", &self.registration)
+            .field("scopes", &self.scopes)
+            .field("resource", &self.resource)
+            .field("verifier", &"<redacted>")
+            .field("state", &"<redacted>")
+            .field("response_issuer_required", &self.response_issuer_required)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+impl McpOAuthAttempt {
+    /// Return the owning MCP target.
+    #[must_use]
+    pub const fn target(&self) -> &AuthTarget {
+        &self.target
+    }
+
+    /// Return the CSRF state used to locate the durable callback attempt.
+    #[must_use]
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    /// Return the attempt expiry.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+
+    /// Return the registration selection.
+    #[must_use]
+    pub const fn registration_method(&self) -> McpOAuthRegistrationMethod {
+        self.registration.method
+    }
+
+    /// Return the exact redirect URI bound to this attempt.
+    #[must_use]
+    pub fn redirect_uri(&self) -> &str {
+        &self.registration.redirect_uri
+    }
+
+    pub(super) fn validate_response_issuer(&self, issuer: Option<&str>) -> Result<(), Status> {
+        if issuer.is_some_and(|value| value != self.issuer)
+            || (self.response_issuer_required && issuer != Some(self.issuer.as_str()))
+        {
+            return Err(Status::invalid_argument(
+                "OAuth authorization response issuer does not match",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl OAuthAttempt {
     /// Return the owning target.
     #[must_use]
-    pub fn target(&self) -> &AuthTarget {
+    pub const fn target(&self) -> &AuthTarget {
         &self.target
     }
 
     /// Return the OAuth definition used for the attempt.
     #[must_use]
-    pub fn definition(&self) -> &OAuthProvider {
+    pub const fn definition(&self) -> &OAuthProvider {
         &self.definition
     }
 
@@ -74,7 +159,7 @@ impl OAuthAttempt {
 
 /// Return the active OAuth definition for a provider.
 #[must_use]
-pub(crate) fn provider_definition(
+pub fn provider_definition(
     _provider_key: &str,
     provider: &Provider,
 ) -> Option<ProviderOAuthDefinition> {
@@ -82,12 +167,12 @@ pub(crate) fn provider_definition(
         return None;
     }
 
-    if let Some(settings) = &provider.oauth_settings {
-        if !definition_is_empty(settings) {
-            return Some(ProviderOAuthDefinition {
-                definition: settings.clone(),
-            });
-        }
+    if let Some(settings) = &provider.oauth_settings
+        && !definition_is_empty(settings)
+    {
+        return Some(ProviderOAuthDefinition {
+            definition: settings.clone(),
+        });
     }
 
     None
@@ -95,7 +180,7 @@ pub(crate) fn provider_definition(
 
 /// Return whether an OAuth definition is empty/defaulted.
 #[must_use]
-pub(crate) fn definition_is_empty(definition: &OAuthProvider) -> bool {
+pub const fn definition_is_empty(definition: &OAuthProvider) -> bool {
     definition.name.is_empty()
         && definition.authorize_url.is_empty()
         && definition.token_url.is_empty()
@@ -140,6 +225,177 @@ pub fn begin_manual(
     Ok((attempt, response))
 }
 
+/// Build an MCP-specific public-client authorization attempt.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_mcp(
+    target: AuthTarget,
+    issuer: String,
+    authorize_url: &str,
+    token_url: String,
+    revocation_url: Option<String>,
+    registration: McpOAuthRegistration,
+    scopes: Vec<String>,
+    resource: String,
+    response_issuer_required: bool,
+    now_ms: i64,
+) -> Result<(McpOAuthAttempt, BeginProviderAuthResponse), Status> {
+    for (name, value) in [
+        ("authorization endpoint", authorize_url),
+        ("token endpoint", token_url.as_str()),
+        ("client id", registration.client_id.as_str()),
+        ("redirect URI", registration.redirect_uri.as_str()),
+        ("protected resource", resource.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "MCP OAuth {name} is required"
+            )));
+        }
+    }
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+    let state = Uuid::new_v4().to_string();
+    let expires_at_ms = now_ms + 15 * 60 * 1000;
+    let params = vec![
+        ("response_type".to_owned(), "code".to_owned()),
+        ("client_id".to_owned(), registration.client_id.clone()),
+        ("redirect_uri".to_owned(), registration.redirect_uri.clone()),
+        ("scope".to_owned(), scopes.join(" ")),
+        ("code_challenge".to_owned(), challenge),
+        ("code_challenge_method".to_owned(), "S256".to_owned()),
+        ("state".to_owned(), state.clone()),
+        ("resource".to_owned(), resource.clone()),
+    ];
+    let response = BeginProviderAuthResponse {
+        method: ProviderAuthMethod::OauthManual as i32,
+        auth_url: query_url(authorize_url, &params),
+        expires_at_ms,
+        messages: vec![
+            "Open the URL, approve access, then paste the final redirect URL including state."
+                .to_owned(),
+        ],
+        ..BeginProviderAuthResponse::default()
+    };
+    Ok((
+        McpOAuthAttempt {
+            target,
+            issuer,
+            authorization_url: authorize_url.to_owned(),
+            token_url,
+            revocation_url,
+            registration,
+            scopes,
+            resource,
+            verifier,
+            state,
+            response_issuer_required,
+            expires_at_ms,
+        },
+        response,
+    ))
+}
+
+/// Exchange an MCP authorization code while preserving resource binding.
+pub async fn complete_mcp(
+    attempt: &McpOAuthAttempt,
+    input: &str,
+    now_ms: i64,
+) -> Result<McpOAuthState, Status> {
+    if now_ms > attempt.expires_at_ms {
+        return Err(Status::deadline_exceeded("OAuth attempt expired"));
+    }
+    complete_mcp_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production()).await
+}
+
+pub(super) async fn complete_mcp_with_policy(
+    attempt: &McpOAuthAttempt,
+    input: &str,
+    now_ms: i64,
+    policy: OutboundHttpPolicy,
+) -> Result<McpOAuthState, Status> {
+    if now_ms > attempt.expires_at_ms {
+        return Err(Status::deadline_exceeded("OAuth attempt expired"));
+    }
+    let (code, state, issuer) = parse_manual_input(input);
+    let code = code.ok_or_else(|| Status::invalid_argument("OAuth code is required"))?;
+    if state.as_deref() != Some(attempt.state.as_str()) {
+        return Err(Status::invalid_argument("OAuth state does not match"));
+    }
+    attempt.validate_response_issuer(issuer.as_deref())?;
+    let pairs = [
+        ("grant_type", "authorization_code"),
+        ("client_id", attempt.registration.client_id.as_str()),
+        ("code", code.as_str()),
+        ("redirect_uri", attempt.registration.redirect_uri.as_str()),
+        ("code_verifier", attempt.verifier.as_str()),
+        ("resource", attempt.resource.as_str()),
+    ];
+    let (token_url, client) = policy.client_for(&attempt.token_url).await?;
+    let response = client
+        .post(token_url)
+        .form(&pairs)
+        .send()
+        .await
+        .map_err(|error| Status::unavailable(format!("MCP OAuth token request failed: {error}")))?;
+    validate_response_peer(policy, &response)?;
+    let status = response.status();
+    let body = read_json_body(response, OAUTH_RESPONSE_LIMIT).await?;
+    if !status.is_success() {
+        return Err(Status::unauthenticated(format!(
+            "MCP OAuth token endpoint returned {status}"
+        )));
+    }
+    let token: mcp::oauth::McpTokenResponse = serde_json::from_slice(&body).map_err(|error| {
+        Status::data_loss(format!("MCP OAuth token response was invalid: {error}"))
+    })?;
+    mcp_state_from_token(attempt, &token, now_ms)
+}
+
+fn mcp_state_from_token(
+    attempt: &McpOAuthAttempt,
+    token: &mcp::oauth::McpTokenResponse,
+    now_ms: i64,
+) -> Result<McpOAuthState, Status> {
+    if token.access_token.expose_secret().is_empty() {
+        return Err(Status::data_loss(
+            "MCP OAuth token response did not include a bearer access token",
+        ));
+    }
+    let expires_at_ms = token.expires_in.map_or(i64::MAX, |seconds| {
+        now_ms.saturating_add(
+            i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000),
+        )
+    });
+    let granted_scopes = token.scope.as_deref().map_or_else(
+        || attempt.scopes.clone(),
+        |scope| scope.split_whitespace().map(ToOwned::to_owned).collect(),
+    );
+    Ok(McpOAuthState {
+        version: 1,
+        resource: attempt.resource.clone(),
+        issuer: attempt.issuer.clone(),
+        registration: attempt.registration.clone(),
+        endpoints: McpOAuthEndpoints {
+            authorization: attempt.authorization_url.clone(),
+            token: attempt.token_url.clone(),
+            revocation: attempt.revocation_url.clone(),
+        },
+        token: McpOAuthToken {
+            access_token: token.access_token.expose_secret().to_owned(),
+            refresh_token: token
+                .refresh_token
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
+            token_type: "Bearer".to_owned(),
+            granted_scopes,
+            expires_at_ms,
+            refresh_generation: 0,
+        },
+    })
+}
+
 /// Exchange a manual OAuth callback input for a stored credential.
 pub async fn complete_manual(
     attempt: &OAuthAttempt,
@@ -158,7 +414,7 @@ async fn complete_manual_with_policy(
     if now_ms > attempt.expires_at_ms {
         return Err(Status::deadline_exceeded("OAuth attempt expired"));
     }
-    let (code, state) = parse_manual_input(input);
+    let (code, state, _) = parse_manual_input(input);
     let code = code.ok_or_else(|| Status::invalid_argument("OAuth code is required"))?;
     if state.as_deref() != Some(attempt.state.as_str()) {
         return Err(Status::invalid_argument("OAuth state does not match"));
@@ -218,6 +474,10 @@ async fn request_token(
     token_response_to_credential(definition, response).await
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the small request enum is consumed to build request pairs"
+)]
 fn token_request_pairs<'a>(
     definition: &'a OAuthProvider,
     token_request: TokenRequest<'a>,
@@ -302,10 +562,10 @@ fn percent_encode(value: &str) -> String {
         .collect()
 }
 
-fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
+fn parse_manual_input(input: &str) -> (Option<String>, Option<String>, Option<String>) {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
     let query = trimmed
         .split_once('?')
@@ -317,6 +577,7 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
         );
     let mut code = None;
     let mut state = None;
+    let mut issuer = None;
     for part in query.split('&') {
         let Some((key, value)) = part.split_once('=') else {
             continue;
@@ -324,6 +585,7 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
         match key {
             "code" => code = Some(percent_decode(value)),
             "state" => state = Some(percent_decode(value)),
+            "iss" => issuer = Some(percent_decode(value)),
             _ => {}
         }
     }
@@ -335,7 +597,7 @@ fn parse_manual_input(input: &str) -> (Option<String>, Option<String>) {
             code = Some(trimmed.to_owned());
         }
     }
-    (code, state)
+    (code, state, issuer)
 }
 
 fn percent_decode(value: &str) -> String {
@@ -568,6 +830,27 @@ mod tests {
         (format!("http://{address}/token"), redirected_requests)
     }
 
+    fn loopback_attempt(token_url: String) -> McpOAuthAttempt {
+        begin_mcp(
+            AuthTarget::mcp_server("remote"),
+            "http://127.0.0.1".to_owned(),
+            "http://127.0.0.1/authorize",
+            token_url,
+            None,
+            McpOAuthRegistration {
+                client_id: "client".to_owned(),
+                redirect_uri: "http://127.0.0.1/callback".to_owned(),
+                ..McpOAuthRegistration::default()
+            },
+            Vec::new(),
+            "http://127.0.0.1/resource".to_owned(),
+            true,
+            1_000,
+        )
+        .unwrap()
+        .0
+    }
+
     fn loopback_provider_attempt(token_url: String) -> OAuthAttempt {
         let mut definition = openai_codex_oauth_settings();
         definition.token_url = token_url;
@@ -613,6 +896,79 @@ mod tests {
             extract_metadata(&openai_codex_oauth_settings(), &token).expect("metadata extracts");
 
         assert_eq!(metadata.get("account_id"), Some(&"account-123".to_owned()));
+    }
+
+    #[test]
+    fn mcp_authorization_preserves_exact_resource_and_public_client_parameters() {
+        let resource = "https://mcp.example.test/protected?tenant=one";
+        let (attempt, response) = begin_mcp(
+            AuthTarget::mcp_server("remote"),
+            "https://auth.example.test".to_owned(),
+            "https://auth.example.test/authorize",
+            "https://auth.example.test/token".to_owned(),
+            Some("https://auth.example.test/revoke".to_owned()),
+            McpOAuthRegistration {
+                method: McpOAuthRegistrationMethod::Dynamic,
+                client_id: "waltr-client".to_owned(),
+                redirect_uri: "https://waltr.example.test/outbound-oauth/callback".to_owned(),
+                token_endpoint_auth_method: "none".to_owned(),
+                created_at_ms: Some(1_000),
+                expires_at_ms: None,
+            },
+            vec!["tools.read".to_owned()],
+            resource.to_owned(),
+            true,
+            1_000,
+        )
+        .expect("MCP authorization should begin");
+
+        assert_eq!(attempt.resource, resource);
+        assert!(response.auth_url.contains("client_id=waltr-client"));
+        assert!(response.auth_url.contains("scope=tools.read"));
+        assert!(
+            response
+                .auth_url
+                .contains("resource=https%3A%2F%2Fmcp.example.test%2Fprotected%3Ftenant%3Done")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_completion_requires_exact_state_and_response_issuer() {
+        let (attempt, _) = begin_mcp(
+            AuthTarget::mcp_server("remote"),
+            "https://issuer.example".to_owned(),
+            "https://issuer.example/authorize",
+            "https://issuer.example/token".to_owned(),
+            None,
+            McpOAuthRegistration {
+                client_id: "client".to_owned(),
+                redirect_uri: "https://waltr.example/outbound-oauth/callback".to_owned(),
+                token_endpoint_auth_method: "none".to_owned(),
+                ..McpOAuthRegistration::default()
+            },
+            Vec::new(),
+            "https://mcp.example".to_owned(),
+            true,
+            1_000,
+        )
+        .unwrap();
+
+        let missing_state = complete_mcp(&attempt, "code=secret", 1_001)
+            .await
+            .unwrap_err();
+        assert_eq!(missing_state.code(), tonic::Code::InvalidArgument);
+
+        let wrong_issuer = complete_mcp(
+            &attempt,
+            &format!(
+                "code=secret&state={}&iss=https://evil.example",
+                attempt.state()
+            ),
+            1_001,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_issuer.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]
@@ -669,5 +1025,63 @@ mod tests {
             credential_expiry_ms(i64::MAX, Some(i64::MAX)),
             i64::MAX - 300_000
         );
+    }
+
+    #[test]
+    fn oauth_attempt_debug_redacts_state_and_pkce_verifier() {
+        let (attempt, _) = begin_mcp(
+            AuthTarget::mcp_server("remote"),
+            "https://issuer.example".to_owned(),
+            "https://issuer.example/authorize",
+            "https://issuer.example/token".to_owned(),
+            None,
+            McpOAuthRegistration {
+                client_id: "client".to_owned(),
+                redirect_uri: "https://waltr.example/callback".to_owned(),
+                ..McpOAuthRegistration::default()
+            },
+            Vec::new(),
+            "https://mcp.example".to_owned(),
+            false,
+            1_000,
+        )
+        .unwrap();
+        let state = attempt.state().to_owned();
+        let debug = format!("{attempt:?}");
+        assert!(!debug.contains(&state));
+        assert!(!debug.contains(&attempt.verifier));
+    }
+
+    #[tokio::test]
+    async fn code_exchange_refuses_redirect_without_replaying_code() {
+        let (token_url, redirected_requests) = malicious_token_server(false).await;
+        let attempt = loopback_attempt(token_url);
+        let input = format!(
+            "code=code-secret&state={}&iss=http://127.0.0.1",
+            attempt.state()
+        );
+        let error =
+            complete_mcp_with_policy(&attempt, &input, 1_001, OutboundHttpPolicy::loopback_test())
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn code_exchange_rejects_oversized_token_response() {
+        let (token_url, _) = malicious_token_server(true).await;
+        let attempt = loopback_attempt(token_url);
+        let input = format!(
+            "code=code-secret&state={}&iss=http://127.0.0.1",
+            attempt.state()
+        );
+        let error =
+            complete_mcp_with_policy(&attempt, &input, 1_001, OutboundHttpPolicy::loopback_test())
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     }
 }

@@ -476,7 +476,9 @@ async fn sqlite_files_keep_component_tables_and_histories_isolated() {
             "_sqlx_migrations",
             "waltr_browser_sessions",
             "waltr_mcp_oauth_login_continuations",
-            "waltr_oidc_login_attempts"
+            "waltr_oidc_login_attempts",
+            "outbound_oauth_attempts",
+            "outbound_oauth_credentials"
         ]
     );
     assert_eq!(
@@ -546,6 +548,58 @@ async fn standard_sqlx_checksum_mismatch_is_rejected() {
             .expect_err("reject checksum mismatch"),
         PersistenceError::Migration(DatabaseBackend::Sqlite)
     );
+}
+
+#[tokio::test]
+async fn sqlite_upgrades_committed_migrations_through_outbound_oauth_and_reopens() {
+    let database = TestDatabase::new();
+    fs::create_dir_all(&database.root).expect("create test database directory");
+    let legacy_migrations = database.root.join("legacy-migrations");
+    fs::create_dir_all(&legacy_migrations).expect("create legacy migration directory");
+    let migration_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
+    for migration in [
+        "0001_schema_ownership.sql",
+        "0002_oidc_access_auth.sql",
+        "0003_mcp_oauth_login_continuations.sql",
+    ] {
+        fs::copy(
+            migration_source.join(migration),
+            legacy_migrations.join(migration),
+        )
+        .expect("copy committed migration");
+    }
+    let url = database.url("waltr.sqlite3");
+    let options = SqliteConnectOptions::from_str(&url)
+        .expect("parse SQLite URL")
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options)
+        .await
+        .expect("connect legacy database");
+    sqlx::migrate::Migrator::new(legacy_migrations)
+        .await
+        .expect("load legacy migrations")
+        .run(&pool)
+        .await
+        .expect("run committed migrations");
+    pool.close().await;
+
+    let config = DatabaseConfig::from_url(&url).expect("create config");
+    let upgraded = Persistence::initialize(config.clone())
+        .await
+        .expect("upgrade database");
+    assert_component_histories(&upgraded).await;
+    assert!(
+        sqlite_tables(upgraded.sqlite_pool().expect("Waltr pool"))
+            .await
+            .contains(&"outbound_oauth_credentials".to_owned())
+    );
+    drop(upgraded);
+
+    let reopened = Persistence::initialize(config)
+        .await
+        .expect("reopen upgraded database");
+    assert_component_histories(&reopened).await;
 }
 
 #[tokio::test]
@@ -621,7 +675,42 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .fetch_one(pool)
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (3, 3));
+    assert_eq!((waltr_count, mcp_count), (4, 3));
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT to_regclass('waltr.outbound_oauth_attempts')::text"
+        )
+        .fetch_one(pool)
+        .await
+        .expect("find outbound OAuth attempts")
+        .is_some()
+    );
+    let outbound = first.outbound_oauth_store();
+    outbound
+        .save_attempt(
+            &DurableAttemptRecord {
+                attempt_id: "postgres-attempt".to_owned(),
+                target_key: "mcp:postgres".to_owned(),
+                attempt_json: "{}".to_owned(),
+                registration_method: "dynamic".to_owned(),
+                completion_mode: "server_callback".to_owned(),
+                status: "pending".to_owned(),
+                failure_reason: None,
+                expires_at_ms: i64::MAX,
+            },
+            "postgres-state",
+        )
+        .await
+        .expect("save PostgreSQL outbound attempt");
+    let other_outbound = second.outbound_oauth_store();
+    let (first_claim, second_claim) = tokio::join!(
+        outbound.claim_attempt("postgres-attempt", "first", i64::MAX),
+        other_outbound.claim_attempt("postgres-attempt", "second", i64::MAX),
+    );
+    assert_ne!(
+        first_claim.expect("first PostgreSQL claim"),
+        second_claim.expect("second PostgreSQL claim")
+    );
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT to_regclass('waltr.oidc_login_attempts')::text"
@@ -684,7 +773,7 @@ async fn assert_component_histories(persistence: &Persistence) {
         .fetch_one(persistence.mcp_sqlite_pool().expect("MCP pool"))
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (3, 3));
+    assert_eq!((waltr_count, mcp_count), (4, 3));
 }
 
 async fn sqlite_tables(pool: &SqlitePool) -> Vec<String> {

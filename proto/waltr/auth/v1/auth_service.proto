@@ -7,6 +7,7 @@ service AuthService {
   rpc GetAuthStatus(GetAuthStatusRequest) returns (GetAuthStatusResponse);
   rpc BeginAuth(BeginAuthRequest) returns (BeginAuthResponse);
   rpc CompleteAuth(CompleteAuthRequest) returns (CompleteAuthResponse);
+  rpc GetAuthAttemptStatus(GetAuthAttemptStatusRequest) returns (GetAuthAttemptStatusResponse);
   rpc CancelAuth(CancelAuthRequest) returns (CancelAuthResponse);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc ListProviderAuthStatuses(ListProviderAuthStatusesRequest) returns (ListProviderAuthStatusesResponse);
@@ -45,6 +46,8 @@ message BeginAuthResponse {
   int64 expires_at_ms = 6;
   int32 poll_interval_seconds = 7;
   repeated string messages = 8;
+  AuthCompletionMode completion_mode = 9;
+  McpOAuthRegistrationMethod registration_method = 10;
 }
 
 message CompleteAuthRequest {
@@ -54,6 +57,48 @@ message CompleteAuthRequest {
 
 message CompleteAuthResponse {
   AuthStatus status = 1;
+}
+
+message GetAuthAttemptStatusRequest {
+  string attempt_id = 1;
+}
+
+message GetAuthAttemptStatusResponse {
+  AuthAttemptStatus attempt = 1;
+  AuthStatus status = 2;
+}
+
+message AuthAttemptStatus {
+  string attempt_id = 1;
+  AuthTarget target = 2;
+  AuthAttemptLifecycle lifecycle = 3;
+  AuthCompletionMode completion_mode = 4;
+  McpOAuthRegistrationMethod registration_method = 5;
+  int64 expires_at_ms = 6;
+  string failure_reason = 7;
+}
+
+enum AuthAttemptLifecycle {
+  AUTH_ATTEMPT_LIFECYCLE_UNSPECIFIED = 0;
+  AUTH_ATTEMPT_LIFECYCLE_PENDING = 1;
+  AUTH_ATTEMPT_LIFECYCLE_COMPLETING = 2;
+  AUTH_ATTEMPT_LIFECYCLE_SUCCEEDED = 3;
+  AUTH_ATTEMPT_LIFECYCLE_FAILED = 4;
+  AUTH_ATTEMPT_LIFECYCLE_CANCELED = 5;
+  AUTH_ATTEMPT_LIFECYCLE_EXPIRED = 6;
+}
+
+enum AuthCompletionMode {
+  AUTH_COMPLETION_MODE_UNSPECIFIED = 0;
+  AUTH_COMPLETION_MODE_MANUAL = 1;
+  AUTH_COMPLETION_MODE_SERVER_CALLBACK = 2;
+}
+
+enum McpOAuthRegistrationMethod {
+  MCP_O_AUTH_REGISTRATION_METHOD_UNSPECIFIED = 0;
+  MCP_O_AUTH_REGISTRATION_METHOD_PREREGISTERED = 1;
+  MCP_O_AUTH_REGISTRATION_METHOD_CLIENT_METADATA = 2;
+  MCP_O_AUTH_REGISTRATION_METHOD_DYNAMIC = 3;
 }
 
 message CancelAuthRequest {
@@ -82,11 +127,15 @@ message AuthenticationFailure {
   uint32 version = 1;
   AuthenticationDomain domain = 2;
   AuthenticationFailureReason reason = 3;
+  optional AuthTarget target = 4;
+  optional McpAuthorizationContext mcp_authorization = 5;
 }
 
 enum AuthenticationDomain {
   AUTHENTICATION_DOMAIN_UNSPECIFIED = 0;
   AUTHENTICATION_DOMAIN_WALTR_ACCESS = 1;
+  AUTHENTICATION_DOMAIN_OUTBOUND_PROVIDER = 2;
+  AUTHENTICATION_DOMAIN_OUTBOUND_MCP = 3;
 }
 
 enum AuthenticationFailureReason {
@@ -94,6 +143,21 @@ enum AuthenticationFailureReason {
   AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REQUIRED = 1;
   AUTHENTICATION_FAILURE_REASON_CREDENTIAL_REJECTED = 2;
   AUTHENTICATION_FAILURE_REASON_NETWORK_FAILED = 3;
+  AUTHENTICATION_FAILURE_REASON_TOKEN_EXCHANGE_FAILED = 4;
+  AUTHENTICATION_FAILURE_REASON_RESPONSE_INVALID = 5;
+  AUTHENTICATION_FAILURE_REASON_CONFIGURATION_REQUIRED = 6;
+}
+
+// Sanitized MCP bearer challenge and protected endpoint context.
+message McpAuthorizationContext {
+  string endpoint = 1;
+  uint32 http_status = 2;
+  optional string resource_metadata_url = 3;
+  optional string scope = 4;
+  optional string error = 5;
+  optional string error_description = 6;
+  optional string error_uri = 7;
+  optional string realm = 8;
 }
 
 message AuthStatus {
@@ -103,6 +167,7 @@ message AuthStatus {
   int64 expires_at_ms = 4;
   map<string, string> metadata = 5;
   string message = 6;
+  McpOAuthRegistrationMethod registration_method = 7;
 }
 
 enum AuthStatusKind {
