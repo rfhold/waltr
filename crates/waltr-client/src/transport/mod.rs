@@ -26,6 +26,13 @@ pub use status::StatusWatchStream;
 use tonic::Code;
 use tonic::codegen::{Body, Bytes, StdError};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, RwLock};
+#[cfg(not(target_arch = "wasm32"))]
+use tonic::metadata::AsciiMetadataValue;
+#[cfg(not(target_arch = "wasm32"))]
+use tonic::service::{Interceptor, interceptor::InterceptedService};
+
 use crate::{
     ClientError, ConfigPatch, Configuration, RollbackTarget, SearchSessionTemplatesRequest,
     SearchSessionTemplatesResponse, SessionRuntimeConfigRequest, SessionSummary, TimelineEvent,
@@ -223,27 +230,50 @@ pub trait WaltrTransport {
 trait RemoteTransport {
     type Inner;
 
+    fn request_credentials(&self) -> RequestCredentials;
+
     fn config_client(
         &self,
+        credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<ConfigServiceClient<Self::Inner>, ClientError>>;
 
     fn auth_client(
         &self,
+        credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<AuthServiceClient<Self::Inner>, ClientError>>;
 
     fn catalog_client(
         &self,
+        credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<CatalogServiceClient<Self::Inner>, ClientError>>;
 
     fn status_client(
         &self,
+        credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<StatusServiceClient<Self::Inner>, ClientError>>;
 
     fn session_client(
         &self,
+        credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<SessionServiceClient<Self::Inner>, ClientError>>;
 }
 
+#[derive(Clone, Default)]
+struct RequestCredentials {
+    #[cfg(not(target_arch = "wasm32"))]
+    provider: NativeCredentialProvider,
+    #[cfg(not(target_arch = "wasm32"))]
+    lease_generation: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    credential_revision: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    authorization: Option<AsciiMetadataValue>,
+}
+
+#[allow(
+    clippy::future_not_send,
+    reason = "the transport implementation also supports browser-local RPC futures"
+)]
 impl<T> WaltrTransport for T
 where
     T: RemoteTransport,
@@ -451,9 +481,249 @@ where
 
 /// Native gRPC transport backed by tonic channels.
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NativeGrpcTransport {
     endpoint: String,
+    credentials: NativeCredentialProvider,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::large_enum_variant)]
+enum NativeEndpoint {
+    Plaintext(tonic::transport::Endpoint),
+    NativeRootsTls {
+        endpoint: tonic::transport::Endpoint,
+        tls: tonic::transport::ClientTlsConfig,
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeEndpoint {
+    fn into_tonic_endpoint(self) -> Result<tonic::transport::Endpoint, ClientError> {
+        match self {
+            Self::Plaintext(endpoint) => Ok(endpoint),
+            Self::NativeRootsTls { endpoint, tls } => endpoint
+                .tls_config(tls)
+                .map_err(|error| ClientError::new(error.to_string())),
+        }
+    }
+}
+
+/// Cloneable in-memory bearer credential provider for native runtimes.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+pub struct NativeCredentialProvider {
+    state: Arc<RwLock<NativeCredentialState>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct NativeCredentialState {
+    lease_generation: u64,
+    credential_revision: u64,
+    authorization: Option<AsciiMetadataValue>,
+}
+
+/// Generation lease used to reject stale native credential updates.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCredentialLease {
+    lease_generation: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeCredentialLease {
+    /// Return the monotonic credential generation.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.lease_generation
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for NativeCredentialProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeCredentialProvider")
+            .field("has_bearer_token", &self.has_bearer_token())
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeCredentialProvider {
+    /// Create an empty in-memory credential provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the bearer token used by subsequently sent requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token cannot be represented as gRPC metadata.
+    pub fn replace_bearer_token(
+        &self,
+        token: impl AsRef<str>,
+    ) -> Result<NativeCredentialLease, ClientError> {
+        let authorization = format!("Bearer {}", token.as_ref())
+            .parse::<AsciiMetadataValue>()
+            .map_err(|_| ClientError::new("invalid bearer token metadata"))?;
+        let mut state = self.write_state();
+        state.lease_generation = state.lease_generation.saturating_add(1);
+        state.credential_revision = state.credential_revision.saturating_add(1);
+        state.authorization = Some(authorization);
+        Ok(NativeCredentialLease {
+            lease_generation: state.lease_generation,
+        })
+    }
+
+    /// Begin a credential generation, clearing any previous token.
+    #[must_use]
+    pub fn begin_credential_lease(&self) -> NativeCredentialLease {
+        self.clear_bearer_token()
+    }
+
+    /// Return a lease for the current credential generation without changing it.
+    #[must_use]
+    pub fn credential_lease(&self) -> NativeCredentialLease {
+        NativeCredentialLease {
+            lease_generation: self.read_state().lease_generation,
+        }
+    }
+
+    /// Return the current token revision for atomic compare-and-clear operations.
+    #[must_use]
+    pub fn credential_revision(&self) -> u64 {
+        self.read_state().credential_revision
+    }
+
+    /// Replace the token only when the lease is still current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token cannot be represented as gRPC metadata.
+    pub fn replace_bearer_token_if_current(
+        &self,
+        lease: NativeCredentialLease,
+        token: impl AsRef<str>,
+    ) -> Result<bool, ClientError> {
+        let authorization = format!("Bearer {}", token.as_ref())
+            .parse::<AsciiMetadataValue>()
+            .map_err(|_| ClientError::new("invalid bearer token metadata"))?;
+        let mut state = self.write_state();
+        if state.lease_generation != lease.lease_generation {
+            return Ok(false);
+        }
+        state.credential_revision = state.credential_revision.saturating_add(1);
+        state.authorization = Some(authorization);
+        drop(state);
+        Ok(true)
+    }
+
+    /// Clear the bearer token used by subsequently sent requests.
+    #[must_use]
+    pub fn clear_bearer_token(&self) -> NativeCredentialLease {
+        let mut state = self.write_state();
+        state.lease_generation = state.lease_generation.saturating_add(1);
+        state.credential_revision = state.credential_revision.saturating_add(1);
+        state.authorization = None;
+        NativeCredentialLease {
+            lease_generation: state.lease_generation,
+        }
+    }
+
+    /// Clear credentials only when both the lease and token revision are current.
+    #[must_use]
+    pub fn clear_bearer_token_if_current(
+        &self,
+        lease: NativeCredentialLease,
+        credential_revision: u64,
+    ) -> bool {
+        let mut state = self.write_state();
+        if state.lease_generation != lease.lease_generation
+            || state.credential_revision != credential_revision
+        {
+            return false;
+        }
+        state.lease_generation = state.lease_generation.saturating_add(1);
+        state.credential_revision = state.credential_revision.saturating_add(1);
+        state.authorization = None;
+        true
+    }
+
+    fn request_credentials(&self) -> RequestCredentials {
+        let state = self.read_state();
+        let credentials = RequestCredentials {
+            provider: self.clone(),
+            lease_generation: state.lease_generation,
+            credential_revision: state.credential_revision,
+            authorization: state.authorization.clone(),
+        };
+        drop(state);
+        credentials
+    }
+
+    /// Return whether a bearer token is currently installed.
+    #[must_use]
+    pub fn has_bearer_token(&self) -> bool {
+        self.read_state().authorization.is_some()
+    }
+
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, NativeCredentialState> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, NativeCredentialState> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct NativeBearerInterceptor {
+    authorization: Option<AsciiMetadataValue>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for NativeBearerInterceptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeBearerInterceptor")
+            .field("has_bearer_token", &self.authorization.is_some())
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Interceptor for NativeBearerInterceptor {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(authorization) = self.authorization.clone() {
+            request
+                .metadata_mut()
+                .insert("authorization", authorization);
+        }
+        Ok(request)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for NativeGrpcTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeGrpcTransport")
+            .field("endpoint", &self.endpoint)
+            .field("credentials", &self.credentials)
+            .finish()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -463,61 +733,175 @@ impl NativeGrpcTransport {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            credentials: NativeCredentialProvider::new(),
+        }
+    }
+
+    /// Create a transport using a runtime-owned in-memory credential provider.
+    #[must_use]
+    pub fn with_credential_provider(
+        endpoint: impl Into<String>,
+        credentials: NativeCredentialProvider,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            credentials,
+        }
+    }
+
+    /// Return a clone of the shared in-memory credential provider.
+    #[must_use]
+    pub fn credential_provider(&self) -> NativeCredentialProvider {
+        self.credentials.clone()
+    }
+
+    /// Replace the bearer token used by subsequently sent requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token cannot be represented as gRPC metadata.
+    pub fn replace_bearer_token(
+        &self,
+        token: impl AsRef<str>,
+    ) -> Result<NativeCredentialLease, ClientError> {
+        self.credentials.replace_bearer_token(token)
+    }
+
+    /// Begin a credential generation, clearing any previous token.
+    #[must_use]
+    pub fn begin_credential_lease(&self) -> NativeCredentialLease {
+        self.credentials.begin_credential_lease()
+    }
+
+    /// Replace the token only when the lease is still current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token cannot be represented as gRPC metadata.
+    pub fn replace_bearer_token_if_current(
+        &self,
+        lease: NativeCredentialLease,
+        token: impl AsRef<str>,
+    ) -> Result<bool, ClientError> {
+        self.credentials
+            .replace_bearer_token_if_current(lease, token)
+    }
+
+    /// Clear the bearer token used by subsequently sent requests.
+    #[must_use]
+    pub fn clear_bearer_token(&self) -> NativeCredentialLease {
+        self.credentials.clear_bearer_token()
+    }
+
+    /// Clear credentials only when the supplied lease and revision are current.
+    #[must_use]
+    pub fn clear_bearer_token_if_current(
+        &self,
+        lease: NativeCredentialLease,
+        credential_revision: u64,
+    ) -> bool {
+        self.credentials
+            .clear_bearer_token_if_current(lease, credential_revision)
+    }
+
+    async fn channel(&self) -> Result<tonic::transport::Channel, ClientError> {
+        self.native_endpoint()?
+            .into_tonic_endpoint()?
+            .connect()
+            .await
+            .map_err(|error| ClientError::new(error.to_string()))
+    }
+
+    fn native_endpoint(&self) -> Result<NativeEndpoint, ClientError> {
+        let endpoint = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|error| ClientError::new(error.to_string()))?;
+        if self.endpoint.starts_with("https://") {
+            drop(rustls::crypto::ring::default_provider().install_default());
+            Ok(NativeEndpoint::NativeRootsTls {
+                endpoint,
+                tls: tonic::transport::ClientTlsConfig::new().with_native_roots(),
+            })
+        } else {
+            Ok(NativeEndpoint::Plaintext(endpoint))
+        }
+    }
+
+    #[cfg(test)]
+    fn interceptor(&self) -> NativeBearerInterceptor {
+        NativeBearerInterceptor {
+            authorization: self.credentials.read_state().authorization.clone(),
+        }
+    }
+
+    fn interceptor_for(credentials: &RequestCredentials) -> NativeBearerInterceptor {
+        NativeBearerInterceptor {
+            authorization: credentials.authorization.clone(),
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RemoteTransport for NativeGrpcTransport {
-    type Inner = tonic::transport::Channel;
+    type Inner = InterceptedService<tonic::transport::Channel, NativeBearerInterceptor>;
 
-    async fn config_client(&self) -> Result<ConfigServiceClient<Self::Inner>, ClientError> {
-        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|error| ClientError::new(error.to_string()))?
-            .connect()
-            .await
-            .map_err(|error| ClientError::new(error.to_string()))?;
-        Ok(ConfigServiceClient::new(channel))
+    fn request_credentials(&self) -> RequestCredentials {
+        self.credentials.request_credentials()
     }
 
-    async fn auth_client(&self) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
-        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|error| ClientError::new(error.to_string()))?
-            .connect()
-            .await
-            .map_err(|error| ClientError::new(error.to_string()))?;
-        Ok(AuthServiceClient::new(channel))
+    async fn config_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> Result<ConfigServiceClient<Self::Inner>, ClientError> {
+        Ok(ConfigServiceClient::with_interceptor(
+            self.channel().await?,
+            Self::interceptor_for(credentials),
+        ))
     }
 
-    async fn catalog_client(&self) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
-        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|error| ClientError::new(error.to_string()))?
-            .connect()
-            .await
-            .map_err(|error| ClientError::new(error.to_string()))?;
-        Ok(CatalogServiceClient::new(channel))
+    async fn auth_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
+        Ok(AuthServiceClient::with_interceptor(
+            self.channel().await?,
+            Self::interceptor_for(credentials),
+        ))
     }
 
-    async fn status_client(&self) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
-        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|error| ClientError::new(error.to_string()))?
-            .connect()
-            .await
-            .map_err(|error| ClientError::new(error.to_string()))?;
-        Ok(StatusServiceClient::new(channel))
+    async fn catalog_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
+        Ok(CatalogServiceClient::with_interceptor(
+            self.channel().await?,
+            Self::interceptor_for(credentials),
+        ))
     }
 
-    async fn session_client(&self) -> Result<SessionServiceClient<Self::Inner>, ClientError> {
-        let channel = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|error| ClientError::new(error.to_string()))?
-            .connect()
-            .await
-            .map_err(|error| ClientError::new(error.to_string()))?;
-        Ok(SessionServiceClient::new(channel))
+    async fn status_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
+        Ok(StatusServiceClient::with_interceptor(
+            self.channel().await?,
+            Self::interceptor_for(credentials),
+        ))
+    }
+
+    async fn session_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> Result<SessionServiceClient<Self::Inner>, ClientError> {
+        Ok(SessionServiceClient::with_interceptor(
+            self.channel().await?,
+            Self::interceptor_for(credentials),
+        ))
     }
 }
 
 /// Browser gRPC-web transport backed by `fetch`.
+/// Same-origin requests retain the browser transport's cookie credential behavior;
+/// bearer injection is intentionally native-only.
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Debug, Default)]
 pub struct WasmGrpcTransport {
@@ -539,36 +923,98 @@ impl WasmGrpcTransport {
 impl RemoteTransport for WasmGrpcTransport {
     type Inner = tonic_web_wasm_client::Client;
 
-    async fn config_client(&self) -> Result<ConfigServiceClient<Self::Inner>, ClientError> {
+    fn request_credentials(&self) -> RequestCredentials {
+        RequestCredentials::default()
+    }
+
+    async fn config_client(
+        &self,
+        _: &RequestCredentials,
+    ) -> Result<ConfigServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(ConfigServiceClient::new(transport))
     }
 
-    async fn auth_client(&self) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
+    async fn auth_client(
+        &self,
+        _: &RequestCredentials,
+    ) -> Result<AuthServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(AuthServiceClient::new(transport))
     }
 
-    async fn catalog_client(&self) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
+    async fn catalog_client(
+        &self,
+        _: &RequestCredentials,
+    ) -> Result<CatalogServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(CatalogServiceClient::new(transport))
     }
 
-    async fn status_client(&self) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
+    async fn status_client(
+        &self,
+        _: &RequestCredentials,
+    ) -> Result<StatusServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(StatusServiceClient::new(transport))
     }
 
-    async fn session_client(&self) -> Result<SessionServiceClient<Self::Inner>, ClientError> {
+    async fn session_client(
+        &self,
+        _: &RequestCredentials,
+    ) -> Result<SessionServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(SessionServiceClient::new(transport))
     }
 }
 
-fn status_error(error: &tonic::Status) -> ClientError {
+fn status_error(error: &tonic::Status, credentials: &RequestCredentials) -> ClientError {
+    #[cfg(target_arch = "wasm32")]
+    let _ = credentials;
+
+    let failure = waltr::grpc::waltr::auth::v1::AuthenticationFailure::decode(error.details())
+        .ok()
+        .filter(|failure| failure.version == 1);
+    let domain = failure.as_ref().and_then(|failure| {
+        waltr::grpc::waltr::auth::v1::AuthenticationDomain::try_from(failure.domain).ok()
+    });
+    let reason = failure.as_ref().and_then(|failure| {
+        waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::try_from(failure.reason).ok()
+    });
+
+    if error.code() == Code::Unauthenticated
+        && domain == Some(waltr::grpc::waltr::auth::v1::AuthenticationDomain::WaltrAccess)
+        && matches!(
+            reason,
+            Some(
+                waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRequired
+                    | waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRejected
+            )
+        )
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !credentials.provider.clear_bearer_token_if_current(
+            NativeCredentialLease {
+                lease_generation: credentials.lease_generation,
+            },
+            credentials.credential_revision,
+        ) {
+            return ClientError::new(format!(
+                "{}: stale Waltr credentials were rejected",
+                status_code_name(error.code())
+            ));
+        }
+
+        return ClientError::waltr_login_required(format!(
+            "{}: {}",
+            status_code_name(error.code()),
+            error.message()
+        ));
+    }
+
     if error.code() == Code::Unauthenticated
         && let Ok(target) = AuthTarget::decode(error.details())
-        && target.target.is_some()
+        && auth_target_is_valid(&target)
     {
         return ClientError::authorization_required(
             format!("{}: {}", status_code_name(error.code()), error.message()),
@@ -581,6 +1027,16 @@ fn status_error(error: &tonic::Status) -> ClientError {
         status_code_name(error.code()),
         error.message()
     ))
+}
+
+fn auth_target_is_valid(target: &AuthTarget) -> bool {
+    match target.target.as_ref() {
+        Some(
+            waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(key)
+            | waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(key),
+        ) => !key.trim().is_empty(),
+        None => false,
+    }
 }
 
 const fn status_code_name(code: Code) -> &'static str {
@@ -607,3 +1063,633 @@ const fn status_code_name(code: Code) -> &'static str {
 pub use auth::{AuthAttempt, AuthStatus, GenericAuthAttempt, ProviderAuthStatus};
 pub use waltr::grpc::waltr::auth::v1::AuthTarget;
 use waltr::grpc::waltr::auth::v1::auth_service_client::AuthServiceClient;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    use futures_core::Stream;
+    use futures_util::StreamExt;
+    use waltr::grpc::waltr::auth::v1::auth_target;
+    use waltr::grpc::waltr::config::v1::{
+        GetConfigRequest, GetConfigResponse, PatchConfigRequest, PatchConfigResponse,
+        WatchConfigRequest, WatchConfigResponse,
+        config_service_server::{ConfigService, ConfigServiceServer},
+    };
+
+    #[derive(Clone, Default)]
+    struct MetadataConfigService {
+        authorizations: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl MetadataConfigService {
+        fn record<T>(&self, request: &tonic::Request<T>) {
+            let authorization = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            self.authorizations.lock().unwrap().push(authorization);
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ConfigService for MetadataConfigService {
+        async fn patch_config(
+            &self,
+            request: tonic::Request<PatchConfigRequest>,
+        ) -> Result<tonic::Response<PatchConfigResponse>, tonic::Status> {
+            self.record(&request);
+            Ok(tonic::Response::new(PatchConfigResponse::default()))
+        }
+
+        async fn get_config(
+            &self,
+            request: tonic::Request<GetConfigRequest>,
+        ) -> Result<tonic::Response<GetConfigResponse>, tonic::Status> {
+            self.record(&request);
+            Ok(tonic::Response::new(GetConfigResponse::default()))
+        }
+
+        type WatchConfigStream =
+            Pin<Box<dyn Stream<Item = Result<WatchConfigResponse, tonic::Status>> + Send>>;
+
+        async fn watch_config(
+            &self,
+            request: tonic::Request<WatchConfigRequest>,
+        ) -> Result<tonic::Response<Self::WatchConfigStream>, tonic::Status> {
+            self.record(&request);
+            Ok(tonic::Response::new(Box::pin(futures_util::stream::once(
+                async { Ok(WatchConfigResponse::default()) },
+            ))))
+        }
+    }
+
+    async fn metadata_transport_server() -> (
+        NativeGrpcTransport,
+        MetadataConfigService,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("metadata test listener should bind");
+        let address = listener.local_addr().unwrap();
+        let incoming = futures_util::stream::unfold(listener, |listener| async move {
+            let item = listener.accept().await.map(|(stream, _)| stream);
+            Some((item, listener))
+        });
+        let service = MetadataConfigService::default();
+        let server_service = service.clone();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(ConfigServiceServer::new(server_service))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("metadata test server should run");
+        });
+        (
+            NativeGrpcTransport::new(format!("http://{address}")),
+            service,
+            task,
+        )
+    }
+
+    fn waltr_access_status(message: &str) -> tonic::Status {
+        let failure = waltr::grpc::waltr::auth::v1::AuthenticationFailure {
+            version: 1,
+            domain: waltr::grpc::waltr::auth::v1::AuthenticationDomain::WaltrAccess as i32,
+            reason: waltr::grpc::waltr::auth::v1::AuthenticationFailureReason::CredentialRequired
+                as i32,
+        };
+        tonic::Status::with_details(
+            Code::Unauthenticated,
+            message,
+            Bytes::from(failure.encode_to_vec()),
+        )
+    }
+
+    #[test]
+    fn unauthenticated_status_without_explicit_domain_is_not_waltr_login() {
+        for status in [
+            tonic::Status::unauthenticated("login required"),
+            tonic::Status::with_details(
+                Code::Unauthenticated,
+                "login required",
+                Bytes::from_static(&[0]),
+            ),
+            tonic::Status::with_details(
+                Code::Unauthenticated,
+                "login required",
+                Bytes::from(AuthTarget::default().encode_to_vec()),
+            ),
+            tonic::Status::with_details(
+                Code::Unauthenticated,
+                "login required",
+                Bytes::from(
+                    AuthTarget {
+                        target: Some(auth_target::Target::ProviderKey(String::new())),
+                    }
+                    .encode_to_vec(),
+                ),
+            ),
+        ] {
+            let error = status_error(&status, &RequestCredentials::default());
+            assert_eq!(error.kind(), crate::ClientErrorKind::Other);
+            assert!(error.auth_target().is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_waltr_access_failure_requires_waltr_login() {
+        let status = waltr_access_status("login required");
+
+        let error = status_error(&status, &RequestCredentials::default());
+
+        assert!(error.is_waltr_login_required());
+    }
+
+    #[test]
+    fn unauthenticated_status_with_target_remains_credential_authorization() {
+        let target = AuthTarget {
+            target: Some(auth_target::Target::ProviderKey("anthropic".to_owned())),
+        };
+        let status = tonic::Status::with_details(
+            Code::Unauthenticated,
+            "provider login required",
+            Bytes::from(target.encode_to_vec()),
+        );
+
+        let credentials = RequestCredentials::default();
+        let error = status_error(&status, &credentials);
+
+        assert_eq!(error.kind(), crate::ClientErrorKind::AuthorizationRequired);
+        assert_eq!(error.auth_target(), Some(&target));
+        assert!(!error.is_waltr_login_required());
+    }
+
+    #[test]
+    fn unauthenticated_status_with_mcp_target_remains_credential_authorization() {
+        let target = AuthTarget {
+            target: Some(auth_target::Target::McpServerKey("github".to_owned())),
+        };
+        let status = tonic::Status::with_details(
+            Code::Unauthenticated,
+            "MCP login required",
+            Bytes::from(target.encode_to_vec()),
+        );
+
+        let credentials = RequestCredentials::default();
+        let error = status_error(&status, &credentials);
+
+        assert_eq!(error.kind(), crate::ClientErrorKind::AuthorizationRequired);
+        assert_eq!(error.auth_target(), Some(&target));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn outbound_failure_never_clears_waltr_bearer_or_requires_waltr_login() {
+        let credentials = NativeCredentialProvider::new();
+        credentials
+            .replace_bearer_token("waltr-token")
+            .expect("token should install");
+        let request = credentials.request_credentials();
+        let target = AuthTarget {
+            target: Some(auth_target::Target::McpServerKey("self".to_owned())),
+        };
+        let status = tonic::Status::with_details(
+            Code::Unavailable,
+            "token service unavailable",
+            Bytes::from(target.encode_to_vec()),
+        );
+
+        let error = status_error(&status, &request);
+
+        assert_eq!(error.kind(), crate::ClientErrorKind::Other);
+        assert!(error.auth_target().is_none());
+        assert!(!error.is_waltr_login_required());
+        assert!(credentials.has_bearer_token());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_bearer_interceptor_covers_unary_and_streaming_requests() {
+        let credentials = NativeCredentialProvider::new();
+        credentials
+            .replace_bearer_token("stream-token")
+            .expect("token should be valid metadata");
+        let mut interceptor = NativeBearerInterceptor {
+            authorization: credentials.request_credentials().authorization,
+        };
+
+        let unary = interceptor
+            .call(tonic::Request::new(()))
+            .expect("unary request should be authorized");
+        let streaming = interceptor
+            .call(tonic::Request::new(()))
+            .expect("streaming request should be authorized");
+
+        assert_eq!(
+            unary.metadata().get("authorization").unwrap(),
+            "Bearer stream-token"
+        );
+        assert_eq!(
+            streaming.metadata().get("authorization").unwrap(),
+            "Bearer stream-token"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stale_waltr_401_does_not_clear_replacement_credentials() {
+        let credentials = NativeCredentialProvider::new();
+        credentials
+            .replace_bearer_token("token-a")
+            .expect("first token should install");
+        let request = credentials.request_credentials();
+        credentials
+            .replace_bearer_token_if_current(credentials.credential_lease(), "token-b")
+            .expect("replacement token should be valid");
+
+        let error = status_error(&waltr_access_status("expired"), &request);
+
+        assert_eq!(error.kind(), crate::ClientErrorKind::Other);
+        assert!(credentials.has_bearer_token());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn current_waltr_401_atomically_clears_credentials() {
+        let credentials = NativeCredentialProvider::new();
+        credentials
+            .replace_bearer_token("current-token")
+            .expect("token should install");
+        let request = credentials.request_credentials();
+
+        let error = status_error(&waltr_access_status("expired"), &request);
+
+        assert!(error.is_waltr_login_required());
+        assert!(!credentials.has_bearer_token());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn token_refresh_advances_revision_without_replacing_lease() {
+        let credentials = NativeCredentialProvider::new();
+        let lease = credentials.begin_credential_lease();
+        credentials
+            .replace_bearer_token_if_current(lease, "first-token")
+            .expect("first token should be valid");
+        let stale_revision = credentials.credential_revision();
+        credentials
+            .replace_bearer_token_if_current(lease, "refreshed-token")
+            .expect("refresh token should be valid");
+
+        assert_eq!(credentials.credential_lease(), lease);
+        assert!(credentials.credential_revision() > stale_revision);
+        assert!(!credentials.clear_bearer_token_if_current(lease, stale_revision));
+        assert!(credentials.has_bearer_token());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    #[allow(clippy::similar_names)]
+    async fn native_endpoint_connection_uses_native_root_tls_only_for_https() {
+        let http = NativeGrpcTransport::new("http://127.0.0.1:8080")
+            .native_endpoint()
+            .expect("HTTP endpoint should construct");
+        let https = NativeGrpcTransport::new("https://waltr.example.test")
+            .native_endpoint()
+            .expect("HTTPS endpoint should construct");
+
+        let NativeEndpoint::Plaintext(http_endpoint) = &http else {
+            panic!("HTTP endpoint must not carry TLS configuration");
+        };
+        assert_eq!(http_endpoint.uri().scheme_str(), Some("http"));
+
+        let NativeEndpoint::NativeRootsTls { endpoint, tls } = &https else {
+            panic!("HTTPS endpoint must carry a native-root TLS configuration");
+        };
+        assert_eq!(endpoint.uri().scheme_str(), Some("https"));
+        let _ = tls;
+
+        let http_bytes = initial_connection_bytes(http).await;
+        assert!(http_bytes.starts_with(b"PRI * HTTP/2.0"));
+
+        let https_bytes = initial_connection_bytes(https).await;
+        assert_eq!(
+            https_bytes.first(),
+            Some(&22),
+            "HTTPS must emit a TLS handshake"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_https_trusts_controlled_native_root() {
+        const CHILD_ENV: &str = "WALTR_CLIENT_NATIVE_TLS_CHILD_ENDPOINT";
+        if let Ok(endpoint) = std::env::var(CHILD_ENV) {
+            assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+            let transport = NativeGrpcTransport::new(endpoint);
+            transport
+                .native_endpoint()
+                .expect("HTTPS endpoint should initialize its crypto provider");
+            assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+            transport
+                .get_config()
+                .await
+                .expect("native-root TLS connection should succeed");
+            return;
+        }
+
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TLS fixture listener should bind");
+        let address = listener.local_addr().unwrap();
+        let incoming = futures_util::stream::unfold(listener, |listener| async move {
+            let item = listener.accept().await.map(|(stream, _)| stream);
+            Some((item, listener))
+        });
+        let identity = tonic::transport::Identity::from_pem(
+            include_str!("../../tests/fixtures/native-tls-server.pem"),
+            include_str!("../../tests/fixtures/native-tls-server-key.pem"),
+        );
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .expect("TLS fixture identity should configure")
+                .add_service(ConfigServiceServer::new(MetadataConfigService::default()))
+                .serve_with_incoming(incoming)
+                .await
+                .expect("TLS fixture server should run");
+        });
+
+        let ca_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native-tls-ca.pem");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("transport::tests::native_https_trusts_controlled_native_root")
+            .arg("--nocapture")
+            .env(CHILD_ENV, format!("https://localhost:{}", address.port()))
+            .env("SSL_CERT_FILE", ca_path)
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("TLS child test should start");
+        server.abort();
+
+        assert!(
+            output.status.success(),
+            "TLS child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[derive(Clone)]
+    struct DuplexConnector {
+        stream: Arc<Mutex<Option<tokio::io::DuplexStream>>>,
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Uri> for DuplexConnector {
+        type Response = hyper_util::rt::TokioIo<tokio::io::DuplexStream>;
+        type Error = std::io::Error;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: tonic::codegen::http::Uri) -> Self::Future {
+            std::future::ready(
+                self.stream
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(hyper_util::rt::TokioIo::new)
+                    .ok_or_else(|| std::io::Error::other("connector called more than once")),
+            )
+        }
+    }
+
+    async fn initial_connection_bytes(endpoint: NativeEndpoint) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let endpoint = endpoint
+            .into_tonic_endpoint()
+            .expect("endpoint security should configure");
+        let (client, mut server) = tokio::io::duplex(4_096);
+        let connector = DuplexConnector {
+            stream: Arc::new(Mutex::new(Some(client))),
+        };
+        let connection = endpoint.connect_with_connector(connector);
+        let mut bytes = vec![0; 24];
+        tokio::pin!(connection);
+        tokio::select! {
+            result = server.read_exact(&mut bytes) => {
+                result.expect("client should write its connection preface");
+            }
+            result = &mut connection => {
+                let _channel = result.expect("plaintext connector should create a channel");
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    server.read_exact(&mut bytes),
+                )
+                .await
+                .expect("channel should write its connection preface")
+                .expect("connection preface should be readable");
+            }
+        }
+        bytes
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn native_transport_applies_current_metadata_to_unary_and_reopened_streams() {
+        let (transport, service, server) = metadata_transport_server().await;
+        transport
+            .replace_bearer_token("first-token")
+            .expect("first token should install");
+
+        transport
+            .get_config()
+            .await
+            .expect("unary call should succeed");
+        let mut first_stream = transport
+            .watch_config()
+            .await
+            .expect("first stream should open");
+        first_stream.next().await.unwrap().unwrap();
+
+        transport
+            .replace_bearer_token("second-token")
+            .expect("replacement token should install");
+        transport
+            .get_config()
+            .await
+            .expect("replaced unary should succeed");
+        let _ = transport.clear_bearer_token();
+        transport
+            .get_config()
+            .await
+            .expect("cleared unary should succeed");
+
+        let lease = transport.begin_credential_lease();
+        assert!(
+            transport
+                .replace_bearer_token_if_current(lease, "stream-token")
+                .expect("stream token should be valid")
+        );
+        let mut reopened = transport
+            .watch_config()
+            .await
+            .expect("stream should reopen");
+        reopened.next().await.unwrap().unwrap();
+
+        assert_eq!(
+            *service.authorizations.lock().unwrap(),
+            vec![
+                Some("Bearer first-token".to_owned()),
+                Some("Bearer first-token".to_owned()),
+                Some("Bearer second-token".to_owned()),
+                None,
+                Some("Bearer stream-token".to_owned()),
+            ]
+        );
+        server.abort();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_request_credentials_are_fixed_per_rpc_and_refresh_between_rpcs() {
+        let transport = NativeGrpcTransport::new("http://127.0.0.1:1");
+        let credentials = transport.credential_provider();
+        transport
+            .replace_bearer_token("first-secret")
+            .expect("first token should be valid");
+        let mut interceptor = transport.interceptor();
+        assert_eq!(
+            interceptor
+                .call(tonic::Request::new(()))
+                .unwrap()
+                .metadata()
+                .get("authorization")
+                .unwrap(),
+            "Bearer first-secret"
+        );
+
+        credentials
+            .replace_bearer_token("second-secret")
+            .expect("replacement token should be valid");
+        assert_eq!(
+            transport
+                .interceptor()
+                .call(tonic::Request::new(()))
+                .unwrap()
+                .metadata()
+                .get("authorization")
+                .unwrap(),
+            "Bearer second-secret"
+        );
+
+        let _ = transport.clear_bearer_token();
+        assert_eq!(
+            interceptor
+                .call(tonic::Request::new(()))
+                .unwrap()
+                .metadata()
+                .get("authorization")
+                .unwrap(),
+            "Bearer first-secret"
+        );
+        assert!(
+            transport
+                .interceptor()
+                .call(tonic::Request::new(()))
+                .unwrap()
+                .metadata()
+                .get("authorization")
+                .is_none()
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_credentials_do_not_expose_tokens_in_debug_or_errors() {
+        let transport = NativeGrpcTransport::new("http://127.0.0.1:1");
+        transport
+            .replace_bearer_token("debug-secret")
+            .expect("token should be valid");
+
+        let debug = format!("{transport:?}");
+        assert!(!debug.contains("debug-secret"));
+        assert!(debug.contains("has_bearer_token: true"));
+
+        let invalid = "error-secret\ninvalid";
+        let error = transport
+            .replace_bearer_token(invalid)
+            .expect_err("invalid metadata should fail");
+        assert!(!error.to_string().contains("error-secret"));
+        assert!(!format!("{error:?}").contains("error-secret"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_credential_leases_reject_stale_login_and_refresh_tasks() {
+        let credentials = NativeCredentialProvider::new();
+        let stale_login = credentials.begin_credential_lease();
+        let current_login = credentials.begin_credential_lease();
+
+        assert!(
+            !credentials
+                .replace_bearer_token_if_current(stale_login, "stale-login-secret")
+                .unwrap()
+        );
+        assert!(
+            credentials
+                .replace_bearer_token_if_current(current_login, "current-secret")
+                .unwrap()
+        );
+        let refresh = credentials.credential_lease();
+        let cleared = credentials.clear_bearer_token();
+        assert!(cleared.generation() > refresh.generation());
+        assert!(
+            !credentials
+                .replace_bearer_token_if_current(refresh, "stale-refresh-secret")
+                .unwrap()
+        );
+        assert!(!credentials.has_bearer_token());
+
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("stale-login-secret"));
+        assert!(!debug.contains("stale-refresh-secret"));
+        assert!(!debug.contains("current-secret"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_credential_clear_recovers_from_lock_poisoning() {
+        let credentials = NativeCredentialProvider::new();
+        credentials
+            .replace_bearer_token("poison-secret")
+            .expect("token should install");
+        let poisoned = credentials.clone();
+        drop(
+            std::thread::spawn(move || {
+                let _guard = poisoned.state.write().unwrap();
+                panic!("poison credential lock");
+            })
+            .join(),
+        );
+
+        let lease = credentials.clear_bearer_token();
+
+        assert!(!credentials.has_bearer_token());
+        assert_eq!(credentials.credential_lease(), lease);
+        assert!(!format!("{credentials:?}").contains("poison-secret"));
+    }
+}

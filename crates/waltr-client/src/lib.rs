@@ -1,7 +1,5 @@
 //! Shared Waltr shell client reducer, executor, and stable view models.
 
-#![allow(clippy::future_not_send)]
-
 mod client;
 mod coordination;
 mod error;
@@ -14,25 +12,26 @@ mod wasm;
 
 pub use client::{Client, ClientUpdate};
 pub use coordination::event::{
-    AuthEffect, AuthEvent, ClientEffect, ClientEvent, ConfigEffect, ConfigEvent, ConfigPatch,
-    ProviderEditBaseline, SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent,
-    StreamId,
+    AccessEvent, AuthEffect, AuthEvent, ClientEffect, ClientEvent, ConfigEffect, ConfigEvent,
+    ConfigPatch, ProviderEditBaseline, SessionEffect, SessionEvent, StatusEffect, StatusEvent,
+    StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
-    AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot, ClientAuthTarget, ClientCommand,
-    ClientCommandRequest, ClientOperationView, ClientRuntime, ClientSessionTemplateKind,
-    ClientSessionTemplateSearchTarget, ClientSnapshot, ClientStateStream, ClientStateStreamEvent,
-    ClientTimelineDirection, ConfigSnapshot, OperationCollectionSnapshot, OperationSnapshot,
-    RollbackTargetView, SessionSnapshot, SessionTemplateOptionView, SessionTemplateSearchSnapshot,
-    StatusSnapshot,
+    AccessSnapshot, AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot, ClientAuthTarget,
+    ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime,
+    ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
+    ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
+    OperationCollectionSnapshot, OperationSnapshot, RollbackTargetView, SessionSnapshot,
+    SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
-    AuthAttemptState, AuthClientState, AuthRequirement, ClientOperationState, ClientState,
-    ConfigClientState, OperationKey, OperationState, OperationStatus, SessionClientState,
-    SessionTemplateSearchState, StatusClientState, StreamClientState, StreamState, StreamStatus,
-    TimelineWatchKey, WatchState, watch_reconnect_delay_ms,
+    AccessAttemptId, AccessClientState, AccessStatus, AuthAttemptState, AuthClientState,
+    AuthRequirement, ClientOperationState, ClientState, ConfigClientState, OperationKey,
+    OperationState, OperationStatus, SessionClientState, SessionTemplateSearchState,
+    StatusClientState, StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
+    watch_reconnect_delay_ms,
 };
-pub use error::ClientError;
+pub use error::{ClientError, ClientErrorKind};
 pub use executor::{
     ConfigChange, ConfigChangeStream, GrpcEffectExecutor, SessionChangeStream, StatusChangeStream,
 };
@@ -67,6 +66,8 @@ pub use transport::{
     GenericAuthAttempt, WaltrTransport, ProviderAuthStatus, SessionTimelineWatchEvent,
     SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
 pub use view::{
     CatalogMatchSourceView, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,
     ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,

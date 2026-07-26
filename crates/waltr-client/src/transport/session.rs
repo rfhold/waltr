@@ -63,6 +63,10 @@ pub enum SessionTimelineWatchEvent {
     Truncated(TimelineTruncation),
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn create_session<T>(transport: &T) -> Result<SessionSummary, ClientError>
 where
     T: RemoteTransport,
@@ -73,21 +77,27 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     let response = transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .create_session(CreateSessionRequest::default())
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
     response.session.ok_or_else(|| {
-        status_error(&tonic::Status::data_loss(
-            "create session response missing session",
-        ))
+        status_error(
+            &tonic::Status::data_loss("create session response missing session"),
+            &credentials,
+        )
     })
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn list_sessions<T>(transport: &T) -> Result<Vec<SessionSummary>, ClientError>
 where
     T: RemoteTransport,
@@ -98,17 +108,22 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     let response = transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .list_sessions(ListSessionsRequest::default())
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
     Ok(response.sessions)
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn delete_session<T>(transport: &T, id: String) -> Result<(), ClientError>
 where
     T: RemoteTransport,
@@ -119,16 +134,21 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .delete_session(DeleteSessionRequest { id })
         .await
-        .map_err(|error| status_error(&error))?;
+        .map_err(|error| status_error(&error, &credentials))?;
 
     Ok(())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn update_session_runtime_config<T>(
     transport: &T,
     id: String,
@@ -143,24 +163,30 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     let response = transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .update_session_runtime_config(UpdateSessionRuntimeConfigRequest {
             id,
             runtime_config: Some(runtime_config),
         })
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
     response.session.ok_or_else(|| {
-        status_error(&tonic::Status::data_loss(
-            "update session runtime config response missing session",
-        ))
+        status_error(
+            &tonic::Status::data_loss("update session runtime config response missing session"),
+            &credentials,
+        )
     })
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn watch_sessions<T>(transport: &T) -> Result<SessionWatchStream, ClientError>
 where
     T: RemoteTransport,
@@ -171,22 +197,28 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
+    let stream_credentials = credentials.clone();
     let stream = transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .watch_sessions(WatchSessionsRequest::default())
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner()
-        .map(|response| {
+        .map(move |response| {
             response
                 .and_then(session_watch_update)
-                .map_err(|error| status_error(&error))
+                .map_err(|error| status_error(&error, &stream_credentials))
         });
 
     Ok(Box::pin(stream))
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn get_timeline<T>(
     transport: &T,
     session_id: String,
@@ -201,17 +233,22 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     let response = transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .get_timeline(GetTimelineRequest { session_id, query })
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
     Ok(response.events)
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn watch_timeline<T>(
     transport: &T,
     session_id: String,
@@ -228,8 +265,10 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
+    let stream_credentials = credentials.clone();
     let stream = transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .watch_timeline(WatchTimelineRequest {
             session_id,
@@ -238,21 +277,29 @@ where
             initial_limit,
         })
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner()
-        .filter_map(|response| async {
-            match response {
-                Ok(response) if response.update.is_none() => None,
-                Ok(response) => {
-                    Some(timeline_watch_update(response).map_err(|error| status_error(&error)))
+        .filter_map(move |response| {
+            let stream_credentials = stream_credentials.clone();
+            async move {
+                match response {
+                    Ok(response) if response.update.is_none() => None,
+                    Ok(response) => Some(
+                        timeline_watch_update(response)
+                            .map_err(|error| status_error(&error, &stream_credentials)),
+                    ),
+                    Err(error) => Some(Err(status_error(&error, &stream_credentials))),
                 }
-                Err(error) => Some(Err(status_error(&error))),
             }
         });
 
     Ok(Box::pin(stream))
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn search_session_templates<T>(
     transport: &T,
     request: SearchSessionTemplatesRequest,
@@ -266,15 +313,20 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     Ok(transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .search_session_templates(request)
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn rollback_session<T>(
     transport: &T,
     session_id: String,
@@ -289,24 +341,30 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     let response = transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .rollback_session(RollbackSessionRequest {
             session_id,
             target: Some(target),
         })
         .await
-        .map_err(|error| status_error(&error))?
+        .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
     response.session.ok_or_else(|| {
-        status_error(&tonic::Status::data_loss(
-            "rollback session response missing session",
-        ))
+        status_error(
+            &tonic::Status::data_loss("rollback session response missing session"),
+            &credentials,
+        )
     })
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn continue_session<T>(
     transport: &T,
     session_id: String,
@@ -321,19 +379,24 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .continue_session(ContinueSessionRequest {
             session_id,
             target: Some(target),
         })
         .await
-        .map_err(|error| status_error(&error))?;
+        .map_err(|error| status_error(&error, &credentials))?;
 
     Ok(())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn submit_user_message<T>(
     transport: &T,
     session_id: String,
@@ -348,16 +411,21 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .submit_user_message(SubmitUserMessageRequest { session_id, text })
         .await
-        .map_err(|error| status_error(&error))?;
+        .map_err(|error| status_error(&error, &credentials))?;
 
     Ok(())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn respond_external_request<T>(
     transport: &T,
     session_id: String,
@@ -373,8 +441,9 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .respond_external_request(RespondExternalRequestRequest {
             session_id,
@@ -382,11 +451,15 @@ where
             response_json,
         })
         .await
-        .map_err(|error| status_error(&error))?;
+        .map_err(|error| status_error(&error, &credentials))?;
 
     Ok(())
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
 pub(super) async fn interrupt_session<T>(
     transport: &T,
     session_id: String,
@@ -400,12 +473,13 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
+    let credentials = transport.request_credentials();
     transport
-        .session_client()
+        .session_client(&credentials)
         .await?
         .interrupt_session(InterruptSessionRequest { session_id })
         .await
-        .map_err(|error| status_error(&error))?;
+        .map_err(|error| status_error(&error, &credentials))?;
 
     Ok(())
 }

@@ -1,5 +1,6 @@
 //! Shared coordination state machine internals.
 
+pub mod access;
 pub mod auth;
 pub mod config;
 pub mod event;

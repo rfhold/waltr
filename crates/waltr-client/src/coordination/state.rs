@@ -2,6 +2,9 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
 use crate::transport::SessionTimelineWatchEvent;
 use crate::{
     AuthStatus, AuthTarget, Configuration, GenericAuthAttempt, RollbackTarget, SessionSummary,
@@ -10,6 +13,9 @@ use crate::{
 
 /// Runtime-local operation identifier used by shells to track command results.
 pub type OperationKey = String;
+
+/// Monotonic runtime-local generation for a Waltr access login attempt.
+pub type AccessAttemptId = String;
 
 /// Lifecycle-defining request parameters for one timeline watch.
 pub type TimelineWatchRequest = (Option<u64>, Vec<String>, Option<u32>);
@@ -29,7 +35,8 @@ pub struct TimelineWatchKey {
 
 impl TimelineWatchKey {
     /// Create a watch key from request parameters.
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         session_id: String,
         after_cursor: Option<u64>,
         channels: Vec<String>,
@@ -44,6 +51,7 @@ impl TimelineWatchKey {
     }
 
     /// Return the request parameters represented by this key.
+    #[must_use]
     pub fn request(&self) -> TimelineWatchRequest {
         (self.after_cursor, self.channels.clone(), self.initial_limit)
     }
@@ -60,6 +68,10 @@ pub fn watch_reconnect_delay_ms(attempt: usize) -> u64 {
 /// Full headless state for Waltr shells.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClientState {
+    /// Monotonic generation of the current Waltr access context.
+    pub access_generation: u64,
+    /// Waltr access authentication state.
+    pub access: AccessClientState,
     /// Auth coordination state.
     pub auth: AuthClientState,
     /// Configuration coordination state.
@@ -72,7 +84,40 @@ pub struct ClientState {
     pub streams: StreamClientState,
     /// Command operation results by runtime-local key.
     pub operations: BTreeMap<OperationKey, ClientOperationState>,
+    next_access_attempt_generation: u64,
+    next_status_watch_epoch: u64,
+    next_watch_open_id: u64,
     next_operation_id: u64,
+}
+
+/// Waltr access authentication state, independent from provider credentials.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AccessClientState {
+    /// Current Waltr access authentication status.
+    pub status: AccessStatus,
+    /// Last safe login error, when present.
+    pub error: Option<String>,
+    /// Active platform login generation, when a login flow is running.
+    pub active_attempt_id: Option<AccessAttemptId>,
+    pub(crate) reload_config: bool,
+    pub(crate) reload_sessions: bool,
+}
+
+/// Current Waltr access authentication status.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum AccessStatus {
+    /// Access has not yet been established and a protected status check is allowed.
+    #[default]
+    UnknownChecking,
+    /// Waltr rejected access and login is required.
+    LoginRequired,
+    /// A platform-specific login flow is active.
+    LoginInProgress,
+    /// A protected status response established access.
+    Authenticated,
+    /// A platform-specific login flow failed.
+    LoginFailed,
 }
 
 /// Auth coordination state.
@@ -97,7 +142,7 @@ pub struct AuthClientState {
 }
 
 /// One queued auth requirement.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthRequirement {
     /// Target that requires authentication.
     pub target: AuthTarget,
@@ -108,7 +153,7 @@ pub struct AuthRequirement {
 }
 
 /// Active OAuth attempt details safe to show in clients.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthAttemptState {
     /// Target being authenticated.
     pub target: AuthTarget,
@@ -148,6 +193,7 @@ pub struct StatusClientState {
     pub current: Option<SystemStatus>,
     /// Status watch operation state.
     pub watch: WatchState,
+    pub(crate) watch_epoch: u64,
 }
 
 /// Session coordination state.
@@ -183,7 +229,7 @@ pub struct SessionClientState {
 }
 
 /// Resource search coordination state for one session.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionTemplateSearchState {
     /// Runtime-local caller request id.
     pub request_id: String,
@@ -361,6 +407,112 @@ pub enum ClientOperationState {
     },
 }
 
+impl ClientOperationState {
+    fn fail_for_waltr_login(&mut self) -> bool {
+        const MESSAGE: &str = "Waltr login required";
+        match self {
+            Self::AuthBegin {
+                status,
+                error,
+                attempt,
+                ..
+            } => fail_loading_operation(status, error, MESSAGE, || *attempt = None),
+            Self::AuthComplete {
+                status,
+                error,
+                auth_status,
+            }
+            | Self::AuthLogout {
+                status,
+                error,
+                auth_status,
+                ..
+            } => fail_loading_operation(status, error, MESSAGE, || *auth_status = None),
+            Self::AuthCancel { status, error }
+            | Self::SessionDelete { status, error, .. }
+            | Self::SessionSubmitUserMessage { status, error, .. }
+            | Self::SessionRespondExternalRequest { status, error, .. }
+            | Self::SessionInterrupt { status, error, .. }
+            | Self::SessionContinue { status, error, .. } => {
+                fail_loading_operation(status, error, MESSAGE, || {})
+            }
+            Self::ConfigPatch {
+                status,
+                error,
+                config,
+            } => fail_loading_operation(status, error, MESSAGE, || *config = None),
+            Self::SessionCreate {
+                status,
+                error,
+                session,
+            }
+            | Self::SessionRuntimeConfigUpdate {
+                status,
+                error,
+                session,
+            }
+            | Self::SessionRollback {
+                status,
+                error,
+                session,
+                ..
+            } => fail_loading_operation(status, error, MESSAGE, || *session = None),
+        }
+    }
+
+    fn redact_identity(&mut self) {
+        match self {
+            Self::AuthBegin { target, .. } | Self::AuthLogout { target, .. } => {
+                *target = AuthTarget::default();
+            }
+            Self::SessionDelete { id, .. } => id.clear(),
+            Self::SessionSubmitUserMessage { session_id, .. }
+            | Self::SessionInterrupt { session_id, .. }
+            | Self::SessionRollback { session_id, .. } => session_id.clear(),
+            Self::SessionRespondExternalRequest {
+                session_id,
+                request_id,
+                ..
+            } => {
+                session_id.clear();
+                request_id.clear();
+            }
+            Self::SessionContinue {
+                session_id, target, ..
+            } => {
+                session_id.clear();
+                target.target = None;
+            }
+            Self::AuthComplete { .. }
+            | Self::AuthCancel { .. }
+            | Self::ConfigPatch { .. }
+            | Self::SessionCreate { .. }
+            | Self::SessionRuntimeConfigUpdate { .. } => {}
+        }
+    }
+}
+
+fn fail_loading_operation(
+    status: &mut OperationStatus,
+    error: &mut Option<String>,
+    message: &str,
+    clear_payload: impl FnOnce(),
+) -> bool {
+    if *status != OperationStatus::Loading {
+        return false;
+    }
+    *status = OperationStatus::Failed;
+    *error = Some(message.to_owned());
+    clear_payload();
+    true
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ClearPolicy {
+    TransientExpiry,
+    ExplicitLogout,
+}
+
 /// Shared state for one watch-style operation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WatchState {
@@ -370,9 +522,200 @@ pub struct WatchState {
     pub error: Option<String>,
     pub(crate) interests: usize,
     pub(crate) retry_attempt: usize,
+    pub(crate) open_id: Option<u64>,
 }
 
 impl ClientState {
+    pub(crate) fn require_waltr_login(&mut self, error: Option<String>) {
+        if matches!(
+            self.access.status,
+            AccessStatus::LoginRequired | AccessStatus::LoginInProgress | AccessStatus::LoginFailed
+        ) {
+            return;
+        }
+        self.bump_access_generation();
+        self.access.status = AccessStatus::LoginRequired;
+        self.access.error = error;
+        self.access.active_attempt_id = None;
+        self.clear_protected_state(ClearPolicy::TransientExpiry);
+    }
+
+    pub(crate) fn start_waltr_login(&mut self) -> AccessAttemptId {
+        let attempt_id = format!("login-{}", self.next_access_attempt_generation);
+        self.next_access_attempt_generation = self.next_access_attempt_generation.saturating_add(1);
+        self.access.status = AccessStatus::LoginInProgress;
+        self.access.error = None;
+        self.access.active_attempt_id = Some(attempt_id.clone());
+        attempt_id
+    }
+
+    pub(crate) fn complete_waltr_login(&mut self, attempt_id: &str) -> Option<u64> {
+        if self.access.active_attempt_id.as_deref() != Some(attempt_id) {
+            return None;
+        }
+        self.access.status = AccessStatus::UnknownChecking;
+        self.access.error = None;
+        self.access.active_attempt_id = None;
+        self.bump_access_generation();
+        Some(self.start_status_watch())
+    }
+
+    pub(crate) fn authenticate_waltr_access(&mut self, epoch: u64) -> bool {
+        if self.status.watch_epoch != epoch || self.access.status != AccessStatus::UnknownChecking {
+            return false;
+        }
+        self.access.status = AccessStatus::Authenticated;
+        self.access.error = None;
+        true
+    }
+
+    pub(crate) fn fail_waltr_login(&mut self, attempt_id: &str, error: String) {
+        if self.access.active_attempt_id.as_deref() != Some(attempt_id) {
+            return;
+        }
+        self.access.status = AccessStatus::LoginFailed;
+        self.access.error = Some(error);
+        self.access.active_attempt_id = None;
+        self.clear_protected_state(ClearPolicy::TransientExpiry);
+    }
+
+    pub(crate) fn cancel_waltr_login(&mut self, attempt_id: &str) {
+        if self.access.active_attempt_id.as_deref() != Some(attempt_id) {
+            return;
+        }
+        self.access.status = AccessStatus::LoginRequired;
+        self.access.error = None;
+        self.access.active_attempt_id = None;
+        self.clear_protected_state(ClearPolicy::TransientExpiry);
+    }
+
+    pub(crate) fn reprobe_waltr_access(&mut self) -> Option<u64> {
+        if self.access.status != AccessStatus::LoginRequired {
+            return None;
+        }
+        self.access.status = AccessStatus::UnknownChecking;
+        self.access.error = None;
+        self.access.active_attempt_id = None;
+        self.bump_access_generation();
+        Some(self.start_status_watch())
+    }
+
+    pub(crate) fn logout_waltr(&mut self) {
+        self.bump_access_generation();
+        self.access.status = AccessStatus::UnknownChecking;
+        self.access.error = None;
+        self.access.active_attempt_id = None;
+        self.clear_protected_state(ClearPolicy::ExplicitLogout);
+        self.start_status_watch();
+    }
+
+    const fn bump_access_generation(&mut self) {
+        self.access_generation = self.access_generation.saturating_add(1);
+    }
+
+    #[must_use]
+    pub(crate) const fn permits_protected_requests(&self) -> bool {
+        matches!(
+            self.access.status,
+            AccessStatus::UnknownChecking | AccessStatus::Authenticated
+        )
+    }
+
+    fn clear_protected_state(&mut self, policy: ClearPolicy) {
+        self.terminalize_loading_operations(policy);
+        let auth_pending = match policy {
+            ClearPolicy::TransientExpiry => std::mem::take(&mut self.auth.pending),
+            ClearPolicy::ExplicitLogout => Vec::new(),
+        };
+        let config_interests = self.config.watch.interests;
+        let session_interests = self.sessions.watch.interests;
+        let timeline_interests = self
+            .sessions
+            .timelines
+            .values()
+            .flat_map(|timeline| timeline.watches.iter())
+            .map(|(key, watch)| (key.clone(), watch.interests))
+            .collect::<Vec<_>>();
+        if policy == ClearPolicy::TransientExpiry {
+            self.access.reload_config |=
+                self.config.current.is_some() || self.config.load.status != OperationStatus::Idle;
+            self.access.reload_sessions |= !self.sessions.current.is_empty()
+                || self.sessions.list.status != OperationStatus::Idle;
+        } else {
+            self.access.reload_config = false;
+            self.access.reload_sessions = false;
+        }
+
+        self.config = ConfigClientState::default();
+        self.auth = AuthClientState {
+            pending: auth_pending,
+            ..AuthClientState::default()
+        };
+        self.config.watch.interests = match policy {
+            ClearPolicy::TransientExpiry => config_interests,
+            ClearPolicy::ExplicitLogout => 0,
+        };
+        if self.config.watch.interests > 0 {
+            self.config.watch.status = OperationStatus::Waiting;
+        }
+        self.invalidate_status_watch();
+        self.status.current = None;
+        self.status.watch.status = OperationStatus::Waiting;
+        self.sessions = SessionClientState::default();
+        self.sessions.watch.interests = match policy {
+            ClearPolicy::TransientExpiry => session_interests,
+            ClearPolicy::ExplicitLogout => 0,
+        };
+        if self.sessions.watch.interests > 0 {
+            self.sessions.watch.status = OperationStatus::Waiting;
+        }
+        for (key, interests) in timeline_interests
+            .into_iter()
+            .filter(|_| policy == ClearPolicy::TransientExpiry)
+        {
+            let timeline = self
+                .sessions
+                .timelines
+                .entry(key.session_id.clone())
+                .or_default();
+            timeline.watch.interests = timeline.watch.interests.saturating_add(interests);
+            timeline.watch.status = OperationStatus::Waiting;
+            let watch = timeline.watches.entry(key).or_default();
+            watch.interests = interests;
+            watch.status = OperationStatus::Waiting;
+        }
+        self.streams = StreamClientState::default();
+    }
+
+    pub(crate) fn start_status_watch(&mut self) -> u64 {
+        self.next_status_watch_epoch = self.next_status_watch_epoch.saturating_add(1);
+        self.status.watch_epoch = self.next_status_watch_epoch;
+        self.status.watch.status = OperationStatus::Loading;
+        self.status.watch.error = None;
+        self.status.watch_epoch
+    }
+
+    fn invalidate_status_watch(&mut self) {
+        self.next_status_watch_epoch = self.next_status_watch_epoch.saturating_add(1);
+        self.status = StatusClientState {
+            watch_epoch: self.next_status_watch_epoch,
+            ..StatusClientState::default()
+        };
+    }
+
+    fn terminalize_loading_operations(&mut self, policy: ClearPolicy) {
+        self.operations.retain(|_, operation| {
+            if operation.fail_for_waltr_login() {
+                if policy == ClearPolicy::ExplicitLogout {
+                    operation.redact_identity();
+                }
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     pub(crate) fn next_operation_key(&mut self) -> OperationKey {
         let key = format!("op-{}", self.next_operation_id);
         self.next_operation_id = self.next_operation_id.saturating_add(1);
@@ -386,7 +729,9 @@ impl ClientState {
 
     #[must_use]
     pub(crate) fn permits_watch_maintenance(&self) -> bool {
-        self.status.watch.status == OperationStatus::Received && self.is_system_ready()
+        self.permits_protected_requests()
+            && self.status.watch.status == OperationStatus::Received
+            && self.is_system_ready()
     }
 
     pub(crate) fn set_config_load_loading(&mut self) {
@@ -717,14 +1062,24 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_config_watch_loading(&mut self) {
+    pub(crate) fn set_config_watch_loading(&mut self) -> Option<u64> {
+        let Some(open_id) = self.next_watch_open_id() else {
+            fail_watch_open_id_exhausted(&mut self.config.watch);
+            return None;
+        };
         self.config.watch.status = OperationStatus::Loading;
         self.config.watch.error = None;
+        self.config.watch.open_id = Some(open_id);
+        Some(open_id)
     }
 
-    pub(crate) fn set_config_watch_opened(&mut self) {
+    pub(crate) fn set_config_watch_opened(&mut self, open_id: u64) {
+        if self.config.watch.open_id != Some(open_id) {
+            return;
+        }
         self.config.watch.status = OperationStatus::Opened;
         self.config.watch.error = None;
+        self.config.watch.open_id = None;
     }
 
     pub(crate) const fn add_config_watch_interest(&mut self) -> usize {
@@ -739,6 +1094,7 @@ impl ClientState {
             self.config.watch.status = OperationStatus::Idle;
             self.config.watch.error = None;
             self.config.watch.retry_attempt = 0;
+            self.config.watch.open_id = None;
         }
 
         self.config.watch.interests
@@ -770,15 +1126,11 @@ impl ClientState {
     pub(crate) fn set_config_watch_failed(&mut self, message: String) -> u64 {
         self.config.watch.status = OperationStatus::Failed;
         self.config.watch.error = Some(message);
+        self.config.watch.open_id = None;
 
         let delay = watch_reconnect_delay_ms(self.config.watch.retry_attempt);
         self.config.watch.retry_attempt = self.config.watch.retry_attempt.saturating_add(1);
         delay
-    }
-
-    pub(crate) fn set_status_watch_loading(&mut self) {
-        self.status.watch.status = OperationStatus::Loading;
-        self.status.watch.error = None;
     }
 
     pub(crate) fn set_status_watch_started(&mut self) {
@@ -1067,21 +1419,42 @@ impl ClientState {
         keys
     }
 
-    pub(crate) fn set_session_timeline_watch_loading(&mut self, key: &TimelineWatchKey) {
+    pub(crate) fn set_session_timeline_watch_loading(
+        &mut self,
+        key: &TimelineWatchKey,
+    ) -> Option<u64> {
+        let Some(open_id) = self.next_watch_open_id() else {
+            let timeline = self.session_timeline_mut(&key.session_id);
+            if let Some(watch) = timeline.watches.get_mut(key) {
+                fail_watch_open_id_exhausted(watch);
+            }
+            fail_watch_open_id_exhausted(&mut timeline.watch);
+            return None;
+        };
         let timeline = self.session_timeline_mut(&key.session_id);
         if let Some(watch) = timeline.watches.get_mut(key) {
             watch.status = OperationStatus::Loading;
             watch.error = None;
+            watch.open_id = Some(open_id);
         }
         timeline.watch.status = OperationStatus::Loading;
         timeline.watch.error = None;
+        Some(open_id)
     }
 
-    pub(crate) fn set_session_timeline_watch_opened(&mut self, key: &TimelineWatchKey) {
+    pub(crate) fn set_session_timeline_watch_opened(
+        &mut self,
+        key: &TimelineWatchKey,
+        open_id: u64,
+    ) {
         let timeline = self.session_timeline_mut(&key.session_id);
         if let Some(watch) = timeline.watches.get_mut(key) {
+            if watch.open_id != Some(open_id) {
+                return;
+            }
             watch.status = OperationStatus::Opened;
             watch.error = None;
+            watch.open_id = None;
         }
         timeline.watch.status = OperationStatus::Opened;
         timeline.watch.error = None;
@@ -1135,6 +1508,7 @@ impl ClientState {
         let watch = timeline.watches.entry(key.clone()).or_default();
         watch.status = OperationStatus::Failed;
         watch.error = Some(message.clone());
+        watch.open_id = None;
 
         let delay = watch_reconnect_delay_ms(watch.retry_attempt);
         watch.retry_attempt = watch.retry_attempt.saturating_add(1);
@@ -1174,6 +1548,17 @@ impl ClientState {
             .get(&key.session_id)
             .and_then(|timeline| timeline.watches.get(key))
             .is_some_and(|watch| watch.interests > 0)
+    }
+
+    fn next_watch_open_id(&mut self) -> Option<u64> {
+        let next = self.next_watch_open_id.checked_add(1)?;
+        self.next_watch_open_id = next;
+        Some(next)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn exhaust_watch_open_ids_for_test(&mut self) {
+        self.next_watch_open_id = u64::MAX;
     }
 
     pub(crate) fn set_session_submit_user_message_loading(
@@ -1456,14 +1841,24 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_session_watch_loading(&mut self) {
+    pub(crate) fn set_session_watch_loading(&mut self) -> Option<u64> {
+        let Some(open_id) = self.next_watch_open_id() else {
+            fail_watch_open_id_exhausted(&mut self.sessions.watch);
+            return None;
+        };
         self.sessions.watch.status = OperationStatus::Loading;
         self.sessions.watch.error = None;
+        self.sessions.watch.open_id = Some(open_id);
+        Some(open_id)
     }
 
-    pub(crate) fn set_session_watch_opened(&mut self) {
+    pub(crate) fn set_session_watch_opened(&mut self, open_id: u64) {
+        if self.sessions.watch.open_id != Some(open_id) {
+            return;
+        }
         self.sessions.watch.status = OperationStatus::Opened;
         self.sessions.watch.error = None;
+        self.sessions.watch.open_id = None;
     }
 
     pub(crate) const fn add_session_watch_interest(&mut self) -> usize {
@@ -1478,6 +1873,7 @@ impl ClientState {
             self.sessions.watch.status = OperationStatus::Idle;
             self.sessions.watch.error = None;
             self.sessions.watch.retry_attempt = 0;
+            self.sessions.watch.open_id = None;
         }
 
         self.sessions.watch.interests
@@ -1521,6 +1917,7 @@ impl ClientState {
     pub(crate) fn set_session_watch_failed(&mut self, message: String) -> u64 {
         self.sessions.watch.status = OperationStatus::Failed;
         self.sessions.watch.error = Some(message);
+        self.sessions.watch.open_id = None;
 
         let delay = watch_reconnect_delay_ms(self.sessions.watch.retry_attempt);
         self.sessions.watch.retry_attempt = self.sessions.watch.retry_attempt.saturating_add(1);
@@ -1546,6 +1943,12 @@ impl ClientState {
     pub(crate) fn stream_mut(&mut self, stream_id: StreamId) -> &mut StreamState {
         self.streams.items.entry(stream_id).or_default()
     }
+}
+
+fn fail_watch_open_id_exhausted(watch: &mut WatchState) {
+    watch.status = OperationStatus::Failed;
+    watch.error = Some("watch open identity exhausted".to_owned());
+    watch.open_id = None;
 }
 
 /// Status for one shared client operation.
@@ -1611,7 +2014,7 @@ impl StreamState {
     }
 }
 
-pub(crate) fn auth_target_key(target: &AuthTarget) -> String {
+pub fn auth_target_key(target: &AuthTarget) -> String {
     match target.target.as_ref() {
         Some(waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(key)) => {
             format!("provider:{key}")

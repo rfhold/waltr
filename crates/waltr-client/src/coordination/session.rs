@@ -7,6 +7,7 @@ use crate::{
 };
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::match_same_arms)]
 pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
     match event {
         SessionEvent::CreateRequested(operation_key) => {
@@ -150,9 +151,21 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             ClientUpdate::default()
         }
         SessionEvent::WatchStarted => {
-            state.set_session_watch_opened();
+            if let Some(open_id) = state.sessions.watch.open_id {
+                state.set_session_watch_opened(open_id);
+            }
             ClientUpdate::default()
         }
+        SessionEvent::WatchStartedForOpen { open_id } => {
+            state.set_session_watch_opened(open_id);
+            ClientUpdate::default()
+        }
+        SessionEvent::WatchOpenFailed { open_id, error }
+            if state.sessions.watch.open_id == Some(open_id) =>
+        {
+            watch_failed(state, error.to_string())
+        }
+        SessionEvent::WatchOpenFailed { .. } => ClientUpdate::default(),
         SessionEvent::WatchChanged(update) => apply_watch_update(state, update),
         SessionEvent::WatchFailed(error) => watch_failed(state, error.to_string()),
         SessionEvent::WatchEnded => watch_failed(state, "session watch ended".to_owned()),
@@ -172,9 +185,35 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             ClientUpdate::default()
         }
         SessionEvent::TimelineWatchStarted { key } => {
-            state.set_session_timeline_watch_opened(&key);
+            if let Some(open_id) = state
+                .sessions
+                .timelines
+                .get(&key.session_id)
+                .and_then(|timeline| timeline.watches.get(&key))
+                .and_then(|watch| watch.open_id)
+            {
+                state.set_session_timeline_watch_opened(&key, open_id);
+            }
             ClientUpdate::default()
         }
+        SessionEvent::TimelineWatchStartedForOpen { key, open_id } => {
+            state.set_session_timeline_watch_opened(&key, open_id);
+            ClientUpdate::default()
+        }
+        SessionEvent::TimelineWatchOpenFailed {
+            key,
+            open_id,
+            error,
+        } if state
+            .sessions
+            .timelines
+            .get(&key.session_id)
+            .and_then(|timeline| timeline.watches.get(&key))
+            .is_some_and(|watch| watch.open_id == Some(open_id)) =>
+        {
+            timeline_watch_failed(state, &key, error.to_string())
+        }
+        SessionEvent::TimelineWatchOpenFailed { .. } => ClientUpdate::default(),
         SessionEvent::TimelineWatchChanged { key, update } => {
             state.set_session_timeline_watch_changed(&key, update.sequence, update.event);
             ClientUpdate::default()
@@ -378,8 +417,10 @@ pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
         return ClientUpdate::default();
     }
 
-    state.set_session_watch_loading();
-    ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Watch))
+    let Some(open_id) = state.set_session_watch_loading() else {
+        return ClientUpdate::default();
+    };
+    ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Watch { open_id }))
 }
 
 pub fn maintain_timeline_watch(state: &mut ClientState, key: &TimelineWatchKey) -> ClientUpdate {
@@ -412,7 +453,9 @@ pub fn maintain_timeline_watch(state: &mut ClientState, key: &TimelineWatchKey) 
         return ClientUpdate::default();
     };
 
-    state.set_session_timeline_watch_loading(key);
+    let Some(open_id) = state.set_session_timeline_watch_loading(key) else {
+        return ClientUpdate::default();
+    };
     ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::WatchTimeline {
         key: TimelineWatchKey::new(
             key.session_id.clone(),
@@ -420,6 +463,7 @@ pub fn maintain_timeline_watch(state: &mut ClientState, key: &TimelineWatchKey) 
             channels,
             initial_limit,
         ),
+        open_id,
     }))
 }
 

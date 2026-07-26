@@ -24,13 +24,13 @@ mod tests {
     use ts_rs::TS as _;
 
     use crate::{
-        AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot, CatalogMatchSource,
-        ClientAuthTarget, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
-        ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection, ConfigSnapshot,
-        Configuration, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits, ModelOptions,
-        ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType,
-        RollbackTargetView, SessionSnapshot, SessionTemplateOptionView,
-        SessionTemplateSearchSnapshot, StatusSnapshot,
+        AccessSnapshot, AccessStatus, AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot,
+        CatalogMatchSource, ClientAuthTarget, ClientCommand, ClientOperationView,
+        ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
+        ClientTimelineDirection, ConfigSnapshot, Configuration, Model, ModelCapabilities,
+        ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
+        OperationSnapshot, Provider, ProviderType, RollbackTargetView, SessionSnapshot,
+        SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -134,6 +134,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn exports_web_typescript_bindings() {
         let bindings = [
             ProviderKindView::decl(),
@@ -173,6 +174,8 @@ mod tests {
             SessionTemplateOptionView::decl(),
             SessionTemplateSearchSnapshot::decl(),
             RollbackTargetView::decl(),
+            AccessStatus::decl(),
+            AccessSnapshot::decl(),
             ClientAuthTarget::decl(),
             AuthAttemptSnapshot::decl(),
             AuthRequirementSnapshot::decl(),

@@ -26,16 +26,18 @@ wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tonic = { workspace = true, features = ["transport"] }
+rustls.workspace = true
+tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-ring"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tonic-web-wasm-client.workspace = true
 
 [dev-dependencies]
+hyper-util.workspace = true
 waltr-agent.workspace = true
 waltr-server = { workspace = true, features = ["test"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

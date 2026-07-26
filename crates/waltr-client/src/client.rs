@@ -1,11 +1,12 @@
 //! Shell-neutral client reducer.
 
-use crate::coordination::{auth, config, session, status, stream};
+use crate::coordination::{access, auth, config, session, status, stream};
 use crate::{
-    AuthEvent, AuthTarget, ClientEffect, ClientError, ClientEvent, ClientSessionTemplateKind,
-    ClientSessionTemplateSearchTarget, ClientState, ConfigEffect, ConfigEvent, ConfigPatch,
-    Configuration, McpServer, OperationKey, Provider, ProviderEditBaseline, RuntimeDefaults,
-    SessionEvent, SessionRuntimeConfigRequest, StatusEvent, TimelineQuery,
+    AccessAttemptId, AccessEvent, AuthEvent, AuthTarget, ClientEffect, ClientError, ClientEvent,
+    ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientState, ConfigEffect,
+    ConfigEvent, ConfigPatch, Configuration, McpServer, OperationKey, Provider,
+    ProviderEditBaseline, RuntimeDefaults, SessionEvent, SessionRuntimeConfigRequest, StatusEvent,
+    TimelineQuery,
 };
 
 /// Single headless client reducer used by shells.
@@ -29,7 +30,39 @@ impl Client {
 
     /// Apply a shell-neutral event and return resulting side-effect intents.
     pub fn apply(&mut self, event: ClientEvent) -> ClientUpdate {
+        self.apply_current(event)
+    }
+
+    pub(crate) fn apply_for_access_generation(
+        &mut self,
+        access_generation: u64,
+        event: ClientEvent,
+    ) -> ClientUpdate {
+        if self.state.access_generation != access_generation {
+            return ClientUpdate::default();
+        }
+        self.apply_current(event)
+    }
+
+    fn apply_current(&mut self, event: ClientEvent) -> ClientUpdate {
+        if !event_is_current(&self.state, &event) {
+            return ClientUpdate::default();
+        }
+        if let Some(error) = waltr_login_error(&event) {
+            if !matches!(
+                self.state.access.status,
+                crate::AccessStatus::UnknownChecking | crate::AccessStatus::Authenticated
+            ) {
+                return ClientUpdate::default();
+            }
+            return access::reduce(
+                &mut self.state,
+                AccessEvent::LoginRequired { error: Some(error) },
+            );
+        }
+
         match event {
+            ClientEvent::Access(event) => access::reduce(&mut self.state, event),
             ClientEvent::Auth(event) => auth::reduce(&mut self.state, event),
             ClientEvent::Config(event) => config::reduce(&mut self.state, event),
             ClientEvent::Status(event) => status::reduce(&mut self.state, event),
@@ -39,6 +72,54 @@ impl Client {
                 ClientUpdate::default()
             }
         }
+    }
+
+    /// Record that a platform-specific Waltr login flow started.
+    pub fn start_waltr_login(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Access(AccessEvent::LoginStarted))
+    }
+
+    /// Record that a platform installed Waltr credentials and restart status checking.
+    pub fn complete_waltr_login(&mut self, attempt_id: AccessAttemptId) -> ClientUpdate {
+        self.apply(ClientEvent::Access(AccessEvent::LoginCompleted {
+            attempt_id,
+        }))
+    }
+
+    /// Record that a platform-specific Waltr login flow failed.
+    pub fn fail_waltr_login(
+        &mut self,
+        attempt_id: AccessAttemptId,
+        error: impl Into<String>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Access(AccessEvent::LoginFailed {
+            attempt_id,
+            error: error.into(),
+        }))
+    }
+
+    /// Record that a platform-specific Waltr login flow was canceled.
+    pub fn cancel_waltr_login(&mut self, attempt_id: AccessAttemptId) -> ClientUpdate {
+        self.apply(ClientEvent::Access(AccessEvent::LoginCanceled {
+            attempt_id,
+        }))
+    }
+
+    /// Reprobe access after native credentials were atomically rejected and cleared.
+    pub fn reprobe_waltr_access(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Access(AccessEvent::ReprobeRequested))
+    }
+
+    /// Clear protected client state after platform-specific Waltr logout.
+    pub fn logout_waltr(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Access(AccessEvent::LoggedOut))
+    }
+
+    /// Record proactive native credential expiry or terminal refresh failure.
+    pub fn expire_waltr_access(&mut self, error: impl Into<String>) -> ClientUpdate {
+        self.apply(ClientEvent::Access(AccessEvent::LoginRequired {
+            error: Some(error.into()),
+        }))
     }
 
     /// Request all secret-safe auth statuses.
@@ -358,6 +439,9 @@ impl Client {
 
     /// Request that system status changes be watched.
     pub fn request_status_watch(&mut self) -> ClientUpdate {
+        if !self.state.permits_protected_requests() {
+            return ClientUpdate::default();
+        }
         self.apply(ClientEvent::Status(StatusEvent::WatchRequested))
     }
 
@@ -626,6 +710,7 @@ impl Client {
     }
 
     /// Request template search for one session.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_session_templates(
         &mut self,
         request_id: impl Into<String>,
@@ -813,6 +898,160 @@ impl Client {
     }
 }
 
+#[allow(clippy::too_many_lines)]
+fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
+    match event {
+        ClientEvent::Status(
+            StatusEvent::WatchStartedForEpoch { epoch }
+            | StatusEvent::WatchChangedForEpoch { epoch, .. }
+            | StatusEvent::WatchFailedForEpoch { epoch, .. }
+            | StatusEvent::WatchEndedForEpoch { epoch }
+            | StatusEvent::ReconnectReadyForEpoch { epoch },
+        ) => state.status.watch_epoch == *epoch,
+        ClientEvent::Auth(
+            AuthEvent::Begun { operation_key, .. } | AuthEvent::BeginFailed { operation_key, .. },
+        ) => operation_is_current(state.auth.begin.key.as_ref(), operation_key),
+        ClientEvent::Auth(
+            AuthEvent::Completed { operation_key, .. }
+            | AuthEvent::CompleteFailed { operation_key, .. },
+        ) => operation_is_current(state.auth.complete.key.as_ref(), operation_key),
+        ClientEvent::Auth(
+            AuthEvent::Canceled { operation_key } | AuthEvent::CancelFailed { operation_key, .. },
+        ) => operation_is_current(state.auth.cancel.key.as_ref(), operation_key),
+        ClientEvent::Auth(
+            AuthEvent::LoggedOut { operation_key, .. }
+            | AuthEvent::LogoutFailed { operation_key, .. },
+        ) => operation_is_current(state.auth.logout.key.as_ref(), operation_key),
+        ClientEvent::Config(
+            ConfigEvent::Patched { operation_key, .. }
+            | ConfigEvent::PatchFailed { operation_key, .. },
+        ) => operation_is_current(state.config.patch.key.as_ref(), operation_key),
+        ClientEvent::Config(
+            ConfigEvent::WatchStartedForOpen { open_id }
+            | ConfigEvent::WatchOpenFailed { open_id, .. },
+        ) => state.config.watch.open_id == Some(*open_id),
+        ClientEvent::Session(
+            SessionEvent::Created { operation_key, .. }
+            | SessionEvent::CreateFailed { operation_key, .. },
+        ) => operation_is_current(state.sessions.create.key.as_ref(), operation_key),
+        ClientEvent::Session(
+            SessionEvent::Deleted { operation_key, .. }
+            | SessionEvent::DeleteFailed { operation_key, .. },
+        ) => operation_is_current(state.sessions.delete.key.as_ref(), operation_key),
+        ClientEvent::Session(
+            SessionEvent::RuntimeConfigUpdated { operation_key, .. }
+            | SessionEvent::RuntimeConfigUpdateFailed { operation_key, .. },
+        ) => operation_is_current(
+            state.sessions.runtime_config_update.key.as_ref(),
+            operation_key,
+        ),
+        ClientEvent::Session(
+            SessionEvent::UserMessageSubmitted { operation_key }
+            | SessionEvent::UserMessageSubmitFailed { operation_key, .. },
+        ) => operation_is_current(
+            state.sessions.submit_user_message.key.as_ref(),
+            operation_key,
+        ),
+        ClientEvent::Session(
+            SessionEvent::ExternalRequestResponded { operation_key }
+            | SessionEvent::ExternalRequestRespondFailed { operation_key, .. },
+        ) => operation_is_current(
+            state.sessions.respond_external_request.key.as_ref(),
+            operation_key,
+        ),
+        ClientEvent::Session(
+            SessionEvent::Interrupted { operation_key }
+            | SessionEvent::InterruptFailed { operation_key, .. },
+        ) => operation_is_current(state.sessions.interrupt.key.as_ref(), operation_key),
+        ClientEvent::Session(
+            SessionEvent::RolledBack { operation_key, .. }
+            | SessionEvent::RollbackFailed { operation_key, .. },
+        ) => operation_is_current(state.sessions.rollback.key.as_ref(), operation_key),
+        ClientEvent::Session(
+            SessionEvent::Continued { operation_key }
+            | SessionEvent::ContinueFailed { operation_key, .. },
+        ) => operation_is_current(state.sessions.continue_session.key.as_ref(), operation_key),
+        ClientEvent::Session(
+            SessionEvent::WatchStartedForOpen { open_id }
+            | SessionEvent::WatchOpenFailed { open_id, .. },
+        ) => state.sessions.watch.open_id == Some(*open_id),
+        ClientEvent::Session(
+            SessionEvent::TimelineWatchStartedForOpen { key, open_id }
+            | SessionEvent::TimelineWatchOpenFailed { key, open_id, .. },
+        ) => state
+            .sessions
+            .timelines
+            .get(&key.session_id)
+            .and_then(|timeline| timeline.watches.get(key))
+            .is_some_and(|watch| watch.open_id == Some(*open_id)),
+        ClientEvent::Session(
+            SessionEvent::TemplatesSearched {
+                request_id,
+                session_id,
+                ..
+            }
+            | SessionEvent::TemplatesSearchFailed {
+                request_id,
+                session_id,
+                ..
+            },
+        ) => state
+            .sessions
+            .template_searches
+            .get(session_id)
+            .is_some_and(|search| search.request_id == *request_id),
+        _ => true,
+    }
+}
+
+fn operation_is_current(current: Option<&OperationKey>, completed: &OperationKey) -> bool {
+    current.is_none_or(|current| current == completed)
+}
+
+#[allow(clippy::manual_let_else)]
+fn waltr_login_error(event: &ClientEvent) -> Option<String> {
+    let error = match event {
+        ClientEvent::Auth(
+            AuthEvent::ListFailed(error)
+            | AuthEvent::BeginFailed { error, .. }
+            | AuthEvent::CompleteFailed { error, .. }
+            | AuthEvent::CancelFailed { error, .. }
+            | AuthEvent::LogoutFailed { error, .. },
+        )
+        | ClientEvent::Config(
+            ConfigEvent::LoadFailed(error)
+            | ConfigEvent::PatchFailed { error, .. }
+            | ConfigEvent::WatchFailed(error)
+            | ConfigEvent::WatchOpenFailed { error, .. },
+        )
+        | ClientEvent::Status(
+            StatusEvent::WatchFailed(error) | StatusEvent::WatchFailedForEpoch { error, .. },
+        )
+        | ClientEvent::Session(
+            SessionEvent::CreateFailed { error, .. }
+            | SessionEvent::DeleteFailed { error, .. }
+            | SessionEvent::RuntimeConfigUpdateFailed { error, .. }
+            | SessionEvent::ListFailed(error)
+            | SessionEvent::TimelineLoadFailed { error, .. }
+            | SessionEvent::TemplatesSearchFailed { error, .. }
+            | SessionEvent::TimelineWatchFailed { error, .. }
+            | SessionEvent::TimelineWatchOpenFailed { error, .. }
+            | SessionEvent::UserMessageSubmitFailed { error, .. }
+            | SessionEvent::ExternalRequestRespondFailed { error, .. }
+            | SessionEvent::InterruptFailed { error, .. }
+            | SessionEvent::RollbackFailed { error, .. }
+            | SessionEvent::ContinueFailed { error, .. }
+            | SessionEvent::WatchFailed(error)
+            | SessionEvent::WatchOpenFailed { error, .. },
+        ) => error,
+        _ => return None,
+    };
+
+    error
+        .is_waltr_login_required()
+        .then(|| error.message().to_owned())
+}
+
 const fn providers_patch(
     providers: std::collections::HashMap<String, Provider>,
 ) -> crate::ConfigPatch {
@@ -899,10 +1138,509 @@ mod tests {
 
     use crate::transport::{SessionTimelineWatchEvent, SessionTimelineWatchUpdate};
     use crate::{
-        ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary, SessionTemplateKind,
-        SessionTemplateOption, SessionWatchEvent, SessionWatchUpdate, StatusEffect, StreamEvent,
-        StreamStatus, SystemStatus, TimelineEvent, watch_reconnect_delay_ms,
+        AccessStatus, ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary,
+        SessionTemplateKind, SessionTemplateOption, SessionWatchEvent, SessionWatchUpdate,
+        StatusEffect, StreamEvent, StreamStatus, SystemStatus, TimelineEvent,
+        watch_reconnect_delay_ms,
     };
+
+    #[test]
+    fn waltr_access_login_transitions_are_independent_from_provider_auth() {
+        let mut client = Client::new();
+        let target = AuthTarget {
+            target: Some(
+                waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
+                    "anthropic".to_owned(),
+                ),
+            ),
+        };
+
+        assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
+        client.require_auth(target.clone(), "provider credentials required", None);
+        client.start_waltr_login();
+        let failed_attempt = client.state().access.active_attempt_id.clone().unwrap();
+        assert_eq!(client.state().access.status, AccessStatus::LoginInProgress);
+        assert_eq!(client.state().auth.pending.len(), 1);
+
+        client.fail_waltr_login(failed_attempt, "identity provider unavailable");
+        assert_eq!(client.state().access.status, AccessStatus::LoginFailed);
+        assert_eq!(
+            client.state().access.error.as_deref(),
+            Some("identity provider unavailable")
+        );
+        assert_eq!(client.state().auth.pending[0].target, target);
+
+        client.start_waltr_login();
+        let canceled_attempt = client.state().access.active_attempt_id.clone().unwrap();
+        client.cancel_waltr_login(canceled_attempt);
+        assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
+        assert_eq!(client.state().auth.pending.len(), 1);
+
+        client.start_waltr_login();
+        let completed_attempt = client.state().access.active_attempt_id.clone().unwrap();
+        client.complete_waltr_login(completed_attempt);
+        let epoch = client.state().status.watch_epoch;
+        client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch,
+            status: SystemStatus { ready: true },
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::Authenticated);
+        assert_eq!(client.state().auth.pending.len(), 1);
+    }
+
+    #[test]
+    fn waltr_access_loss_suspends_watches_without_reconnect_and_preserves_interest() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        drop(client.register_config_watch_interest());
+        drop(client.register_session_watch_interest());
+        drop(client.register_session_timeline_watch_interest("session", Some(0), Vec::new(), None));
+
+        let update = client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
+            ClientError::waltr_login_required("unauthenticated: login required"),
+        )));
+
+        assert!(update.is_empty());
+        assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
+        assert_eq!(client.state().status.watch.status, OperationStatus::Waiting);
+        assert_eq!(client.state().config.watch.status, OperationStatus::Waiting);
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Waiting
+        );
+        assert!(client.maintain_watches().is_empty());
+        assert!(
+            client
+                .apply(ClientEvent::Status(StatusEvent::ReconnectReady))
+                .is_empty()
+        );
+        assert_eq!(client.state().config.watch.interests, 1);
+        assert_eq!(client.state().sessions.watch.interests, 1);
+        assert_eq!(client.state().timeline_watch_keys().len(), 1);
+    }
+
+    #[test]
+    fn transient_reprobe_preserves_interests_reload_flags_and_resumes_watches() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        drop(client.register_config_watch_interest());
+        drop(client.register_session_watch_interest());
+        drop(client.register_session_timeline_watch_interest("session", Some(0), Vec::new(), None));
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(
+            config_with_provider("anthropic", "etag-1"),
+        )));
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "session",
+        )])));
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
+            ClientError::waltr_login_required("current credential rejected"),
+        )));
+        assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
+        assert_eq!(client.state().config.watch.interests, 1);
+        assert_eq!(client.state().sessions.watch.interests, 1);
+        assert_eq!(client.state().timeline_watch_keys().len(), 1);
+        assert!(client.state().access.reload_config);
+        assert!(client.state().access.reload_sessions);
+
+        let update = client.reprobe_waltr_access();
+        assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
+        assert!(matches!(
+            update.effects(),
+            [ClientEffect::Status(StatusEffect::Watch { .. })]
+        ));
+        assert_eq!(client.state().config.watch.interests, 1);
+        assert_eq!(client.state().sessions.watch.interests, 1);
+        assert_eq!(client.state().timeline_watch_keys().len(), 1);
+
+        let epoch = client.state().status.watch_epoch;
+        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch,
+            status: SystemStatus { ready: true },
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::Authenticated);
+        assert!(matches!(
+            update.effects(),
+            [
+                ClientEffect::Config(ConfigEffect::Watch { .. }),
+                ClientEffect::Session(SessionEffect::Watch { .. }),
+                ClientEffect::Config(ConfigEffect::Load),
+                ClientEffect::Session(SessionEffect::List),
+            ]
+        ));
+        assert!(matches!(
+            client.maintain_watches().effects(),
+            [ClientEffect::Session(SessionEffect::WatchTimeline { .. })]
+        ));
+        assert_eq!(client.state().config.watch.interests, 1);
+        assert_eq!(client.state().sessions.watch.interests, 1);
+        assert_eq!(client.state().timeline_watch_keys().len(), 1);
+        assert!(!client.state().access.reload_config);
+        assert!(!client.state().access.reload_sessions);
+    }
+
+    #[test]
+    fn completed_waltr_login_restarts_status_before_interested_child_watches() {
+        let mut client = Client::new();
+        drop(client.register_config_watch_interest());
+        drop(client.register_session_watch_interest());
+        drop(client.register_session_timeline_watch_interest("session", Some(0), Vec::new(), None));
+        client.apply(ClientEvent::Access(AccessEvent::LoginRequired {
+            error: None,
+        }));
+        client.start_waltr_login();
+        let attempt_id = client.state().access.active_attempt_id.clone().unwrap();
+
+        let update = client.complete_waltr_login(attempt_id);
+        assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
+        assert!(matches!(
+            update.effects(),
+            [ClientEffect::Status(StatusEffect::Watch { .. })]
+        ));
+        assert_eq!(client.state().config.watch.status, OperationStatus::Waiting);
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Waiting
+        );
+
+        let epoch = client.state().status.watch_epoch;
+        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch,
+            status: SystemStatus { ready: true },
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::Authenticated);
+        assert!(matches!(
+            update.effects(),
+            [
+                ClientEffect::Config(ConfigEffect::Watch { .. }),
+                ClientEffect::Session(SessionEffect::Watch { .. }),
+            ]
+        ));
+        let timeline_update = client.maintain_watches();
+        assert!(matches!(
+            timeline_update.effects(),
+            [ClientEffect::Session(SessionEffect::WatchTimeline { .. })]
+        ));
+    }
+
+    #[test]
+    fn waltr_logout_clears_protected_data_provider_statuses_and_requirements() {
+        let mut client = Client::new();
+        let target = AuthTarget {
+            target: Some(
+                waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
+                    "anthropic".to_owned(),
+                ),
+            ),
+        };
+        client.require_auth(target, "provider credentials required", None);
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(
+            config_with_provider("anthropic", "etag-1"),
+        )));
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+        client.apply(ClientEvent::Stream(StreamEvent::Chunk {
+            stream_id: 1,
+            text: "protected".to_owned(),
+        }));
+
+        let update = client.logout_waltr();
+
+        assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
+        assert!(matches!(
+            update.effects(),
+            [ClientEffect::Status(StatusEffect::Watch { .. })]
+        ));
+        assert!(client.state().config.current.is_none());
+        assert!(client.state().sessions.current.is_empty());
+        assert!(client.state().sessions.timelines.is_empty());
+        assert!(client.state().operations.is_empty());
+        assert!(client.state().streams.items.is_empty());
+        assert!(client.state().auth.statuses.is_empty());
+        assert!(client.state().auth.pending.is_empty());
+    }
+
+    #[test]
+    fn stale_login_attempt_events_and_pre_logout_status_events_are_ignored() {
+        let mut client = Client::new();
+        client.start_waltr_login();
+        let first = client.state().access.active_attempt_id.clone().unwrap();
+        client.start_waltr_login();
+        let second = client.state().access.active_attempt_id.clone().unwrap();
+        assert!(second > first);
+
+        client.fail_waltr_login(first.clone(), "stale failure");
+        client.cancel_waltr_login(first.clone());
+        assert_eq!(
+            client.state().access.active_attempt_id,
+            Some(second.clone())
+        );
+        assert_eq!(client.state().access.status, AccessStatus::LoginInProgress);
+        assert!(client.complete_waltr_login(first).is_empty());
+
+        client.logout_waltr();
+        assert!(client.complete_waltr_login(second).is_empty());
+        assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
+
+        client.start_waltr_login();
+        let current = client.state().access.active_attempt_id.clone().unwrap();
+        let update = client.complete_waltr_login(current);
+        let [ClientEffect::Status(StatusEffect::Watch { epoch })] = update.effects() else {
+            panic!("current login should start a status watch");
+        };
+        let epoch = *epoch;
+        client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch: epoch.saturating_sub(1),
+            status: SystemStatus { ready: true },
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
+        assert!(client.state().status.current.is_none());
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch,
+            status: SystemStatus { ready: true },
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::Authenticated);
+    }
+
+    #[test]
+    fn logout_reprobe_authenticates_or_requires_login_from_current_epoch() {
+        let mut client = Client::new();
+        let update = client.logout_waltr();
+        let [ClientEffect::Status(StatusEffect::Watch { epoch })] = update.effects() else {
+            panic!("logout should emit exactly one status probe");
+        };
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch: *epoch,
+            status: SystemStatus { ready: true },
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::Authenticated);
+
+        let update = client.logout_waltr();
+        let [ClientEffect::Status(StatusEffect::Watch { epoch })] = update.effects() else {
+            panic!("second logout should emit exactly one status probe");
+        };
+        client.apply(ClientEvent::Status(StatusEvent::WatchFailedForEpoch {
+            epoch: *epoch,
+            error: ClientError::waltr_login_required("login required"),
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
+    }
+
+    #[test]
+    fn stale_access_generation_completion_is_ignored() {
+        let mut client = Client::new();
+        let generation = client.state().access_generation;
+        client.logout_waltr();
+
+        client.apply_for_access_generation(
+            generation,
+            ClientEvent::Config(ConfigEvent::Loaded(config_with_provider(
+                "stale",
+                "stale-etag",
+            ))),
+        );
+
+        assert!(client.state().config.current.is_none());
+    }
+
+    #[test]
+    fn stale_operation_401_does_not_expire_current_access() {
+        let mut client = Client::new();
+        let first = client.create_session();
+        let [
+            ClientEffect::Session(SessionEffect::Create {
+                operation_key: first_key,
+            }),
+        ] = first.effects()
+        else {
+            panic!("first create should emit an effect");
+        };
+        let second = client.create_session();
+        let [
+            ClientEffect::Session(SessionEffect::Create {
+                operation_key: second_key,
+            }),
+        ] = second.effects()
+        else {
+            panic!("second create should emit an effect");
+        };
+
+        client.apply(ClientEvent::Session(SessionEvent::CreateFailed {
+            operation_key: first_key.clone(),
+            error: ClientError::waltr_login_required("stale unauthorized"),
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
+
+        client.apply(ClientEvent::Session(SessionEvent::CreateFailed {
+            operation_key: second_key.clone(),
+            error: ClientError::waltr_login_required("current unauthorized"),
+        }));
+        assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
+    }
+
+    #[test]
+    fn duplicate_expiry_does_not_replace_newer_login_attempt() {
+        let mut client = Client::new();
+        client.expire_waltr_access("expired");
+        client.start_waltr_login();
+        let attempt_id = client.state().access.active_attempt_id.clone();
+        let generation = client.state().access_generation;
+
+        client.expire_waltr_access("stale refresh failure");
+
+        assert_eq!(client.state().access.status, AccessStatus::LoginInProgress);
+        assert_eq!(client.state().access.active_attempt_id, attempt_id);
+        assert_eq!(client.state().access_generation, generation);
+    }
+
+    #[test]
+    fn expiry_preserves_requirements_and_interests_but_logout_removes_them() {
+        let mut client = Client::new();
+        let target = AuthTarget {
+            target: Some(
+                waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey("github".to_owned()),
+            ),
+        };
+        client.require_auth(target, "authorize github", Some("session-1".to_owned()));
+        drop(client.register_session_watch_interest());
+        drop(client.register_session_timeline_watch_interest(
+            "session-1",
+            Some(7),
+            vec!["assistant_text".to_owned()],
+            Some(10),
+        ));
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
+            ClientError::waltr_login_required("expired"),
+        )));
+        assert_eq!(client.state().auth.pending.len(), 1);
+        assert_eq!(
+            client.state().auth.pending[0].source_session_id.as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(client.state().sessions.watch.interests, 1);
+        assert_eq!(client.state().timeline_watch_keys().len(), 1);
+
+        client.logout_waltr();
+        assert!(client.state().auth.pending.is_empty());
+        assert_eq!(client.state().sessions.watch.interests, 0);
+        assert!(client.state().timeline_watch_keys().is_empty());
+    }
+
+    #[test]
+    fn proactive_access_expiry_uses_transient_preservation_policy() {
+        let mut client = Client::new();
+        let target = AuthTarget {
+            target: Some(
+                waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
+                    "anthropic".to_owned(),
+                ),
+            ),
+        };
+        client.require_auth(
+            target,
+            "provider login required",
+            Some("session-1".to_owned()),
+        );
+        drop(client.register_config_watch_interest());
+        drop(client.register_session_watch_interest());
+        client.create_session();
+        let operation_key = client.state().sessions.create.key.clone().unwrap();
+        let update = client.expire_waltr_access("native token expired");
+
+        assert!(update.is_empty());
+        assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
+        assert_eq!(
+            client.state().access.error.as_deref(),
+            Some("native token expired")
+        );
+        assert!(client.state().access.active_attempt_id.is_none());
+        assert_eq!(client.state().config.watch.interests, 1);
+        assert_eq!(client.state().sessions.watch.interests, 1);
+        assert_eq!(client.state().auth.pending.len(), 1);
+        assert!(matches!(
+            client.state().operations.get(&operation_key),
+            Some(crate::ClientOperationState::SessionCreate {
+                status: OperationStatus::Failed,
+                ..
+            })
+        ));
+        assert!(client.maintain_watches().is_empty());
+    }
+
+    #[test]
+    fn access_loss_terminalizes_loading_operations_and_reloads_authoritative_data() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(
+            config_with_provider("anthropic", "etag-1"),
+        )));
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+        let started = client.create_session();
+        let operation_key = client.state().sessions.create.key.clone().unwrap();
+        assert!(!started.is_empty());
+
+        client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
+            ClientError::waltr_login_required("expired"),
+        )));
+        assert!(matches!(
+            client.state().operations.get(&operation_key),
+            Some(crate::ClientOperationState::SessionCreate {
+                status: OperationStatus::Failed,
+                error: Some(error),
+                session: None,
+            }) if error == "Waltr login required"
+        ));
+        assert!(client.state().config.current.is_none());
+        assert!(client.state().sessions.current.is_empty());
+
+        client.start_waltr_login();
+        let attempt_id = client.state().access.active_attempt_id.clone().unwrap();
+        let update = client.complete_waltr_login(attempt_id);
+        let [ClientEffect::Status(StatusEffect::Watch { epoch })] = update.effects() else {
+            panic!("login completion should start status first");
+        };
+        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch: *epoch,
+            status: SystemStatus { ready: true },
+        }));
+        assert!(
+            update
+                .effects()
+                .contains(&ClientEffect::Config(ConfigEffect::Load))
+        );
+        assert!(
+            update
+                .effects()
+                .contains(&ClientEffect::Session(SessionEffect::List))
+        );
+    }
+
+    #[test]
+    fn logout_preserves_pending_operation_key_but_redacts_identity_data() {
+        let mut client = Client::new();
+        client.delete_session("identity-session");
+        let operation_key = client.state().sessions.delete.key.clone().unwrap();
+
+        client.logout_waltr();
+
+        assert!(matches!(
+            client.state().operations.get(&operation_key),
+            Some(crate::ClientOperationState::SessionDelete {
+                status: OperationStatus::Failed,
+                error: Some(error),
+                id,
+            }) if error == "Waltr login required" && id.is_empty()
+        ));
+    }
 
     #[test]
     fn request_config_sets_loading_and_emits_load_effect() {
@@ -981,10 +1719,10 @@ mod tests {
         )));
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchInterestRegistered));
         assert_eq!(client.state().config.watch.status, OperationStatus::Loading);
-        assert_eq!(
+        assert!(matches!(
             update.effects(),
-            &[ClientEffect::Config(ConfigEffect::Watch)]
-        );
+            [ClientEffect::Config(ConfigEffect::Watch { .. })]
+        ));
 
         client.apply(ClientEvent::Config(ConfigEvent::WatchStarted));
         assert_eq!(client.state().config.watch.status, OperationStatus::Opened);
@@ -1018,6 +1756,114 @@ mod tests {
             &[ClientEffect::Config(ConfigEffect::SleepReconnect {
                 delay_ms: 500
             })]
+        );
+    }
+
+    #[test]
+    fn terminal_watch_open_failures_clear_identity_and_retry_only_once() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+
+        let config = client.register_config_watch_interest();
+        let [
+            ClientEffect::Config(ConfigEffect::Watch {
+                open_id: config_open_id,
+            }),
+        ] = config.effects()
+        else {
+            panic!("config watch should open");
+        };
+        let config_failure = ClientEvent::Config(ConfigEvent::WatchOpenFailed {
+            open_id: *config_open_id,
+            error: ClientError::new("config open failed"),
+        });
+        assert_eq!(client.apply(config_failure.clone()).effects().len(), 1);
+        assert!(client.apply(config_failure).is_empty());
+        assert!(client.state().config.watch.open_id.is_none());
+
+        let sessions = client.register_session_watch_interest();
+        let [
+            ClientEffect::Session(SessionEffect::Watch {
+                open_id: session_open_id,
+            }),
+        ] = sessions.effects()
+        else {
+            panic!("session watch should open");
+        };
+        let session_failure = ClientEvent::Session(SessionEvent::WatchOpenFailed {
+            open_id: *session_open_id,
+            error: ClientError::new("session open failed"),
+        });
+        assert_eq!(client.apply(session_failure.clone()).effects().len(), 1);
+        assert!(client.apply(session_failure).is_empty());
+        assert!(client.state().sessions.watch.open_id.is_none());
+
+        let timeline = client.register_session_timeline_watch_interest(
+            "session",
+            Some(1),
+            vec!["assistant_text".to_owned()],
+            Some(10),
+        );
+        let [
+            ClientEffect::Session(SessionEffect::WatchTimeline {
+                key,
+                open_id: timeline_open_id,
+            }),
+        ] = timeline.effects()
+        else {
+            panic!("timeline watch should open");
+        };
+        let timeline_failure = ClientEvent::Session(SessionEvent::TimelineWatchOpenFailed {
+            key: key.clone(),
+            open_id: *timeline_open_id,
+            error: ClientError::new("timeline open failed"),
+        });
+        assert_eq!(client.apply(timeline_failure.clone()).effects().len(), 1);
+        assert!(client.apply(timeline_failure).is_empty());
+        assert!(
+            client
+                .state()
+                .sessions
+                .timelines
+                .get("session")
+                .and_then(|timeline| timeline.watches.get(key))
+                .is_some_and(|watch| watch.open_id.is_none())
+        );
+    }
+
+    #[test]
+    fn watch_open_identity_exhaustion_fails_closed_without_aliasing() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        client.state.exhaust_watch_open_ids_for_test();
+
+        assert!(client.register_config_watch_interest().is_empty());
+        assert_eq!(client.state().config.watch.status, OperationStatus::Failed);
+        assert_eq!(
+            client.state().config.watch.error.as_deref(),
+            Some("watch open identity exhausted")
+        );
+        assert!(client.register_session_watch_interest().is_empty());
+        assert_eq!(
+            client.state().sessions.watch.status,
+            OperationStatus::Failed
+        );
+        assert!(
+            client
+                .register_session_timeline_watch_interest("session", None, Vec::new(), None)
+                .is_empty()
+        );
+        let timeline = client.state().sessions.timelines.get("session").unwrap();
+        assert_eq!(timeline.watch.status, OperationStatus::Failed);
+        assert!(
+            timeline
+                .watches
+                .values()
+                .all(|watch| watch.open_id.is_none())
         );
     }
 
@@ -1254,14 +2100,16 @@ mod tests {
         assert!(update.is_empty());
         assert_eq!(client.state().config.watch.status, OperationStatus::Waiting);
 
-        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
-            SystemStatus { ready: true },
-        )));
+        let epoch = client.state().status.watch_epoch;
+        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch,
+            status: SystemStatus { ready: true },
+        }));
 
-        assert_eq!(
+        assert!(matches!(
             update.effects(),
-            &[ClientEffect::Config(ConfigEffect::Watch)]
-        );
+            [ClientEffect::Config(ConfigEffect::Watch { .. })]
+        ));
         assert_eq!(client.state().config.watch.status, OperationStatus::Loading);
     }
 
@@ -1291,10 +2139,10 @@ mod tests {
         assert!(client.state().is_system_ready());
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::ReconnectReady));
-        assert_eq!(
+        assert!(matches!(
             update.effects(),
-            &[ClientEffect::Config(ConfigEffect::Watch)]
-        );
+            [ClientEffect::Config(ConfigEffect::Watch { .. })]
+        ));
 
         drop(client.apply(ClientEvent::Config(ConfigEvent::WatchStarted)));
         drop(client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
@@ -1326,6 +2174,7 @@ mod tests {
         assert_eq!(
             status_update.effects(),
             &[ClientEffect::Status(StatusEffect::SleepReconnect {
+                epoch: 0,
                 delay_ms: 500
             })]
         );
@@ -1337,10 +2186,10 @@ mod tests {
         let recovery_update = client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
             SystemStatus { ready: true },
         )));
-        assert_eq!(
+        assert!(matches!(
             recovery_update.effects(),
-            &[ClientEffect::Config(ConfigEffect::Watch)]
-        );
+            [ClientEffect::Config(ConfigEffect::Watch { .. })]
+        ));
     }
 
     #[test]
@@ -1575,6 +2424,7 @@ mod tests {
         assert_eq!(
             status_update.effects(),
             &[ClientEffect::Status(StatusEffect::SleepReconnect {
+                epoch: 0,
                 delay_ms: 500
             })]
         );
@@ -1587,10 +2437,10 @@ mod tests {
             client.state().sessions.watch.status,
             OperationStatus::Loading
         );
-        assert_eq!(
+        assert!(matches!(
             recovery_update.effects(),
-            &[ClientEffect::Session(SessionEffect::Watch)]
-        );
+            [ClientEffect::Session(SessionEffect::Watch { .. })]
+        ));
     }
 
     #[test]
@@ -1629,6 +2479,7 @@ mod tests {
         assert_eq!(
             status_update.effects(),
             &[ClientEffect::Status(StatusEffect::SleepReconnect {
+                epoch: 0,
                 delay_ms: 500
             })]
         );
@@ -1644,14 +2495,16 @@ mod tests {
 
         let update = client.request_status_watch();
         assert_eq!(client.state().status.watch.status, OperationStatus::Loading);
-        assert_eq!(
+        assert!(matches!(
             update.effects(),
-            &[ClientEffect::Status(StatusEffect::Watch)]
-        );
+            [ClientEffect::Status(StatusEffect::Watch { .. })]
+        ));
 
-        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
-            SystemStatus { ready: true },
-        )));
+        let epoch = client.state().status.watch_epoch;
+        let update = client.apply(ClientEvent::Status(StatusEvent::WatchChangedForEpoch {
+            epoch,
+            status: SystemStatus { ready: true },
+        }));
         assert!(update.is_empty());
         assert_eq!(
             client.state().status.watch.status,
@@ -1665,9 +2518,10 @@ mod tests {
                 .is_some_and(|status| status.ready)
         );
 
-        let update = client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
-            ClientError::new("lost status"),
-        )));
+        let update = client.apply(ClientEvent::Status(StatusEvent::WatchFailedForEpoch {
+            epoch,
+            error: ClientError::new("lost status"),
+        }));
         assert_eq!(client.state().status.watch.status, OperationStatus::Failed);
         assert!(!client.state().is_system_ready());
         assert_eq!(
@@ -1677,27 +2531,32 @@ mod tests {
         assert_eq!(
             update.effects(),
             &[ClientEffect::Status(StatusEffect::SleepReconnect {
+                epoch: 1,
                 delay_ms: 500
             })]
         );
 
         for expected_delay in [1_000, 2_000, 5_000, 5_000] {
-            let update = client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
-                ClientError::new("lost status"),
-            )));
+            let update = client.apply(ClientEvent::Status(StatusEvent::WatchFailedForEpoch {
+                epoch,
+                error: ClientError::new("lost status"),
+            }));
             assert_eq!(
                 update.effects(),
                 &[ClientEffect::Status(StatusEffect::SleepReconnect {
+                    epoch: 1,
                     delay_ms: expected_delay
                 })]
             );
         }
 
-        let update = client.apply(ClientEvent::Status(StatusEvent::ReconnectReady));
-        assert_eq!(
+        let update = client.apply(ClientEvent::Status(StatusEvent::ReconnectReadyForEpoch {
+            epoch,
+        }));
+        assert!(matches!(
             update.effects(),
-            &[ClientEffect::Status(StatusEffect::Watch)]
-        );
+            [ClientEffect::Status(StatusEffect::Watch { .. })]
+        ));
         assert_eq!(watch_reconnect_delay_ms(99), 5_000);
     }
 
