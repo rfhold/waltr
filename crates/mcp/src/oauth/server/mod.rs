@@ -4,7 +4,8 @@ use crate::Result;
 
 #[cfg(feature = "oauth-authorization-server")]
 mod authorization;
-
+#[cfg(feature = "oauth-authorization-server")]
+mod registration;
 #[cfg(feature = "oauth-authorization-server")]
 mod signing;
 #[cfg(feature = "oauth-authorization-server")]
@@ -12,6 +13,8 @@ mod store;
 
 #[cfg(feature = "oauth-authorization-server")]
 pub use authorization::*;
+#[cfg(feature = "oauth-authorization-server")]
+pub use registration::*;
 #[cfg(feature = "oauth-authorization-server")]
 pub use signing::*;
 #[cfg(feature = "oauth-authorization-server")]

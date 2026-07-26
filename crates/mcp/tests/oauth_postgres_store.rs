@@ -2,18 +2,20 @@
 
 mod oauth_store_support;
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use mcp::oauth::{
     McpPrincipalId, OAuthAuthorizationStore, OAuthValidateAccessTokenRequest,
     PostgresOAuthAuthorizationStore,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, migrate::Migrator};
 use testcontainers::{
     GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
+
+static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgresql");
 
 #[tokio::test]
 #[ignore = "requires Docker"]
@@ -29,6 +31,16 @@ async fn postgres_store_passes_contract_across_reopen() {
     let container = image.start().await.unwrap();
     let port = container.get_host_port_ipv4(5432.tcp()).await.unwrap();
     let url = format!("postgres://mcp:mcp@127.0.0.1:{port}/mcp");
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::query("CREATE SCHEMA mcp")
+        .execute(&pool)
+        .await
+        .unwrap();
+    legacy_migrator().run(&pool).await.unwrap();
+    sqlx::query("INSERT INTO mcp.oauth_clients (client_id,display_metadata,created_at_ms,redirect_limit) VALUES ('legacy-client','legacy metadata',1,4)")
+        .execute(&pool)
+        .await
+        .unwrap();
     let (first, reopened) = tokio::join!(
         PostgresOAuthAuthorizationStore::connect_with_config(&url, oauth_store_support::config()),
         PostgresOAuthAuthorizationStore::connect_with_config(&url, oauth_store_support::config())
@@ -37,7 +49,6 @@ async fn postgres_store_passes_contract_across_reopen() {
     let reopened = Arc::new(reopened.unwrap());
     let validator = first.clone();
     oauth_store_support::assert_store_contract(first, reopened).await;
-    let pool = PgPool::connect(&url).await.unwrap();
     let mut lock = pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(1296257103, 1331053396)")
         .fetch_one(&mut *lock)
@@ -52,11 +63,27 @@ async fn postgres_store_passes_contract_across_reopen() {
     .unwrap();
     lock.rollback().await.unwrap();
     assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = TRUE")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT display_metadata,registration_method,redirect_limit FROM mcp.oauth_clients WHERE client_id = 'legacy-client'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("legacy metadata".to_owned(), "preconfigured".to_owned(), 4)
+    );
+    assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mcp.oauth_grants")
             .fetch_one(&pool)
             .await
             .unwrap(),
-        0
+        2
     );
     assert_eq!(
         sqlx::query_scalar::<_, Vec<u8>>(
@@ -92,6 +119,19 @@ async fn postgres_store_passes_contract_across_reopen() {
             .unwrap(),
         0
     );
+}
+
+fn legacy_migrator() -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 2)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    }
 }
 
 fn missing_validation() -> OAuthValidateAccessTokenRequest {

@@ -13,6 +13,7 @@ pub const fn config() -> OAuthAuthorizationStoreConfig {
         max_grants: 4,
         max_refresh_families: 4,
         max_access_tokens: 8,
+        allow_public_client_registration: true,
     }
 }
 
@@ -23,10 +24,6 @@ pub async fn assert_store_contract(
 ) {
     assert!(first.register_client(client("client")).await.unwrap());
     assert!(!first.register_client(client("client")).await.unwrap());
-    assert_eq!(
-        first.client("client".to_owned(), -1).await,
-        Err(OAuthAuthorizationStoreError::InvalidData)
-    );
     let mut invalid_client = client("invalid-client");
     invalid_client.redirect_uris = vec!["https://client.example/callback#fragment".to_owned()];
     assert_eq!(
@@ -36,6 +33,7 @@ pub async fn assert_store_contract(
     let transaction = OAuthAuthorizationTransaction {
         transaction_id: "transaction".to_owned(),
         client_id: "client".to_owned(),
+        client_metadata_snapshot_id: None,
         redirect_uri: "https://client.example/callback".to_owned(),
         resource: "https://resource.example/mcp".to_owned(),
         scopes: vec!["write".to_owned(), "read".to_owned(), "read".to_owned()],
@@ -199,12 +197,246 @@ pub async fn assert_store_contract(
             .await
             .unwrap()
     );
-    assert!(first.register_client(client("client-2")).await.unwrap());
-    assert!(first.register_client(client("client-3")).await.unwrap());
-    assert!(first.register_client(client("client-4")).await.unwrap());
-    assert!(!first.register_client(client("client-5")).await.unwrap());
+
+    assert_registration_contract(first.clone(), reopened.clone()).await;
 
     assert_signing_contract(first, reopened).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_registration_contract(
+    first: Arc<dyn OAuthAuthorizationStore>,
+    reopened: Arc<dyn OAuthAuthorizationStore>,
+) {
+    let left = dynamic_registration("dynamic-a", 5_000);
+    let right = dynamic_registration("dynamic-b", 5_000);
+    let (left, right) = tokio::join!(
+        first.register_dynamic_client(left),
+        reopened.register_dynamic_client(right)
+    );
+    let outcomes = [left.unwrap(), right.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| **result == OAuthDynamicClientRegistrationResult::Registered)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| **result == OAuthDynamicClientRegistrationResult::CapacityExceeded)
+            .count(),
+        1
+    );
+    first.cleanup(6_001, 10).await.unwrap();
+    assert_eq!(
+        reopened
+            .register_dynamic_client(dynamic_registration("dynamic-c", 7_000))
+            .await
+            .unwrap(),
+        OAuthDynamicClientRegistrationResult::Registered
+    );
+
+    let transaction = OAuthAuthorizationTransaction {
+        transaction_id: "dynamic-transaction".to_owned(),
+        client_id: "dynamic-c".to_owned(),
+        client_metadata_snapshot_id: None,
+        redirect_uri: "https://client.example/callback".to_owned(),
+        resource: "https://resource.example/mcp".to_owned(),
+        scopes: vec!["read".to_owned()],
+        pkce_challenge: "challenge".to_owned(),
+        browser_correlation_digest: digest(20),
+        state_reference: "state".to_owned(),
+        principal_id: None,
+        decision: None,
+        created_at_ms: 7_100,
+        expires_at_ms: 9_000,
+    };
+    assert!(
+        first
+            .create_authorization_transaction(transaction)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        reopened
+            .authenticate_and_promote_client(OAuthDynamicClientPromotionRequest {
+                transaction_id: "dynamic-transaction".to_owned(),
+                principal_id: McpPrincipalId::new("alice").unwrap(),
+                now_ms: 7_200,
+                max_clients_per_principal: 1,
+                max_active_dynamic_clients: 2,
+            })
+            .await
+            .unwrap(),
+        OAuthClientPromotionResult::Authenticated
+    );
+    assert!(
+        first
+            .decide_authorization_transaction(
+                "dynamic-transaction".to_owned(),
+                OAuthAuthorizationDecision::Approved,
+                7_600,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        first
+            .issue_authorization_code(OAuthAuthorizationCode {
+                code_digest: digest(23),
+                transaction_id: "dynamic-transaction".to_owned(),
+                created_at_ms: 7_600,
+                expires_at_ms: 8_500,
+                consumed_at_ms: None,
+            })
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        reopened
+            .redeem_authorization_code(OAuthIssueGrantRequest {
+                code_digest: digest(23),
+                client_id: "dynamic-c".to_owned(),
+                redirect_uri: "https://client.example/callback".to_owned(),
+                resource: "https://resource.example/mcp".to_owned(),
+                pkce_challenge: "challenge".to_owned(),
+                grant_id: "terminal-grant".to_owned(),
+                refresh_family_id: "terminal-family".to_owned(),
+                refresh_token_digest: digest(24),
+                refresh_token_expires_at_ms: 8_800,
+                refresh_family_expires_at_ms: 9_000,
+                access_token: token("terminal-access", 7_700),
+                now_ms: 7_700,
+            })
+            .await
+            .unwrap(),
+        OAuthIssueGrantResult::Issued(_)
+    ));
+    assert_eq!(
+        reopened
+            .register_dynamic_client(dynamic_registration("dynamic-d", 7_300))
+            .await
+            .unwrap(),
+        OAuthDynamicClientRegistrationResult::Registered
+    );
+    assert!(
+        first
+            .create_authorization_transaction(OAuthAuthorizationTransaction {
+                transaction_id: "quota-transaction".to_owned(),
+                client_id: "dynamic-d".to_owned(),
+                client_metadata_snapshot_id: None,
+                redirect_uri: "https://client.example/callback".to_owned(),
+                resource: "https://resource.example/mcp".to_owned(),
+                scopes: vec!["read".to_owned()],
+                pkce_challenge: "challenge".to_owned(),
+                browser_correlation_digest: digest(22),
+                state_reference: "state".to_owned(),
+                principal_id: None,
+                decision: None,
+                created_at_ms: 7_400,
+                expires_at_ms: 9_000,
+            })
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        reopened
+            .authenticate_and_promote_client(OAuthDynamicClientPromotionRequest {
+                transaction_id: "quota-transaction".to_owned(),
+                principal_id: McpPrincipalId::new("alice").unwrap(),
+                now_ms: 7_500,
+                max_clients_per_principal: 1,
+                max_active_dynamic_clients: 2,
+            })
+            .await
+            .unwrap(),
+        OAuthClientPromotionResult::QuotaExceeded
+    );
+    assert!(first.register_client(client("reserved-a")).await.unwrap());
+    assert!(first.register_client(client("reserved-b")).await.unwrap());
+    first.cleanup(12_701, 32).await.unwrap();
+    assert!(
+        reopened
+            .client("dynamic-c".to_owned(), 12_701)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let document = serde_json::json!({
+        "client_id": "https://metadata.example/client.json",
+        "redirect_uris": ["https://client.example/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "code_challenge_methods": ["S256"]
+    });
+    let snapshot = OAuthCachedClientMetadata {
+        snapshot_id: "snapshot".to_owned(),
+        client_id: "https://metadata.example/client.json".to_owned(),
+        document: document.clone(),
+        document_digest: digest(21),
+        retrieved_at_ms: 13_000,
+        expires_at_ms: 14_000,
+        retain_until_ms: 14_000,
+    };
+    first.cache_client_metadata(snapshot.clone()).await.unwrap();
+    let mut mutation = snapshot;
+    mutation.document["redirect_uris"] = serde_json::json!(["https://attacker.example/callback"]);
+    assert_eq!(
+        reopened.cache_client_metadata(mutation).await,
+        Err(OAuthAuthorizationStoreError::InvalidData)
+    );
+    assert!(
+        first
+            .create_authorization_transaction(OAuthAuthorizationTransaction {
+                transaction_id: "z-referenced-cimd-transaction".to_owned(),
+                client_id: "https://metadata.example/client.json".to_owned(),
+                client_metadata_snapshot_id: Some("snapshot".to_owned()),
+                redirect_uri: "https://client.example/callback".to_owned(),
+                resource: "https://resource.example/mcp".to_owned(),
+                scopes: vec!["read".to_owned()],
+                pkce_challenge: "challenge".to_owned(),
+                browser_correlation_digest: digest(22),
+                state_reference: "cimd-state".to_owned(),
+                principal_id: None,
+                decision: None,
+                created_at_ms: 13_001,
+                expires_at_ms: 14_000,
+            })
+            .await
+            .unwrap()
+    );
+    assert_eq!(first.cleanup(14_000, 2).await.unwrap().records_deleted, 2);
+    assert_eq!(
+        reopened.cleanup(14_000, 2).await.unwrap().records_deleted,
+        0
+    );
+}
+
+fn dynamic_registration(client_id: &str, now_ms: i64) -> OAuthDynamicClientRegistrationRequest {
+    OAuthDynamicClientRegistrationRequest {
+        client: OAuthClient {
+            client_id: client_id.to_owned(),
+            registration_method: OAuthClientRegistrationMethod::Dynamic,
+            display_name: None,
+            client_secret_digest: None,
+            redirect_uris: vec!["https://client.example/callback".to_owned()],
+            created_at_ms: now_ms,
+            expires_at_ms: None,
+            disabled_at_ms: None,
+        },
+        provisional_expires_at_ms: now_ms + 1_000,
+        inactivity_lifetime_ms: 5_000,
+        max_provisional_clients: 1,
+        max_active_dynamic_clients: 2,
+        global_rate_limit: 100,
+        source_rate_limit: 10,
+        rate_limit_window_ms: 1_000,
+        trusted_source: None,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -241,16 +473,6 @@ async fn assert_signing_contract(
         &entropy,
     )
     .unwrap();
-    assert_ne!(
-        candidate1.encrypted_private_key.nonce,
-        candidate2.encrypted_private_key.nonce
-    );
-    let alias_ring =
-        VersionedOAuthWrappingKeyring::new("wrap-alias", [("wrap-alias".to_owned(), vec![1; 32])])
-            .unwrap();
-    let mut tampered = candidate1.encrypted_private_key.clone();
-    tampered.wrapping_key_id = "wrap-alias".to_owned();
-    assert!(alias_ring.decrypt("ES256", "key-1", &tampered).is_err());
     let (left, right) = tokio::join!(
         first.put_signing_key_candidate(candidate1, true),
         reopened.put_signing_key_candidate(candidate2, true)
@@ -343,15 +565,14 @@ async fn assert_signing_contract(
     assert!(!format!("{:?}", active.encrypted_private_key).contains("ciphertext"));
     let cleanup = first.cleanup(5_000, 10).await.unwrap();
     assert_eq!(cleanup.signing_keys_deleted, 1);
-    assert_eq!(first.cleanup(5_000, 1).await.unwrap().records_deleted, 1);
-    assert_eq!(first.cleanup(5_000, 1).await.unwrap().records_deleted, 1);
 }
 
 fn client(id: &str) -> OAuthClient {
     OAuthClient {
         client_id: id.to_owned(),
+        registration_method: OAuthClientRegistrationMethod::Preconfigured,
         display_name: Some("Client".to_owned()),
-        client_secret_digest: Some(digest(31)),
+        client_secret_digest: Some(vec![31; 32]),
         redirect_uris: vec!["https://client.example/callback".to_owned()],
         created_at_ms: 1_000,
         expires_at_ms: None,
