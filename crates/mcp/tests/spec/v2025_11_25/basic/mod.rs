@@ -3,6 +3,7 @@ pub mod cancellation;
 pub mod json_rpc;
 pub mod lifecycle;
 pub mod meta;
+pub mod oauth_protocol;
 pub mod ping;
 pub mod progress;
 pub mod transports;

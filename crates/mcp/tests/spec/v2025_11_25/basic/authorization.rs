@@ -1,5 +1,5 @@
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -9,10 +9,10 @@ use std::{
 
 use futures_util::StreamExt;
 use mcp::{
-    Error, McpAccessToken, McpAuthorizationError, McpBearerChallenge, McpPrincipalId,
-    McpProtectedResourceMetadata, McpTokenValidation,
+    Error, McpAccessToken, McpAuthorizationError, McpBearerChallenge, McpOAuthDestinationPolicy,
+    McpOAuthDiscoveryClient, McpOAuthEndpointPolicy, McpPrincipalId, McpProtectedResourceMetadata,
+    McpTokenValidation,
     client::{McpClient, McpClientHandler, McpClientOptions, McpTransportConfig},
-    discover_protected_resource_metadata,
     oauth::{authorization_server_metadata_urls, protected_resource_metadata_urls},
     server::{
         BoxFuture, InMemoryStreamableHttpSessionStore, McpAuthorizationContext,
@@ -702,12 +702,9 @@ async fn protected_resource_metadata_discovery_validates_mcp_required_fields() -
         ..McpBearerChallenge::new()
     };
 
-    let metadata = discover_protected_resource_metadata(
-        &reqwest::Client::new(),
-        &server.endpoint,
-        Some(&challenge),
-    )
-    .await?;
+    let metadata = loopback_discovery_client()?
+        .discover_protected_resource_metadata(&server.endpoint, Some(&challenge))
+        .await?;
     assert_eq!(metadata.resource, server.endpoint);
     assert_eq!(metadata.authorization_servers, ["https://auth.example.com"]);
     Ok(())
@@ -734,8 +731,9 @@ async fn protected_resource_metadata_discovery_falls_back_to_root_well_known() -
         }
     });
 
-    let discovered =
-        discover_protected_resource_metadata(&reqwest::Client::new(), &endpoint, None).await?;
+    let discovered = loopback_discovery_client()?
+        .discover_protected_resource_metadata(&endpoint, None)
+        .await?;
     task.abort();
     assert_eq!(discovered.resource, endpoint);
     assert_eq!(
@@ -788,6 +786,12 @@ fn bearer_challenge_parser_finds_case_insensitive_bearer_challenge() {
     ])
     .expect("bearer challenge from later header value");
     assert_eq!(challenge.error.as_deref(), Some("invalid_token"));
+    let challenge =
+        McpBearerChallenge::parse("Bearer error=\"invalid_token\", Basic realm=\"unrelated\"")
+            .expect("bearer challenge before another scheme");
+    assert_eq!(challenge.error.as_deref(), Some("invalid_token"));
+    assert!(McpBearerChallenge::parse("Bearer scope=one, scope=two").is_none());
+    assert!(McpBearerChallenge::parse("Bearer scope=\"unterminated").is_none());
 }
 
 #[test]
@@ -800,11 +804,17 @@ fn authorization_discovery_urls_follow_mcp_priority_order() {
         ]
     );
     assert_eq!(
-        protected_resource_metadata_urls("https://mcp.example.com/public/mcp?tenant=a#ignored"),
+        protected_resource_metadata_urls("https://mcp.example.com/public/mcp?tenant=a"),
         [
             "https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp?tenant=a",
             "https://mcp.example.com/.well-known/oauth-protected-resource",
         ]
+    );
+    assert!(
+        protected_resource_metadata_urls(
+            "https://mcp.example.com/public/mcp?tenant=secret#ambiguous"
+        )
+        .is_empty()
     );
     assert_eq!(
         authorization_server_metadata_urls("https://auth.example.com/tenant1"),
@@ -814,6 +824,30 @@ fn authorization_discovery_urls_follow_mcp_priority_order() {
             "https://auth.example.com/tenant1/.well-known/openid-configuration",
         ]
     );
+}
+
+#[derive(Debug)]
+struct AllowLoopbackDiscovery;
+
+impl McpOAuthDestinationPolicy for AllowLoopbackDiscovery {
+    fn validate(&self, _destination: &reqwest::Url) -> mcp::Result<()> {
+        Ok(())
+    }
+
+    fn validate_address(&self, address: IpAddr) -> mcp::Result<()> {
+        if address.is_loopback() {
+            Ok(())
+        } else {
+            Err(Error::protocol("test destination is not loopback"))
+        }
+    }
+}
+
+fn loopback_discovery_client() -> mcp::Result<McpOAuthDiscoveryClient> {
+    Ok(
+        McpOAuthDiscoveryClient::new(McpOAuthEndpointPolicy::AllowLoopbackHttp)?
+            .with_destination_policy(Arc::new(AllowLoopbackDiscovery)),
+    )
 }
 
 struct AuthorizationClient;
