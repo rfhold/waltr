@@ -1,17 +1,82 @@
 //! Shared integration test server setup.
 
 use crate::{
-    build_app_with_catalog_loader, catalog::CatalogLoader, config_service::ConfigService, session,
+    ServerApplication, build_app_with_catalog_loader,
+    catalog::CatalogLoader,
+    config_service::ConfigService,
+    persistence::{DatabaseConfig, Persistence},
+    session,
 };
 use waltr_agent::{MemorySessionStore, SessionCoordinator};
 use std::{
     net::{SocketAddr, TcpListener},
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
 };
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Observability and join controls for an application with blocked cleanup.
+#[derive(Debug)]
+pub struct BlockedCleanupProbe {
+    /// Notified after the blocked cleanup future starts.
+    pub cleanup_started: Arc<Notify>,
+    /// Set when cancellation drops the blocked cleanup future.
+    pub cleanup_dropped: Arc<AtomicBool>,
+    /// Notified after cancellation is observed but before cleanup can finish.
+    pub shutdown_observed: Arc<Notify>,
+    /// Allows the cleanup task to finish so shutdown can join it.
+    pub release_cleanup: Arc<Notify>,
+}
+
+struct CleanupDropGuard(Arc<AtomicBool>);
+
+impl Drop for CleanupDropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Construct an application whose cleanup remains blocked until explicitly released.
+#[must_use]
+pub fn blocked_cleanup_application() -> (ServerApplication, BlockedCleanupProbe) {
+    let cancellation = CancellationToken::new();
+    let cleanup_started = Arc::new(Notify::new());
+    let cleanup_dropped = Arc::new(AtomicBool::new(false));
+    let shutdown_observed = Arc::new(Notify::new());
+    let release_cleanup = Arc::new(Notify::new());
+    let task = {
+        let cancellation = cancellation.clone();
+        let cleanup_started = Arc::clone(&cleanup_started);
+        let cleanup_dropped = Arc::clone(&cleanup_dropped);
+        let shutdown_observed = Arc::clone(&shutdown_observed);
+        let release_cleanup = Arc::clone(&release_cleanup);
+        tokio::spawn(async move {
+            let guard = CleanupDropGuard(cleanup_dropped);
+            cleanup_started.notify_one();
+            cancellation.cancelled().await;
+            drop(guard);
+            shutdown_observed.notify_one();
+            release_cleanup.notified().await;
+        })
+    };
+    let app = ServerApplication::with_cleanup_task_for_test(cancellation, task);
+    (
+        app,
+        BlockedCleanupProbe {
+            cleanup_started,
+            cleanup_dropped,
+            shutdown_observed,
+            release_cleanup,
+        },
+    )
+}
 
 /// Shared test server for integration tests in one test binary.
 #[derive(Debug)]
@@ -52,9 +117,7 @@ pub fn setup_server_at(addr: SocketAddr) -> &'static TestServer {
 
 /// Start an isolated integration test server with an explicit config service.
 #[must_use]
-pub fn setup_server_with_services(
-    config_service: std::sync::Arc<ConfigService>,
-) -> &'static TestServer {
+pub fn setup_server_with_services(config_service: Arc<ConfigService>) -> &'static TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
     setup_server_with_listener(config_service, listener)
 }
@@ -90,7 +153,7 @@ pub fn setup_server_with_seeded_sessions(
 }
 
 fn setup_server_with_listener(
-    config_service: std::sync::Arc<ConfigService>,
+    config_service: Arc<ConfigService>,
     listener: TcpListener,
 ) -> &'static TestServer {
     setup_server_with_listener_and_sessions(
@@ -101,7 +164,7 @@ fn setup_server_with_listener(
 }
 
 fn setup_server_with_listener_and_catalog_loader(
-    config_service: std::sync::Arc<ConfigService>,
+    config_service: Arc<ConfigService>,
     listener: TcpListener,
     catalog_loader: CatalogLoader,
 ) -> &'static TestServer {
@@ -114,7 +177,7 @@ fn setup_server_with_listener_and_catalog_loader(
 }
 
 fn setup_server_with_listener_and_sessions(
-    config_service: std::sync::Arc<ConfigService>,
+    config_service: Arc<ConfigService>,
     listener: TcpListener,
     sessions: SessionCoordinator<MemorySessionStore>,
 ) -> &'static TestServer {
@@ -127,7 +190,7 @@ fn setup_server_with_listener_and_sessions(
 }
 
 fn setup_server_with_listener_sessions_and_catalog_loader(
-    config_service: std::sync::Arc<ConfigService>,
+    config_service: Arc<ConfigService>,
     listener: TcpListener,
     sessions: SessionCoordinator<MemorySessionStore>,
     catalog_loader: CatalogLoader,
@@ -146,18 +209,22 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
             .expect("test server runtime should start");
 
         runtime.block_on(async move {
+            let persistence = Persistence::initialize(
+                DatabaseConfig::for_tests().expect("test persistence config should be valid"),
+            )
+            .await
+            .expect("test persistence should initialize");
             let listener = tokio::net::TcpListener::from_std(listener)
                 .expect("test server listener should become async");
-            axum::serve(
-                listener,
-                build_app_with_catalog_loader(
-                    config_service,
-                    catalog_loader,
-                    |routes, config, credential_store| {
-                        session::add_sessions_service(routes, sessions, config, credential_store);
-                    },
-                ),
+            build_app_with_catalog_loader(
+                config_service,
+                persistence,
+                catalog_loader,
+                |routes, config, credential_store| {
+                    session::add_sessions_service(routes, sessions, config, credential_store);
+                },
             )
+            .serve_with_shutdown(listener, std::future::pending())
             .await
             .expect("test server should run");
         });
