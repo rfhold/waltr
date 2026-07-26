@@ -7,7 +7,7 @@ version.workspace = true
 [features]
 default = ["macros"]
 macros = ["dep:mcp-macros"]
-oauth-authorization-server = ["dep:aes-gcm", "dep:base64", "dep:p256", "dep:zeroize"]
+oauth-authorization-server = ["dep:aes-gcm", "dep:base64", "dep:p256", "dep:sha2", "dep:zeroize"]
 oauth-authorization-server-postgres = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/postgres", "sqlx/runtime-tokio-rustls"]
 oauth-authorization-server-sqlite = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite"]
 progressive = ["macros", "dep:jaq-interpret", "dep:jaq-parse", "dep:schemars"]
@@ -28,6 +28,7 @@ p256 = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2 = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
@@ -47,6 +48,11 @@ testcontainers.workspace = true
 [[test]]
 name = "oauth_store"
 path = "tests/oauth_store.rs"
+required-features = ["oauth-authorization-server"]
+
+[[test]]
+name = "oauth_authorization_server"
+path = "tests/oauth_authorization_server.rs"
 required-features = ["oauth-authorization-server"]
 
 [[test]]

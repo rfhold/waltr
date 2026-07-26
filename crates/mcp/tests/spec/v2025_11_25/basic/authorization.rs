@@ -556,6 +556,132 @@ async fn authorized_get_stream_ends_at_credential_expiry() -> mcp::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "oauth-authorization-server")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn hosted_get_stream_ends_on_notification_poll_and_store_failure() -> mcp::Result<()> {
+    use std::sync::atomic::AtomicBool;
+
+    use mcp::server::{McpHostedTokenValidation, McpRevocationLease, McpTokenAuthorization};
+    use tokio::sync::watch;
+
+    let valid = Arc::new(AtomicBool::new(true));
+    let unavailable = Arc::new(AtomicBool::new(false));
+    let (revocations, _) = watch::channel(0_u64);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let endpoint = format!("http://{address}/mcp");
+    let metadata = McpProtectedResourceMetadata::new(&endpoint, ["https://auth.example.com"])
+        .with_scopes(["files:read"]);
+    let authorizer_valid = valid.clone();
+    let authorizer_unavailable = unavailable.clone();
+    let authorizer_revocations = revocations.clone();
+    let authorization = mcp::server::StreamableHttpAuthorization::hosted(metadata, move |_, _| {
+        let valid = authorizer_valid.clone();
+        let unavailable = authorizer_unavailable.clone();
+        let receiver = authorizer_revocations.subscribe();
+        Box::pin(async move {
+            let lease_valid = valid.clone();
+            let lease_unavailable = unavailable.clone();
+            McpHostedTokenValidation::Authorized(McpTokenAuthorization {
+                principal_id: McpPrincipalId::new("lease-owner").unwrap(),
+                expires_at: None,
+                revocation: Some(McpRevocationLease::new(
+                    move || {
+                        let valid = lease_valid.clone();
+                        let unavailable = lease_unavailable.clone();
+                        Box::pin(async move {
+                            if unavailable.load(Ordering::SeqCst) {
+                                Err(())
+                            } else {
+                                Ok(valid.load(Ordering::SeqCst))
+                            }
+                        })
+                    },
+                    Duration::from_millis(75),
+                    receiver,
+                )),
+            })
+        })
+    })?
+    .with_required_scopes(["files:read"]);
+    let handler: Arc<dyn mcp::server::ServerHandler> =
+        Arc::new(AuthorizationServer::new(Arc::new(|_, _| {
+            Box::pin(async { authorized() })
+        })));
+    let router = streamable_http_router_with_options(
+        handler,
+        mcp::server::StreamableHttpOptions::default().with_authorization(authorization),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, router).await });
+    let response = initialized_hosted_get(&endpoint).await?;
+    let mut body = response.bytes_stream();
+    assert!(body.next().await.is_some());
+    valid.store(false, Ordering::SeqCst);
+    revocations.send_modify(|generation| *generation += 1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while body.next().await.is_some() {}
+    })
+    .await
+    .expect("revocation closes stream");
+
+    valid.store(true, Ordering::SeqCst);
+    let response = initialized_hosted_get(&endpoint).await?;
+    let mut body = response.bytes_stream();
+    assert!(body.next().await.is_some());
+    valid.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while body.next().await.is_some() {}
+    })
+    .await
+    .expect("authoritative polling closes revoked stream");
+
+    valid.store(true, Ordering::SeqCst);
+    let response = initialized_hosted_get(&endpoint).await?;
+    let mut body = response.bytes_stream();
+    assert!(body.next().await.is_some());
+    unavailable.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while body.next().await.is_some() {}
+    })
+    .await
+    .expect("store failure closes stream");
+    task.abort();
+    Ok(())
+}
+
+#[cfg(feature = "oauth-authorization-server")]
+async fn initialized_hosted_get(endpoint: &str) -> mcp::Result<reqwest::Response> {
+    let client = reqwest::Client::new();
+    let initialize = initialize_request(endpoint, Some("hosted")).await?;
+    let session_id = initialize.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    drop(initialize.bytes().await?);
+    assert_eq!(
+        client
+            .post(endpoint)
+            .bearer_auth("hosted")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session_id)
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    Ok(client
+        .get(endpoint)
+        .bearer_auth("hosted")
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", session_id)
+        .header("mcp-protocol-version", "2025-11-25")
+        .send()
+        .await?)
+}
+
 #[tokio::test]
 async fn already_expired_get_lease_closes_before_claiming_or_delivering_events() -> mcp::Result<()>
 {
