@@ -470,7 +470,14 @@ async fn sqlite_files_keep_component_tables_and_histories_isolated() {
 
     let waltr_tables = sqlite_tables(waltr_pool).await;
     let mcp_tables = sqlite_tables(mcp_pool).await;
-    assert_eq!(waltr_tables, ["_sqlx_migrations"]);
+    assert_eq!(
+        waltr_tables,
+        [
+            "_sqlx_migrations",
+            "waltr_browser_sessions",
+            "waltr_oidc_login_attempts"
+        ]
+    );
     assert_eq!(
         mcp_tables,
         [
@@ -599,10 +606,10 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .fetch_one(pool)
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (1, 1));
+    assert_eq!((waltr_count, mcp_count), (2, 1));
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
-            "SELECT to_regclass('waltr._sqlx_migrations')::text"
+            "SELECT to_regclass('waltr.oidc_login_attempts')::text"
         )
         .fetch_one(pool)
         .await
@@ -662,7 +669,7 @@ async fn assert_component_histories(persistence: &Persistence) {
         .fetch_one(persistence.mcp_sqlite_pool().expect("MCP pool"))
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (1, 1));
+    assert_eq!((waltr_count, mcp_count), (2, 1));
 }
 
 async fn sqlite_tables(pool: &SqlitePool) -> Vec<String> {

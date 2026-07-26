@@ -12,6 +12,24 @@ use std::{
     time::Duration,
 };
 
+const OIDC_ENVIRONMENT: &[&str] = &[
+    "WALTR_AUTH_MODE",
+    "WALTR_OIDC_ISSUER",
+    "WALTR_OIDC_CLIENT_ID",
+    "WALTR_OIDC_CLIENT_SECRET",
+    "WALTR_OIDC_REDIRECT_URI",
+    "WALTR_PUBLIC_URL",
+    "WALTR_API_OIDC_ISSUER",
+    "WALTR_API_OIDC_AUDIENCE",
+    "WALTR_API_REQUIRED_SCOPES",
+    "WALTR_OIDC_AUDIENCE",
+    "WALTR_OIDC_SCOPES",
+    "WALTR_AUTH_SESSION_TTL",
+    "WALTR_AUTH_ALLOW_INSECURE_COOKIE",
+    "WALTR_OIDC_ALLOW_INSECURE_HTTP",
+    "WALTR_TRUSTED_PROXIES",
+];
+
 #[tokio::test]
 async fn server_process_boots_and_serves_health() -> Result<(), Box<dyn std::error::Error>> {
     let (addr, root, database_url) = process_test_inputs()?;
@@ -83,6 +101,63 @@ async fn server_process_fails_before_bind_for_unusable_database_path()
     Ok(())
 }
 
+#[tokio::test]
+async fn server_process_fails_closed_for_missing_oidc_configuration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (addr, root, database_url) = process_test_inputs()?;
+    let mut command = isolated_server_command(addr, &root, &database_url);
+    command.env("WALTR_AUTH_MODE", "oidc");
+    let mut server = command.spawn()?;
+
+    let status = wait_for_exit(&mut server, Duration::from_secs(5)).await?;
+    let output = captured_output(&mut server)?;
+    assert!(!status.success(), "server unexpectedly started: {output}");
+    assert!(output.contains("access authentication configuration is invalid"));
+    assert!(!output.contains("WALTR_OIDC_ISSUER"));
+    assert!(!output.contains("WALTR_OIDC_CLIENT_SECRET"));
+    assert_listener_unused(addr).await?;
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_process_fails_closed_for_unreachable_oidc_discovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (addr, root, database_url) = process_test_inputs()?;
+    let issuer_listener = TcpListener::bind("127.0.0.1:0")?;
+    let issuer = format!("http://{}", issuer_listener.local_addr()?);
+    drop(issuer_listener);
+    let secret = "must-not-appear-in-startup-output";
+    let mut command = isolated_server_command(addr, &root, &database_url);
+    command
+        .env("WALTR_AUTH_MODE", "oidc")
+        .env("WALTR_OIDC_ISSUER", &issuer)
+        .env("WALTR_OIDC_CLIENT_ID", "waltr-process-test")
+        .env("WALTR_OIDC_CLIENT_SECRET", secret)
+        .env(
+            "WALTR_OIDC_REDIRECT_URI",
+            format!("http://{addr}/oidc/callback"),
+        )
+        .env("WALTR_PUBLIC_URL", "https://waltr.example")
+        .env("WALTR_OIDC_AUDIENCE", "waltr-api")
+        .env("WALTR_OIDC_SCOPES", "openid")
+        .env("WALTR_AUTH_ALLOW_INSECURE_COOKIE", "true")
+        .env("WALTR_OIDC_ALLOW_INSECURE_HTTP", "true");
+    let mut server = command.spawn()?;
+
+    let status = wait_for_exit(&mut server, Duration::from_secs(5)).await?;
+    let output = captured_output(&mut server)?;
+    assert!(!status.success(), "server unexpectedly started: {output}");
+    assert!(output.contains("failed to initialize OIDC provider discovery"));
+    assert!(!output.contains(&issuer));
+    assert!(!output.contains(secret));
+    assert_listener_unused(addr).await?;
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 async fn patch_config(addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = config_client_for_addr(addr).await?;
     let current = get_config(&mut client).await?;
@@ -133,6 +208,9 @@ fn isolated_server_command(
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for name in OIDC_ENVIRONMENT {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -209,7 +287,14 @@ async fn assert_process_database_isolation(
     )
     .fetch_all(&mut mcp)
     .await?;
-    assert_eq!(waltr_tables, ["_sqlx_migrations"]);
+    assert_eq!(
+        waltr_tables,
+        [
+            "_sqlx_migrations",
+            "waltr_browser_sessions",
+            "waltr_oidc_login_attempts"
+        ]
+    );
     assert_eq!(
         mcp_tables,
         [
