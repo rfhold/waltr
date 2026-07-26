@@ -50,6 +50,7 @@ pub async fn assert_standard_surface(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn assert_surface(client: &McpClient) -> mcp::Result<()> {
     let cancel = CancellationToken::new();
 
@@ -130,9 +131,9 @@ async fn assert_surface(client: &McpClient) -> mcp::Result<()> {
             .contains("ecosystem-resource-status-616")
     );
 
-    let templated = client.read_resource(ITEM_42, cancel.clone()).await?;
+    let item_resource = client.read_resource(ITEM_42, cancel.clone()).await?;
     assert!(
-        templated
+        item_resource
             .format_text()
             .contains("ecosystem-resource-template-item-42-717")
     );

@@ -1,3 +1,5 @@
+//! Ecosystem interoperability integration tests.
+
 #[path = "ecosystem/mod.rs"]
 mod ecosystem;
 

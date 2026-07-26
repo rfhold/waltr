@@ -1,5 +1,13 @@
 //! Integration tests for the exported `mcp::mcp_server` macro.
 
+// Fixtures intentionally exercise every supported owned/fallible/async handler shape.
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unused_async
+)]
+
 use std::{net::SocketAddr, sync::Arc, sync::Mutex};
 
 use mcp::{

@@ -87,7 +87,7 @@ async fn progress_notification_reuses_request_progress_token() -> mcp::Result<()
             "params": {
                 "name": "progress-tool",
                 "arguments": {},
-                "_meta": { "progressToken": 20250618 }
+                "_meta": { "progressToken": 20_250_618 }
             }
         }))
         .send()
@@ -106,7 +106,7 @@ async fn progress_notification_reuses_request_progress_token() -> mcp::Result<()
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0]["jsonrpc"], "2.0");
     assert_eq!(messages[0]["method"], "notifications/progress");
-    assert_eq!(messages[0]["params"]["progressToken"], 20250618);
+    assert_eq!(messages[0]["params"]["progressToken"], 20_250_618);
     assert_eq!(messages[0]["params"]["progress"], 0.5);
     assert_eq!(messages[0]["params"]["total"], 1.0);
     assert_eq!(messages[0]["params"]["message"], "Halfway done");

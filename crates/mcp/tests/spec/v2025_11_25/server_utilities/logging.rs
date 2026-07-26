@@ -12,7 +12,7 @@ struct LoggingServer {
 }
 
 impl LoggingServer {
-    fn new(seen_levels: Arc<Mutex<Vec<String>>>) -> Self {
+    const fn new(seen_levels: Arc<Mutex<Vec<String>>>) -> Self {
         Self { seen_levels }
     }
 }

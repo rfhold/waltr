@@ -1,3 +1,6 @@
+// Macro fixtures intentionally retain the owned and fallible handler signatures under test.
+#![allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+
 use std::net::SocketAddr;
 
 use mcp::{

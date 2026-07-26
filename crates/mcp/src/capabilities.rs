@@ -125,7 +125,7 @@ impl McpServerCapabilities {
                 .map(|elicitation| McpElicitationCapability {
                     form: elicitation
                         .as_object()
-                        .is_none_or(|object| object.is_empty())
+                        .is_none_or(serde_json::Map::is_empty)
                         || elicitation.get("form").is_some(),
                     url: elicitation.get("url").is_some(),
                     raw: elicitation.clone(),

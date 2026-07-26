@@ -1,3 +1,6 @@
+// Macro fixtures intentionally exercise owned and fallible completion handlers.
+#![allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+
 use std::sync::Arc;
 
 use mcp::server::{ServerContext, ServerResult};

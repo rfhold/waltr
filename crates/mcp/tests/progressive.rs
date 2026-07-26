@@ -1,5 +1,15 @@
 //! Integration tests for the exported `mcp::progressive_server` macro.
 
+// Fixtures intentionally exercise generated receiver, owned-input, and fallible handler shapes.
+#![allow(
+    clippy::literal_string_with_formatting_args,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unused_self,
+    clippy::useless_vec
+)]
+
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
