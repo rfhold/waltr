@@ -1,7 +1,15 @@
 /.dev
+**/.DS_Store
+**/*.key
+**/*.sqlite3*
+**/node_modules
+/.env*
+/.envrc
 /.git
+/.waltr
+/.npmrc
+/.worktrees
 /target
 /crates/waltr-web/dist
 /crates/waltr-web/generated
-/crates/waltr-web/node_modules
-/node_modules
+/tests/web/k6/snapshots
