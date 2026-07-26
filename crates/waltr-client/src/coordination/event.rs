@@ -2,10 +2,10 @@
 
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
-    AccessAttemptId, AuthStatus, AuthTarget, ClientError, Configuration, GenericAuthAttempt,
-    OperationKey, Provider, RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest,
-    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
-    SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
+    AccessAttemptId, AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientError,
+    Configuration, GenericAuthAttempt, OperationKey, Provider, RollbackTarget, RuntimeDefaults,
+    SessionRuntimeConfigRequest, SessionSummary, SessionTemplateKind, SessionTemplateOption,
+    SessionTemplateSearchTarget, SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -19,6 +19,8 @@ pub enum ClientEvent {
     Access(AccessEvent),
     /// Auth coordination event.
     Auth(AuthEvent),
+    /// Model catalog coordination event.
+    Catalog(CatalogEvent),
     /// Configuration coordination event.
     Config(ConfigEvent),
     /// Status coordination event.
@@ -27,6 +29,65 @@ pub enum ClientEvent {
     Session(SessionEvent),
     /// A model or tool stream coordination event.
     Stream(StreamEvent),
+}
+
+/// Model catalog coordination event applied to the reducer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CatalogEvent {
+    /// A caller requested a model catalog search.
+    ModelsSearchRequested {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Search query.
+        query: String,
+        /// Optional provider filter.
+        provider_id: Option<String>,
+        /// Maximum results.
+        limit: u32,
+    },
+    /// A model catalog search completed successfully.
+    ModelsSearched {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Matching models.
+        models: Vec<CatalogModelSummary>,
+        /// Whether cached data is stale.
+        stale: bool,
+    },
+    /// A model catalog search failed.
+    ModelsSearchFailed {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Search failure.
+        error: ClientError,
+    },
+    /// A caller requested catalog match suggestions.
+    MatchesSuggestRequested {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Configured provider key.
+        provider_key: String,
+        /// Configured model key.
+        model_key: String,
+        /// Maximum suggestions.
+        limit: u32,
+    },
+    /// Catalog match suggestions completed successfully.
+    MatchesSuggested {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Suggested matches.
+        matches: Vec<CatalogMatch>,
+        /// Whether cached data is stale.
+        stale: bool,
+    },
+    /// Catalog match suggestions failed.
+    MatchesSuggestFailed {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Suggestion failure.
+        error: ClientError,
+    },
 }
 
 /// Waltr access authentication facts applied to the reducer.
@@ -612,12 +673,41 @@ pub enum SessionEvent {
 pub enum ClientEffect {
     /// Auth side-effect intent.
     Auth(AuthEffect),
+    /// Model catalog side-effect intent.
+    Catalog(CatalogEffect),
     /// Configuration side-effect intent.
     Config(ConfigEffect),
     /// Status side-effect intent.
     Status(StatusEffect),
     /// Session side-effect intent.
     Session(SessionEffect),
+}
+
+/// Model catalog side-effect intent emitted by the client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogEffect {
+    /// Search model catalog entries.
+    SearchModels {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Search query.
+        query: String,
+        /// Optional provider filter.
+        provider_id: Option<String>,
+        /// Maximum results.
+        limit: u32,
+    },
+    /// Suggest catalog matches for a configured model.
+    SuggestMatches {
+        /// Runtime-local request identity.
+        request_id: String,
+        /// Configured provider key.
+        provider_key: String,
+        /// Configured model key.
+        model_key: String,
+        /// Maximum suggestions.
+        limit: u32,
+    },
 }
 
 /// Auth side-effect intent emitted by the client.

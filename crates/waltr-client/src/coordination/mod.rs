@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod catalog;
 pub mod config;
 pub mod event;
 pub mod runtime;

@@ -8,89 +8,6 @@ export type {
 
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 
-export type CatalogModelRef = {
-  providerId: string;
-  modelId: string;
-};
-
-export type CatalogModelSummary = {
-  model: CatalogModelRef | null;
-  providerName: string;
-  modelName: string;
-  family: string | null;
-  status: string | null;
-  limits: { context: number | null; output: number | null } | null;
-  cost: {
-    inputPerMillionTokens: number | null;
-    outputPerMillionTokens: number | null;
-    cacheReadPerMillionTokens: number | null;
-    cacheWritePerMillionTokens: number | null;
-    imageInputPerMillionTokens: number | null;
-    imageInputPerImage: number | null;
-    currency: string;
-  } | null;
-  capabilities: { tools: boolean; image: boolean; audio: boolean } | null;
-  reasoning: { supported: boolean; effort: string | null; efforts: string[] } | null;
-};
-
-export type CatalogMatch = {
-  model: CatalogModelRef | null;
-  providerName: string;
-  modelName: string;
-  confidence: "unspecified" | "exact" | "high" | "suggested" | "unknown";
-  reasons: string[];
-  upstreamModel: CatalogModelRef | null;
-};
-
-export type CatalogSearchRequest = {
-  query: string;
-  providerId?: string;
-  limit?: number;
-};
-
-export type CatalogSearchResponse = {
-  models: CatalogModelSummary[];
-  stale: boolean;
-};
-
-export type CatalogSuggestRequest = {
-  providerKey: string;
-  modelKey: string;
-  limit?: number;
-};
-
-export type CatalogSuggestResponse = {
-  matches: CatalogMatch[];
-  stale: boolean;
-};
-
-export type SessionTemplateKind = "file" | "tool" | "prompt" | "resource" | "unknown";
-export type SessionTemplateSearchTarget = "resources" | "prompts";
-
-export type SessionTemplateOption = {
-  kind: SessionTemplateKind;
-  label: string;
-  detail: string;
-  template: string;
-  metadata: unknown;
-};
-
-export type SessionTemplateSearchRequest = {
-  requestId: string;
-  sessionId: string;
-  query: string;
-  cursor?: number;
-  limit?: number;
-  kinds?: Array<"file" | "tool" | "prompt" | "resource">;
-  target?: SessionTemplateSearchTarget;
-};
-
-export type SessionTemplateSearchResponse = {
-  requestId: string;
-  options: SessionTemplateOption[];
-  error: string | null;
-};
-
 export type ClientSnapshotListener = (snapshot: ClientSnapshot) => void;
 
 export type WasmClient = {
@@ -99,9 +16,6 @@ export type WasmClient = {
   start: () => Promise<void>;
   subscribe: (listener: ClientSnapshotListener) => () => void;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
-  searchCatalogModels: (request: CatalogSearchRequest) => Promise<CatalogSearchResponse>;
-  suggestCatalogMatches: (request: CatalogSuggestRequest) => Promise<CatalogSuggestResponse>;
-  searchSessionTemplates: (request: SessionTemplateSearchRequest) => Promise<SessionTemplateSearchResponse>;
 };
 
 export type WasmClientLoader = () => Promise<WasmClient>;
@@ -146,21 +60,6 @@ export async function loadWasmClient(): Promise<WasmClient> {
     }
   };
 
-  const searchCatalogModels = async (request: CatalogSearchRequest) =>
-    JSON.parse(await (client as WaltrClient & {
-      searchCatalogModelsJson(requestJson: string): Promise<string>;
-    }).searchCatalogModelsJson(JSON.stringify(request))) as CatalogSearchResponse;
-
-  const suggestCatalogMatches = async (request: CatalogSuggestRequest) =>
-    JSON.parse(await (client as WaltrClient & {
-      suggestCatalogMatchesJson(requestJson: string): Promise<string>;
-    }).suggestCatalogMatchesJson(JSON.stringify(request))) as CatalogSuggestResponse;
-
-  const searchSessionTemplates = async (request: SessionTemplateSearchRequest) =>
-    JSON.parse(await (client as WaltrClient & {
-      searchSessionTemplatesJson(requestJson: string): Promise<string>;
-    }).searchSessionTemplatesJson(JSON.stringify(request))) as SessionTemplateSearchResponse;
-
   const start = async () => {
     if (started) {
       return;
@@ -190,8 +89,5 @@ export async function loadWasmClient(): Promise<WasmClient> {
       };
     },
     dispatch,
-    searchCatalogModels,
-    suggestCatalogMatches,
-    searchSessionTemplates,
   };
 }

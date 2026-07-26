@@ -12,12 +12,13 @@ mod wasm;
 
 pub use client::{Client, ClientUpdate};
 pub use coordination::event::{
-    AccessEvent, AuthEffect, AuthEvent, ClientEffect, ClientEvent, ConfigEffect, ConfigEvent,
-    ConfigPatch, ProviderEditBaseline, SessionEffect, SessionEvent, StatusEffect, StatusEvent,
-    StreamEvent, StreamId,
+    AccessEvent, AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientEvent,
+    ConfigEffect, ConfigEvent, ConfigPatch, ProviderEditBaseline, SessionEffect, SessionEvent,
+    StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
-    AccessSnapshot, AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot, ClientAuthTarget,
+    AccessSnapshot, AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot,
+    CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot, CatalogSnapshot, ClientAuthTarget,
     ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime,
     ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
@@ -26,9 +27,10 @@ pub use coordination::runtime::{
 };
 pub use coordination::state::{
     AccessAttemptId, AccessClientState, AccessStatus, AuthAttemptState, AuthClientState,
-    AuthRequirement, ClientOperationState, ClientState, ConfigClientState, OperationKey,
-    OperationState, OperationStatus, SessionClientState, SessionTemplateSearchState,
-    StatusClientState, StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
+    AuthRequirement, CatalogClientState, CatalogMatchSuggestionState, CatalogModelSearchState,
+    ClientOperationState, ClientState, ConfigClientState, OperationKey, OperationState,
+    OperationStatus, SessionClientState, SessionTemplateSearchState, StatusClientState,
+    StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
     watch_reconnect_delay_ms,
 };
 pub use error::{ClientError, ClientErrorKind};
@@ -69,12 +71,26 @@ pub use transport::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
 pub use view::{
-    CatalogMatchSourceView, ConfigView, ExternalRequestView, McpServerTypeView, McpServerView,
-    ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
-    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    CatalogMatchConfidenceView, CatalogMatchSourceView, CatalogMatchView,
+    CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
+    CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSummaryView, ConfigView,
+    ExternalRequestView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
+    ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView, ModelTypeView,
+    ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
     RuntimeConfigMatchView, RuntimeDefaultsView, SessionMcpServerRuntimeView, SessionMetricsView,
     SessionPhaseView, SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView,
     SessionTimelineView, SessionView, TimelineContentView, TimelineEventKindView,
     TimelineEventView, TimelineStatusView, TimestampView,
 };
+
+#[cfg(test)]
+mod direct_transport_tests {
+    #[test]
+    fn wasm_binding_does_not_reference_a_direct_default_transport() {
+        let source = include_str!("wasm.rs");
+        let forbidden = concat!("Default", "GrpcTransport");
+
+        assert!(!source.contains(forbidden));
+    }
+}

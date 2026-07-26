@@ -19,12 +19,13 @@ use crate::executor::{
 };
 use crate::transport::SessionTimelineWatchUpdate;
 use crate::{
-    AccessAttemptId, AccessStatus, AuthAttemptState, AuthRequirement, AuthTarget, Client,
-    ClientEffect, ClientError, ClientEvent, ClientOperationState, ClientUpdate, ConfigEffect,
-    ConfigEvent, ConfigView, GrpcEffectExecutor, McpServerView, OperationKey, OperationStatus,
-    ProviderView, RollbackTarget, RuntimeDefaultsView, SessionEffect, SessionEvent,
-    SessionRuntimeConfigRequest, SessionTemplateKind, SessionTemplateOption, SessionTimelineView,
-    SessionView, StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
+    AccessAttemptId, AccessStatus, AuthAttemptState, AuthRequirement, AuthTarget, CatalogEffect,
+    CatalogMatchView, CatalogModelSummaryView, Client, ClientEffect, ClientError, ClientEvent,
+    ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
+    McpServerView, OperationKey, OperationStatus, ProviderView, RollbackTarget,
+    RuntimeDefaultsView, SessionEffect, SessionEvent, SessionRuntimeConfigRequest,
+    SessionTemplateKind, SessionTemplateOption, SessionTimelineView, SessionView,
+    StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
     TimelineWatchKey, rollback_target,
 };
 
@@ -100,6 +101,33 @@ pub enum ClientCommand {
     },
     /// Load the current configuration.
     RequestConfig,
+    /// Search the model catalog.
+    SearchCatalogModels {
+        /// Runtime-local request identity.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Search query.
+        query: String,
+        /// Optional provider filter.
+        #[serde(rename = "providerId")]
+        provider_id: Option<String>,
+        /// Maximum results.
+        limit: u32,
+    },
+    /// Suggest model catalog matches.
+    SuggestCatalogMatches {
+        /// Runtime-local request identity.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Configured provider key.
+        #[serde(rename = "providerKey")]
+        provider_key: String,
+        /// Configured model key.
+        #[serde(rename = "modelKey")]
+        model_key: String,
+        /// Maximum suggestions.
+        limit: u32,
+    },
     /// Add a provider to the latest configuration.
     AddProvider {
         /// Provider to add.
@@ -352,6 +380,8 @@ pub struct ClientSnapshot {
     pub access: AccessSnapshot,
     /// Auth coordination snapshot.
     pub auth: AuthSnapshot,
+    /// Model catalog coordination snapshot.
+    pub catalog: CatalogSnapshot,
     /// Command operation result snapshots.
     pub operations: OperationCollectionSnapshot,
     /// Configuration coordination snapshot.
@@ -360,6 +390,52 @@ pub struct ClientSnapshot {
     pub status: StatusSnapshot,
     /// Session coordination snapshot.
     pub sessions: SessionSnapshot,
+}
+
+/// Stable model catalog coordination snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSnapshot {
+    /// Latest model search.
+    pub search: CatalogModelSearchSnapshot,
+    /// Latest match suggestions.
+    pub suggestions: CatalogMatchSuggestionSnapshot,
+}
+
+/// Stable latest model catalog search snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogModelSearchSnapshot {
+    /// Runtime-local request identity.
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    /// Search query.
+    pub query: String,
+    /// Stable operation status name.
+    pub status: &'static str,
+    /// Last search error.
+    pub error: Option<String>,
+    /// Whether cached data is stale.
+    pub stale: bool,
+    /// Matching models.
+    pub models: Vec<CatalogModelSummaryView>,
+}
+
+/// Stable latest catalog match suggestion snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogMatchSuggestionSnapshot {
+    /// Runtime-local request identity.
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    /// Stable operation status name.
+    pub status: &'static str,
+    /// Last suggestion error.
+    pub error: Option<String>,
+    /// Whether cached data is stale.
+    pub stale: bool,
+    /// Suggested matches.
+    pub matches: Vec<CatalogMatchView>,
 }
 
 /// Stable Waltr access authentication snapshot.
@@ -1273,6 +1349,8 @@ impl ClientStateStream {
             | ClientCommand::SetRuntimeDefaults { .. }
             | ClientCommand::RegisterConfigWatchInterest
             | ClientCommand::ReleaseConfigWatchInterest => self.begin_config_command(command)?,
+            ClientCommand::SearchCatalogModels { .. }
+            | ClientCommand::SuggestCatalogMatches { .. } => self.begin_catalog_command(command),
             ClientCommand::CreateSession
             | ClientCommand::DeleteSession { .. }
             | ClientCommand::UpdateSessionRuntimeConfig { .. }
@@ -1387,6 +1465,47 @@ impl ClientStateStream {
         })
     }
 
+    fn begin_catalog_command(&mut self, command: ClientCommand) -> ClientUpdate {
+        match command {
+            ClientCommand::SearchCatalogModels {
+                request_id,
+                query,
+                provider_id,
+                limit,
+            } => {
+                self.cancel_effects(|effect| {
+                    matches!(
+                        effect,
+                        ClientEffect::Catalog(CatalogEffect::SearchModels { .. })
+                    )
+                });
+                self.runtime
+                    .reducer
+                    .search_catalog_models(request_id, query, provider_id, limit)
+            }
+            ClientCommand::SuggestCatalogMatches {
+                request_id,
+                provider_key,
+                model_key,
+                limit,
+            } => {
+                self.cancel_effects(|effect| {
+                    matches!(
+                        effect,
+                        ClientEffect::Catalog(CatalogEffect::SuggestMatches { .. })
+                    )
+                });
+                self.runtime.reducer.suggest_catalog_matches(
+                    request_id,
+                    provider_key,
+                    model_key,
+                    limit,
+                )
+            }
+            _ => unreachable!("non-catalog command routed to catalog handler"),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn begin_session_command(&mut self, command: ClientCommand) -> ClientUpdate {
         match command {
@@ -1415,9 +1534,20 @@ impl ClientStateStream {
                 kinds,
                 target,
                 cursor,
-            } => self.runtime.reducer.search_session_templates(
-                request_id, session_id, query, limit, kinds, target, cursor,
-            ),
+            } => {
+                self.cancel_effects(|effect| {
+                    matches!(
+                        effect,
+                        ClientEffect::Session(SessionEffect::SearchTemplates {
+                            session_id: pending_session_id,
+                            ..
+                        }) if pending_session_id == &session_id
+                    )
+                });
+                self.runtime.reducer.search_session_templates(
+                    request_id, session_id, query, limit, kinds, target, cursor,
+                )
+            }
             ClientCommand::RegisterSessionWatchInterest => {
                 self.runtime.reducer.register_session_watch_interest()
             }
@@ -1869,6 +1999,37 @@ impl ClientSnapshot {
                 cancel: OperationSnapshot::from_state(&state.auth.cancel),
                 logout: OperationSnapshot::from_state(&state.auth.logout),
             },
+            catalog: CatalogSnapshot {
+                search: CatalogModelSearchSnapshot {
+                    request_id: state.catalog.search.request_id.clone(),
+                    query: state.catalog.search.query.clone(),
+                    status: operation_status_name(state.catalog.search.status),
+                    error: state.catalog.search.error.clone(),
+                    stale: state.catalog.search.stale,
+                    models: state
+                        .catalog
+                        .search
+                        .models
+                        .iter()
+                        .cloned()
+                        .map(Into::into)
+                        .collect(),
+                },
+                suggestions: CatalogMatchSuggestionSnapshot {
+                    request_id: state.catalog.suggestions.request_id.clone(),
+                    status: operation_status_name(state.catalog.suggestions.status),
+                    error: state.catalog.suggestions.error.clone(),
+                    stale: state.catalog.suggestions.stale,
+                    matches: state
+                        .catalog
+                        .suggestions
+                        .matches
+                        .iter()
+                        .cloned()
+                        .map(Into::into)
+                        .collect(),
+                },
+            },
             operations: OperationCollectionSnapshot {
                 current: state
                     .operations
@@ -2202,6 +2363,40 @@ mod tests {
     use crate::transport::{
         ConfigWatchUpdate, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
     };
+
+    #[test]
+    fn snapshot_exposes_latest_catalog_operations() {
+        let mut client = Client::new();
+        client.search_catalog_models("search-1", "sonnet", None, 10);
+        client.apply(ClientEvent::Catalog(crate::CatalogEvent::ModelsSearched {
+            request_id: "search-1".to_owned(),
+            models: vec![crate::CatalogModelSummary {
+                model: Some(crate::CatalogModelRef {
+                    provider_id: "anthropic".to_owned(),
+                    model_id: "claude-sonnet".to_owned(),
+                }),
+                model_name: "Claude Sonnet".to_owned(),
+                ..crate::CatalogModelSummary::default()
+            }],
+            stale: true,
+        }));
+        client.suggest_catalog_matches("suggest-1", "claude", "sonnet", 5);
+
+        let snapshot = ClientSnapshot::from_client(&client);
+
+        assert_eq!(snapshot.catalog.search.request_id, "search-1");
+        assert_eq!(snapshot.catalog.search.status, "ready");
+        assert!(snapshot.catalog.search.stale);
+        assert_eq!(
+            snapshot.catalog.search.models[0]
+                .model
+                .as_ref()
+                .map(|model| model.model_id.as_str()),
+            Some("claude-sonnet")
+        );
+        assert_eq!(snapshot.catalog.suggestions.request_id, "suggest-1");
+        assert_eq!(snapshot.catalog.suggestions.status, "loading");
+    }
 
     #[tokio::test]
     async fn state_stream_yields_status_loading_before_transport_work() {
@@ -2671,6 +2866,93 @@ mod tests {
             .await
             .expect("preserved effect should complete");
         assert!(stream.in_flight.is_none());
+    }
+
+    #[test]
+    fn newer_catalog_search_cancels_the_superseded_effect() {
+        let mut stream = ready_state_stream();
+        stream
+            .begin_command(ClientCommand::SearchCatalogModels {
+                request_id: "catalog-old".to_owned(),
+                query: "old".to_owned(),
+                provider_id: None,
+                limit: 10,
+            })
+            .expect("old search should start");
+        let old = stream.effects.pop().expect("old search should queue");
+        let (in_flight, _started, release) =
+            controlled_in_flight(old, ExecutedEffect::Events(Vec::new()));
+        stream.in_flight = Some(in_flight);
+
+        stream
+            .begin_command(ClientCommand::SearchCatalogModels {
+                request_id: "catalog-new".to_owned(),
+                query: "new".to_owned(),
+                provider_id: None,
+                limit: 10,
+            })
+            .expect("new search should start");
+
+        assert!(release.send(()).is_err(), "old search should be canceled");
+        assert!(stream.in_flight.is_none());
+        let [
+            QueuedEffect {
+                effect:
+                    ClientEffect::Catalog(CatalogEffect::SearchModels {
+                        request_id, query, ..
+                    }),
+                ..
+            },
+        ] = stream.effects.as_slice()
+        else {
+            panic!("only the new catalog search should remain");
+        };
+        assert_eq!(request_id, "catalog-new");
+        assert_eq!(query, "new");
+    }
+
+    #[test]
+    fn template_search_supersession_is_keyed_by_session() {
+        let mut stream = ready_state_stream();
+        for (request_id, session_id) in [("a-old", "session-a"), ("b", "session-b")] {
+            stream
+                .begin_command(ClientCommand::SearchSessionTemplates {
+                    request_id: request_id.to_owned(),
+                    session_id: session_id.to_owned(),
+                    query: request_id.to_owned(),
+                    limit: 10,
+                    kinds: Vec::new(),
+                    target: ClientSessionTemplateSearchTarget::Resources,
+                    cursor: None,
+                })
+                .expect("template search should start");
+        }
+
+        stream
+            .begin_command(ClientCommand::SearchSessionTemplates {
+                request_id: "a-new".to_owned(),
+                session_id: "session-a".to_owned(),
+                query: "new".to_owned(),
+                limit: 10,
+                kinds: Vec::new(),
+                target: ClientSessionTemplateSearchTarget::Resources,
+                cursor: None,
+            })
+            .expect("replacement search should start");
+
+        let searches = stream
+            .effects
+            .iter()
+            .filter_map(|queued| match &queued.effect {
+                ClientEffect::Session(SessionEffect::SearchTemplates {
+                    request_id,
+                    session_id,
+                    ..
+                }) => Some((request_id.as_str(), session_id.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(searches, vec![("b", "session-b"), ("a-new", "session-a")]);
     }
 
     #[tokio::test]

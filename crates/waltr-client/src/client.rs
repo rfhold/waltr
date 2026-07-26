@@ -1,10 +1,10 @@
 //! Shell-neutral client reducer.
 
-use crate::coordination::{access, auth, config, session, status, stream};
+use crate::coordination::{access, auth, catalog, config, session, status, stream};
 use crate::{
-    AccessAttemptId, AccessEvent, AuthEvent, AuthTarget, ClientEffect, ClientError, ClientEvent,
-    ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientState, ConfigEffect,
-    ConfigEvent, ConfigPatch, Configuration, McpServer, OperationKey, Provider,
+    AccessAttemptId, AccessEvent, AuthEvent, AuthTarget, CatalogEvent, ClientEffect, ClientError,
+    ClientEvent, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientState,
+    ConfigEffect, ConfigEvent, ConfigPatch, Configuration, McpServer, OperationKey, Provider,
     ProviderEditBaseline, RuntimeDefaults, SessionEvent, SessionRuntimeConfigRequest, StatusEvent,
     TimelineQuery,
 };
@@ -64,6 +64,7 @@ impl Client {
         match event {
             ClientEvent::Access(event) => access::reduce(&mut self.state, event),
             ClientEvent::Auth(event) => auth::reduce(&mut self.state, event),
+            ClientEvent::Catalog(event) => catalog::reduce(&mut self.state, event),
             ClientEvent::Config(event) => config::reduce(&mut self.state, event),
             ClientEvent::Status(event) => status::reduce(&mut self.state, event),
             ClientEvent::Session(event) => session::reduce(&mut self.state, event),
@@ -190,6 +191,40 @@ impl Client {
     /// Request that the current configuration be loaded.
     pub fn request_config(&mut self) -> ClientUpdate {
         self.apply(ClientEvent::Config(ConfigEvent::LoadRequested))
+    }
+
+    /// Request a model catalog search.
+    pub fn search_catalog_models(
+        &mut self,
+        request_id: impl Into<String>,
+        query: impl Into<String>,
+        provider_id: Option<String>,
+        limit: u32,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Catalog(CatalogEvent::ModelsSearchRequested {
+            request_id: request_id.into(),
+            query: query.into(),
+            provider_id,
+            limit,
+        }))
+    }
+
+    /// Request catalog match suggestions for a configured model.
+    pub fn suggest_catalog_matches(
+        &mut self,
+        request_id: impl Into<String>,
+        provider_key: impl Into<String>,
+        model_key: impl Into<String>,
+        limit: u32,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Catalog(
+            CatalogEvent::MatchesSuggestRequested {
+                request_id: request_id.into(),
+                provider_key: provider_key.into(),
+                model_key: model_key.into(),
+                limit,
+            },
+        ))
     }
 
     /// Request that configuration changes be watched.
@@ -922,6 +957,14 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             AuthEvent::LoggedOut { operation_key, .. }
             | AuthEvent::LogoutFailed { operation_key, .. },
         ) => operation_is_current(state.auth.logout.key.as_ref(), operation_key),
+        ClientEvent::Catalog(
+            CatalogEvent::ModelsSearched { request_id, .. }
+            | CatalogEvent::ModelsSearchFailed { request_id, .. },
+        ) => state.catalog.search.request_id == *request_id,
+        ClientEvent::Catalog(
+            CatalogEvent::MatchesSuggested { request_id, .. }
+            | CatalogEvent::MatchesSuggestFailed { request_id, .. },
+        ) => state.catalog.suggestions.request_id == *request_id,
         ClientEvent::Config(
             ConfigEvent::Patched { operation_key, .. }
             | ConfigEvent::PatchFailed { operation_key, .. },
@@ -1017,6 +1060,10 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
             | AuthEvent::CompleteFailed { error, .. }
             | AuthEvent::CancelFailed { error, .. }
             | AuthEvent::LogoutFailed { error, .. },
+        )
+        | ClientEvent::Catalog(
+            CatalogEvent::ModelsSearchFailed { error, .. }
+            | CatalogEvent::MatchesSuggestFailed { error, .. },
         )
         | ClientEvent::Config(
             ConfigEvent::LoadFailed(error)
@@ -1138,9 +1185,10 @@ mod tests {
 
     use crate::transport::{SessionTimelineWatchEvent, SessionTimelineWatchUpdate};
     use crate::{
-        AccessStatus, ConfigWatchUpdate, OperationStatus, SessionEffect, SessionSummary,
-        SessionTemplateKind, SessionTemplateOption, SessionWatchEvent, SessionWatchUpdate,
-        StatusEffect, StreamEvent, StreamStatus, SystemStatus, TimelineEvent,
+        AccessStatus, CatalogEffect, CatalogEvent, CatalogMatch, CatalogMatchConfidence,
+        CatalogModelRef, CatalogModelSummary, ConfigWatchUpdate, OperationStatus, SessionEffect,
+        SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionWatchEvent,
+        SessionWatchUpdate, StatusEffect, StreamEvent, StreamStatus, SystemStatus, TimelineEvent,
         watch_reconnect_delay_ms,
     };
 
@@ -1988,6 +2036,130 @@ mod tests {
                 target: crate::SessionTemplateSearchTarget::Resources,
                 cursor: Some(3),
             })]
+        );
+    }
+
+    #[test]
+    fn catalog_search_and_suggestion_transition_through_success_and_failure() {
+        let mut client = Client::new();
+
+        let search = client.search_catalog_models(
+            "catalog-search-1",
+            "sonnet",
+            Some("anthropic".to_owned()),
+            10,
+        );
+        assert_eq!(
+            client.state().catalog.search.status,
+            OperationStatus::Loading
+        );
+        assert_eq!(client.state().catalog.search.query, "sonnet");
+        assert_eq!(
+            search.effects(),
+            &[ClientEffect::Catalog(CatalogEffect::SearchModels {
+                request_id: "catalog-search-1".to_owned(),
+                query: "sonnet".to_owned(),
+                provider_id: Some("anthropic".to_owned()),
+                limit: 10,
+            })]
+        );
+
+        client.apply(ClientEvent::Catalog(CatalogEvent::ModelsSearched {
+            request_id: "catalog-search-1".to_owned(),
+            models: vec![catalog_model("anthropic", "claude-sonnet")],
+            stale: true,
+        }));
+        assert_eq!(client.state().catalog.search.status, OperationStatus::Ready);
+        assert!(client.state().catalog.search.stale);
+        assert_eq!(client.state().catalog.search.models.len(), 1);
+
+        let suggestions =
+            client.suggest_catalog_matches("catalog-suggest-1", "claude", "sonnet", 5);
+        assert_eq!(
+            suggestions.effects(),
+            &[ClientEffect::Catalog(CatalogEffect::SuggestMatches {
+                request_id: "catalog-suggest-1".to_owned(),
+                provider_key: "claude".to_owned(),
+                model_key: "sonnet".to_owned(),
+                limit: 5,
+            })]
+        );
+        client.apply(ClientEvent::Catalog(CatalogEvent::MatchesSuggested {
+            request_id: "catalog-suggest-1".to_owned(),
+            matches: vec![catalog_match("anthropic", "claude-sonnet")],
+            stale: false,
+        }));
+        assert_eq!(
+            client.state().catalog.suggestions.status,
+            OperationStatus::Ready
+        );
+        assert_eq!(client.state().catalog.suggestions.matches.len(), 1);
+
+        client.suggest_catalog_matches("catalog-suggest-2", "claude", "opus", 5);
+        client.apply(ClientEvent::Catalog(CatalogEvent::MatchesSuggestFailed {
+            request_id: "catalog-suggest-2".to_owned(),
+            error: ClientError::new("suggest failed"),
+        }));
+        assert_eq!(
+            client.state().catalog.suggestions.status,
+            OperationStatus::Failed
+        );
+        assert_eq!(
+            client.state().catalog.suggestions.error.as_deref(),
+            Some("suggest failed")
+        );
+    }
+
+    #[test]
+    fn catalog_ignores_stale_request_and_access_generation_results() {
+        let mut client = Client::new();
+        client.search_catalog_models("catalog-search-1", "old", None, 10);
+        client.search_catalog_models("catalog-search-2", "new", None, 10);
+
+        client.apply(ClientEvent::Catalog(CatalogEvent::ModelsSearched {
+            request_id: "catalog-search-1".to_owned(),
+            models: vec![catalog_model("old", "old")],
+            stale: false,
+        }));
+        assert_eq!(
+            client.state().catalog.search.status,
+            OperationStatus::Loading
+        );
+        assert_eq!(client.state().catalog.search.request_id, "catalog-search-2");
+        assert!(client.state().catalog.search.models.is_empty());
+
+        let generation = client.state().access_generation;
+        client.logout_waltr();
+        client.apply_for_access_generation(
+            generation,
+            ClientEvent::Catalog(CatalogEvent::ModelsSearched {
+                request_id: "catalog-search-2".to_owned(),
+                models: vec![catalog_model("stale", "stale")],
+                stale: false,
+            }),
+        );
+        assert!(client.state().catalog.search.models.is_empty());
+        assert_eq!(client.state().catalog.search.status, OperationStatus::Idle);
+    }
+
+    #[test]
+    fn current_catalog_unauthenticated_failure_requires_waltr_login() {
+        let mut client = Client::new();
+        client.suggest_catalog_matches("catalog-suggest-1", "claude", "sonnet", 5);
+
+        client.apply(ClientEvent::Catalog(CatalogEvent::MatchesSuggestFailed {
+            request_id: "catalog-suggest-1".to_owned(),
+            error: ClientError::waltr_login_required("login required"),
+        }));
+
+        assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
+        assert_eq!(
+            client.state().access.error.as_deref(),
+            Some("login required")
+        );
+        assert_eq!(
+            client.state().catalog.suggestions.status,
+            OperationStatus::Idle
         );
     }
 
@@ -2892,5 +3064,28 @@ mod tests {
             .collect();
         names.sort_unstable();
         names
+    }
+
+    fn catalog_model(provider_id: &str, model_id: &str) -> CatalogModelSummary {
+        CatalogModelSummary {
+            model: Some(CatalogModelRef {
+                provider_id: provider_id.to_owned(),
+                model_id: model_id.to_owned(),
+            }),
+            provider_name: provider_id.to_owned(),
+            model_name: model_id.to_owned(),
+            ..CatalogModelSummary::default()
+        }
+    }
+
+    fn catalog_match(provider_id: &str, model_id: &str) -> CatalogMatch {
+        CatalogMatch {
+            model: Some(CatalogModelRef {
+                provider_id: provider_id.to_owned(),
+                model_id: model_id.to_owned(),
+            }),
+            confidence: CatalogMatchConfidence::High as i32,
+            ..CatalogMatch::default()
+        }
     }
 }

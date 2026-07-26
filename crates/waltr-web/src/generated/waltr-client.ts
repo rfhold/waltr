@@ -302,6 +302,208 @@ mcpServers: { [key in string]?: McpServerView },
  */
 runtimeDefaults: RuntimeDefaultsView | null, };
 
+export type CatalogModelRefView = { 
+/**
+ * Catalog provider identity.
+ */
+providerId: string, 
+/**
+ * Catalog model identity.
+ */
+modelId: string, };
+
+export type CatalogModelLimitsSummaryView = { 
+/**
+ * Maximum context tokens.
+ */
+context: number | null, 
+/**
+ * Maximum output tokens.
+ */
+output: number | null, };
+
+export type CatalogModelCostSummaryView = { 
+/**
+ * Input cost per million tokens.
+ */
+inputPerMillionTokens: number | null, 
+/**
+ * Output cost per million tokens.
+ */
+outputPerMillionTokens: number | null, 
+/**
+ * Cache-read cost per million tokens.
+ */
+cacheReadPerMillionTokens: number | null, 
+/**
+ * Cache-write cost per million tokens.
+ */
+cacheWritePerMillionTokens: number | null, 
+/**
+ * Image-input cost per million tokens.
+ */
+imageInputPerMillionTokens: number | null, 
+/**
+ * Image-input cost per image.
+ */
+imageInputPerImage: number | null, 
+/**
+ * Cost currency.
+ */
+currency: string, };
+
+export type CatalogModelCapabilitySummaryView = { 
+/**
+ * Whether tools are supported.
+ */
+tools: boolean, 
+/**
+ * Whether image input is supported.
+ */
+image: boolean, 
+/**
+ * Whether audio input is supported.
+ */
+audio: boolean, };
+
+export type CatalogModelReasoningSummaryView = { 
+/**
+ * Whether reasoning is supported.
+ */
+supported: boolean, 
+/**
+ * Default reasoning effort.
+ */
+effort: string | null, 
+/**
+ * Available reasoning efforts.
+ */
+efforts: Array<string>, };
+
+export type CatalogModelSummaryView = { 
+/**
+ * Catalog model identity.
+ */
+model: CatalogModelRefView | null, 
+/**
+ * Provider display name.
+ */
+providerName: string, 
+/**
+ * Model display name.
+ */
+modelName: string, 
+/**
+ * Model family.
+ */
+family: string | null, 
+/**
+ * Catalog lifecycle status.
+ */
+status: string | null, 
+/**
+ * Token limits.
+ */
+limits: CatalogModelLimitsSummaryView | null, 
+/**
+ * Token and image costs.
+ */
+cost: CatalogModelCostSummaryView | null, 
+/**
+ * Input and tool capabilities.
+ */
+capabilities: CatalogModelCapabilitySummaryView | null, 
+/**
+ * Reasoning support.
+ */
+reasoning: CatalogModelReasoningSummaryView | null, };
+
+export type CatalogMatchConfidenceView = "unspecified" | "exact" | "high" | "suggested" | "unknown";
+
+export type CatalogMatchView = { 
+/**
+ * Matched catalog model.
+ */
+model: CatalogModelRefView | null, 
+/**
+ * Provider display name.
+ */
+providerName: string, 
+/**
+ * Model display name.
+ */
+modelName: string, 
+/**
+ * Match confidence.
+ */
+confidence: CatalogMatchConfidenceView, 
+/**
+ * Human-readable match reasons.
+ */
+reasons: Array<string>, 
+/**
+ * Upstream model identity when a gateway model was matched.
+ */
+upstreamModel: CatalogModelRefView | null, };
+
+export type CatalogModelSearchSnapshot = { 
+/**
+ * Runtime-local request identity.
+ */
+requestId: string, 
+/**
+ * Search query.
+ */
+query: string, 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last search error.
+ */
+error: string | null, 
+/**
+ * Whether cached data is stale.
+ */
+stale: boolean, 
+/**
+ * Matching models.
+ */
+models: Array<CatalogModelSummaryView>, };
+
+export type CatalogMatchSuggestionSnapshot = { 
+/**
+ * Runtime-local request identity.
+ */
+requestId: string, 
+/**
+ * Stable operation status name.
+ */
+status: string, 
+/**
+ * Last suggestion error.
+ */
+error: string | null, 
+/**
+ * Whether cached data is stale.
+ */
+stale: boolean, 
+/**
+ * Suggested matches.
+ */
+matches: Array<CatalogMatchView>, };
+
+export type CatalogSnapshot = { 
+/**
+ * Latest model search.
+ */
+search: CatalogModelSearchSnapshot, 
+/**
+ * Latest match suggestions.
+ */
+suggestions: CatalogMatchSuggestionSnapshot, };
+
 export type TimestampView = { 
 /**
  * Seconds since the Unix epoch.
@@ -968,6 +1170,10 @@ access: AccessSnapshot,
  */
 auth: AuthSnapshot, 
 /**
+ * Model catalog coordination snapshot.
+ */
+catalog: CatalogSnapshot, 
+/**
  * Command operation result snapshots.
  */
 operations: OperationCollectionSnapshot, 
@@ -1034,7 +1240,39 @@ attemptId: string, } | { "type": "logoutAuth",
 /**
  * Target to log out.
  */
-target: ClientAuthTarget, } | { "type": "requestConfig" } | { "type": "addProvider", 
+target: ClientAuthTarget, } | { "type": "requestConfig" } | { "type": "searchCatalogModels", 
+/**
+ * Runtime-local request identity.
+ */
+requestId: string, 
+/**
+ * Search query.
+ */
+query: string, 
+/**
+ * Optional provider filter.
+ */
+providerId: string | null, 
+/**
+ * Maximum results.
+ */
+limit: number, } | { "type": "suggestCatalogMatches", 
+/**
+ * Runtime-local request identity.
+ */
+requestId: string, 
+/**
+ * Configured provider key.
+ */
+providerKey: string, 
+/**
+ * Configured model key.
+ */
+modelKey: string, 
+/**
+ * Maximum suggestions.
+ */
+limit: number, } | { "type": "addProvider", 
 /**
  * Provider to add.
  */

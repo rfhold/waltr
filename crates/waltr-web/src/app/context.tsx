@@ -6,12 +6,6 @@ import {
 } from "solid-js";
 
 import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
-import type {
-  CatalogSearchRequest,
-  CatalogSearchResponse,
-  CatalogSuggestRequest,
-  CatalogSuggestResponse,
-} from "../wasm/client";
 
 export type AppPhase = "splash" | "ready";
 
@@ -25,8 +19,6 @@ export type AppState = {
   systemReady: Accessor<boolean>;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispatchConfigPatch: (command: ClientCommand) => Promise<ClientSnapshot>;
-  searchCatalogModels: (request: CatalogSearchRequest) => Promise<CatalogSearchResponse>;
-  suggestCatalogMatches: (request: CatalogSuggestRequest) => Promise<CatalogSuggestResponse>;
   dispatchCreateSession: () => Promise<ClientSnapshot>;
   dispatchDeleteSession: (id: string) => Promise<ClientSnapshot>;
   dispatchUpdateSessionRuntimeConfig: (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => Promise<ClientSnapshot>;

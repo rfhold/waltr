@@ -7,8 +7,8 @@ use ts_rs::TS;
 
 use crate::transport::SessionTimelineWatchEvent;
 use crate::{
-    AuthStatus, AuthTarget, Configuration, GenericAuthAttempt, RollbackTarget, SessionSummary,
-    SessionTemplateOption, StreamId, SystemStatus, TimelineEvent,
+    AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, Configuration, GenericAuthAttempt,
+    RollbackTarget, SessionSummary, SessionTemplateOption, StreamId, SystemStatus, TimelineEvent,
 };
 
 /// Runtime-local operation identifier used by shells to track command results.
@@ -74,6 +74,8 @@ pub struct ClientState {
     pub access: AccessClientState,
     /// Auth coordination state.
     pub auth: AuthClientState,
+    /// Model catalog coordination state.
+    pub catalog: CatalogClientState,
     /// Configuration coordination state.
     pub config: ConfigClientState,
     /// System status coordination state.
@@ -88,6 +90,47 @@ pub struct ClientState {
     next_status_watch_epoch: u64,
     next_watch_open_id: u64,
     next_operation_id: u64,
+}
+
+/// Model catalog coordination state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CatalogClientState {
+    /// Latest model search operation.
+    pub search: CatalogModelSearchState,
+    /// Latest match suggestion operation.
+    pub suggestions: CatalogMatchSuggestionState,
+}
+
+/// Latest model catalog search state.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CatalogModelSearchState {
+    /// Runtime-local request identity.
+    pub request_id: String,
+    /// Search query.
+    pub query: String,
+    /// Current operation status.
+    pub status: OperationStatus,
+    /// Last search error.
+    pub error: Option<String>,
+    /// Whether cached data is stale.
+    pub stale: bool,
+    /// Matching models.
+    pub models: Vec<CatalogModelSummary>,
+}
+
+/// Latest catalog match suggestion state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatalogMatchSuggestionState {
+    /// Runtime-local request identity.
+    pub request_id: String,
+    /// Current operation status.
+    pub status: OperationStatus,
+    /// Last suggestion error.
+    pub error: Option<String>,
+    /// Whether cached data is stale.
+    pub stale: bool,
+    /// Suggested matches.
+    pub matches: Vec<CatalogMatch>,
 }
 
 /// Waltr access authentication state, independent from provider credentials.
@@ -647,6 +690,7 @@ impl ClientState {
         }
 
         self.config = ConfigClientState::default();
+        self.catalog = CatalogClientState::default();
         self.auth = AuthClientState {
             pending: auth_pending,
             ..AuthClientState::default()
@@ -737,6 +781,77 @@ impl ClientState {
     pub(crate) fn set_config_load_loading(&mut self) {
         self.config.load.status = OperationStatus::Loading;
         self.config.load.error = None;
+    }
+
+    pub(crate) fn set_catalog_model_search_loading(&mut self, request_id: String, query: String) {
+        self.catalog.search = CatalogModelSearchState {
+            request_id,
+            query,
+            status: OperationStatus::Loading,
+            ..CatalogModelSearchState::default()
+        };
+    }
+
+    pub(crate) fn set_catalog_model_search_ready(
+        &mut self,
+        request_id: &str,
+        models: Vec<CatalogModelSummary>,
+        stale: bool,
+    ) {
+        if self.catalog.search.request_id != request_id {
+            return;
+        }
+        self.catalog.search.status = OperationStatus::Ready;
+        self.catalog.search.error = None;
+        self.catalog.search.stale = stale;
+        self.catalog.search.models = models;
+    }
+
+    pub(crate) fn set_catalog_model_search_failed(&mut self, request_id: &str, message: String) {
+        if self.catalog.search.request_id != request_id {
+            return;
+        }
+        self.catalog.search.status = OperationStatus::Failed;
+        self.catalog.search.error = Some(message);
+        self.catalog.search.stale = false;
+        self.catalog.search.models.clear();
+    }
+
+    pub(crate) fn set_catalog_match_suggestion_loading(&mut self, request_id: String) {
+        self.catalog.suggestions = CatalogMatchSuggestionState {
+            request_id,
+            status: OperationStatus::Loading,
+            ..CatalogMatchSuggestionState::default()
+        };
+    }
+
+    pub(crate) fn set_catalog_match_suggestion_ready(
+        &mut self,
+        request_id: &str,
+        matches: Vec<CatalogMatch>,
+        stale: bool,
+    ) {
+        if self.catalog.suggestions.request_id != request_id {
+            return;
+        }
+        self.catalog.suggestions.status = OperationStatus::Ready;
+        self.catalog.suggestions.error = None;
+        self.catalog.suggestions.stale = stale;
+        self.catalog.suggestions.matches = matches;
+    }
+
+    pub(crate) fn set_catalog_match_suggestion_failed(
+        &mut self,
+        request_id: &str,
+        message: String,
+    ) {
+        if self.catalog.suggestions.request_id != request_id {
+            return;
+        }
+        self.catalog.suggestions.status = OperationStatus::Failed;
+        self.catalog.suggestions.error = Some(message);
+        self.catalog.suggestions.stale = false;
+        self.catalog.suggestions.matches.clear();
     }
 
     pub(crate) fn set_auth_list_loading(&mut self) {

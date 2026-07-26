@@ -19,6 +19,7 @@ import {
 } from "solid-js";
 
 import { useAppState } from "../../app/context";
+import { clientRequestId } from "../../app/requestId";
 import { CodeBlock, HighlightedCode } from "../../components/markdown/CodeBlock";
 import { MarkdownMessage } from "../../components/markdown/MarkdownMessage";
 import { ConfirmAction, Dialog, InlineAlert } from "../../components/ui";
@@ -346,7 +347,6 @@ function SessionDetail(props: { session: SessionView }) {
   let highlightLayer: HTMLDivElement | undefined;
   let registeredTimelineSession: string | undefined;
   let templateSearchDebounce: number | undefined;
-  let templateSearchSequence = 0;
   let previousTimelineItemKeys: string[] = [];
   let initialScrollSession: string | undefined;
   let pendingHistoryCursor: SessionTimelineView["events"][number]["cursor"] | undefined;
@@ -661,7 +661,7 @@ function SessionDetail(props: { session: SessionView }) {
   };
 
   const sendTemplateSearch = async (token: ActiveTemplateToken) => {
-    const requestId = `${props.session.id}-resource-${++templateSearchSequence}`;
+    const requestId = clientRequestId(`${props.session.id}-resource`);
     setResourceRequestId(requestId);
     setTemplateSearchError(undefined);
     setSelectedResourceIndex(0);

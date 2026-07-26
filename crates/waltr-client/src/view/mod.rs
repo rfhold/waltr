@@ -1,8 +1,14 @@
 //! Stable shell-facing view models.
 
+mod catalog;
 mod config;
 mod session;
 
+pub use catalog::{
+    CatalogMatchConfidenceView, CatalogMatchView, CatalogModelCapabilitySummaryView,
+    CatalogModelCostSummaryView, CatalogModelLimitsSummaryView, CatalogModelReasoningSummaryView,
+    CatalogModelRefView, CatalogModelSummaryView,
+};
 pub use config::{
     CatalogMatchSourceView, ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
     ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView, ModelTypeView,
@@ -25,12 +31,16 @@ mod tests {
 
     use crate::{
         AccessSnapshot, AccessStatus, AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot,
-        CatalogMatchSource, ClientAuthTarget, ClientCommand, ClientOperationView,
-        ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
-        ClientTimelineDirection, ConfigSnapshot, Configuration, Model, ModelCapabilities,
-        ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
-        OperationSnapshot, Provider, ProviderType, RollbackTargetView, SessionSnapshot,
-        SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
+        CatalogMatchConfidenceView, CatalogMatchSource, CatalogMatchSuggestionSnapshot,
+        CatalogMatchView, CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView,
+        CatalogModelLimitsSummaryView, CatalogModelReasoningSummaryView, CatalogModelRefView,
+        CatalogModelSearchSnapshot, CatalogModelSummaryView, CatalogSnapshot, ClientAuthTarget,
+        ClientCommand, ClientOperationView, ClientSessionTemplateKind,
+        ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection, ConfigSnapshot,
+        Configuration, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits, ModelOptions,
+        ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider, ProviderType,
+        RollbackTargetView, SessionSnapshot, SessionTemplateOptionView,
+        SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -156,6 +166,17 @@ mod tests {
             RuntimeDefaultsView::decl(),
             ProviderView::decl(),
             ConfigView::decl(),
+            CatalogModelRefView::decl(),
+            CatalogModelLimitsSummaryView::decl(),
+            CatalogModelCostSummaryView::decl(),
+            CatalogModelCapabilitySummaryView::decl(),
+            CatalogModelReasoningSummaryView::decl(),
+            CatalogModelSummaryView::decl(),
+            CatalogMatchConfidenceView::decl(),
+            CatalogMatchView::decl(),
+            CatalogModelSearchSnapshot::decl(),
+            CatalogMatchSuggestionSnapshot::decl(),
+            CatalogSnapshot::decl(),
             TimestampView::decl(),
             SessionPhaseView::decl(),
             SessionStatusView::decl(),
