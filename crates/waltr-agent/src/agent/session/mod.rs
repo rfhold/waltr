@@ -23,7 +23,9 @@ pub(super) use run::{RunOutcomeSender, RunResult};
 pub use runtime::{AgentSessionRuntime, RuntimeResumeOutput};
 pub use runtime_factory::AgentSessionRuntimeFactory;
 pub use settings::{
-    FileCredentialStore, OAuthCredential, SessionMcpServerRuntimeKind,
+    FileCredentialStore, McpOAuthCredentialStore, McpOAuthEndpoints, McpOAuthRegistration,
+    McpOAuthRegistrationMethod, McpOAuthState, McpOAuthStoreFuture, McpOAuthToken, McpRefreshClaim,
+    McpRefreshClaimResult, OAuthCredential, SessionMcpServerRuntimeKind,
     SessionMcpServerRuntimeSettings, SessionOAuthProviderSettings, SessionOAuthTokenField,
     SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle, SessionProviderRuntimeSettings,
     SessionRuntimeSettings, StoredCredential,

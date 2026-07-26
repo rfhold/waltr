@@ -100,15 +100,28 @@ impl McpServerRuntime {
             active_progress: Arc::clone(&active_progress),
             refresh: Mutex::new(None),
         });
-        let client = McpClient::connect(
-            name.clone(),
-            config.transport,
-            handler.clone(),
-            McpClientOptions::new("waltr-agent", env!("CARGO_PKG_VERSION"), timeout)
-                .with_trace_propagation(trace_propagation),
-            cancellation_token.clone(),
-        )
-        .await?;
+        let options = McpClientOptions::new("waltr-agent", env!("CARGO_PKG_VERSION"), timeout)
+            .with_trace_propagation(trace_propagation);
+        let client = if let Some(provider) = config.bearer_provider {
+            McpClient::connect_with_bearer_provider(
+                name.clone(),
+                config.transport,
+                provider,
+                handler.clone(),
+                options,
+                cancellation_token.clone(),
+            )
+            .await?
+        } else {
+            McpClient::connect(
+                name.clone(),
+                config.transport,
+                handler.clone(),
+                options,
+                cancellation_token.clone(),
+            )
+            .await?
+        };
         let runtime = Arc::new(Self {
             name,
             client,

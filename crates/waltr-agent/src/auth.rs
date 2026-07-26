@@ -2,6 +2,44 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Sanitized authorization context returned by an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpAuthorizationContext {
+    /// Configured protected MCP endpoint.
+    pub endpoint: String,
+    /// HTTP status returned by the protected endpoint.
+    pub http_status: u16,
+    /// Protected resource metadata URL from the bearer challenge.
+    pub resource_metadata_url: Option<String>,
+    /// Required scope string from the bearer challenge.
+    pub scope: Option<String>,
+    /// Bearer error code.
+    pub error: Option<String>,
+    /// Sanitized bearer error description.
+    pub error_description: Option<String>,
+    /// Bearer error documentation URL.
+    pub error_uri: Option<String>,
+    /// Authentication realm.
+    pub realm: Option<String>,
+}
+
+/// Machine-readable outbound authentication failure reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationFailureReason {
+    /// A usable credential is absent or expired.
+    CredentialRequired,
+    /// The upstream rejected a credential.
+    CredentialRejected,
+    /// An authorization-code or refresh exchange was rejected.
+    TokenExchangeFailed,
+    /// The authentication service could not be reached.
+    NetworkFailed,
+    /// The authentication service returned an invalid response.
+    ResponseInvalid,
+    /// Required OAuth registration or endpoint configuration is absent.
+    ConfigurationRequired,
+}
+
 /// Runtime/config target that can require authentication.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

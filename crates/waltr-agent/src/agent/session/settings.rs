@@ -112,7 +112,11 @@ pub enum SessionOAuthTokenFieldTarget {
 
 mod credentials;
 
-pub use credentials::{FileCredentialStore, OAuthCredential, StoredCredential};
+pub use credentials::{
+    FileCredentialStore, McpOAuthCredentialStore, McpOAuthEndpoints, McpOAuthRegistration,
+    McpOAuthRegistrationMethod, McpOAuthState, McpOAuthStoreFuture, McpOAuthToken, McpRefreshClaim,
+    McpRefreshClaimResult, OAuthCredential, StoredCredential,
+};
 
 #[cfg(test)]
 mod tests {

@@ -100,7 +100,8 @@ fn is_retryable(error: &LlmError) -> bool {
         | LlmError::Json(_)
         | LlmError::Io(_)
         | LlmError::Protocol { .. }
-        | LlmError::Authorization { .. } => false,
+        | LlmError::Authorization { .. }
+        | LlmError::McpAuthorization { .. } => false,
     }
 }
 

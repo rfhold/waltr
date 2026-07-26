@@ -21,7 +21,9 @@ pub use agent::{
     AgentSessionRunOutcome, AgentSessionRunSubmission, AgentSessionRuntime,
     AgentSessionRuntimeError, AgentSessionRuntimeFactory, AgentTool, BoxAgentTimelineStream,
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, FileCredentialStore, FilesystemSessionStore, MemorySessionStore,
+    ExternalResponse, FileCredentialStore, FilesystemSessionStore, McpOAuthCredentialStore,
+    McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod, McpOAuthState,
+    McpOAuthStoreFuture, McpOAuthToken, McpRefreshClaim, McpRefreshClaimResult, MemorySessionStore,
     OAuthCredential, OpenDalSessionStore, PendingWork, PendingWorkStatus, ProviderRetryConfig,
     RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput,
     S3SessionStore, ScyllaSessionStore, SessionCoordinator, SessionId, SessionJournalEvent,
@@ -34,7 +36,7 @@ pub use agent::{
     Suspension, ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
     run_postgresql_migrations,
 };
-pub use auth::AuthTarget;
+pub use auth::{AuthTarget, AuthenticationFailureReason, McpAuthorizationContext};
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
 pub use permission::{
