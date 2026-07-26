@@ -319,9 +319,16 @@ impl McpClientRuntime {
             .await
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        let mut first_error = None;
         for server in self.servers.values() {
-            server.shutdown().await;
+            if let Err(error) = server.shutdown().await {
+                tracing::warn!(server = %server.name(), "failed to shut down MCP server");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
+        first_error.map_or(Ok(()), Err)
     }
 }

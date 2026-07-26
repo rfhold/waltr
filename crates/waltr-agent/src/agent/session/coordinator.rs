@@ -210,10 +210,13 @@ where
         AgentSessionRuntime::new(&self.store)
             .delete_session(id)
             .await?;
-        if let Some(runtime) = self.mcp_sessions.lock().await.remove(id) {
-            runtime.shutdown().await;
-        }
+        let runtime = self.mcp_sessions.lock().await.remove(id);
+        let shutdown = match runtime {
+            Some(runtime) => runtime.shutdown().await,
+            None => Ok(()),
+        };
         self.sessions.publish(SessionListEvent::Deleted(id.clone()));
+        shutdown?;
         Ok(())
     }
 
@@ -409,11 +412,14 @@ where
         let record = AgentSessionRuntime::new(&self.store)
             .set_runtime_settings(id, runtime_settings)
             .await?;
-        if let Some(runtime) = self.mcp_sessions.lock().await.remove(id) {
-            runtime.shutdown().await;
-        }
+        let runtime = self.mcp_sessions.lock().await.remove(id);
+        let shutdown = match runtime {
+            Some(runtime) => runtime.shutdown().await,
+            None => Ok(()),
+        };
         self.sessions
             .publish(SessionListEvent::Upsert(record.summary()));
+        shutdown?;
         Ok(AgentSession::new(record))
     }
 
