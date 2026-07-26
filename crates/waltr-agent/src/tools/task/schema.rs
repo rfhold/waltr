@@ -65,13 +65,13 @@ pub(super) fn task_definition() -> ToolDefinition {
 
 pub(super) fn task_result(
     context: &ToolExecutionContext,
-    output: TaskOutput,
+    output: &TaskOutput,
 ) -> crate::Result<ToolResult> {
-    let content = serde_json::to_string(&output)?;
-    Ok(context.result(content))
+    let serialized = serde_json::to_string(output)?;
+    Ok(context.result(serialized))
 }
 
-pub(super) fn status_label(status: &SessionStatus) -> &'static str {
+pub(super) const fn status_label(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Finished => "finished",
         SessionStatus::Failed { .. } => "failed",
@@ -89,7 +89,7 @@ pub(super) fn status_label(status: &SessionStatus) -> &'static str {
     }
 }
 
-pub(super) fn disposition_label(disposition: &AgentSessionRunDisposition) -> &'static str {
+pub(super) const fn disposition_label(disposition: &AgentSessionRunDisposition) -> &'static str {
     match disposition {
         AgentSessionRunDisposition::Started => "started",
         AgentSessionRunDisposition::ReplacedActive => "replaced_active",

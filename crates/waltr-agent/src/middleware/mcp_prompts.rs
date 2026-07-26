@@ -17,12 +17,13 @@ use crate::{
 use super::{AgentMiddleware, context::TemplateRenderContext, context::TemplateSearchContext};
 
 #[derive(Debug, Clone)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpPromptsMiddleware {
     runtime: Arc<McpClientRuntime>,
 }
 
 impl McpPromptsMiddleware {
-    pub(crate) fn new(runtime: Arc<McpClientRuntime>) -> Self {
+    pub(crate) const fn new(runtime: Arc<McpClientRuntime>) -> Self {
         Self { runtime }
     }
 }
@@ -114,7 +115,7 @@ impl AgentMiddleware for McpPromptsMiddleware {
             return Ok(TemplateReferenceRender::Continue);
         }
 
-        let arguments = match validate_prompt_arguments(arguments) {
+        let arguments = match validate_prompt_arguments(arguments.as_ref()) {
             Ok(arguments) => arguments,
             Err(error) => {
                 return Ok(TemplateReferenceRender::Rendered(template_error(
@@ -145,7 +146,7 @@ impl AgentMiddleware for McpPromptsMiddleware {
 }
 
 fn validate_prompt_arguments(
-    arguments: &Option<Value>,
+    arguments: Option<&Value>,
 ) -> std::result::Result<Option<Value>, String> {
     let Some(arguments) = arguments else {
         return Ok(None);

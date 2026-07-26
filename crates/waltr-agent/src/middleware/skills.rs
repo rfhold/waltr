@@ -347,7 +347,7 @@ fn collect_reveals_for_tree(
     reminders: &mut Vec<String>,
 ) -> Result<()> {
     let mut entries = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
     for entry in entries {
         let path = entry.path();
         if !path.is_dir() {

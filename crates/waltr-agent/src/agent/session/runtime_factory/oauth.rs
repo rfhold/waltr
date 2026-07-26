@@ -56,6 +56,11 @@ pub(super) async fn refresh_oauth(
     Ok(next)
 }
 
+#[allow(
+    clippy::assigning_clones,
+    clippy::collapsible_if,
+    clippy::too_many_lines
+)]
 pub(super) async fn refresh_mcp_oauth(
     credential: &McpOAuthState,
     allow_loopback_http: bool,
@@ -178,6 +183,7 @@ fn pairs_to_json(pairs: &[(&str, &str)]) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+#[allow(clippy::assigning_clones)]
 async fn token_response_to_credential(
     definition: &SessionOAuthProviderSettings,
     response: reqwest::Response,

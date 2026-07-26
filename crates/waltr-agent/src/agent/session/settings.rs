@@ -35,7 +35,7 @@ pub struct SessionProviderRuntimeSettings {
     pub headers: BTreeMap<String, String>,
     /// Optional OAuth refresh definition for this provider.
     pub oauth: Option<SessionOAuthProviderSettings>,
-    /// Optional OpenAI reasoning effort.
+    /// Optional `OpenAI` reasoning effort.
     pub reasoning_effort: Option<String>,
 }
 

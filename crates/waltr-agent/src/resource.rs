@@ -49,17 +49,13 @@ impl SessionTemplateSearchRequest {
 /// Session template search target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SessionTemplateSearchTarget {
     /// File and tool references available to the session runtime.
+    #[default]
     Resources,
     /// Prompt templates such as skills or MCP prompts.
     Prompts,
-}
-
-impl Default for SessionTemplateSearchTarget {
-    fn default() -> Self {
-        Self::Resources
-    }
 }
 
 /// Session template kind.
@@ -78,6 +74,7 @@ pub enum SessionTemplateKind {
 
 /// Template option suitable for insertion into a prompt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
 pub struct SessionTemplateOption {
     /// Template kind.
     pub kind: SessionTemplateKind,
@@ -99,6 +96,7 @@ struct ScoredTemplateOption {
 
 /// Mutable scored template-search results collected by middleware.
 #[derive(Debug, Default)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct TemplateSearchResults {
     results: Vec<ScoredTemplateOption>,
 }
@@ -127,6 +125,7 @@ impl TemplateSearchResults {
 }
 
 /// Search prompt-template resources available to a session runtime.
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) async fn search_session_templates_with_state(
     root: &Path,
     runtime: &AgentRuntime,
@@ -153,6 +152,7 @@ pub(crate) async fn search_session_templates_with_state(
     Ok(results.finish(limit))
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn tool_template(name: &str, input_schema: &Value) -> String {
     let mut arguments = Map::new();
     if let Some(required) = input_schema.get("required").and_then(Value::as_array) {
@@ -166,6 +166,7 @@ pub(crate) fn tool_template(name: &str, input_schema: &Value) -> String {
     format!("@tool({name}, {arguments})")
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn mcp_resource_template(server_name: &str, uri: &str) -> Option<String> {
     if !is_mcp_template_part(server_name) {
         return None;
@@ -175,6 +176,7 @@ pub(crate) fn mcp_resource_template(server_name: &str, uri: &str) -> Option<Stri
     Some(format!("@resource({server_name}, {uri})"))
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn mcp_prompt_template(
     server_name: &str,
     prompt_name: &str,
@@ -199,10 +201,12 @@ pub(crate) fn mcp_prompt_template(
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn is_mcp_prompt_template_part(part: &str) -> bool {
     is_mcp_template_part(part)
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn is_mcp_template_part(part: &str) -> bool {
     !part.is_empty()
         && part
@@ -210,6 +214,7 @@ pub(crate) fn is_mcp_template_part(part: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn file_score(label: &str, detail: &str, query_lower: &str) -> Option<u8> {
     let label_lower = label.to_lowercase();
     let detail_lower = detail.to_lowercase();
@@ -231,6 +236,7 @@ pub(crate) fn file_score(label: &str, detail: &str, query_lower: &str) -> Option
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn tool_score(name: &str, description: &str, query_lower: &str) -> Option<u8> {
     let name_lower = name.to_lowercase();
     let description_lower = description.to_lowercase();
@@ -247,6 +253,7 @@ pub(crate) fn tool_score(name: &str, description: &str, query_lower: &str) -> Op
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn prompt_score(name: &str, description: &str, query_lower: &str) -> Option<u8> {
     if query_lower.is_empty() || "skill:".starts_with(query_lower) {
         return Some(4);
@@ -262,6 +269,7 @@ fn compare_options(left: &ScoredTemplateOption, right: &ScoredTemplateOption) ->
         .then_with(|| left.option.label.cmp(&right.option.label))
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn normalize_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -269,6 +277,7 @@ pub(crate) fn normalize_path(path: &Path) -> String {
         .join("/")
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn file_template(path: &str) -> String {
     if is_bare_file_ref(path) {
         format!("@{path}")
@@ -277,6 +286,7 @@ pub(crate) fn file_template(path: &str) -> String {
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn is_bare_file_ref(path: &str) -> bool {
     !path.is_empty()
         && (path.contains('/') || path.contains('.'))

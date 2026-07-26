@@ -410,16 +410,14 @@ where
         } else {
             snapshot.turn
         };
-        let mut prompt_index = snapshot.prompts.len();
-        for prompt in prompts {
+        for (prompt_index, prompt) in prompts.into_iter().enumerate() {
             prompt_timeline.push(user_prompt_timeline_event(
                 &record.id,
                 turn,
-                prompt_index,
+                snapshot.prompts.len() + prompt_index,
                 prompt.clone(),
             ));
             journal.push(SessionJournalEvent::PromptAppended { prompt });
-            prompt_index += 1;
         }
 
         let mut record = if cancellation_timeline.is_empty() {

@@ -64,14 +64,14 @@ impl OpenAiResponsesWebSocket {
         self
     }
 
-    /// Set the OpenAI prompt cache retention hint for outgoing requests.
+    /// Set the `OpenAI` prompt cache retention hint for outgoing requests.
     #[must_use]
     pub fn with_prompt_cache_retention(mut self, retention: impl Into<String>) -> Self {
         self.prompt_cache_retention = Some(retention.into());
         self
     }
 
-    /// Disable OpenAI prompt cache routing hints on outgoing requests.
+    /// Disable `OpenAI` prompt cache routing hints on outgoing requests.
     #[must_use]
     pub const fn without_prompt_cache(mut self) -> Self {
         self.prompt_cache = false;
@@ -150,6 +150,7 @@ impl LlmStream for OpenAiResponsesWebSocket {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn stream_request<'a>(
         &'a self,
         request: CompletionRequest<'a>,
@@ -304,12 +305,9 @@ impl LlmStream for OpenAiResponsesWebSocket {
                             ));
                         }
 
-                        let message = match websocket.next().await {
-                            Some(result) => result,
-                            None => {
-                                record_stream_end(&stream_span, "eof", message_count, event_count);
-                                return None;
-                            }
+                        let Some(message) = websocket.next().await else {
+                            record_stream_end(&stream_span, "eof", message_count, event_count);
+                            return None;
                         };
                         let message = match message {
                             Ok(message) => {
@@ -417,7 +415,7 @@ fn record_stream_end(
             event_count,
             terminal_state,
             "provider websocket stream ended"
-        )
+        );
     });
 }
 

@@ -66,7 +66,10 @@ async fn session_template_search_finds_files_and_tools() {
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
     let session_id = sessions
-        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .create_with_runtime_settings(
+            Some(test_runtime_settings()),
+            std::collections::BTreeMap::default(),
+        )
         .await
         .expect("created session")
         .id()
@@ -137,7 +140,10 @@ async fn session_template_search_clamps_oversized_limits() {
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
     let session_id = sessions
-        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .create_with_runtime_settings(
+            Some(test_runtime_settings()),
+            std::collections::BTreeMap::default(),
+        )
         .await
         .expect("created session")
         .id()
@@ -177,7 +183,7 @@ async fn session_template_search_ignores_mcp_startup_failures() {
         url: String::new(),
     });
     let session_id = sessions
-        .create_with_runtime_settings(Some(settings), Default::default())
+        .create_with_runtime_settings(Some(settings), std::collections::BTreeMap::default())
         .await
         .expect("created session")
         .id()
@@ -217,7 +223,10 @@ async fn session_template_search_empty_query_returns_no_options() {
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
     let session_id = sessions
-        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .create_with_runtime_settings(
+            Some(test_runtime_settings()),
+            std::collections::BTreeMap::default(),
+        )
         .await
         .expect("created session")
         .id()
@@ -1354,7 +1363,7 @@ async fn user_prompt_template_tool_auto_approves_ask_permissions() {
 
     let events = collect_events(
         agent
-            .prompt(&format!(
+            .prompt(format!(
                 "@tool(shell, {{\"command\":{command:?},\"description\":\"Read the test fixture.\"}})"
             ))
             .stream(),
@@ -1907,7 +1916,7 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             url: String::new(),
             model_id: "test-model".to_owned(),
             model_cost: None,
-            headers: Default::default(),
+            headers: std::collections::BTreeMap::default(),
             oauth: None,
             reasoning_effort: None,
         },

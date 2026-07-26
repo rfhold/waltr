@@ -256,6 +256,7 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn permission_resume_preserves_remaining_provider_tool_calls() -> waltr_agent::Result<()> {
     let fixture = PermissionFixture::new()?;
     let provider = Arc::new(ScriptedProvider::new(

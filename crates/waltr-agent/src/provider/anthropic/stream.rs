@@ -91,6 +91,7 @@ fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn completion_stream<S, B>(
     bytes_stream: S,
     parser: AnthropicParser,
@@ -267,7 +268,7 @@ fn record_stream_end(
             event_count,
             terminal_state,
             "provider stream ended"
-        )
+        );
     });
 }
 

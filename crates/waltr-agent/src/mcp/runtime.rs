@@ -15,29 +15,34 @@ use super::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpServerPromptDefinition {
     pub(crate) server_name: String,
     pub(crate) prompt: McpPromptDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpServerResourceDefinition {
     pub(crate) server_name: String,
     pub(crate) resource: McpResourceDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpServerResourceTemplateDefinition {
     pub(crate) server_name: String,
     pub(crate) resource_template: McpResourceTemplateDefinition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpServerInstructions {
     pub(crate) server_name: String,
     pub(crate) instructions: String,
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpClientRuntime {
     servers: BTreeMap<String, Arc<McpServerRuntime>>,
     #[allow(dead_code)]
@@ -45,6 +50,7 @@ pub(crate) struct McpClientRuntime {
 }
 
 #[derive(Debug)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct McpRuntimeStartError {
     pub(crate) server_key: String,
     pub(crate) error: LlmError,
@@ -82,6 +88,7 @@ impl std::fmt::Debug for McpClientRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 impl McpClientRuntime {
     pub(crate) async fn start(
         config: McpConfig,
@@ -97,7 +104,7 @@ impl McpClientRuntime {
                 server,
                 timeout,
                 log_level,
-                trace_propagation.clone(),
+                trace_propagation,
                 root_uri.clone(),
                 events.clone(),
                 cancellation_token.clone(),

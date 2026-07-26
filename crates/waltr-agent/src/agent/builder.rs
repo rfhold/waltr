@@ -235,7 +235,7 @@ impl AgentRuntimeBuilder {
 
     /// Set provider retry behavior for this agent runtime.
     #[must_use]
-    pub fn with_provider_retry_config(mut self, config: ProviderRetryConfig) -> Self {
+    pub const fn with_provider_retry_config(mut self, config: ProviderRetryConfig) -> Self {
         self.retry_config = config;
         self
     }

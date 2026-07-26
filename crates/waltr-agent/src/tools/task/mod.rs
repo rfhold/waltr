@@ -54,7 +54,7 @@ where
 {
     /// Create a task tool configuration.
     #[must_use]
-    pub fn new(sessions: SessionCoordinator<S>) -> Self {
+    pub const fn new(sessions: SessionCoordinator<S>) -> Self {
         Self {
             sessions,
             max_subagent_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
@@ -94,11 +94,12 @@ where
     }
 
     async fn handle(&self, context: ToolExecutionContext) -> crate::Result<ToolResult> {
-        let input: TaskInput =
-            serde_json::from_value(context.call().arguments.clone()).map_err(invalid_task_input)?;
+        let input: TaskInput = serde_json::from_value(context.call().arguments.clone())
+            .map_err(|error| invalid_task_input(&error))?;
         self.run_task(context, input).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_task(
         &self,
         context: ToolExecutionContext,
@@ -106,7 +107,7 @@ where
     ) -> crate::Result<ToolResult> {
         let prompt = required_non_empty(input.prompt.as_deref(), "prompt")?.to_owned();
         let mode = input.mode.unwrap_or(TaskMode::Sync);
-        let task_id = self.resolve_task_id(&context);
+        let task_id = Self::resolve_task_id(&context);
         let child_depth = self.child_depth(&context).await;
         self.ensure_depth_allowed(child_depth)?;
         self.ensure_child_session(
@@ -194,7 +195,7 @@ where
                     run_id: Some(outcome.run_id),
                     disposition: Some(disposition_label(&submission.disposition).to_owned()),
                 };
-                task_result(&context, output)
+                task_result(&context, &output)
             }
             TaskMode::Async => {
                 let run_id = submission.run_id;
@@ -215,7 +216,7 @@ where
                     run_id: Some(run_id),
                     disposition: Some(disposition_label(&disposition).to_owned()),
                 };
-                task_result(&context, output)
+                task_result(&context, &output)
             }
         }
     }
@@ -280,7 +281,7 @@ where
         });
     }
 
-    fn resolve_task_id(&self, context: &ToolExecutionContext) -> SessionId {
+    fn resolve_task_id(context: &ToolExecutionContext) -> SessionId {
         if let Some(parent_session_id) = context.session_id() {
             let turn = context.turn().unwrap_or_default();
             return SessionId::new(format!(
@@ -415,6 +416,7 @@ struct TaskProgress {
 }
 
 impl TaskProgress {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         task_id: &SessionId,
         mode: TaskMode,
@@ -466,7 +468,7 @@ impl TaskProgress {
         };
         if event.kind == crate::TimelineEventKind::SessionStatusChanged {
             if let Some(status) = event.status {
-                self.status = timeline_status_label(status).to_owned();
+                timeline_status_label(status).clone_into(&mut self.status);
                 return true;
             }
             return false;
@@ -491,7 +493,7 @@ impl TaskMode {
     }
 }
 
-fn timeline_status_label(status: TimelineStatus) -> &'static str {
+const fn timeline_status_label(status: TimelineStatus) -> &'static str {
     match status {
         TimelineStatus::Idle => "idle",
         TimelineStatus::BuildingRequest
@@ -509,7 +511,7 @@ fn timeline_status_label(status: TimelineStatus) -> &'static str {
     }
 }
 
-fn invalid_task_input(error: serde_json::Error) -> LlmError {
+fn invalid_task_input(error: &serde_json::Error) -> LlmError {
     task_protocol_error(format!("invalid task input: {error}"))
 }
 

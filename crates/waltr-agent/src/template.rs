@@ -1,6 +1,6 @@
 //! Prompt template expansion.
 
-use std::path::Path;
+use std::{fmt::Write as _, path::Path};
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -21,17 +21,21 @@ use crate::{
 const MAX_TEMPLATE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) enum TemplateSource {
     UserPrompt,
     RuntimePrompt,
 }
 
+#[allow(clippy::redundant_pub_crate)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum TemplateRender {
     Rendered(String),
     Suspend(middleware::Suspension),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) enum TemplateReference {
     File {
         path: String,
@@ -66,6 +70,7 @@ impl TemplateReference {
     }
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) enum TemplateReferenceRender {
     Continue,
     Rendered(String),
@@ -86,6 +91,7 @@ enum TemplatePermissionOutcome {
 }
 
 /// Runtime values available while expanding prompt templates.
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct TemplateRuntime<'a> {
     /// Base directory used for relative file references.
     pub(crate) base_dir: &'a Path,
@@ -107,6 +113,7 @@ impl TemplateRuntime<'_> {
         self.render_template_depth(input, 0).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn render_template_depth(&mut self, input: &str, depth: usize) -> Result<TemplateRender> {
         if depth >= MAX_TEMPLATE_DEPTH {
             return Ok(TemplateRender::Rendered(input.to_owned()));
@@ -174,25 +181,23 @@ impl TemplateRuntime<'_> {
                 && is_first_line(input, index)
                 && remaining.starts_with('/')
                 && is_reference_boundary(input, index)
-            {
-                if let Some((namespace, name, arguments, consumed)) =
+                && let Some((namespace, name, arguments, consumed)) =
                     parse_prompt_reference(remaining)
-                {
-                    let reference = TemplateReference::Prompt {
-                        namespace,
-                        name,
-                        arguments,
-                        raw: remaining[..consumed].to_owned(),
-                    };
-                    match self.render_reference(reference, depth).await? {
-                        TemplateRender::Rendered(rendered) => output.push_str(&rendered),
-                        TemplateRender::Suspend(suspension) => {
-                            return Ok(TemplateRender::Suspend(suspension));
-                        }
+            {
+                let reference = TemplateReference::Prompt {
+                    namespace,
+                    name,
+                    arguments,
+                    raw: remaining[..consumed].to_owned(),
+                };
+                match self.render_reference(reference, depth).await? {
+                    TemplateRender::Rendered(rendered) => output.push_str(&rendered),
+                    TemplateRender::Suspend(suspension) => {
+                        return Ok(TemplateRender::Suspend(suspension));
                     }
-                    index += consumed;
-                    continue;
                 }
+                index += consumed;
+                continue;
             }
 
             if let Some(rest) = remaining.strip_prefix("@\"") {
@@ -219,22 +224,23 @@ impl TemplateRuntime<'_> {
                 continue;
             }
 
-            if remaining.starts_with('@') && is_reference_boundary(input, index) {
-                if let Some((path, consumed)) = parse_bare_file_reference(&remaining[1..]) {
-                    let consumed = 1 + consumed;
-                    let reference = TemplateReference::File {
-                        path,
-                        raw: remaining[..consumed].to_owned(),
-                    };
-                    match self.render_reference(reference, depth).await? {
-                        TemplateRender::Rendered(rendered) => output.push_str(&rendered),
-                        TemplateRender::Suspend(suspension) => {
-                            return Ok(TemplateRender::Suspend(suspension));
-                        }
+            if remaining.starts_with('@')
+                && is_reference_boundary(input, index)
+                && let Some((path, consumed)) = parse_bare_file_reference(&remaining[1..])
+            {
+                let consumed = 1 + consumed;
+                let reference = TemplateReference::File {
+                    path,
+                    raw: remaining[..consumed].to_owned(),
+                };
+                match self.render_reference(reference, depth).await? {
+                    TemplateRender::Rendered(rendered) => output.push_str(&rendered),
+                    TemplateRender::Suspend(suspension) => {
+                        return Ok(TemplateRender::Suspend(suspension));
                     }
-                    index += consumed;
-                    continue;
                 }
+                index += consumed;
+                continue;
             }
 
             let Some(character) = remaining.chars().next() else {
@@ -313,6 +319,7 @@ impl TemplateRuntime<'_> {
     }
 }
 
+#[allow(clippy::redundant_pub_crate, clippy::too_many_lines)]
 pub(crate) async fn render_tool_template_reference(
     ctx: &mut TemplateRenderContext<'_>,
     tools: &[AgentTool],
@@ -613,7 +620,7 @@ fn is_template_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(is_template_name_character)
 }
 
-fn is_template_name_character(character: char) -> bool {
+const fn is_template_name_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
 }
 
@@ -665,6 +672,7 @@ fn is_bare_file_reference(path: &str) -> bool {
         })
 }
 
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) fn template_error(context: &str, error: impl std::fmt::Display) -> String {
     format!("<template-error>{context}: {error}</template-error>")
 }
@@ -672,10 +680,12 @@ pub(crate) fn template_error(context: &str, error: impl std::fmt::Display) -> St
 fn template_result(kind: &str, tool: Option<&str>, source: Option<&str>, content: &str) -> String {
     let mut output = format!("<template-result kind=\"{}\"", escape_xml_attribute(kind));
     if let Some(tool) = tool {
-        output.push_str(&format!(" tool=\"{}\"", escape_xml_attribute(tool)));
+        write!(output, " tool=\"{}\"", escape_xml_attribute(tool))
+            .expect("writing to a string cannot fail");
     }
     if let Some(source) = source {
-        output.push_str(&format!(" source=\"{}\"", escape_xml_attribute(source)));
+        write!(output, " source=\"{}\"", escape_xml_attribute(source))
+            .expect("writing to a string cannot fail");
     }
     output.push_str(">\n");
     output.push_str(content);

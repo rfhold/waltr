@@ -186,7 +186,7 @@ fn test_runtime_settings(
             url: String::new(),
             model_id: "live-model".to_owned(),
             model_cost: None,
-            headers: Default::default(),
+            headers: std::collections::BTreeMap::default(),
             oauth: None,
             reasoning_effort: None,
         },

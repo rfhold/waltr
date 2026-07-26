@@ -348,6 +348,10 @@ impl FileCredentialStore {
     }
 
     /// Read a credential by namespaced target key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured backend cannot read the credential.
     pub async fn read(&self, target_key: &str) -> Result<Option<StoredCredential>, std::io::Error> {
         if target_key.starts_with("mcp:")
             && let Some(store) = &self.mcp_store
@@ -364,6 +368,10 @@ impl FileCredentialStore {
     }
 
     /// Serialize a read-modify-write for a credential target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured backend cannot read or write the credential.
     pub async fn modify<F>(
         &self,
         target_key: &str,
@@ -414,6 +422,10 @@ impl FileCredentialStore {
     }
 
     /// Delete a credential by namespaced target key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured backend cannot delete the credential.
     pub async fn delete(&self, target_key: &str) -> Result<(), std::io::Error> {
         self.modify(target_key, |_| None).await.map(|_| ())
     }
