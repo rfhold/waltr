@@ -95,6 +95,22 @@ export async function waitForMissingText(page, selector, unexpectedText) {
   throw new Error(`Timed out waiting for ${selector} to omit ${unexpectedText}; saw ${text}`);
 }
 
+export async function waitForMissingElement(page, selector, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let count = 1;
+
+  while (Date.now() < deadline) {
+    count = await page.locator(selector).count();
+    if (count === 0) {
+      return;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for ${selector} to disappear; saw ${count}`);
+}
+
 export async function waitForPathname(page, expectedPathname) {
   const deadline = Date.now() + 10_000;
   let pathname = "";

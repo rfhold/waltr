@@ -39,6 +39,7 @@ const screenshotLockPath = `${screenshotRoot}/.lock`;
 const modelsDevFixture = `${repoRoot}/tests/web/k6/support/models-dev-api.fixture.json`;
 const emptyConfigFixture = `${repoRoot}/tests/web/k6/support/empty-config.fixture.toml`;
 const sessionsRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/sessions-runtime-config.fixture.toml`;
+const mcpOauthRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/mcp-oauth-runtime-config.fixture.toml`;
 const screenshotSnapshotDir = `${repoRoot}/tests/web/k6/snapshots/screenshots`;
 const BUILD_TIMEOUT_MS = 20 * 60_000;
 const COMPOSE_UP_TIMEOUT_MS = 3 * 60_000;
@@ -496,6 +497,8 @@ function browserScriptsForPhase(mode, live, selectedScript, phase) {
 
   if (!live && mode === "dev") {
     scripts.splice(2, 0, "tests/web/k6/sessions/prompts.browser.js");
+  } else if (!live && phase === "oidc") {
+    scripts.push("tests/web/k6/sessions/mcp-oauth.browser.js");
   }
   if (!live && phase === "oidc") {
     scripts.unshift(
@@ -1981,6 +1984,9 @@ async function seedComposeConfig(state, phase, browserScript) {
 function fixtureForBrowserScript(browserScript) {
   if (browserScript === "tests/web/k6/sessions/sessions.browser.js") {
     return sessionsRuntimeConfigFixture;
+  }
+  if (browserScript === "tests/web/k6/sessions/mcp-oauth.browser.js") {
+    return mcpOauthRuntimeConfigFixture;
   }
   return emptyConfigFixture;
 }
