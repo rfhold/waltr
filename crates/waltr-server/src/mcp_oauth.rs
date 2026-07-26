@@ -316,6 +316,10 @@ impl McpOAuthServer {
     /// # Errors
     ///
     /// Returns a sanitized startup error when persistence or signing state is unusable.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "startup ordering must remain linear and fail closed"
+    )]
     pub async fn initialize(
         config: McpOAuthEnabledConfig,
         persistence: &Persistence,

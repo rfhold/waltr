@@ -5,13 +5,14 @@ use waltr::grpc::waltr::session::v1::{
 };
 use waltr_agent::{ModelApi, SessionProviderRuntimeSettings, SessionRuntimeSettings};
 use waltr_server::test_support::setup_server_with_sessions;
+use std::collections::BTreeMap;
 
 #[tokio::test]
 async fn search_session_templates_returns_tagged_tool_results()
 -> Result<(), Box<dyn std::error::Error>> {
     let (server, sessions) = setup_server_with_sessions();
     let session_id = sessions
-        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .create_with_runtime_settings(Some(test_runtime_settings()), BTreeMap::default())
         .await?
         .id()
         .as_str()
@@ -69,7 +70,7 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             url: String::new(),
             model_id: "test-model".to_owned(),
             model_cost: None,
-            headers: Default::default(),
+            headers: BTreeMap::default(),
             oauth: None,
             reasoning_effort: None,
         },

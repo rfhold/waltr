@@ -1762,6 +1762,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture verifies one complete hardened OAuth binding flow"
+    )]
     async fn hardened_discovery_and_dynamic_registration_preserve_exact_bindings() {
         use axum::{http::header, routing::get};
 

@@ -1,6 +1,6 @@
 //! Build bundled web assets when the server `web` feature is enabled.
 
-use std::{env, fs, io, path::Path};
+use std::{env, fmt::Write as _, fs, io, path::Path};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WEB");
@@ -65,13 +65,12 @@ fn main() {
     source.push_str("pub(crate) static WEB_ASSETS: &[WebAsset] = &[\n");
     for (path, file) in assets {
         let include_path = file.to_string_lossy();
-        source.push_str("    WebAsset { path: ");
-        source.push_str(&format!("{path:?}"));
-        source.push_str(", content_type: ");
-        source.push_str(&format!("{:?}", content_type(&file)));
-        source.push_str(", bytes: include_bytes!(");
-        source.push_str(&format!("{include_path:?}"));
-        source.push_str(") },\n");
+        writeln!(
+            source,
+            "    WebAsset {{ path: {path:?}, content_type: {:?}, bytes: include_bytes!({include_path:?}) }},",
+            content_type(&file)
+        )
+        .expect("writing generated asset source should succeed");
     }
     source.push_str("];\n");
 

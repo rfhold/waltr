@@ -78,8 +78,8 @@ impl ConfigStore for FilesystemConfigStore {
         let current = if let Some(config) = self.load_unlocked().await? {
             config
         } else {
-            let path = self.config_path();
-            tracing::debug!(path = %path.display(), "config file missing during patch; creating default config");
+            let config_path = self.config_path();
+            tracing::debug!(path = %config_path.display(), "config file missing during patch; creating default config");
             self.save_unlocked(default_configuration()).await?
         };
 

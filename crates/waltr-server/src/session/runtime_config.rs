@@ -223,7 +223,7 @@ fn provider_api(value: i32) -> Result<ModelApi, Status> {
     }
 }
 
-fn provider_type(api: ModelApi) -> ProviderType {
+const fn provider_type(api: ModelApi) -> ProviderType {
     match api {
         ModelApi::AnthropicMessages => ProviderType::AnthropicMessages,
         ModelApi::OpenAiChatCompletions => ProviderType::OpenaiChatCompletions,
@@ -242,10 +242,43 @@ fn mcp_server_kind(value: i32) -> Result<SessionMcpServerRuntimeKind, Status> {
     }
 }
 
-fn mcp_server_type(kind: SessionMcpServerRuntimeKind) -> McpServerType {
+const fn mcp_server_type(kind: SessionMcpServerRuntimeKind) -> McpServerType {
     match kind {
         SessionMcpServerRuntimeKind::Stdio => McpServerType::Stdio,
         SessionMcpServerRuntimeKind::StreamableHttp => McpServerType::Sse,
+    }
+}
+
+fn oauth_settings(
+    definition: waltr::grpc::waltr::config::v1::OAuthProvider,
+) -> SessionOAuthProviderSettings {
+    let token_request_style = match OauthTokenRequestStyle::try_from(definition.token_request_style)
+        .unwrap_or(OauthTokenRequestStyle::Unspecified)
+    {
+        OauthTokenRequestStyle::FormUrlencoded => SessionOAuthTokenRequestStyle::FormUrlencoded,
+        OauthTokenRequestStyle::Json | OauthTokenRequestStyle::Unspecified => {
+            SessionOAuthTokenRequestStyle::Json
+        }
+    };
+
+    SessionOAuthProviderSettings {
+        token_url: definition.token_url,
+        client_id: definition.client_id,
+        redirect_uri: definition.redirect_uri,
+        token_request_style,
+        token_fields: Vec::new(),
+    }
+}
+
+fn model_cost(cost: waltr::grpc::waltr::config::v1::ModelCost) -> ModelCost {
+    ModelCost {
+        input_per_million_tokens: cost.input_per_million_tokens,
+        output_per_million_tokens: cost.output_per_million_tokens,
+        cache_read_per_million_tokens: cost.cache_read_per_million_tokens,
+        cache_write_per_million_tokens: cost.cache_write_per_million_tokens,
+        image_input_per_million_tokens: cost.image_input_per_million_tokens,
+        image_input_per_image: cost.image_input_per_image,
+        currency: cost.currency,
     }
 }
 
@@ -288,38 +321,5 @@ mod tests {
         .expect("runtime config should resolve");
 
         assert!(runtime.mcp_trace_propagation);
-    }
-}
-
-fn oauth_settings(
-    definition: waltr::grpc::waltr::config::v1::OAuthProvider,
-) -> SessionOAuthProviderSettings {
-    let token_request_style = match OauthTokenRequestStyle::try_from(definition.token_request_style)
-        .unwrap_or(OauthTokenRequestStyle::Unspecified)
-    {
-        OauthTokenRequestStyle::FormUrlencoded => SessionOAuthTokenRequestStyle::FormUrlencoded,
-        OauthTokenRequestStyle::Json | OauthTokenRequestStyle::Unspecified => {
-            SessionOAuthTokenRequestStyle::Json
-        }
-    };
-
-    SessionOAuthProviderSettings {
-        token_url: definition.token_url,
-        client_id: definition.client_id,
-        redirect_uri: definition.redirect_uri,
-        token_request_style,
-        token_fields: Vec::new(),
-    }
-}
-
-fn model_cost(cost: waltr::grpc::waltr::config::v1::ModelCost) -> ModelCost {
-    ModelCost {
-        input_per_million_tokens: cost.input_per_million_tokens,
-        output_per_million_tokens: cost.output_per_million_tokens,
-        cache_read_per_million_tokens: cost.cache_read_per_million_tokens,
-        cache_write_per_million_tokens: cost.cache_write_per_million_tokens,
-        image_input_per_million_tokens: cost.image_input_per_million_tokens,
-        image_input_per_image: cost.image_input_per_image,
-        currency: cost.currency,
     }
 }

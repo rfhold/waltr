@@ -167,9 +167,8 @@ async fn start_router_bind_failure_cancels_and_joins_cleanup() {
     assert!(!startup.is_finished());
     probe.release_cleanup.notify_one();
 
-    let error = match startup.await.expect("router startup should join") {
-        Ok(_) => panic!("occupied port should fail router startup"),
-        Err(error) => error,
+    let Err(error) = startup.await.expect("router startup should join") else {
+        panic!("occupied port should fail router startup");
     };
     assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
 }

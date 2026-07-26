@@ -286,14 +286,13 @@ async fn logout(State(auth): State<AccessAuthenticator>, headers: HeaderMap) -> 
             Ok(token) => token,
             Err(error) => return handler_error(error),
         };
-        if let Some(token) = token {
-            if auth
+        if let Some(token) = token
+            && auth
                 .revoke_browser_session_token(token, SystemTime::now())
                 .await
                 .is_err()
-            {
-                return handler_error(HandlerError::Internal);
-            }
+        {
+            return handler_error(HandlerError::Internal);
         }
     }
     let mut response = StatusCode::NO_CONTENT.into_response();

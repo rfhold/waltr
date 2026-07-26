@@ -1,6 +1,6 @@
 //! Implementation of the generated `SessionService`.
 
-use std::{path::PathBuf, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, pin::Pin, sync::Arc};
 
 use crate::config::ConfigHandle;
 
@@ -134,7 +134,7 @@ where
         let runtime_config = resolve_runtime_config_for_create(request.runtime_config, &config)?;
         let session = self
             .sessions
-            .create_with_runtime_settings(runtime_config, Default::default())
+            .create_with_runtime_settings(runtime_config, BTreeMap::default())
             .await
             .map_err(agent_error_to_status)?;
         tracing::Span::current().record("session_id", session.record.id.as_str());
@@ -670,8 +670,10 @@ where
 fn template_search_target_from_proto(target: i32) -> SessionTemplateSearchTarget {
     match ProtoSessionTemplateSearchTarget::try_from(target).ok() {
         Some(ProtoSessionTemplateSearchTarget::Prompts) => SessionTemplateSearchTarget::Prompts,
-        Some(ProtoSessionTemplateSearchTarget::Resources)
-        | Some(ProtoSessionTemplateSearchTarget::Unspecified)
+        Some(
+            ProtoSessionTemplateSearchTarget::Resources
+            | ProtoSessionTemplateSearchTarget::Unspecified,
+        )
         | None => SessionTemplateSearchTarget::Resources,
     }
 }

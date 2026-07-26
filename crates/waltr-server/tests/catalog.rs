@@ -299,7 +299,7 @@ async fn catalog_apply_defaults_fills_blanks_without_touching_options()
     );
     assert_eq!(
         model.limits.as_ref().and_then(|limits| limits.output),
-        Some(128000)
+        Some(128_000)
     );
     assert_eq!(
         model.capabilities,
@@ -475,7 +475,7 @@ fn gateway_provider(model: Model) -> Provider {
     }
 }
 
-fn blank_model() -> Model {
+const fn blank_model() -> Model {
     Model {
         name: String::new(),
         r#type: ModelType::Llm as i32,

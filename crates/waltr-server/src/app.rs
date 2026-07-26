@@ -92,7 +92,6 @@ impl ServerApplication {
     }
 
     /// Clone the router for in-process request testing.
-    #[must_use]
     pub fn router(&self) -> Router {
         self.router.clone()
     }

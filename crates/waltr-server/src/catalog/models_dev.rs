@@ -271,6 +271,10 @@ impl CatalogModel {
 
     /// Compare configured facts to this catalog model.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the comparisons intentionally enumerate every catalog drift field"
+    )]
     pub fn compare_configured_facts(&self, configured: &ConfiguredModelFacts) -> Vec<CatalogDrift> {
         let mut drifts = Vec::new();
 
@@ -376,14 +380,15 @@ impl CatalogModel {
             &self.modalities.output,
         );
 
-        if let Some(configured_options) = &configured.reasoning_options {
-            if !self.reasoning_options.is_empty() && configured_options != &self.reasoning_options {
-                drifts.push(CatalogDrift::new(
-                    CatalogDriftField::ReasoningOptions,
-                    configured_options,
-                    &self.reasoning_options,
-                ));
-            }
+        if let Some(configured_options) = &configured.reasoning_options
+            && !self.reasoning_options.is_empty()
+            && configured_options != &self.reasoning_options
+        {
+            drifts.push(CatalogDrift::new(
+                CatalogDriftField::ReasoningOptions,
+                configured_options,
+                &self.reasoning_options,
+            ));
         }
 
         drifts
@@ -513,9 +518,10 @@ pub struct CatalogModelProvider {
 }
 
 /// Interleaved thinking/tool content support details.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CatalogInterleaved {
     /// Missing or explicit null interleaved facts.
+    #[default]
     Null,
     /// Boolean interleaved support flag.
     Boolean(bool),
@@ -523,12 +529,6 @@ pub enum CatalogInterleaved {
     Object(CatalogInterleavedObject),
     /// Unknown interleaved shape preserved from source JSON.
     Unknown(Value),
-}
-
-impl Default for CatalogInterleaved {
-    fn default() -> Self {
-        Self::Null
-    }
 }
 
 impl Serialize for CatalogInterleaved {
@@ -575,7 +575,7 @@ pub struct CatalogInterleavedObject {
 }
 
 /// Reasoning option exposed by the catalog.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogReasoningOption {
     /// Reasoning effort values.
     Effort {
@@ -671,7 +671,7 @@ impl<'de> Deserialize<'de> for CatalogReasoningOption {
 }
 
 /// Reasoning effort value, including non-string values preserved from source JSON.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CatalogReasoningEffortValue {
     /// Named effort value.
@@ -806,7 +806,7 @@ pub enum CatalogDriftField {
 }
 
 /// One configured fact that differs from the catalog.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogDrift {
     /// Drift field.
     pub field: CatalogDriftField,
@@ -897,7 +897,7 @@ fn sort_matches(matches: &mut [CatalogMatch]) {
     });
 }
 
-fn confidence_rank(confidence: CatalogMatchConfidence) -> u8 {
+const fn confidence_rank(confidence: CatalogMatchConfidence) -> u8 {
     match confidence {
         CatalogMatchConfidence::Exact => 3,
         CatalogMatchConfidence::High => 2,
@@ -982,6 +982,10 @@ fn token_score(provider: &CatalogProvider, model: &CatalogModel, query_tokens: &
     score
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the scoring inputs are independent matching signals"
+)]
 fn suggestion_score(
     provider: &CatalogProvider,
     model: &CatalogModel,
@@ -1046,10 +1050,10 @@ fn compare_present<T>(
 ) where
     T: PartialEq + Serialize,
 {
-    if let (Some(configured), Some(catalog)) = (configured, catalog) {
-        if configured != catalog {
-            drifts.push(CatalogDrift::new(field, configured, catalog));
-        }
+    if let (Some(configured), Some(catalog)) = (configured, catalog)
+        && configured != catalog
+    {
+        drifts.push(CatalogDrift::new(field, configured, catalog));
     }
 }
 
