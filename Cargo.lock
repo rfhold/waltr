@@ -3087,15 +3087,21 @@ name = "waltr-tui"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "insta",
  "waltr-client",
  "waltr-server",
  "pulldown-cmark",
+ "rand 0.9.4",
  "ratatui",
+ "reqwest",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "syntect",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

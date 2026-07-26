@@ -16,7 +16,7 @@ expression: render_app(&app)
 "                     Connect providers, tune local settings,                    "
 "                  and keep the runtime in sync from one shell.                  "
 "                                                                                "
-"              Ctrl-X c config  Ctrl-X s sessions  Ctrl-X q quit                 "
+"              C-x c config  C-x s sessions  C-x q quit                          "
 "                                                                                "
 "                                                                                "
 "                                                                                "

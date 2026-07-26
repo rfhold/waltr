@@ -28,6 +28,8 @@ pub enum LeaderCommand {
     Mcp,
     /// Quit the app immediately.
     Quit,
+    /// Clear in-memory Waltr credentials.
+    Logout,
     /// Start deleting the current row/detail item.
     Delete,
     /// Unknown leader command text for notices.
@@ -74,6 +76,10 @@ fn leader_command(key: KeyEvent) -> LeaderCommand {
 
     if matches!(key.code, KeyCode::Char('q')) {
         return LeaderCommand::Quit;
+    }
+
+    if matches!(key.code, KeyCode::Char('l')) {
+        return LeaderCommand::Logout;
     }
 
     if matches!(key.code, KeyCode::Char('d')) {

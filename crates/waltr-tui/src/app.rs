@@ -2,18 +2,19 @@
 
 use std::time::{Duration, Instant};
 
-use waltr_client::{ClientAuthTarget, ClientCommand, ClientSnapshot};
+use waltr_client::{AccessStatus, ClientAuthTarget, ClientCommand, ClientSnapshot};
 use ratatui::Frame;
 use ratatui::crossterm::{
-    event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind},
+    event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind},
     terminal,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::{
-    event::AppEvent,
+    event::{AppEvent, NativeLoginEvent},
     input::InputEvent,
     keys::{KeyCommand, LeaderCommand, key_command},
+    native_auth::NativeAuthAction,
     screens::{
         ConfigTab, McpSection, ProviderSection, RuntimeDefaultsSection, SectionAction,
         SessionsSection, register_timeline_watch_command,
@@ -40,6 +41,8 @@ pub enum AppAction {
     ClientCommand(ClientCommand),
     /// Dispatch shared client commands in order.
     ClientCommands(Vec<ClientCommand>),
+    /// Ask the platform runtime to perform a native authentication side effect.
+    NativeAuth(NativeAuthAction),
 }
 
 /// The currently armed close confirmation, if any.
@@ -57,6 +60,8 @@ pub enum AppScreen {
     /// Waiting for the shared client to observe server readiness.
     #[default]
     Waiting,
+    /// Waltr server access login, separate from provider/MCP authorization.
+    Access,
     /// Ready landing screen with command palette.
     Landing,
     /// Read-only configuration view.
@@ -87,8 +92,13 @@ pub struct App {
     leader_armed: bool,
     notice: Option<TransientNotice>,
     screen: AppScreen,
+    access_return_screen: Option<AppScreen>,
     auth_input: String,
     client_snapshot: Option<ClientSnapshot>,
+    native_login: NativeLoginState,
+    has_native_credential: bool,
+    logout_snapshot_barrier: LogoutSnapshotBarrier,
+    now: Option<Instant>,
 }
 
 impl App {
@@ -106,8 +116,13 @@ impl App {
             leader_armed: false,
             notice: None,
             screen: AppScreen::Waiting,
+            access_return_screen: None,
             auth_input: String::new(),
             client_snapshot: None,
+            native_login: NativeLoginState::Idle,
+            has_native_credential: false,
+            logout_snapshot_barrier: LogoutSnapshotBarrier::None,
+            now: None,
         }
     }
 
@@ -132,12 +147,17 @@ impl App {
                 AppAction::from_commands(self.handle_client_snapshot(snapshot.as_ref().clone()))
             }
             AppEvent::Input(input) => self.handle_input_event(*input, now),
+            AppEvent::NativeLogin(event) => {
+                self.handle_native_login_event(event.clone(), now);
+                AppAction::Continue
+            }
         }
     }
 
     fn handle_input_event(&mut self, input: InputEvent, now: Instant) -> AppAction {
         match input {
             InputEvent::CtrlC => self.handle_close_intent(CloseIntent::CtrlC, now),
+            InputEvent::Key(key) if self.screen == AppScreen::Access => self.handle_access_key(key),
             InputEvent::Key(key) if self.auth_requirement().is_some() => {
                 self.handle_auth_key(key, now)
             }
@@ -163,6 +183,7 @@ impl App {
 
     /// Update time-sensitive app state.
     pub fn update(&mut self, now: Instant) {
+        self.now = Some(now);
         if self
             .armed_close
             .is_some_and(|armed_close| now >= armed_close.expires_at)
@@ -215,6 +236,81 @@ impl App {
         &self.auth_input
     }
 
+    /// Safe reason shown on the Waltr access screen.
+    #[must_use]
+    pub fn access_reason(&self) -> &str {
+        self.client_snapshot()
+            .and_then(|snapshot| snapshot.access.error.as_deref())
+            .unwrap_or("This Waltr server requires authentication.")
+    }
+
+    /// Current native login status text.
+    #[must_use]
+    pub const fn native_login_status(&self) -> &'static str {
+        match self.native_login {
+            NativeLoginState::Idle | NativeLoginState::Canceled => "Signed out",
+            NativeLoginState::Discovering => "Discovering identity provider...",
+            NativeLoginState::AwaitingBrowser {
+                browser_opened: true,
+                ..
+            } => "Waiting for browser callback",
+            NativeLoginState::AwaitingBrowser {
+                browser_opened: false,
+                ..
+            } => "Browser unavailable; open the URL manually",
+            NativeLoginState::Exchanging => "Exchanging authorization code...",
+            NativeLoginState::Refreshing => "Refreshing access...",
+            NativeLoginState::Succeeded => "Signed in; reconnecting...",
+            NativeLoginState::Failed { .. } => "Sign in failed",
+        }
+    }
+
+    /// Current copyable authorization URL.
+    #[must_use]
+    pub fn native_login_url(&self) -> Option<&str> {
+        match &self.native_login {
+            NativeLoginState::AwaitingBrowser {
+                authorization_url, ..
+            } => Some(authorization_url),
+            _ => None,
+        }
+    }
+
+    /// Seconds until the loopback callback expires.
+    #[must_use]
+    pub fn native_login_remaining(&self) -> Option<u64> {
+        match self.native_login {
+            NativeLoginState::AwaitingBrowser { expires_at, .. } => Some(
+                expires_at
+                    .saturating_duration_since(self.now.unwrap_or(expires_at))
+                    .as_secs(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Safe native login failure text.
+    #[must_use]
+    pub fn native_login_error(&self) -> Option<&str> {
+        match &self.native_login {
+            NativeLoginState::Failed { error } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Keyboard hints for the current access state.
+    #[must_use]
+    pub const fn access_hint(&self) -> &'static str {
+        match self.native_login {
+            NativeLoginState::AwaitingBrowser { .. } => "c copy URL    Esc cancel",
+            NativeLoginState::Discovering | NativeLoginState::Exchanging => "Esc cancel",
+            NativeLoginState::Succeeded | NativeLoginState::Refreshing => "Reconnecting to Waltr...",
+            NativeLoginState::Idle
+            | NativeLoginState::Canceled
+            | NativeLoginState::Failed { .. } => "Enter sign in    r retry    Ctrl-C Ctrl-C quit",
+        }
+    }
+
     /// Return the active config tab.
     #[must_use]
     pub const fn active_config_tab(&self) -> ConfigTab {
@@ -243,6 +339,12 @@ impl App {
     #[must_use]
     pub const fn sessions_section(&self) -> &SessionsSection {
         &self.sessions_section
+    }
+
+    /// Whether an explicit native logout is currently meaningful.
+    #[must_use]
+    pub const fn can_logout(&self) -> bool {
+        self.has_native_credential
     }
 
     /// Whether Escape has armed interruption for the active session.
@@ -324,11 +426,109 @@ impl App {
         }
     }
 
+    fn handle_access_key(&self, key: KeyEvent) -> AppAction {
+        if key.kind != KeyEventKind::Press {
+            return AppAction::Continue;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('r')
+                if matches!(
+                    self.native_login,
+                    NativeLoginState::Idle
+                        | NativeLoginState::Canceled
+                        | NativeLoginState::Failed { .. }
+                ) =>
+            {
+                AppAction::NativeAuth(NativeAuthAction::Start)
+            }
+            KeyCode::Esc
+                if matches!(
+                    self.native_login,
+                    NativeLoginState::Discovering
+                        | NativeLoginState::AwaitingBrowser { .. }
+                        | NativeLoginState::Exchanging
+                ) =>
+            {
+                AppAction::NativeAuth(NativeAuthAction::Cancel)
+            }
+            KeyCode::Char('c') => self.native_login_url().map_or(AppAction::Continue, |url| {
+                AppAction::NativeAuth(NativeAuthAction::CopyUrl(url.to_owned()))
+            }),
+            _ => AppAction::Continue,
+        }
+    }
+
+    fn handle_native_login_event(&mut self, event: NativeLoginEvent, now: Instant) {
+        self.now = Some(now);
+        self.native_login = match event {
+            NativeLoginEvent::Discovering => NativeLoginState::Discovering,
+            NativeLoginEvent::AwaitingBrowser {
+                authorization_url,
+                expires_at,
+                browser_opened,
+            } => NativeLoginState::AwaitingBrowser {
+                authorization_url,
+                expires_at,
+                browser_opened,
+            },
+            NativeLoginEvent::BrowserLaunchFailed => {
+                if let NativeLoginState::AwaitingBrowser {
+                    authorization_url,
+                    expires_at,
+                    ..
+                } = &self.native_login
+                {
+                    NativeLoginState::AwaitingBrowser {
+                        authorization_url: authorization_url.clone(),
+                        expires_at: *expires_at,
+                        browser_opened: false,
+                    }
+                } else {
+                    return;
+                }
+            }
+            NativeLoginEvent::Exchanging => NativeLoginState::Exchanging,
+            NativeLoginEvent::Refreshing => NativeLoginState::Refreshing,
+            NativeLoginEvent::RefreshSucceeded | NativeLoginEvent::Succeeded => {
+                self.has_native_credential = true;
+                NativeLoginState::Succeeded
+            }
+            NativeLoginEvent::Failed { error } => {
+                self.has_native_credential = false;
+                NativeLoginState::Failed { error }
+            }
+            NativeLoginEvent::Canceled => {
+                self.has_native_credential = false;
+                NativeLoginState::Canceled
+            }
+            NativeLoginEvent::LoggedOut => {
+                self.clear_protected_ui_state();
+                self.logout_snapshot_barrier = LogoutSnapshotBarrier::AwaitingLogoutObservation;
+                NativeLoginState::Canceled
+            }
+            NativeLoginEvent::UrlCopyFinished { copied } => {
+                self.notice = Some(TransientNotice {
+                    text: if copied {
+                        "authorization URL copied".to_owned()
+                    } else {
+                        "clipboard unavailable; select the displayed URL".to_owned()
+                    },
+                    expires_at: now + NOTICE_DURATION,
+                });
+                return;
+            }
+        };
+    }
+
     fn auth_requirement(&self) -> Option<&waltr_client::AuthRequirementSnapshot> {
         self.client_snapshot()
             .and_then(|snapshot| snapshot.auth.pending.first())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered key routing keeps terminal state transitions auditable"
+    )]
     fn handle_key_command(&mut self, command: KeyCommand, now: Instant) -> AppAction {
         match command {
             KeyCommand::None => AppAction::Continue,
@@ -526,6 +726,14 @@ impl App {
                 self.leader_armed = false;
                 AppAction::Exit
             }
+            KeyCommand::LeaderCommand(LeaderCommand::Logout) => {
+                self.leader_armed = false;
+                if self.has_native_credential {
+                    AppAction::NativeAuth(NativeAuthAction::Logout)
+                } else {
+                    AppAction::Continue
+                }
+            }
             KeyCommand::LeaderCommand(LeaderCommand::Delete) => {
                 self.leader_armed = false;
                 if self.screen == AppScreen::Sessions {
@@ -551,42 +759,98 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "snapshot reconciliation is one ordered UI state transition"
+    )]
     fn handle_client_snapshot(&mut self, snapshot: ClientSnapshot) -> Vec<ClientCommand> {
-        let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
+        match self.logout_snapshot_barrier {
+            LogoutSnapshotBarrier::AwaitingLogoutObservation
+                if snapshot.access.status != AccessStatus::UnknownChecking =>
+            {
+                return Vec::new();
+            }
+            LogoutSnapshotBarrier::AwaitingLogoutObservation => {
+                self.logout_snapshot_barrier = LogoutSnapshotBarrier::AwaitingAnonymousReprobe;
+            }
+            LogoutSnapshotBarrier::AwaitingAnonymousReprobe
+                if matches!(
+                    snapshot.access.status,
+                    AccessStatus::Authenticated
+                        | AccessStatus::LoginRequired
+                        | AccessStatus::LoginFailed
+                ) =>
+            {
+                self.logout_snapshot_barrier = LogoutSnapshotBarrier::None;
+            }
+            LogoutSnapshotBarrier::None | LogoutSnapshotBarrier::AwaitingAnonymousReprobe => {}
+        }
 
-        if snapshot.status.ready && self.screen == AppScreen::Waiting {
+        let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
+        let mut commands = Vec::new();
+
+        if matches!(
+            snapshot.access.status,
+            AccessStatus::LoginRequired | AccessStatus::LoginFailed | AccessStatus::LoginInProgress
+        ) {
+            if snapshot.access.status == AccessStatus::LoginRequired && self.has_native_credential {
+                self.has_native_credential = false;
+                commands.push(ClientCommand::ReprobeWaltrAccess);
+            }
+            if self.screen != AppScreen::Access {
+                self.access_return_screen = match self.screen {
+                    AppScreen::Landing | AppScreen::Config | AppScreen::Sessions => {
+                        Some(self.screen)
+                    }
+                    AppScreen::Waiting | AppScreen::Access => None,
+                };
+            }
+            self.screen = AppScreen::Access;
+            if snapshot.access.status == AccessStatus::LoginRequired
+                && matches!(self.native_login, NativeLoginState::Succeeded)
+            {
+                self.native_login =
+                    NativeLoginState::Failed {
+                        error: snapshot.access.error.clone().unwrap_or_else(|| {
+                            "Waltr rejected the installed credentials".to_owned()
+                        }),
+                    };
+            }
+        } else if snapshot.access.status == AccessStatus::Authenticated && snapshot.status.ready {
+            if matches!(self.screen, AppScreen::Access | AppScreen::Waiting) {
+                self.screen = self
+                    .access_return_screen
+                    .take()
+                    .unwrap_or(AppScreen::Landing);
+            }
+            self.native_login = NativeLoginState::Idle;
+        } else if snapshot.status.ready && self.screen == AppScreen::Waiting {
             self.screen = AppScreen::Landing;
         }
 
-        self.provider_section.reconcile_patch(&snapshot);
-        self.mcp_section.reconcile_patch(&snapshot);
-        self.runtime_defaults_section.reconcile_patch(&snapshot);
-        self.sessions_section.reconcile_operations(&snapshot);
+        if snapshot.access.status == AccessStatus::Authenticated && snapshot.status.ready {
+            self.provider_section.reconcile_patch(&snapshot);
+            self.mcp_section.reconcile_patch(&snapshot);
+            self.runtime_defaults_section.reconcile_patch(&snapshot);
+            self.sessions_section.reconcile_operations(&snapshot);
 
-        let provider_count = snapshot
-            .config
-            .current
-            .as_ref()
-            .map_or(0, |config| config.providers.len());
-        self.provider_section.sync_selection(provider_count);
+            if let Some(config) = snapshot.config.current.as_ref() {
+                self.provider_section.sync_selection(config.providers.len());
+                self.mcp_section.sync_selection(config.mcp_servers.len());
+                self.runtime_defaults_section.sync_selection(Some(config));
+            }
 
-        let server_count = snapshot
-            .config
-            .current
-            .as_ref()
-            .map_or(0, |config| config.mcp_servers.len());
-        self.mcp_section.sync_selection(server_count);
-        self.runtime_defaults_section
-            .sync_selection(snapshot.config.current.as_ref());
-
-        self.sessions_section
-            .sync_selection(snapshot.sessions.current.len());
+            if snapshot.sessions.watch.status == "received" {
+                self.sessions_section
+                    .sync_selection(snapshot.sessions.current.len());
+            }
+        }
 
         let detail_after = self.sessions_section.detail_session_id().map(str::to_owned);
 
         self.client_snapshot = Some(snapshot);
 
-        match (detail_before, detail_after) {
+        commands.extend(match (detail_before, detail_after) {
             (None, Some(session_id)) => vec![register_timeline_watch_command(session_id)],
             (Some(session_id), None) => {
                 vec![ClientCommand::ReleaseSessionTimelineWatchInterest { session_id }]
@@ -600,7 +864,26 @@ impl App {
                 ]
             }
             _ => Vec::new(),
-        }
+        });
+        commands
+    }
+
+    fn clear_protected_ui_state(&mut self) {
+        self.armed_close = None;
+        self.armed_session_interrupt = None;
+        self.active_config_tab = ConfigTab::Providers;
+        self.provider_section = ProviderSection::new();
+        self.mcp_section = McpSection::new();
+        self.runtime_defaults_section = RuntimeDefaultsSection::new();
+        self.sessions_section = SessionsSection::new();
+        self.leader_armed = false;
+        self.notice = None;
+        self.screen = AppScreen::Waiting;
+        self.access_return_screen = None;
+        self.auth_input.clear();
+        self.client_snapshot = None;
+        self.has_native_credential = false;
+        self.logout_snapshot_barrier = LogoutSnapshotBarrier::None;
     }
 
     fn active_section_has_overlay(&self) -> bool {
@@ -749,4 +1032,31 @@ struct ArmedClose {
 struct TransientNotice {
     text: String,
     expires_at: Instant,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum NativeLoginState {
+    #[default]
+    Idle,
+    Discovering,
+    AwaitingBrowser {
+        authorization_url: String,
+        expires_at: Instant,
+        browser_opened: bool,
+    },
+    Exchanging,
+    Refreshing,
+    Succeeded,
+    Failed {
+        error: String,
+    },
+    Canceled,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LogoutSnapshotBarrier {
+    #[default]
+    None,
+    AwaitingLogoutObservation,
+    AwaitingAnonymousReprobe,
 }

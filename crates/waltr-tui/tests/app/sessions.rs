@@ -100,6 +100,36 @@ fn sessions_provider_runtime_editor_renders_layered_snapshot() {
 }
 
 #[test]
+fn explicit_logout_clears_runtime_editor_and_session_confirmation_state() {
+    let mut app = open_sessions_app_with(runtime_editor_snapshot());
+    let now = Instant::now();
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("chat")
+    );
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press('p'), now), AppAction::Continue);
+    assert!(render_app(&app).contains("Models"));
+    drop(app.handle_event(
+        &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::LoggedOut),
+        now,
+    ));
+    assert_eq!(app.sessions_section(), &SessionsSection::new());
+
+    let mut confirmation = open_sessions_app_with(watched_sessions_snapshot(vec![session_view(
+        "doomed", 1,
+    )]));
+    assert_eq!(confirmation.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(confirmation.handle_event(&char_press('d'), now), AppAction::Continue);
+    assert!(render_app(&confirmation).contains("Delete?"));
+    drop(confirmation.handle_event(
+        &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::LoggedOut),
+        now,
+    ));
+    assert_eq!(confirmation.sessions_section(), &SessionsSection::new());
+}
+
+#[test]
 fn sessions_runtime_search_supports_middle_editing() {
     let mut app = open_sessions_app_with(runtime_editor_snapshot());
     let now = Instant::now();
@@ -1572,6 +1602,34 @@ fn sessions_detail_permission_prompt_selectable_deny_resume_includes_message() {
                     .to_owned(),
         })
     );
+}
+
+#[test]
+fn explicit_logout_clears_prompt_draft_and_focus() {
+    let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"rm -rf target"}}}"#;
+    let mut app = open_sessions_app_with(watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![external_request_event(
+            1, "chat", "req-item", "req-1", 1, payload,
+        )],
+    ));
+    let now = Instant::now();
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("chat")
+    );
+    assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
+    for character in "private denial".chars() {
+        assert_eq!(app.handle_event(&char_press(character), now), AppAction::Continue);
+    }
+    assert!(render_app(&app).contains("private denial"));
+    drop(app.handle_event(
+        &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::LoggedOut),
+        now,
+    ));
+    assert_eq!(app.sessions_section(), &SessionsSection::new());
+    assert!(!render_app(&app).contains("private denial"));
 }
 
 #[test]

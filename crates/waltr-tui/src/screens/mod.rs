@@ -1,5 +1,6 @@
 //! TUI screen rendering.
 
+mod access;
 mod config;
 mod landing;
 mod operation;
@@ -7,6 +8,7 @@ mod runtime_selector;
 mod sessions;
 mod splash;
 
+pub use access::draw_access;
 pub use config::{
     ConfigTab, McpForm, McpFormMode, McpSection, ModelForm, ModelFormMode, ProviderForm,
     ProviderFormMode, ProviderSection, RuntimeDefaultsSection, draw_config,

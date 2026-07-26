@@ -17,6 +17,8 @@ pub enum AppEvent {
     Stream(StreamEvent),
     /// Shared client state changed.
     Client(Box<ClientSnapshot>),
+    /// Secret-free progress from the native Waltr login runtime.
+    NativeLogin(NativeLoginEvent),
 }
 
 impl AppEvent {
@@ -25,9 +27,49 @@ impl AppEvent {
     pub const fn timestamp(&self, fallback: Instant) -> Instant {
         match self {
             Self::Tick(now) => *now,
-            Self::Input(_) | Self::Stream(_) | Self::Client(_) => fallback,
+            Self::Input(_) | Self::Stream(_) | Self::Client(_) | Self::NativeLogin(_) => fallback,
         }
     }
+}
+
+/// Secret-free native Waltr login progress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeLoginEvent {
+    /// Metadata discovery is in progress.
+    Discovering,
+    /// The authorization URL is ready and the callback listener is active.
+    AwaitingBrowser {
+        /// URL that may be copied when browser launching is unavailable.
+        authorization_url: String,
+        /// Callback deadline.
+        expires_at: Instant,
+        /// Whether a platform browser command was started successfully.
+        browser_opened: bool,
+    },
+    /// The platform browser command started but later reported failure.
+    BrowserLaunchFailed,
+    /// The authorization code is being exchanged.
+    Exchanging,
+    /// The access token is being refreshed.
+    Refreshing,
+    /// Refresh completed and credentials were atomically replaced.
+    RefreshSucceeded,
+    /// Credentials were installed before client reconnection.
+    Succeeded,
+    /// The flow failed with safe user-facing text.
+    Failed {
+        /// Safe failure text; never contains token response bodies.
+        error: String,
+    },
+    /// The flow was canceled.
+    Canceled,
+    /// In-memory credentials were removed.
+    LoggedOut,
+    /// Clipboard command completed.
+    UrlCopyFinished {
+        /// Whether a supported platform clipboard command succeeded.
+        copied: bool,
+    },
 }
 
 /// Async stream update delivered to the app event loop.
