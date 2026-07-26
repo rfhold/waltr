@@ -170,12 +170,21 @@ test("script selection only schedules phases where the script exists", () => {
   const oidcPlan = buildRunPlan(parseCliArgs(["--access", "oidc"]));
   assert.equal(
     oidcPlan[0].scripts.includes("tests/web/k6/sessions/mcp-oauth.browser.js"),
-    false,
+    true,
   );
+  const hostedPlan = buildRunPlan(parseCliArgs([
+    "--access",
+    "both",
+    "--script",
+    "sessions/mcp-oauth.browser.js",
+  ]));
+  assert.equal(hostedPlan.length, 1);
+  assert.equal(hostedPlan[0].phase, "oidc");
+  assert.deepEqual(hostedPlan[0].scripts, ["tests/web/k6/sessions/mcp-oauth.browser.js"]);
   assert.throws(
     () => buildRunPlan(parseCliArgs([
       "--access",
-      "oidc",
+      "disabled",
       "--script",
       "sessions/mcp-oauth.browser.js",
     ])),

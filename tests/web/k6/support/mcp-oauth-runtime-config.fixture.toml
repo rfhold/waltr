@@ -25,7 +25,7 @@ image = false
 name = "protected"
 type = 2
 command = ""
-url = "http://mcp:14666/mcp"
+url = "https://waltr.test/mcp"
 
 [runtime_defaults]
 provider_key = "k6-openai"

@@ -17,6 +17,8 @@ const caScriptPath = `${repoRoot}/tests/web/k6/support/generate-test-ca.sh`;
 const caScript = readFileSync(caScriptPath, "utf8");
 const k6Entrypoint = readFileSync(`${repoRoot}/tests/web/k6/support/k6-entrypoint.sh`, "utf8");
 const trustScript = readFileSync(`${repoRoot}/tests/web/k6/access/trust.browser.js`, "utf8");
+const hostedOauthScript = readFileSync(`${repoRoot}/tests/web/k6/sessions/mcp-oauth.browser.js`, "utf8");
+const hostedOauthFixture = readFileSync(`${repoRoot}/tests/web/k6/support/mcp-oauth-runtime-config.fixture.toml`, "utf8");
 const config = composeConfig("*");
 
 const expectedServicesByProfile = {
@@ -91,7 +93,15 @@ test("all Waltr services have exact static environments", () => {
       ...expectedCommonEnvironment,
       WALTR_AUTH_MODE: "oidc",
       WALTR_MCP_REQUIRED_SCOPES: "mcp:use",
+      WALTR_MCP_OAUTH_ISSUER: "https://waltr.test/oauth",
       WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE: "/run/waltr-mcp-oauth/keyring.json",
+      WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL: "600",
+      WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL: "86400",
+      WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL: "2592000",
+      WALTR_MCP_OAUTH_CODE_TTL: "300",
+      WALTR_MCP_OAUTH_ALLOW_DCR: "true",
+      WALTR_MCP_OAUTH_ALLOW_CIMD: "true",
+      WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS: "true",
       WALTR_OIDC_AUDIENCE: "waltr-access-test",
       WALTR_OIDC_CLIENT_ID: "waltr-access-test",
       WALTR_OIDC_CLIENT_SECRET: "waltr-access-test-secret",
@@ -116,8 +126,19 @@ test("all Waltr services have exact static environments", () => {
   ]);
   assert.match(config.services["waltr-auth"].command.join(" "), /head -c 32 \/dev\/urandom/);
   assert.match(config.services["waltr-auth"].command.join(" "), /chmod 0440 \/run\/waltr-mcp-oauth\/keyring\.json/);
-  assert.doesNotMatch(rawCompose, /WALTR_MCP_(?:OIDC|SELF|PROTECTED_OAUTH|OAUTH_ALLOW_DCR|OAUTH_ALLOW_CIMD)/);
-  assert.doesNotMatch(rawCompose, /WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS/);
+  assert.doesNotMatch(rawCompose, /WALTR_MCP_(?:OIDC|SELF|PROTECTED_OAUTH)/);
+  for (const serviceName of ["waltr", "waltr-test", "mcp", "k6", "mcp-auth", "k6-auth"]) {
+    assert.equal(config.services[serviceName].environment?.WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS, undefined);
+  }
+});
+
+test("hosted MCP OAuth fixture uses the OIDC/TLS Waltr resource contract", () => {
+  assert.match(hostedOauthFixture, /^url = "https:\/\/waltr\.test\/mcp"$/m);
+  assert.match(hostedOauthFixture, /^enabled_mcp_server_keys = \["protected"\]$/m);
+  assert.match(hostedOauthScript, /\.well-known\/oauth-client\/waltr/);
+  assert.match(hostedOauthScript, /outbound-oauth\/callback/);
+  assert.match(hostedOauthScript, /configuration\.inspect/);
+  assert.doesNotMatch(hostedOauthScript, /completeDexLoginViaHttp/);
 });
 
 test("test services use profile-local internal networks", () => {

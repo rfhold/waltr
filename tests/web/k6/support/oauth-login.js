@@ -28,7 +28,10 @@ export function completeDexLoginViaHttp({ authUrl, username, password }) {
     return redirectUrl;
   }
 
-  throw new Error(`Dex HTTP login did not reach authorization code redirect at ${redirectUrl}: ${loginResponse.body}`);
+  throw new Error(
+    `Dex HTTP login did not reach authorization code redirect at ${safeUrl(redirectUrl)} ` +
+      `(status ${loginResponse.status})`,
+  );
 }
 
 async function waitForCodeRedirect(page, failureScreenshot, isComplete) {
@@ -43,8 +46,7 @@ async function waitForCodeRedirect(page, failureScreenshot, isComplete) {
   }
 
   await screenshot(page, failureScreenshot);
-  const bodyText = await page.locator("body").textContent().catch(() => "");
-  throw new Error(`Dex login did not reach authorization code redirect at ${page.url()}: ${bodyText}`);
+  throw new Error(`Dex login did not reach authorization code redirect at ${safeUrl(page.url())}`);
 }
 
 export function dexAuthorizeUrl({ issuer, clientId, redirectUri, scope = "openid email profile" }) {
@@ -99,4 +101,9 @@ function resolveUrl(base, location) {
   }
 
   return `${base.replace(/\/[^/]*$/, "/")}${location}`;
+}
+
+function safeUrl(value) {
+  const match = value.match(/^(https?:\/\/[^/?#]+)([^?#]*)/);
+  return match ? `${match[1]}${match[2] || "/"}` : "an invalid URL";
 }
