@@ -88,6 +88,10 @@ pub(super) fn composer_cursor_at_line_column(
     text.len()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "render entry point receives independent composer layout inputs"
+)]
 pub(super) fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -171,7 +175,7 @@ fn render_resource_autocomplete_overlay(
         .min(RESOURCE_AUTOCOMPLETE_MAX_ROWS.saturating_add(2));
     if height <= 2 {
         return;
-    };
+    }
 
     let area = Rect {
         x: inner_area.x,
@@ -185,13 +189,15 @@ fn render_resource_autocomplete_overlay(
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    let lines = match section.current_template_search(snapshot) {
-        Some(search) => resource_autocomplete_lines(section, search, usize::from(body_area.height)),
-        None => vec![Line::from(vec![Span::styled(
-            "Searching resources...",
-            panel_muted_style(),
-        )])],
-    };
+    let lines = section.current_template_search(snapshot).map_or_else(
+        || {
+            vec![Line::from(vec![Span::styled(
+                "Searching resources...",
+                panel_muted_style(),
+            )])]
+        },
+        |search| resource_autocomplete_lines(section, search, usize::from(body_area.height)),
+    );
 
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Line::default()).style(panel_style()), area);

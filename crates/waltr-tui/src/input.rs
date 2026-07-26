@@ -28,24 +28,24 @@ pub fn drain_input_events() -> io::Result<Vec<InputEvent>> {
     let mut events = Vec::new();
 
     while event::poll(Duration::ZERO)? {
-        push_terminal_event(&mut events, event::read()?);
+        push_terminal_event(&mut events, &event::read()?);
     }
 
     Ok(events)
 }
 
-fn push_terminal_event(events: &mut Vec<InputEvent>, event: Event) {
+fn push_terminal_event(events: &mut Vec<InputEvent>, event: &Event) {
     match event {
-        Event::Key(key) => events.push(normalize_key_event(key)),
+        Event::Key(key) => events.push(normalize_key_event(*key)),
         Event::Mouse(mouse) => match mouse_scroll_delta(mouse.kind) {
             Some(delta) => push_scroll_event(events, delta),
-            None => events.push(InputEvent::Mouse(mouse)),
+            None => events.push(InputEvent::Mouse(*mouse)),
         },
         _ => {}
     }
 }
 
-fn mouse_scroll_delta(kind: MouseEventKind) -> Option<i32> {
+const fn mouse_scroll_delta(kind: MouseEventKind) -> Option<i32> {
     match kind {
         MouseEventKind::ScrollUp => Some(1),
         MouseEventKind::ScrollDown => Some(-1),
@@ -104,9 +104,9 @@ mod tests {
     fn consecutive_scroll_events_coalesce() {
         let mut events = Vec::new();
 
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollUp));
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollUp));
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollUp));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollUp));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollUp));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollUp));
 
         assert_eq!(events, vec![InputEvent::Scroll(3)]);
     }
@@ -115,9 +115,9 @@ mod tests {
     fn mixed_scroll_events_net_together() {
         let mut events = Vec::new();
 
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollUp));
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollUp));
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollDown));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollUp));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollUp));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollDown));
 
         assert_eq!(events, vec![InputEvent::Scroll(1)]);
     }
@@ -128,9 +128,9 @@ mod tests {
         let key =
             KeyEvent::new_with_kind(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Press);
 
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollUp));
-        push_terminal_event(&mut events, Event::Key(key));
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollDown));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollUp));
+        push_terminal_event(&mut events, &Event::Key(key));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollDown));
 
         assert_eq!(
             events,
@@ -146,8 +146,8 @@ mod tests {
     fn opposing_scroll_events_cancel() {
         let mut events = Vec::new();
 
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollUp));
-        push_terminal_event(&mut events, scroll_event(MouseEventKind::ScrollDown));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollUp));
+        push_terminal_event(&mut events, &scroll_event(MouseEventKind::ScrollDown));
 
         assert!(events.is_empty());
     }

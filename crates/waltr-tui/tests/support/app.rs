@@ -1,3 +1,11 @@
+#![allow(
+    clippy::default_trait_access,
+    clippy::redundant_pub_crate,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "shared test fixtures retain crate-scoped helpers and explicit scenario fields"
+)]
+
 use std::{collections::BTreeMap, time::Instant};
 
 use waltr_client::{

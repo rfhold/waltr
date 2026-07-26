@@ -49,13 +49,13 @@ pub(super) fn template_inline_spans(
                             token_style,
                             template_attr(open_tag, "kind").as_deref() != Some("tool"),
                         );
-                        if template_attr(open_tag, "status").as_deref() == Some("error") {
-                            if let Some(error) = template_content(body) {
-                                spans.push(Span::styled(
-                                    format!(" {}", decode_xml_entities(error.trim())),
-                                    error_style,
-                                ));
-                            }
+                        if template_attr(open_tag, "status").as_deref() == Some("error")
+                            && let Some(error) = template_content(body)
+                        {
+                            spans.push(Span::styled(
+                                format!(" {}", decode_xml_entities(error.trim())),
+                                error_style,
+                            ));
                         }
                     } else {
                         push_template_token_spans(

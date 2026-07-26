@@ -72,7 +72,7 @@ async fn setup_runtime_defaults_server() -> &'static TestServer {
                     kind: ProviderKindView::AnthropicMessages,
                     name: "anthropic".to_owned(),
                     url: "https://api.anthropic.com/v1/messages".to_owned(),
-                    headers: Default::default(),
+                    headers: BTreeMap::default(),
                     oauth_compatible: false,
                     oauth_settings: None,
                     models: BTreeMap::from([("sonnet".to_owned(), model("Claude"))]),

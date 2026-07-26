@@ -281,7 +281,7 @@ impl PromptDraft {
         }
     }
 
-    fn move_question_focus_up(&mut self) {
+    const fn move_question_focus_up(&mut self) {
         match self.question_focus {
             QuestionPromptFocus::Options => {
                 self.selected_option = self.selected_option.saturating_sub(1);
@@ -941,7 +941,7 @@ fn handle_text_edit_key(text: &mut String, cursor: &mut usize, key: KeyEvent) ->
             TextEditAction::Handled
         }
         KeyCode::Delete => {
-            delete_text_at_cursor(text, cursor);
+            delete_text_at_cursor(text, *cursor);
             TextEditAction::Handled
         }
         KeyCode::Char(character)
@@ -993,15 +993,15 @@ fn delete_text_before_cursor(text: &mut String, cursor: &mut usize) {
     *cursor = previous;
 }
 
-fn delete_text_at_cursor(text: &mut String, cursor: &mut usize) {
-    if *cursor >= text.len() {
+fn delete_text_at_cursor(text: &mut String, cursor: usize) {
+    if cursor >= text.len() {
         return;
     }
-    let end = text[*cursor..]
+    let end = text[cursor..]
         .chars()
         .next()
-        .map_or(*cursor, |character| *cursor + character.len_utf8());
-    text.drain(*cursor..end);
+        .map_or(cursor, |character| cursor + character.len_utf8());
+    text.drain(cursor..end);
 }
 
 pub(super) fn current_external_prompt(

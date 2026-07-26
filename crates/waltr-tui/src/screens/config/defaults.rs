@@ -119,7 +119,7 @@ impl RuntimeDefaultsSection {
     }
 
     /// Dismiss active overlay, if any.
-    pub fn dismiss_overlay(&mut self) -> bool {
+    pub const fn dismiss_overlay(&mut self) -> bool {
         if self.patch.is_pending() {
             return false;
         }
@@ -128,7 +128,7 @@ impl RuntimeDefaultsSection {
     }
 
     /// Open the default model selector from the config shell leader command.
-    pub fn open_create_form(&mut self) {
+    pub const fn open_create_form(&mut self) {
         if !self.patch.is_pending() {
             self.overlay = Some(RuntimeDefaultsOverlay::Model);
         }
@@ -195,7 +195,7 @@ impl RuntimeDefaultsSection {
                     self.selected_mcp = (self.selected_mcp + 1).min(max);
                     SectionAction::Continue
                 }
-                KeyCode::Char(' ') | KeyCode::Char('m') => {
+                KeyCode::Char(' ' | 'm') => {
                     self.toggle_selected_mcp(config);
                     SectionAction::Continue
                 }
@@ -461,10 +461,7 @@ impl RuntimeDefaultsSection {
         {
             "not supported".to_owned()
         } else {
-            draft
-                .reasoning_effort
-                .clone()
-                .unwrap_or_else(|| "none".to_owned())
+            draft.reasoning_effort.unwrap_or_else(|| "none".to_owned())
         };
 
         vec![

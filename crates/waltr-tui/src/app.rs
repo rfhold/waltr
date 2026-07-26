@@ -32,6 +32,10 @@ const NOTICE_DURATION: Duration = Duration::from_millis(1_500);
 
 /// Result of applying an input event to the app.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "actions directly carry the command selected by the input state machine"
+)]
 pub enum AppAction {
     /// Continue running the TUI.
     Continue,
@@ -178,8 +182,7 @@ impl App {
             InputEvent::Key(key) => {
                 self.handle_key_command(key_command(key, self.leader_armed), now)
             }
-            InputEvent::Scroll(_) => AppAction::Continue,
-            InputEvent::Mouse(_) => AppAction::Continue,
+            InputEvent::Scroll(_) | InputEvent::Mouse(_) => AppAction::Continue,
         }
     }
 
@@ -377,13 +380,11 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return AppAction::Continue;
         }
-        let snapshot = match self.client_snapshot() {
-            Some(snapshot) => snapshot,
-            None => return AppAction::Continue,
+        let Some(snapshot) = self.client_snapshot() else {
+            return AppAction::Continue;
         };
-        let requirement = match snapshot.auth.pending.first() {
-            Some(requirement) => requirement,
-            None => return AppAction::Continue,
+        let Some(requirement) = snapshot.auth.pending.first() else {
+            return AppAction::Continue;
         };
         let target = requirement.target.clone();
         let attempt = snapshot
