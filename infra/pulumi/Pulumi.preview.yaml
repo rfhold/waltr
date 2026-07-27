@@ -1,0 +1,25 @@
+config:
+  kubernetes:context: pantheon
+  waltr:namespace: waltr-preview
+  waltr:hostname: preview-waltr.holdenitdown.net
+  waltr:displayName: Waltr Preview
+  waltr:slug: waltr-preview
+  waltr:authentikBaseUrl: https://auth.holdenitdown.net
+  waltr:protectData: false
+  waltr:dataStorageSize: 10Gi
+  waltr:databaseStorageSize: 10Gi
+  waltr:storageClass: shared-fs
+  waltr:bucketStorageClass: default-bucket
+  waltr:s3Endpoint: https://s3.pantheon.holdenitdown.net
+  waltr:s3Prefix: preview/sessions
+  waltr:apiAudience: waltr-preview-api
+  waltr:apiScope: waltr:use
+  waltr:mcpScope: mcp:use
+  waltr:mcpOAuthAccessTokenTtl: "300"
+  waltr:mcpOAuthRefreshTokenTtl: "86400"
+  waltr:mcpOAuthRefreshFamilyTtl: "2592000"
+  waltr:mcpOAuthCodeTtl: "300"
+  waltr:mcpOAuthAllowDcr: true
+  waltr:mcpOAuthAllowCimd: true
+  waltr:mcpOAuthWrappingKeyVersions: [v1]
+  waltr:mcpOAuthActiveWrappingKeyVersion: v1
