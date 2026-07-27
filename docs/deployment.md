@@ -1,0 +1,171 @@
+# Deployment
+
+## Persistence
+
+`WALTR_DATABASE_URL` selects the Waltr-owned database used for access-auth and outbound OAuth state. Optional `WALTR_MCP_DATABASE_URL` independently selects the database used for MCP Streamable HTTP sessions and the hosted MCP authorization server.
+
+| Value | Behavior |
+| --- | --- |
+| Unset | Waltr SQLite at `$XDG_DATA_HOME/waltr/waltr.sqlite3`, or `$HOME/.local/share/waltr/waltr.sqlite3` when `XDG_DATA_HOME` is unset. MCP uses sibling `mcp.sqlite3`. Startup fails if no absolute data directory can be resolved. |
+| `sqlite:<path>` | File-backed SQLite. Parent directories are created. Use an explicit SQLite memory URL only for ephemeral development or tests. |
+| `postgres://...` or `postgresql://...` | PostgreSQL. A supplied `sslmode` is preserved; otherwise Waltr defaults to `sslmode=require`. |
+
+When `WALTR_MCP_DATABASE_URL` is absent or empty, file-backed SQLite derives sibling `mcp.sqlite3` while preserving safe parsed SQLite options; PostgreSQL reuses the same logical database through a separate pool. An explicit MCP URL may override either default. Waltr rejects physical aliases for the same SQLite file and equal named shared in-memory databases. Separate private `sqlite::memory:` targets create independent Waltr and MCP databases.
+
+These databases are not the agent session store configured by `WALTR_SESSION_STORE`, nor the provider/upstream-MCP credential file configured by `WALTR_AUTH_PATH`.
+
+Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, and outbound OAuth attempts/credentials in `waltr.sqlite3`, while MCP history, session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, and `0004_outbound_oauth`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
+
+## Container Runtime And Local Compose
+
+The repository `Dockerfile` produces the supported production `runtime` image as well as test-only stages. The runtime contains the release server with embedded web assets, runs as nonroot UID/GID `65532`, listens on `0.0.0.0:14333`, and uses `/data` as its home, working directory, and default writable persistence root. Mount writable storage at `/data` for filesystem-backed settings, or configure external PostgreSQL and S3 services.
+
+`compose.yml` remains fixed local development and integration-test infrastructure. It intentionally exposes only static `dev`, `test`, and `test-auth` profiles; bare `docker compose up` starts nothing.
+
+`docker compose --profile dev up` builds the embedded server and web assets for local use. The `waltr` service uses:
+
+- `WALTR_DATABASE_URL=sqlite:///data/waltr.sqlite3`
+- Empty `WALTR_MCP_DATABASE_URL`, which derives the MCP target
+- Derived MCP database `/data/mcp.sqlite3`
+- `WALTR_AUTH_PATH=/data/auth.json`
+- `WALTR_SESSION_STORE=filesystem`
+- `WALTR_SESSION_FILESYSTEM_ROOT=/data/sessions`
+- Named volume `waltr-dev-data` mounted at `/data`
+
+The static profile does not consume ambient `WALTR_*` deployment settings. Change server environment configuration in the actual process/container runtime used by a deployment, not through this Compose fixture.
+
+The `dev` volume contains both SQLite files, provider credentials, and filesystem agent sessions. It is disposable local state, not a production backup contract.
+
+The `test` and `test-auth` profiles use tmpfs persistence, internal-only networking, health-gated startup, deterministic Dex/MCP fixtures, and an ephemeral TLS CA. Their `WALTR_OAUTH_*` and `WALTR_TEST_MCP_*` values are test-fixture settings, not server deployment variables. The authenticated Waltr fixture enables the hosted MCP issuer, generates an ephemeral keyring in tmpfs, and sets `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS=true` only so HTTPS Waltr-to-Waltr CIMD and token requests can reach private Compose aliases. Production deployments must leave this deterministic test exception unset. The fixture does not configure a direct MCP issuer or a preregistered self client.
+
+## Agent Session Storage
+
+`WALTR_SESSION_STORE` selects agent session storage independently of the Waltr and MCP SQL databases:
+
+| Value | Configuration |
+| --- | --- |
+| Unset or `filesystem` | Uses `WALTR_SESSION_FILESYSTEM_ROOT`, defaulting to `$HOME/.local/share/waltr/sessions`. |
+| `memory` | Ephemeral process-local sessions; suitable only for development and tests. |
+| `s3` | Requires every `WALTR_SESSION_S3_*` variable below. |
+
+| S3 variable | Contract |
+| --- | --- |
+| `WALTR_SESSION_S3_ENDPOINT` | HTTPS base URL without credentials, path, query, or fragment; HTTP is allowed only on loopback. |
+| `WALTR_SESSION_S3_REGION` | S3 region. |
+| `WALTR_SESSION_S3_BUCKET` | Existing bucket name. |
+| `WALTR_SESSION_S3_PREFIX` | Object-key prefix for Waltr session data. |
+| `WALTR_SESSION_S3_ACCESS_KEY_ID` | Static S3 access-key ID. |
+| `WALTR_SESSION_S3_SECRET_ACCESS_KEY` | Static S3 secret access key. |
+| `WALTR_SESSION_S3_FORCE_PATH_STYLE` | Exactly `true` or `false`. |
+
+The Pulumi workload definition uses S3 session storage. It intentionally specifies one Waltr replica with a `Recreate` strategy; do not increase the replica count without validating all coordination and credential-file ownership assumptions.
+
+## OIDC Access Domains
+
+Production OIDC deployment requires:
+
+```text
+WALTR_AUTH_MODE=oidc
+WALTR_PUBLIC_URL=https://waltr.example
+WALTR_OIDC_ISSUER=https://identity.example/issuer
+WALTR_OIDC_CLIENT_ID=waltr-browser
+WALTR_OIDC_CLIENT_SECRET=<provider-dependent secret>
+WALTR_OIDC_REDIRECT_URI=https://waltr.example/oidc/callback
+WALTR_OIDC_SCOPES=openid profile
+WALTR_API_OIDC_ISSUER=https://identity.example/application/o/waltr-native/
+WALTR_API_OIDC_AUDIENCE=waltr-api
+WALTR_API_REQUIRED_SCOPES=waltr:api
+WALTR_MCP_REQUIRED_SCOPES=mcp:use
+WALTR_MCP_OAUTH_ISSUER=https://waltr.example/oauth
+WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE=/var/run/secrets/waltr/mcp-oauth/keyring.json
+WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL=300
+WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL=86400
+WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL=2592000
+WALTR_MCP_OAUTH_CODE_TTL=300
+WALTR_MCP_OAUTH_ALLOW_DCR=true
+WALTR_MCP_OAUTH_ALLOW_CIMD=true
+WALTR_TRUSTED_PROXIES=10.0.0.0/8,2001:db8::/32
+```
+
+The browser, native Waltr API, and inbound MCP endpoint are separate authorization domains:
+
+| Domain | Issuer | Audience | Required scopes |
+| --- | --- | --- | --- |
+| Browser login | `WALTR_OIDC_ISSUER` | ID-token audience `WALTR_OIDC_CLIENT_ID` | Browser request `WALTR_OIDC_SCOPES` |
+| Native Waltr API bearer | `WALTR_API_OIDC_ISSUER`, falling back to `WALTR_OIDC_ISSUER` | `WALTR_API_OIDC_AUDIENCE`, falling back to legacy `WALTR_OIDC_AUDIENCE` | `WALTR_API_REQUIRED_SCOPES`, empty when omitted |
+| Inbound MCP bearer | Local `WALTR_MCP_OAUTH_ISSUER` | Exact public `/mcp` resource | `WALTR_MCP_REQUIRED_SCOPES` |
+
+The hosted issuer is enabled only in OIDC mode. `WALTR_MCP_REQUIRED_SCOPES` and `WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE` are required. The issuer defaults to the exact `WALTR_PUBLIC_URL` path plus `/oauth`; an override must equal that same HTTPS deployment-relative URL. Token/code lifetime bounds and defaults are documented in [Access Authentication](architecture/access-authentication.md). DCR and CIMD default off and must be enabled independently.
+
+`WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. It is required in OIDC mode, must use HTTPS except in explicit loopback mode, and is not inferred from the browser callback. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly.
+
+`WALTR_OIDC_CLIENT_SECRET` is optional only when browser-provider metadata supports token endpoint auth method `none`. `WALTR_AUTH_SESSION_TTL` optionally sets browser-session seconds and defaults to eight hours. `WALTR_TRUSTED_PROXIES` is optional; when set it is a comma-separated CIDR allowlist for trusting forwarded client addresses. Omit it unless a known reverse proxy overwrites forwarding headers.
+
+Register `WALTR_OIDC_REDIRECT_URI` exactly with the browser provider. It must use the exact `/oidc/callback` path and have no query or fragment. Browser ID tokens are validated against `WALTR_OIDC_CLIENT_ID`, native API tokens remain Authentik-issued, and MCP access tokens are issued and validated locally by Waltr.
+
+Terminate TLS at Waltr or a reverse proxy and preserve the public origin. `WALTR_PUBLIC_URL` is the sole authority for advertised URLs; Waltr does not infer issuer or resource URLs from forwarding headers. Route `/oidc/*`, `/oauth/*`, `/outbound-oauth/callback`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server/oauth`, `/.well-known/oauth-client/waltr`, `/mcp`, gRPC-web, web assets, and SPA paths without rewriting. The API-root RFC 9728 document remains the native API/Authentik domain. MCP metadata advertises only `WALTR_PUBLIC_URL` plus `/oauth` and the exact public `/mcp` resource.
+
+Waltr has no browser MCP client. `/mcp` therefore keeps an empty Origin allowlist: requests without `Origin` are accepted, while every browser-originated request is denied.
+
+OIDC discovery, authorization, token, and JWKS endpoints must use HTTPS. For loopback-only development, HTTP is accepted only when both settings are explicit:
+
+```text
+WALTR_AUTH_ALLOW_INSECURE_COOKIE=true
+WALTR_OIDC_ALLOW_INSECURE_HTTP=true
+```
+
+The callback and every HTTP OIDC endpoint must then be loopback. These flags are not a reverse-proxy workaround and must not be used for non-loopback deployments.
+
+## Native Client Registration
+
+Register a separate public native client at the effective API authorization server. It must allow Authorization Code with PKCE S256, token endpoint auth method `none`, and the selected loopback redirects. Do not reuse or distribute the browser confidential-client secret.
+
+Configure the TUI process with:
+
+```text
+WALTR_SERVER_ENDPOINT=https://waltr.example
+WALTR_OIDC_NATIVE_CLIENT_ID=waltr-native
+WALTR_OIDC_NATIVE_SCOPES="openid offline_access waltr:api"
+WALTR_OIDC_NATIVE_AUDIENCE=waltr-api
+WALTR_OIDC_NATIVE_LOOPBACK_POLICY=ephemeral
+```
+
+Only the native client ID is required at login. The TUI discovers only the API-root metadata at `/.well-known/oauth-protected-resource`, verifies its resource exactly matches `WALTR_SERVER_ENDPOINT`, sends that API resource in the authorization request, and never derives or discovers `/mcp`. Omit scopes to request `openid` plus the API metadata scopes. `WALTR_OIDC_NATIVE_AUDIENCE` is an optional provider-specific authorization parameter; it does not replace the resource parameter or server-side API audience validation. The loopback policy defaults to `ephemeral`; a fixed value must be an exact `http://127.0.0.1:<port>` URL registered with the provider.
+
+Native tokens and refresh tokens are process-memory only. Restarting the TUI requires login again. The TUI refreshes before expiry when a refresh token is returned and returns to login-required state when refresh fails or no refresh token remains after expiry.
+
+## Authentik And Pulumi Deployment
+
+The repository's supported infrastructure/workload definition is Pulumi under `infra/pulumi/`; there is no Kustomize deployment. Each `preview` and `prod` stack is defined to provision the Kubernetes workload, PostgreSQL, S3-compatible session/backup bucket, and two Authentik providers:
+
+| Provider | Type | Use |
+| --- | --- | --- |
+| Browser | Confidential | Server-side browser Authorization Code flow and `/oidc/callback`. |
+| Native API | Public | TUI Authorization Code with PKCE and loopback redirects; issues the API audience/scope. |
+Authentik has no MCP provider, application, audience, scope mapping, callback, or token-issuance role. Waltr hosts MCP authorization, supports DCR and CIMD according to explicit stack policy, and retains `WALTR_MCP_REQUIRED_SCOPES` as local policy.
+
+This is a clean cutover. Do not add `WALTR_MCP_OIDC_*`, `WALTR_MCP_SELF_OAUTH_*`, an Authentik MCP audience, a second advertised issuer, or a fallback validator. Existing native API tokens remain Authentik-issued but are not accepted at `/mcp`.
+
+Pulumi creates one random 256-bit key per configured wrapping-key version and persists it as a secret output in stack state. The generated versioned ring is stored only in the `waltr-mcp-oauth-wrapping-keys` Secret, mounted read-only at `/var/run/secrets/waltr/mcp-oauth/keyring.json` with mode `0440`, and made readable to runtime UID/GID `65532` through pod `fsGroup`. A secret-derived SHA-256 rollout annotation changes when the ring changes; no key or keyring is exported. Stack outputs expose only issuer, resource, metadata, and JWKS URLs.
+
+The keyring JSON requires top-level `schema_version: 1`, names one active version, and contains URL-safe base64 256-bit keys. Waltr rejects missing or unknown schema versions, unknown fields, non-files, files larger than 64 KiB, duplicate IDs, invalid key lengths, and Unix files writable by any class. Signing keys are generated in MCP, encrypted at rest under the active wrapping version, and rotated by the server-owned maintenance task every 24 hours. Activation is atomic; the prior public key remains in JWKS for the maximum configured access-token lifetime plus clock skew, and retained private material is rewrapped with the current wrapping key.
+
+The egress NetworkPolicy permits DNS, HTTPS discovery, and PostgreSQL. Application destination policy still rejects private, loopback, link-local, metadata-service, DNS-rebinding, and redirect destinations for CIMD. Fetches pin approved DNS addresses, verify the connected peer, use bounded headers/body/timeouts, require JSON, and send no ambient credentials. NetworkPolicy port filtering does not replace those checks.
+
+CloudNativePG writes compressed WAL and data backups under the generated S3 bucket's `database/` prefix, retains backups for 30 days, and runs a daily scheduled backup. Treat the MCP database and the matching wrapping-key Secret version as one recovery unit. A restored database without every wrapping key referenced by encrypted signing rows cannot issue or rotate credentials. See [MCP OAuth Key Rotation And Recovery](runbooks/mcp-oauth-key-rotation-recovery.md).
+
+Pipelines as Code definitions under `.tekton/` are configured to build the Dockerfile's multi-architecture `runtime` target and deploy only through Pulumi. A push to `main` targets the `preview` stack with an image tagged by the full commit SHA. The production definition accepts only a tag that strictly matches `vX.Y.Z`; it builds and deploys that exact tag and publishes the multi-architecture tag as `latest`. A tag matching the broad trigger but not the strict version expression fails before production provisioning or deployment. These definitions and their static checks do not establish that either stack has been deployed successfully.
+
+## Startup And Operation
+
+The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets, completes both standard migrators, validates access-auth and hosted-OAuth configuration, performs upstream OIDC discovery and initial JWKS loading, loads the wrapping ring, decrypts or creates the local active signer, and initializes agent session storage before returning `ServerApplication`. That server-owned lifecycle contains the router, five-minute bounded cleanup, daily signing rotation/rewrap, and MCP session cleanup; graceful shutdown cancels and joins that work. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds. `/health` is process liveness. `/ready` fails closed when either database is unavailable, the hosted OAuth store or active signer is unusable, signer PKCS#8 and public JWK disagree, maintenance is unhealthy, or revocation termination exceeds its bounded durable-check policy. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
+
+Local revocation wakes same-process streams after the database commit. Every hosted stream also performs an authoritative durable check at most every five seconds; another replica's revocation therefore closes it within five seconds plus scheduling and query latency. PostgreSQL `LISTEN/NOTIFY` is not implemented. Do not increase the current one-replica Pulumi workload until the documented container-backed concurrency and cross-replica operational checks have been exercised.
+
+Explicit builders are intended for callers that own dependencies. They require already initialized `Persistence`; access-authenticated composition additionally requires an initialized `AccessAuthenticator`. They return the same `ServerApplication` lifecycle, which callers must serve or explicitly shut down rather than detaching its background work from server ownership.
+
+The bundled TUI installed with `pnpm install:bundled` includes server and web features and starts its embedded server by default. The TUI retains the embedded server's shutdown signal and task, signals shutdown after the terminal runtime exits on either success or error, and joins server completion before the process returns; MCP cleanup therefore does not depend on dropping the Tokio runtime. Use `--no-server` with `WALTR_SERVER_ENDPOINT` to connect it to an external deployment. A plain `cargo run -p waltr-tui` build has no server feature and connects to `WALTR_SERVER_ENDPOINT`, defaulting to `http://127.0.0.1:14333`.
+
+See [Access Authentication](architecture/access-authentication.md), [Server Persistence](architecture/persistence.md), and [Testing](testing.md).
+
+No successful production deployment, live Pulumi/Tekton deployment, database failover, or backup restoration is asserted by this document.

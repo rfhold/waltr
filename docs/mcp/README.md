@@ -5,7 +5,7 @@ MCP docs describe Waltr's generic Model Context Protocol crate, protocol behavio
 | Document | Covers |
 | --- | --- |
 | [progressive.md](progressive.md) | Opinionated progressive-workflow MCP server macro pattern, generated `exec` tool behavior, help, workflows, resources, filters, and auth helpers. |
-| [protocol.md](protocol.md) | Generic `mcp` crate boundaries, typed client/server APIs, transports, unsupported areas, and tests. |
+| [protocol.md](protocol.md) | Generic `mcp` crate boundaries, typed client/server APIs, transports, protected resources, hosted OAuth/DCR/CIMD, persistence, revocation leases, shutdown, and tests. |
 | [tracing.md](tracing.md) | MCP request spans, trace context propagation, and span fields. |
 
 For Waltr agent session integration on top of the generic crate, see [../agent/mcp.md](../agent/mcp.md).
