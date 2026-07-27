@@ -65,13 +65,13 @@ schemars = "1.2.1"
 serde = "1.0.228"
 serde_json = "1.0.150"
 sha2 = "0.11.0"
+sqlx = { version = "0.8.6", default-features = false }
 syn = { version = "2.0.111", features = ["full"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 scylla = "1.6.0"
 tempfile = "3.23.0"
 testcontainers = "0.25.2"
 tokio = "1.52.3"
-sqlx = { version = "0.8.6", default-features = false }
 tokio-postgres = "0.7.15"
 tokio-stream = "0.1.18"
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
