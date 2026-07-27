@@ -4,7 +4,7 @@ import * as pulumi from "@pulumi/pulumi";
 import * as random from "@pulumi/random";
 import * as tls from "@pulumi/tls";
 import { createHash } from "node:crypto";
-import { OAuthApplication } from "./authentik.ts";
+import { OAuthApplication } from "./authentik";
 
 const config = new pulumi.Config();
 const namespaceName = config.require("namespace");
