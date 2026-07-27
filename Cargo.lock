@@ -3132,7 +3132,6 @@ dependencies = [
 name = "waltr-tui"
 version = "0.1.0"
 dependencies = [
- "axum",
  "base64",
  "insta",
  "waltr-client",
