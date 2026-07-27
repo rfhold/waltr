@@ -6,6 +6,8 @@ TUI server-backed tests should validate the same server-backed user flows as bro
 
 Server-backed TUI tests should cover client/server connectivity paths, not terminal-only rendering details.
 
+Native OIDC discovery, loopback, and refresh mechanics are deterministic library tests. Add server-backed access coverage here only when it requires a real Waltr server contract and has a corresponding browser outcome.
+
 # Contracts
 
 | Path | Info |
