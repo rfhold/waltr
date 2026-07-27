@@ -44,6 +44,7 @@ The config RPC model is `waltr.config.v1.Configuration`:
 | --- | --- |
 | `providers` | Configured model providers keyed by provider name. |
 | `mcp_servers` | Configured MCP servers keyed by server name. |
+| `runtime_defaults` | Optional default provider, model, MCP servers, and provider parameters resolved for new agent sessions. |
 | `etag` | Server-generated version hash used for optimistic concurrency. |
 
 The filesystem store persists `.waltr/waltr.toml`. ETags are not persisted as authoritative data. On load or save, the store clears `etag`, serializes the config, hashes the serialized content with SHA-256, and returns an `etag` prefixed with `sha256:`.
@@ -58,8 +59,10 @@ The filesystem store persists `.waltr/waltr.toml`. ETags are not persisted as au
 | `providers` present | Replace the entire providers map. |
 | `mcp_servers` absent | Leave existing MCP servers unchanged. |
 | `mcp_servers` present | Replace the entire MCP servers map. |
+| `runtime_defaults` absent | Leave existing runtime defaults unchanged. |
+| `runtime_defaults` present | Replace the complete runtime-defaults message. |
 
-Patches are partial at the top-level section boundary only. They do not patch individual providers, provider fields, individual MCP servers, or nested model data in place. Shared client helpers build full replacement maps from the latest loaded config for operations like add, update, delete, and rename.
+Patches are partial at the top-level section boundary only. They do not patch individual providers, provider fields, individual MCP servers, runtime-default fields, or nested model data in place. Shared client helpers build full replacement sections from the latest loaded config for operations like add, update, delete, rename, and setting runtime defaults.
 
 The server validates the resulting full config before saving. Invalid provider names, provider key/name mismatches, unspecified model types, invalid MCP server types, and missing required MCP command or URL values are rejected.
 
@@ -119,7 +122,7 @@ Watch change responses include:
 | --- | --- |
 | `previous_etag` | ETag observed before the change. Empty on initial snapshots. |
 | `etag` | ETag after the change. |
-| `changed_keys` | Top-level sections that changed, currently `providers` and/or `mcp_servers`. |
+| `changed_keys` | Top-level sections that changed: `providers`, `mcp_servers`, and/or `runtime_defaults`. |
 | `config` | Full initial snapshot, or a sparse config containing only changed sections plus the new ETag for later changes. |
 | `error` | Server-reported watch/load error when a change could not be loaded. |
 
