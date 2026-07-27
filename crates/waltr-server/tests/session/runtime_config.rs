@@ -28,7 +28,6 @@ async fn create_session_uses_runtime_defaults() -> Result<(), Box<dyn std::error
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut client = session_client(server).await?;
 
     let session = client
@@ -62,7 +61,6 @@ async fn create_session_uses_runtime_default_reasoning_effort()
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut client = session_client(server).await?;
 
     let session = client
@@ -100,7 +98,6 @@ async fn create_session_without_provider_default_keeps_runtime_unset()
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut client = session_client(server).await?;
 
     let session = client
@@ -124,7 +121,6 @@ async fn create_session_manual_runtime_config_wins_over_defaults()
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut client = session_client(server).await?;
 
     let session = client
@@ -176,7 +172,6 @@ async fn create_session_preserves_unresolved_header_templates()
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut client = session_client(server).await?;
 
     let session = client
@@ -205,7 +200,6 @@ async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn 
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut mutation_client = session_client(server).await?;
     let mut watch_client = session_client(server).await?;
     let created = mutation_client
@@ -279,7 +273,6 @@ async fn update_runtime_config_rejects_unconfigured_reasoning_effort()
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut client = session_client(server).await?;
     let created = client
         .create_session(CreateSessionRequest::default())
@@ -317,7 +310,6 @@ async fn session_runtime_summary_marks_changed_provider_and_missing_mcp()
         .await
         .expect("config should save");
     let server = setup_server_with_services(config_service);
-    wait_for_config_handle().await;
     let mut session_client = session_client(server).await?;
     let mut config_client = config_client(server).await?;
 
@@ -503,8 +495,4 @@ async fn patch_changed_provider_and_removed_mcp(
     }
 
     Err("config patch did not apply after etag retries".into())
-}
-
-async fn wait_for_config_handle() {
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 }
