@@ -14,10 +14,13 @@ Web tests should cover browser routing, forms, transitions, and UI-specific stat
 | [config/](config/) | Config form, routing, provider, model, MCP, read, and watch flows. |
 | [status/](status/) | Status, splash, readiness, landing, and wiring flows. |
 | [system/](system/) | Cross-feature web shell routing flows. |
+| [access/](access/) | Waltr login route, safe returns, expiry/logout transitions, and generated access bindings. |
 
 # Contracts
 
 Web tests should mirror non-server-backed TUI test intent for shared user-facing flows.
+
+Mock browser/client boundaries here. Cookie validation, callback exchange, Origin enforcement, and protected server routes belong in `waltr-server` access-auth tests.
 
 # Hints
 

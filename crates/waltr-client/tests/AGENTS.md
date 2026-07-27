@@ -15,6 +15,10 @@ Client tests should validate reducer-style state transitions and server-facing f
 | [status/](status/) | Status and readiness flows. |
 | [system/](system/) | Cross-feature client system flows. |
 
+# Contracts
+
+Shared access lifecycle coverage belongs in client unit tests: unauthenticated classification, protected-state clearing, preserved interests on expiry, explicit-logout clearing, current watch epochs, and native credential leases. Platform OAuth I/O belongs in web or TUI tests.
+
 # Hints
 
 Use the test-modification skill when modifying tests.
