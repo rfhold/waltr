@@ -7,8 +7,6 @@ metadata:
     pipelinesascode.tekton.dev/on-target-branch: "[main]"
     pipelinesascode.tekton.dev/max-keep-runs: "2"
 spec:
-  taskRunTemplate:
-    serviceAccountName: waltr-preview-pipeline
   taskRunSpecs:
     - pipelineTaskName: verify-infrastructure
       podTemplate:
@@ -315,7 +313,7 @@ spec:
           volumes:
             - name: kubeconfig
               secret:
-                secretName: waltr-preview-kubeconfig
+                secretName: tekton-cluster-kubeconfig
           steps:
             - name: preview-and-up
               image: docker.io/pulumi/pulumi:3.215.0@sha256:ab55d0231c0da85ebb21dd939341c39f52104f6f1e8574b764d1f40b26b884bf
@@ -327,9 +325,9 @@ spec:
                   value: /tmp/pulumi-home
               envFrom:
                 - secretRef:
-                    name: waltr-preview-pulumi-credentials
+                    name: pulumi-credentials
                 - secretRef:
-                    name: waltr-preview-authentik-credentials
+                    name: authentik-credentials
               volumeMounts:
                 - name: kubeconfig
                   mountPath: /etc/kubeconfig

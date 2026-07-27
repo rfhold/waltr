@@ -23,3 +23,4 @@ config:
   waltr:mcpOAuthAllowCimd: true
   waltr:mcpOAuthWrappingKeyVersions: [v1]
   waltr:mcpOAuthActiveWrappingKeyVersion: v1
+encryptionsalt: v1:fcdgYymm124=:v1:BvAZLhOwNbU1QDHF:6wmUOrWg74bNiix3sgzSMmhxGG/2bw==

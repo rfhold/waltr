@@ -7,8 +7,6 @@ metadata:
     pipelinesascode.tekton.dev/on-target-branch: "[refs/tags/v*]"
     pipelinesascode.tekton.dev/max-keep-runs: "10"
 spec:
-  taskRunTemplate:
-    serviceAccountName: waltr-release-pipeline
   taskRunSpecs:
     - pipelineTaskName: verify-infrastructure
       podTemplate:
@@ -372,7 +370,7 @@ spec:
           volumes:
             - name: kubeconfig
               secret:
-                secretName: waltr-production-kubeconfig
+                secretName: tekton-cluster-kubeconfig
           steps:
             - name: preview-and-up
               image: docker.io/pulumi/pulumi:3.215.0@sha256:ab55d0231c0da85ebb21dd939341c39f52104f6f1e8574b764d1f40b26b884bf
@@ -384,9 +382,9 @@ spec:
                   value: /tmp/pulumi-home
               envFrom:
                 - secretRef:
-                    name: waltr-production-pulumi-credentials
+                    name: pulumi-credentials
                 - secretRef:
-                    name: waltr-production-authentik-credentials
+                    name: authentik-credentials
               volumeMounts:
                 - name: kubeconfig
                   mountPath: /etc/kubeconfig

@@ -12,7 +12,7 @@ interface ResourceRecord {
 
 const resources: ResourceRecord[] = [];
 const previousConfig = process.env.PULUMI_CONFIG;
-let program: typeof import("./index.ts");
+let program: typeof import("./index");
 
 before(async () => {
   process.env.PULUMI_CONFIG = JSON.stringify({
@@ -98,7 +98,7 @@ before(async () => {
     "test",
     false,
   );
-  program = await import("./index.ts");
+  program = await import("./index");
   await pulumi.runtime.disconnect();
 });
 
