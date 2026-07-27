@@ -45,7 +45,7 @@ Config traffic uses `waltr.config.v1.ConfigService`:
 
 Status traffic uses the status service to watch system readiness. Config watch maintenance depends on the status watch because the reducer only opens or reopens config watches after the server reports ready.
 
-`crates/waltr-client/src/transport.rs` defines the runtime-neutral `WaltrTransport` trait and the default transports:
+`crates/waltr-client/src/transport/mod.rs` defines the runtime-neutral `WaltrTransport` trait and the default transports:
 
 | Runtime | Transport |
 | --- | --- |
@@ -62,8 +62,8 @@ The reducer is intentionally split from side effects:
 
 | Concept | Role |
 | --- | --- |
-| `ClientState` | Current config, status, stream state, operation status, watch status, errors, watch interest counts, and retry attempts. |
-| `ClientEvent` | Facts that already happened, such as config loaded, patch failed, watch changed, or reconnect delay elapsed. |
+| `ClientState` | Current access, config, status, stream state, operation status, watch status, errors, watch interest counts, and retry attempts. |
+| `ClientEvent` | Facts that already happened, such as access changed, config loaded, patch failed, watch changed, or reconnect delay elapsed. |
 | `ClientEffect` | Work that must happen outside the reducer, such as load config, patch config, open a watch, or sleep before reconnecting. |
 | `ClientUpdate` | Reducer output containing side-effect intents for the runtime to execute. |
 
@@ -106,6 +106,26 @@ The runtime loop:
 
 The stream form coordinates startup and long-lived watches. It waits for status readiness, maintains watch streams, applies watch events as they arrive, and dispatches shell commands into the same reducer-owned state.
 
+The runtime keeps one cancellation-safe in-flight effect slot. Command preemption does not drop or restart that future; it resumes and completes exactly once. When access is denied and queued/in-flight work is drained, the stream parks until a command or credential generation change instead of publishing an unchanged busy loop.
+
+## Access Lifecycle
+
+Waltr access authentication is separate from provider and upstream-MCP credential authorization. `AccessStatus` is `UnknownChecking`, `LoginRequired`, `LoginInProgress`, `Authenticated`, or `LoginFailed`; provider credential requirements remain in `snapshot.auth` and retain their `AuthTarget`.
+
+Shared access commands are `StartWaltrLogin`, `CompleteWaltrLogin`, `FailWaltrLogin`, `CancelWaltrLogin`, `LogoutWaltr`, and `WaltrAccessExpired`. `AccessEvent` applies the corresponding facts to deterministic reducer state while browser navigation, OIDC exchange, loopback listeners, token refresh, and cookie logout stay in platform runtimes.
+
+The transport decodes version-1 `AuthenticationFailure` protobuf status details. An outbound-provider or outbound-MCP domain is classified as credential authorization only for a credential-required/rejected reason with a valid nonempty `AuthTarget`. Only an `Unauthenticated` response explicitly classified as the `WALTR_ACCESS` domain becomes Waltr login required and clears the current native bearer lease. Missing, malformed, unknown-version, or otherwise unmatched details remain ordinary operation errors rather than guessing an authentication domain.
+
+Expiry or failed native refresh clears protected config, status, sessions, timelines, streams, and in-flight protected operation state. It preserves watch interests and reload intent, but invalidates the status watch epoch so late events from an old credential cannot reauthenticate the client. Login completion starts a new status epoch. A current-epoch protected status event establishes authentication, then child watches reopen according to interest and config/session collections reload. Explicit logout also clears watch interests and queued provider-auth requirements.
+
+Native transports attach the current in-memory bearer credential to each unary request and newly opened stream. Credential leases are monotonic generations: stale login and refresh tasks cannot overwrite or clear credentials owned by a newer flow. Browser gRPC-web relies on same-origin cookie behavior and does not inject bearer tokens.
+
+Native HTTPS uses rustls-backed tonic channels with normal certificate and hostname verification. Explicit logout clears the credential and performs an anonymous status reprobe so access-disabled servers can return to `Authenticated`; credential generations prevent results from the prior lease from mutating the new state.
+
+The web route sends the browser to `/oidc/login` with a validated local return path and calls `/oidc/logout` with same-origin credentials. The TUI owns protected-resource discovery, public-client PKCE, loopback callback handling, and in-memory refresh/expiry. See [Access Authentication](access-authentication.md).
+
+Outbound provider/MCP authorization remains separate from Waltr access. The shared reducer exposes only an opaque attempt ID, authorization URL, expiry, completion mode, registration method, lifecycle, and sanitized failure reason. For server-callback attempts the shared runtime polls `PollAuthAttempt`; shells only render snapshots and dispatch cancellation or dismissal. Manual attempts submit the final redirect URL or code. Web and TUI never receive MCP access tokens, refresh tokens, PKCE verifiers, registration responses, or callback state. An outbound MCP credential failure updates its `AuthTarget` and does not log the caller out of Waltr.
+
 ```mermaid
 sequenceDiagram
     participant Shell as Web or TUI
@@ -137,6 +157,9 @@ Web and TUI implementations should follow these rules:
 - For async command completion, capture the operation key from the immediate command snapshot and observe `snapshot.operations.current[key]` until it reaches `ready` or `failed`.
 - Register config watch interest while a UI surface needs live config updates, and release interest when that surface no longer needs them.
 - Preserve feature parity between web and TUI by changing shared reducer behavior in `waltr-client` when behavior is not platform-specific.
+- Keep Waltr access state distinct from provider/upstream-MCP `AuthTarget` state, and ignore stale login attempts, credential leases, and watch epochs.
+- Keep provider and MCP catalog loading, mutation commands, operation keys, and snapshots in the shared reducer; browser bindings must not construct direct catalog transports.
+- Keep outbound OAuth attempt state in shared commands/snapshots while credentials, refresh claims, callback validation, discovery, and registration remain server/agent concerns.
 
 ## References
 
@@ -146,7 +169,8 @@ Web and TUI implementations should follow these rules:
 | [../../crates/waltr-client/src/coordination/state.rs](../../crates/waltr-client/src/coordination/state.rs) | Shared client state and operation statuses. |
 | [../../crates/waltr-client/src/coordination/event.rs](../../crates/waltr-client/src/coordination/event.rs) | Client events, effects, and config patch shape. |
 | [../../crates/waltr-client/src/coordination/runtime.rs](../../crates/waltr-client/src/coordination/runtime.rs) | Runtime and state-stream orchestration. |
-| [../../crates/waltr-client/src/transport.rs](../../crates/waltr-client/src/transport.rs) | RPC transport boundary. |
-| [../../crates/waltr-client/src/view.rs](../../crates/waltr-client/src/view.rs) | Stable shell-facing view models. |
+| [../../crates/waltr-client/src/transport/mod.rs](../../crates/waltr-client/src/transport/mod.rs) | RPC transport boundary. |
+| [../../crates/waltr-client/src/view/mod.rs](../../crates/waltr-client/src/view/mod.rs) | Stable shell-facing view models. |
 | [../../proto/waltr/config/v1/config_service.proto](../../proto/waltr/config/v1/config_service.proto) | Config RPC contract. |
 | [config.md](config.md) | Config patch, ETag, and watch behavior. |
+| [access-authentication.md](access-authentication.md) | Access boundaries and browser, native, and MCP authentication flows. |
