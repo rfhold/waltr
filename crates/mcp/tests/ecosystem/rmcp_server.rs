@@ -253,9 +253,9 @@ fn complete(params: &CompleteRequestParams) -> Result<CompleteResult, ErrorData>
         };
     let mut completion =
         CompletionInfo::new(values).map_err(|error| ErrorData::internal_error(error, None))?;
-    #[allow(clippy::cast_possible_truncation)]
-    let total = completion.values.len() as u32;
-    completion.total = Some(total);
+    completion.total = Some(
+        u32::try_from(completion.values.len()).expect("completion fixture length fits in u32"),
+    );
     completion.has_more = Some(false);
     Ok(CompleteResult::new(completion))
 }
