@@ -8,6 +8,8 @@ Waltr agent session integration belongs in `docs/agent/mcp.md`. Server/client/we
 
 Keep protocol docs aligned with `crates/mcp/` and its tests. Do not document Waltr-specific session defaults, UI behavior, or server config policy as generic MCP behavior.
 
+Document `StreamableHttpSessionStore`, `OAuthAuthorizationStore`, hosted public-client OAuth/DCR/CIMD, authorization leases, optional SQL features, standard SQLx migration behavior in MCP-owned storage, and explicit client shutdown here. Waltr identity adapters and deployment selection belong in server documentation.
+
 # Hints
 
 Use the documenting skill when changing these docs.

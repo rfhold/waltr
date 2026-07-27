@@ -31,6 +31,8 @@ Run only the TUI:
 
 `cargo run -p waltr-tui`
 
+This plain build connects to `WALTR_SERVER_ENDPOINT` and does not bundle a server. Install the bundled binary, which starts its embedded server and web assets by default, with `pnpm install:bundled`; pass `--no-server` to connect that binary to an external server.
+
 Run only the web development stack:
 
 `pnpm dev:web`
@@ -45,6 +47,15 @@ Useful environment variables:
 | --- | --- |
 | `WALTR_SERVER_ADDR` | Address used by the local server. |
 | `WALTR_SERVER_ENDPOINT` | Server endpoint used by the TUI. |
+| `WALTR_DATABASE_URL` | SQLite or PostgreSQL URL for Waltr-owned persistence. Unset uses durable `waltr.sqlite3` under the XDG/HOME data directory. |
+| `WALTR_MCP_DATABASE_URL` | Optional MCP persistence override. Otherwise SQLite derives sibling `mcp.sqlite3`, while PostgreSQL uses the same logical database through a separate pool. |
+| `WALTR_AUTH_MODE` | Waltr access mode: `disabled` by default or `oidc`. |
+| `WALTR_PUBLIC_URL`, `WALTR_OIDC_*` | Public resource URL and independent browser OIDC settings. |
+| `WALTR_API_OIDC_*`, `WALTR_API_REQUIRED_SCOPES` | Native Waltr API bearer issuer, audience, and scopes. |
+| `WALTR_MCP_OAUTH_*`, `WALTR_MCP_REQUIRED_SCOPES` | Waltr-hosted MCP OAuth issuer, signing-key wrapping ring, token lifetimes, registration policy, and required scopes. |
+| `WALTR_OIDC_NATIVE_CLIENT_ID` | Public-client ID used by TUI login. |
+| `WALTR_OIDC_NATIVE_SCOPES`, `WALTR_OIDC_NATIVE_AUDIENCE`, `WALTR_OIDC_NATIVE_LOOPBACK_POLICY` | Optional TUI authorization request and loopback settings. |
+| `WALTR_SESSION_STORE` | Agent session backend: filesystem, memory, or S3. |
 | `WALTR_OTEL_EXPORT` | Enables OpenTelemetry export when set to `1` or `true`. |
 | `WALTR_PYROSCOPE_URL` | Enables server profiling. |
 
@@ -62,13 +73,17 @@ Common test command:
 
 `pnpm --filter @rfhold/waltr-web test`
 
-Run the production server+web container locally:
+Run the local development container profile:
 
-`docker compose up`
+`docker compose --profile dev up`
+
+`compose.yml` is fixed local development/test infrastructure. The Dockerfile's nonroot `runtime` target supports production containers; Pulumi under `infra/pulumi/` owns the repository deployment. See [deployment configuration](docs/deployment.md) for OIDC, storage, containers, and release behavior.
 
 Run browser-level server-backed web tests against the Compose image:
 
 `pnpm test:web:integration`
+
+This runs the browser suite against the static `test` profile and then against the HTTPS `test-auth` fixture. Use `pnpm test:web:integration:no-auth` or `pnpm test:web:integration:auth` to isolate one phase.
 
 For the full test matrix, see [docs/testing.md](docs/testing.md).
 
@@ -93,3 +108,5 @@ For the full test matrix, see [docs/testing.md](docs/testing.md).
 | [docs/agent/README.md](docs/agent/README.md) | Agent feature docs. |
 | [docs/architecture/config.md](docs/architecture/config.md) | Config persistence and sync behavior. |
 | [docs/architecture/clients.md](docs/architecture/clients.md) | Shared client, web, and TUI boundaries. |
+| [docs/architecture/access-authentication.md](docs/architecture/access-authentication.md) | Waltr access authentication and browser, native, and MCP flows. |
+| [docs/deployment.md](docs/deployment.md) | SQLite/PostgreSQL, Compose persistence, OIDC, hosted MCP OAuth, reverse proxy, and native-client deployment. |

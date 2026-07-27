@@ -152,6 +152,26 @@ The agent integration also wraps Waltr-facing MCP operations in `mcp.agent.opera
 | `resources/read` | `mcp.server`, `mcp.transport`, `rpc.method`, `mcp.resource.uri`. |
 | `completion/complete` | `mcp.server`, `mcp.transport`, `rpc.method`, `mcp.resource_template.uri_template`. |
 
+## Outbound OAuth
+
+Streamable HTTP authentication failures preserve the parsed bearer challenge instead of flattening it into a display string. Session errors carry the server endpoint, HTTP status, protected-resource metadata URL, scope, bearer `error`, sanitized `error_description`, `error_uri`, and realm through `McpAuthorizationContext`; the server exposes that context in typed `AuthenticationFailure` gRPC status details under the outbound-MCP domain.
+
+Authorization begins only after a Streamable HTTP bearer challenge. The server discovers the exact RFC 9728 protected resource, tries advertised authorization servers until it finds a compatible public server, and discovers RFC 8414 endpoints before selecting registration. Production discovery and every discovered authorization, token, registration, revocation, and JWKS destination require HTTPS and a public network destination. Redirects are disabled, DNS answers are checked and pinned for direct requests, private/link-local/metadata addresses are rejected, and the connected peer is checked where the HTTP stack exposes it. Loopback HTTP and private-network HTTPS exist only through explicit deterministic test policies. Registration selection is:
+
+1. A configured preregistered client for that server key.
+2. A still-valid persisted preregistered or CIMD registration for the same issuer, resource, and redirect.
+3. Waltr's `/.well-known/oauth-client/waltr` CIMD client ID when the server advertises CIMD.
+4. A still-valid persisted dynamic registration.
+5. Public DCR when the server advertises a registration endpoint.
+
+Configured preregistration is optional and target-scoped. Normalize the server key by uppercasing ASCII letters/digits and replacing every other character with `_`; `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_CLIENT_ID` supplies the public client ID and optional `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_REDIRECT_URI` overrides the default server callback. There is no global registration, `self` branch, or deployment-owned `WALTR_MCP_SELF_OAUTH_*` contract. If no mechanism is available, authorization returns typed `CONFIGURATION_REQUIRED` in the outbound-MCP domain.
+
+The default redirect is the server-owned `/outbound-oauth/callback`. Callback attempts, state, PKCE material, registration method, completion mode, and expiry are durable in Waltr SQL so another replica can claim completion. Completion requires the exact state for both callback and manual input. When the authorization server advertises RFC 9207, the response must also contain its exact issuer; a supplied issuer is always checked. Completion claims carry an opaque identity and expiry, use compare-and-swap for every terminal write, and can be reclaimed after a worker crashes. A configured nondefault redirect uses manual completion. Shared clients receive only the authorization URL and sanitized attempt lifecycle; web polls callback attempts and TUI can submit a final redirect URL for manual completion.
+
+Target-scoped durable credential state preserves the exact resource, issuer, selected registration, authorization/token/revocation endpoints, access and refresh tokens, granted scopes, expiry, and refresh generation. Expiry distinguishes a known deadline, a true non-expiring token, and a token whose successful response omitted `expires_in`; omitted expiry does not retain the replaced token's deadline. The Waltr SQL backend uses a 30-second identity-bound compare-and-swap refresh lease across sessions/replicas. A claimant commits only against its generation and claim identity. An indeterminate exchange or an expired refresh lease requires reauthorization rather than risking reuse of a rotated token family. Code-exchange and refresh responses must be JSON and fit within 64 KiB. Authorization, token, refresh, and revocation requests preserve the discovered resource. Debug output for attempts, claims, durable OAuth state, and token values is redacted.
+
+Agent transports use a bearer provider rather than copying one token into transport configuration. The provider reads current durable state before each POST, GET/reconnect, and DELETE, refreshes shortly before a known expiry, and returns the replacement token without reconstructing the session runtime. A newly issued bearer with unknown expiry is reused until the MCP server rejects it rather than refreshing on every request. Outbound logout attempts RFC 7009 revocation without redirects or a long-lived wait, then deletes local state unconditionally. External MCP expiration or rejection remains an outbound-MCP authorization requirement and never clears Waltr access credentials.
+
 ## Boundaries
 
 - MCP support is opt-in through session runtime settings.
@@ -161,7 +181,8 @@ The agent integration also wraps Waltr-facing MCP operations in `mcp.agent.opera
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - The shared server config names the HTTP MCP server type `SSE`; session runtime settings map that to the agent's Streamable HTTP transport.
-- HTTP GET SSE streams, `Last-Event-ID` resume requests, and DELETE session termination are generic MCP transport gaps tracked in `crates/mcp`.
+- Streamable HTTP GET delivery, `Last-Event-ID` acknowledgments, and DELETE session termination are implemented by the generic MCP transport; Waltr agent callers handle fallible async shutdown.
+- Confidential downstream clients and registration-management credentials are not supported; outbound registration is public-client only.
 
 ## Tests
 
@@ -176,6 +197,7 @@ Focused coverage:
 | [../../crates/waltr-agent/tests/agent/mcp.rs](../../crates/waltr-agent/tests/agent/mcp.rs) | Deterministic stdio and streamable HTTP MCP tool flows, server instructions, plus stdio MCP prompt/resource template discovery and rendering. |
 | [../../crates/waltr-agent/tests/live/agent/mcp.rs](../../crates/waltr-agent/tests/live/agent/mcp.rs) | Ignored live-provider MCP coverage. |
 | [../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs](../../crates/waltr-agent/src/bin/waltr-agent-test-mcp-server.rs) | Test MCP server binary. |
+| [../../crates/waltr-server/tests/mcp_oauth_server.rs](../../crates/waltr-server/tests/mcp_oauth_server.rs) | Waltr-hosted issuer, browser bridge/consent, token lifecycle, direct-upstream rejection, and restart behavior. |
 
 ## References
 
