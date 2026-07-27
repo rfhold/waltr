@@ -1,0 +1,6 @@
+name: waltr
+runtime:
+  name: nodejs
+  options:
+    packagemanager: bun
+description: Waltr deployment on Pantheon
