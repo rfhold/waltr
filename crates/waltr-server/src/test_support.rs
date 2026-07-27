@@ -681,7 +681,9 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                         credential_store,
                     );
                 },
-            );
+            )
+            .await
+            .expect("test server config should load");
             ready_tx
                 .send(addr)
                 .expect("auth test server should report ready");
@@ -831,6 +833,8 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
                     session::add_sessions_service(routes, sessions, config, credential_store);
                 },
             )
+            .await
+            .expect("test server config should load")
             .serve_with_shutdown(listener, std::future::pending())
             .await
             .expect("test server should run");
@@ -1001,7 +1005,9 @@ END
                         credential_store,
                     );
                 },
-            );
+            )
+            .await
+            .expect("test server config should load");
             ready_tx.send(addr).expect("server should report ready");
             app.serve_with_shutdown(listener, async move {
                 drop(shutdown_rx.await);

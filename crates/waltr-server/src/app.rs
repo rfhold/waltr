@@ -429,21 +429,26 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         |grpc_routes, config, credential_store| {
             session_storage = session::add_service_from_env(grpc_routes, config, credential_store);
         },
-    );
+    )
+    .await
+    .map_err(BuildAppError::Config)?;
     session_storage.map_err(BuildAppError::SessionStorage)?;
     Ok(router)
 }
 
 /// Build the Axum application using an explicit config service.
 ///
+/// # Errors
+///
+/// Returns an error when persisted config cannot be loaded before router construction.
+///
 /// # Panics
 ///
 /// Panics when session storage environment configuration is invalid.
-#[must_use]
-pub fn build_app_with_config_service(
+pub async fn build_app_with_config_service(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
-) -> ServerApplication {
+) -> Result<ServerApplication, ConfigError> {
     build_app_with_services(
         config_service,
         persistence,
@@ -452,14 +457,19 @@ pub fn build_app_with_config_service(
                 .expect("session service should start");
         },
     )
+    .await
 }
 
 /// Build the Axum application using explicit services.
-pub fn build_app_with_services<F>(
+///
+/// # Errors
+///
+/// Returns an error when persisted config cannot be loaded before router construction.
+pub async fn build_app_with_services<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     add_session_service: F,
-) -> ServerApplication
+) -> Result<ServerApplication, ConfigError>
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
@@ -470,15 +480,20 @@ where
         AccessAuthenticator::disabled(),
         add_session_service,
     )
+    .await
 }
 
 /// Build the Axum application with an initialized access authenticator.
-pub fn build_app_with_access_authenticator<F>(
+///
+/// # Errors
+///
+/// Returns an error when persisted config cannot be loaded before router construction.
+pub async fn build_app_with_access_authenticator<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     access_authenticator: AccessAuthenticator,
     add_session_service: F,
-) -> ServerApplication
+) -> Result<ServerApplication, ConfigError>
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
@@ -490,16 +505,21 @@ where
         None,
         add_session_service,
     )
+    .await
 }
 
 /// Build the application with initialized access authentication and hosted MCP OAuth.
-pub fn build_app_with_access_authenticator_and_mcp_oauth<F>(
+///
+/// # Errors
+///
+/// Returns an error when persisted config cannot be loaded before router construction.
+pub async fn build_app_with_access_authenticator_and_mcp_oauth<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     access_authenticator: AccessAuthenticator,
     mcp_oauth: Option<McpOAuthServer>,
     add_session_service: F,
-) -> ServerApplication
+) -> Result<ServerApplication, ConfigError>
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
@@ -511,15 +531,20 @@ where
         mcp_oauth,
         add_session_service,
     )
+    .await
 }
 
 /// Build the Axum application using explicit services and catalog loader.
-pub fn build_app_with_catalog_loader<F>(
+///
+/// # Errors
+///
+/// Returns an error when persisted config cannot be loaded before router construction.
+pub async fn build_app_with_catalog_loader<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     catalog_loader: CatalogLoader,
     add_session_service: F,
-) -> ServerApplication
+) -> Result<ServerApplication, ConfigError>
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
@@ -530,9 +555,14 @@ where
         AccessAuthenticator::disabled(),
         add_session_service,
     )
+    .await
 }
 
 /// Build the Axum application using explicit services, catalog, and access authentication.
+///
+/// # Errors
+///
+/// Returns an error when persisted config cannot be loaded before router construction.
 ///
 /// # Panics
 ///
@@ -542,13 +572,13 @@ where
     clippy::too_many_lines,
     reason = "router assembly consumes initialized services in dependency order"
 )]
-pub fn build_app_with_catalog_loader_and_access_authenticator<F>(
+pub async fn build_app_with_catalog_loader_and_access_authenticator<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     catalog_loader: CatalogLoader,
     access_authenticator: AccessAuthenticator,
     add_session_service: F,
-) -> ServerApplication
+) -> Result<ServerApplication, ConfigError>
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
@@ -560,9 +590,14 @@ where
         None,
         add_session_service,
     )
+    .await
 }
 
 /// Build the application with explicit catalog, access auth, and hosted MCP OAuth.
+///
+/// # Errors
+///
+/// Returns an error when persisted config cannot be loaded before router construction.
 ///
 /// # Panics
 ///
@@ -573,14 +608,14 @@ where
     clippy::too_many_lines,
     reason = "router assembly consumes initialized services in dependency order"
 )]
-pub fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth<F>(
+pub async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     catalog_loader: CatalogLoader,
     access_authenticator: AccessAuthenticator,
     mcp_oauth: Option<McpOAuthServer>,
     add_session_service: F,
-) -> ServerApplication
+) -> Result<ServerApplication, ConfigError>
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
 {
@@ -588,7 +623,8 @@ where
     let config = ConfigHandle::watching(
         config_service.store().clone(),
         config_service.pubsub().clone(),
-    );
+    )
+    .await?;
     let outbound_oauth_store = persistence.outbound_oauth_store();
     let credential_store =
         FileCredentialStore::from_env().with_mcp_store(outbound_oauth_store.clone());
@@ -696,7 +732,7 @@ where
     let router = router
         .fallback_service(grpc)
         .layer(TraceLayer::new_for_http().make_span_with(request_span));
-    ServerApplication::new(router, mcp_session_store, mcp_oauth)
+    Ok(ServerApplication::new(router, mcp_session_store, mcp_oauth))
 }
 
 fn request_span<B>(request: &Request<B>) -> tracing::Span {

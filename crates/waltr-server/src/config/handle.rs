@@ -9,7 +9,7 @@ use waltr::{
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt as _;
 
-use crate::config::{ConfigPubSub, ConfigStore, ConfigWatchEvent};
+use crate::config::{ConfigError, ConfigPubSub, ConfigStore, ConfigWatchEvent};
 
 /// Read-only config handle for services that need the current watched config.
 #[derive(Debug, Clone, Default)]
@@ -27,15 +27,19 @@ impl ConfigHandle {
     }
 
     /// Create a handle and spawn a maintainer driven by config pubsub updates.
-    #[must_use]
-    pub fn watching<S, P>(store: S, pubsub: P) -> Self
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the initial config snapshot cannot be loaded.
+    pub async fn watching<S, P>(store: S, pubsub: P) -> Result<Self, ConfigError>
     where
         S: ConfigStore + Clone,
         P: ConfigPubSub + Clone,
     {
-        let handle = Self::default();
-        tokio::spawn(maintain_config(handle.clone(), store, pubsub));
-        handle
+        let subscription = pubsub.subscribe();
+        let handle = Self::new(store.load().await?);
+        tokio::spawn(maintain_config(handle.clone(), store, pubsub, subscription));
+        Ok(handle)
     }
 
     /// Return the current config snapshot.
@@ -48,21 +52,21 @@ impl ConfigHandle {
     }
 }
 
-async fn maintain_config<S, P>(handle: ConfigHandle, store: S, pubsub: P)
-where
+async fn maintain_config<S, P>(
+    handle: ConfigHandle,
+    store: S,
+    pubsub: P,
+    mut subscription: P::Subscription,
+) where
     S: ConfigStore + Clone,
     P: ConfigPubSub + Clone,
 {
-    reload_from_store(&handle, &store).await;
-
     loop {
-        let mut subscription = pubsub.subscribe();
         while let Some(event) = subscription.next().await {
             match event {
                 Ok(event) => apply_event(&handle, &store, event).await,
                 Err(error) => {
                     tracing::warn!(%error, "config handle watch lagged; reloading from store");
-                    reload_from_store(&handle, &store).await;
                     break;
                 }
             }
@@ -70,6 +74,7 @@ where
 
         tracing::warn!("config handle watch ended; resubscribing");
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        subscription = pubsub.subscribe();
         reload_from_store(&handle, &store).await;
     }
 }
