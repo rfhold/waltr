@@ -1,0 +1,408 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: waltr-release
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[refs/tags/v*]"
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+spec:
+  taskRunTemplate:
+    serviceAccountName: waltr-release-pipeline
+  taskRunSpecs:
+    - pipelineTaskName: verify-infrastructure
+      podTemplate:
+        nodeSelector:
+          kubernetes.io/arch: amd64
+    - pipelineTaskName: deploy-production
+      podTemplate:
+        nodeSelector:
+          kubernetes.io/arch: amd64
+  timeouts:
+    pipeline: 2h0m0s
+  params:
+    - name: repo-url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+    - name: source-branch
+      value: "{{ source_branch }}"
+    - name: base-image
+      value: "{{ CONTAINER_REGISTRY }}/{{ repo_owner }}/waltr"
+  pipelineSpec:
+    params:
+      - name: repo-url
+        type: string
+      - name: revision
+        type: string
+      - name: source-branch
+        type: string
+      - name: base-image
+        type: string
+    workspaces:
+      - name: source
+    tasks:
+      - name: fetch-repository
+        retries: 1
+        taskSpec:
+          params:
+            - name: repo-url
+              type: string
+            - name: revision
+              type: string
+          workspaces:
+            - name: output
+          volumes:
+            - name: git-auth
+              secret:
+                secretName: "{{ git_auth_secret }}"
+          steps:
+            - name: clone
+              image: docker.io/alpine/git:2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+              workingDir: $(workspaces.output.path)
+              volumeMounts:
+                - name: git-auth
+                  mountPath: /etc/git-auth
+                  readOnly: true
+              script: |
+                #!/bin/sh
+                set -eu
+                cp /etc/git-auth/.gitconfig /root/.gitconfig
+                cp /etc/git-auth/.git-credentials /root/.git-credentials
+                git clone "$(params.repo-url)" .
+                git checkout --detach "$(params.revision)"
+                test "`git rev-parse HEAD`" = "$(params.revision)"
+        params:
+          - name: repo-url
+            value: $(params.repo-url)
+          - name: revision
+            value: $(params.revision)
+        workspaces:
+          - name: output
+            workspace: source
+
+      - name: validate-release
+        runAfter: [fetch-repository]
+        taskSpec:
+          params:
+            - name: revision
+              type: string
+            - name: source-branch
+              type: string
+          results:
+            - name: tag
+              type: string
+          workspaces:
+            - name: source
+          volumes:
+            - name: trusted-signers
+              secret:
+                secretName: waltr-release-trusted-signers
+          steps:
+            - name: policy
+              image: docker.io/alpine/git:2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: SOURCE_BRANCH
+                  value: $(params.source-branch)
+              volumeMounts:
+                - name: trusted-signers
+                  mountPath: /etc/release-signers
+                  readOnly: true
+              script: |
+                #!/bin/sh
+                set -eu
+                case "$SOURCE_BRANCH" in refs/tags/v*) tag="${SOURCE_BRANCH#refs/tags/}" ;; *) exit 1 ;; esac
+                printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+                printf '%s\n' "$(params.revision)" | grep -Eq '^[0-9a-f]{40}$'
+                export GNUPGHOME=/tmp/release-gnupg
+                install -d -m 700 "$GNUPGHOME"
+                gpg --batch --import /etc/release-signers/signing-key.asc
+                test "`git rev-parse "refs/tags/$tag^{commit}"`" = "$(params.revision)"
+                git merge-base --is-ancestor "$(params.revision)" refs/remotes/origin/main
+                git verify-tag "$tag"
+                printf '%s' "$tag" > "$(results.tag.path)"
+        params:
+          - name: revision
+            value: $(params.revision)
+          - name: source-branch
+            value: $(params.source-branch)
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: verify-rust
+        runAfter: [fetch-repository]
+        retries: 1
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: test
+              image: docker.io/library/rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                cargo fmt --all --check
+                cargo test --locked -p mcp --features oauth-authorization-server-sqlite --test oauth_sqlite_store
+                cargo test --locked -p waltr-server --tests
+                cargo test --locked -p waltr-client --tests
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: verify-web
+        runAfter: [fetch-repository]
+        retries: 1
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: test
+              image: docker.io/library/node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: npm_config_cache
+                  value: /tmp/npm-cache
+              script: |
+                #!/bin/sh
+                set -eu
+                npm install --global pnpm@11.5.0
+                pnpm install --frozen-lockfile --config.dangerouslyAllowAllBuilds=true
+                pnpm --filter @rfhold/waltr-web test
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: verify-infrastructure
+        runAfter: [fetch-repository]
+        retries: 1
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: build-and-test
+              image: docker.io/pulumi/pulumi:3.215.0@sha256:ab55d0231c0da85ebb21dd939341c39f52104f6f1e8574b764d1f40b26b884bf
+              workingDir: $(workspaces.source.path)/infra/pulumi
+              script: |
+                #!/bin/sh
+                set -eu
+                test "`bun --version`" = "1.3.5"
+                test "`pulumi version`" = "v3.215.0"
+                bun install --frozen-lockfile
+                bun run build
+                bun run test
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: scan-private-material
+        runAfter: [fetch-repository]
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: scan
+              image: docker.io/alpine/git:2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                if git grep -n -E 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|AKIA[0-9A-Z]{16}' -- infra/pulumi Dockerfile .tekton; then
+                  echo "private credential material is tracked in deployment inputs" >&2
+                  exit 1
+                fi
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: build-amd64
+        runAfter: [validate-release, verify-rust, verify-web, verify-infrastructure, scan-private-material]
+        retries: 1
+        taskSpec:
+          params:
+            - name: image
+              type: string
+            - name: revision
+              type: string
+            - name: buildkit-addr
+              type: string
+          workspaces:
+            - name: source
+          steps:
+            - name: build
+              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+                  --opt filename=Dockerfile --opt target=runtime --opt platform=linux/amd64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --output "type=image,name=$(params.image),push=true"
+        params:
+          - name: image
+            value: $(params.base-image):sha-$(params.revision)-amd64
+          - name: revision
+            value: $(params.revision)
+          - name: buildkit-addr
+            value: "{{ BUILDKIT_AMD64_ADDR }}"
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: build-arm64
+        runAfter: [validate-release, verify-rust, verify-web, verify-infrastructure, scan-private-material]
+        retries: 1
+        taskSpec:
+          params:
+            - name: image
+              type: string
+            - name: revision
+              type: string
+            - name: buildkit-addr
+              type: string
+          workspaces:
+            - name: source
+          steps:
+            - name: build
+              image: docker.io/moby/buildkit:v0.26.3@sha256:5601811fde88bb9e8a577bfe804af82bccb712e1cd07ff94663bded5e628cf75
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                buildctl --addr "tcp://$(params.buildkit-addr)" build \
+                  --frontend dockerfile.v0 --local context=. --local dockerfile=. \
+                  --opt filename=Dockerfile --opt target=runtime --opt platform=linux/arm64 \
+                  --opt "build-arg:REVISION=$(params.revision)" \
+                  --output "type=image,name=$(params.image),push=true"
+        params:
+          - name: image
+            value: $(params.base-image):sha-$(params.revision)-arm64
+          - name: revision
+            value: $(params.revision)
+          - name: buildkit-addr
+            value: "{{ BUILDKIT_ARM64_ADDR }}"
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: create-source-manifest
+        runAfter: [build-amd64, build-arm64]
+        taskSpec:
+          params:
+            - name: base-image
+              type: string
+            - name: tag
+              type: string
+          steps:
+            - name: create
+              image: docker.io/mplatform/manifest-tool:alpine-v2.1.7@sha256:ebc7670e868e29759ec655bbf379a1909d03d7bb341966c585c692412020cc4f
+              script: |
+                #!/bin/sh
+                set -eu
+                manifest-tool push from-args \
+                  --platforms linux/amd64,linux/arm64 \
+                  --template "$(params.base-image):$(params.tag)-ARCH" \
+                  --target "$(params.base-image):$(params.tag)"
+        params:
+          - name: base-image
+            value: $(params.base-image)
+          - name: tag
+            value: sha-$(params.revision)
+
+      - name: promote-release
+        runAfter: [create-source-manifest]
+        retries: 1
+        taskSpec:
+          params:
+            - name: base-image
+              type: string
+            - name: source-tag
+              type: string
+            - name: release-tag
+              type: string
+            - name: revision
+              type: string
+          results:
+            - name: image
+              type: string
+          steps:
+            - name: promote-and-verify
+              image: gcr.io/go-containerregistry/crane:debug@sha256:54b27703e6c602fbd6f95712910e9c8d45d4361a59274bde38aeec943734e424
+              script: |
+                #!/busybox/sh
+                set -eu
+                source="$(params.base-image):$(params.source-tag)"
+                digest="`crane digest "$source"`"
+                case "$digest" in sha256:[0-9a-f][0-9a-f]*) ;; *) exit 1 ;; esac
+                immutable="$(params.base-image)@$digest"
+                config="`crane config "$immutable"`"
+                printf '%s' "$config" | grep -Fq '"User":"65532:65532"'
+                printf '%s' "$config" | grep -Fq '"org.opencontainers.image.revision":"$(params.revision)"'
+                release="$(params.base-image):$(params.release-tag)"
+                if existing="`crane digest "$release" 2>/dev/null`"; then
+                  test "$existing" = "$digest"
+                else
+                  crane copy "$immutable" "$release"
+                fi
+                test "`crane digest "$release"`" = "$digest"
+                printf '%s' "$immutable" > "$(results.image.path)"
+        params:
+          - name: base-image
+            value: $(params.base-image)
+          - name: source-tag
+            value: sha-$(params.revision)
+          - name: release-tag
+            value: $(tasks.validate-release.results.tag)
+          - name: revision
+            value: $(params.revision)
+
+      - name: deploy-production
+        runAfter: [promote-release]
+        retries: 1
+        taskSpec:
+          params:
+            - name: image
+              type: string
+          workspaces:
+            - name: source
+          volumes:
+            - name: kubeconfig
+              secret:
+                secretName: waltr-production-kubeconfig
+          steps:
+            - name: preview-and-up
+              image: docker.io/pulumi/pulumi:3.215.0@sha256:ab55d0231c0da85ebb21dd939341c39f52104f6f1e8574b764d1f40b26b884bf
+              workingDir: $(workspaces.source.path)/infra/pulumi
+              env:
+                - name: KUBECONFIG
+                  value: /etc/kubeconfig/kubeconfig
+                - name: PULUMI_HOME
+                  value: /tmp/pulumi-home
+              envFrom:
+                - secretRef:
+                    name: waltr-production-pulumi-credentials
+                - secretRef:
+                    name: waltr-production-authentik-credentials
+              volumeMounts:
+                - name: kubeconfig
+                  mountPath: /etc/kubeconfig
+                  readOnly: true
+              script: |
+                #!/bin/sh
+                set -eu
+                bun install --frozen-lockfile
+                pulumi preview --stack prod --diff --config "image=$(params.image)"
+                pulumi up --stack prod --yes --skip-preview --config "image=$(params.image)"
+        params:
+          - name: image
+            value: $(tasks.promote-release.results.image)
+        workspaces:
+          - name: source
+            workspace: source
+  workspaces:
+    - name: source
+      emptyDir: {}
