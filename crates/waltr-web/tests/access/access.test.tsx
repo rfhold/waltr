@@ -136,25 +136,20 @@ describe("Waltr access", () => {
 
   test("session expiry replaces protected content and provider OAuth", async () => {
     let setSnapshot!: (snapshot: ClientSnapshot) => void;
-    const authenticated = accessSnapshot("authenticated");
-    authenticated.auth.pending = [{
-      target: { kind: "provider", key: "claude" },
-      message: "Authorize Claude",
-      sourceSessionId: null,
-      mcpAuthorization: null,
-    }];
+    const authenticated = outboundAuthSnapshot({ target: { kind: "provider", key: "claude" } });
     renderWithAppState(() => <ShellRouteWithChildren />, {
       routePath: "/",
       snapshot: authenticated,
+      explicitAuthTarget: { kind: "provider", key: "claude" },
       onSnapshotSetter: (setter) => { setSnapshot = setter; },
     });
 
-    expect(screen.getByRole("dialog", { name: "OAuth required" })).toBeTruthy();
+    expect(screen.getByRole("dialog", { name: "OAuth authorization" })).toBeTruthy();
     setSnapshot(accessSnapshot("loginRequired"));
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "Sign in to continue" })).toBeTruthy());
     expect(screen.queryByLabelText("Primary navigation")).toBeNull();
-    expect(screen.queryByRole("dialog", { name: "OAuth required" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull();
   });
 
   test.each([
@@ -170,35 +165,111 @@ describe("Waltr access", () => {
       routePath: "/sessions",
       snapshot: outboundAuthSnapshot({ lifecycle, failureReason: lifecycle === "failed" ? "safe failure" : "" }),
       commands,
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
     });
 
     expect(screen.getByText(message)).toBeTruthy();
     expect(screen.getByText("Server callback")).toBeTruthy();
     expect(screen.getByText("Dynamic")).toBeTruthy();
-    expect(screen.getByText("Open authorization URL").getAttribute("href")).toBe("https://auth.example/authorize");
+    expect(screen.getByText("https://auth.example/authorize")).toBeTruthy();
+    if (["succeeded", "failed", "expired", "canceled"].includes(lifecycle)) {
+      expect(screen.queryByRole("link", { name: "Open authorization URL" })).toBeNull();
+      expect(screen.getByRole("button", { name: "Dismiss" })).toBeTruthy();
+    } else {
+      expect(screen.getByRole("link", { name: "Open authorization URL" }).getAttribute("href")).toBe("https://auth.example/authorize");
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    }
     expect(screen.queryByPlaceholderText("Paste the final redirect URL or authorization code")).toBeNull();
     expect(commands.some((command) => command.type === "pollAuthAttempt")).toBe(false);
   });
 
-  test("cancels live attempts and dismisses terminal attempts with snapshot identity", async () => {
-    const commands: ClientCommand[] = [];
-    let setSnapshot!: (snapshot: ClientSnapshot) => void;
+  test("presents an explicitly initiated OAuth attempt without a session requirement", () => {
+    const snapshot = outboundAuthSnapshot({ attemptId: "explicit-attempt" });
+
     renderWithAppState(() => <ShellRouteWithChildren />, {
-      snapshot: outboundAuthSnapshot({ lifecycle: "pending", attemptId: "attempt-live" }),
-      commands,
-      onSnapshotSetter: (setter) => { setSnapshot = setter; },
+      routePath: "/config/provider",
+      snapshot,
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    await waitFor(() => expect(commands).toContainEqual({ type: "cancelAuth", attemptId: "attempt-live" }));
+    expect(screen.getByRole("dialog", { name: "OAuth authorization" })).toBeTruthy();
+    expect(screen.getByText("Authenticate MCP server remote.")).toBeTruthy();
+    expect(screen.queryByText(/continue agent work/i)).toBeNull();
+  });
 
-    setSnapshot(outboundAuthSnapshot({ lifecycle: "failed", attemptId: "attempt-terminal" }));
+  test("shows preregistered MCP attempts and omits registration for providers", () => {
+    const mcpSnapshot = outboundAuthSnapshot({ registrationMethod: "preregistered" });
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions",
+      snapshot: mcpSnapshot,
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+    });
+    expect(screen.getByText("Preregistered")).toBeTruthy();
+
+    const providerSnapshot = outboundAuthSnapshot({
+      target: { kind: "provider", key: "claude" },
+      registrationMethod: "preregistered",
+    });
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions",
+      snapshot: providerSnapshot,
+      explicitAuthTarget: { kind: "provider", key: "claude" },
+    });
+    const providerDialog = screen.getAllByRole("dialog", { name: "OAuth authorization" }).at(-1)!;
+    expect(providerDialog.textContent).not.toContain("Registration");
+    expect(providerDialog.textContent).not.toContain("Preregistered");
+  });
+
+  test("does not render an active attempt unrelated to the explicit target", () => {
+    const snapshot = outboundAuthSnapshot({ attemptId: "unrelated-attempt" });
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions",
+      snapshot,
+      explicitAuthTarget: { kind: "provider", key: "claude" },
+    });
+
+    expect(screen.queryByRole("dialog", { name: /OAuth/ })).toBeNull();
+  });
+
+  test("explicit dismissal and cancellation clear local presentation origin", async () => {
+    const terminal = outboundAuthSnapshot({ lifecycle: "succeeded", attemptId: "explicit-terminal" });
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions",
+      snapshot: terminal,
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    await waitFor(() => expect(commands).toContainEqual({
-      type: "dismissAuthRequirement",
-      target: { kind: "mcpServer", key: "remote" },
-    }));
-    expect(commands).not.toContainEqual({ type: "cancelAuth", attemptId: "attempt-terminal" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull());
+
+    const pending = outboundAuthSnapshot({ lifecycle: "pending", attemptId: "explicit-pending" });
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions",
+      snapshot: pending,
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull());
+  });
+
+  test("explicit manual completion clears local presentation origin", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = outboundAuthSnapshot({
+      completionMode: "manual",
+      lifecycle: "pending",
+      attemptId: "explicit-manual",
+    });
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/sessions",
+      snapshot,
+      commands,
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+    });
+
+    fireEvent.input(screen.getByPlaceholderText("Paste the final redirect URL or authorization code"), { target: { value: "callback-code" } });
+    fireEvent.click(screen.getByRole("button", { name: "Complete OAuth" }));
+
+    await waitFor(() => expect(commands).toContainEqual({ type: "completeAuth", attemptId: "explicit-manual", input: "callback-code" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "OAuth authorization" })).toBeNull());
   });
 
   test("rejects unsafe authorization URLs and bounds sanitized failure text", () => {
@@ -209,6 +280,7 @@ describe("Waltr access", () => {
         authUrl: "javascript:alert(document.domain)",
         failureReason: failure,
       }),
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
     });
 
     expect(screen.queryByRole("link", { name: "Open authorization URL" })).toBeNull();
@@ -337,12 +409,6 @@ function locationParts(pathname: string, search = "", hash = "") {
 
 function outboundAuthSnapshot(overrides: Partial<AuthAttemptSnapshot> = {}) {
   const snapshot = accessSnapshot("authenticated");
-  snapshot.auth.pending = [{
-    target: { kind: "mcpServer", key: "remote" },
-    message: "Authorize remote MCP",
-    sourceSessionId: "session-a",
-    mcpAuthorization: null,
-  }];
   snapshot.auth.activeAttempt = {
     target: { kind: "mcpServer", key: "remote" },
     attemptId: "attempt-1",

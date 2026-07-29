@@ -28,6 +28,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
 
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
+  const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Extract<ClientCommand, { type: "beginAuth" }>["target"]>();
+  const [ignoredTerminalAttemptId, setIgnoredTerminalAttemptId] = createSignal<string>();
   const operationWaiters = new Set<OperationWaiter>();
   const [wasmClient] = createResource(() =>
     (props.loadWasmClient ?? loadWasmClient)(),
@@ -37,6 +39,17 @@ export function AppStateProvider(props: AppStateProviderProps) {
     return true;
   });
   const systemReady = createMemo(() => snapshot()?.status.ready ?? false);
+
+  createEffect(() => {
+    const explicitTarget = explicitAuthTarget();
+    const attempt = snapshot()?.auth.activeAttempt;
+    if (attempt?.lifecycle === "succeeded"
+      && attempt.attemptId !== ignoredTerminalAttemptId()
+      && sameAuthTarget(explicitTarget, attempt.target)) {
+      setExplicitAuthTarget(undefined);
+      setIgnoredTerminalAttemptId(undefined);
+    }
+  });
 
   createEffect(() => {
     const client = wasmClient();
@@ -88,6 +101,84 @@ export function AppStateProvider(props: AppStateProviderProps) {
       failureMessage: "config patch failed",
     });
   };
+
+  const dispatchBeginAuth = (target: Extract<ClientCommand, { type: "beginAuth" }>["target"]) =>
+    dispatchAndWaitForOperation({
+      command: { type: "beginAuth", target },
+      key: (snapshot) => snapshot.auth.begin.key,
+      kind: "authBegin",
+      missingKeyMessage: "begin auth command did not produce an operation key",
+      failureMessage: "authorization could not be started",
+    });
+
+  const dispatchBeginExplicitAuth = async (target: Extract<ClientCommand, { type: "beginAuth" }>["target"]) => {
+    const activeAttempt = snapshot()?.auth.activeAttempt;
+    setIgnoredTerminalAttemptId(
+      activeAttempt?.lifecycle === "succeeded" && sameAuthTarget(target, activeAttempt.target)
+        ? activeAttempt.attemptId
+        : undefined,
+    );
+    setExplicitAuthTarget(target);
+    try {
+      return await dispatchBeginAuth(target);
+    } catch (error) {
+      if (sameAuthTarget(explicitAuthTarget(), target)) {
+        setExplicitAuthTarget(undefined);
+        setIgnoredTerminalAttemptId(undefined);
+      }
+      throw error;
+    }
+  };
+
+  const dispatchCompleteAuth = async (attemptId: string, input: string) => {
+    const attemptTarget = snapshot()?.auth.activeAttempt?.target;
+    const result = await dispatchAndWaitForOperation({
+      command: { type: "completeAuth", attemptId, input },
+      key: (snapshot) => snapshot.auth.complete.key,
+      kind: "authComplete",
+      missingKeyMessage: "complete auth command did not produce an operation key",
+      failureMessage: "authorization could not be completed",
+    });
+    if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) {
+      setExplicitAuthTarget(undefined);
+      setIgnoredTerminalAttemptId(undefined);
+    }
+    return result;
+  };
+
+  const dispatchCancelAuth = async (attemptId: string) => {
+    const attemptTarget = snapshot()?.auth.activeAttempt?.target;
+    const result = await dispatchAndWaitForOperation({
+      command: { type: "cancelAuth", attemptId },
+      key: (snapshot) => snapshot.auth.cancel.key,
+      kind: "authCancel",
+      missingKeyMessage: "cancel auth command did not produce an operation key",
+      failureMessage: "authorization could not be canceled",
+    });
+    if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) {
+      setExplicitAuthTarget(undefined);
+      setIgnoredTerminalAttemptId(undefined);
+    }
+    return result;
+  };
+
+  const dispatchRefreshAuth = (target: Extract<ClientCommand, { type: "refreshAuth" }>["target"]) =>
+    dispatchAndWaitForOperation({
+      command: { type: "refreshAuth", target },
+      key: (snapshot) => snapshot.auth.refresh.key,
+      kind: "authRefresh",
+      missingKeyMessage: "refresh auth command did not produce an operation key",
+      failureMessage: "credential refresh failed",
+    });
+
+  const dispatchLogoutAuth = (target: Extract<ClientCommand, { type: "logoutAuth" }>["target"]) =>
+    dispatchAndWaitForOperation({
+      command: { type: "logoutAuth", target },
+      key: (snapshot) => snapshot.auth.logout.key,
+      kind: "authLogout",
+      missingKeyMessage: "reset auth command did not produce an operation key",
+      failureMessage: "credential reset failed",
+    });
 
   const dispatchCreateSession = async () => {
     return dispatchAndWaitForOperation({
@@ -149,6 +240,16 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
   };
 
+  const dispatchContinueSession = async (command: Extract<ClientCommand, { type: "continueSessionFromTurn" | "continueSessionFromCursor" }>) => {
+    return dispatchAndWaitForOperation({
+      command,
+      key: (snapshot) => snapshot.sessions.continueSession.key,
+      kind: "sessionContinue",
+      missingKeyMessage: "session continue command did not produce an operation key",
+      failureMessage: "session continue failed",
+    });
+  };
+
   async function dispatchAndWaitForOperation(options: {
     command: ClientCommand;
     key: (snapshot: ClientSnapshot) => string | null;
@@ -195,7 +296,14 @@ export function AppStateProvider(props: AppStateProviderProps) {
         clientLoadError: () => wasmClient.error,
         clientLoaded: () => Boolean(wasmClient()),
         systemReady,
+        explicitAuthTarget,
         dispatch,
+        dispatchBeginExplicitAuth,
+        dispatchCompleteAuth,
+        dispatchCancelAuth,
+        dispatchRefreshAuth,
+        dispatchLogoutAuth,
+        clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
         dispatchConfigPatch,
         dispatchCreateSession,
         dispatchDeleteSession,
@@ -203,6 +311,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
         dispatchSubmitUserMessage,
         dispatchRespondExternalRequest,
         dispatchInterruptSession,
+        dispatchContinueSession,
       }}
     >
       {props.children}
@@ -260,6 +369,13 @@ function operationResult(snapshot: ClientSnapshot, key: string, kind: OperationK
   const result = snapshot.operations.current[key];
 
   return result?.kind === kind ? result : undefined;
+}
+
+function sameAuthTarget(
+  left: Extract<ClientCommand, { type: "beginAuth" }>["target"] | undefined,
+  right: Extract<ClientCommand, { type: "beginAuth" }>["target"] | undefined,
+) {
+  return Boolean(left && right && left.kind === right.kind && left.key === right.key);
 }
 
 function getLoadedClient(client: LoadedWasmClient | undefined) {

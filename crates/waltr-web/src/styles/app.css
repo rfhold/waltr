@@ -252,20 +252,21 @@
   text-decoration: none;
 }
 
-.oauth-dialog__field {
-  display: grid;
-  gap: var(--space-2);
-  color: var(--color-text-muted);
-}
-
-.oauth-dialog__field textarea {
-  min-width: 0;
-  resize: vertical;
-}
-
 .oauth-dialog__actions {
   display: flex;
   justify-content: flex-end;
+  margin-top: var(--space-2);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.oauth-dialog__actions .oauth-dialog__primary {
+  border-color: var(--color-accent);
+  background: var(--color-accent-strong);
+}
+
+.oauth-dialog__actions .oauth-dialog__primary:not(:disabled):hover {
+  background: var(--color-accent-strong-hover);
 }
 
 .shell {
@@ -582,6 +583,47 @@
 
 .sessions__detail-main > .ui-alert + .ui-alert {
   margin-top: var(--space-3);
+}
+
+.sessions__auth-failure {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  border: 1px solid var(--border-danger);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+  background: var(--color-danger-soft);
+  color: var(--color-text);
+}
+
+.sessions__auth-failure p,
+.sessions__auth-failure-context {
+  margin: 0;
+}
+
+.sessions__auth-failure a {
+  color: var(--color-accent);
+  font-weight: 700;
+}
+
+.sessions__auth-failure-context {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr));
+  gap: var(--space-2) var(--space-4);
+}
+
+.sessions__auth-failure-context div {
+  min-width: 0;
+}
+
+.sessions__auth-failure-context dt {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.sessions__auth-failure-context dd {
+  overflow-wrap: anywhere;
+  margin: var(--space-1) 0 0;
 }
 
 .sessions__timeline-empty {
@@ -2054,6 +2096,118 @@
   color: var(--color-text-muted);
 }
 
+.config__oauth-fields,
+.config__oauth-list,
+.config__oauth-mapping,
+.auth-status {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.config__oauth-list {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.config__oauth-list-heading,
+.auth-status__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.config__oauth-list-heading h4,
+.auth-status__heading h3,
+.auth-status__heading p {
+  margin: 0;
+}
+
+.auth-status__heading p {
+  margin-top: var(--space-1);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.config__oauth-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--space-3);
+}
+
+.config__oauth-mapping {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4);
+}
+
+.config .config__oauth-remove {
+  justify-self: start;
+  border-color: var(--border-danger);
+  background: var(--color-danger-soft);
+}
+
+.auth-status {
+  margin-top: var(--space-5);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  background: color-mix(in srgb, var(--color-surface-soft) 72%, transparent);
+}
+
+.config__form .auth-status {
+  margin-top: 0;
+}
+
+.auth-status__badge {
+  flex: 0 0 auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  padding: 0.25rem 0.55rem;
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.auth-status__badge--success {
+  border-color: rgba(116, 232, 166, 0.42);
+  color: var(--color-success);
+}
+
+.auth-status__badge--warning {
+  border-color: rgba(252, 211, 77, 0.44);
+  color: var(--color-warning);
+}
+
+.auth-status__metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin: 0;
+}
+
+.auth-status__metadata div {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.auth-status__metadata dt {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.auth-status__metadata dd {
+  margin: 0;
+  font-weight: 700;
+}
+
+.auth-status__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
 .config__model-dialog {
   width: min(44rem, calc(100vw - 2.5rem));
 }
@@ -2386,6 +2540,22 @@
 
   .provider-row code {
     max-width: 100%;
+  }
+
+  .config__oauth-row {
+    grid-template-columns: 1fr;
+  }
+
+  .config__oauth-row button,
+  .auth-status__actions > button,
+  .auth-status__actions .ui-confirm {
+    width: 100%;
+  }
+
+  .config__oauth-list-heading,
+  .auth-status__heading {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .catalog-panel__header,

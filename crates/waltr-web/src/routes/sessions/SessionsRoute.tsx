@@ -25,7 +25,9 @@ import { MarkdownMessage } from "../../components/markdown/MarkdownMessage";
 import { ConfirmAction, Dialog, InlineAlert } from "../../components/ui";
 import { languageFromFilePath } from "../../web-lib/language";
 import type {
+  AuthenticationFailureSnapshot,
   ClientCommand,
+  ClientSnapshot,
   ConfigView,
   ExternalRequestView,
   McpServerView,
@@ -72,6 +74,11 @@ type SessionsContextValue = {
   cancelDelete: () => void;
   deleteSession: (id: string) => Promise<void>;
   deleteDisabled: Accessor<boolean>;
+};
+
+type SessionCommandError = {
+  message: string;
+  authenticationFailure?: AuthenticationFailureSnapshot;
 };
 
 const SessionsContext = createContext<SessionsContextValue>();
@@ -338,7 +345,7 @@ function SessionDetail(props: { session: SessionView }) {
   const [resourceRequestId, setResourceRequestId] = createSignal<string>();
   const [selectedResourceIndex, setSelectedResourceIndex] = createSignal(0);
   const [templateSearchError, setTemplateSearchError] = createSignal<string>();
-  const [commandError, setCommandError] = createSignal<string>();
+  const [commandError, setCommandError] = createSignal<SessionCommandError>();
   const [expandedShellOutputs, setExpandedShellOutputs] = createSignal<Record<string, boolean>>({});
   const [historyShift, setHistoryShift] = createSignal(false);
   let timelineScroll: HTMLDivElement | undefined;
@@ -441,7 +448,7 @@ function SessionDetail(props: { session: SessionView }) {
           initialLimit: TIMELINE_PAGE_SIZE,
         });
       } catch (error) {
-        setCommandError(error instanceof Error ? error.message : "Unable to watch session timeline.");
+        setCommandError({ message: error instanceof Error ? error.message : "Unable to watch session timeline." });
       }
     })();
   });
@@ -639,7 +646,7 @@ function SessionDetail(props: { session: SessionView }) {
     } catch (error) {
       pendingHistoryCursor = undefined;
       scheduleHistoryShiftClear();
-      setCommandError(error instanceof Error ? error.message : "Unable to load earlier history.");
+      setCommandError({ message: error instanceof Error ? error.message : "Unable to load earlier history." });
     }
   };
 
@@ -656,7 +663,11 @@ function SessionDetail(props: { session: SessionView }) {
       setCaret({ start: 0, end: 0 });
       clearResourceAutocomplete();
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to send message.");
+      const current = app.snapshot();
+      setCommandError({
+        message: error instanceof Error ? error.message : "Unable to send message.",
+        authenticationFailure: sessionOperationAuthenticationFailure(current, current?.sessions.submitUserMessage.key, "sessionSubmitUserMessage", props.session.id),
+      });
     }
   };
 
@@ -782,7 +793,7 @@ function SessionDetail(props: { session: SessionView }) {
     try {
       await app.dispatchInterruptSession(props.session.id);
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to stop session.");
+      setCommandError({ message: error instanceof Error ? error.message : "Unable to stop session." });
     }
   };
 
@@ -791,7 +802,11 @@ function SessionDetail(props: { session: SessionView }) {
     try {
       await app.dispatchRespondExternalRequest(props.session.id, requestId, JSON.stringify(response));
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to answer prompt.");
+      const current = app.snapshot();
+      setCommandError({
+        message: error instanceof Error ? error.message : "Unable to answer prompt.",
+        authenticationFailure: sessionOperationAuthenticationFailure(current, current?.sessions.respondExternalRequest.key, "sessionRespondExternalRequest", props.session.id),
+      });
     }
   };
 
@@ -800,7 +815,7 @@ function SessionDetail(props: { session: SessionView }) {
     try {
       await app.dispatch({ type: "rollbackSessionToTurn", sessionId: props.session.id, turn });
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to roll back session.");
+      setCommandError({ message: error instanceof Error ? error.message : "Unable to roll back session." });
     }
   };
 
@@ -809,25 +824,33 @@ function SessionDetail(props: { session: SessionView }) {
     try {
       await app.dispatch({ type: "rollbackSessionToCursor", sessionId: props.session.id, cursor });
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to roll back response.");
+      setCommandError({ message: error instanceof Error ? error.message : "Unable to roll back response." });
     }
   };
 
   const continueTurn = async (turn: bigint) => {
     setCommandError(undefined);
     try {
-      await app.dispatch({ type: "continueSessionFromTurn", sessionId: props.session.id, turn });
+      await app.dispatchContinueSession({ type: "continueSessionFromTurn", sessionId: props.session.id, turn });
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to continue session.");
+      const current = app.snapshot();
+      setCommandError({
+        message: error instanceof Error ? error.message : "Unable to continue session.",
+        authenticationFailure: sessionOperationAuthenticationFailure(current, current?.sessions.continueSession.key, "sessionContinue", props.session.id),
+      });
     }
   };
 
   const continueCursor = async (cursor: bigint) => {
     setCommandError(undefined);
     try {
-      await app.dispatch({ type: "continueSessionFromCursor", sessionId: props.session.id, cursor });
+      await app.dispatchContinueSession({ type: "continueSessionFromCursor", sessionId: props.session.id, cursor });
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to rerun message.");
+      const current = app.snapshot();
+      setCommandError({
+        message: error instanceof Error ? error.message : "Unable to rerun message.",
+        authenticationFailure: sessionOperationAuthenticationFailure(current, current?.sessions.continueSession.key, "sessionContinue", props.session.id),
+      });
     }
   };
 
@@ -837,7 +860,7 @@ function SessionDetail(props: { session: SessionView }) {
       await app.dispatch({ type: "rollbackSessionBeforeCursor", sessionId: props.session.id, cursor: item.cursor });
       setDraft(retemplatizeUserMessage(item.text));
     } catch (error) {
-      setCommandError(error instanceof Error ? error.message : "Unable to edit message.");
+      setCommandError({ message: error instanceof Error ? error.message : "Unable to edit message." });
     }
   };
 
@@ -864,7 +887,14 @@ function SessionDetail(props: { session: SessionView }) {
         <Show when={sessions.deleteErrors()[props.session.id]}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>
-        <Show when={commandError()}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
+        <Show when={commandError()}>
+          {(error) => error().authenticationFailure
+            ? <AuthenticationFailureAlert failure={error().authenticationFailure!} message={error().message} />
+            : <InlineAlert tone="danger">{error().message}</InlineAlert>}
+        </Show>
+        <Show when={props.session.status.authenticationFailure}>
+          {(failure) => <AuthenticationFailureAlert failure={failure()} message={props.session.status.failedMessage || "Session failed."} />}
+        </Show>
         <Show
           when={items().length > 0}
           fallback={<p class="sessions__timeline-empty">No messages yet.</p>}
@@ -2599,6 +2629,73 @@ function diffLineParts(text: string, kind: "add" | "remove" | "file" | "meta" | 
 
 function sessionActive(session: SessionView) {
   return !["idle", "suspended", "finished", "failed", "unknown", "unspecified"].includes(session.status.phase);
+}
+
+function AuthenticationFailureAlert(props: { failure: AuthenticationFailureSnapshot; message: string }) {
+  const targetName = () => props.failure.target.kind === "mcpServer" ? "MCP server" : "provider";
+  const configHref = () => props.failure.target.kind === "mcpServer"
+    ? `/config/mcp/edit/${encodeURIComponent(props.failure.target.key)}`
+    : `/config/provider/edit/${encodeURIComponent(props.failure.target.key)}`;
+  const context = () => authenticationContextEntries(props.failure);
+
+  return (
+    <section class="sessions__auth-failure" role="alert" aria-live="assertive">
+      <strong>Authentication failed for {targetName()} <code>{safeFailureText(props.failure.target.key)}</code>.</strong>
+      <p>{authenticationReasonText(props.failure.reason)}</p>
+      <Show when={props.message}><p>{safeFailureText(props.message)}</p></Show>
+      <Show when={context().length > 0}>
+        <dl class="sessions__auth-failure-context">
+          <For each={context()}>{(entry) => <div><dt>{entry.label}</dt><dd>{entry.value}</dd></div>}</For>
+        </dl>
+      </Show>
+      <p><A href={configHref()}>Open {targetName()} Config</A>, authorize or update the target, then resend the message or rerun the action.</p>
+    </section>
+  );
+}
+
+function authenticationReasonText(reason: string) {
+  switch (reason) {
+    case "credentialRequired": return "No usable credential is configured for this target.";
+    case "credentialRejected": return "The configured credential was rejected.";
+    case "tokenExchangeFailed": return "The OAuth token exchange failed.";
+    case "networkFailed": return "Authentication could not reach the upstream service.";
+    case "responseInvalid": return "The upstream authentication response was invalid.";
+    case "configurationRequired": return "Authentication configuration is missing or incomplete.";
+    default: return "The target reported an authentication failure.";
+  }
+}
+
+function authenticationContextEntries(failure: AuthenticationFailureSnapshot) {
+  const context = failure.mcpContext;
+  if (!context) return [];
+
+  return [
+    ["Endpoint", context.endpoint],
+    ["HTTP status", context.httpStatus > 0 ? String(context.httpStatus) : null],
+    ["Resource metadata", context.resourceMetadataUrl],
+    ["Scope", context.scope],
+    ["OAuth error", context.error],
+    ["Description", context.errorDescription],
+    ["Error documentation", context.errorUri],
+    ["Realm", context.realm],
+  ].flatMap(([label, value]) => value ? [{ label: label!, value: safeFailureText(value) }] : []);
+}
+
+function safeFailureText(value: string) {
+  const sanitized = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
+  return sanitized.length > 500 ? `${sanitized.slice(0, 499)}...` : sanitized;
+}
+
+function sessionOperationAuthenticationFailure(
+  snapshot: ClientSnapshot | undefined,
+  key: string | null | undefined,
+  kind: "sessionSubmitUserMessage" | "sessionRespondExternalRequest" | "sessionContinue",
+  sessionId: string,
+) {
+  if (!snapshot || !key) return undefined;
+  const operation = snapshot.operations.current[key];
+  if (!operation || operation.status !== "failed" || operation.kind !== kind || operation.sessionId !== sessionId) return undefined;
+  return operation.authenticationFailure ?? undefined;
 }
 
 function sessionImportantStatus(session: SessionView, working: boolean, watchError?: string | null) {

@@ -1,12 +1,65 @@
 import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
 import { describe, expect, test } from "vitest";
 
-import type { ClientCommand } from "../../src/generated/waltr-client";
+import type { ClientCommand, ConfigView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { ConfigRouteWithChildren, testHistory } from "../support/routes";
 import { claudeConfig, snapshotWithConfig } from "../support/snapshots";
 
 describe("provider config", () => {
+  test("round-trips every public-client OAuth setting and preserves settings while disabled", async () => {
+    const commands: ClientCommand[] = [];
+    const config: ConfigView = claudeConfig();
+    config.providers.claude = {
+      ...config.providers.claude!,
+      oauthCompatible: true,
+      oauthSettings: {
+        name: "Claude OAuth",
+        authorizeUrl: "https://id.example/authorize",
+        tokenUrl: "https://id.example/token",
+        clientId: "public-client",
+        redirectUri: "http://127.0.0.1/callback",
+        scopes: ["openid", "profile"],
+        tokenRequestStyle: "json",
+        sendStateInTokenRequest: true,
+        authUrlParams: [{ key: "audience", value: "waltr" }],
+        jwtMetadata: [{ token: "id", metadataKey: "subject", claimNames: ["sub", "uid"], required: true }],
+      },
+    };
+
+    renderWithAppState(() => <ConfigRouteWithChildren />, { commands, snapshot: snapshotWithConfig(config) });
+    fireEvent.click(screen.getByLabelText("Edit claude"));
+
+    await waitFor(() => expect(screen.getByLabelText("OAuth name")).toBeTruthy());
+    expect((screen.getByLabelText("Authorization URL") as HTMLInputElement).value).toBe("https://id.example/authorize");
+    expect((screen.getByLabelText("Token URL") as HTMLInputElement).value).toBe("https://id.example/token");
+    expect((screen.getByLabelText("Client ID") as HTMLInputElement).value).toBe("public-client");
+    expect((screen.getByLabelText("Redirect URI") as HTMLInputElement).value).toBe("http://127.0.0.1/callback");
+    expect((screen.getByLabelText("Scopes") as HTMLInputElement).value).toBe("openid profile");
+    expect((screen.getByLabelText("Token request style") as HTMLSelectElement).value).toBe("json");
+    expect((screen.getByLabelText("Send state during code exchange") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("Parameter 1 key") as HTMLInputElement).value).toBe("audience");
+    expect((screen.getByLabelText("Mapping 1 metadata key") as HTMLInputElement).value).toBe("subject");
+
+    fireEvent.click(screen.getByLabelText("OAuth compatible"));
+    expect(screen.getByLabelText("OAuth name")).toBeTruthy();
+    fireEvent.input(screen.getByLabelText("Scopes"), { target: { value: "openid,email" } });
+    fireEvent.submit(screen.getByLabelText("Edit provider"));
+
+    await waitFor(() => expect(commands.some((command) => command.type === "updateProvider")).toBe(true));
+    const update = commands.find((command): command is Extract<ClientCommand, { type: "updateProvider" }> => command.type === "updateProvider")!;
+    expect(update.provider.oauthCompatible).toBe(false);
+    expect(update.provider.oauthSettings).toMatchObject({
+      name: "Claude OAuth",
+      scopes: ["openid", "email"],
+      tokenRequestStyle: "json",
+      sendStateInTokenRequest: true,
+      authUrlParams: [{ key: "audience", value: "waltr" }],
+      jwtMetadata: [{ token: "id", metadataKey: "subject", claimNames: ["sub", "uid"], required: true }],
+    });
+    expect(document.body.textContent?.toLowerCase()).not.toContain("client secret");
+  });
+
   test("creates edits and deletes providers from config route state", async () => {
     const commands: ClientCommand[] = [];
 

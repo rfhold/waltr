@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor, within } from "@solidjs/testing-library";
 import { describe, expect, test, vi } from "vitest";
 
-import type { ClientCommand, ClientSnapshot, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
+import type { AuthenticationFailureSnapshot, ClientCommand, ClientSnapshot, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, testHistory } from "../support/routes";
 import { emptyConfig, readySessionTimeline, sessionMetricsView, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
@@ -35,7 +35,7 @@ describe("sessions route", () => {
       commands,
       routePath: "/sessions",
       snapshot: snapshotWithSessions([
-        sessionView({ id: "session-b", status: { phase: "runningTool", failedMessage: "" } }),
+        sessionView({ id: "session-b", status: { phase: "runningTool", failedMessage: "", authenticationFailure: null } }),
       ]),
     });
 
@@ -532,6 +532,7 @@ describe("sessions route", () => {
   });
 
   test("session detail composer keeps draft and shows operation failures", async () => {
+    const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
       sessionWithRuntime("session-compose-fail"),
     ]);
@@ -541,6 +542,8 @@ describe("sessions route", () => {
       routePath: "/sessions/session-compose-fail",
       snapshot,
       submitUserMessageError: "submit rejected",
+      sessionOperationAuthenticationFailure: authenticationFailure("provider", "team/claude", "credentialRejected"),
+      commands,
     });
 
     const input = screen.getByLabelText("Session message") as HTMLTextAreaElement;
@@ -549,11 +552,13 @@ describe("sessions route", () => {
 
     await waitFor(() => expect(screen.getByText("submit rejected")).toBeTruthy());
     expect(input.value).toBe("keep me");
+    expect(screen.getByRole("link", { name: "Open provider Config" }).getAttribute("href")).toBe("/config/provider/edit/team%2Fclaude");
+    expect(commands.some(isOAuthCommand)).toBe(false);
   });
 
   test("session detail shows assistant pending state while active", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-active", { phase: "streamingProvider", failedMessage: "" }),
+      sessionWithRuntime("session-active", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-active"] = readySessionTimeline();
 
@@ -567,7 +572,7 @@ describe("sessions route", () => {
 
   test("session detail treats suspended sessions as waiting", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-suspended", { phase: "suspended", failedMessage: "" }),
+      sessionWithRuntime("session-suspended", { phase: "suspended", failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-suspended"] = readySessionTimeline();
 
@@ -585,7 +590,7 @@ describe("sessions route", () => {
 
   test("session detail shows failed status in important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-failed", { phase: "failed", failedMessage: "provider unavailable" }),
+      sessionWithRuntime("session-failed", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-failed"] = readySessionTimeline();
 
@@ -598,9 +603,49 @@ describe("sessions route", () => {
     expect(screen.getByLabelText("Session status summary").textContent).not.toContain("failed");
   });
 
+  test.each([
+    ["credentialRequired", "No usable credential is configured"],
+    ["credentialRejected", "configured credential was rejected"],
+    ["tokenExchangeFailed", "OAuth token exchange failed"],
+    ["networkFailed", "could not reach the upstream service"],
+    ["responseInvalid", "authentication response was invalid"],
+    ["configurationRequired", "configuration is missing or incomplete"],
+  ])("renders actionable failed-session authentication reason %s", (reason, text) => {
+    const commands: ClientCommand[] = [];
+    const status: SessionStatusView = {
+      phase: "failed",
+      failedMessage: "safe session failure",
+      authenticationFailure: authenticationFailure("mcpServer", "remote server", reason),
+    };
+    status.authenticationFailure!.mcpContext = {
+      endpoint: "https://mcp.example/resources",
+      httpStatus: 401,
+      resourceMetadataUrl: "https://mcp.example/.well-known/oauth-protected-resource",
+      scope: "tools.read",
+      error: "invalid_token",
+      errorDescription: "Credential unavailable.",
+      errorUri: "https://mcp.example/errors/invalid-token",
+      realm: "remote",
+    };
+    const snapshot = snapshotWithSessions([sessionWithRuntime("session-auth-status", status)]);
+    snapshot.sessions.timelines["session-auth-status"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-auth-status",
+      snapshot,
+    });
+
+    expect(screen.getByRole("alert").textContent).toContain(text);
+    expect(screen.getByRole("alert").textContent).toContain("tools.read");
+    expect(screen.getByRole("link", { name: "Open MCP server Config" }).getAttribute("href")).toBe("/config/mcp/edit/remote%20server");
+    expect(screen.getByRole("alert").textContent).toContain("resend the message or rerun the action");
+    expect(commands.some(isOAuthCommand)).toBe(false);
+  });
+
   test("session detail shows timeline watch errors in the important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-timeline-error", { phase: "failed", failedMessage: "provider unavailable" }),
+      sessionWithRuntime("session-timeline-error", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
     ]);
     const timeline = readySessionTimeline();
     timeline.watch = { status: "failed", error: "timeline disconnected", key: null };
@@ -1098,6 +1143,33 @@ describe("sessions route", () => {
       sessionId: "session-rerun-user",
       cursor: 9n,
     }));
+  });
+
+  test("session detail renders structured rerun authentication failures without beginning OAuth", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([sessionWithRuntime("session-rerun-auth")]);
+    const timeline = readySessionTimeline();
+    timeline.events = [timelineEvent({
+      cursor: 9n,
+      sessionId: "session-rerun-auth",
+      itemId: "user-item",
+      channel: "user_text",
+      content: { kind: "textSnapshot", text: "rerun prompt" },
+    })];
+    snapshot.sessions.timelines["session-rerun-auth"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-rerun-auth",
+      snapshot,
+      continueSessionError: "authorization required",
+      sessionOperationAuthenticationFailure: authenticationFailure("provider", "claude", "credentialRequired"),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Rerun" }));
+
+    await waitFor(() => expect(screen.getByRole("link", { name: "Open provider Config" })).toBeTruthy());
+    expect(commands.some(isOAuthCommand)).toBe(false);
   });
 
   test("session detail renders thinking markdown", () => {
@@ -1611,6 +1683,7 @@ describe("sessions route", () => {
   });
 
   test("session detail shows external response operation failures", async () => {
+    const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
       sessionWithRuntime("session-permission-fail"),
     ]);
@@ -1630,16 +1703,20 @@ describe("sessions route", () => {
       routePath: "/sessions/session-permission-fail",
       snapshot,
       respondExternalRequestError: "response rejected",
+      sessionOperationAuthenticationFailure: authenticationFailure("mcpServer", "remote", "credentialRequired"),
+      commands,
     });
 
     fireEvent.click(within(screen.getByLabelText("Permission prompt")).getByText("Allow once"));
 
     await waitFor(() => expect(screen.getByText("response rejected")).toBeTruthy());
+    expect(screen.getByRole("link", { name: "Open MCP server Config" }).getAttribute("href")).toBe("/config/mcp/edit/remote");
+    expect(commands.some(isOAuthCommand)).toBe(false);
   });
 
   test("session detail shows interrupt operation failures", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-interrupt-fail", { phase: "streamingProvider", failedMessage: "" }),
+      sessionWithRuntime("session-interrupt-fail", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-interrupt-fail"] = readySessionTimeline();
 
@@ -2006,7 +2083,7 @@ function provider(name: string, modelIds: string[], reasoningEfforts: string[] =
   };
 }
 
-function sessionWithRuntime(id: string, status: SessionStatusView = { phase: "idle", failedMessage: "" }) {
+function sessionWithRuntime(id: string, status: SessionStatusView = { phase: "idle", failedMessage: "", authenticationFailure: null }) {
   return sessionView({
     id,
     status,
@@ -2028,6 +2105,24 @@ function sessionWithRuntime(id: string, status: SessionStatusView = { phase: "id
       }],
     },
   });
+}
+
+function authenticationFailure(
+  targetKind: "provider" | "mcpServer",
+  key: string,
+  reason: string,
+): AuthenticationFailureSnapshot {
+  return {
+    version: 1,
+    domain: targetKind === "provider" ? "outboundProvider" : "outboundMcp",
+    reason,
+    target: { kind: targetKind, key },
+    mcpContext: null,
+  };
+}
+
+function isOAuthCommand(command: ClientCommand) {
+  return ["beginAuth", "completeAuth", "cancelAuth", "refreshAuth", "logoutAuth"].includes(command.type);
 }
 
 function timelineEvent(overrides: Partial<TimelineEventView> = {}): TimelineEventView {

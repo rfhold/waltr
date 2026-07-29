@@ -57,12 +57,13 @@ export function emptyCatalogSnapshot(): CatalogSnapshot {
 
 export function emptyAuthSnapshot(): AuthSnapshot {
   return {
-    pending: [],
+    statuses: {},
     activeAttempt: null,
     list: operationSnapshot("idle"),
     begin: operationSnapshot("idle"),
     complete: operationSnapshot("idle"),
     cancel: operationSnapshot("idle"),
+    refresh: operationSnapshot("idle"),
     logout: operationSnapshot("idle"),
   };
 }
@@ -128,7 +129,7 @@ export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
   return {
     id,
     revision: 0n,
-    status: { phase: "idle", failedMessage: "" },
+    status: { phase: "idle", failedMessage: "", authenticationFailure: null },
     currentPrompt: null,
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),

@@ -72,6 +72,9 @@ export function ConfigRoute(props: ParentProps) {
     untrack(() => dispatchConfigWatchCommand(app.dispatch, {
       type: "registerConfigWatchInterest",
     }));
+    untrack(() => dispatchConfigWatchCommand(app.dispatch, {
+      type: "requestAuthStatuses",
+    }));
   }));
 
   onCleanup(() => {

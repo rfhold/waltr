@@ -1,0 +1,763 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`OAuth config presentation > MCP expired credential status and registration > expired preregistered MCP credential actions 1`] = `
+<section
+  aria-label="Authentication for remote"
+  class="auth-status"
+>
+  <div
+    class="auth-status__heading"
+  >
+    <div>
+      <h3>
+        Authentication
+      </h3>
+      <p>
+        Credentials stay on the server and are never shown here.
+      </p>
+    </div>
+    <span
+      class="auth-status__badge auth-status__badge--warning"
+    >
+      Expired
+    </span>
+  </div>
+  
+  
+  <dl
+    class="auth-status__metadata"
+  >
+    <div>
+      <dt>
+        Expires
+      </dt>
+      <dd>
+        [expiration timestamp]
+      </dd>
+    </div>
+    <div>
+      <dt>
+        Registration
+      </dt>
+      <dd>
+        Preregistered
+      </dd>
+    </div>
+  </dl>
+  
+  
+  <div
+    class="auth-status__actions"
+  >
+    
+    <button
+      type="button"
+    >
+      Reauthorize
+    </button>
+    <button
+      type="button"
+    >
+      Force refresh
+    </button>
+    <button
+      type="button"
+    >
+      Reset
+    </button>
+  </div>
+</section>
+`;
+
+exports[`OAuth config presentation > explicit config-originated manual provider dialog > explicit provider manual authorization dialog 1`] = `
+<div
+  class="config__form oauth-dialog__body"
+>
+  <p
+    class="oauth-dialog__intro"
+  >
+    Authenticate 
+    provider claude
+    <!---->
+    .
+  </p>
+  <div
+    class="oauth-dialog__attempt"
+  >
+    <dl
+      class="oauth-dialog__metadata"
+    >
+      <div>
+        <dt>
+          Status
+        </dt>
+        <dd>
+          Pending
+        </dd>
+      </div>
+      <div>
+        <dt>
+          Completion
+        </dt>
+        <dd>
+          Manual
+        </dd>
+      </div>
+      
+    </dl>
+    <p
+      aria-live="polite"
+      class="ui-alert ui-alert--info"
+      role="status"
+    >
+      Waiting for the final redirect URL or authorization code.
+    </p>
+    <ul
+      class="oauth-dialog__messages"
+    >
+      <li>
+        Authorize in the provider window, then return here.
+      </li>
+    </ul>
+    <code
+      class="oauth-dialog__url"
+    >
+      https://auth.example/authorize
+    </code>
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="oauth-manual-input"
+        >
+          Final redirect URL or code
+        </label>
+        
+      </div>
+      <textarea
+        aria-invalid="false"
+        id="oauth-manual-input"
+        placeholder="Paste the final redirect URL or authorization code"
+        rows="4"
+      />
+      
+      
+    </div>
+    
+  </div>
+  
+  <div
+    class="config__form-actions oauth-dialog__actions"
+  >
+    <a
+      class="ui-button oauth-dialog__open"
+      href="https://auth.example/authorize"
+      rel="noopener noreferrer"
+      target="_blank"
+    >
+      Open authorization URL
+    </a>
+    <button
+      class="ui-button oauth-dialog__primary"
+      type="button"
+    >
+      Complete OAuth
+    </button>
+    <button
+      class="ui-button"
+      type="button"
+    >
+      Cancel
+    </button>
+  </div>
+</div>
+`;
+
+exports[`OAuth config presentation > provider public-client editor and credential reset flow > populated provider public-client editor 1`] = `
+<fieldset
+  class="config__form-fieldset"
+>
+  <legend>
+    Public-client OAuth
+  </legend>
+  <label
+    class="config__form-checkbox"
+  >
+    <input
+      checked=""
+      name="oauthCompatible"
+      type="checkbox"
+    />
+    <span>
+      OAuth compatible
+    </span>
+  </label>
+  <p
+    class="config__form-hint"
+  >
+    Only public clients are supported. Settings are preserved when compatibility is turned off.
+  </p>
+  <div
+    class="config__oauth-fields"
+  >
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="provider-oauth-name"
+        >
+          OAuth name
+        </label>
+        
+      </div>
+      <input
+        id="provider-oauth-name"
+        name="oauthName"
+        value="Claude OAuth"
+      />
+      
+      
+    </div>
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="provider-oauth-authorize-url"
+        >
+          Authorization URL
+        </label>
+        
+      </div>
+      <input
+        id="provider-oauth-authorize-url"
+        name="authorizeUrl"
+        type="url"
+        value="https://id.example/authorize"
+      />
+      
+      
+    </div>
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="provider-oauth-token-url"
+        >
+          Token URL
+        </label>
+        
+      </div>
+      <input
+        id="provider-oauth-token-url"
+        name="tokenUrl"
+        type="url"
+        value="https://id.example/token"
+      />
+      
+      
+    </div>
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="provider-oauth-client-id"
+        >
+          Client ID
+        </label>
+        
+      </div>
+      <input
+        id="provider-oauth-client-id"
+        name="clientId"
+        value="waltr-browser-public"
+      />
+      
+      
+    </div>
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="provider-oauth-redirect-uri"
+        >
+          Redirect URI
+        </label>
+        
+      </div>
+      <input
+        id="provider-oauth-redirect-uri"
+        name="redirectUri"
+        type="url"
+        value="http://127.0.0.1:8765/callback"
+      />
+      
+      
+    </div>
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="provider-oauth-scopes"
+        >
+          Scopes
+        </label>
+        
+      </div>
+      <input
+        aria-describedby="provider-oauth-scopes-hint"
+        id="provider-oauth-scopes"
+        name="scopes"
+        value="openid profile offline_access"
+      />
+      <p
+        class="ui-field__hint"
+        id="provider-oauth-scopes-hint"
+      >
+        Separate scopes with spaces or commas.
+      </p>
+      
+    </div>
+    <div
+      class="ui-field"
+    >
+      <div
+        class="ui-field__label-row"
+      >
+        <label
+          class="ui-field__label"
+          for="provider-oauth-request-style"
+        >
+          Token request style
+        </label>
+        
+      </div>
+      <select
+        id="provider-oauth-request-style"
+        name="tokenRequestStyle"
+      >
+        <option
+          value="unspecified"
+        >
+          Unspecified
+        </option>
+        <option
+          value="json"
+        >
+          JSON
+        </option>
+        <option
+          selected=""
+          value="formUrlencoded"
+        >
+          Form URL encoded
+        </option>
+        <option
+          value="unknown"
+        >
+          Unknown
+        </option>
+      </select>
+      
+      
+    </div>
+    <label
+      class="config__form-checkbox"
+    >
+      <input
+        checked=""
+        name="sendStateInTokenRequest"
+        type="checkbox"
+      />
+      <span>
+        Send state during code exchange
+      </span>
+    </label>
+    <section
+      aria-label="Extra authorization parameters"
+      class="config__oauth-list"
+    >
+      <div
+        class="config__oauth-list-heading"
+      >
+        <h4>
+          Extra authorization parameters
+        </h4>
+        <button
+          type="button"
+        >
+          Add parameter
+        </button>
+      </div>
+      <div
+        class="config__oauth-row"
+      >
+        <div
+          class="ui-field"
+        >
+          <div
+            class="ui-field__label-row"
+          >
+            <label
+              class="ui-field__label"
+              for="provider-oauth-param-key-0"
+            >
+              Parameter 1 key
+            </label>
+            
+          </div>
+          <input
+            id="provider-oauth-param-key-0"
+            value="audience"
+          />
+          
+          
+        </div>
+        <div
+          class="ui-field"
+        >
+          <div
+            class="ui-field__label-row"
+          >
+            <label
+              class="ui-field__label"
+              for="provider-oauth-param-value-0"
+            >
+              Parameter 1 value
+            </label>
+            
+          </div>
+          <input
+            id="provider-oauth-param-value-0"
+            value="https://api.example"
+          />
+          
+          
+        </div>
+        <button
+          aria-label="Remove authorization parameter 1"
+          type="button"
+        >
+          Remove
+        </button>
+      </div>
+    </section>
+    <section
+      aria-label="JWT metadata mappings"
+      class="config__oauth-list"
+    >
+      <div
+        class="config__oauth-list-heading"
+      >
+        <h4>
+          JWT metadata mappings
+        </h4>
+        <button
+          type="button"
+        >
+          Add mapping
+        </button>
+      </div>
+      <div
+        class="config__oauth-mapping"
+      >
+        <div
+          class="ui-field"
+        >
+          <div
+            class="ui-field__label-row"
+          >
+            <label
+              class="ui-field__label"
+              for="provider-oauth-jwt-token-0"
+            >
+              Mapping 1 token
+            </label>
+            
+          </div>
+          <select
+            id="provider-oauth-jwt-token-0"
+          >
+            <option
+              value="unspecified"
+            >
+              Unspecified
+            </option>
+            <option
+              value="access"
+            >
+              Access JWT
+            </option>
+            <option
+              selected=""
+              value="id"
+            >
+              ID JWT
+            </option>
+            <option
+              value="unknown"
+            >
+              Unknown
+            </option>
+          </select>
+          
+          
+        </div>
+        <div
+          class="ui-field"
+        >
+          <div
+            class="ui-field__label-row"
+          >
+            <label
+              class="ui-field__label"
+              for="provider-oauth-jwt-key-0"
+            >
+              Mapping 1 metadata key
+            </label>
+            
+          </div>
+          <input
+            id="provider-oauth-jwt-key-0"
+            value="subject"
+          />
+          
+          
+        </div>
+        <div
+          class="ui-field"
+        >
+          <div
+            class="ui-field__label-row"
+          >
+            <label
+              class="ui-field__label"
+              for="provider-oauth-jwt-claims-0"
+            >
+              Mapping 1 claim names
+            </label>
+            
+          </div>
+          <input
+            aria-describedby="provider-oauth-jwt-claims-0-hint"
+            id="provider-oauth-jwt-claims-0"
+            value="sub uid"
+          />
+          <p
+            class="ui-field__hint"
+            id="provider-oauth-jwt-claims-0-hint"
+          >
+            Separate fallback claims with spaces or commas.
+          </p>
+          
+        </div>
+        <label
+          class="config__form-checkbox"
+        >
+          <input
+            checked=""
+            type="checkbox"
+          />
+          <span>
+            Required mapping
+          </span>
+        </label>
+        <button
+          aria-label="Remove JWT metadata mapping 1"
+          type="button"
+        >
+          Remove
+        </button>
+      </div>
+    </section>
+    <button
+      class="config__oauth-remove"
+      type="button"
+    >
+      Remove OAuth settings
+    </button>
+  </div>
+</fieldset>
+`;
+
+exports[`OAuth config presentation > provider public-client editor and credential reset flow > provider connected status with reset confirmation 1`] = `
+<section
+  aria-label="Authentication for claude"
+  class="auth-status"
+>
+  <div
+    class="auth-status__heading"
+  >
+    <div>
+      <h3>
+        Authentication
+      </h3>
+      <p>
+        Credentials stay on the server and are never shown here.
+      </p>
+    </div>
+    <span
+      class="auth-status__badge auth-status__badge--success"
+    >
+      Connected
+    </span>
+  </div>
+  
+  
+  <dl
+    class="auth-status__metadata"
+  >
+    <div>
+      <dt>
+        Expires
+      </dt>
+      <dd>
+        [expiration timestamp]
+      </dd>
+    </div>
+    
+  </dl>
+  
+  
+  <div
+    class="auth-status__actions"
+  >
+    
+    <button
+      type="button"
+    >
+      Reauthorize
+    </button>
+    <button
+      type="button"
+    >
+      Force refresh
+    </button>
+    <div
+      aria-label="Reset authentication for claude confirmation"
+      class="ui-confirm"
+      role="group"
+    >
+      <span
+        class="ui-confirm__prompt"
+      >
+        Remove credential?
+      </span>
+      <button
+        aria-label="Confirm reset authentication for claude"
+        class="ui-button ui-button--danger"
+        type="button"
+      >
+        Reset
+      </button>
+      <button
+        aria-label="Cancel reset authentication for claude"
+        class="ui-button"
+        type="button"
+      >
+        Cancel
+      </button>
+    </div>
+  </div>
+</section>
+`;
+
+exports[`OAuth config presentation > provider retained status after auth-list failure > retained provider status with stale warning and retry 1`] = `
+<section
+  aria-label="Authentication for claude"
+  class="auth-status"
+>
+  <div
+    class="auth-status__heading"
+  >
+    <div>
+      <h3>
+        Authentication
+      </h3>
+      <p>
+        Credentials stay on the server and are never shown here.
+      </p>
+    </div>
+    <span
+      class="auth-status__badge auth-status__badge--success"
+    >
+      Connected
+    </span>
+  </div>
+  
+  <p
+    aria-live="assertive"
+    class="ui-alert ui-alert--danger"
+    role="alert"
+  >
+    Status service unavailable.
+     Authentication statuses may be stale.
+  </p>
+  <dl
+    class="auth-status__metadata"
+  >
+    <div>
+      <dt>
+        Expires
+      </dt>
+      <dd>
+        [expiration timestamp]
+      </dd>
+    </div>
+    
+  </dl>
+  
+  
+  <div
+    class="auth-status__actions"
+  >
+    <button
+      type="button"
+    >
+      Retry status
+    </button>
+    <button
+      type="button"
+    >
+      Reauthorize
+    </button>
+    <button
+      type="button"
+    >
+      Force refresh
+    </button>
+    <button
+      type="button"
+    >
+      Reset
+    </button>
+  </div>
+</section>
+`;
