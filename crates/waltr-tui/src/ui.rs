@@ -69,24 +69,24 @@ fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
     let Some(snapshot) = app.client_snapshot() else {
         return;
     };
-    let Some(requirement) = snapshot.auth.pending.first() else {
+    let Some(target) = app.outbound_auth_target() else {
         return;
     };
-    let attempt = snapshot.auth.active_attempt.as_ref().filter(|attempt| {
-        attempt.target.kind == requirement.target.kind
-            && attempt.target.key == requirement.target.key
-    });
-    let area = centered_percent_rect(frame.area(), 78, if attempt.is_some() { 20 } else { 10 });
+    let attempt =
+        snapshot.auth.active_attempt.as_ref().filter(|attempt| {
+            attempt.target.kind == target.kind && attempt.target.key == target.key
+        });
+    let area = centered_percent_rect(frame.area(), 90, if attempt.is_some() { 20 } else { 10 });
     frame.render_widget(Clear, area);
-    let body = render_modal_frame(frame, area, "OAuth required", auth_footer(attempt));
+    let body = render_modal_frame(frame, area, "OAuth authorization", auth_footer(attempt));
 
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Target: ", THEME.muted_text_style()),
-            Span::styled(auth_target_label(&requirement.target), THEME.accent_bold()),
+            Span::styled(auth_target_label(target), THEME.accent_bold()),
         ]),
         Line::from(Span::styled(
-            display_text(&requirement.message),
+            "Authorization requested from configuration.",
             THEME.accent_bold(),
         )),
     ];
@@ -102,13 +102,15 @@ fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
                 THEME.text_style(),
             ),
         ]));
-        lines.push(Line::from(vec![
-            Span::styled("Registration: ", THEME.muted_text_style()),
-            Span::styled(
-                registration_method_label(&attempt.registration_method),
-                THEME.text_style(),
-            ),
-        ]));
+        if target.kind == "mcpServer" {
+            lines.push(Line::from(vec![
+                Span::styled("Registration: ", THEME.muted_text_style()),
+                Span::styled(
+                    registration_method_label(&attempt.registration_method),
+                    THEME.text_style(),
+                ),
+            ]));
+        }
         lines.push(Line::from(Span::styled(
             lifecycle_message(attempt),
             THEME.muted_text_style(),
@@ -135,15 +137,10 @@ fn render_auth_modal(frame: &mut Frame<'_>, app: &App) {
         if !attempt.failure_reason.is_empty() {
             lines.push(error_line(&display_text(&attempt.failure_reason)));
         }
-        if let Some(error) = snapshot.auth.complete.error.as_ref().or(snapshot
-            .auth
-            .cancel
-            .error
-            .as_ref())
-        {
+        if let Some(error) = app.outbound_auth_error() {
             lines.push(error_line(&display_text(error)));
         }
-    } else if let Some(error) = snapshot.auth.begin.error.as_ref() {
+    } else if let Some(error) = app.outbound_auth_error() {
         lines.push(Line::from(""));
         lines.push(error_line(error));
     }
@@ -185,7 +182,7 @@ fn registration_method_label(method: &str) -> &'static str {
     match method {
         "dynamic" => "Dynamic",
         "clientMetadata" => "Client metadata",
-        "static" => "Static",
+        "preregistered" => "Preregistered",
         _ => "Unknown",
     }
 }

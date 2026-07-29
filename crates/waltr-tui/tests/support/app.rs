@@ -9,9 +9,10 @@
 use std::{collections::BTreeMap, time::Instant};
 
 use waltr_client::{
-    AccessSnapshot, AccessStatus, AuthSnapshot, CatalogMatchSourceView,
-    CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot, CatalogSnapshot, ClientCommand,
-    ClientOperationView, ClientSnapshot, ConfigSnapshot, ConfigView, ExternalRequestView,
+    AccessSnapshot, AccessStatus, AuthSnapshot, AuthStatusSnapshot, AuthenticationFailureSnapshot,
+    CatalogMatchSourceView, CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot,
+    CatalogSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
+    ConfigSnapshot, ConfigView, ExternalRequestView, McpAuthorizationContextSnapshot,
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
     OperationSnapshot, ProviderKindView, ProviderView, SessionPhaseView, SessionSnapshot,
@@ -132,10 +133,17 @@ pub(crate) fn open_config_app_with(snapshot: ClientSnapshot) -> App {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
 
     app
+}
+
+pub(crate) fn expected_config_entry_action() -> AppAction {
+    AppAction::ClientCommands(vec![
+        ClientCommand::RegisterConfigWatchInterest,
+        ClientCommand::RequestAuthStatuses,
+    ])
 }
 
 pub(crate) fn open_sessions_app_with(snapshot: ClientSnapshot) -> App {
@@ -561,9 +569,32 @@ pub(crate) fn session_submit_snapshot(
             status,
             error: error.map(str::to_owned),
             session_id,
+            authentication_failure: None,
         },
     );
     snapshot
+}
+
+pub(crate) fn authentication_failure(
+    target_kind: &str,
+    key: &str,
+    reason: &str,
+    mcp_context: Option<McpAuthorizationContextSnapshot>,
+) -> AuthenticationFailureSnapshot {
+    AuthenticationFailureSnapshot {
+        version: 1,
+        domain: if target_kind == "mcpServer" {
+            "outboundMcp".to_owned()
+        } else {
+            "outboundProvider".to_owned()
+        },
+        reason: reason.to_owned(),
+        target: ClientAuthTarget {
+            kind: target_kind.to_owned(),
+            key: key.to_owned(),
+        },
+        mcp_context,
+    }
 }
 
 pub(crate) fn session_view(id: &str, seconds: i64) -> SessionView {
@@ -582,6 +613,7 @@ pub(crate) fn session_with_phase(
         status: SessionStatusView {
             phase,
             failed_message: failed_message.to_owned(),
+            authentication_failure: None,
         },
         current_prompt: None,
         created_at: Some(TimestampView { seconds, nanos: 0 }),
@@ -600,7 +632,7 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
             active_attempt_id: None,
         },
         auth: AuthSnapshot {
-            pending: Vec::new(),
+            statuses: BTreeMap::new(),
             active_attempt: None,
             list: OperationSnapshot {
                 status: "idle",
@@ -618,6 +650,11 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 key: None,
             },
             cancel: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            refresh: OperationSnapshot {
                 status: "idle",
                 error: None,
                 key: None,
@@ -769,4 +806,82 @@ pub(crate) fn watched_config_snapshot() -> ClientSnapshot {
     snapshot.config.watch.status = "received";
     snapshot.config.load.status = "idle";
     snapshot
+}
+
+pub(crate) fn auth_status(
+    target_kind: &str,
+    key: &str,
+    kind: &str,
+    can_refresh: bool,
+) -> AuthStatusSnapshot {
+    auth_status_with_methods(
+        target_kind,
+        key,
+        kind,
+        can_refresh,
+        vec!["oauthManual".to_owned()],
+    )
+}
+
+pub(crate) fn auth_status_with_methods(
+    target_kind: &str,
+    key: &str,
+    kind: &str,
+    can_refresh: bool,
+    supported_methods: Vec<String>,
+) -> AuthStatusSnapshot {
+    AuthStatusSnapshot {
+        target: waltr_client::ClientAuthTarget {
+            kind: target_kind.to_owned(),
+            key: key.to_owned(),
+        },
+        kind: kind.to_owned(),
+        supported_methods,
+        expires_at_ms: 0,
+        metadata: BTreeMap::new(),
+        message: String::new(),
+        registration_method: if target_kind == "mcpServer" {
+            "dynamic".to_owned()
+        } else {
+            "unknown".to_owned()
+        },
+        can_refresh,
+    }
+}
+
+pub(crate) fn set_auth_status_with_methods(
+    snapshot: &mut ClientSnapshot,
+    target_kind: &str,
+    key: &str,
+    kind: &str,
+    can_refresh: bool,
+    supported_methods: Vec<String>,
+) {
+    let map_key = if target_kind == "mcpServer" {
+        format!("mcp:{key}")
+    } else {
+        format!("provider:{key}")
+    };
+    snapshot.auth.statuses.insert(
+        map_key,
+        auth_status_with_methods(target_kind, key, kind, can_refresh, supported_methods),
+    );
+}
+
+pub(crate) fn set_auth_status(
+    snapshot: &mut ClientSnapshot,
+    target_kind: &str,
+    key: &str,
+    kind: &str,
+    can_refresh: bool,
+) {
+    let map_key = if target_kind == "mcpServer" {
+        format!("mcp:{key}")
+    } else {
+        format!("provider:{key}")
+    };
+    snapshot
+        .auth
+        .statuses
+        .insert(map_key, auth_status(target_kind, key, kind, can_refresh));
 }

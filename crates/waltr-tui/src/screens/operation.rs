@@ -100,12 +100,18 @@ impl OperationTracker {
                 return None;
             }
 
-            self.key.clone_from(&operation.key);
+            let candidate = operation.key.as_ref()?;
+            let result = inspect_operation(&snapshot.operations.current, candidate, inspect)?;
+            self.key = Some(candidate.clone());
+            return self.apply_result(result);
         }
 
         let key = self.key.as_ref()?;
         let result = inspect_operation(&snapshot.operations.current, key, inspect)?;
+        self.apply_result(result)
+    }
 
+    fn apply_result<T>(&mut self, result: OperationResult<T>) -> Option<Result<T, String>> {
         match result {
             OperationResult::Pending => None,
             OperationResult::Ready(value) => {

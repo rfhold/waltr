@@ -469,6 +469,7 @@ fn sessions_detail_leader_c_releases_timeline_before_config_watch() {
             },
             ClientCommand::ReleaseSessionWatchInterest,
             ClientCommand::RegisterConfigWatchInterest,
+            ClientCommand::RequestAuthStatuses,
         ])
     );
     assert_eq!(app.screen(), AppScreen::Config);
@@ -1133,6 +1134,237 @@ fn sessions_detail_submit_failure_preserves_draft() {
     let rendered = render_app(&app);
     assert!(rendered.contains("hello"));
     assert!(rendered.contains("send failed"));
+}
+
+#[test]
+fn sessions_submit_auth_failure_is_actionable_without_emitting_oauth() {
+    let session = session_view("chat", 1);
+    let mut app = open_sessions_app_with(watched_session_with_timeline(
+        session.clone(),
+        Vec::new(),
+    ));
+    let now = Instant::now();
+    drop(app.handle_event(&right_press(), now));
+    for character in "retry me".chars() {
+        drop(app.handle_event(&char_press(character), now));
+    }
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::SubmitUserMessage { .. })
+    ));
+
+    let loading = session_submit_snapshot(session.clone(), "op-submit-auth", "loading", None);
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(loading)), now),
+        AppAction::Continue
+    );
+    let mut failed = session_submit_snapshot(
+        session,
+        "op-submit-auth",
+        "failed",
+        Some("authentication failed"),
+    );
+    let ClientOperationView::SessionSubmitUserMessage {
+        authentication_failure: failure_slot,
+        ..
+    } = failed
+        .operations
+        .current
+        .get_mut("op-submit-auth")
+        .expect("submit operation")
+    else {
+        panic!("expected submit operation");
+    };
+    *failure_slot = Some(authentication_failure(
+        "provider",
+        "anthropic",
+        "credentialRequired",
+        None,
+    ));
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(failed)), now),
+        AppAction::Continue
+    );
+
+    let rendered = render_app_with_size(&app, 120, 30);
+    assert!(rendered.contains("Authentication failed for provider anthropic"));
+    assert!(rendered.contains("Open Config (Ctrl-X c)"));
+    assert!(rendered.contains("resend the message"));
+    assert!(rendered.contains("retry me"));
+    assert!(!rendered.contains("OAuth authorization"));
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::SubmitUserMessage { .. })
+    ));
+}
+
+#[test]
+fn sessions_failed_status_renders_mcp_context_and_all_reason_guidance() {
+    let reasons = [
+        ("credentialRequired", "credentials are required"),
+        ("credentialRejected", "stored credentials were rejected"),
+        ("networkFailed", "authentication network request failed"),
+        ("tokenExchangeFailed", "OAuth token exchange failed"),
+        ("responseInvalid", "authentication response was invalid"),
+        ("configurationRequired", "authentication configuration is required"),
+    ];
+
+    for (reason, expected) in reasons {
+        let mut session = session_with_phase("chat", 1, SessionPhaseView::Failed, "safe failure");
+        session.status.authentication_failure = Some(authentication_failure(
+            "mcpServer",
+            "github",
+            reason,
+            Some(McpAuthorizationContextSnapshot {
+                endpoint: Some("https://mcp.example/rpc".to_owned()),
+                http_status: 401,
+                resource_metadata_url: Some(
+                    "https://mcp.example/.well-known/oauth-protected-resource".to_owned(),
+                ),
+                scope: Some("repo:read".to_owned()),
+                error: Some("invalid_token".to_owned()),
+                error_description: Some("authorization is required".to_owned()),
+                error_uri: Some("https://mcp.example/auth-help".to_owned()),
+                realm: Some("github-mcp".to_owned()),
+            }),
+        ));
+        let mut app = open_sessions_app_with(watched_session_with_timeline(session, Vec::new()));
+        assert!(matches!(
+            app.handle_event(&right_press(), Instant::now()),
+            AppAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest { .. })
+        ));
+
+        let rendered = render_app_with_size(&app, 140, 32);
+        assert!(rendered.contains("MCP server github"), "{rendered}");
+        assert!(rendered.contains(expected), "{rendered}");
+        assert!(rendered.contains("MCP endpoint: https://mcp.example/rpc"), "{rendered}");
+        assert!(rendered.contains("MCP HTTP status: 401"), "{rendered}");
+        assert!(rendered.contains("MCP scope: repo:read"), "{rendered}");
+        assert!(rendered.contains("Open Config (Ctrl-X c)"), "{rendered}");
+        assert!(rendered.contains("rerun the failed work"), "{rendered}");
+        assert!(!rendered.contains("OAuth authorization"), "{rendered}");
+    }
+}
+
+#[test]
+fn sessions_respond_and_continue_auth_failures_stay_inline() {
+    let now = Instant::now();
+    let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
+    let base = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![external_request_event(
+            1, "chat", "req-item", "req-1", 1, payload,
+        )],
+    );
+    let mut app = open_sessions_app_with(base.clone());
+    drop(app.handle_event(&right_press(), now));
+    assert!(matches!(
+        app.handle_event(&char_press('a'), now),
+        AppAction::ClientCommand(ClientCommand::RespondExternalRequest { .. })
+    ));
+    let mut loading = base.clone();
+    set_respond_operation(&mut loading, "op-respond", "loading", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(loading)), now));
+    let mut failed = base;
+    set_respond_operation(
+        &mut failed,
+        "op-respond",
+        "failed",
+        Some(authentication_failure(
+            "provider",
+            "anthropic",
+            "credentialRejected",
+            None,
+        )),
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(failed)), now),
+        AppAction::Continue
+    );
+    let rendered = render_app_with_size(&app, 120, 30);
+    assert!(rendered.contains("respond again"), "{rendered}");
+    assert!(!rendered.contains("OAuth authorization"), "{rendered}");
+
+    let base = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![timeline_text_event(42, "chat", "user_text", "try this")],
+    );
+    let mut section = open_detail_section(&base);
+    let area = Rect::new(0, 0, 120, 30);
+    drop(section.handle_detail_click(Some(&base), area, 1, 0));
+    assert!(matches!(
+        section.handle_key(KeyEvent::from(KeyCode::Enter), Some(&base), Some(area)),
+        SectionAction::ClientCommand(ClientCommand::ContinueSessionFromCursor { .. })
+    ));
+    let mut loading = base.clone();
+    set_continue_operation(&mut loading, "op-continue", "loading", None);
+    section.reconcile_operations(&loading);
+    let mut failed = base;
+    set_continue_operation(
+        &mut failed,
+        "op-continue",
+        "failed",
+        Some(authentication_failure(
+            "mcpServer",
+            "github",
+            "configurationRequired",
+            None,
+        )),
+    );
+    section.reconcile_operations(&failed);
+    let rendered = render_section(&section, &failed, area);
+    assert!(rendered.contains("MCP server github"), "{rendered}");
+    assert!(rendered.contains("rerun the failed work"), "{rendered}");
+    assert!(!rendered.contains("OAuth authorization"), "{rendered}");
+}
+
+fn set_respond_operation(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    authentication_failure: Option<AuthenticationFailureSnapshot>,
+) {
+    snapshot.sessions.respond_external_request = OperationSnapshot {
+        status,
+        error: (status == "failed").then(|| "authentication failed".to_owned()),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionRespondExternalRequest {
+            status,
+            error: (status == "failed").then(|| "authentication failed".to_owned()),
+            session_id: "chat".to_owned(),
+            request_id: "req-1".to_owned(),
+            authentication_failure,
+        },
+    );
+}
+
+fn set_continue_operation(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    authentication_failure: Option<AuthenticationFailureSnapshot>,
+) {
+    snapshot.sessions.continue_session = OperationSnapshot {
+        status,
+        error: (status == "failed").then(|| "authentication failed".to_owned()),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionContinue {
+            status,
+            error: (status == "failed").then(|| "authentication failed".to_owned()),
+            session_id: "chat".to_owned(),
+            target: RollbackTargetView {
+                turn: None,
+                cursor: Some(42),
+            },
+            authentication_failure,
+        },
+    );
 }
 
 #[test]

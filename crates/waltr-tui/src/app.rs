@@ -16,8 +16,8 @@ use crate::{
     keys::{KeyCommand, LeaderCommand, key_command},
     native_auth::NativeAuthAction,
     screens::{
-        ConfigTab, McpSection, ProviderSection, RuntimeDefaultsSection, SectionAction,
-        SessionsSection, register_timeline_watch_command,
+        ConfigAuthState, ConfigTab, McpSection, ProviderSection, RuntimeDefaultsSection,
+        SectionAction, SessionsSection, register_timeline_watch_command, targets_match,
     },
     ui,
     ui::Notice,
@@ -99,7 +99,7 @@ pub struct App {
     notice: Option<TransientNotice>,
     screen: AppScreen,
     access_return_screen: Option<AppScreen>,
-    auth_input: String,
+    config_auth: ConfigAuthState,
     client_snapshot: Option<ClientSnapshot>,
     native_login: NativeLoginState,
     has_native_credential: bool,
@@ -123,7 +123,7 @@ impl App {
             notice: None,
             screen: AppScreen::Waiting,
             access_return_screen: None,
-            auth_input: String::new(),
+            config_auth: ConfigAuthState::new(),
             client_snapshot: None,
             native_login: NativeLoginState::Idle,
             has_native_credential: false,
@@ -164,7 +164,7 @@ impl App {
         match input {
             InputEvent::CtrlC => self.handle_close_intent(CloseIntent::CtrlC, now),
             InputEvent::Key(key) if self.screen == AppScreen::Access => self.handle_access_key(key),
-            InputEvent::Key(key) if self.auth_requirement().is_some() => {
+            InputEvent::Key(key) if self.outbound_auth_target().is_some() => {
                 self.handle_auth_key(key, now)
             }
             InputEvent::Key(key) if self.screen == AppScreen::Config => {
@@ -238,7 +238,7 @@ impl App {
     /// Return the current pasted OAuth redirect/code draft.
     #[must_use]
     pub fn auth_input(&self) -> &str {
-        &self.auth_input
+        self.config_auth.input()
     }
 
     /// Safe reason shown on the Waltr access screen.
@@ -383,15 +383,14 @@ impl App {
         let Some(snapshot) = self.client_snapshot() else {
             return AppAction::Continue;
         };
-        let Some(requirement) = snapshot.auth.pending.first() else {
+        let Some(target) = self.outbound_auth_target().cloned() else {
             return AppAction::Continue;
         };
-        let target = requirement.target.clone();
         let attempt = snapshot
             .auth
             .active_attempt
             .as_ref()
-            .filter(|attempt| auth_targets_match(&attempt.target, &target))
+            .filter(|attempt| targets_match(&attempt.target, &target))
             .cloned();
         let cancellable = attempt
             .as_ref()
@@ -402,8 +401,9 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                self.auth_input.clear();
+                self.config_auth.clear_input();
                 if cancellable {
+                    self.config_auth.begin_cancel(target);
                     return AppAction::ClientCommand(ClientCommand::CancelAuth {
                         attempt_id: attempt
                             .as_ref()
@@ -413,11 +413,12 @@ impl App {
                     });
                 }
 
-                AppAction::ClientCommand(ClientCommand::DismissAuthRequirement { target })
+                self.config_auth.dismiss_attempt();
+                AppAction::Continue
             }
             KeyCode::Enter => {
                 if manual_input {
-                    let input = self.auth_input.trim().to_owned();
+                    let input = self.config_auth.input().trim().to_owned();
                     if input.is_empty() {
                         self.notice = Some(TransientNotice {
                             text: "paste redirect URL or code first".to_owned(),
@@ -427,10 +428,13 @@ impl App {
                     }
 
                     let attempt_id = attempt.as_ref().expect("manual attempt").attempt_id.clone();
-                    self.auth_input.clear();
+                    self.config_auth.clear_input();
+                    self.config_auth.begin_complete(target);
                     AppAction::ClientCommand(ClientCommand::CompleteAuth { attempt_id, input })
                 } else if attempt.is_none() {
-                    AppAction::ClientCommand(ClientCommand::BeginAuth { target })
+                    self.config_auth
+                        .retry_begin(target)
+                        .map_or(AppAction::Continue, AppAction::ClientCommand)
                 } else {
                     AppAction::Continue
                 }
@@ -444,11 +448,11 @@ impl App {
                 AppAction::CopyAuthUrl(attempt.as_ref().expect("safe URL attempt").auth_url.clone())
             }
             KeyCode::Backspace if manual_input => {
-                self.auth_input.pop();
+                self.config_auth.input_mut().pop();
                 AppAction::Continue
             }
             KeyCode::Char(character) if manual_input => {
-                self.auth_input.push(character);
+                self.config_auth.input_mut().push(character);
                 AppAction::Continue
             }
             _ => AppAction::Continue,
@@ -549,21 +553,39 @@ impl App {
         };
     }
 
-    fn auth_requirement(&self) -> Option<&waltr_client::AuthRequirementSnapshot> {
-        self.client_snapshot()
-            .and_then(|snapshot| snapshot.auth.pending.first())
+    /// Target currently presented by the outbound OAuth overlay.
+    #[must_use]
+    pub const fn outbound_auth_target(&self) -> Option<&ClientAuthTarget> {
+        self.config_auth.target()
+    }
+
+    pub(crate) const fn config_auth_state(&self) -> &ConfigAuthState {
+        &self.config_auth
+    }
+
+    /// Whether a Config authentication action is pending for one target.
+    #[must_use]
+    pub fn config_auth_action_pending(&self, target: &ClientAuthTarget) -> bool {
+        self.config_auth.pending_for(target)
+    }
+
+    /// Error for the explicitly presented outbound authentication target.
+    #[must_use]
+    pub fn outbound_auth_error(&self) -> Option<&str> {
+        self.outbound_auth_target()
+            .and_then(|target| self.config_auth.error_for(target))
     }
 
     /// Validated provider or upstream MCP authorization URL for presentation.
     #[must_use]
     pub fn outbound_auth_url(&self) -> Option<&str> {
-        let requirement = self.auth_requirement()?;
+        let target = self.outbound_auth_target()?;
         let attempt = self
             .client_snapshot()?
             .auth
             .active_attempt
             .as_ref()
-            .filter(|attempt| auth_targets_match(&attempt.target, &requirement.target))?;
+            .filter(|attempt| targets_match(&attempt.target, target))?;
         safe_auth_url(&attempt.auth_url)
     }
 
@@ -678,6 +700,7 @@ impl App {
                         commands.push(ClientCommand::ReleaseSessionWatchInterest);
                     }
                     commands.push(ClientCommand::RegisterConfigWatchInterest);
+                    commands.push(ClientCommand::RequestAuthStatuses);
                     return AppAction::from_commands(commands);
                 }
 
@@ -839,7 +862,30 @@ impl App {
             .as_ref()
             .map(|attempt| attempt.attempt_id.as_str());
         if previous_attempt_id != next_attempt_id {
-            self.auth_input.clear();
+            self.config_auth.clear_input();
+        }
+        let authorization_succeeded = self
+            .client_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.auth.active_attempt.as_ref())
+            .zip(snapshot.auth.active_attempt.as_ref())
+            .is_some_and(|(previous, next)| {
+                targets_match(&previous.target, &next.target)
+                    && previous.lifecycle != "succeeded"
+                    && next.lifecycle == "succeeded"
+                    && self
+                        .config_auth
+                        .target()
+                        .is_some_and(|target| targets_match(target, &next.target))
+            });
+        if authorization_succeeded
+            && let Some(target) = snapshot
+                .auth
+                .active_attempt
+                .as_ref()
+                .map(|attempt| attempt.target.clone())
+        {
+            self.config_auth.complete_attempt(&target);
         }
 
         let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
@@ -887,6 +933,11 @@ impl App {
         if snapshot.access.status == AccessStatus::Authenticated && snapshot.status.ready {
             self.provider_section.reconcile_patch(&snapshot);
             self.mcp_section.reconcile_patch(&snapshot);
+            let auth_status_stale =
+                self.config_auth.reconcile(&snapshot) || authorization_succeeded;
+            if auth_status_stale {
+                commands.push(ClientCommand::RequestAuthStatuses);
+            }
             self.runtime_defaults_section.reconcile_patch(&snapshot);
             self.sessions_section.reconcile_operations(&snapshot);
 
@@ -936,13 +987,17 @@ impl App {
         self.notice = None;
         self.screen = AppScreen::Waiting;
         self.access_return_screen = None;
-        self.auth_input.clear();
+        self.config_auth = ConfigAuthState::new();
         self.client_snapshot = None;
         self.has_native_credential = false;
         self.logout_snapshot_barrier = LogoutSnapshotBarrier::None;
     }
 
     fn active_section_has_overlay(&self) -> bool {
+        self.active_section_has_content_overlay() || self.config_auth.has_reset()
+    }
+
+    fn active_section_has_content_overlay(&self) -> bool {
         match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.has_overlay(),
             ConfigTab::Mcp => self.mcp_section.has_overlay(),
@@ -951,6 +1006,9 @@ impl App {
     }
 
     fn dismiss_active_overlay(&mut self) -> bool {
+        if self.config_auth.dismiss_reset() {
+            return true;
+        }
         match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.dismiss_overlay(),
             ConfigTab::Mcp => self.mcp_section.dismiss_overlay(),
@@ -976,6 +1034,27 @@ impl App {
             .as_ref()
             .and_then(|snapshot| snapshot.config.current.as_ref())
             .cloned();
+        let statuses = self
+            .client_snapshot
+            .as_ref()
+            .map_or_else(Default::default, |snapshot| snapshot.auth.statuses.clone());
+        let auth_target = match self.active_config_tab {
+            ConfigTab::Providers => self.provider_section.selected_auth_target(config.as_ref()),
+            ConfigTab::Mcp => self.mcp_section.selected_auth_target(config.as_ref()),
+            ConfigTab::Defaults => None,
+        };
+        if !self.active_section_has_content_overlay() {
+            match self.config_auth.handle_key(key, auth_target, &statuses) {
+                SectionAction::ClientCommand(command) => {
+                    return AppAction::ClientCommand(command);
+                }
+                SectionAction::ClientCommands(commands) => {
+                    return AppAction::ClientCommands(commands);
+                }
+                SectionAction::Continue => return AppAction::Continue,
+                SectionAction::Unhandled => {}
+            }
+        }
         let action = match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.handle_key(key, config.as_ref()),
             ConfigTab::Mcp => self.mcp_section.handle_key(key, config.as_ref()),
@@ -1086,10 +1165,6 @@ impl AppAction {
             _ => Self::ClientCommands(commands),
         }
     }
-}
-
-fn auth_targets_match(left: &ClientAuthTarget, right: &ClientAuthTarget) -> bool {
-    left.kind == right.kind && left.key == right.key
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

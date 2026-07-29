@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/config.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"         Configuration                                                          "
+"                                                                                "
+"          Providers   MCP Servers   Defaults                                    "
+"                                                                                "
+"        > anthropic  anthropic-messages  oauth  no-url                          "
+"            status: connected (OAuth)                                           "
+"            actions: a reauthorize  f refresh  r reset                          "
+"            message: OAuth credential is ready for provider requests.           "
+"            expires: 2027-01-15 08:00 UTC                                       "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"         Esc back Tab switch C-x c create Enter edit Del delete a/f/r           "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

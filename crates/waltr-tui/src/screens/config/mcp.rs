@@ -5,9 +5,11 @@
 //! "MCP Servers" tab and does not depend on the surrounding tab chrome. The
 //! shell holds no MCP-specific state; all of it lives here.
 
+use std::collections::BTreeMap;
+
 use waltr_client::{
-    ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, McpServerTypeView,
-    McpServerView,
+    AuthStatusSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
+    ConfigView, McpServerTypeView, McpServerView,
 };
 use ratatui::{
     Frame,
@@ -19,6 +21,7 @@ use ratatui::{
 };
 
 use crate::{
+    screens::config::auth::{ConfigAuthState, status_for},
     screens::{OperationResult, OperationTracker},
     theme::THEME,
     ui,
@@ -389,16 +392,29 @@ impl McpSection {
             .cloned()
     }
 
+    pub(crate) fn selected_auth_target(
+        &self,
+        config: Option<&ConfigView>,
+    ) -> Option<ClientAuthTarget> {
+        self.selected_server_key(config).map(mcp_target)
+    }
+
     /// Render the section content (MCP server list) into `area`.
     ///
     /// `loaded` indicates the watch stream has delivered config; when false the
     /// section shows a waiting placeholder.
-    pub fn render_content(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "rendering consumes the complete shared config and auth snapshot state"
+    )]
+    pub(crate) fn render_content(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         config: Option<&ConfigView>,
         loaded: bool,
+        statuses: &BTreeMap<String, AuthStatusSnapshot>,
+        auth: &ConfigAuthState,
     ) {
         let lines = if loaded {
             config.map_or_else(loading_lines, |config| {
@@ -408,6 +424,8 @@ impl McpSection {
                     self.delete_server(),
                     self.patch.is_pending(),
                     self.patch.error(),
+                    statuses,
+                    auth,
                 )
             })
         } else {
@@ -447,12 +465,18 @@ fn loading_lines() -> Vec<Line<'static>> {
     vec![ui::loading_line("Waiting for configuration...")]
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "line rendering receives explicit config, patch, and credential presentation state"
+)]
 fn config_lines(
     config: &ConfigView,
     selected_server: usize,
     delete_server: Option<&str>,
     pending_patch: bool,
     patch_error: Option<&str>,
+    statuses: &BTreeMap<String, AuthStatusSnapshot>,
+    auth: &ConfigAuthState,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -462,27 +486,67 @@ fn config_lines(
     }
 
     for (index, (key, server)) in config.mcp_servers.iter().enumerate() {
+        let selected = index == selected_server;
+        let target = mcp_target(key.clone());
+        let auth_status = status_for(statuses, &target);
+        let deleting = delete_server == Some(key.as_str());
+        let resetting = auth.reset_matches(&target);
+        let auth_pending = auth.pending_for(&target);
         lines.push(server_line(
             key,
             server,
             ServerLineState {
-                selected: index == selected_server,
-                deleting: delete_server == Some(key.as_str()),
+                selected,
+                deleting,
                 pending_patch,
                 patch_error,
+                auth_status,
+                resetting,
+                auth_pending,
             },
         ));
+        if selected && !deleting && !resetting {
+            lines.push(super::providers::auth_status_line(auth_status));
+            lines.push(super::providers::auth_action_line(
+                auth_status,
+                auth_pending,
+            ));
+            lines.extend(super::providers::auth_status_detail_lines(
+                auth_status,
+                true,
+            ));
+        }
+    }
+
+    let selected_target = config
+        .mcp_servers
+        .keys()
+        .nth(selected_server)
+        .cloned()
+        .map(mcp_target);
+    if let Some(error) = selected_target
+        .as_ref()
+        .and_then(|target| auth.error_for(target))
+    {
+        lines.push(ui::error_line(error));
     }
 
     lines
 }
 
 #[derive(Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "row presentation combines independent selection, patch, reset, and auth states"
+)]
 struct ServerLineState<'a> {
     selected: bool,
     deleting: bool,
     pending_patch: bool,
     patch_error: Option<&'a str>,
+    auth_status: Option<&'a AuthStatusSnapshot>,
+    resetting: bool,
+    auth_pending: bool,
 }
 
 fn server_line(key: &str, server: &McpServerView, state: ServerLineState<'_>) -> Line<'static> {
@@ -505,7 +569,21 @@ fn server_line(key: &str, server: &McpServerView, state: ServerLineState<'_>) ->
         ]);
     }
 
-    Line::from(vec![
+    if state.resetting {
+        return Line::from(vec![
+            ui::selection_marker(state.selected),
+            Span::raw(" "),
+            ui::selected_title(display),
+            Span::raw("  "),
+            ui::delete_prompt_span(if state.auth_pending {
+                "Resetting credential..."
+            } else {
+                "Reset credential? Enter/y confirm, n/Esc cancel"
+            }),
+        ]);
+    }
+
+    let mut spans = vec![
         ui::selection_marker(state.selected),
         Span::raw(" "),
         ui::selected_title(display),
@@ -513,7 +591,22 @@ fn server_line(key: &str, server: &McpServerView, state: ServerLineState<'_>) ->
         Span::styled(mcp_type_name(server.kind), THEME.focus_style()),
         Span::raw("  "),
         Span::styled(server_target(server), THEME.text_style()),
-    ])
+    ];
+    if !state.selected {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            super::providers::auth_status_label(state.auth_status),
+            super::providers::auth_status_style(state.auth_status),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn mcp_target(key: String) -> ClientAuthTarget {
+    ClientAuthTarget {
+        kind: "mcpServer".to_owned(),
+        key,
+    }
 }
 
 fn server_target(server: &McpServerView) -> String {
