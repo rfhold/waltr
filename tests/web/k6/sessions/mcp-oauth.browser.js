@@ -13,16 +13,28 @@ export default async function () {
     await waitForPathname(page, "/sessions");
     await page.locator(".sessions__header button").click();
     await waitForText(page, '[aria-label="Session status summary"]', "MCP protected");
+    const sessionUrl = page.url();
+    const sessionPath = await page.evaluate(() => window.location.pathname);
 
-    await typeAndKeepFocus(page, '[aria-label="Session message"]', "trigger protected mcp oauth");
+    const protectedPrompt = "trigger protected mcp oauth";
+    await typeAndKeepFocus(page, '[aria-label="Session message"]', protectedPrompt);
     await page.locator('[aria-label="Send session message"] button[type="submit"]').click();
-    const oauthDialog = await waitForText(page, '[role="dialog"]', "OAuth required");
-    await waitForText(page, '[role="dialog"]', "MCP server protected");
-    visibleSnapshots.push(await visibleText(page, '[role="dialog"]'));
+    const authenticationFailure = await waitForText(
+      page,
+      ".sessions__auth-failure",
+      "Authentication failed for MCP server protected",
+    );
+    await waitForText(page, ".sessions__auth-failure", "Open MCP server Config");
+    const retainedDraft = await textareaValue(page, '[aria-label="Session message"]');
+    const noRuntimeDialog = await page.locator('.oauth-dialog').count() === 0;
+    visibleSnapshots.push(await visibleText(page, ".sessions__auth-failure"));
     await screenshot(page, "sessions-mcp-oauth-required");
 
-    await clickButtonByText(page, "Begin OAuth");
-    await waitForText(page, '[role="dialog"]', "Open authorization URL");
+    await page.locator('.sessions__auth-failure a').click();
+    await waitForPathname(page, "/config/mcp/edit/protected");
+    await waitForText(page, '[aria-label="Authentication for protected"]', "Authentication");
+    await clickAuthorizationButton(page, '[aria-label="Authentication for protected"]');
+    await waitForText(page, '.oauth-dialog', "Open authorization URL");
     const authUrl = await page.evaluate(() => {
       const link = document.querySelector(".oauth-dialog__open");
       if (!(link instanceof HTMLAnchorElement)) {
@@ -42,13 +54,13 @@ export default async function () {
     }, authUrl);
     const pendingDialog = await waitForText(
       page,
-      '[role="dialog"]',
+      '.oauth-dialog',
       "Waiting for the server callback",
     );
-    await waitForText(page, '[role="dialog"]', "Client metadata");
+    await waitForText(page, '.oauth-dialog', "Client metadata");
     visibleSnapshots.push(await visibleTextWithout(
       page,
-      '[role="dialog"]',
+      '.oauth-dialog',
       ".oauth-dialog__open, .oauth-dialog__url",
     ));
 
@@ -103,7 +115,15 @@ export default async function () {
       await authPage.close();
     }
 
-    await waitForMissingElement(page, '[role="dialog"]', 20_000);
+    await waitForMissingElement(page, '.oauth-dialog', 20_000);
+    await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
+    await waitForPathname(page, sessionPath);
+    await waitForText(page, '[aria-label="Session status summary"]', "MCP protected");
+    await typeAndKeepFocus(page, '[aria-label="Session message"]', protectedPrompt);
+    await page.locator('[aria-label="Send session message"] button[type="submit"]').click();
+    await waitForTextareaValue(page, '[aria-label="Session message"]', "");
+    const noRetryDialog = await page.locator('.oauth-dialog').count() === 0;
+
     await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
     await waitForPathname(page, "/sessions");
     await page.locator(".sessions__header button").click();
@@ -125,15 +145,19 @@ export default async function () {
     visibleSnapshots.push(await visibleText(page, "body"));
     await screenshot(page, "sessions-mcp-oauth-authorized-resource-search");
 
-    const noReauthorization = await page.locator('[role="dialog"]').count() === 0;
+    const noReauthorization = await page.locator('.oauth-dialog').count() === 0;
     const combinedSnapshots = visibleSnapshots.join("\n");
     const clientSecret = __ENV.WALTR_OAUTH_CLIENT_SECRET || "waltr-access-test-secret";
 
     check(null, {
-      "mcp oauth requirement is shown": () => includesText(oauthDialog, "MCP server protected"),
+      "runtime MCP failure is inline and target scoped": () =>
+        includesText(authenticationFailure, "Authentication failed for MCP server protected"),
+      "runtime failure retains the draft without opening OAuth": () =>
+        retainedDraft === protectedPrompt && noRuntimeDialog,
       "server callback lifecycle reaches shared-client terminal state": () =>
         includesText(pendingDialog, "Waiting for the server callback") && noReauthorization,
       "persisted credential is reused without reauthorization": () => noReauthorization,
+      "explicit retry is admitted without another MCP auth blocker": () => noRetryDialog,
       "dynamic bearer reaches the protected Waltr MCP resource": () =>
         authorizationContract.callbackUri === `${baseUrl}/outbound-oauth/callback` &&
         includesText(suggestions, "configuration.inspect"),
@@ -142,7 +166,7 @@ export default async function () {
       "authorization URL omits the PKCE verifier": () => authorizationContract.codeVerifier === "",
       "authorization request carries callback state": () => authorizationContract.state.length >= 8,
       "authorization request carries an S256 challenge": () => authorizationContract.codeChallenge.length >= 8,
-      "required-dialog snapshot omits callback state and PKCE material": () =>
+      "inline failure snapshot omits callback state and PKCE material": () =>
         snapshotOmits(visibleSnapshots[0], authorizationContract.state, authorizationContract.codeChallenge),
       "pending non-URL snapshot omits callback state": () =>
         snapshotOmits(visibleSnapshots[1], authorizationContract.state),
@@ -200,6 +224,25 @@ async function clearTextarea(page, selector) {
   }, selector);
 }
 
+async function textareaValue(page, selector) {
+  return page.evaluate((inputSelector) => {
+    const input = document.querySelector(inputSelector);
+    if (!(input instanceof HTMLTextAreaElement)) {
+      throw new Error(`Textarea not found: ${inputSelector}`);
+    }
+    return input.value;
+  }, selector);
+}
+
+async function waitForTextareaValue(page, selector, expectedValue) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (await textareaValue(page, selector) === expectedValue) return;
+    sleep(0.25);
+  }
+  throw new Error(`Timed out waiting for ${selector} value ${JSON.stringify(expectedValue)}`);
+}
+
 async function clickButtonByText(page, text) {
   await page.evaluate((buttonText) => {
     const button = Array.from(document.querySelectorAll("button")).find((candidate) =>
@@ -211,6 +254,25 @@ async function clickButtonByText(page, text) {
     button.scrollIntoView({ block: "center", inline: "center" });
     button.click();
   }, text);
+}
+
+async function clickAuthorizationButton(page, selector) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const clicked = await page.evaluate((sectionSelector) => {
+      const section = document.querySelector(sectionSelector);
+      const button = Array.from(section?.querySelectorAll("button") ?? []).find((candidate) => {
+        const text = candidate.textContent?.trim();
+        return text === "Authorize" || text === "Reauthorize";
+      });
+      if (!(button instanceof HTMLButtonElement)) return false;
+      button.click();
+      return true;
+    }, selector);
+    if (clicked) return;
+    sleep(0.25);
+  }
+  throw new Error(`Authorization action not found in ${selector}`);
 }
 
 async function clickResourceSuggestion(page, text) {

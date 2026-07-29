@@ -1,4 +1,4 @@
-import { createMemo, type ParentProps } from "solid-js";
+import { createMemo, createSignal, type ParentProps } from "solid-js";
 
 import { AppStateContextProvider, type AppPhase, type AppState } from "./context";
 import type { AuthSnapshot, ClientCommand, ClientSnapshot, OperationSnapshot, SessionTimelineView, SessionView, TimelineEventView } from "../generated/waltr-client";
@@ -18,6 +18,7 @@ export function fixtureSnapshotForPath(pathname: string) {
 export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSnapshot }>) {
   const snapshot = () => props.snapshot;
   const phase = createMemo<AppPhase>(() => "ready");
+  const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Parameters<AppState["dispatchBeginExplicitAuth"]>[0]>();
   const state: AppState = {
     phase,
     minimumSplashElapsed: () => true,
@@ -26,7 +27,23 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
     clientLoadError: () => undefined,
     clientLoaded: () => true,
     systemReady: () => true,
+    explicitAuthTarget,
     dispatch: async (_command: ClientCommand) => props.snapshot,
+    dispatchBeginExplicitAuth: async (target) => {
+      setExplicitAuthTarget(target);
+      return props.snapshot;
+    },
+    dispatchCompleteAuth: async (_attemptId, _input) => {
+      setExplicitAuthTarget(undefined);
+      return props.snapshot;
+    },
+    dispatchCancelAuth: async (_attemptId) => {
+      setExplicitAuthTarget(undefined);
+      return props.snapshot;
+    },
+    dispatchRefreshAuth: async (_target) => props.snapshot,
+    dispatchLogoutAuth: async (_target) => props.snapshot,
+    clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
     dispatchConfigPatch: async (_command: ClientCommand) => props.snapshot,
     dispatchCreateSession: async () => props.snapshot,
     dispatchDeleteSession: async (_id: string) => props.snapshot,
@@ -34,6 +51,7 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
     dispatchSubmitUserMessage: async (_sessionId: string, _text: string) => props.snapshot,
     dispatchRespondExternalRequest: async (_sessionId: string, _requestId: string, _responseJson: string) => props.snapshot,
     dispatchInterruptSession: async (_sessionId: string) => props.snapshot,
+    dispatchContinueSession: async (_command) => props.snapshot,
   };
 
   return <AppStateContextProvider value={state}>{props.children}</AppStateContextProvider>;
@@ -78,12 +96,13 @@ function promptFixtureSnapshot(): ClientSnapshot {
 
 function emptyAuthSnapshot(): AuthSnapshot {
   return {
-    pending: [],
+    statuses: {},
     activeAttempt: null,
     list: operationSnapshot("idle"),
     begin: operationSnapshot("idle"),
     complete: operationSnapshot("idle"),
     cancel: operationSnapshot("idle"),
+    refresh: operationSnapshot("idle"),
     logout: operationSnapshot("idle"),
   };
 }
@@ -92,7 +111,7 @@ function sessionView(id: string): SessionView {
   return {
     id,
     revision: 0n,
-    status: { phase: "suspended", failedMessage: "" },
+    status: { phase: "suspended", failedMessage: "", authenticationFailure: null },
     currentPrompt: null,
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),

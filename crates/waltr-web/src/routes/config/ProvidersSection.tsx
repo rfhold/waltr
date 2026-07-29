@@ -22,9 +22,13 @@ import type {
   ModelCatalogMatchView,
   ModelTypeView,
   ModelView,
+  OAuthJwtMetadataView,
+  OAuthProviderView,
+  OAuthUrlParamView,
   ProviderKindView,
   ProviderView,
 } from "../../generated/waltr-client";
+import { AuthStatusPanel } from "./AuthStatusPanel";
 
 type FormMode = "create" | "edit";
 
@@ -264,6 +268,9 @@ export function ProvidersSection(props: ParentProps & {
           </ActionList>
         )}
       </Show>
+      <Show when={!providerFormDraft() && selectedProvider()}>
+        {(providerName) => <AuthStatusPanel target={{ kind: "provider", key: providerName() }} />}
+      </Show>
       <Show when={providerFormDraft()}>
         {(draft) => (
           <ProviderFormPanel
@@ -383,6 +390,7 @@ function ProviderFormPanel(props: {
 }) {
   const form = () => props.form;
   const update = (patch: Partial<ProviderForm>) => props.setForm((current) => current ? { ...current, ...patch } : current);
+  const updateOAuth = (patch: Partial<OAuthProviderView>) => update({ oauthSettings: { ...(form().oauthSettings ?? emptyOAuthSettings()), ...patch } });
   const title = () => props.form.mode === "create" ? "Create provider" : "Edit provider";
   const modelRouteBase = () => providerFormBasePath(props.form);
 
@@ -416,6 +424,66 @@ function ProviderFormPanel(props: {
               <input name="url" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="url" value={form().url} onInput={(event) => update({ url: event.currentTarget.value })} />
             )}
           </Field>
+          <fieldset class="config__form-fieldset">
+            <legend>Public-client OAuth</legend>
+            <label class="config__form-checkbox">
+              <input
+                name="oauthCompatible"
+                type="checkbox"
+                checked={form().oauthCompatible}
+                onChange={(event) => update({
+                  oauthCompatible: event.currentTarget.checked,
+                  oauthSettings: event.currentTarget.checked && !form().oauthSettings ? emptyOAuthSettings() : form().oauthSettings,
+                })}
+              />
+              <span>OAuth compatible</span>
+            </label>
+            <p class="config__form-hint">Only public clients are supported. Settings are preserved when compatibility is turned off.</p>
+            <Show when={form().oauthSettings}>
+              {(settings) => (
+                <div class="config__oauth-fields">
+                  <Field id="provider-oauth-name" label="OAuth name">
+                    {(field) => <input name="oauthName" id={field.id} aria-describedby={field.describedBy} value={settings().name} onInput={(event) => updateOAuth({ name: event.currentTarget.value })} />}
+                  </Field>
+                  <Field id="provider-oauth-authorize-url" label="Authorization URL">
+                    {(field) => <input name="authorizeUrl" id={field.id} aria-describedby={field.describedBy} type="url" value={settings().authorizeUrl} onInput={(event) => updateOAuth({ authorizeUrl: event.currentTarget.value })} />}
+                  </Field>
+                  <Field id="provider-oauth-token-url" label="Token URL">
+                    {(field) => <input name="tokenUrl" id={field.id} aria-describedby={field.describedBy} type="url" value={settings().tokenUrl} onInput={(event) => updateOAuth({ tokenUrl: event.currentTarget.value })} />}
+                  </Field>
+                  <Field id="provider-oauth-client-id" label="Client ID">
+                    {(field) => <input name="clientId" id={field.id} aria-describedby={field.describedBy} value={settings().clientId} onInput={(event) => updateOAuth({ clientId: event.currentTarget.value })} />}
+                  </Field>
+                  <Field id="provider-oauth-redirect-uri" label="Redirect URI">
+                    {(field) => <input name="redirectUri" id={field.id} aria-describedby={field.describedBy} type="url" value={settings().redirectUri} onInput={(event) => updateOAuth({ redirectUri: event.currentTarget.value })} />}
+                  </Field>
+                  <Field id="provider-oauth-scopes" label="Scopes" hint="Separate scopes with spaces or commas.">
+                    {(field) => <input name="scopes" id={field.id} aria-describedby={field.describedBy} value={settings().scopes.join(" ")} onInput={(event) => updateOAuth({ scopes: splitList(event.currentTarget.value) })} />}
+                  </Field>
+                  <Field id="provider-oauth-request-style" label="Token request style">
+                    {(field) => (
+                      <select name="tokenRequestStyle" id={field.id} aria-describedby={field.describedBy} value={settings().tokenRequestStyle} onChange={(event) => updateOAuth({ tokenRequestStyle: event.currentTarget.value as OAuthProviderView["tokenRequestStyle"] })}>
+                        <option value="unspecified">Unspecified</option>
+                        <option value="json">JSON</option>
+                        <option value="formUrlencoded">Form URL encoded</option>
+                        <option value="unknown">Unknown</option>
+                      </select>
+                    )}
+                  </Field>
+                  <label class="config__form-checkbox">
+                    <input name="sendStateInTokenRequest" type="checkbox" checked={settings().sendStateInTokenRequest} onChange={(event) => updateOAuth({ sendStateInTokenRequest: event.currentTarget.checked })} />
+                    <span>Send state during code exchange</span>
+                  </label>
+                  <OAuthUrlParamsEditor values={settings().authUrlParams} onChange={(authUrlParams) => updateOAuth({ authUrlParams })} />
+                  <OAuthJwtMetadataEditor values={settings().jwtMetadata} onChange={(jwtMetadata) => updateOAuth({ jwtMetadata })} />
+                  <button type="button" class="config__oauth-remove" onClick={() => update({ oauthCompatible: false, oauthSettings: null })}>Remove OAuth settings</button>
+                </div>
+              )}
+            </Show>
+          </fieldset>
+          <Show when={form().mode === "edit" && form().originalName}>
+            {(providerName) => <AuthStatusPanel target={{ kind: "provider", key: providerName() }} />}
+          </Show>
           <div class="config__form-actions">
             <button type="submit" disabled={props.pending}>Save</button>
             <button type="button" disabled={props.pending} onClick={props.onCancel}>Cancel</button>
@@ -490,6 +558,50 @@ function ProviderFormPanel(props: {
           </Show>
         </div>
     </Dialog>
+  );
+}
+
+function OAuthUrlParamsEditor(props: { values: OAuthUrlParamView[]; onChange: (values: OAuthUrlParamView[]) => void }) {
+  const update = (index: number, patch: Partial<OAuthUrlParamView>) => props.onChange(props.values.map((value, valueIndex) => valueIndex === index ? { ...value, ...patch } : value));
+  return (
+    <section class="config__oauth-list" aria-label="Extra authorization parameters">
+      <div class="config__oauth-list-heading"><h4>Extra authorization parameters</h4><button type="button" onClick={() => props.onChange([...props.values, { key: "", value: "" }])}>Add parameter</button></div>
+      <For each={props.values}>{(value, index) => (
+        <div class="config__oauth-row">
+          <Field id={`provider-oauth-param-key-${index()}`} label={`Parameter ${index() + 1} key`}>
+            {(field) => <input id={field.id} value={value.key} onInput={(event) => update(index(), { key: event.currentTarget.value })} />}
+          </Field>
+          <Field id={`provider-oauth-param-value-${index()}`} label={`Parameter ${index() + 1} value`}>
+            {(field) => <input id={field.id} value={value.value} onInput={(event) => update(index(), { value: event.currentTarget.value })} />}
+          </Field>
+          <button type="button" aria-label={`Remove authorization parameter ${index() + 1}`} onClick={() => props.onChange(props.values.filter((_, valueIndex) => valueIndex !== index()))}>Remove</button>
+        </div>
+      )}</For>
+    </section>
+  );
+}
+
+function OAuthJwtMetadataEditor(props: { values: OAuthJwtMetadataView[]; onChange: (values: OAuthJwtMetadataView[]) => void }) {
+  const update = (index: number, patch: Partial<OAuthJwtMetadataView>) => props.onChange(props.values.map((value, valueIndex) => valueIndex === index ? { ...value, ...patch } : value));
+  return (
+    <section class="config__oauth-list" aria-label="JWT metadata mappings">
+      <div class="config__oauth-list-heading"><h4>JWT metadata mappings</h4><button type="button" onClick={() => props.onChange([...props.values, emptyJwtMetadata()])}>Add mapping</button></div>
+      <For each={props.values}>{(value, index) => (
+        <div class="config__oauth-mapping">
+          <Field id={`provider-oauth-jwt-token-${index()}`} label={`Mapping ${index() + 1} token`}>
+            {(field) => <select id={field.id} value={value.token} onChange={(event) => update(index(), { token: event.currentTarget.value as OAuthJwtMetadataView["token"] })}><option value="unspecified">Unspecified</option><option value="access">Access JWT</option><option value="id">ID JWT</option><option value="unknown">Unknown</option></select>}
+          </Field>
+          <Field id={`provider-oauth-jwt-key-${index()}`} label={`Mapping ${index() + 1} metadata key`}>
+            {(field) => <input id={field.id} value={value.metadataKey} onInput={(event) => update(index(), { metadataKey: event.currentTarget.value })} />}
+          </Field>
+          <Field id={`provider-oauth-jwt-claims-${index()}`} label={`Mapping ${index() + 1} claim names`} hint="Separate fallback claims with spaces or commas.">
+            {(field) => <input id={field.id} aria-describedby={field.describedBy} value={value.claimNames.join(" ")} onInput={(event) => update(index(), { claimNames: splitList(event.currentTarget.value) })} />}
+          </Field>
+          <label class="config__form-checkbox"><input type="checkbox" checked={value.required} onChange={(event) => update(index(), { required: event.currentTarget.checked })} /><span>Required mapping</span></label>
+          <button type="button" aria-label={`Remove JWT metadata mapping ${index() + 1}`} onClick={() => props.onChange(props.values.filter((_, valueIndex) => valueIndex !== index()))}>Remove</button>
+        </div>
+      )}</For>
+    </section>
   );
 }
 
@@ -723,6 +835,29 @@ function initialProviderForm(form: ActiveForm): ProviderForm {
   }
 
   return providerToForm(form.providerName, form.provider);
+}
+
+function emptyOAuthSettings(): OAuthProviderView {
+  return {
+    name: "",
+    authorizeUrl: "",
+    tokenUrl: "",
+    clientId: "",
+    redirectUri: "",
+    scopes: [],
+    tokenRequestStyle: "unspecified",
+    authUrlParams: [],
+    jwtMetadata: [],
+    sendStateInTokenRequest: false,
+  };
+}
+
+function emptyJwtMetadata(): OAuthJwtMetadataView {
+  return { token: "unspecified", metadataKey: "", claimNames: [], required: false };
+}
+
+function splitList(value: string) {
+  return value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
 }
 
 function providerToForm(providerName: string, provider: ProviderView): ProviderForm {

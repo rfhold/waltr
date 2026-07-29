@@ -6,7 +6,6 @@ import {
   createEffect,
   createMemo,
   createSignal,
-  on,
   useContext,
 } from "solid-js";
 import type { Accessor, ParentProps } from "solid-js";
@@ -19,6 +18,7 @@ import type {
   McpServerTypeView,
   McpServerView,
 } from "../../generated/waltr-client";
+import { AuthStatusPanel } from "./AuthStatusPanel";
 
 type FormMode = "create" | "edit";
 
@@ -179,6 +179,9 @@ export function McpServersSection(props: ParentProps & {
           </ActionList>
         )}
       </Show>
+      <Show when={!routeServerName() && selectedServer()}>
+        {(serverName) => <AuthStatusPanel target={{ kind: "mcpServer", key: serverName() }} />}
+      </Show>
       {props.children}
     </McpServersSectionContext.Provider>
   );
@@ -203,16 +206,17 @@ export function ConfigMcpEditRoute() {
   const section = useMcpServersSectionState();
   const params = useParams<{ server: string }>();
   const serverName = createMemo(() => params.server);
-  const activeForm = createMemo<ActiveForm | undefined>(() => {
-    const name = serverName();
-    const server = section.watchedConfig()?.mcpServers[name];
-    return server ? { mode: "edit", serverName: name, server } : undefined;
-  });
+  const [activeForm, setActiveForm] = createSignal<ActiveForm>();
 
-  createEffect(on(serverName, (name) => {
+  createEffect(() => {
+    const name = serverName();
     section.setDeleteServer(undefined);
     section.setSelectedServer(name);
-  }));
+    const form = activeForm();
+    if (form?.mode === "edit" && form.serverName === name) return;
+    const server = section.watchedConfig()?.mcpServers[name];
+    setActiveForm(server ? { mode: "edit", serverName: name, server } : undefined);
+  });
 
   return (
     <Show when={activeForm()} keyed>
@@ -293,6 +297,9 @@ function McpServerFormPanel(props: {
               <input name="url" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="url" value={form().url} onInput={(event) => update({ url: event.currentTarget.value })} />
             )}
           </Field>
+        </Show>
+        <Show when={form().mode === "edit" && form().originalName}>
+          {(serverName) => <AuthStatusPanel target={{ kind: "mcpServer", key: serverName() }} />}
         </Show>
         <div class="config__form-actions">
           <button type="submit" disabled={props.pending || requiredFieldMissing()}>Save</button>

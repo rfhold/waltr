@@ -5,7 +5,7 @@ import {
   type ParentProps,
 } from "solid-js";
 
-import type { ClientCommand, ClientSnapshot } from "../generated/waltr-client";
+import type { ClientAuthTarget, ClientCommand, ClientSnapshot } from "../generated/waltr-client";
 
 export type AppPhase = "splash" | "ready";
 
@@ -17,7 +17,14 @@ export type AppState = {
   clientLoadError: Accessor<unknown>;
   clientLoaded: Accessor<boolean>;
   systemReady: Accessor<boolean>;
+  explicitAuthTarget: Accessor<ClientAuthTarget | undefined>;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
+  dispatchBeginExplicitAuth: (target: ClientAuthTarget) => Promise<ClientSnapshot>;
+  dispatchCompleteAuth: (attemptId: string, input: string) => Promise<ClientSnapshot>;
+  dispatchCancelAuth: (attemptId: string) => Promise<ClientSnapshot>;
+  dispatchRefreshAuth: (target: ClientAuthTarget) => Promise<ClientSnapshot>;
+  dispatchLogoutAuth: (target: ClientAuthTarget) => Promise<ClientSnapshot>;
+  clearExplicitAuthTarget: () => void;
   dispatchConfigPatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispatchCreateSession: () => Promise<ClientSnapshot>;
   dispatchDeleteSession: (id: string) => Promise<ClientSnapshot>;
@@ -25,6 +32,7 @@ export type AppState = {
   dispatchSubmitUserMessage: (sessionId: string, text: string) => Promise<ClientSnapshot>;
   dispatchRespondExternalRequest: (sessionId: string, requestId: string, responseJson: string) => Promise<ClientSnapshot>;
   dispatchInterruptSession: (sessionId: string) => Promise<ClientSnapshot>;
+  dispatchContinueSession: (command: Extract<ClientCommand, { type: "continueSessionFromTurn" | "continueSessionFromCursor" }>) => Promise<ClientSnapshot>;
 };
 
 export const AppStateContext = createContext<AppState>();

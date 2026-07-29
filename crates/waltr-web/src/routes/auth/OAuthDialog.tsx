@@ -1,8 +1,8 @@
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { Dialog, InlineAlert } from "../../components/ui";
-import type { AuthAttemptSnapshot, AuthRequirementSnapshot, ClientAuthTarget } from "../../generated/waltr-client";
+import { Dialog, Field, InlineAlert } from "../../components/ui";
+import type { AuthAttemptSnapshot, ClientAuthTarget } from "../../generated/waltr-client";
 
 function targetLabel(target: ClientAuthTarget) {
   return target.kind === "mcpServer" ? `MCP server ${target.key}` : `provider ${target.key}`;
@@ -10,14 +10,6 @@ function targetLabel(target: ClientAuthTarget) {
 
 function sameTarget(left: ClientAuthTarget | undefined, right: ClientAuthTarget | undefined) {
   return Boolean(left && right && left.kind === right.kind && left.key === right.key);
-}
-
-function attemptFor(requirement: AuthRequirementSnapshot | undefined, attempt: AuthAttemptSnapshot | null | undefined) {
-  if (!requirement || !attempt || !sameTarget(requirement.target, attempt.target)) {
-    return undefined;
-  }
-
-  return attempt;
 }
 
 const TERMINAL_LIFECYCLES = new Set(["succeeded", "failed", "expired", "canceled"]);
@@ -52,7 +44,7 @@ function registrationMethodLabel(method: string) {
   switch (method) {
     case "dynamic": return "Dynamic";
     case "clientMetadata": return "Client metadata";
-    case "static": return "Static";
+    case "preregistered": return "Preregistered";
     default: return "Unknown";
   }
 }
@@ -80,8 +72,13 @@ export function OAuthDialog() {
   const app = useAppState();
   const [input, setInput] = createSignal("");
   const [localError, setLocalError] = createSignal<string | undefined>();
-  const requirement = createMemo(() => app.snapshot()?.auth?.pending[0]);
-  const attempt = createMemo(() => attemptFor(requirement(), app.snapshot()?.auth?.activeAttempt));
+  const activeAttempt = createMemo(() => app.snapshot()?.auth?.activeAttempt);
+  const attempt = createMemo(() => (
+    sameTarget(app.explicitAuthTarget(), activeAttempt()?.target)
+      ? activeAttempt() ?? undefined
+      : undefined
+  ));
+  const target = createMemo(() => attempt()?.target);
   const attemptId = createMemo(() => attempt()?.attemptId);
   const terminal = createMemo(() => TERMINAL_LIFECYCLES.has(attempt()?.lifecycle ?? ""));
   const cancellable = createMemo(() => ["pending", "completing"].includes(attempt()?.lifecycle ?? ""));
@@ -99,22 +96,12 @@ export function OAuthDialog() {
   const operationError = createMemo(
     () => app.snapshot()?.auth?.begin.error ?? app.snapshot()?.auth?.complete.error ?? app.snapshot()?.auth?.cancel.error,
   );
+  const manualFieldError = createMemo(() => localError() === "Paste the final redirect URL or authorization code." ? localError() : undefined);
   createEffect(() => {
     attemptId();
     setInput("");
     setLocalError(undefined);
   });
-
-  const begin = async () => {
-    const current = requirement();
-
-    if (!current) {
-      return;
-    }
-
-    setLocalError(undefined);
-    await app.dispatch({ type: "beginAuth", target: current.target });
-  };
 
   const complete = async () => {
     const current = attempt();
@@ -130,43 +117,53 @@ export function OAuthDialog() {
     }
 
     setLocalError(undefined);
-    await app.dispatch({ type: "completeAuth", attemptId: current.attemptId, input: value });
-    setInput("");
+    try {
+      await app.dispatchCompleteAuth(current.attemptId, value);
+      setInput("");
+      await app.dispatch({ type: "requestAuthStatuses" }).catch(() => undefined);
+    } catch (error) {
+      setLocalError(displayText(error instanceof Error ? error.message : "Authorization could not be completed."));
+    }
   };
 
   const close = async () => {
-    const currentRequirement = requirement();
     const currentAttempt = attempt();
 
     setLocalError(undefined);
 
     if (currentAttempt && ["pending", "completing"].includes(currentAttempt.lifecycle)) {
-      await app.dispatch({ type: "cancelAuth", attemptId: currentAttempt.attemptId });
+      try {
+        await app.dispatchCancelAuth(currentAttempt.attemptId);
+        await app.dispatch({ type: "requestAuthStatuses" }).catch(() => undefined);
+      } catch (error) {
+        setLocalError(displayText(error instanceof Error ? error.message : "Authorization could not be canceled."));
+      }
       return;
     }
 
-    if (currentRequirement) {
-      await app.dispatch({ type: "dismissAuthRequirement", target: currentRequirement.target });
+    if (currentAttempt) {
+      app.clearExplicitAuthTarget();
     }
   };
 
   return (
-    <Show when={requirement()}>
-      {(current) => (
-        <Dialog title="OAuth required" label="OAuth required" class="oauth-dialog" onClose={close}>
-          <div class="oauth-dialog__body">
+    <Show when={target()}>
+      {(currentTarget) => (
+        <Dialog title="OAuth authorization" label="OAuth authorization" class="panel oauth-dialog" onClose={close}>
+          <div class="config__form oauth-dialog__body">
             <p class="oauth-dialog__intro">
-              Authenticate {targetLabel(current().target)} to continue agent work.
+              Authenticate {targetLabel(currentTarget())}.
             </p>
-            <InlineAlert tone="warning">{displayText(current().message)}</InlineAlert>
 
-            <Show when={attempt()} fallback={<button class="ui-button" disabled={busy()} onClick={begin}>Begin OAuth</button>}>
+            <Show when={attempt()}>
               {(currentAttempt) => (
                 <div class="oauth-dialog__attempt">
                   <dl class="oauth-dialog__metadata">
                     <div><dt>Status</dt><dd>{lifecycleLabel(currentAttempt().lifecycle)}</dd></div>
                     <div><dt>Completion</dt><dd>{completionModeLabel(currentAttempt().completionMode)}</dd></div>
-                    <div><dt>Registration</dt><dd>{registrationMethodLabel(currentAttempt().registrationMethod)}</dd></div>
+                    <Show when={currentAttempt().target.kind === "mcpServer"}>
+                      <div><dt>Registration</dt><dd>{registrationMethodLabel(currentAttempt().registrationMethod)}</dd></div>
+                    </Show>
                   </dl>
                   <InlineAlert tone={currentAttempt().lifecycle === "failed" ? "danger" : "info"}>
                     {lifecycleMessage(currentAttempt())}
@@ -181,25 +178,23 @@ export function OAuthDialog() {
                     fallback={<InlineAlert tone="danger">Authorization URL unavailable.</InlineAlert>}
                   >
                     {(url) => (
-                      <>
-                        <code class="oauth-dialog__url">{url()}</code>
-                        <a class="ui-button oauth-dialog__open" href={url()} target="_blank" rel="noopener noreferrer">
-                          Open authorization URL
-                        </a>
-                      </>
+                      <code class="oauth-dialog__url">{url()}</code>
                     )}
                   </Show>
                   <Show when={manualInput()}>
-                    <label class="oauth-dialog__field">
-                      <span>Final redirect URL or code</span>
-                      <textarea
-                        rows={4}
-                        value={input()}
-                        onInput={(event) => setInput(event.currentTarget.value)}
-                        placeholder="Paste the final redirect URL or authorization code"
-                      />
-                    </label>
-                    <button class="ui-button" disabled={busy()} onClick={complete}>Complete OAuth</button>
+                    <Field id="oauth-manual-input" label="Final redirect URL or code" error={manualFieldError()}>
+                      {(field) => (
+                        <textarea
+                          id={field.id}
+                          aria-describedby={field.describedBy}
+                          aria-invalid={field.invalid}
+                          rows={4}
+                          value={input()}
+                          onInput={(event) => setInput(event.currentTarget.value)}
+                          placeholder="Paste the final redirect URL or authorization code"
+                        />
+                      )}
+                    </Field>
                   </Show>
                   <Show when={currentAttempt().failureReason}>
                     {(reason) => <InlineAlert tone="danger">{displayText(reason())}</InlineAlert>}
@@ -208,12 +203,18 @@ export function OAuthDialog() {
               )}
             </Show>
 
-            <Show when={localError() ?? operationError()}>
+            <Show when={(manualFieldError() ? undefined : localError()) ?? operationError()}>
               {(message) => <InlineAlert tone="danger">{displayText(message())}</InlineAlert>}
             </Show>
 
-            <div class="oauth-dialog__actions">
-              <button class="ui-button" disabled={busy()} onClick={close}>
+            <div class="config__form-actions oauth-dialog__actions">
+              <Show when={!terminal() ? authorizationUrl() : undefined}>
+                {(url) => <a class="ui-button oauth-dialog__open" href={url()} target="_blank" rel="noopener noreferrer">Open authorization URL</a>}
+              </Show>
+              <Show when={manualInput()}>
+                <button type="button" class="ui-button oauth-dialog__primary" disabled={busy()} onClick={complete}>Complete OAuth</button>
+              </Show>
+              <button type="button" class="ui-button" disabled={busy()} onClick={close}>
                 {terminal() || !cancellable() ? "Dismiss" : "Cancel"}
               </button>
             </div>

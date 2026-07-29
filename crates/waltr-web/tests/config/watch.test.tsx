@@ -23,6 +23,7 @@ describe("config watch", () => {
     await waitFor(() =>
       expect(commands.map((command) => command.type)).toEqual([
         "registerConfigWatchInterest",
+        "requestAuthStatuses",
         "releaseConfigWatchInterest",
       ]),
     );

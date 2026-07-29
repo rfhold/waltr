@@ -3,7 +3,7 @@ import { createMemo, createSignal, type JSX } from "solid-js";
 import { afterEach } from "vitest";
 
 import { AppStateContextProvider } from "../../src/app/context";
-import type { ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
+import type { AuthenticationFailureSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
 import { resetTestHistory } from "./routes";
 import { emptyConfig, snapshotWithConfig } from "./snapshots";
 
@@ -21,12 +21,15 @@ export function renderWithAppState(
     clientError?: unknown;
     minimumSplashElapsed?: boolean;
     routePath?: string;
+    explicitAuthTarget?: ClientAuthTarget;
     configPatchError?: string;
     sessionCreateError?: string;
     sessionDeleteError?: string;
     sessionRuntimeConfigUpdateError?: string;
     submitUserMessageError?: string;
     respondExternalRequestError?: string;
+    continueSessionError?: string;
+    sessionOperationAuthenticationFailure?: AuthenticationFailureSnapshot;
     interruptSessionError?: string;
     onDispatch?: (
       command: ClientCommand,
@@ -44,6 +47,7 @@ export function renderWithAppState(
     const [snapshot, setSnapshot] = createSignal<ClientSnapshot | undefined>(
       options.snapshot,
     );
+    const [explicitAuthTarget, setExplicitAuthTarget] = createSignal(options.explicitAuthTarget);
     options.onSnapshotSetter?.(setSnapshot);
     const systemReady = createMemo(() => snapshot()?.status.ready ?? false);
     const phase = createMemo(() => systemReady() ? "ready" : "splash");
@@ -106,7 +110,7 @@ export function renderWithAppState(
       const session: SessionView = {
         id: `session-${nextOperationId}`,
         revision: 0n,
-        status: { phase: "idle", failedMessage: "" },
+        status: { phase: "idle", failedMessage: "", authenticationFailure: null },
         currentPrompt: null,
         createdAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         updatedAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
@@ -263,9 +267,9 @@ export function renderWithAppState(
         operationName: "submitUserMessage",
         kind: "sessionSubmitUserMessage",
         error: options.submitUserMessageError,
-        loadingOperation: { kind: "sessionSubmitUserMessage", status: "loading", error: null, sessionId },
-        readyOperation: () => ({ kind: "sessionSubmitUserMessage", status: "ready", error: null, sessionId }),
-        failedOperation: (error) => ({ kind: "sessionSubmitUserMessage", status: "failed", error, sessionId }),
+        loadingOperation: { kind: "sessionSubmitUserMessage", status: "loading", error: null, sessionId, authenticationFailure: null },
+        readyOperation: () => ({ kind: "sessionSubmitUserMessage", status: "ready", error: null, sessionId, authenticationFailure: null }),
+        failedOperation: (error) => ({ kind: "sessionSubmitUserMessage", status: "failed", error, sessionId, authenticationFailure: options.sessionOperationAuthenticationFailure ?? null }),
       });
     };
 
@@ -275,9 +279,9 @@ export function renderWithAppState(
         operationName: "respondExternalRequest",
         kind: "sessionRespondExternalRequest",
         error: options.respondExternalRequestError,
-        loadingOperation: { kind: "sessionRespondExternalRequest", status: "loading", error: null, sessionId, requestId },
-        readyOperation: () => ({ kind: "sessionRespondExternalRequest", status: "ready", error: null, sessionId, requestId }),
-        failedOperation: (error) => ({ kind: "sessionRespondExternalRequest", status: "failed", error, sessionId, requestId }),
+        loadingOperation: { kind: "sessionRespondExternalRequest", status: "loading", error: null, sessionId, requestId, authenticationFailure: null },
+        readyOperation: () => ({ kind: "sessionRespondExternalRequest", status: "ready", error: null, sessionId, requestId, authenticationFailure: null }),
+        failedOperation: (error) => ({ kind: "sessionRespondExternalRequest", status: "failed", error, sessionId, requestId, authenticationFailure: options.sessionOperationAuthenticationFailure ?? null }),
       });
     };
 
@@ -293,9 +297,21 @@ export function renderWithAppState(
       });
     };
 
+    const dispatchContinueSession = async (command: Extract<ClientCommand, { type: "continueSessionFromTurn" | "continueSessionFromCursor" }>) => {
+      return dispatchSessionOperation({
+        command,
+        operationName: "continueSession",
+        kind: "sessionContinue",
+        error: options.continueSessionError,
+        loadingOperation: { kind: "sessionContinue", status: "loading", error: null, sessionId: command.sessionId, target: continueTarget(command), authenticationFailure: null },
+        readyOperation: () => ({ kind: "sessionContinue", status: "ready", error: null, sessionId: command.sessionId, target: continueTarget(command), authenticationFailure: null }),
+        failedOperation: (error) => ({ kind: "sessionContinue", status: "failed", error, sessionId: command.sessionId, target: continueTarget(command), authenticationFailure: options.sessionOperationAuthenticationFailure ?? null }),
+      });
+    };
+
     const dispatchSessionOperation = async (operation: {
       command: ClientCommand;
-      operationName: "runtimeConfigUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt";
+      operationName: "runtimeConfigUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt" | "continueSession";
       kind: ClientOperationView["kind"];
       error?: string;
       loadingOperation: ClientOperationView;
@@ -353,7 +369,32 @@ export function renderWithAppState(
           clientLoadError: () => options.clientLoadError,
           clientLoaded: () => options.clientLoaded ?? true,
           systemReady,
+          explicitAuthTarget,
           dispatch,
+          dispatchBeginExplicitAuth: async (target) => {
+            setExplicitAuthTarget(target);
+            try {
+              return await dispatch({ type: "beginAuth", target });
+            } catch (error) {
+              setExplicitAuthTarget(undefined);
+              throw error;
+            }
+          },
+          dispatchCompleteAuth: async (attemptId, input) => {
+            const attemptTarget = snapshot()?.auth.activeAttempt?.target;
+            const result = await dispatch({ type: "completeAuth", attemptId, input });
+            if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) setExplicitAuthTarget(undefined);
+            return result;
+          },
+          dispatchCancelAuth: async (attemptId) => {
+            const attemptTarget = snapshot()?.auth.activeAttempt?.target;
+            const result = await dispatch({ type: "cancelAuth", attemptId });
+            if (sameAuthTarget(explicitAuthTarget(), attemptTarget)) setExplicitAuthTarget(undefined);
+            return result;
+          },
+          dispatchRefreshAuth: (target) => dispatch({ type: "refreshAuth", target }),
+          dispatchLogoutAuth: (target) => dispatch({ type: "logoutAuth", target }),
+          clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
           dispatchConfigPatch,
           dispatchCreateSession,
           dispatchDeleteSession,
@@ -361,12 +402,23 @@ export function renderWithAppState(
           dispatchSubmitUserMessage,
           dispatchRespondExternalRequest,
           dispatchInterruptSession,
+          dispatchContinueSession,
         }}
       >
         {ui()}
       </AppStateContextProvider>
     );
   });
+}
+
+function sameAuthTarget(left: ClientAuthTarget | undefined, right: ClientAuthTarget | undefined) {
+  return Boolean(left && right && left.kind === right.kind && left.key === right.key);
+}
+
+function continueTarget(command: Extract<ClientCommand, { type: "continueSessionFromTurn" | "continueSessionFromCursor" }>) {
+  return command.type === "continueSessionFromTurn"
+    ? { turn: command.turn, cursor: null }
+    : { turn: null, cursor: command.cursor };
 }
 
 function applyConfigPatchCommand(current: ConfigView, command: ClientCommand): ConfigView {
