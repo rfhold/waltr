@@ -8,7 +8,7 @@ use axum::{
 };
 
 #[derive(Debug)]
-pub(crate) struct WebAsset {
+struct WebAsset {
     path: &'static str,
     content_type: &'static str,
     bytes: &'static [u8],
@@ -16,11 +16,11 @@ pub(crate) struct WebAsset {
 
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 
-pub(crate) async fn serve_root() -> Response {
+pub async fn serve_root() -> Response {
     serve_web_asset_path("/")
 }
 
-pub(crate) async fn serve_path(Path(path): Path<String>) -> Response {
+pub async fn serve_path(Path(path): Path<String>) -> Response {
     serve_web_asset_path(&format!("/{path}"))
 }
 
