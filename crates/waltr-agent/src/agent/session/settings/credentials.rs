@@ -1,13 +1,33 @@
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+
+type ProviderRefreshLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+struct FileCredentialSynchronization {
+    lock: Arc<Mutex<()>>,
+    refresh_lock: Arc<Mutex<()>>,
+    refresh_claims: Arc<Mutex<HashMap<String, McpRefreshClaim>>>,
+    provider_refresh_locks: ProviderRefreshLocks,
+}
+
+impl FileCredentialSynchronization {
+    fn new() -> Self {
+        Self {
+            lock: Arc::new(Mutex::new(())),
+            refresh_lock: Arc::new(Mutex::new(())),
+            refresh_claims: Arc::new(Mutex::new(HashMap::new())),
+            provider_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
 
 /// Durable credential stored outside shared config.
 #[derive(Clone, Serialize, Deserialize)]
@@ -295,9 +315,11 @@ pub trait McpOAuthCredentialStore: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct FileCredentialStore {
     path: PathBuf,
+    _synchronization: Arc<FileCredentialSynchronization>,
     lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
     refresh_claims: Arc<Mutex<HashMap<String, McpRefreshClaim>>>,
+    provider_refresh_locks: ProviderRefreshLocks,
     mcp_store: Option<Arc<dyn McpOAuthCredentialStore>>,
 }
 
@@ -315,11 +337,15 @@ impl FileCredentialStore {
     /// Create a store at `path`.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = effective_credential_path(path.into());
+        let synchronization = credential_synchronization(&path);
         Self {
-            path: path.into(),
-            lock: Arc::new(Mutex::new(())),
-            refresh_lock: Arc::new(Mutex::new(())),
-            refresh_claims: Arc::new(Mutex::new(HashMap::new())),
+            path,
+            _synchronization: Arc::clone(&synchronization),
+            lock: Arc::clone(&synchronization.lock),
+            refresh_lock: Arc::clone(&synchronization.refresh_lock),
+            refresh_claims: Arc::clone(&synchronization.refresh_claims),
+            provider_refresh_locks: Arc::clone(&synchronization.provider_refresh_locks),
             mcp_store: None,
         }
     }
@@ -428,6 +454,37 @@ impl FileCredentialStore {
     /// Returns an error when the configured backend cannot delete the credential.
     pub async fn delete(&self, target_key: &str) -> Result<(), std::io::Error> {
         self.modify(target_key, |_| None).await.map(|_| ())
+    }
+
+    pub(crate) async fn upgrade_legacy_mcp(
+        &self,
+        target_key: &str,
+        expected: &OAuthCredential,
+        upgraded: McpOAuthState,
+    ) -> Result<Option<StoredCredential>, std::io::Error> {
+        self.modify(target_key, |stored| match stored {
+            Some(StoredCredential::OAuth(current))
+                if oauth_credentials_match(&current, expected) =>
+            {
+                Some(StoredCredential::McpOAuth(upgraded))
+            }
+            other => other,
+        })
+        .await
+    }
+
+    pub(crate) async fn lock_provider_refresh(
+        &self,
+        target_key: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .provider_refresh_locks
+            .lock()
+            .await
+            .entry(target_key.to_owned())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
     }
 
     pub(crate) async fn claim_mcp_refresh(
@@ -604,6 +661,59 @@ impl FileCredentialStore {
     }
 }
 
+fn credential_synchronization(path: &Path) -> Arc<FileCredentialSynchronization> {
+    static SYNCHRONIZATION: OnceLock<
+        StdMutex<HashMap<PathBuf, Weak<FileCredentialSynchronization>>>,
+    > = OnceLock::new();
+    let registry = SYNCHRONIZATION.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(synchronization) = registry.get(path).and_then(Weak::upgrade) {
+        return synchronization;
+    }
+    registry.retain(|_, synchronization| synchronization.strong_count() > 0);
+    let synchronization = Arc::new(FileCredentialSynchronization::new());
+    registry.insert(path.to_path_buf(), Arc::downgrade(&synchronization));
+    synchronization
+}
+
+fn oauth_credentials_match(left: &OAuthCredential, right: &OAuthCredential) -> bool {
+    left.access == right.access
+        && left.refresh == right.refresh
+        && left.expires_at_ms == right.expires_at_ms
+        && left.metadata == right.metadata
+}
+
+fn effective_credential_path(path: PathBuf) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().map_or_else(|_| path.clone(), |current| current.join(&path))
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return canonical;
+    }
+
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            return absolute;
+        };
+        missing.push(name.to_owned());
+        let Some(parent) = ancestor.parent() else {
+            return absolute;
+        };
+        ancestor = parent;
+    }
+    let mut effective = std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for component in missing.iter().rev() {
+        effective.push(component);
+    }
+    effective
+}
+
 fn credential_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -614,6 +724,11 @@ fn credential_now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     use serde_json::json;
 
     use super::*;
@@ -756,5 +871,100 @@ mod tests {
             panic!("expected MCP OAuth state");
         };
         assert_eq!(current.token.refresh_generation, 8);
+    }
+
+    #[tokio::test]
+    async fn independently_constructed_stores_serialize_file_modifications() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("auth.json");
+        let first = FileCredentialStore::new(&path);
+        let second = FileCredentialStore::new(path);
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+
+        let modify = |store: FileCredentialStore, key: &'static str| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            async move {
+                store
+                    .modify(key, |_| {
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(count, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(25));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Some(StoredCredential::OAuth(OAuthCredential {
+                            access: key.to_owned(),
+                            refresh: String::new(),
+                            expires_at_ms: 1,
+                            metadata: BTreeMap::new(),
+                        }))
+                    })
+                    .await
+                    .expect("modify credentials");
+            }
+        };
+
+        tokio::join!(
+            modify(first.clone(), "provider:first"),
+            modify(second, "provider:second")
+        );
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        assert!(
+            first
+                .read("provider:first")
+                .await
+                .expect("read first")
+                .is_some()
+        );
+        assert!(
+            first
+                .read("provider:second")
+                .await
+                .expect("read second")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_mcp_upgrade_does_not_replace_concurrent_reauthorization() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("auth.json");
+        let first = FileCredentialStore::new(&path);
+        let second = FileCredentialStore::new(path);
+        let key = "mcp:remote";
+        let legacy = OAuthCredential {
+            access: "legacy-access".to_owned(),
+            refresh: "legacy-refresh".to_owned(),
+            expires_at_ms: 1,
+            metadata: BTreeMap::new(),
+        };
+        first
+            .modify(key, |_| Some(StoredCredential::OAuth(legacy.clone())))
+            .await
+            .expect("store legacy credential");
+        let concurrent = state(12);
+        second
+            .modify(key, |_| {
+                Some(StoredCredential::McpOAuth(concurrent.clone()))
+            })
+            .await
+            .expect("store concurrent reauthorization");
+
+        let result = first
+            .upgrade_legacy_mcp(key, &legacy, state(1))
+            .await
+            .expect("attempt legacy upgrade");
+
+        let Some(StoredCredential::McpOAuth(actual)) = result else {
+            panic!("expected concurrent typed credential");
+        };
+        assert_eq!(actual.token.refresh_generation, 12);
+        let Some(StoredCredential::McpOAuth(stored)) =
+            first.read(key).await.expect("read current credential")
+        else {
+            panic!("expected stored typed credential");
+        };
+        assert_eq!(stored.token.refresh_generation, 12);
     }
 }

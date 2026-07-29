@@ -198,13 +198,61 @@ async fn mcp_streamable_http_auth_failure_is_reported_as_auth_required() -> walt
     assert!(
         matches!(
             error,
-            AgentSessionRunError::Runtime(AgentSessionRuntimeError::AuthorizationRequired {
+            AgentSessionRunError::Runtime(AgentSessionRuntimeError::Authentication {
                 target: AuthTarget::McpServer { ref key },
                 ..
             }) if key == "http_test"
         ),
         "unexpected error: {error:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_authentication_is_the_first_blocker_before_provider_authentication()
+-> waltr_agent::Result<()> {
+    let http_server = HttpMcpTestServer::start_requiring_bearer("valid-token").await?;
+    let expected_endpoint = http_server.endpoint.clone();
+    let root = tempfile::tempdir()?.keep();
+    let credentials = FileCredentialStore::new(root.join("credentials.json"));
+    let factory = AgentSessionRuntimeFactory::new(root, credentials).with_runtime_builder(|_| {
+        Err(AgentSessionRuntimeError::Authentication {
+            target: AuthTarget::provider("configured-provider"),
+            message: "provider OAuth credential is required".to_owned(),
+            reason: waltr_agent::AuthenticationFailureReason::CredentialRequired,
+            mcp_authorization: None,
+        })
+    });
+    let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![http_runtime_server(
+                &http_server,
+            )])),
+        )
+        .await?;
+
+    let error = sessions
+        .submit_prompt(
+            session_id,
+            "trigger both authentication blockers",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await
+        .expect_err("MCP authentication should block runtime construction first");
+
+    assert!(matches!(
+        error,
+        AgentSessionRunError::Runtime(AgentSessionRuntimeError::Authentication {
+            target: AuthTarget::McpServer { ref key },
+            reason: waltr_agent::AuthenticationFailureReason::CredentialRequired,
+            mcp_authorization: Some(ref context),
+            ..
+        }) if key == "http_test" && context.endpoint == expected_endpoint && context.http_status == 401
+    ));
 
     Ok(())
 }

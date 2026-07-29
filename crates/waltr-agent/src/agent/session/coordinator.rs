@@ -1,7 +1,7 @@
 //! Durable agent session coordinator.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -40,7 +40,7 @@ where
     sessions: SessionListBroadcaster,
     timeline: SessionTimelineBroadcaster,
     runtime_factory: Option<AgentSessionRuntimeFactory>,
-    mcp_sessions: Arc<Mutex<BTreeMap<SessionId, Arc<McpClientRuntime>>>>,
+    mcp_sessions: Arc<Mutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
     active_runs: Arc<Mutex<BTreeMap<SessionId, ActiveSessionRun>>>,
     next_run_id: Arc<AtomicU64>,
 }
@@ -57,6 +57,12 @@ struct QueuedSessionRun {
     id: u64,
     input: AgentSessionRunInput,
     outcome_tx: RunOutcomeSender,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMcpRuntime {
+    runtime: Arc<McpClientRuntime>,
+    credentialed_servers: BTreeSet<String>,
 }
 
 struct SessionRunStart {
@@ -220,7 +226,7 @@ where
             .await?;
         let runtime = self.mcp_sessions.lock().await.remove(id);
         let shutdown = match runtime {
-            Some(runtime) => runtime.shutdown().await,
+            Some(runtime) => runtime.runtime.shutdown().await,
             None => Ok(()),
         };
         self.sessions.publish(SessionListEvent::Deleted(id.clone()));
@@ -426,7 +432,7 @@ where
             .await?;
         let runtime = self.mcp_sessions.lock().await.remove(id);
         let shutdown = match runtime {
-            Some(runtime) => runtime.shutdown().await,
+            Some(runtime) => runtime.runtime.shutdown().await,
             None => Ok(()),
         };
         self.sessions
@@ -543,6 +549,7 @@ where
         session_id: SessionId,
         turn: u64,
     ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.preflight_authentication(&session_id).await?;
         self.rollback_to_turn(session_id.clone(), turn).await?;
         self.submit(
             session_id,
@@ -562,6 +569,7 @@ where
         session_id: SessionId,
         cursor: crate::timeline::TimelineCursor,
     ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.preflight_authentication(&session_id).await?;
         self.rollback_to_cursor(session_id.clone(), cursor).await?;
         self.submit(
             session_id,
@@ -896,6 +904,30 @@ where
         Ok(builder.build())
     }
 
+    async fn preflight_authentication(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<(), AgentSessionRunError> {
+        match self.resolve_runtime(session_id).await {
+            Err(error) if error.authentication_failure().is_some() => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    async fn persist_authentication_failure(
+        &self,
+        session_id: &SessionId,
+        message: String,
+        failure: crate::AuthenticationFailure,
+    ) -> Result<()> {
+        AgentSessionRuntime::new(&self.store)
+            .with_session_broadcaster(self.sessions.clone())
+            .with_timeline_broadcaster(self.timeline.clone())
+            .fail_authentication(session_id, message, failure)
+            .await?;
+        Ok(())
+    }
+
     async fn ensure_mcp_runtime(
         &self,
         session_id: &SessionId,
@@ -906,10 +938,15 @@ where
             return Ok(None);
         }
         let runtime = self.mcp_sessions.lock().await.get(session_id).cloned();
-        if let Some(runtime) = runtime {
-            return Ok(Some(runtime));
+        if let Some(cached) = runtime {
+            factory
+                .preflight_cached_mcp_authentication(settings, &cached.credentialed_servers)
+                .await?;
+            return Ok(Some(cached.runtime));
         }
-        let config = factory.mcp_config(settings).await?;
+        let (config, credentialed_servers) = factory
+            .mcp_config_and_credentialed_servers(settings)
+            .await?;
         let runtime =
             McpClientRuntime::start(config, factory.mcp_root_uri(), CancellationToken::new())
                 .await
@@ -938,7 +975,7 @@ where
                             error_uri: challenge.as_ref().and_then(|value| value.error_uri.clone()),
                             realm: challenge.as_ref().and_then(|value| value.realm.clone()),
                         }));
-                        super::AgentSessionRuntimeError::AuthorizationRequired {
+                        super::AgentSessionRuntimeError::Authentication {
                             target: crate::AuthTarget::mcp_server(error.server_key),
                             message,
                             reason: crate::AuthenticationFailureReason::CredentialRequired,
@@ -946,7 +983,7 @@ where
                         }
                     }
                     crate::LlmError::Authorization { message, .. } => {
-                        super::AgentSessionRuntimeError::AuthorizationRequired {
+                        super::AgentSessionRuntimeError::Authentication {
                             target: crate::AuthTarget::mcp_server(error.server_key),
                             message,
                             reason: crate::AuthenticationFailureReason::CredentialRequired,
@@ -955,10 +992,13 @@ where
                     }
                     error => super::AgentSessionRuntimeError::from(error),
                 })?;
-        self.mcp_sessions
-            .lock()
-            .await
-            .insert(session_id.clone(), Arc::clone(&runtime));
+        self.mcp_sessions.lock().await.insert(
+            session_id.clone(),
+            CachedMcpRuntime {
+                runtime: Arc::clone(&runtime),
+                credentialed_servers,
+            },
+        );
         Ok(Some(runtime))
     }
 }
@@ -977,7 +1017,17 @@ where
 {
     let runtime = match runtime {
         Some(runtime) => runtime,
-        None => coordinator.resolve_runtime(&session_id).await?,
+        None => match coordinator.resolve_runtime(&session_id).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                if let Some(failure) = error.authentication_failure() {
+                    coordinator
+                        .persist_authentication_failure(&session_id, error.to_string(), failure)
+                        .await?;
+                }
+                return Err(error);
+            }
+        },
     };
     let mut stream = match input {
         AgentSessionRunInput::Continue => {
@@ -1118,12 +1168,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionReplayItem,
-        CompletionRequest, LlmStream, ModelApi, ModelRef, ProviderId, SessionStatus,
-        TimelineItemId,
+        AgentSessionRuntimeError, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
+        CompletionReplayItem, CompletionRequest, LlmStream, ModelApi, ModelRef, ProviderId,
+        SessionStatus, TimelineItemId,
         agent::session::{
-            FileCredentialStore, MemorySessionStore, SessionListEvent,
-            SessionProviderRuntimeSettings,
+            FileCredentialStore, MemorySessionStore, SessionListEvent, SessionMcpServerRuntimeKind,
+            SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
         },
     };
 
@@ -1140,6 +1190,27 @@ mod tests {
                     Ok(CompletionEvent::Delta("ok".to_owned())),
                     Ok(CompletionEvent::Finished),
                 ])) as BoxCompletionStream)
+            })
+        }
+    }
+
+    struct AuthenticationFailingProvider;
+
+    impl LlmStream for AuthenticationFailingProvider {
+        fn name(&self) -> &'static str {
+            "authentication_failing_provider"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async {
+                Err(LlmError::AuthenticationFailure {
+                    failure: crate::AuthenticationFailure {
+                        target: crate::AuthTarget::provider("configured-provider"),
+                        reason: crate::AuthenticationFailureReason::CredentialRejected,
+                        mcp_authorization: None,
+                    },
+                    message: "provider rejected the configured credential".to_owned(),
+                })
             })
         }
     }
@@ -1238,6 +1309,15 @@ mod tests {
         });
 
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment)
+    }
+
+    fn authentication_runtime_error() -> crate::AgentSessionRuntimeError {
+        crate::AgentSessionRuntimeError::Authentication {
+            target: crate::AuthTarget::provider("configured-provider"),
+            message: "provider OAuth credential is required".to_owned(),
+            reason: crate::AuthenticationFailureReason::CredentialRequired,
+            mcp_authorization: None,
+        }
     }
 
     #[tokio::test]
@@ -1358,6 +1438,214 @@ mod tests {
         let snapshot = record.snapshot();
         assert_eq!(snapshot.prompts, vec!["active", "queued one", "queued two"]);
         assert_eq!(snapshot.prompt_turns[1].turn, snapshot.prompt_turns[2].turn);
+    }
+
+    #[tokio::test]
+    async fn asynchronous_provider_authentication_failure_is_durable() {
+        let sessions = runtime_sessions(Arc::new(AuthenticationFailingProvider));
+        let session = sessions
+            .create_with_runtime_settings(Some(test_runtime_settings()), BTreeMap::new())
+            .await
+            .unwrap();
+        let session_id = session.record.id.clone();
+
+        let submission = sessions
+            .submit_prompt(
+                session_id.clone(),
+                "authenticate",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .expect("submission returns before provider failure");
+        let error = submission
+            .handle
+            .wait()
+            .await
+            .expect_err("provider authentication should fail");
+        assert!(matches!(error, AgentSessionRunError::Agent(_)));
+
+        let status = sessions
+            .load(&session_id)
+            .await
+            .unwrap()
+            .record
+            .summary()
+            .status;
+        assert!(matches!(
+            status,
+            SessionStatus::Failed {
+                authentication_failure: Some(crate::AuthenticationFailure {
+                    target: crate::AuthTarget::Provider { ref key },
+                    reason: crate::AuthenticationFailureReason::CredentialRejected,
+                    ..
+                }),
+                ..
+            } if key == "configured-provider"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_credentialed_mcp_runtime_remains_the_first_authentication_blocker() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        )
+        .with_runtime_builder(|_| Err(authentication_runtime_error()));
+        let sessions =
+            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let mut settings = test_runtime_settings();
+        settings.mcp_servers.push(SessionMcpServerRuntimeSettings {
+            key: "protected".to_owned(),
+            kind: SessionMcpServerRuntimeKind::StreamableHttp,
+            command: String::new(),
+            url: "https://mcp.example/rpc".to_owned(),
+        });
+        let session = sessions
+            .create_with_runtime_settings(Some(settings), BTreeMap::new())
+            .await
+            .unwrap();
+        let runtime = McpClientRuntime::start(
+            crate::mcp::McpConfig::new(),
+            "file:///tmp".to_owned(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("empty MCP runtime should start");
+        sessions.mcp_sessions.lock().await.insert(
+            session.record.id.clone(),
+            CachedMcpRuntime {
+                runtime,
+                credentialed_servers: BTreeSet::from(["protected".to_owned()]),
+            },
+        );
+
+        let error = sessions
+            .resolve_runtime(&session.record.id)
+            .await
+            .expect_err("missing cached MCP credential should block provider resolution");
+
+        assert!(matches!(
+            error,
+            AgentSessionRunError::Runtime(AgentSessionRuntimeError::Authentication {
+                target: crate::AuthTarget::McpServer { ref key },
+                reason: crate::AuthenticationFailureReason::CredentialRequired,
+                ..
+            }) if key == "protected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_runtime_authentication_failure_is_durable() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let resolutions = Arc::new(AtomicU64::new(0));
+        let resolution_count = Arc::clone(&resolutions);
+        let runtime_provider = Arc::clone(&provider);
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        )
+        .with_runtime_builder(move |_| {
+            if resolution_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(AgentRuntime::builder(
+                    ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+                    Arc::clone(&runtime_provider),
+                ))
+            } else {
+                Err(authentication_runtime_error())
+            }
+        });
+        let sessions =
+            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let session = sessions
+            .create_with_runtime_settings(Some(test_runtime_settings()), BTreeMap::new())
+            .await
+            .unwrap();
+        let session_id = session.record.id.clone();
+        let active = sessions
+            .submit_prompt(
+                session_id.clone(),
+                "active",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+        let queued = sessions
+            .submit_prompt(
+                session_id.clone(),
+                "queued",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+
+        provider.release_active();
+        active.handle.wait().await.unwrap();
+        let error = queued
+            .handle
+            .wait()
+            .await
+            .expect_err("queued runtime resolution should fail");
+        assert!(matches!(error, AgentSessionRunError::Runtime(_)));
+        let status = sessions
+            .load(&session_id)
+            .await
+            .unwrap()
+            .record
+            .summary()
+            .status;
+        assert!(matches!(
+            status,
+            SessionStatus::Failed {
+                authentication_failure: Some(crate::AuthenticationFailure {
+                    target: crate::AuthTarget::Provider { ref key },
+                    reason: crate::AuthenticationFailureReason::CredentialRequired,
+                    ..
+                }),
+                ..
+            } if key == "configured-provider"
+        ));
+    }
+
+    #[tokio::test]
+    async fn continue_authentication_preflight_does_not_append_rollback() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        )
+        .with_runtime_builder(|_| Err(authentication_runtime_error()));
+        let sessions =
+            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let session = sessions
+            .create_with_runtime_settings(Some(test_runtime_settings()), BTreeMap::new())
+            .await
+            .unwrap();
+        let session_id = session.record.id.clone();
+        sessions
+            .append_timeline(
+                &session_id,
+                vec![PendingTimelineEvent::assistant_text_delta(
+                    session_id.clone(),
+                    0,
+                    TimelineItemId::new("assistant-1"),
+                    "before",
+                )],
+            )
+            .await
+            .unwrap();
+        let before = sessions.load(&session_id).await.unwrap().record;
+
+        let error = sessions
+            .continue_from_cursor(session_id.clone(), crate::TimelineCursor::new(1))
+            .await
+            .expect_err("authentication preflight should reject continuation");
+        assert!(error.authentication_failure().is_some());
+        let after = sessions.load(&session_id).await.unwrap().record;
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.journal, before.journal);
     }
 
     #[tokio::test]

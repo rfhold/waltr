@@ -98,6 +98,16 @@ pub struct CancelAuthRequest {
 pub struct CancelAuthResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RefreshAuthRequest {
+    #[prost(message, optional, tag="1")]
+    pub target: ::core::option::Option<AuthTarget>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RefreshAuthResponse {
+    #[prost(message, optional, tag="1")]
+    pub status: ::core::option::Option<AuthStatus>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LogoutRequest {
     #[prost(message, optional, tag="1")]
     pub target: ::core::option::Option<AuthTarget>,
@@ -172,95 +182,8 @@ pub struct AuthStatus {
     pub message: ::prost::alloc::string::String,
     #[prost(enumeration="McpOAuthRegistrationMethod", tag="7")]
     pub registration_method: i32,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ListProviderAuthStatusesRequest {
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListProviderAuthStatusesResponse {
-    #[prost(message, repeated, tag="1")]
-    pub statuses: ::prost::alloc::vec::Vec<ProviderAuthStatus>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetProviderAuthStatusRequest {
-    #[prost(string, tag="1")]
-    pub provider_key: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GetProviderAuthStatusResponse {
-    #[prost(message, optional, tag="1")]
-    pub status: ::core::option::Option<ProviderAuthStatus>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BeginProviderAuthRequest {
-    #[prost(string, tag="1")]
-    pub provider_key: ::prost::alloc::string::String,
-    #[prost(enumeration="ProviderAuthMethod", tag="2")]
-    pub method: i32,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BeginProviderAuthResponse {
-    #[prost(string, tag="1")]
-    pub attempt_id: ::prost::alloc::string::String,
-    #[prost(enumeration="ProviderAuthMethod", tag="2")]
-    pub method: i32,
-    #[prost(string, tag="3")]
-    pub auth_url: ::prost::alloc::string::String,
-    #[prost(string, tag="4")]
-    pub verification_url: ::prost::alloc::string::String,
-    #[prost(string, tag="5")]
-    pub user_code: ::prost::alloc::string::String,
-    #[prost(int64, tag="6")]
-    pub expires_at_ms: i64,
-    #[prost(int32, tag="7")]
-    pub poll_interval_seconds: i32,
-    #[prost(string, repeated, tag="8")]
-    pub messages: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CompleteProviderAuthRequest {
-    #[prost(string, tag="1")]
-    pub attempt_id: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
-    pub input: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CompleteProviderAuthResponse {
-    #[prost(message, optional, tag="1")]
-    pub status: ::core::option::Option<ProviderAuthStatus>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CancelProviderAuthRequest {
-    #[prost(string, tag="1")]
-    pub attempt_id: ::prost::alloc::string::String,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CancelProviderAuthResponse {
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct LogoutProviderRequest {
-    #[prost(string, tag="1")]
-    pub provider_key: ::prost::alloc::string::String,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LogoutProviderResponse {
-    #[prost(message, optional, tag="1")]
-    pub status: ::core::option::Option<ProviderAuthStatus>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ProviderAuthStatus {
-    #[prost(string, tag="1")]
-    pub provider_key: ::prost::alloc::string::String,
-    #[prost(enumeration="ProviderAuthStatusKind", tag="2")]
-    pub kind: i32,
-    #[prost(enumeration="ProviderAuthMethod", repeated, tag="3")]
-    pub supported_methods: ::prost::alloc::vec::Vec<i32>,
-    #[prost(int64, tag="4")]
-    pub expires_at_ms: i64,
-    #[prost(map="string, string", tag="5")]
-    pub metadata: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    #[prost(string, tag="6")]
-    pub message: ::prost::alloc::string::String,
+    #[prost(bool, tag="8")]
+    pub can_refresh: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -503,73 +426,6 @@ impl AuthMethod {
             "AUTH_METHOD_UNSPECIFIED" => Some(Self::Unspecified),
             "AUTH_METHOD_OAUTH_MANUAL" => Some(Self::OauthManual),
             "AUTH_METHOD_OAUTH_DEVICE" => Some(Self::OauthDevice),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum ProviderAuthStatusKind {
-    Unspecified = 0,
-    NotConfigured = 1,
-    ApiKeyConfigured = 2,
-    OauthConfigured = 3,
-    Expired = 4,
-    Unsupported = 5,
-}
-impl ProviderAuthStatusKind {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PROVIDER_AUTH_STATUS_KIND_UNSPECIFIED",
-            Self::NotConfigured => "PROVIDER_AUTH_STATUS_KIND_NOT_CONFIGURED",
-            Self::ApiKeyConfigured => "PROVIDER_AUTH_STATUS_KIND_API_KEY_CONFIGURED",
-            Self::OauthConfigured => "PROVIDER_AUTH_STATUS_KIND_OAUTH_CONFIGURED",
-            Self::Expired => "PROVIDER_AUTH_STATUS_KIND_EXPIRED",
-            Self::Unsupported => "PROVIDER_AUTH_STATUS_KIND_UNSUPPORTED",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PROVIDER_AUTH_STATUS_KIND_UNSPECIFIED" => Some(Self::Unspecified),
-            "PROVIDER_AUTH_STATUS_KIND_NOT_CONFIGURED" => Some(Self::NotConfigured),
-            "PROVIDER_AUTH_STATUS_KIND_API_KEY_CONFIGURED" => Some(Self::ApiKeyConfigured),
-            "PROVIDER_AUTH_STATUS_KIND_OAUTH_CONFIGURED" => Some(Self::OauthConfigured),
-            "PROVIDER_AUTH_STATUS_KIND_EXPIRED" => Some(Self::Expired),
-            "PROVIDER_AUTH_STATUS_KIND_UNSUPPORTED" => Some(Self::Unsupported),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum ProviderAuthMethod {
-    Unspecified = 0,
-    OauthManual = 1,
-    OauthDevice = 2,
-}
-impl ProviderAuthMethod {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "PROVIDER_AUTH_METHOD_UNSPECIFIED",
-            Self::OauthManual => "PROVIDER_AUTH_METHOD_OAUTH_MANUAL",
-            Self::OauthDevice => "PROVIDER_AUTH_METHOD_OAUTH_DEVICE",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PROVIDER_AUTH_METHOD_UNSPECIFIED" => Some(Self::Unspecified),
-            "PROVIDER_AUTH_METHOD_OAUTH_MANUAL" => Some(Self::OauthManual),
-            "PROVIDER_AUTH_METHOD_OAUTH_DEVICE" => Some(Self::OauthDevice),
             _ => None,
         }
     }

@@ -4,9 +4,10 @@ use ts_rs::TS;
 use waltr::grpc::waltr::session::v1::timeline_content;
 
 use crate::{
-    McpServerTypeView, ProviderKindView, RuntimeConfigMatch, SessionMcpServerRuntime,
-    SessionMetrics, SessionPhase, SessionProviderRuntime, SessionRuntimeConfig, SessionStatus,
-    SessionSummary, TimelineContent, TimelineEvent, TimelineEventKind, TimelineStatus,
+    AuthenticationFailureSnapshot, McpServerTypeView, OutboundAuthenticationFailure,
+    ProviderKindView, RuntimeConfigMatch, SessionMcpServerRuntime, SessionMetrics, SessionPhase,
+    SessionProviderRuntime, SessionRuntimeConfig, SessionStatus, SessionSummary, TimelineContent,
+    TimelineEvent, TimelineEventKind, TimelineStatus,
 };
 
 /// Stable session summary view shared by Waltr shells.
@@ -129,6 +130,8 @@ pub struct SessionStatusView {
     pub phase: SessionPhaseView,
     /// Failure message, when phase is failed.
     pub failed_message: String,
+    /// Structured outbound authentication failure, when present.
+    pub authentication_failure: Option<AuthenticationFailureSnapshot>,
 }
 
 /// Stable session phase view shared by Waltr shells.
@@ -341,15 +344,22 @@ impl Default for SessionStatusView {
         Self {
             phase: SessionPhaseView::Unspecified,
             failed_message: String::new(),
+            authentication_failure: None,
         }
     }
 }
 
 impl From<SessionStatus> for SessionStatusView {
     fn from(status: SessionStatus) -> Self {
+        let authentication_failure = (status.phase == SessionPhase::Failed as i32)
+            .then_some(status.authentication_failure)
+            .flatten()
+            .and_then(OutboundAuthenticationFailure::from_proto)
+            .map(Into::into);
         Self {
             phase: status.phase.into(),
             failed_message: status.failed_message,
+            authentication_failure,
         }
     }
 }

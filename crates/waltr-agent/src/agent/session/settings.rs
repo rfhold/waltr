@@ -75,6 +75,33 @@ pub struct SessionOAuthProviderSettings {
     /// Provider-specific token field mappings.
     #[serde(default)]
     pub token_fields: Vec<SessionOAuthTokenField>,
+    /// JWT claims copied into provider metadata after token exchange.
+    #[serde(default)]
+    pub jwt_metadata: Vec<SessionOAuthJwtMetadata>,
+}
+
+/// JWT token containing provider metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionOAuthJwtToken {
+    /// OAuth access token.
+    Access,
+    /// `OpenID` Connect ID token.
+    Id,
+}
+
+/// Provider metadata extracted from an unverified token response JWT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOAuthJwtMetadata {
+    /// Token response field containing the JWT.
+    pub token: SessionOAuthJwtToken,
+    /// Credential metadata key populated by this extractor.
+    pub metadata_key: String,
+    /// Claim names checked in order.
+    #[serde(default)]
+    pub claim_names: Vec<String>,
+    /// Whether metadata must exist after preserving and extracting values.
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// OAuth token request body format.
@@ -142,5 +169,19 @@ mod tests {
         .expect("settings deserialize");
 
         assert!(!settings.mcp_trace_propagation);
+    }
+
+    #[test]
+    fn provider_oauth_settings_default_missing_jwt_metadata() {
+        let settings: SessionOAuthProviderSettings = serde_json::from_value(json!({
+            "token_url": "https://issuer.example/token",
+            "client_id": "client",
+            "redirect_uri": "http://localhost/callback",
+            "token_request_style": "FormUrlencoded",
+            "token_fields": []
+        }))
+        .expect("legacy provider OAuth settings");
+
+        assert!(settings.jwt_metadata.is_empty());
     }
 }

@@ -1250,6 +1250,7 @@ where
             drop(
                 self.append_journal_event(SessionJournalEvent::Failed {
                     message: error.to_string(),
+                    authentication_failure: error.authentication_failure().cloned(),
                 })
                 .await,
             );

@@ -28,45 +28,57 @@ pub(super) fn session_run_error_to_status(error: waltr_agent::AgentSessionRunErr
             }
             waltr_agent::AgentSessionRuntimeError::Internal(message) => Status::internal(message),
             waltr_agent::AgentSessionRuntimeError::Agent(error) => agent_error_to_status(error),
-            waltr_agent::AgentSessionRuntimeError::AuthorizationRequired {
+            waltr_agent::AgentSessionRuntimeError::Authentication {
                 target,
                 message,
                 reason,
                 mcp_authorization,
             } => {
-                let (domain, target) = match target {
-                    waltr_agent::AuthTarget::Provider { key } => (
-                        AuthenticationDomain::OutboundProvider,
-                        AuthTarget {
-                            target: Some(auth_target::Target::ProviderKey(key)),
-                        },
-                    ),
-                    waltr_agent::AuthTarget::McpServer { key } => (
-                        AuthenticationDomain::OutboundMcp,
-                        AuthTarget {
-                            target: Some(auth_target::Target::McpServerKey(key)),
-                        },
-                    ),
-                };
-                let details = AuthenticationFailure {
-                    version: 1,
-                    domain: domain as i32,
-                    reason: proto_reason(reason) as i32,
-                    target: Some(target),
-                    mcp_authorization: mcp_authorization.map(|context| McpAuthorizationContext {
-                        endpoint: context.endpoint,
-                        http_status: u32::from(context.http_status),
-                        resource_metadata_url: context.resource_metadata_url,
-                        scope: context.scope,
-                        error: context.error,
-                        error_description: context.error_description,
-                        error_uri: context.error_uri,
-                        realm: context.realm,
-                    }),
-                };
+                let details = authentication_failure_to_proto(waltr_agent::AuthenticationFailure {
+                    target,
+                    reason,
+                    mcp_authorization,
+                });
                 Status::with_details(status_code(reason), message, details.encode_to_vec().into())
             }
         },
+    }
+}
+
+pub(super) fn authentication_failure_to_proto(
+    failure: waltr_agent::AuthenticationFailure,
+) -> AuthenticationFailure {
+    let (domain, target) = match failure.target {
+        waltr_agent::AuthTarget::Provider { key } => (
+            AuthenticationDomain::OutboundProvider,
+            AuthTarget {
+                target: Some(auth_target::Target::ProviderKey(key)),
+            },
+        ),
+        waltr_agent::AuthTarget::McpServer { key } => (
+            AuthenticationDomain::OutboundMcp,
+            AuthTarget {
+                target: Some(auth_target::Target::McpServerKey(key)),
+            },
+        ),
+    };
+    AuthenticationFailure {
+        version: 1,
+        domain: domain as i32,
+        reason: proto_reason(failure.reason) as i32,
+        target: Some(target),
+        mcp_authorization: failure
+            .mcp_authorization
+            .map(|context| McpAuthorizationContext {
+                endpoint: context.endpoint,
+                http_status: u32::from(context.http_status),
+                resource_metadata_url: context.resource_metadata_url,
+                scope: context.scope,
+                error: context.error,
+                error_description: context.error_description,
+                error_uri: context.error_uri,
+                realm: context.realm,
+            }),
     }
 }
 
@@ -117,9 +129,9 @@ mod tests {
     #[test]
     fn mcp_requirement_encodes_domain_reason_target_and_challenge() {
         let status = session_run_error_to_status(waltr_agent::AgentSessionRunError::Runtime(
-            waltr_agent::AgentSessionRuntimeError::AuthorizationRequired {
+            waltr_agent::AgentSessionRuntimeError::Authentication {
                 target: waltr_agent::AuthTarget::mcp_server("self"),
-                message: "MCP authorization required".to_owned(),
+                message: "MCP authentication failed".to_owned(),
                 reason: waltr_agent::AuthenticationFailureReason::CredentialRequired,
                 mcp_authorization: Some(Box::new(waltr_agent::McpAuthorizationContext {
                     endpoint: "https://waltr.example.test/mcp".to_owned(),
@@ -160,7 +172,7 @@ mod tests {
     #[test]
     fn outbound_network_failure_is_unavailable_not_access_unauthenticated() {
         let status = session_run_error_to_status(waltr_agent::AgentSessionRunError::Runtime(
-            waltr_agent::AgentSessionRuntimeError::AuthorizationRequired {
+            waltr_agent::AgentSessionRuntimeError::Authentication {
                 target: waltr_agent::AuthTarget::provider("openai"),
                 message: "token service unavailable".to_owned(),
                 reason: waltr_agent::AuthenticationFailureReason::NetworkFailed,

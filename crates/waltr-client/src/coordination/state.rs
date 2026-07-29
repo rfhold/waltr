@@ -170,8 +170,6 @@ pub enum AccessStatus {
 /// Auth coordination state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AuthClientState {
-    /// Queued auth requirements reported by session runs.
-    pub pending: Vec<AuthRequirement>,
     /// Last known statuses by target key.
     pub statuses: BTreeMap<String, AuthStatus>,
     /// Auth status list operation state.
@@ -182,44 +180,12 @@ pub struct AuthClientState {
     pub complete: OperationState,
     /// Cancel auth operation state.
     pub cancel: OperationState,
+    /// Forced refresh operation state.
+    pub refresh: OperationState,
     /// Logout operation state.
     pub logout: OperationState,
     /// Active manual auth attempt, when one has been started.
     pub active_attempt: Option<AuthAttemptState>,
-}
-
-/// One queued auth requirement.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthRequirement {
-    /// Target that requires authentication.
-    pub target: AuthTarget,
-    /// Human-readable reason.
-    pub message: String,
-    /// Session whose work reported the requirement.
-    pub source_session_id: Option<String>,
-    /// Sanitized upstream MCP bearer challenge context.
-    pub mcp_authorization: Option<McpAuthorizationRequirement>,
-}
-
-/// Sanitized upstream MCP authorization requirement safe for shell presentation.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct McpAuthorizationRequirement {
-    /// Protected MCP endpoint, when it is a safe HTTP(S) URL.
-    pub endpoint: Option<String>,
-    /// HTTP response status associated with the challenge.
-    pub http_status: u32,
-    /// Protected-resource metadata URL, when safe.
-    pub resource_metadata_url: Option<String>,
-    /// Requested OAuth scope.
-    pub scope: Option<String>,
-    /// OAuth bearer error code.
-    pub error: Option<String>,
-    /// OAuth bearer error description.
-    pub error_description: Option<String>,
-    /// OAuth bearer error documentation URL, when safe.
-    pub error_uri: Option<String>,
-    /// Bearer challenge realm.
-    pub realm: Option<String>,
 }
 
 /// Active OAuth attempt details safe to show in clients.
@@ -388,6 +354,17 @@ pub enum ClientOperationState {
         /// Last operation error, when present.
         error: Option<String>,
     },
+    /// Forced auth refresh command result.
+    AuthRefresh {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Target being refreshed.
+        target: AuthTarget,
+        /// Secret-safe status returned by the server.
+        auth_status: Option<AuthStatus>,
+    },
     /// Logout command result.
     AuthLogout {
         /// Current operation status.
@@ -443,6 +420,8 @@ pub enum ClientOperationState {
         error: Option<String>,
         /// Session id submitted to.
         session_id: String,
+        /// Structured outbound authentication failure, when present.
+        authentication_failure: Option<crate::OutboundAuthenticationFailure>,
     },
     /// External request response command result.
     SessionRespondExternalRequest {
@@ -454,6 +433,8 @@ pub enum ClientOperationState {
         session_id: String,
         /// External request id.
         request_id: String,
+        /// Structured outbound authentication failure, when present.
+        authentication_failure: Option<crate::OutboundAuthenticationFailure>,
     },
     /// Session interrupt command result.
     SessionInterrupt {
@@ -485,6 +466,8 @@ pub enum ClientOperationState {
         session_id: String,
         /// Rollback target continued from.
         target: RollbackTarget,
+        /// Structured outbound authentication failure, when present.
+        authentication_failure: Option<crate::OutboundAuthenticationFailure>,
     },
 }
 
@@ -502,6 +485,12 @@ impl ClientOperationState {
                 status,
                 error,
                 auth_status,
+            }
+            | Self::AuthRefresh {
+                status,
+                error,
+                auth_status,
+                ..
             }
             | Self::AuthLogout {
                 status,
@@ -543,7 +532,9 @@ impl ClientOperationState {
 
     fn redact_identity(&mut self) {
         match self {
-            Self::AuthBegin { target, .. } | Self::AuthLogout { target, .. } => {
+            Self::AuthBegin { target, .. }
+            | Self::AuthRefresh { target, .. }
+            | Self::AuthLogout { target, .. } => {
                 *target = AuthTarget::default();
             }
             Self::SessionDelete { id, .. } => id.clear(),
@@ -704,10 +695,6 @@ impl ClientState {
 
     fn clear_protected_state(&mut self, policy: ClearPolicy) {
         self.terminalize_loading_operations(policy);
-        let auth_pending = match policy {
-            ClearPolicy::TransientExpiry => std::mem::take(&mut self.auth.pending),
-            ClearPolicy::ExplicitLogout => Vec::new(),
-        };
         let config_interests = self.config.watch.interests;
         let session_interests = self.sessions.watch.interests;
         let timeline_interests = self
@@ -729,10 +716,7 @@ impl ClientState {
 
         self.config = ConfigClientState::default();
         self.catalog = CatalogClientState::default();
-        self.auth = AuthClientState {
-            pending: auth_pending,
-            ..AuthClientState::default()
-        };
+        self.auth = AuthClientState::default();
         self.config.watch.interests = match policy {
             ClearPolicy::TransientExpiry => config_interests,
             ClearPolicy::ExplicitLogout => 0,
@@ -914,48 +898,6 @@ impl ClientState {
         self.auth.list.error = Some(message);
     }
 
-    pub(crate) fn enqueue_auth_requirement(
-        &mut self,
-        target: AuthTarget,
-        message: &str,
-        source_session_id: Option<String>,
-        mcp_authorization: Option<McpAuthorizationRequirement>,
-    ) {
-        if let Some(requirement) = self
-            .auth
-            .pending
-            .iter_mut()
-            .find(|requirement| requirement.target == target)
-        {
-            requirement.message = safe_text(message, 1_024);
-            requirement.source_session_id = source_session_id;
-            requirement.mcp_authorization = mcp_authorization;
-            return;
-        }
-
-        self.auth.pending.push(AuthRequirement {
-            target,
-            message: safe_text(message, 1_024),
-            source_session_id,
-            mcp_authorization,
-        });
-    }
-
-    pub(crate) fn remove_auth_requirement(&mut self, target: &AuthTarget) {
-        self.auth
-            .pending
-            .retain(|requirement| &requirement.target != target);
-
-        if self
-            .auth
-            .active_attempt
-            .as_ref()
-            .is_some_and(|attempt| &attempt.target == target)
-        {
-            self.auth.active_attempt = None;
-        }
-    }
-
     pub(crate) fn set_auth_begin_loading(&mut self, key: OperationKey, target: AuthTarget) {
         self.auth.active_attempt = None;
         self.auth.begin.status = OperationStatus::Loading;
@@ -1100,9 +1042,6 @@ impl ClientState {
             {
                 let target = attempt.target.clone();
                 self.auth
-                    .pending
-                    .retain(|requirement| requirement.target != target);
-                self.auth
                     .statuses
                     .insert(auth_target_key(&target), auth_status);
             } else {
@@ -1187,7 +1126,6 @@ impl ClientState {
 
     pub(crate) fn set_auth_complete_ready(&mut self, key: OperationKey, status: AuthStatus) {
         if let Some(target) = status.target.as_ref() {
-            self.remove_auth_requirement(target);
             self.auth
                 .statuses
                 .insert(auth_target_key(target), status.clone());
@@ -1260,6 +1198,61 @@ impl ClientState {
         );
     }
 
+    pub(crate) fn set_auth_refresh_loading(&mut self, key: OperationKey, target: AuthTarget) {
+        self.auth.refresh.status = OperationStatus::Loading;
+        self.auth.refresh.error = None;
+        self.auth.refresh.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthRefresh {
+                status: OperationStatus::Loading,
+                error: None,
+                target,
+                auth_status: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_refresh_ready(&mut self, key: OperationKey, status: AuthStatus) {
+        let target = status.target.clone().unwrap_or_default();
+        self.auth
+            .statuses
+            .insert(auth_target_key(&target), status.clone());
+        if self.auth.refresh.key.as_ref() == Some(&key) {
+            self.auth.refresh.status = OperationStatus::Ready;
+            self.auth.refresh.error = None;
+        }
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthRefresh {
+                status: OperationStatus::Ready,
+                error: None,
+                target,
+                auth_status: Some(status),
+            },
+        );
+    }
+
+    pub(crate) fn set_auth_refresh_failed(&mut self, key: OperationKey, message: String) {
+        let target = match self.operations.get(&key) {
+            Some(ClientOperationState::AuthRefresh { target, .. }) => target.clone(),
+            _ => AuthTarget::default(),
+        };
+        if self.auth.refresh.key.as_ref() == Some(&key) {
+            self.auth.refresh.status = OperationStatus::Failed;
+            self.auth.refresh.error = Some(message.clone());
+        }
+        self.operations.insert(
+            key,
+            ClientOperationState::AuthRefresh {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                target,
+                auth_status: None,
+            },
+        );
+    }
+
     pub(crate) fn set_auth_logout_loading(&mut self, key: OperationKey, target: AuthTarget) {
         self.auth.logout.status = OperationStatus::Loading;
         self.auth.logout.error = None;
@@ -1277,7 +1270,6 @@ impl ClientState {
 
     pub(crate) fn set_auth_logout_ready(&mut self, key: OperationKey, status: AuthStatus) {
         let target = status.target.clone().unwrap_or_default();
-        self.remove_auth_requirement(&target);
         self.auth
             .statuses
             .insert(auth_target_key(&target), status.clone());
@@ -1881,6 +1873,7 @@ impl ClientState {
                 status: OperationStatus::Loading,
                 error: None,
                 session_id,
+                authentication_failure: None,
             },
         );
     }
@@ -1899,6 +1892,7 @@ impl ClientState {
                 status: OperationStatus::Ready,
                 error: None,
                 session_id,
+                authentication_failure: None,
             },
         );
     }
@@ -1907,8 +1901,10 @@ impl ClientState {
         &mut self,
         key: OperationKey,
         session_id: String,
-        message: String,
+        error: &crate::ClientError,
     ) {
+        let authentication_failure = error.authentication_failure().cloned();
+        let message = error.to_string();
         self.sessions.submit_user_message.status = OperationStatus::Failed;
         self.sessions.submit_user_message.error = Some(message.clone());
         self.sessions.submit_user_message.key = Some(key.clone());
@@ -1918,6 +1914,7 @@ impl ClientState {
                 status: OperationStatus::Failed,
                 error: Some(message),
                 session_id,
+                authentication_failure,
             },
         );
     }
@@ -1938,6 +1935,7 @@ impl ClientState {
                 error: None,
                 session_id,
                 request_id,
+                authentication_failure: None,
             },
         );
     }
@@ -1958,6 +1956,7 @@ impl ClientState {
                 error: None,
                 session_id,
                 request_id,
+                authentication_failure: None,
             },
         );
     }
@@ -1967,8 +1966,10 @@ impl ClientState {
         key: OperationKey,
         session_id: String,
         request_id: String,
-        message: String,
+        error: &crate::ClientError,
     ) {
+        let authentication_failure = error.authentication_failure().cloned();
+        let message = error.to_string();
         self.sessions.respond_external_request.status = OperationStatus::Failed;
         self.sessions.respond_external_request.error = Some(message.clone());
         self.sessions.respond_external_request.key = Some(key.clone());
@@ -1979,6 +1980,7 @@ impl ClientState {
                 error: Some(message),
                 session_id,
                 request_id,
+                authentication_failure,
             },
         );
     }
@@ -2102,6 +2104,7 @@ impl ClientState {
                 error: None,
                 session_id,
                 target,
+                authentication_failure: None,
             },
         );
     }
@@ -2122,6 +2125,7 @@ impl ClientState {
                 error: None,
                 session_id,
                 target,
+                authentication_failure: None,
             },
         );
     }
@@ -2131,8 +2135,10 @@ impl ClientState {
         key: OperationKey,
         session_id: String,
         target: RollbackTarget,
-        message: String,
+        error: &crate::ClientError,
     ) {
+        let authentication_failure = error.authentication_failure().cloned();
+        let message = error.to_string();
         self.sessions.continue_session.status = OperationStatus::Failed;
         self.sessions.continue_session.error = Some(message.clone());
         self.sessions.continue_session.key = Some(key.clone());
@@ -2143,6 +2149,7 @@ impl ClientState {
                 error: Some(message),
                 session_id,
                 target,
+                authentication_failure,
             },
         );
     }
@@ -2237,26 +2244,6 @@ impl ClientState {
     fn remove_session(&mut self, id: &str) {
         self.sessions.current.remove(id);
         self.sessions.timelines.remove(id);
-        let removed_targets = self
-            .auth
-            .pending
-            .iter()
-            .filter(|requirement| requirement.source_session_id.as_deref() == Some(id))
-            .map(|requirement| requirement.target.clone())
-            .collect::<Vec<_>>();
-        self.auth
-            .pending
-            .retain(|requirement| requirement.source_session_id.as_deref() != Some(id));
-        if self.auth.active_attempt.as_ref().is_some_and(|attempt| {
-            removed_targets.contains(&attempt.target)
-                && !self
-                    .auth
-                    .pending
-                    .iter()
-                    .any(|requirement| requirement.target == attempt.target)
-        }) {
-            self.auth.active_attempt = None;
-        }
     }
 
     fn session_timeline_mut(&mut self, session_id: &str) -> &mut SessionTimelineState {

@@ -128,26 +128,6 @@ impl Client {
         self.apply(ClientEvent::Auth(AuthEvent::ListRequested))
     }
 
-    /// Queue an auth requirement surfaced by a server-side run.
-    pub fn require_auth(
-        &mut self,
-        target: AuthTarget,
-        message: impl Into<String>,
-        source_session_id: Option<String>,
-    ) -> ClientUpdate {
-        self.apply(ClientEvent::Auth(AuthEvent::AuthorizationRequired {
-            target,
-            message: message.into(),
-            source_session_id,
-            mcp_authorization: None,
-        }))
-    }
-
-    /// Dismiss one queued auth requirement.
-    pub fn dismiss_auth_requirement(&mut self, target: AuthTarget) -> ClientUpdate {
-        self.apply(ClientEvent::Auth(AuthEvent::Dismissed { target }))
-    }
-
     /// Begin manual OAuth for a target.
     pub fn begin_auth(&mut self, target: AuthTarget) -> ClientUpdate {
         let operation_key = self.state.next_operation_key();
@@ -184,6 +164,15 @@ impl Client {
         self.apply(ClientEvent::Auth(AuthEvent::CancelRequested {
             operation_key,
             attempt_id: attempt_id.into(),
+        }))
+    }
+
+    /// Force-refresh stored OAuth credentials for a target.
+    pub fn refresh_auth(&mut self, target: AuthTarget) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Auth(AuthEvent::RefreshRequested {
+            operation_key,
+            target,
         }))
     }
 
@@ -962,6 +951,16 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             AuthEvent::Canceled { operation_key } | AuthEvent::CancelFailed { operation_key, .. },
         ) => operation_is_current(state.auth.cancel.key.as_ref(), operation_key),
         ClientEvent::Auth(
+            AuthEvent::Refreshed { operation_key, .. }
+            | AuthEvent::RefreshFailed { operation_key, .. },
+        ) => matches!(
+            state.operations.get(operation_key),
+            Some(crate::ClientOperationState::AuthRefresh {
+                status: crate::OperationStatus::Loading,
+                ..
+            })
+        ),
+        ClientEvent::Auth(
             AuthEvent::LoggedOut { operation_key, .. }
             | AuthEvent::LogoutFailed { operation_key, .. },
         ) => operation_is_current(state.auth.logout.key.as_ref(), operation_key),
@@ -1079,6 +1078,7 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
             | AuthEvent::BeginFailed { error, .. }
             | AuthEvent::CompleteFailed { error, .. }
             | AuthEvent::CancelFailed { error, .. }
+            | AuthEvent::RefreshFailed { error, .. }
             | AuthEvent::LogoutFailed { error, .. },
         )
         | ClientEvent::Catalog(
@@ -1215,20 +1215,11 @@ mod tests {
     #[test]
     fn waltr_access_login_transitions_are_independent_from_provider_auth() {
         let mut client = Client::new();
-        let target = AuthTarget {
-            target: Some(
-                waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
-                    "anthropic".to_owned(),
-                ),
-            ),
-        };
 
         assert_eq!(client.state().access.status, AccessStatus::UnknownChecking);
-        client.require_auth(target.clone(), "provider credentials required", None);
         client.start_waltr_login();
         let failed_attempt = client.state().access.active_attempt_id.clone().unwrap();
         assert_eq!(client.state().access.status, AccessStatus::LoginInProgress);
-        assert_eq!(client.state().auth.pending.len(), 1);
 
         client.fail_waltr_login(failed_attempt, "identity provider unavailable");
         assert_eq!(client.state().access.status, AccessStatus::LoginFailed);
@@ -1236,13 +1227,11 @@ mod tests {
             client.state().access.error.as_deref(),
             Some("identity provider unavailable")
         );
-        assert_eq!(client.state().auth.pending[0].target, target);
 
         client.start_waltr_login();
         let canceled_attempt = client.state().access.active_attempt_id.clone().unwrap();
         client.cancel_waltr_login(canceled_attempt);
         assert_eq!(client.state().access.status, AccessStatus::LoginRequired);
-        assert_eq!(client.state().auth.pending.len(), 1);
 
         client.start_waltr_login();
         let completed_attempt = client.state().access.active_attempt_id.clone().unwrap();
@@ -1253,7 +1242,6 @@ mod tests {
             status: SystemStatus { ready: true },
         }));
         assert_eq!(client.state().access.status, AccessStatus::Authenticated);
-        assert_eq!(client.state().auth.pending.len(), 1);
     }
 
     #[test]
@@ -1396,16 +1384,8 @@ mod tests {
     }
 
     #[test]
-    fn waltr_logout_clears_protected_data_provider_statuses_and_requirements() {
+    fn waltr_logout_clears_protected_data_and_provider_statuses() {
         let mut client = Client::new();
-        let target = AuthTarget {
-            target: Some(
-                waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
-                    "anthropic".to_owned(),
-                ),
-            ),
-        };
-        client.require_auth(target, "provider credentials required", None);
         client.apply(ClientEvent::Config(ConfigEvent::Loaded(
             config_with_provider("anthropic", "etag-1"),
         )));
@@ -1430,7 +1410,6 @@ mod tests {
         assert!(client.state().operations.is_empty());
         assert!(client.state().streams.items.is_empty());
         assert!(client.state().auth.statuses.is_empty());
-        assert!(client.state().auth.pending.is_empty());
     }
 
     #[test]
@@ -1569,14 +1548,8 @@ mod tests {
     }
 
     #[test]
-    fn expiry_preserves_requirements_and_interests_but_logout_removes_them() {
+    fn expiry_preserves_watch_interests_but_logout_removes_them() {
         let mut client = Client::new();
-        let target = AuthTarget {
-            target: Some(
-                waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey("github".to_owned()),
-            ),
-        };
-        client.require_auth(target, "authorize github", Some("session-1".to_owned()));
         drop(client.register_session_watch_interest());
         drop(client.register_session_timeline_watch_interest(
             "session-1",
@@ -1588,16 +1561,10 @@ mod tests {
         client.apply(ClientEvent::Status(StatusEvent::WatchFailed(
             ClientError::waltr_login_required("expired"),
         )));
-        assert_eq!(client.state().auth.pending.len(), 1);
-        assert_eq!(
-            client.state().auth.pending[0].source_session_id.as_deref(),
-            Some("session-1")
-        );
         assert_eq!(client.state().sessions.watch.interests, 1);
         assert_eq!(client.state().timeline_watch_keys().len(), 1);
 
         client.logout_waltr();
-        assert!(client.state().auth.pending.is_empty());
         assert_eq!(client.state().sessions.watch.interests, 0);
         assert!(client.state().timeline_watch_keys().is_empty());
     }
@@ -1605,18 +1572,6 @@ mod tests {
     #[test]
     fn proactive_access_expiry_uses_transient_preservation_policy() {
         let mut client = Client::new();
-        let target = AuthTarget {
-            target: Some(
-                waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
-                    "anthropic".to_owned(),
-                ),
-            ),
-        };
-        client.require_auth(
-            target,
-            "provider login required",
-            Some("session-1".to_owned()),
-        );
         drop(client.register_config_watch_interest());
         drop(client.register_session_watch_interest());
         client.create_session();
@@ -1632,7 +1587,6 @@ mod tests {
         assert!(client.state().access.active_attempt_id.is_none());
         assert_eq!(client.state().config.watch.interests, 1);
         assert_eq!(client.state().sessions.watch.interests, 1);
-        assert_eq!(client.state().auth.pending.len(), 1);
         assert!(matches!(
             client.state().operations.get(&operation_key),
             Some(crate::ClientOperationState::SessionCreate {

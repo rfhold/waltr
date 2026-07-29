@@ -64,6 +64,10 @@ impl OutboundHttpPolicy {
         Ok((url, client))
     }
 
+    pub(super) const fn allows_loopback_http(self) -> bool {
+        self.allow_loopback_http
+    }
+
     pub(super) async fn validate_destination(self, value: &str) -> Result<Url, Status> {
         self.client_for(value).await.map(|(url, _)| url)
     }

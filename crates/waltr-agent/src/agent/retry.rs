@@ -104,7 +104,8 @@ fn is_retryable(error: &LlmError) -> bool {
         | LlmError::Io(_)
         | LlmError::Protocol { .. }
         | LlmError::Authorization { .. }
-        | LlmError::McpAuthorization { .. } => false,
+        | LlmError::McpAuthorization { .. }
+        | LlmError::AuthenticationFailure { .. } => false,
     }
 }
 

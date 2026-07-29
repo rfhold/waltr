@@ -24,7 +24,8 @@ pub struct McpAuthorizationContext {
 }
 
 /// Machine-readable outbound authentication failure reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthenticationFailureReason {
     /// A usable credential is absent or expired.
     CredentialRequired,
@@ -38,6 +39,18 @@ pub enum AuthenticationFailureReason {
     ResponseInvalid,
     /// Required OAuth registration or endpoint configuration is absent.
     ConfigurationRequired,
+}
+
+/// Durable, target-scoped outbound authentication failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticationFailure {
+    /// Configured provider or MCP server that failed authentication.
+    pub target: AuthTarget,
+    /// Machine-readable reason for the failure.
+    pub reason: AuthenticationFailureReason,
+    /// Sanitized MCP challenge context, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_authorization: Option<Box<McpAuthorizationContext>>,
 }
 
 /// Runtime/config target that can require authentication.

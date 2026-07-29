@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use waltr::grpc::waltr::{
-    auth::v1::{BeginProviderAuthResponse, ProviderAuthMethod},
+    auth::v1::{AuthMethod, BeginAuthResponse},
     config::v1::{
         OAuthProvider, OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, Provider,
     },
 };
 use waltr_agent::{
     McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod, McpOAuthState,
-    McpOAuthToken,
+    McpOAuthToken, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionOAuthTokenRequestStyle,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -146,15 +147,6 @@ impl OAuthAttempt {
     pub const fn definition(&self) -> &OAuthProvider {
         &self.definition
     }
-
-    /// Return the owning provider key when this is a provider attempt.
-    #[must_use]
-    pub fn provider_key(&self) -> Option<&str> {
-        match &self.target {
-            AuthTarget::Provider { key } => Some(key),
-            AuthTarget::McpServer { .. } => None,
-        }
-    }
 }
 
 /// Return the active OAuth definition for a provider.
@@ -193,13 +185,60 @@ pub const fn definition_is_empty(definition: &OAuthProvider) -> bool {
         && !definition.send_state_in_token_request
 }
 
+/// Convert configured provider OAuth into the agent refresh settings.
+#[must_use]
+pub fn provider_refresh_settings(definition: &OAuthProvider) -> SessionOAuthProviderSettings {
+    let token_request_style = match OauthTokenRequestStyle::try_from(definition.token_request_style)
+        .unwrap_or(OauthTokenRequestStyle::Unspecified)
+    {
+        OauthTokenRequestStyle::FormUrlencoded => SessionOAuthTokenRequestStyle::FormUrlencoded,
+        OauthTokenRequestStyle::Json | OauthTokenRequestStyle::Unspecified => {
+            SessionOAuthTokenRequestStyle::Json
+        }
+    };
+    SessionOAuthProviderSettings {
+        token_url: definition.token_url.clone(),
+        client_id: definition.client_id.clone(),
+        redirect_uri: definition.redirect_uri.clone(),
+        token_request_style,
+        token_fields: Vec::new(),
+        jwt_metadata: definition
+            .jwt_metadata
+            .iter()
+            .filter_map(|metadata| {
+                let token = match OauthTokenField::try_from(metadata.token).ok()? {
+                    OauthTokenField::Access => SessionOAuthJwtToken::Access,
+                    OauthTokenField::Id => SessionOAuthJwtToken::Id,
+                    OauthTokenField::Unspecified => return None,
+                };
+                Some(SessionOAuthJwtMetadata {
+                    token,
+                    metadata_key: metadata.metadata_key.clone(),
+                    claim_names: metadata.claim_names.clone(),
+                    required: metadata.required,
+                })
+            })
+            .collect(),
+    }
+}
+
 /// Build a manual OAuth authorization attempt from a provider definition.
+#[cfg(test)]
 pub fn begin_manual(
     target: AuthTarget,
     definition: OAuthProvider,
     now_ms: i64,
-) -> Result<(OAuthAttempt, BeginProviderAuthResponse), Status> {
-    validate_definition(&definition)?;
+) -> Result<(OAuthAttempt, BeginAuthResponse), Status> {
+    begin_manual_with_policy(target, definition, now_ms, OutboundHttpPolicy::production())
+}
+
+pub(super) fn begin_manual_with_policy(
+    target: AuthTarget,
+    definition: OAuthProvider,
+    now_ms: i64,
+    policy: OutboundHttpPolicy,
+) -> Result<(OAuthAttempt, BeginAuthResponse), Status> {
+    validate_definition(&definition, policy.allows_loopback_http())?;
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);
     let state = Uuid::new_v4().to_string();
@@ -212,15 +251,15 @@ pub fn begin_manual(
         state,
         expires_at_ms,
     };
-    let response = BeginProviderAuthResponse {
-        method: ProviderAuthMethod::OauthManual as i32,
+    let response = BeginAuthResponse {
+        method: AuthMethod::OauthManual as i32,
         auth_url,
         expires_at_ms,
         messages: vec![
             "Open the URL, approve access, then paste the final redirect URL including state."
                 .to_owned(),
         ],
-        ..BeginProviderAuthResponse::default()
+        ..BeginAuthResponse::default()
     };
     Ok((attempt, response))
 }
@@ -238,7 +277,7 @@ pub fn begin_mcp(
     resource: String,
     response_issuer_required: bool,
     now_ms: i64,
-) -> Result<(McpOAuthAttempt, BeginProviderAuthResponse), Status> {
+) -> Result<(McpOAuthAttempt, BeginAuthResponse), Status> {
     for (name, value) in [
         ("authorization endpoint", authorize_url),
         ("token endpoint", token_url.as_str()),
@@ -266,15 +305,15 @@ pub fn begin_mcp(
         ("state".to_owned(), state.clone()),
         ("resource".to_owned(), resource.clone()),
     ];
-    let response = BeginProviderAuthResponse {
-        method: ProviderAuthMethod::OauthManual as i32,
+    let response = BeginAuthResponse {
+        method: AuthMethod::OauthManual as i32,
         auth_url: query_url(authorize_url, &params),
         expires_at_ms,
         messages: vec![
             "Open the URL, approve access, then paste the final redirect URL including state."
                 .to_owned(),
         ],
-        ..BeginProviderAuthResponse::default()
+        ..BeginAuthResponse::default()
     };
     Ok((
         McpOAuthAttempt {
@@ -397,6 +436,7 @@ fn mcp_state_from_token(
 }
 
 /// Exchange a manual OAuth callback input for a stored credential.
+#[cfg(test)]
 pub async fn complete_manual(
     attempt: &OAuthAttempt,
     input: &str,
@@ -405,7 +445,7 @@ pub async fn complete_manual(
     complete_manual_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production()).await
 }
 
-async fn complete_manual_with_policy(
+pub(super) async fn complete_manual_with_policy(
     attempt: &OAuthAttempt,
     input: &str,
     now_ms: i64,
@@ -719,7 +759,10 @@ fn claim_path_string<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a
     current.as_str()
 }
 
-fn validate_definition(definition: &OAuthProvider) -> Result<(), Status> {
+fn validate_definition(
+    definition: &OAuthProvider,
+    allow_loopback_http: bool,
+) -> Result<(), Status> {
     if definition.authorize_url.trim().is_empty()
         || definition.token_url.trim().is_empty()
         || definition.client_id.trim().is_empty()
@@ -730,15 +773,21 @@ fn validate_definition(definition: &OAuthProvider) -> Result<(), Status> {
         ));
     }
     request_style(definition)?;
-    validate_front_channel_url(&definition.authorize_url)?;
-    validate_front_channel_url(&definition.token_url)?;
+    validate_front_channel_url(&definition.authorize_url, allow_loopback_http)?;
+    validate_front_channel_url(&definition.token_url, allow_loopback_http)?;
     Ok(())
 }
 
-fn validate_front_channel_url(value: &str) -> Result<(), Status> {
+fn validate_front_channel_url(value: &str, allow_loopback_http: bool) -> Result<(), Status> {
     let url = url::Url::parse(value)
         .map_err(|_| Status::failed_precondition("OAuth endpoint URL is invalid"))?;
-    if url.scheme() != "https"
+    let loopback_http = allow_loopback_http
+        && url.scheme() == "http"
+        && url
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+    if (url.scheme() != "https" && !loopback_http)
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -896,6 +945,16 @@ mod tests {
             extract_metadata(&openai_codex_oauth_settings(), &token).expect("metadata extracts");
 
         assert_eq!(metadata.get("account_id"), Some(&"account-123".to_owned()));
+    }
+
+    #[test]
+    fn provider_refresh_settings_include_configured_jwt_metadata() {
+        let settings = provider_refresh_settings(&openai_codex_oauth_settings());
+
+        assert_eq!(settings.jwt_metadata.len(), 1);
+        assert_eq!(settings.jwt_metadata[0].token, SessionOAuthJwtToken::Id);
+        assert_eq!(settings.jwt_metadata[0].metadata_key, "account_id");
+        assert!(settings.jwt_metadata[0].required);
     }
 
     #[test]

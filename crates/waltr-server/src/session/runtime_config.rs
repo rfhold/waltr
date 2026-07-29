@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::auth::oauth;
 use waltr::grpc::waltr::{
-    config::v1::{Configuration, McpServerType, OauthTokenRequestStyle, ProviderType},
+    config::v1::{Configuration, McpServerType, ProviderType},
     session::v1::{
         RuntimeConfigMatch, SessionMcpServerRuntime, SessionProviderRuntime,
         SessionRuntimeConfig as ProtoSessionRuntimeConfig,
@@ -11,8 +11,7 @@ use waltr::grpc::waltr::{
 };
 use waltr_agent::{
     ModelApi, ModelCost, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
-    SessionOAuthProviderSettings, SessionOAuthTokenRequestStyle, SessionProviderRuntimeSettings,
-    SessionRuntimeSettings,
+    SessionProviderRuntimeSettings, SessionRuntimeSettings,
 };
 use tonic::Status;
 
@@ -85,7 +84,7 @@ pub(super) fn resolve_runtime_config(
 
     let provider_api = provider_api(provider.r#type)?;
     let oauth = oauth::provider_definition(&request.provider_key, provider)
-        .map(|definition| oauth_settings(definition.definition));
+        .map(|definition| oauth::provider_refresh_settings(&definition.definition));
 
     let mut mcp_servers = Vec::with_capacity(request.enabled_mcp_server_keys.len());
     for key in request.enabled_mcp_server_keys {
@@ -246,27 +245,6 @@ const fn mcp_server_type(kind: SessionMcpServerRuntimeKind) -> McpServerType {
     match kind {
         SessionMcpServerRuntimeKind::Stdio => McpServerType::Stdio,
         SessionMcpServerRuntimeKind::StreamableHttp => McpServerType::Sse,
-    }
-}
-
-fn oauth_settings(
-    definition: waltr::grpc::waltr::config::v1::OAuthProvider,
-) -> SessionOAuthProviderSettings {
-    let token_request_style = match OauthTokenRequestStyle::try_from(definition.token_request_style)
-        .unwrap_or(OauthTokenRequestStyle::Unspecified)
-    {
-        OauthTokenRequestStyle::FormUrlencoded => SessionOAuthTokenRequestStyle::FormUrlencoded,
-        OauthTokenRequestStyle::Json | OauthTokenRequestStyle::Unspecified => {
-            SessionOAuthTokenRequestStyle::Json
-        }
-    };
-
-    SessionOAuthProviderSettings {
-        token_url: definition.token_url,
-        client_id: definition.client_id,
-        redirect_uri: definition.redirect_uri,
-        token_request_style,
-        token_fields: Vec::new(),
     }
 }
 

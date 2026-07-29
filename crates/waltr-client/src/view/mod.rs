@@ -30,17 +30,18 @@ mod tests {
     use ts_rs::TS as _;
 
     use crate::{
-        AccessSnapshot, AccessStatus, AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot,
-        CatalogMatchConfidenceView, CatalogMatchSource, CatalogMatchSuggestionSnapshot,
-        CatalogMatchView, CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView,
-        CatalogModelLimitsSummaryView, CatalogModelReasoningSummaryView, CatalogModelRefView,
-        CatalogModelSearchSnapshot, CatalogModelSummaryView, CatalogSnapshot, ClientAuthTarget,
-        ClientCommand, ClientOperationView, ClientSessionTemplateKind,
-        ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection, ConfigSnapshot,
-        Configuration, McpAuthorizationRequirementSnapshot, Model, ModelCapabilities,
-        ModelCatalogMatch, ModelLimits, ModelOptions, ModelType, OperationCollectionSnapshot,
-        OperationSnapshot, Provider, ProviderType, RollbackTargetView, SessionSnapshot,
-        SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
+        AccessSnapshot, AccessStatus, AuthAttemptSnapshot, AuthSnapshot, AuthStatusSnapshot,
+        AuthenticationFailureSnapshot, CatalogMatchConfidenceView, CatalogMatchSource,
+        CatalogMatchSuggestionSnapshot, CatalogMatchView, CatalogModelCapabilitySummaryView,
+        CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
+        CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSearchSnapshot,
+        CatalogModelSummaryView, CatalogSnapshot, ClientAuthTarget, ClientCommand,
+        ClientOperationView, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget,
+        ClientSnapshot, ClientTimelineDirection, ConfigSnapshot, Configuration,
+        McpAuthorizationContextSnapshot, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits,
+        ModelOptions, ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider,
+        ProviderType, RollbackTargetView, SessionSnapshot, SessionTemplateOptionView,
+        SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -144,6 +145,46 @@ mod tests {
     }
 
     #[test]
+    fn failed_session_view_retains_structured_authentication_failure() {
+        use waltr::grpc::waltr::auth::v1::{
+            AuthTarget, AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason,
+            McpAuthorizationContext, auth_target,
+        };
+
+        let view = SessionStatusView::from(crate::SessionStatus {
+            phase: crate::SessionPhase::Failed as i32,
+            failed_message: "safe watched failure".to_owned(),
+            authentication_failure: Some(AuthenticationFailure {
+                version: 1,
+                domain: AuthenticationDomain::OutboundMcp as i32,
+                reason: AuthenticationFailureReason::ResponseInvalid as i32,
+                target: Some(AuthTarget {
+                    target: Some(auth_target::Target::McpServerKey("github".to_owned())),
+                }),
+                mcp_authorization: Some(McpAuthorizationContext {
+                    endpoint: "https://mcp.example/rpc".to_owned(),
+                    http_status: 401,
+                    resource_metadata_url: Some("javascript:unsafe".to_owned()),
+                    scope: Some("repo:read".to_owned()),
+                    ..McpAuthorizationContext::default()
+                }),
+            }),
+            ..crate::SessionStatus::default()
+        });
+
+        assert_eq!(view.failed_message, "safe watched failure");
+        let failure = view.authentication_failure.expect("authentication failure");
+        assert_eq!(failure.version, 1);
+        assert_eq!(failure.domain, "outboundMcp");
+        assert_eq!(failure.reason, "responseInvalid");
+        assert_eq!(failure.target.key, "github");
+        let context = failure.mcp_context.expect("MCP context");
+        assert_eq!(context.endpoint.as_deref(), Some("https://mcp.example/rpc"));
+        assert_eq!(context.scope.as_deref(), Some("repo:read"));
+        assert!(context.resource_metadata_url.is_none());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn exports_web_typescript_bindings() {
         let bindings = [
@@ -198,9 +239,10 @@ mod tests {
             AccessStatus::decl(),
             AccessSnapshot::decl(),
             ClientAuthTarget::decl(),
+            AuthStatusSnapshot::decl(),
             AuthAttemptSnapshot::decl(),
-            McpAuthorizationRequirementSnapshot::decl(),
-            AuthRequirementSnapshot::decl(),
+            McpAuthorizationContextSnapshot::decl(),
+            AuthenticationFailureSnapshot::decl(),
             AuthSnapshot::decl(),
             ClientOperationView::decl(),
             OperationCollectionSnapshot::decl(),

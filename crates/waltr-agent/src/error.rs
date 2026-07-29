@@ -2,6 +2,8 @@
 
 use std::{error::Error, fmt, io};
 
+use crate::AuthenticationFailure;
+
 /// Result type used by LLM streaming providers.
 pub type Result<T> = std::result::Result<T, LlmError>;
 
@@ -63,6 +65,13 @@ pub enum LlmError {
         /// Authentication failure message.
         message: String,
     },
+    /// A configured provider returned a target-scoped authentication failure.
+    AuthenticationFailure {
+        /// Structured failure safe to persist and return to clients.
+        failure: AuthenticationFailure,
+        /// Sanitized human-readable failure message.
+        message: String,
+    },
 }
 
 impl fmt::Display for LlmError {
@@ -90,6 +99,7 @@ impl fmt::Display for LlmError {
             Self::McpAuthorization { message, .. } => {
                 write!(formatter, "mcp authorization required: {message}")
             }
+            Self::AuthenticationFailure { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -106,7 +116,8 @@ impl Error for LlmError {
             | Self::Api { .. }
             | Self::Protocol { .. }
             | Self::Authorization { .. }
-            | Self::McpAuthorization { .. } => None,
+            | Self::McpAuthorization { .. }
+            | Self::AuthenticationFailure { .. } => None,
         }
     }
 }
@@ -122,6 +133,15 @@ impl LlmError {
             headers: Vec::new(),
             code: None,
             body: None,
+        }
+    }
+
+    /// Return structured authentication data carried by this error.
+    #[must_use]
+    pub const fn authentication_failure(&self) -> Option<&AuthenticationFailure> {
+        match self {
+            Self::AuthenticationFailure { failure, .. } => Some(failure),
+            _ => None,
         }
     }
 }
