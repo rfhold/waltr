@@ -1,6 +1,10 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+
+vi.mock("../../src/wasm/client", () => ({
+  loadWasmClient: vi.fn(),
+}));
 
 import { useAppState, type AppState } from "../../src/app/context";
 import { AppStateProvider } from "../../src/app/state";
