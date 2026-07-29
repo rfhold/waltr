@@ -49,6 +49,8 @@ The config RPC model is `waltr.config.v1.Configuration`:
 
 The filesystem store persists `.waltr/waltr.toml`. ETags are not persisted as authoritative data. On load or save, the store clears `etag`, serializes the config, hashes the serialized content with SHA-256, and returns an `etag` prefixed with `sha256:`.
 
+Provider entries may contain public-client OAuth compatibility and settings, including authorization/token endpoints, client ID, redirect URI, scopes, request encoding, authorization parameters, and JWT metadata mappings. Credential values are not configuration and never enter config snapshots. Remote MCP entries contain transport command or URL only; OAuth discovery, registration, credential status, refresh, and reset remain in the target-scoped auth lifecycle rather than `PatchConfig`.
+
 ## Partial Updates
 
 `PatchConfig` accepts a sparse top-level patch:
@@ -210,6 +212,7 @@ Client implementations should react to config coordination through `waltr-client
 - On watch updates, render from the updated `state.config.current`; do not maintain a second server config cache in web or TUI code.
 - On watch error or `Waiting` status, preserve local UI state while the shared reducer reconnects or waits for system readiness.
 - Register watch interest for screens that need live config data and release it when they no longer do.
+- Use target-scoped auth commands, status snapshots, and keyed auth operation results for provider/MCP credential actions; do not encode authorize, refresh, or reset as config patches.
 
 ## References
 
