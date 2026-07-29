@@ -44,12 +44,23 @@ fn main() {
         repo_root.join("pnpm-lock.yaml").display()
     );
 
-    let status = std::process::Command::new("pnpm")
+    let mut command = std::process::Command::new("pnpm");
+    command
         .arg("--filter")
         .arg("@rfhold/waltr-web")
         .arg("build")
         .current_dir(repo_root)
-        .env("CARGO_TARGET_DIR", repo_root.join("target/web-bundle"))
+        .env("CARGO_TARGET_DIR", repo_root.join("target/web-bundle"));
+    // The nested WASM build cannot reuse the parent Cargo jobserver or Clippy driver.
+    for key in [
+        "CARGO_MAKEFLAGS",
+        "CLIPPY_ARGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        command.env_remove(key);
+    }
+    let status = command
         .status()
         .expect("pnpm should be available to build bundled web assets");
 
@@ -62,7 +73,7 @@ fn main() {
     assets.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut source = String::new();
-    source.push_str("pub(crate) static WEB_ASSETS: &[WebAsset] = &[\n");
+    source.push_str("static WEB_ASSETS: &[WebAsset] = &[\n");
     for (path, file) in assets {
         let include_path = file.to_string_lossy();
         writeln!(

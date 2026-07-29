@@ -100,7 +100,7 @@ async fn web_navigation_redirects_with_encoded_local_return_path()
 async fn browser_login_survives_reconstruction_and_logout_revokes_it()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup_access_auth_browser_fixture();
-    let first_server = fixture.start_server(std::time::Duration::from_secs(3600));
+    let first_server = fixture.start_server(std::time::Duration::from_hours(1));
     let client = no_redirect_client()?;
 
     let protected = client
@@ -117,7 +117,7 @@ async fn browser_login_survives_reconstruction_and_logout_revokes_it()
     assert_authenticated(&client, &first_server, &session_cookie).await?;
     first_server.stop();
 
-    let second_server = fixture.start_server(std::time::Duration::from_secs(3600));
+    let second_server = fixture.start_server(std::time::Duration::from_hours(1));
     assert_authenticated(&client, &second_server, &session_cookie).await?;
     let rejected_logout = client
         .post(second_server.url("/oidc/logout"))
@@ -252,7 +252,7 @@ async fn callback_cleanup_failure_preserves_redirect_cookie_and_authenticated_se
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup_access_auth_browser_fixture();
     let server =
-        fixture.start_server_with_callback_cleanup_failure(std::time::Duration::from_secs(3600));
+        fixture.start_server_with_callback_cleanup_failure(std::time::Duration::from_hours(1));
     let client = no_redirect_client()?;
 
     let session_cookie = complete_browser_login(&client, &server, false).await?;
