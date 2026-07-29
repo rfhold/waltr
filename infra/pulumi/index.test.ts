@@ -282,6 +282,24 @@ describe("hosted MCP OAuth deployment", () => {
     );
   });
 
+  test("exports telemetry with the Pulumi stack as the deployment environment", () => {
+    const values = environment();
+    assert.equal(values.WALTR_OTEL_EXPORT, "true");
+    assert.equal(
+      values.OTEL_EXPORTER_OTLP_ENDPOINT,
+      "https://telemetry.holdenitdown.net:4318",
+    );
+    assert.equal(values.OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf");
+    assert.equal(
+      values.OTEL_RESOURCE_ATTRIBUTES,
+      "deployment.environment.name=test",
+    );
+    assert.equal(
+      values.WALTR_PYROSCOPE_URL,
+      "https://telemetry.holdenitdown.net:4040",
+    );
+  });
+
   test("does not project wrapping material into non-Secret resources", () => {
     for (const candidate of resources.filter(
       (resource) =>
@@ -355,10 +373,13 @@ describe("hosted MCP OAuth deployment", () => {
         },
       },
     ]);
-    assert.ok(
-      egress.some((rule: any) =>
-        rule.ports?.some((port: any) => port.port === 443),
-      ),
+    assert.deepEqual(
+      egress.find((rule: any) => rule.to === undefined).ports,
+      [
+        { port: 443, protocol: "TCP" },
+        { port: 4040, protocol: "TCP" },
+        { port: 4318, protocol: "TCP" },
+      ],
     );
     assert.ok(
       egress.some((rule: any) =>

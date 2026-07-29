@@ -70,6 +70,7 @@ const labels = {
   "app.kubernetes.io/managed-by": "pulumi",
 };
 const workloadLabels = { ...labels, "app.kubernetes.io/component": "server" };
+const deploymentEnvironment = pulumi.getStack();
 const publicUrl = `https://${hostname}`;
 const mcpIssuer = `${publicUrl}/oauth`;
 const mcpResource = `${publicUrl}/mcp`;
@@ -361,6 +362,11 @@ const appSecret = new k8s.core.v1.Secret(
       WALTR_MCP_OAUTH_CODE_TTL: mcpOAuthCodeTtl,
       WALTR_MCP_OAUTH_ALLOW_DCR: String(mcpOAuthAllowDcr),
       WALTR_MCP_OAUTH_ALLOW_CIMD: String(mcpOAuthAllowCimd),
+      WALTR_OTEL_EXPORT: "true",
+      OTEL_EXPORTER_OTLP_ENDPOINT: "https://telemetry.holdenitdown.net:4318",
+      OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
+      OTEL_RESOURCE_ATTRIBUTES: `deployment.environment.name=${deploymentEnvironment}`,
+      WALTR_PYROSCOPE_URL: "https://telemetry.holdenitdown.net:4040",
       WALTR_SESSION_STORE: "s3",
       WALTR_SESSION_S3_ENDPOINT: s3Endpoint,
       WALTR_SESSION_S3_REGION: "us-east-1",
@@ -513,7 +519,13 @@ new k8s.networking.v1.NetworkPolicy("waltr-egress", {
           { port: 53, protocol: "TCP" },
         ],
       },
-      { ports: [{ port: 443, protocol: "TCP" }] },
+      {
+        ports: [
+          { port: 443, protocol: "TCP" },
+          { port: 4040, protocol: "TCP" },
+          { port: 4318, protocol: "TCP" },
+        ],
+      },
       {
         to: [
           {
