@@ -10,7 +10,6 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build-base
 
 ARG PNPM_VERSION=11.5.0
 ARG WASM_BINDGEN_VERSION=0.2.122
-ARG REVISION
 ARG TARGETARCH
 
 ENV PNPM_HOME=/pnpm
@@ -33,9 +32,12 @@ COPY crates/waltr-web/package.json crates/waltr-web/package.json
 RUN --mount=type=cache,id=waltr-${TARGETARCH}-pnpm-store,target=/pnpm/store \
     pnpm install --frozen-lockfile --store-dir /pnpm/store --config.dangerouslyAllowAllBuilds=true
 
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
 
 FROM build-base AS server-build
+
+ARG REVISION
 
 RUN --mount=type=cache,id=waltr-${TARGETARCH}-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=waltr-${TARGETARCH}-cargo-git,target=/usr/local/cargo/git \

@@ -20,6 +20,8 @@ Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migration
 
 The repository `Dockerfile` produces the supported production `runtime` image as well as test-only stages. The runtime contains the release server with embedded web assets, runs as nonroot UID/GID `65532`, listens on `0.0.0.0:14333`, and uses `/data` as its home, working directory, and default writable persistence root. Mount writable storage at `/data` for filesystem-backed settings, or configure external PostgreSQL and S3 services.
 
+The build installs pnpm dependencies from workspace manifests before copying Rust and web sources. It then copies only the Cargo workspace files and `crates/` into the shared builder, so documentation, infrastructure, and repository tooling changes do not invalidate application compilation. BuildKit cache mounts retain the pnpm store and Cargo registry, Git, and target data under architecture-specific IDs. Those mutable caches are local to the selected BuildKit worker; the repository pipelines do not import or export a registry-backed build cache. Persistent cluster workers and daemon-configured package or registry mirrors can accelerate builds transparently, but their availability and retention are infrastructure concerns rather than repository guarantees.
+
 `compose.yml` remains fixed local development and integration-test infrastructure. It intentionally exposes only static `dev`, `test`, and `test-auth` profiles; bare `docker compose up` starts nothing.
 
 `docker compose --profile dev up` builds the embedded server and web assets for local use. The `waltr` service uses:

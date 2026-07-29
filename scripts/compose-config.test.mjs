@@ -367,18 +367,48 @@ test("production and test services use isolated runtime targets", () => {
 });
 
 test("runtime and build context contain required hardening", () => {
+  const buildBase = dockerStage("build-base");
+  const serverBuild = dockerStage("server-build");
+  const testBuild = dockerStage("test-build");
   assert.match(dockerStage("runtime-base"), /apt-get install -y --no-install-recommends ca-certificates/);
   assert.match(dockerStage("test-runtime"), /apt-get install -y --no-install-recommends bash coreutils curl findutils procps/);
   assert.match(dockerfile, /ENV PNPM_HOME=\/pnpm/);
   assert.equal((dockerfile.match(/pnpm install --frozen-lockfile/g) ?? []).length, 1);
   assert.equal((dockerfile.match(/pnpm --filter @rfhold\/waltr-web build/g) ?? []).length, 0);
+  assert.doesNotMatch(dockerfile, /^(?:COPY|ADD)\s+(?:\.|\.\/)\s+(?:\.|\.\/|\/workspace)\/?$/m);
+  const installIndex = dockerfile.indexOf("pnpm install --frozen-lockfile");
+  for (const instruction of [
+    "COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./",
+    "COPY crates/waltr-web/package.json crates/waltr-web/package.json",
+  ]) {
+    const copyIndex = dockerfile.indexOf(instruction);
+    assert.notEqual(copyIndex, -1, `${instruction} must exist`);
+    assert.ok(copyIndex < installIndex, `${instruction} must precede pnpm install`);
+  }
+  for (const instruction of [
+    "COPY Cargo.toml Cargo.lock rust-toolchain.toml ./",
+    "COPY crates crates",
+  ]) {
+    const copyIndex = dockerfile.indexOf(instruction);
+    assert.notEqual(copyIndex, -1, `${instruction} must exist`);
+    assert.ok(copyIndex > installIndex, `${instruction} must follow pnpm install`);
+  }
   assert.match(dockerfile, /cargo build -p waltr-server --features web/);
+  assert.doesNotMatch(buildBase, /^ARG REVISION$/m);
+  assert.match(serverBuild, /^ARG REVISION$/m);
+  assert.doesNotMatch(testBuild, /^ARG REVISION$/m);
   assert.match(dockerfile, /^ARG REVISION=unknown$/m);
   assert.match(dockerfile, /WALTR_BUILD_REVISION="\$\{REVISION\}" cargo build/);
   assert.match(dockerfile, /org\.opencontainers\.image\.source="https:\/\/git\.holdenitdown\.net\/rfhold\/waltr"/);
   assert.match(dockerfile, /org\.opencontainers\.image\.revision="\$\{REVISION\}"/);
+  for (const cache of ["cargo-registry", "cargo-git", "pnpm-store"]) {
+    assert.match(buildBase, new RegExp(`id=waltr-\\$\\{TARGETARCH\\}-${cache}`));
+  }
   for (const cache of ["cargo-registry", "cargo-git", "cargo-target", "pnpm-store"]) {
-    assert.match(dockerfile, new RegExp(`id=waltr-\\$\\{TARGETARCH\\}-${cache}`));
+    assert.match(serverBuild, new RegExp(`id=waltr-\\$\\{TARGETARCH\\}-${cache}`));
+  }
+  for (const cache of ["cargo-registry", "cargo-git", "cargo-target"]) {
+    assert.match(testBuild, new RegExp(`id=waltr-\\$\\{TARGETARCH\\}-${cache}`));
   }
   assert.doesNotMatch(dockerfile, /FROM --platform=/);
   const entries = new Set(dockerignore.split("\n").map(normalizeIgnoreEntry).filter(Boolean));
@@ -391,7 +421,13 @@ test("runtime and build context contain required hardening", () => {
     "*.key",
     "tests/web/k6/snapshots",
     ".dev",
+    ".agents",
+    ".tekton",
     ".worktrees",
+    "docs",
+    "infra",
+    "scripts",
+    "proto",
   ]) {
     assert.ok(entries.has(entry), `.dockerignore must contain ${entry}`);
   }

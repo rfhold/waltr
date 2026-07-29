@@ -1,6 +1,9 @@
 /.dev
+/.agents
+/.tekton
 **/.DS_Store
 **/*.key
+**/AGENTS.md
 **/*.sqlite3*
 **/node_modules
 /.env*
@@ -9,7 +12,15 @@
 /.waltr
 /.npmrc
 /.worktrees
+/docs
+/infra
+/scripts
 /target
 /crates/waltr-web/dist
 /crates/waltr-web/generated
 /tests/web/k6/snapshots
+/*.md
+/buf.gen.yaml
+/buf.yaml
+/opencode.jsonc
+/proto
