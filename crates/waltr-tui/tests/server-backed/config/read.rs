@@ -24,10 +24,16 @@ async fn opening_config_before_watch_data_renders_waiting_state() {
 
     let now = Instant::now();
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    let AppAction::ClientCommand(register) = app.handle_event(&char_press('c'), now) else {
+    let AppAction::ClientCommands(commands) = app.handle_event(&char_press('c'), now) else {
         panic!("config entry should register config watch interest");
     };
-    assert_eq!(register, ClientCommand::RegisterConfigWatchInterest);
+    assert_eq!(
+        commands,
+        vec![
+            ClientCommand::RegisterConfigWatchInterest,
+            ClientCommand::RequestAuthStatuses,
+        ]
+    );
     assert_eq!(app.screen(), AppScreen::Config);
 
     let rendered = render_app(&app);

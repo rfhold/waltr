@@ -44,19 +44,30 @@ pub async fn drive_app_to_landing(stream: &mut ClientStateStream, app: &mut App)
 pub async fn open_config_screen(stream: &mut ClientStateStream, app: &mut App) {
     let now = std::time::Instant::now();
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    let AppAction::ClientCommand(register) = app.handle_event(&char_press('c'), now) else {
+    let AppAction::ClientCommands(commands) = app.handle_event(&char_press('c'), now) else {
         panic!("config entry should register config watch interest");
     };
-    assert_eq!(register, ClientCommand::RegisterConfigWatchInterest);
-
-    let opened = dispatch_client_command(stream, register).await;
     assert_eq!(
-        app.handle_event(
-            &AppEvent::Client(Box::new(opened)),
-            std::time::Instant::now()
-        ),
-        AppAction::Continue
+        commands,
+        vec![
+            ClientCommand::RegisterConfigWatchInterest,
+            ClientCommand::RequestAuthStatuses,
+        ]
     );
+
+    for command in commands {
+        let wait_for_auth_statuses = command == ClientCommand::RequestAuthStatuses;
+        let opened = dispatch_client_command(stream, command).await;
+        apply_snapshot(stream, app, opened.clone()).await;
+        if wait_for_auth_statuses && opened.auth.list.status == "loading" {
+            drop(
+                next_snapshot_until(stream, app, |snapshot| {
+                    matches!(snapshot.auth.list.status, "ready" | "failed")
+                })
+                .await,
+            );
+        }
+    }
 }
 
 pub async fn open_sessions_screen(stream: &mut ClientStateStream, app: &mut App) {

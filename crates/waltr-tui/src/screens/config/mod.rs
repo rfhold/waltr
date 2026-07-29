@@ -5,10 +5,12 @@
 //! state; the provider section module ([`providers::ProviderSection`]) owns the
 //! provider list, selection, form, and delete interactions.
 
+mod auth;
 mod defaults;
 mod mcp;
 mod providers;
 
+pub use auth::{ConfigAuthState, targets_match};
 pub use defaults::RuntimeDefaultsSection;
 pub use mcp::{McpForm, McpFormMode, McpSection};
 pub use providers::{ModelForm, ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection};
@@ -102,20 +104,36 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let config = snapshot.and_then(|snapshot| snapshot.config.current.as_ref());
+    let statuses =
+        snapshot.map_or_else(Default::default, |snapshot| snapshot.auth.statuses.clone());
     let loaded = snapshot.is_some_and(|snapshot| snapshot.config.watch.status == "received");
 
     match active_tab {
         ConfigTab::Providers => {
             let section = app.provider_section();
             if !pending {
-                section.render_content(frame, content_area, config, loaded);
+                section.render_content(
+                    frame,
+                    content_area,
+                    config,
+                    loaded,
+                    &statuses,
+                    app.config_auth_state(),
+                );
             }
             section.render_overlay(frame, modal_area);
         }
         ConfigTab::Mcp => {
             let section = app.mcp_section();
             if !pending {
-                section.render_content(frame, content_area, config, loaded);
+                section.render_content(
+                    frame,
+                    content_area,
+                    config,
+                    loaded,
+                    &statuses,
+                    app.config_auth_state(),
+                );
             }
             section.render_overlay(frame, modal_area);
         }
@@ -132,7 +150,7 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
 const fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
     match active_tab {
         ConfigTab::Providers | ConfigTab::Mcp => {
-            "Esc back  Tab switch  C-x c create  Enter edit  Del delete"
+            "Esc back Tab switch C-x c create Enter edit Del delete a/f/r"
         }
         ConfigTab::Defaults => {
             "Esc back  Tab switch  m model  Space MCP  r reason  Enter save  Del clear"

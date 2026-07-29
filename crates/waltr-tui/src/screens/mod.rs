@@ -9,6 +9,7 @@ mod sessions;
 mod splash;
 
 pub use access::draw_access;
+pub(crate) use config::{ConfigAuthState, targets_match};
 pub use config::{
     ConfigTab, McpForm, McpFormMode, McpSection, ModelForm, ModelFormMode, ProviderForm,
     ProviderFormMode, ProviderSection, RuntimeDefaultsSection, draw_config,

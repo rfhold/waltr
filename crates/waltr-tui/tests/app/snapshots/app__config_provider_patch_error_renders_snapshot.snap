@@ -20,7 +20,7 @@ expression: render_app(&app)
 "               error: write failed                                              "
 "                                                                                "
 "                                                                                "
-"                Tab focus  Space/arrows toggle  C-x c model  Esc c              "
+"                Tab field Space toggle Del OAuth C-x c model Esc c              "
 "                                                                                "
 "                                                                                "
 "                                                                                "

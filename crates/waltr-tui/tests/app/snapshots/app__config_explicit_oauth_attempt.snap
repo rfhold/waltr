@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/config.rs
+expression: rendered
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        OAuth authorization                                                     "
+"                                                                                "
+"       Target: provider anthropic                                               "
+"       Authorization requested from configuration.                              "
+"                                                                                "
+"       Status: Pending · Completion: Manual                                     "
+"       Waiting for the final redirect URL or authorization code.                "
+"       URL: https://id.example/authorize                                        "
+"       Input:                                                                   "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"        type/paste URL or code · C copy URL · Enter complete · Esc cancel       "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

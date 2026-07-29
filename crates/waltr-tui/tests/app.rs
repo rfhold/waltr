@@ -3,12 +3,15 @@
 use std::time::{Duration, Instant};
 
 use waltr_client::{
-    CatalogMatchSourceView, ClientCommand, ClientOperationView, ClientSnapshot,
-    ClientTimelineDirection, ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationSnapshot,
-    ProviderKindView, ProviderView, RuntimeConfigMatchView, SessionMcpServerRuntimeView,
-    SessionPhaseView, SessionProviderRuntimeView, SessionRuntimeConfigView, SessionTimelineView,
-    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
+    AuthAttemptSnapshot, AuthenticationFailureSnapshot, CatalogMatchSourceView, ClientAuthTarget,
+    ClientCommand, ClientOperationView, ClientSnapshot, ClientTimelineDirection, ConfigView,
+    McpAuthorizationContextSnapshot, McpServerTypeView, McpServerView, ModelCapabilitiesView,
+    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OAuthJwtMetadataView,
+    OAuthProviderView, OAuthTokenFieldView, OAuthTokenRequestStyleView, OAuthUrlParamView,
+    OperationSnapshot, ProviderKindView, ProviderView, RollbackTargetView, RuntimeConfigMatchView,
+    SessionMcpServerRuntimeView, SessionPhaseView, SessionProviderRuntimeView,
+    SessionRuntimeConfigView, SessionTimelineView, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelineStatusView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},

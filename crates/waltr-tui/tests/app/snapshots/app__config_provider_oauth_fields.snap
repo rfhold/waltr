@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/config.rs
+expression: rendered
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"            Edit provider                                                       "
+"                                                                                "
+"           * name  anthropic                                                    "
+"             type  anthropic-messages                                           "
+"             url  https://api.anthropic.com/v1/messages                         "
+"             oauth  oauth                                                       "
+"             oauth name  Anthropic OAuth                                        "
+"             authorize URL  https://id.example/authorize                        "
+"             token URL  https://id.example/token                                "
+"             client ID  public-client                                           "
+"             redirect URI  http://127.0.0.1/callback                            "
+"             scopes  openid, profile                                            "
+"             request style  form-urlencoded                                     "
+"             send state  yes                                                    "
+"             auth params JSON  [{"key":"audience","value":"api"}]               "
+"             JWT mappings JSON  [{"token":"id","metadataKey":"tena...           "
+"                                                                                "
+"            Tab field Space toggle Del OAuth C-x c model Esc cancel             "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

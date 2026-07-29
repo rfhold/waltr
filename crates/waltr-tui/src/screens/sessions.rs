@@ -9,7 +9,7 @@ mod timeline;
 use std::collections::BTreeSet;
 
 use waltr_client::{
-    ClientCommand, ClientOperationView, ClientSessionTemplateKind,
+    AuthenticationFailureSnapshot, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
     ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection,
     RuntimeConfigMatchView, SessionPhaseView, SessionTemplateSearchSnapshot, SessionTimelineView,
     SessionView,
@@ -365,14 +365,15 @@ impl SessionsSection {
                     status,
                     error,
                     session_id,
+                    authentication_failure,
                 } => Some(match *status {
                     "ready" => OperationResult::Ready(session_id.clone()),
-                    "failed" => OperationResult::Failed(
-                        error
-                            .as_deref()
-                            .unwrap_or("session message submit failed")
-                            .to_owned(),
-                    ),
+                    "failed" => OperationResult::Failed(operation_failure_message(
+                        error.as_deref(),
+                        authentication_failure.as_ref(),
+                        "resend the message",
+                        "session message submit failed",
+                    )),
                     _ => OperationResult::Pending,
                 }),
                 _ => None,
@@ -390,15 +391,16 @@ impl SessionsSection {
                     status,
                     error,
                     request_id,
+                    authentication_failure,
                     ..
                 } => Some(match *status {
                     "ready" => OperationResult::Ready(request_id.clone()),
-                    "failed" => OperationResult::Failed(
-                        error
-                            .as_deref()
-                            .unwrap_or("external request response failed")
-                            .to_owned(),
-                    ),
+                    "failed" => OperationResult::Failed(operation_failure_message(
+                        error.as_deref(),
+                        authentication_failure.as_ref(),
+                        "respond again",
+                        "external request response failed",
+                    )),
                     _ => OperationResult::Pending,
                 }),
                 _ => None,
@@ -468,15 +470,16 @@ impl SessionsSection {
                     status,
                     error,
                     session_id,
+                    authentication_failure,
                     ..
                 } => Some(match *status {
                     "ready" => OperationResult::Ready(session_id.clone()),
-                    "failed" => OperationResult::Failed(
-                        error
-                            .as_deref()
-                            .unwrap_or("session continue failed")
-                            .to_owned(),
-                    ),
+                    "failed" => OperationResult::Failed(operation_failure_message(
+                        error.as_deref(),
+                        authentication_failure.as_ref(),
+                        "rerun the failed work",
+                        "session continue failed",
+                    )),
                     _ => OperationResult::Pending,
                 }),
                 _ => None,
@@ -1622,18 +1625,7 @@ fn is_pending(snapshot: Option<&ClientSnapshot>) -> bool {
 }
 
 fn status_height(snapshot: Option<&ClientSnapshot>, section: &SessionsSection) -> u16 {
-    u16::from(
-        session_error(snapshot).is_some()
-            || detail_error(snapshot, section).is_some()
-            || section.create.error().is_some()
-            || section.delete.error().is_some()
-            || section.runtime_update.error().is_some()
-            || section.submit.error().is_some()
-            || section.respond.error().is_some()
-            || section.interrupt.error().is_some()
-            || section.rollback.error().is_some()
-            || section.continue_session.error().is_some(),
-    )
+    u16::try_from(status_messages(snapshot, section).len()).unwrap_or(u16::MAX)
 }
 
 fn panel_style() -> Style {
@@ -2127,7 +2119,15 @@ fn status_widget(
     snapshot: Option<&ClientSnapshot>,
     section: &SessionsSection,
 ) -> Paragraph<'static> {
-    let error = section
+    let lines = status_messages(snapshot, section)
+        .into_iter()
+        .map(|message| ui::error_line(&message))
+        .collect::<Vec<_>>();
+    Paragraph::new(lines).style(THEME.panel_style())
+}
+
+fn status_messages(snapshot: Option<&ClientSnapshot>, section: &SessionsSection) -> Vec<String> {
+    let operation_error = section
         .create
         .error()
         .or_else(|| section.delete.error())
@@ -2139,9 +2139,101 @@ fn status_widget(
         .or_else(|| section.continue_session.error())
         .or_else(|| detail_error(snapshot, section))
         .or_else(|| session_error(snapshot));
+    if let Some(error) = operation_error {
+        return error.lines().map(str::to_owned).collect();
+    }
 
-    let lines = error.map_or_else(Vec::new, |error| vec![ui::error_line(error)]);
-    Paragraph::new(lines).style(THEME.panel_style())
+    current_detail_authentication_failure(snapshot, section).map_or_else(Vec::new, |failure| {
+        authentication_failure_messages(failure, "rerun the failed work")
+    })
+}
+
+fn current_detail_authentication_failure<'a>(
+    snapshot: Option<&'a ClientSnapshot>,
+    section: &SessionsSection,
+) -> Option<&'a AuthenticationFailureSnapshot> {
+    let session_id = section.detail_session_id()?;
+    snapshot?
+        .sessions
+        .current
+        .iter()
+        .find(|session| session.id == session_id)?
+        .status
+        .authentication_failure
+        .as_ref()
+}
+
+fn operation_failure_message(
+    error: Option<&str>,
+    failure: Option<&AuthenticationFailureSnapshot>,
+    retry_action: &str,
+    fallback: &str,
+) -> String {
+    failure.map_or_else(
+        || error.unwrap_or(fallback).to_owned(),
+        |failure| authentication_failure_messages(failure, retry_action).join("\n"),
+    )
+}
+
+fn authentication_failure_messages(
+    failure: &AuthenticationFailureSnapshot,
+    retry_action: &str,
+) -> Vec<String> {
+    let target = auth_failure_target_label(failure);
+    let mut messages = vec![format!(
+        "Authentication failed for {target}: {}.",
+        auth_failure_reason(failure.reason.as_str())
+    )];
+    if let Some(context) = &failure.mcp_context {
+        if let Some(endpoint) = &context.endpoint {
+            messages.push(format!("MCP endpoint: {endpoint}."));
+        }
+        if context.http_status != 0 {
+            messages.push(format!("MCP HTTP status: {}.", context.http_status));
+        }
+        if let Some(url) = &context.resource_metadata_url {
+            messages.push(format!("MCP resource metadata: {url}."));
+        }
+        if let Some(scope) = &context.scope {
+            messages.push(format!("MCP scope: {scope}."));
+        }
+        if let Some(error) = &context.error {
+            messages.push(format!("MCP bearer error: {error}."));
+        }
+        if let Some(description) = &context.error_description {
+            messages.push(format!("MCP error description: {description}."));
+        }
+        if let Some(url) = &context.error_uri {
+            messages.push(format!("MCP error details: {url}."));
+        }
+        if let Some(realm) = &context.realm {
+            messages.push(format!("MCP realm: {realm}."));
+        }
+    }
+    messages.push(format!(
+        "Open Config (Ctrl-X c), select {target}, authorize, then {retry_action}."
+    ));
+    messages
+}
+
+fn auth_failure_target_label(failure: &AuthenticationFailureSnapshot) -> String {
+    if failure.target.kind == "mcpServer" || failure.domain == "outboundMcp" {
+        format!("MCP server {}", failure.target.key)
+    } else {
+        format!("provider {}", failure.target.key)
+    }
+}
+
+fn auth_failure_reason(reason: &str) -> &'static str {
+    match reason {
+        "credentialRequired" => "credentials are required",
+        "credentialRejected" => "stored credentials were rejected",
+        "networkFailed" => "the authentication network request failed",
+        "tokenExchangeFailed" => "the OAuth token exchange failed",
+        "responseInvalid" => "the authentication response was invalid",
+        "configurationRequired" => "authentication configuration is required",
+        _ => "authentication could not be completed",
+    }
 }
 
 fn phase_span(phase: SessionPhaseView) -> Span<'static> {
@@ -2206,11 +2298,16 @@ fn session_important_status(
     }
 
     if session.status.phase == SessionPhaseView::Failed {
-        return Some(if session.status.failed_message.is_empty() {
-            "Session failed.".to_owned()
-        } else {
-            session.status.failed_message.clone()
-        });
+        return Some(session.status.authentication_failure.as_ref().map_or_else(
+            || {
+                if session.status.failed_message.is_empty() {
+                    "Session failed.".to_owned()
+                } else {
+                    session.status.failed_message.clone()
+                }
+            },
+            |failure| authentication_failure_messages(failure, "rerun the failed work").join(" "),
+        ));
     }
 
     if session_active(session.status.phase) && prompt.is_none() {

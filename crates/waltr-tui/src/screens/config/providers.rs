@@ -7,20 +7,22 @@
 use std::collections::BTreeMap;
 
 use waltr_client::{
-    ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, ModelCapabilitiesView,
-    ModelCatalogMatchView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
-    OAuthProviderView, ProviderKindView, ProviderView,
+    AuthStatusSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
+    ConfigView, ModelCapabilitiesView, ModelCatalogMatchView, ModelLimitsView, ModelOptionsView,
+    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenRequestStyleView,
+    OAuthUrlParamView, ProviderKindView, ProviderView,
 };
 use ratatui::{
     Frame,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     layout::Rect,
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph, Wrap},
 };
 
 use crate::{
+    screens::config::auth::{ConfigAuthState, status_can_authorize, status_can_reset, status_for},
     screens::{OperationResult, OperationTracker, SectionAction},
     theme::THEME,
     ui,
@@ -52,6 +54,11 @@ pub struct ProviderForm {
     pub url: String,
     oauth_compatible: bool,
     oauth_settings: Option<OAuthProviderView>,
+    oauth_scopes: String,
+    oauth_auth_params: String,
+    oauth_jwt_metadata: String,
+    oauth_auth_params_error: Option<String>,
+    oauth_jwt_metadata_error: Option<String>,
     headers: BTreeMap<String, String>,
     models: BTreeMap<String, ModelView>,
     selected_model: usize,
@@ -59,7 +66,8 @@ pub struct ProviderForm {
     delete_model: Option<String>,
 }
 
-const PROVIDER_FIELD_COUNT: usize = 4;
+const PROVIDER_BASE_FIELD_COUNT: usize = 4;
+const PROVIDER_OAUTH_FIELD_COUNT: usize = 10;
 
 impl ProviderForm {
     const fn create() -> Self {
@@ -72,6 +80,11 @@ impl ProviderForm {
             url: String::new(),
             oauth_compatible: false,
             oauth_settings: None,
+            oauth_scopes: String::new(),
+            oauth_auth_params: String::new(),
+            oauth_jwt_metadata: String::new(),
+            oauth_auth_params_error: None,
+            oauth_jwt_metadata_error: None,
             headers: BTreeMap::new(),
             models: BTreeMap::new(),
             selected_model: 0,
@@ -81,6 +94,7 @@ impl ProviderForm {
     }
 
     fn edit((_index, provider): (usize, &ProviderView)) -> Self {
+        let oauth_settings = provider.oauth_settings.clone();
         Self {
             mode: ProviderFormMode::Edit,
             field: 0,
@@ -89,7 +103,22 @@ impl ProviderForm {
             kind: provider.kind,
             url: provider.url.clone(),
             oauth_compatible: provider.oauth_compatible,
-            oauth_settings: provider.oauth_settings.clone(),
+            oauth_scopes: oauth_settings
+                .as_ref()
+                .map_or_else(String::new, |settings| settings.scopes.join(", ")),
+            oauth_auth_params: oauth_settings
+                .as_ref()
+                .map_or_else(String::new, |settings| {
+                    format_auth_params(&settings.auth_url_params)
+                }),
+            oauth_jwt_metadata: oauth_settings
+                .as_ref()
+                .map_or_else(String::new, |settings| {
+                    format_jwt_metadata(&settings.jwt_metadata)
+                }),
+            oauth_auth_params_error: None,
+            oauth_jwt_metadata_error: None,
+            oauth_settings,
             headers: provider.headers.clone(),
             models: provider.models.clone(),
             selected_model: 0,
@@ -111,16 +140,34 @@ impl ProviderForm {
             KeyCode::Backspace | KeyCode::Delete if self.focused_model_index().is_some() => {
                 self.arm_model_delete();
             }
-            KeyCode::Backspace if matches!(self.field, 0 | 2) => {
+            KeyCode::Delete if self.field == 3 => {
+                self.oauth_compatible = false;
+                self.oauth_settings = None;
+                self.oauth_scopes.clear();
+                self.oauth_auth_params.clear();
+                self.oauth_jwt_metadata.clear();
+            }
+            KeyCode::Backspace if self.is_text_field() => {
                 let _ = self.active_text_mut().pop();
+                self.clear_structured_error();
             }
             KeyCode::Left | KeyCode::Right if self.field == 1 => self.toggle_kind(),
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.field == 3 => {
                 self.oauth_compatible = !self.oauth_compatible;
+                if self.oauth_compatible && self.oauth_settings.is_none() {
+                    self.oauth_settings = Some(empty_oauth_settings());
+                }
+            }
+            KeyCode::Left | KeyCode::Right if self.field == 10 => self.toggle_request_style(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.field == 11 => {
+                if let Some(settings) = &mut self.oauth_settings {
+                    settings.send_state_in_token_request = !settings.send_state_in_token_request;
+                }
             }
             KeyCode::Enter => return FormAction::Submit,
-            KeyCode::Char(character) if matches!(self.field, 0 | 2) => {
+            KeyCode::Char(character) if self.is_text_field() => {
                 self.active_text_mut().push(character);
+                self.clear_structured_error();
             }
             _ => {}
         }
@@ -140,12 +187,12 @@ impl ProviderForm {
     }
 
     fn focus_count(&self) -> usize {
-        PROVIDER_FIELD_COUNT + self.models.len()
+        self.model_field_offset() + self.models.len()
     }
 
     fn focused_model_index(&self) -> Option<usize> {
         self.field
-            .checked_sub(PROVIDER_FIELD_COUNT)
+            .checked_sub(self.model_field_offset())
             .filter(|index| *index < self.models.len())
     }
 
@@ -159,7 +206,16 @@ impl ProviderForm {
         }
     }
 
-    fn provider(self) -> ProviderView {
+    fn provider(mut self) -> ProviderView {
+        if let Some(settings) = &mut self.oauth_settings {
+            settings.scopes = split_list(&self.oauth_scopes);
+            if let Ok(params) = parse_auth_params(&self.oauth_auth_params) {
+                settings.auth_url_params = params;
+            }
+            if let Ok(metadata) = parse_jwt_metadata(&self.oauth_jwt_metadata) {
+                settings.jwt_metadata = metadata;
+            }
+        }
         ProviderView {
             kind: self.kind,
             name: self.name,
@@ -213,7 +269,7 @@ impl ProviderForm {
         }
         self.models.insert(new_key, model);
         self.selected_model = self.selected_model.min(self.models.len().saturating_sub(1));
-        self.field = PROVIDER_FIELD_COUNT + self.selected_model;
+        self.field = self.model_field_offset() + self.selected_model;
         self.model_form = None;
         FormAction::Continue
     }
@@ -223,9 +279,9 @@ impl ProviderForm {
         self.models.remove(model_key);
         self.selected_model = self.selected_model.min(self.models.len().saturating_sub(1));
         self.field = if self.models.is_empty() {
-            PROVIDER_FIELD_COUNT - 1
+            self.model_field_offset() - 1
         } else {
-            PROVIDER_FIELD_COUNT + self.selected_model
+            self.model_field_offset() + self.selected_model
         };
     }
 
@@ -234,10 +290,75 @@ impl ProviderForm {
     }
 
     const fn active_text_mut(&mut self) -> &mut String {
-        if self.field == 2 {
-            &mut self.url
+        match self.field {
+            2 => &mut self.url,
+            4 => &mut self.oauth_settings.as_mut().expect("OAuth field").name,
+            5 => {
+                &mut self
+                    .oauth_settings
+                    .as_mut()
+                    .expect("OAuth field")
+                    .authorize_url
+            }
+            6 => &mut self.oauth_settings.as_mut().expect("OAuth field").token_url,
+            7 => &mut self.oauth_settings.as_mut().expect("OAuth field").client_id,
+            8 => {
+                &mut self
+                    .oauth_settings
+                    .as_mut()
+                    .expect("OAuth field")
+                    .redirect_uri
+            }
+            9 => &mut self.oauth_scopes,
+            12 => &mut self.oauth_auth_params,
+            13 => &mut self.oauth_jwt_metadata,
+            _ => &mut self.name,
+        }
+    }
+
+    const fn is_text_field(&self) -> bool {
+        matches!(self.field, 0 | 2)
+            || (self.oauth_settings.is_some()
+                && matches!(self.field, 4 | 5 | 6 | 7 | 8 | 9 | 12 | 13))
+    }
+
+    fn clear_structured_error(&mut self) {
+        match self.field {
+            12 => self.oauth_auth_params_error = None,
+            13 => self.oauth_jwt_metadata_error = None,
+            _ => {}
+        }
+    }
+
+    fn validate_structured_fields(&mut self) -> bool {
+        if self.oauth_settings.is_none() {
+            return true;
+        }
+        self.oauth_auth_params_error = parse_auth_params(&self.oauth_auth_params)
+            .err()
+            .map(|()| "authorization parameters must be a valid JSON array".to_owned());
+        self.oauth_jwt_metadata_error = parse_jwt_metadata(&self.oauth_jwt_metadata)
+            .err()
+            .map(|()| "JWT metadata mappings must be a valid JSON array".to_owned());
+        self.oauth_auth_params_error.is_none() && self.oauth_jwt_metadata_error.is_none()
+    }
+
+    const fn model_field_offset(&self) -> usize {
+        if self.oauth_settings.is_some() {
+            PROVIDER_BASE_FIELD_COUNT + PROVIDER_OAUTH_FIELD_COUNT
         } else {
-            &mut self.name
+            PROVIDER_BASE_FIELD_COUNT
+        }
+    }
+
+    const fn toggle_request_style(&mut self) {
+        if let Some(settings) = &mut self.oauth_settings {
+            settings.token_request_style = match settings.token_request_style {
+                OAuthTokenRequestStyleView::Unspecified
+                | OAuthTokenRequestStyleView::Unknown
+                | OAuthTokenRequestStyleView::FormUrlencoded => OAuthTokenRequestStyleView::Json,
+                OAuthTokenRequestStyleView::Json => OAuthTokenRequestStyleView::FormUrlencoded,
+            };
         }
     }
 
@@ -254,6 +375,52 @@ impl ProviderForm {
 enum FormAction {
     Continue,
     Submit,
+}
+
+const fn empty_oauth_settings() -> OAuthProviderView {
+    OAuthProviderView {
+        name: String::new(),
+        authorize_url: String::new(),
+        token_url: String::new(),
+        client_id: String::new(),
+        redirect_uri: String::new(),
+        scopes: Vec::new(),
+        token_request_style: OAuthTokenRequestStyleView::FormUrlencoded,
+        auth_url_params: Vec::new(),
+        jwt_metadata: Vec::new(),
+        send_state_in_token_request: false,
+    }
+}
+
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn format_auth_params(params: &[OAuthUrlParamView]) -> String {
+    serde_json::to_string(params).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn parse_auth_params(value: &str) -> Result<Vec<OAuthUrlParamView>, ()> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(value.trim()).map_err(|_| ())
+}
+
+fn format_jwt_metadata(metadata: &[OAuthJwtMetadataView]) -> String {
+    serde_json::to_string(metadata).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn parse_jwt_metadata(value: &str) -> Result<Vec<OAuthJwtMetadataView>, ()> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(value.trim()).map_err(|_| ())
 }
 
 /// Model form mode.
@@ -595,6 +762,10 @@ impl ProviderSection {
     }
 
     /// Route a key event into the section, using the current config snapshot.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordered provider form, confirmation, and credential routing stays auditable"
+    )]
     pub fn handle_key(&mut self, key: KeyEvent, config: Option<&ConfigView>) -> SectionAction {
         if self.patch.is_pending() {
             return SectionAction::Continue;
@@ -666,9 +837,12 @@ impl ProviderSection {
     }
 
     fn submit_form(&mut self) -> SectionAction {
-        let Some(form) = &self.config_form else {
+        let Some(form) = &mut self.config_form else {
             return SectionAction::Continue;
         };
+        if !form.validate_structured_fields() {
+            return SectionAction::Continue;
+        }
 
         let mode = form.mode;
         let original_name = form.original_name.clone();
@@ -713,16 +887,29 @@ impl ProviderSection {
             .map(|(_, provider)| provider.name.clone())
     }
 
+    pub(crate) fn selected_auth_target(
+        &self,
+        config: Option<&ConfigView>,
+    ) -> Option<ClientAuthTarget> {
+        self.selected_provider_name(config).map(provider_target)
+    }
+
     /// Render the section content (provider list) into `area`.
     ///
     /// `loaded` indicates the watch stream has delivered config; when false the
     /// section shows a waiting placeholder.
-    pub fn render_content(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "rendering consumes the complete shared config and auth snapshot state"
+    )]
+    pub(crate) fn render_content(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         config: Option<&ConfigView>,
         loaded: bool,
+        statuses: &BTreeMap<String, AuthStatusSnapshot>,
+        auth: &ConfigAuthState,
     ) {
         let lines = if loaded {
             config.map_or_else(loading_lines, |config| {
@@ -732,6 +919,8 @@ impl ProviderSection {
                     self.delete_provider(),
                     self.patch.is_pending(),
                     self.patch.error(),
+                    statuses,
+                    auth,
                 )
             })
         } else {
@@ -757,7 +946,12 @@ impl ProviderSection {
         }
 
         if let Some(form) = &self.config_form {
-            let form_area = ui::centered_percent_rect(area, 82, 15);
+            let (width, height) = if form.oauth_settings.is_some() {
+                (92, 22)
+            } else {
+                (82, 15)
+            };
+            let form_area = ui::centered_percent_rect(area, width, height);
             frame.render_widget(Clear, area);
             frame.render_widget(Clear, form_area);
             render_form_widget(
@@ -779,12 +973,18 @@ fn loading_lines() -> Vec<Line<'static>> {
     vec![ui::loading_line("Waiting for configuration...")]
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "line rendering receives explicit config, patch, and credential presentation state"
+)]
 fn config_lines(
     config: &ConfigView,
     selected_provider: usize,
     delete_provider: Option<&str>,
     pending_patch: bool,
     patch_error: Option<&str>,
+    statuses: &BTreeMap<String, AuthStatusSnapshot>,
+    auth: &ConfigAuthState,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -794,24 +994,58 @@ fn config_lines(
     }
 
     for (index, provider) in config.providers.values().enumerate() {
+        let selected = index == selected_provider;
+        let target = provider_target(provider.name.clone());
+        let auth_status = status_for(statuses, &target);
+        let deleting = delete_provider == Some(provider.name.as_str());
+        let resetting = auth.reset_matches(&target);
+        let auth_pending = auth.pending_for(&target);
         lines.push(provider_line(
             provider,
-            index == selected_provider,
-            delete_provider == Some(provider.name.as_str()),
+            selected,
+            deleting,
             pending_patch,
             patch_error,
+            auth_status,
+            resetting,
+            auth_pending,
         ));
+        if selected && !deleting && !resetting {
+            lines.push(auth_status_line(auth_status));
+            lines.push(auth_action_line(auth_status, auth_pending));
+            lines.extend(auth_status_detail_lines(auth_status, false));
+        }
+    }
+
+    let selected_target = config
+        .providers
+        .values()
+        .nth(selected_provider)
+        .map(|provider| provider_target(provider.name.clone()));
+    if let Some(error) = selected_target
+        .as_ref()
+        .and_then(|target| auth.error_for(target))
+    {
+        lines.push(ui::error_line(error));
     }
 
     lines
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "one provider row directly renders orthogonal selection and operation states"
+)]
 fn provider_line(
     provider: &ProviderView,
     selected: bool,
     deleting: bool,
     pending_patch: bool,
     patch_error: Option<&str>,
+    auth_status: Option<&AuthStatusSnapshot>,
+    resetting: bool,
+    auth_pending: bool,
 ) -> Line<'static> {
     if deleting {
         return Line::from(vec![
@@ -823,7 +1057,21 @@ fn provider_line(
         ]);
     }
 
-    Line::from(vec![
+    if resetting {
+        return Line::from(vec![
+            ui::selection_marker(selected),
+            Span::raw(" "),
+            ui::selected_title(provider.name.clone()),
+            Span::raw("  "),
+            ui::delete_prompt_span(if auth_pending {
+                "Resetting credential..."
+            } else {
+                "Reset credential? Enter/y confirm, n/Esc cancel"
+            }),
+        ]);
+    }
+
+    let mut spans = vec![
         ui::selection_marker(selected),
         Span::raw(" "),
         ui::selected_title(provider.name.clone()),
@@ -836,7 +1084,15 @@ fn provider_line(
         ),
         Span::raw("  "),
         Span::styled(provider_url(provider), THEME.text_style()),
-    ])
+    ];
+    if !selected {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            auth_status_label(auth_status),
+            auth_status_style(auth_status),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn provider_url(provider: &ProviderView) -> String {
@@ -845,6 +1101,215 @@ fn provider_url(provider: &ProviderView) -> String {
     } else {
         provider.url.clone()
     }
+}
+
+fn provider_target(key: String) -> ClientAuthTarget {
+    ClientAuthTarget {
+        kind: "provider".to_owned(),
+        key,
+    }
+}
+
+pub(super) fn auth_status_label(status: Option<&AuthStatusSnapshot>) -> String {
+    let Some(status) = status else {
+        return "status unavailable".to_owned();
+    };
+    match status.kind.as_str() {
+        "oauthConfigured" => "connected (OAuth)",
+        "apiKeyConfigured" => "connected (API key)",
+        "expired" => "expired",
+        "authorizationRequired" => "authorization required",
+        "unsupported" => "unsupported",
+        "notConfigured" => "not connected",
+        _ => "unknown",
+    }
+    .to_owned()
+}
+
+pub(super) fn auth_status_style(status: Option<&AuthStatusSnapshot>) -> Style {
+    match status.map(|status| status.kind.as_str()) {
+        Some("oauthConfigured" | "apiKeyConfigured") => THEME.focus_style(),
+        Some("expired" | "authorizationRequired") => THEME.danger_style(),
+        _ => THEME.muted_text_style(),
+    }
+}
+
+pub(super) fn auth_status_detail_lines(
+    status: Option<&AuthStatusSnapshot>,
+    mcp: bool,
+) -> Vec<Line<'static>> {
+    let Some(status) = status else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    let message = safe_status_text(&status.message);
+    if !message.is_empty() {
+        for (index, chunk) in wrap_status_message(&message, 48).into_iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::raw(if index == 0 {
+                    "    message: "
+                } else {
+                    "             "
+                }),
+                Span::styled(chunk, THEME.muted_text_style()),
+            ]));
+        }
+    }
+    if status.expires_at_ms > 0 {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                format!("expires: {}", format_expiration(status.expires_at_ms)),
+                THEME.muted_text_style(),
+            ),
+        ]));
+    }
+    if mcp && let Some(method) = registration_method_label(&status.registration_method) {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("registration: {method}"), THEME.muted_text_style()),
+        ]));
+    }
+    lines
+}
+
+pub(super) fn auth_status_line(status: Option<&AuthStatusSnapshot>) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled("status: ", THEME.muted_text_style()),
+        Span::styled(auth_status_label(status), auth_status_style(status)),
+    ])
+}
+
+fn safe_status_text(value: &str) -> String {
+    const MAX_STATUS_MESSAGE_CHARS: usize = 120;
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim();
+    if trimmed.chars().count() <= MAX_STATUS_MESSAGE_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut bounded = trimmed
+        .chars()
+        .take(MAX_STATUS_MESSAGE_CHARS - 3)
+        .collect::<String>();
+    bounded.push_str("...");
+    bounded
+}
+
+fn wrap_status_message(value: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        while current.chars().count() > width {
+            let remainder = current.chars().skip(width).collect::<String>();
+            lines.push(current.chars().take(width).collect());
+            current = remainder;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn format_expiration(milliseconds: i64) -> String {
+    let seconds = milliseconds.div_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+fn civil_date(days_since_epoch: i64) -> (i64, i64, i64) {
+    let shifted = days_since_epoch + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn registration_method_label(method: &str) -> Option<&'static str> {
+    match method {
+        "preregistered" => Some("Preregistered"),
+        "clientMetadata" => Some("Client metadata"),
+        "dynamic" => Some("Dynamic"),
+        _ => None,
+    }
+}
+
+pub(super) fn auth_action_hint(status: Option<&AuthStatusSnapshot>, pending: bool) -> String {
+    if pending {
+        return "auth action pending...".to_owned();
+    }
+    let Some(status) = status else {
+        return "no credential actions".to_owned();
+    };
+    let authorize = if status_can_authorize(status) {
+        if matches!(
+            status.kind.as_str(),
+            "oauthConfigured" | "expired" | "authorizationRequired"
+        ) {
+            "a reauthorize"
+        } else {
+            "a authorize"
+        }
+    } else {
+        ""
+    };
+    let refresh = if status.can_refresh {
+        "  f refresh"
+    } else {
+        ""
+    };
+    let reset = if status_can_reset(status) {
+        "  r reset"
+    } else {
+        ""
+    };
+    let hint = format!("{authorize}{refresh}{reset}");
+    if hint.is_empty() {
+        "no credential actions".to_owned()
+    } else {
+        hint.trim_start().to_owned()
+    }
+}
+
+pub(super) fn auth_action_line(
+    status: Option<&AuthStatusSnapshot>,
+    pending: bool,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("actions: {}", auth_action_hint(status, pending)),
+            THEME.muted_text_style(),
+        ),
+    ])
 }
 
 fn render_form_widget(
@@ -863,20 +1328,51 @@ fn render_form_widget(
         frame,
         area,
         title,
-        "Tab focus  Space/arrows toggle  C-x c model  Esc cancel",
+        "Tab field Space toggle Del OAuth C-x c model Esc cancel",
     );
+    let visible_height = frame
+        .area()
+        .bottom()
+        .saturating_sub(body_area.y)
+        .min(body_area.height);
+    let structured_error_count = usize::from(form.oauth_auth_params_error.is_some())
+        + usize::from(form.oauth_jwt_metadata_error.is_some());
+    let mut focused_line = form.field
+        + form
+            .focused_model_index()
+            .map_or(0, |_| 2 + structured_error_count);
+    if form.field == 12 && form.oauth_auth_params_error.is_some() {
+        focused_line = PROVIDER_BASE_FIELD_COUNT + PROVIDER_OAUTH_FIELD_COUNT;
+    } else if form.field == 13 && form.oauth_jwt_metadata_error.is_some() {
+        focused_line = PROVIDER_BASE_FIELD_COUNT
+            + PROVIDER_OAUTH_FIELD_COUNT
+            + usize::from(form.oauth_auth_params_error.is_some());
+    }
+    let scroll =
+        u16::try_from(focused_line.saturating_sub(usize::from(visible_height.saturating_sub(1))))
+            .unwrap_or(u16::MAX);
     frame.render_widget(
-        Paragraph::new(form_lines(form, pending_patch, patch_error))
-            .style(THEME.panel_style())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(form_lines(
+            form,
+            pending_patch,
+            patch_error,
+            usize::from(body_area.width),
+        ))
+        .style(THEME.panel_style())
+        .scroll((scroll, 0)),
         body_area,
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "provider fields and field-specific validation remain in terminal focus order"
+)]
 fn form_lines(
     form: &ProviderForm,
     pending_patch: bool,
     patch_error: Option<&str>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         form_line(0, form.field, "name", &form.name),
@@ -888,12 +1384,67 @@ fn form_lines(
             "oauth",
             oauth_compatible_name(form.oauth_compatible),
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Models staged in this provider draft",
-            THEME.accent_bold(),
-        )),
     ];
+
+    if let Some(settings) = &form.oauth_settings {
+        lines.extend([
+            form_line(4, form.field, "oauth name", &settings.name),
+            form_line(5, form.field, "authorize URL", &settings.authorize_url),
+            form_line(6, form.field, "token URL", &settings.token_url),
+            form_line(7, form.field, "client ID", &settings.client_id),
+            form_line(8, form.field, "redirect URI", &settings.redirect_uri),
+            form_line(9, form.field, "scopes", &form.oauth_scopes),
+            form_line(
+                10,
+                form.field,
+                "request style",
+                token_request_style_name(settings.token_request_style),
+            ),
+            form_line(
+                11,
+                form.field,
+                "send state",
+                if settings.send_state_in_token_request {
+                    "yes"
+                } else {
+                    "no"
+                },
+            ),
+            structured_form_line(
+                12,
+                form.field,
+                "auth params JSON",
+                &form.oauth_auth_params,
+                width,
+            ),
+            structured_form_line(
+                13,
+                form.field,
+                "JWT mappings JSON",
+                &form.oauth_jwt_metadata,
+                width,
+            ),
+        ]);
+    }
+
+    for error in [
+        form.oauth_auth_params_error.as_deref(),
+        form.oauth_jwt_metadata_error.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            THEME.danger_style().add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Models staged in this provider draft",
+        THEME.accent_bold(),
+    )));
 
     if form.models.is_empty() {
         lines.push(ui::loading_line("No models configured."));
@@ -920,8 +1471,45 @@ fn form_lines(
     lines
 }
 
+fn structured_form_line(
+    index: usize,
+    active: usize,
+    label: &'static str,
+    value: &str,
+    width: usize,
+) -> Line<'static> {
+    let available = width.saturating_sub(label.chars().count() + 4);
+    form_line(
+        index,
+        active,
+        label,
+        &truncate_with_ellipsis(value, available),
+    )
+}
+
+fn truncate_with_ellipsis(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut truncated = value.chars().take(width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 const fn oauth_compatible_name(enabled: bool) -> &'static str {
     if enabled { "oauth" } else { "no-oauth" }
+}
+
+const fn token_request_style_name(style: OAuthTokenRequestStyleView) -> &'static str {
+    match style {
+        OAuthTokenRequestStyleView::Json => "json",
+        OAuthTokenRequestStyleView::FormUrlencoded => "form-urlencoded",
+        OAuthTokenRequestStyleView::Unspecified => "unspecified",
+        OAuthTokenRequestStyleView::Unknown => "unknown",
+    }
 }
 
 fn form_line(index: usize, active: usize, label: &'static str, value: &str) -> Line<'static> {

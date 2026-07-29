@@ -10,7 +10,7 @@ fn config_renders_watched_snapshot_as_modal_with_escape_hint() {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
 
     let rendered = render_app(&app);
@@ -730,7 +730,7 @@ fn config_leader_c_opens_create_form_and_adds_provider() {
     assert_eq!(app.handle_event(&char_press('c'), now), AppAction::Continue);
     let rendered = render_app(&app);
     assert!(rendered.contains("Create provider"));
-    assert!(rendered.contains("Tab focus"));
+    assert!(rendered.contains("Tab field"));
     assert!(!rendered.contains("Tab switch field"));
 
     for character in "openai".chars() {
@@ -745,6 +745,1287 @@ fn config_leader_c_opens_create_form_and_adds_provider() {
         panic!("expected add provider command");
     };
     assert_eq!(provider.name, "openai");
+}
+
+#[test]
+fn config_provider_form_edits_all_public_client_oauth_fields() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+    drop(app.handle_event(&ctrl_x_press(), now));
+    drop(app.handle_event(&char_press('c'), now));
+    type_text(&mut app, "custom", now);
+    for _ in 0..3 {
+        drop(app.handle_event(&tab_press(), now));
+    }
+    drop(app.handle_event(&char_press(' '), now));
+
+    let text_fields = [
+        "Custom OAuth",
+        "https://id.example/authorize",
+        "https://id.example/token",
+        "public-client",
+        "http://127.0.0.1/callback",
+        "openid, profile",
+    ];
+    for value in text_fields {
+        drop(app.handle_event(&tab_press(), now));
+        type_text(&mut app, value, now);
+    }
+    drop(app.handle_event(&tab_press(), now));
+    drop(app.handle_event(&right_press(), now));
+    drop(app.handle_event(&tab_press(), now));
+    drop(app.handle_event(&right_press(), now));
+    drop(app.handle_event(&tab_press(), now));
+    type_text(
+        &mut app,
+        r#"[{"key":"audience","value":"api"}]"#,
+        now,
+    );
+    drop(app.handle_event(&tab_press(), now));
+    type_text(
+        &mut app,
+        r#"[{"token":"id","metadataKey":"tenant","claimNames":["tid","tenant"],"required":true}]"#,
+        now,
+    );
+
+    let AppAction::ClientCommand(ClientCommand::AddProvider { provider }) =
+        app.handle_event(&enter_press(), now)
+    else {
+        panic!("expected provider add");
+    };
+    let oauth = provider.oauth_settings.expect("OAuth settings");
+    assert!(provider.oauth_compatible);
+    assert_eq!(oauth.name, "Custom OAuth");
+    assert_eq!(oauth.authorize_url, "https://id.example/authorize");
+    assert_eq!(oauth.token_url, "https://id.example/token");
+    assert_eq!(oauth.client_id, "public-client");
+    assert_eq!(oauth.redirect_uri, "http://127.0.0.1/callback");
+    assert_eq!(oauth.scopes, vec!["openid", "profile"]);
+    assert_eq!(oauth.token_request_style, OAuthTokenRequestStyleView::Json);
+    assert!(oauth.send_state_in_token_request);
+    assert_eq!(
+        oauth.auth_url_params,
+        vec![OAuthUrlParamView {
+            key: "audience".to_owned(),
+            value: "api".to_owned(),
+        }]
+    );
+    assert_eq!(
+        oauth.jwt_metadata,
+        vec![OAuthJwtMetadataView {
+            token: OAuthTokenFieldView::Id,
+            metadata_key: "tenant".to_owned(),
+            claim_names: vec!["tid".to_owned(), "tenant".to_owned()],
+            required: true,
+        }]
+    );
+}
+
+#[test]
+fn config_provider_oauth_toggle_off_preserves_settings_until_explicit_clear() {
+    let mut snapshot = watched_config_snapshot();
+    let expected = OAuthProviderView {
+        name: "Existing".to_owned(),
+        authorize_url: "https://id.example/authorize".to_owned(),
+        token_url: "https://id.example/token".to_owned(),
+        client_id: "public".to_owned(),
+        redirect_uri: "http://127.0.0.1/callback".to_owned(),
+        scopes: vec!["openid".to_owned()],
+        token_request_style: OAuthTokenRequestStyleView::FormUrlencoded,
+        auth_url_params: vec![OAuthUrlParamView {
+            key: "audience".to_owned(),
+            value: "api".to_owned(),
+        }],
+        jwt_metadata: Vec::new(),
+        send_state_in_token_request: false,
+    };
+    let provider = snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap();
+    provider.oauth_compatible = true;
+    provider.oauth_settings = Some(expected.clone());
+    let mut app = open_config_app_with(snapshot);
+    let now = Instant::now();
+    drop(app.handle_event(&enter_press(), now));
+    for _ in 0..3 {
+        drop(app.handle_event(&tab_press(), now));
+    }
+    drop(app.handle_event(&char_press(' '), now));
+    let AppAction::ClientCommand(ClientCommand::UpdateProvider { provider, .. }) =
+        app.handle_event(&enter_press(), now)
+    else {
+        panic!("expected provider update");
+    };
+    assert!(!provider.oauth_compatible);
+    assert_eq!(provider.oauth_settings, Some(expected));
+
+    let mut clear_snapshot = watched_config_snapshot();
+    let provider = clear_snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap();
+    provider.oauth_compatible = true;
+    provider.oauth_settings = Some(OAuthProviderView {
+        name: "Existing".to_owned(),
+        authorize_url: String::new(),
+        token_url: String::new(),
+        client_id: "public".to_owned(),
+        redirect_uri: String::new(),
+        scopes: Vec::new(),
+        token_request_style: OAuthTokenRequestStyleView::FormUrlencoded,
+        auth_url_params: Vec::new(),
+        jwt_metadata: Vec::new(),
+        send_state_in_token_request: false,
+    });
+    let mut clear_app = open_config_app_with(clear_snapshot);
+    drop(clear_app.handle_event(&enter_press(), now));
+    for _ in 0..3 {
+        drop(clear_app.handle_event(&tab_press(), now));
+    }
+    drop(clear_app.handle_event(&delete_press(), now));
+    let AppAction::ClientCommand(ClientCommand::UpdateProvider { provider, .. }) =
+        clear_app.handle_event(&enter_press(), now)
+    else {
+        panic!("expected provider update");
+    };
+    assert!(!provider.oauth_compatible);
+    assert_eq!(provider.oauth_settings, None);
+}
+
+#[test]
+fn config_auth_status_updates_preserve_provider_form_draft_and_focus() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+    drop(app.handle_event(&enter_press(), now));
+    type_text(&mut app, "-draft", now);
+    drop(app.handle_event(&tab_press(), now));
+    let mut update = watched_config_snapshot();
+    set_auth_status(&mut update, "provider", "anthropic", "oauthConfigured", true);
+    drop(app.handle_event(&AppEvent::Client(Box::new(update)), now));
+    let form = app.provider_section().config_form().expect("provider draft");
+    assert_eq!(form.name, "anthropic-draft");
+    assert_eq!(form.field, 1);
+}
+
+#[test]
+fn config_statuses_render_all_secret_safe_kinds_and_mcp_has_no_registration_fields() {
+    for (kind, label) in [
+        ("oauthConfigured", "connected (OAuth)"),
+        ("apiKeyConfigured", "connected (API key)"),
+        ("expired", "expired"),
+        ("authorizationRequired", "authorization required"),
+        ("unsupported", "unsupported"),
+    ] {
+        let mut snapshot = watched_config_snapshot();
+        snapshot
+            .config
+            .current
+            .as_mut()
+            .unwrap()
+            .providers
+            .get_mut("anthropic")
+            .unwrap()
+            .url
+            .clear();
+        set_auth_status(&mut snapshot, "provider", "anthropic", kind, false);
+        let mut app = open_config_app_with(snapshot);
+        let rendered = render_app(&app);
+        assert!(
+            label.split_whitespace().all(|part| rendered.contains(part)),
+            "{kind}: {rendered}"
+        );
+        if kind == "oauthConfigured" {
+            assert!(rendered.contains("a reauthorize"));
+        }
+        if kind == "authorizationRequired" {
+            assert!(rendered.contains("a reauthorize"));
+        }
+        if kind == "unsupported" {
+            assert_eq!(
+                app.handle_event(&char_press('a'), Instant::now()),
+                AppAction::ClientCommand(ClientCommand::BeginAuth {
+                    target: ClientAuthTarget {
+                        kind: "provider".to_owned(),
+                        key: "anthropic".to_owned(),
+                    }
+                })
+            );
+        }
+    }
+
+    let mut app = open_config_app_with_mcp();
+    drop(app.handle_event(&tab_press(), Instant::now()));
+    drop(app.handle_event(&ctrl_x_press(), Instant::now()));
+    drop(app.handle_event(&char_press('c'), Instant::now()));
+    let rendered = render_app(&app);
+    assert!(!rendered.contains("client ID"));
+    assert!(!rendered.contains("authorize URL"));
+    assert!(!rendered.contains("registration"));
+}
+
+#[test]
+fn config_authorize_and_reauthorize_use_explicit_shared_attempt_overlay() {
+    for kind in ["authorizationRequired", "oauthConfigured"] {
+        let mut snapshot = provider_oauth_config_snapshot();
+        set_auth_status(&mut snapshot, "provider", "anthropic", kind, true);
+        let mut app = open_config_app_with(snapshot.clone());
+        let now = Instant::now();
+        assert_eq!(
+            app.handle_event(&char_press('a'), now),
+            AppAction::ClientCommand(ClientCommand::BeginAuth {
+                target: ClientAuthTarget {
+                    kind: "provider".to_owned(),
+                    key: "anthropic".to_owned(),
+                }
+            })
+        );
+        assert!(render_app(&app).contains("OAuth authorization"));
+
+        let mut loading = snapshot.clone();
+        set_auth_begin_operation(&mut loading, "begin-1", "loading", None);
+        drop(app.handle_event(&AppEvent::Client(Box::new(loading)), now));
+        let mut ready = snapshot;
+        set_auth_begin_operation(&mut ready, "begin-1", "ready", None);
+        ready.auth.active_attempt = Some(test_auth_attempt("provider", "anthropic", "pending"));
+        drop(app.handle_event(&AppEvent::Client(Box::new(ready)), now));
+        let rendered = render_app(&app);
+        assert!(rendered.contains("Authorization requested from configuration."));
+        assert!(rendered.contains("https://id.example/authorize"));
+        assert_eq!(app.provider_section().selected_provider(), 0);
+    }
+}
+
+#[test]
+fn config_auth_modal_retries_through_the_shared_tracker() {
+    let mut snapshot = provider_oauth_config_snapshot();
+    set_auth_status(
+        &mut snapshot,
+        "provider",
+        "anthropic",
+        "authorizationRequired",
+        false,
+    );
+    let mut app = open_config_app_with(snapshot.clone());
+    let now = Instant::now();
+    let target = matrix_target("provider");
+
+    assert_eq!(
+        app.handle_event(&char_press('a'), now),
+        AppAction::ClientCommand(ClientCommand::BeginAuth {
+            target: target.clone(),
+        })
+    );
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+
+    let mut loading = snapshot.clone();
+    set_auth_begin_operation_for(
+        &mut loading,
+        "begin-retry",
+        "loading",
+        None,
+        target.clone(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(loading)), now));
+    set_auth_begin_operation_for(
+        &mut snapshot,
+        "begin-retry",
+        "failed",
+        Some("begin denied"),
+        target.clone(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(snapshot)), now));
+    assert!(render_app(&app).contains("begin denied"));
+
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::BeginAuth {
+            target: target.clone(),
+        })
+    );
+    assert!(app.config_auth_action_pending(&target));
+    assert!(!render_app(&app).contains("begin denied"));
+}
+
+#[test]
+fn config_manual_completion_closes_the_shared_modal() {
+    let now = Instant::now();
+    let target = matrix_target("provider");
+
+    let mut complete_base = provider_oauth_config_snapshot();
+    set_auth_status(
+        &mut complete_base,
+        "provider",
+        "anthropic",
+        "authorizationRequired",
+        false,
+    );
+    let mut complete_app = open_config_app_with(complete_base.clone());
+    drop(complete_app.handle_event(&char_press('a'), now));
+    let mut complete_loading = complete_base.clone();
+    set_auth_begin_operation_for(
+        &mut complete_loading,
+        "begin-complete",
+        "loading",
+        None,
+        target.clone(),
+    );
+    drop(complete_app.handle_event(&AppEvent::Client(Box::new(complete_loading)), now));
+    complete_base.auth.active_attempt = Some(test_auth_attempt(
+        "provider",
+        "anthropic",
+        "pending",
+    ));
+    set_auth_begin_operation_for(
+        &mut complete_base,
+        "begin-complete",
+        "ready",
+        None,
+        target,
+    );
+    drop(complete_app.handle_event(&AppEvent::Client(Box::new(complete_base.clone())), now));
+    type_text(&mut complete_app, "completion-code", now);
+    assert!(matches!(
+        complete_app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::CompleteAuth { .. })
+    ));
+    let mut completing = complete_base.clone();
+    set_auth_complete_operation(&mut completing, "complete-1", "loading", None);
+    drop(complete_app.handle_event(&AppEvent::Client(Box::new(completing)), now));
+    complete_base.auth.active_attempt = None;
+    set_auth_complete_operation(&mut complete_base, "complete-1", "ready", None);
+    drop(complete_app.handle_event(&AppEvent::Client(Box::new(complete_base)), now));
+    assert!(complete_app.outbound_auth_target().is_none());
+    assert!(!render_app(&complete_app).contains("OAuth authorization"));
+}
+
+#[test]
+fn config_cancellation_closes_the_shared_modal() {
+    let now = Instant::now();
+    let mut cancel_base = provider_oauth_config_snapshot();
+    set_auth_status(
+        &mut cancel_base,
+        "provider",
+        "anthropic",
+        "authorizationRequired",
+        false,
+    );
+    cancel_base.auth.complete.error = Some("stale completion error".to_owned());
+    let mut cancel_app = open_config_app_with(cancel_base.clone());
+    drop(cancel_app.handle_event(&char_press('a'), now));
+    let mut cancel_begin_loading = cancel_base.clone();
+    set_auth_begin_operation(
+        &mut cancel_begin_loading,
+        "begin-cancel",
+        "loading",
+        None,
+    );
+    drop(cancel_app.handle_event(&AppEvent::Client(Box::new(cancel_begin_loading)), now));
+    cancel_base.auth.active_attempt = Some(test_auth_attempt(
+        "provider",
+        "anthropic",
+        "pending",
+    ));
+    set_auth_begin_operation(&mut cancel_base, "begin-cancel", "ready", None);
+    drop(cancel_app.handle_event(&AppEvent::Client(Box::new(cancel_base.clone())), now));
+    assert!(!render_app(&cancel_app).contains("stale completion error"));
+    assert!(matches!(
+        cancel_app.handle_event(&escape_press(), now),
+        AppAction::ClientCommand(ClientCommand::CancelAuth { .. })
+    ));
+    let mut canceling = cancel_base.clone();
+    set_auth_cancel_operation(&mut canceling, "cancel-1", "loading", None);
+    drop(cancel_app.handle_event(&AppEvent::Client(Box::new(canceling)), now));
+    cancel_base.auth.active_attempt = None;
+    set_auth_cancel_operation(&mut cancel_base, "cancel-1", "ready", None);
+    drop(cancel_app.handle_event(&AppEvent::Client(Box::new(cancel_base)), now));
+    assert!(cancel_app.outbound_auth_target().is_none());
+    assert!(!render_app(&cancel_app).contains("OAuth authorization"));
+}
+
+#[test]
+fn config_explicit_oauth_attempt_renders_snapshot() {
+    let mut snapshot = provider_oauth_config_snapshot();
+    set_auth_status(
+        &mut snapshot,
+        "provider",
+        "anthropic",
+        "authorizationRequired",
+        false,
+    );
+    let mut app = open_config_app_with(snapshot.clone());
+    let now = Instant::now();
+    drop(app.handle_event(&char_press('a'), now));
+    let mut loading = snapshot.clone();
+    set_auth_begin_operation(&mut loading, "begin-explicit", "loading", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(loading)), now));
+    snapshot.auth.active_attempt = Some(test_auth_attempt("provider", "anthropic", "pending"));
+    set_auth_begin_operation(&mut snapshot, "begin-explicit", "ready", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(snapshot)), now));
+
+    let rendered = render_app(&app);
+    assert!(!rendered.contains("Registration:"));
+    insta::assert_snapshot!("config_explicit_oauth_attempt", rendered);
+
+    let mut succeeded = provider_oauth_config_snapshot();
+    succeeded.auth.active_attempt = Some(test_auth_attempt("provider", "anthropic", "succeeded"));
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(succeeded)), now),
+        AppAction::ClientCommand(ClientCommand::RequestAuthStatuses)
+    );
+    assert_eq!(app.provider_section().selected_provider(), 0);
+    assert!(!render_app(&app).contains("OAuth authorization"));
+}
+
+#[test]
+fn config_provider_oauth_fields_render_snapshot_without_secret_field() {
+    let mut snapshot = watched_config_snapshot();
+    let provider = snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap();
+    provider.oauth_compatible = true;
+    provider.oauth_settings = Some(OAuthProviderView {
+        name: "Anthropic OAuth".to_owned(),
+        authorize_url: "https://id.example/authorize".to_owned(),
+        token_url: "https://id.example/token".to_owned(),
+        client_id: "public-client".to_owned(),
+        redirect_uri: "http://127.0.0.1/callback".to_owned(),
+        scopes: vec!["openid".to_owned(), "profile".to_owned()],
+        token_request_style: OAuthTokenRequestStyleView::FormUrlencoded,
+        auth_url_params: vec![OAuthUrlParamView {
+            key: "audience".to_owned(),
+            value: "api".to_owned(),
+        }],
+        jwt_metadata: vec![OAuthJwtMetadataView {
+            token: OAuthTokenFieldView::Id,
+            metadata_key: "tenant".to_owned(),
+            claim_names: vec!["tid".to_owned()],
+            required: true,
+        }],
+        send_state_in_token_request: true,
+    });
+    let mut app = open_config_app_with(snapshot);
+    drop(app.handle_event(&enter_press(), Instant::now()));
+    let rendered = render_app(&app);
+    assert!(!rendered.to_ascii_lowercase().contains("client secret"));
+    assert!(rendered.contains("..."));
+    insta::assert_snapshot!("config_provider_oauth_fields", rendered);
+}
+
+#[test]
+fn config_provider_auth_status_actions_render_snapshot() {
+    let app = open_config_app_with(provider_connected_status_snapshot());
+
+    insta::assert_snapshot!("config_provider_auth_status_actions", render_app(&app));
+}
+
+#[test]
+fn config_provider_oauth_fixture_has_complete_public_client_settings() {
+    let snapshot = provider_oauth_config_snapshot();
+    let provider = snapshot
+        .config
+        .current
+        .as_ref()
+        .unwrap()
+        .providers
+        .get("anthropic")
+        .unwrap();
+    let oauth = provider.oauth_settings.as_ref().expect("OAuth settings");
+    assert!(provider.oauth_compatible);
+    assert_eq!(oauth.authorize_url, "https://id.example/authorize");
+    assert_eq!(oauth.token_url, "https://id.example/token");
+    assert_eq!(oauth.client_id, "public-client");
+    assert_eq!(oauth.redirect_uri, "http://127.0.0.1/callback");
+    assert_eq!(
+        oauth.token_request_style,
+        OAuthTokenRequestStyleView::FormUrlencoded
+    );
+}
+
+#[test]
+fn config_provider_auth_reset_confirmation_renders_snapshot() {
+    let mut app = open_config_app_with(provider_connected_status_snapshot());
+    assert_eq!(
+        app.handle_event(&char_press('r'), Instant::now()),
+        AppAction::Continue
+    );
+
+    insta::assert_snapshot!("config_provider_auth_reset_confirmation", render_app(&app));
+}
+
+#[test]
+fn config_provider_oauth_focus_scrolls_deterministically_on_narrow_terminal() {
+    let mut snapshot = watched_config_snapshot();
+    let provider = snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap();
+    provider.oauth_compatible = true;
+    provider.oauth_settings = Some(OAuthProviderView {
+        name: "OAuth".to_owned(),
+        authorize_url: String::new(),
+        token_url: String::new(),
+        client_id: "public".to_owned(),
+        redirect_uri: String::new(),
+        scopes: Vec::new(),
+        token_request_style: OAuthTokenRequestStyleView::FormUrlencoded,
+        auth_url_params: Vec::new(),
+        jwt_metadata: vec![OAuthJwtMetadataView {
+            token: OAuthTokenFieldView::Id,
+            metadata_key: "tenant".to_owned(),
+            claim_names: vec!["tid".to_owned()],
+            required: true,
+        }],
+        send_state_in_token_request: false,
+    });
+    let mut app = open_config_app_with(snapshot);
+    let now = Instant::now();
+    drop(app.handle_event(&enter_press(), now));
+    for _ in 0..13 {
+        drop(app.handle_event(&tab_press(), now));
+    }
+    let rendered = render_app_with_size(&app, 60, 18);
+    assert!(rendered.contains("JWT mappings JSON"), "{rendered}");
+    assert!(rendered.contains("* JWT mappings JSON"), "{rendered}");
+}
+
+#[test]
+fn config_force_refresh_reconciles_matching_key_and_surfaces_failure() {
+    let mut base = watched_config_snapshot();
+    set_auth_status(&mut base, "provider", "anthropic", "oauthConfigured", true);
+    let mut app = open_config_app_with(base.clone());
+    let now = Instant::now();
+    assert!(matches!(
+        app.handle_event(&char_press('f'), now),
+        AppAction::ClientCommand(ClientCommand::RefreshAuth { .. })
+    ));
+
+    let mut loading = base.clone();
+    set_auth_refresh_operation(&mut loading, "refresh-1", "loading", None);
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(loading)), now),
+        AppAction::Continue
+    );
+    let mut unrelated = base.clone();
+    set_auth_refresh_operation(&mut unrelated, "refresh-2", "ready", None);
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(unrelated)), now),
+        AppAction::Continue
+    );
+    let mut ready = base.clone();
+    set_auth_refresh_operation(&mut ready, "refresh-1", "ready", None);
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(ready)), now),
+        AppAction::ClientCommand(ClientCommand::RequestAuthStatuses)
+    );
+
+    assert!(matches!(
+        app.handle_event(&char_press('f'), now),
+        AppAction::ClientCommand(ClientCommand::RefreshAuth { .. })
+    ));
+    let mut failed_loading = base.clone();
+    set_auth_refresh_operation(&mut failed_loading, "refresh-3", "loading", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed_loading)), now));
+    let mut failed = base;
+    set_auth_refresh_operation(&mut failed, "refresh-3", "failed", Some("refresh denied"));
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed)), now));
+    assert!(render_app(&app).contains("error: refresh denied"));
+    drop(app.handle_event(&char_press('r'), now));
+    drop(app.handle_event(&enter_press(), now));
+    assert!(!render_app(&app).contains("error: refresh denied"));
+}
+
+#[test]
+fn config_reset_requires_confirmation_and_supports_cancellation() {
+    let mut snapshot = patched_mcp_snapshot();
+    set_auth_status(&mut snapshot, "mcpServer", "files", "oauthConfigured", true);
+    let base = snapshot.clone();
+    let mut app = open_config_app_with(snapshot);
+    let now = Instant::now();
+    drop(app.handle_event(&tab_press(), now));
+    drop(app.handle_event(&char_press('r'), now));
+    assert!(render_app(&app).contains("Reset credential?"));
+    drop(app.handle_event(&char_press('n'), now));
+    assert!(!render_app(&app).contains("Reset credential?"));
+    drop(app.handle_event(&char_press('r'), now));
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::LogoutAuth {
+            target: ClientAuthTarget {
+                kind: "mcpServer".to_owned(),
+                key: "files".to_owned(),
+            }
+        })
+    );
+    let mut loading = base.clone();
+    set_auth_logout_operation(&mut loading, "logout-1", "loading", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(loading)), now));
+    let mut ready = base;
+    set_auth_logout_operation(&mut ready, "logout-1", "ready", None);
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(ready)), now),
+        AppAction::ClientCommand(ClientCommand::RequestAuthStatuses)
+    );
+    assert!(!render_app(&app).contains("Reset credential?"));
+}
+
+#[test]
+fn config_reset_confirmation_clears_when_its_target_is_removed() {
+    let mut snapshot = patched_mcp_snapshot();
+    set_auth_status(&mut snapshot, "mcpServer", "files", "oauthConfigured", true);
+    let mut app = open_config_app_with(snapshot.clone());
+    let now = Instant::now();
+    drop(app.handle_event(&tab_press(), now));
+    drop(app.handle_event(&char_press('r'), now));
+    assert!(render_app(&app).contains("Reset credential?"));
+
+    snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .mcp_servers
+        .remove("files");
+    drop(app.handle_event(&AppEvent::Client(Box::new(snapshot)), now));
+    assert!(!render_app(&app).contains("Reset credential?"));
+    drop(app.handle_event(&tab_press(), now));
+    assert_eq!(app.active_config_tab(), ConfigTab::Defaults);
+}
+
+#[test]
+fn config_provider_and_mcp_actions_follow_complete_status_matrix() {
+    let cases = [
+        (None, false, false, false, false),
+        (Some("apiKeyConfigured"), true, false, false, false),
+        (Some("notConfigured"), true, true, false, false),
+        (Some("oauthConfigured"), true, true, true, true),
+        (Some("expired"), true, true, false, true),
+        (Some("authorizationRequired"), true, true, false, true),
+        (Some("unsupported"), false, false, false, false),
+    ];
+    for target_kind in ["provider", "mcpServer"] {
+        for (kind, oauth_supported, can_authorize, can_refresh, can_reset) in cases {
+            let now = Instant::now();
+            let expected_target = matrix_target(target_kind);
+
+            let mut authorize_app = open_matrix_app(
+                target_kind,
+                kind,
+                oauth_supported,
+                can_refresh,
+            );
+            let authorize = authorize_app.handle_event(&char_press('a'), now);
+            if can_authorize {
+                assert_eq!(
+                    authorize,
+                    AppAction::ClientCommand(ClientCommand::BeginAuth {
+                        target: expected_target.clone(),
+                    }),
+                    "authorize matrix failed for {target_kind} {kind:?}"
+                );
+            } else {
+                assert_eq!(authorize, AppAction::Continue);
+            }
+
+            let mut refresh_app = open_matrix_app(
+                target_kind,
+                kind,
+                oauth_supported,
+                can_refresh,
+            );
+            let refresh = refresh_app.handle_event(&char_press('f'), now);
+            if can_refresh {
+                assert_eq!(
+                    refresh,
+                    AppAction::ClientCommand(ClientCommand::RefreshAuth {
+                        target: expected_target.clone(),
+                    }),
+                    "refresh matrix failed for {target_kind} {kind:?}"
+                );
+            } else {
+                assert_eq!(refresh, AppAction::Continue);
+            }
+
+            let mut reset_app = open_matrix_app(
+                target_kind,
+                kind,
+                oauth_supported,
+                can_refresh,
+            );
+            assert_eq!(
+                reset_app.handle_event(&char_press('r'), now),
+                AppAction::Continue
+            );
+            assert_eq!(
+                render_app(&reset_app).contains("Reset credential?"),
+                can_reset,
+                "reset matrix failed for {target_kind} {kind:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "out-of-order snapshots document the complete cross-target operation sequence"
+)]
+fn config_cross_target_refresh_overlap_binds_target_and_key() {
+    let mut base = patched_mcp_snapshot();
+    set_auth_status(&mut base, "provider", "anthropic", "oauthConfigured", true);
+    set_auth_status(&mut base, "mcpServer", "files", "oauthConfigured", true);
+    let mut app = open_config_app_with(base.clone());
+    let now = Instant::now();
+
+    assert!(matches!(
+        app.handle_event(&char_press('f'), now),
+        AppAction::ClientCommand(ClientCommand::RefreshAuth {
+            target: ClientAuthTarget { ref kind, .. }
+        }) if kind == "provider"
+    ));
+    drop(app.handle_event(&tab_press(), now));
+    assert!(matches!(
+        app.handle_event(&char_press('f'), now),
+        AppAction::ClientCommand(ClientCommand::RefreshAuth {
+            target: ClientAuthTarget { ref kind, .. }
+        }) if kind == "mcpServer"
+    ));
+
+    let mut provider_ready_early = base.clone();
+    set_auth_refresh_operation_for(
+        &mut provider_ready_early,
+        "provider-refresh",
+        "ready",
+        None,
+        matrix_target("provider"),
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(provider_ready_early)), now),
+        AppAction::Continue
+    );
+
+    let mut mcp_loading = base.clone();
+    set_auth_refresh_operation_for(
+        &mut mcp_loading,
+        "mcp-refresh",
+        "loading",
+        None,
+        matrix_target("mcpServer"),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(mcp_loading)), now));
+    let mut mcp_ready = base.clone();
+    set_auth_refresh_operation_for(
+        &mut mcp_ready,
+        "mcp-refresh",
+        "ready",
+        None,
+        matrix_target("mcpServer"),
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(mcp_ready)), now),
+        AppAction::ClientCommand(ClientCommand::RequestAuthStatuses)
+    );
+
+    drop(app.handle_event(&tab_press(), now));
+    drop(app.handle_event(&tab_press(), now));
+    assert_eq!(app.active_config_tab(), ConfigTab::Providers);
+    assert!(app.config_auth_action_pending(&matrix_target("provider")));
+
+    let mut provider_loading = base.clone();
+    set_auth_refresh_operation_for(
+        &mut provider_loading,
+        "provider-refresh",
+        "loading",
+        None,
+        matrix_target("provider"),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(provider_loading)), now));
+    let mut provider_ready = base;
+    set_auth_refresh_operation_for(
+        &mut provider_ready,
+        "provider-refresh",
+        "ready",
+        None,
+        matrix_target("provider"),
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(provider_ready)), now),
+        AppAction::ClientCommand(ClientCommand::RequestAuthStatuses)
+    );
+    assert!(!app.config_auth_action_pending(&matrix_target("provider")));
+}
+
+#[test]
+fn config_targeted_begin_and_reset_failures_settle_only_the_initiator() {
+    let now = Instant::now();
+    let mut mcp_base = patched_mcp_snapshot();
+    set_auth_status(
+        &mut mcp_base,
+        "mcpServer",
+        "files",
+        "authorizationRequired",
+        false,
+    );
+    let mut mcp_app = open_config_app_with(mcp_base.clone());
+    drop(mcp_app.handle_event(&tab_press(), now));
+    drop(mcp_app.handle_event(&char_press('a'), now));
+    let mut begin_loading = mcp_base.clone();
+    set_auth_begin_operation_for(
+        &mut begin_loading,
+        "mcp-begin",
+        "loading",
+        None,
+        matrix_target("mcpServer"),
+    );
+    drop(mcp_app.handle_event(&AppEvent::Client(Box::new(begin_loading)), now));
+    let mut begin_failed = mcp_base;
+    set_auth_begin_operation_for(
+        &mut begin_failed,
+        "mcp-begin",
+        "failed",
+        Some("MCP authorization rejected"),
+        matrix_target("mcpServer"),
+    );
+    drop(mcp_app.handle_event(&AppEvent::Client(Box::new(begin_failed)), now));
+    assert!(!mcp_app.config_auth_action_pending(&matrix_target("mcpServer")));
+    assert!(render_app(&mcp_app).contains("MCP authorization rejected"));
+
+    let mut provider_base = watched_config_snapshot();
+    set_auth_status(
+        &mut provider_base,
+        "provider",
+        "anthropic",
+        "authorizationRequired",
+        false,
+    );
+    let mut provider_app = open_config_app_with(provider_base.clone());
+    drop(provider_app.handle_event(&char_press('r'), now));
+    drop(provider_app.handle_event(&enter_press(), now));
+    let mut logout_loading = provider_base.clone();
+    set_auth_logout_operation_for(
+        &mut logout_loading,
+        "provider-logout",
+        "loading",
+        None,
+        matrix_target("provider"),
+    );
+    drop(provider_app.handle_event(&AppEvent::Client(Box::new(logout_loading)), now));
+    let mut logout_failed = provider_base;
+    set_auth_logout_operation_for(
+        &mut logout_failed,
+        "provider-logout",
+        "failed",
+        Some("provider reset rejected"),
+        matrix_target("provider"),
+    );
+    drop(provider_app.handle_event(&AppEvent::Client(Box::new(logout_failed)), now));
+    assert!(!provider_app.config_auth_action_pending(&matrix_target("provider")));
+    assert!(render_app(&provider_app).contains("provider reset rejected"));
+}
+
+#[test]
+fn config_malformed_oauth_json_preserves_mappings_and_keeps_focus() {
+    for (field, expected_error) in [
+        (12, "authorization parameters must be a valid JSON array"),
+        (13, "JWT metadata mappings must be a valid JSON array"),
+    ] {
+        let mut app = open_config_app_with(oauth_mapping_snapshot());
+        let now = Instant::now();
+        drop(app.handle_event(&enter_press(), now));
+        for _ in 0..field {
+            drop(app.handle_event(&tab_press(), now));
+        }
+        for _ in 0..256 {
+            drop(app.handle_event(&backspace_press(), now));
+        }
+        type_text(&mut app, "{malformed", now);
+        assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+        let form = app.provider_section().config_form().expect("form stays open");
+        assert_eq!(form.field, field);
+        let rendered = render_app(&app);
+        let visible_error = if field == 12 {
+            "error: authorization parameters"
+        } else {
+            "error: JWT metadata mappings"
+        };
+        assert!(rendered.contains(visible_error), "{expected_error}: {rendered}");
+
+        for _ in 0..32 {
+            drop(app.handle_event(&backspace_press(), now));
+        }
+        let valid = if field == 12 {
+            r#"[{"key":"audience","value":"api"}]"#
+        } else {
+            r#"[{"token":"id","metadataKey":"tenant","claimNames":["tid"],"required":true}]"#
+        };
+        type_text(&mut app, valid, now);
+        let AppAction::ClientCommand(ClientCommand::UpdateProvider { provider, .. }) =
+            app.handle_event(&enter_press(), now)
+        else {
+            panic!("valid structured edit should save");
+        };
+        let oauth = provider.oauth_settings.expect("OAuth settings remain");
+        assert_eq!(oauth.auth_url_params.len(), 1);
+        assert_eq!(oauth.jwt_metadata.len(), 1);
+    }
+}
+
+#[test]
+fn config_mcp_status_details_are_safe_bounded_and_render_registration_methods() {
+    for (method, label) in [
+        ("preregistered", "Preregistered"),
+        ("clientMetadata", "Client metadata"),
+        ("dynamic", "Dynamic"),
+    ] {
+        let mut snapshot = patched_mcp_snapshot();
+        let config = snapshot.config.current.as_mut().unwrap();
+        let mut server = config.mcp_servers.remove("files").unwrap();
+        server.name = "remote".to_owned();
+        server.kind = McpServerTypeView::Sse;
+        server.command.clear();
+        server.url = "https://mcp.example/sse".to_owned();
+        config.mcp_servers.insert("remote".to_owned(), server);
+        let mut status = auth_status("mcpServer", "remote", "authorizationRequired", false);
+        status.message = if method == "dynamic" {
+            "Authorization is required before this MCP server can be used.".to_owned()
+        } else {
+            format!("credential\u{1b}[31m {}", "x".repeat(600))
+        };
+        status.expires_at_ms = 1_800_000_000_000;
+        status.registration_method = method.to_owned();
+        snapshot.auth.statuses.insert("mcp:remote".to_owned(), status);
+        let mut app = open_config_app_with(snapshot);
+        drop(app.handle_event(&tab_press(), Instant::now()));
+        let rendered = render_app(&app);
+        assert!(!rendered.contains('\u{1b}'));
+        if method == "dynamic" {
+            assert!(rendered.contains("message: Authorization is required"));
+        } else {
+            assert!(rendered.contains("message: credential [31m"));
+            assert!(rendered.contains("..."));
+        }
+        assert!(rendered.contains("expires: 2027-01-15 08:00 UTC"));
+        assert!(rendered.contains(&format!("registration: {label}")));
+        if method == "dynamic" {
+            insta::assert_snapshot!("config_mcp_auth_status_details", rendered);
+        }
+    }
+}
+
+fn open_matrix_app(
+    target_kind: &str,
+    kind: Option<&str>,
+    oauth_supported: bool,
+    can_refresh: bool,
+) -> App {
+    let mut snapshot = patched_mcp_snapshot();
+    let target = matrix_target(target_kind);
+    if let Some(kind) = kind {
+        set_auth_status_with_methods(
+            &mut snapshot,
+            target_kind,
+            &target.key,
+            kind,
+            can_refresh,
+            if oauth_supported {
+                vec!["oauthManual".to_owned()]
+            } else {
+                Vec::new()
+            },
+        );
+    }
+    let mut app = open_config_app_with(snapshot);
+    if target_kind == "mcpServer" {
+        drop(app.handle_event(&tab_press(), Instant::now()));
+    }
+    app
+}
+
+fn matrix_target(target_kind: &str) -> ClientAuthTarget {
+    ClientAuthTarget {
+        kind: target_kind.to_owned(),
+        key: if target_kind == "mcpServer" {
+            "files".to_owned()
+        } else {
+            "anthropic".to_owned()
+        },
+    }
+}
+
+fn oauth_mapping_snapshot() -> ClientSnapshot {
+    let mut snapshot = watched_config_snapshot();
+    let provider = snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap();
+    provider.oauth_compatible = true;
+    provider.oauth_settings = Some(OAuthProviderView {
+        name: "OAuth".to_owned(),
+        authorize_url: String::new(),
+        token_url: String::new(),
+        client_id: "public".to_owned(),
+        redirect_uri: String::new(),
+        scopes: Vec::new(),
+        token_request_style: OAuthTokenRequestStyleView::FormUrlencoded,
+        auth_url_params: vec![OAuthUrlParamView {
+            key: "audience".to_owned(),
+            value: "api".to_owned(),
+        }],
+        jwt_metadata: vec![OAuthJwtMetadataView {
+            token: OAuthTokenFieldView::Id,
+            metadata_key: "tenant".to_owned(),
+            claim_names: vec!["tid".to_owned()],
+            required: true,
+        }],
+        send_state_in_token_request: false,
+    });
+    snapshot
+}
+
+fn provider_connected_status_snapshot() -> ClientSnapshot {
+    let mut snapshot = provider_oauth_config_snapshot();
+    let provider = snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap();
+    provider.url.clear();
+    let mut status = auth_status("provider", "anthropic", "oauthConfigured", true);
+    "OAuth credential is ready for provider requests.".clone_into(&mut status.message);
+    status.expires_at_ms = 1_800_000_000_000;
+    snapshot
+        .auth
+        .statuses
+        .insert("provider:anthropic".to_owned(), status);
+    snapshot
+}
+
+fn provider_oauth_config_snapshot() -> ClientSnapshot {
+    let mut snapshot = watched_config_snapshot();
+    let provider = snapshot
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap();
+    provider.oauth_compatible = true;
+    provider.oauth_settings = Some(OAuthProviderView {
+        name: "Example public OAuth".to_owned(),
+        authorize_url: "https://id.example/authorize".to_owned(),
+        token_url: "https://id.example/token".to_owned(),
+        client_id: "public-client".to_owned(),
+        redirect_uri: "http://127.0.0.1/callback".to_owned(),
+        scopes: vec!["openid".to_owned(), "profile".to_owned()],
+        token_request_style: OAuthTokenRequestStyleView::FormUrlencoded,
+        auth_url_params: Vec::new(),
+        jwt_metadata: Vec::new(),
+        send_state_in_token_request: false,
+    });
+    snapshot
+}
+
+fn type_text(app: &mut App, value: &str, now: Instant) {
+    for character in value.chars() {
+        drop(app.handle_event(&char_press(character), now));
+    }
+}
+
+fn test_auth_attempt(kind: &str, key: &str, lifecycle: &str) -> AuthAttemptSnapshot {
+    AuthAttemptSnapshot {
+        target: ClientAuthTarget {
+            kind: kind.to_owned(),
+            key: key.to_owned(),
+        },
+        attempt_id: "attempt-1".to_owned(),
+        auth_url: "https://id.example/authorize".to_owned(),
+        verification_url: String::new(),
+        user_code: String::new(),
+        expires_at_ms: 0,
+        poll_interval_seconds: 0,
+        messages: Vec::new(),
+        completion_mode: "manual".to_owned(),
+        registration_method: "unknown".to_owned(),
+        lifecycle: lifecycle.to_owned(),
+        failure_reason: String::new(),
+    }
+}
+
+fn set_auth_begin_operation(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) {
+    set_auth_begin_operation_for(
+        snapshot,
+        key,
+        status,
+        error,
+        matrix_target("provider"),
+    );
+}
+
+fn set_auth_begin_operation_for(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+    target: ClientAuthTarget,
+) {
+    snapshot.auth.begin = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::AuthBegin {
+            status,
+            error: error.map(str::to_owned),
+            target,
+            attempt: snapshot.auth.active_attempt.clone(),
+        },
+    );
+}
+
+fn set_auth_refresh_operation(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) {
+    set_auth_refresh_operation_for(
+        snapshot,
+        key,
+        status,
+        error,
+        matrix_target("provider"),
+    );
+}
+
+fn set_auth_refresh_operation_for(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+    target: ClientAuthTarget,
+) {
+    snapshot.auth.refresh = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::AuthRefresh {
+            status,
+            error: error.map(str::to_owned),
+            target,
+        },
+    );
+}
+
+fn set_auth_logout_operation(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) {
+    set_auth_logout_operation_for(
+        snapshot,
+        key,
+        status,
+        error,
+        matrix_target("mcpServer"),
+    );
+}
+
+fn set_auth_logout_operation_for(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+    target: ClientAuthTarget,
+) {
+    snapshot.auth.logout = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::AuthLogout {
+            status,
+            error: error.map(str::to_owned),
+            target,
+        },
+    );
+}
+
+fn set_auth_complete_operation(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) {
+    snapshot.auth.complete = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::AuthComplete {
+            status,
+            error: error.map(str::to_owned),
+        },
+    );
+}
+
+fn set_auth_cancel_operation(
+    snapshot: &mut ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) {
+    snapshot.auth.cancel = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::AuthCancel {
+            status,
+            error: error.map(str::to_owned),
+        },
+    );
 }
 
 #[test]
@@ -847,7 +2128,7 @@ fn config_waits_instead_of_rendering_startup_loaded_config() {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
 
     let rendered = render_app(&app);
@@ -870,7 +2151,7 @@ fn config_renders_waiting_watch_status() {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
 
     assert!(render_app(&app).contains("watch waiting"));
@@ -890,7 +2171,7 @@ fn config_pending_shows_loading_indicator_with_watch_status() {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
 
     let rendered = render_app(&app);
@@ -929,7 +2210,7 @@ fn config_error_takes_precedence_over_loading_indicator() {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
 
     let rendered = render_app(&app);
@@ -954,7 +2235,7 @@ fn config_renders_opened_and_received_watch_statuses() {
         assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
         assert_eq!(
             app.handle_event(&char_press('c'), now),
-            AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+            expected_config_entry_action()
         );
 
         assert!(render_app(&app).contains(&format!("watch {status}")));
@@ -975,7 +2256,7 @@ fn config_omits_non_ready_load_status() {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
 
     let rendered = render_app(&app);
@@ -995,7 +2276,7 @@ fn escape_returns_from_config_to_landing() {
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('c'), now),
-        AppAction::ClientCommand(ClientCommand::RegisterConfigWatchInterest)
+        expected_config_entry_action()
     );
     assert_eq!(
         app.handle_event(&escape_press(), now),
