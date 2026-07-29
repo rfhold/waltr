@@ -1,6 +1,6 @@
 import { AppStateProvider } from "./state";
 import { AppRouter } from "../routes";
-import type { WasmClientLoader } from "../wasm/client";
+import { loadWasmClient, type WasmClientLoader } from "../wasm/client";
 
 export type AppProps = {
   loadWasmClient?: WasmClientLoader;
@@ -8,7 +8,7 @@ export type AppProps = {
 
 export function App(props: AppProps) {
   return (
-    <AppStateProvider loadWasmClient={props.loadWasmClient}>
+    <AppStateProvider loadWasmClient={props.loadWasmClient ?? loadWasmClient}>
       <AppRouter />
     </AppStateProvider>
   );

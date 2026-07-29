@@ -9,14 +9,11 @@ import {
 
 import { AppStateContextProvider, type AppPhase } from "./context";
 import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../generated/waltr-client";
-import {
-  loadWasmClient,
-  type WasmClientLoader,
-} from "../wasm/client";
+import type { WasmClientLoader } from "../wasm/client";
 import { FixtureAppStateProvider, fixtureSnapshotForPath } from "./fixtures";
 
 type AppStateProviderProps = ParentProps<{
-  loadWasmClient?: WasmClientLoader;
+  loadWasmClient: WasmClientLoader;
 }>;
 
 export function AppStateProvider(props: AppStateProviderProps) {
@@ -31,9 +28,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
   const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Extract<ClientCommand, { type: "beginAuth" }>["target"]>();
   const [ignoredTerminalAttemptId, setIgnoredTerminalAttemptId] = createSignal<string>();
   const operationWaiters = new Set<OperationWaiter>();
-  const [wasmClient] = createResource(() =>
-    (props.loadWasmClient ?? loadWasmClient)(),
-  );
+  const [wasmClient] = createResource(() => props.loadWasmClient());
   const [minimumSplashElapsed] = createResource(async () => {
     await sleep(300);
     return true;
