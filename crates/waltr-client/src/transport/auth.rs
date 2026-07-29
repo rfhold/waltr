@@ -1,16 +1,14 @@
 use waltr::grpc::waltr::auth::v1::{
-    AuthMethod, AuthTarget, BeginAuthRequest, BeginProviderAuthRequest, CancelAuthRequest,
-    CancelProviderAuthRequest, CompleteAuthRequest, CompleteProviderAuthRequest,
-    GetAuthAttemptStatusRequest, ListAuthStatusesRequest, ListProviderAuthStatusesRequest,
-    LogoutProviderRequest, LogoutRequest, ProviderAuthMethod,
+    AuthMethod, AuthTarget, BeginAuthRequest, CancelAuthRequest, CompleteAuthRequest,
+    GetAuthAttemptStatusRequest, ListAuthStatusesRequest, LogoutRequest, RefreshAuthRequest,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
 use crate::{ClientError, transport::RemoteTransport};
 
 pub use waltr::grpc::waltr::auth::v1::{
-    AuthStatus, BeginAuthResponse as GenericAuthAttempt, BeginProviderAuthResponse as AuthAttempt,
-    GetAuthAttemptStatusResponse as GenericAuthAttemptStatus, ProviderAuthStatus,
+    AuthStatus, BeginAuthResponse as GenericAuthAttempt,
+    GetAuthAttemptStatusResponse as GenericAuthAttemptStatus,
 };
 
 #[allow(
@@ -176,9 +174,10 @@ where
     clippy::future_not_send,
     reason = "browser RPC futures are locally polled"
 )]
-pub(super) async fn list_provider_auth_statuses<T>(
+pub(super) async fn refresh_auth<T>(
     transport: &T,
-) -> Result<Vec<ProviderAuthStatus>, ClientError>
+    target: AuthTarget,
+) -> Result<AuthStatus, ClientError>
 where
     T: RemoteTransport,
     T::Inner: tonic::client::GrpcService<tonic::body::Body>,
@@ -191,118 +190,9 @@ where
     let credentials = transport.request_credentials();
     let mut client = transport.auth_client(&credentials).await?;
     let response = client
-        .list_provider_auth_statuses(ListProviderAuthStatusesRequest {})
-        .await
-        .map_err(|error| super::status_error(&error, &credentials))?;
-    Ok(response.into_inner().statuses)
-}
-
-#[allow(
-    clippy::future_not_send,
-    reason = "browser RPC futures are locally polled"
-)]
-pub(super) async fn begin_provider_auth<T>(
-    transport: &T,
-    provider_key: String,
-) -> Result<AuthAttempt, ClientError>
-where
-    T: RemoteTransport,
-    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
-        Body<Data = Bytes> + Send + 'static,
-    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
-        Into<StdError> + Send,
-{
-    let credentials = transport.request_credentials();
-    let mut client = transport.auth_client(&credentials).await?;
-    let response = client
-        .begin_provider_auth(BeginProviderAuthRequest {
-            provider_key,
-            method: ProviderAuthMethod::OauthManual as i32,
+        .refresh_auth(RefreshAuthRequest {
+            target: Some(target),
         })
-        .await
-        .map_err(|error| super::status_error(&error, &credentials))?;
-    Ok(response.into_inner())
-}
-
-#[allow(
-    clippy::future_not_send,
-    reason = "browser RPC futures are locally polled"
-)]
-pub(super) async fn complete_provider_auth<T>(
-    transport: &T,
-    attempt_id: String,
-    input: String,
-) -> Result<ProviderAuthStatus, ClientError>
-where
-    T: RemoteTransport,
-    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
-        Body<Data = Bytes> + Send + 'static,
-    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
-        Into<StdError> + Send,
-{
-    let credentials = transport.request_credentials();
-    let mut client = transport.auth_client(&credentials).await?;
-    let response = client
-        .complete_provider_auth(CompleteProviderAuthRequest { attempt_id, input })
-        .await
-        .map_err(|error| super::status_error(&error, &credentials))?;
-    response
-        .into_inner()
-        .status
-        .ok_or_else(|| ClientError::new("auth response did not include status"))
-}
-
-#[allow(
-    clippy::future_not_send,
-    reason = "browser RPC futures are locally polled"
-)]
-pub(super) async fn cancel_provider_auth<T>(
-    transport: &T,
-    attempt_id: String,
-) -> Result<(), ClientError>
-where
-    T: RemoteTransport,
-    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
-        Body<Data = Bytes> + Send + 'static,
-    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
-        Into<StdError> + Send,
-{
-    let credentials = transport.request_credentials();
-    let mut client = transport.auth_client(&credentials).await?;
-    client
-        .cancel_provider_auth(CancelProviderAuthRequest { attempt_id })
-        .await
-        .map_err(|error| super::status_error(&error, &credentials))?;
-    Ok(())
-}
-
-#[allow(
-    clippy::future_not_send,
-    reason = "browser RPC futures are locally polled"
-)]
-pub(super) async fn logout_provider<T>(
-    transport: &T,
-    provider_key: String,
-) -> Result<ProviderAuthStatus, ClientError>
-where
-    T: RemoteTransport,
-    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
-        Body<Data = Bytes> + Send + 'static,
-    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
-        Into<StdError> + Send,
-{
-    let credentials = transport.request_credentials();
-    let mut client = transport.auth_client(&credentials).await?;
-    let response = client
-        .logout_provider(LogoutProviderRequest { provider_key })
         .await
         .map_err(|error| super::status_error(&error, &credentials))?;
     response

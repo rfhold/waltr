@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    CompletionTurn, ModelRef, PromptTurn, ProviderTurnMetadata, ThinkingBlock, ToolCall,
-    ToolResult, TurnItem,
+    AuthenticationFailure, CompletionTurn, ModelRef, PromptTurn, ProviderTurnMetadata,
+    ThinkingBlock, ToolCall, ToolResult, TurnItem,
     timeline::{
         AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, TimelineContent,
         TimelineCursor, TimelineEventKind, TimelineStatus,
@@ -663,9 +663,13 @@ impl SessionSnapshot {
             SessionJournalEvent::Finished => {
                 self.status = SessionStatus::Finished;
             }
-            SessionJournalEvent::Failed { message } => {
+            SessionJournalEvent::Failed {
+                message,
+                authentication_failure,
+            } => {
                 self.status = SessionStatus::Failed {
                     message: message.clone(),
+                    authentication_failure: authentication_failure.clone(),
                 };
             }
         }
@@ -736,6 +740,7 @@ impl SessionSnapshot {
             TimelineStatus::Finished => SessionStatus::Finished,
             TimelineStatus::Failed => SessionStatus::Failed {
                 message: timeline_failure_message(event),
+                authentication_failure: None,
             },
             TimelineStatus::Pending | TimelineStatus::Resolved | TimelineStatus::Canceled => {
                 self.status.clone()
@@ -883,7 +888,11 @@ pub enum SessionStatus {
     /// Session completed normally.
     Finished,
     /// Session failed with a durable error message.
-    Failed { message: String },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authentication_failure: Option<AuthenticationFailure>,
+    },
 }
 
 /// Ordered durable session journal event.
@@ -933,7 +942,11 @@ pub enum SessionJournalEvent {
     /// Session completed normally.
     Finished,
     /// Session failed.
-    Failed { message: String },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authentication_failure: Option<AuthenticationFailure>,
+    },
 }
 
 /// Input used to resume a session.
@@ -1209,6 +1222,63 @@ mod tests {
 
     fn assigned(cursor: u64, pending: PendingTimelineEvent) -> SessionJournalEvent {
         SessionJournalEvent::Timeline(pending.with_cursor(TimelineCursor::new(cursor)))
+    }
+
+    #[test]
+    fn legacy_failed_status_and_journal_event_remain_readable() {
+        let status: SessionStatus = serde_json::from_str(r#"{"Failed":{"message":"legacy"}}"#)
+            .expect("legacy failed status");
+        let event: SessionJournalEvent = serde_json::from_str(r#"{"Failed":{"message":"legacy"}}"#)
+            .expect("legacy failed journal event");
+
+        assert_eq!(
+            status,
+            SessionStatus::Failed {
+                message: "legacy".to_owned(),
+                authentication_failure: None,
+            }
+        );
+        assert_eq!(
+            event,
+            SessionJournalEvent::Failed {
+                message: "legacy".to_owned(),
+                authentication_failure: None,
+            }
+        );
+    }
+
+    #[test]
+    fn authentication_failure_round_trips_through_failed_journal_status() {
+        let failure = AuthenticationFailure {
+            target: crate::AuthTarget::mcp_server("configured-mcp"),
+            reason: crate::AuthenticationFailureReason::CredentialRejected,
+            mcp_authorization: Some(Box::new(crate::McpAuthorizationContext {
+                endpoint: "https://mcp.example/rpc".to_owned(),
+                http_status: 401,
+                resource_metadata_url: None,
+                scope: Some("tools.read".to_owned()),
+                error: Some("invalid_token".to_owned()),
+                error_description: None,
+                error_uri: None,
+                realm: None,
+            })),
+        };
+        let event = SessionJournalEvent::Failed {
+            message: "authentication failed".to_owned(),
+            authentication_failure: Some(failure.clone()),
+        };
+        let serialized = serde_json::to_string(&event).expect("serialize failed event");
+        let restored: SessionJournalEvent =
+            serde_json::from_str(&serialized).expect("deserialize failed event");
+        let snapshot = SessionSnapshot::from_journal(SessionId::new("session-1"), &[restored]);
+
+        assert_eq!(
+            snapshot.status,
+            SessionStatus::Failed {
+                message: "authentication failed".to_owned(),
+                authentication_failure: Some(failure),
+            }
+        );
     }
 
     fn provider_fact_events(

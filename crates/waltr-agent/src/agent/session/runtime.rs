@@ -3,7 +3,7 @@
 #![allow(missing_docs)]
 
 use crate::{
-    LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
+    AuthenticationFailure, LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
     permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
     timeline::{
         CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
@@ -270,6 +270,23 @@ where
             .set_runtime_settings(id, runtime_settings)
             .await
             .map_err(session_store_error)
+    }
+
+    pub(crate) async fn fail_authentication(
+        &self,
+        id: &SessionId,
+        message: String,
+        authentication_failure: AuthenticationFailure,
+    ) -> Result<SessionRecord> {
+        let record = self.load_session(id).await?;
+        self.append_journal_and_reload(
+            record,
+            vec![SessionJournalEvent::Failed {
+                message,
+                authentication_failure: Some(authentication_failure),
+            }],
+        )
+        .await
     }
 
     async fn interrupt_record(&self, record: SessionRecord) -> Result<SessionRecord> {

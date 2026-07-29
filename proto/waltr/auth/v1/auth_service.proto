@@ -9,13 +9,8 @@ service AuthService {
   rpc CompleteAuth(CompleteAuthRequest) returns (CompleteAuthResponse);
   rpc GetAuthAttemptStatus(GetAuthAttemptStatusRequest) returns (GetAuthAttemptStatusResponse);
   rpc CancelAuth(CancelAuthRequest) returns (CancelAuthResponse);
+  rpc RefreshAuth(RefreshAuthRequest) returns (RefreshAuthResponse);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
-  rpc ListProviderAuthStatuses(ListProviderAuthStatusesRequest) returns (ListProviderAuthStatusesResponse);
-  rpc GetProviderAuthStatus(GetProviderAuthStatusRequest) returns (GetProviderAuthStatusResponse);
-  rpc BeginProviderAuth(BeginProviderAuthRequest) returns (BeginProviderAuthResponse);
-  rpc CompleteProviderAuth(CompleteProviderAuthRequest) returns (CompleteProviderAuthResponse);
-  rpc CancelProviderAuth(CancelProviderAuthRequest) returns (CancelProviderAuthResponse);
-  rpc LogoutProvider(LogoutProviderRequest) returns (LogoutProviderResponse);
 }
 
 message ListAuthStatusesRequest {}
@@ -107,6 +102,14 @@ message CancelAuthRequest {
 
 message CancelAuthResponse {}
 
+message RefreshAuthRequest {
+  AuthTarget target = 1;
+}
+
+message RefreshAuthResponse {
+  AuthStatus status = 1;
+}
+
 message LogoutRequest {
   AuthTarget target = 1;
 }
@@ -168,6 +171,7 @@ message AuthStatus {
   map<string, string> metadata = 5;
   string message = 6;
   McpOAuthRegistrationMethod registration_method = 7;
+  bool can_refresh = 8;
 }
 
 enum AuthStatusKind {
@@ -184,81 +188,4 @@ enum AuthMethod {
   AUTH_METHOD_UNSPECIFIED = 0;
   AUTH_METHOD_OAUTH_MANUAL = 1;
   AUTH_METHOD_OAUTH_DEVICE = 2;
-}
-
-message ListProviderAuthStatusesRequest {}
-
-message ListProviderAuthStatusesResponse {
-  repeated ProviderAuthStatus statuses = 1;
-}
-
-message GetProviderAuthStatusRequest {
-  string provider_key = 1;
-}
-
-message GetProviderAuthStatusResponse {
-  ProviderAuthStatus status = 1;
-}
-
-message BeginProviderAuthRequest {
-  string provider_key = 1;
-  ProviderAuthMethod method = 2;
-}
-
-message BeginProviderAuthResponse {
-  string attempt_id = 1;
-  ProviderAuthMethod method = 2;
-  string auth_url = 3;
-  string verification_url = 4;
-  string user_code = 5;
-  int64 expires_at_ms = 6;
-  int32 poll_interval_seconds = 7;
-  repeated string messages = 8;
-}
-
-message CompleteProviderAuthRequest {
-  string attempt_id = 1;
-  string input = 2;
-}
-
-message CompleteProviderAuthResponse {
-  ProviderAuthStatus status = 1;
-}
-
-message CancelProviderAuthRequest {
-  string attempt_id = 1;
-}
-
-message CancelProviderAuthResponse {}
-
-message LogoutProviderRequest {
-  string provider_key = 1;
-}
-
-message LogoutProviderResponse {
-  ProviderAuthStatus status = 1;
-}
-
-message ProviderAuthStatus {
-  string provider_key = 1;
-  ProviderAuthStatusKind kind = 2;
-  repeated ProviderAuthMethod supported_methods = 3;
-  int64 expires_at_ms = 4;
-  map<string, string> metadata = 5;
-  string message = 6;
-}
-
-enum ProviderAuthStatusKind {
-  PROVIDER_AUTH_STATUS_KIND_UNSPECIFIED = 0;
-  PROVIDER_AUTH_STATUS_KIND_NOT_CONFIGURED = 1;
-  PROVIDER_AUTH_STATUS_KIND_API_KEY_CONFIGURED = 2;
-  PROVIDER_AUTH_STATUS_KIND_OAUTH_CONFIGURED = 3;
-  PROVIDER_AUTH_STATUS_KIND_EXPIRED = 4;
-  PROVIDER_AUTH_STATUS_KIND_UNSUPPORTED = 5;
-}
-
-enum ProviderAuthMethod {
-  PROVIDER_AUTH_METHOD_UNSPECIFIED = 0;
-  PROVIDER_AUTH_METHOD_OAUTH_MANUAL = 1;
-  PROVIDER_AUTH_METHOD_OAUTH_DEVICE = 2;
 }

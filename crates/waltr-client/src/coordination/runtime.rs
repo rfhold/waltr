@@ -19,14 +19,14 @@ use crate::executor::{
 };
 use crate::transport::SessionTimelineWatchUpdate;
 use crate::{
-    AccessAttemptId, AccessStatus, AuthAttemptState, AuthRequirement, AuthTarget, CatalogEffect,
+    AccessAttemptId, AccessStatus, AuthAttemptState, AuthStatus, AuthTarget, CatalogEffect,
     CatalogMatchView, CatalogModelSummaryView, Client, ClientEffect, ClientError, ClientEvent,
     ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
-    McpAuthorizationRequirement, McpServerView, OperationKey, OperationStatus, ProviderView,
-    RollbackTarget, RuntimeDefaultsView, SessionEffect, SessionEvent, SessionRuntimeConfigRequest,
-    SessionTemplateKind, SessionTemplateOption, SessionTimelineView, SessionView,
-    StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
-    TimelineWatchKey, rollback_target,
+    McpAuthorizationContext, McpServerView, OperationKey, OperationStatus,
+    OutboundAuthenticationFailure, ProviderView, RollbackTarget, RuntimeDefaultsView,
+    SessionEffect, SessionEvent, SessionRuntimeConfigRequest, SessionTemplateKind,
+    SessionTemplateOption, SessionTimelineView, SessionView, StatusChangeStream, StatusEffect,
+    StatusEvent, TimelineDirection, TimelineQuery, TimelineWatchKey, rollback_target,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -70,11 +70,6 @@ pub enum ClientCommand {
     },
     /// Load secret-safe auth statuses.
     RequestAuthStatuses,
-    /// Dismiss one queued auth requirement.
-    DismissAuthRequirement {
-        /// Target to dismiss from the queue.
-        target: ClientAuthTarget,
-    },
     /// Begin manual OAuth for a target.
     BeginAuth {
         /// Target to authenticate.
@@ -99,6 +94,11 @@ pub enum ClientCommand {
         /// Attempt id returned by begin.
         #[serde(rename = "attemptId")]
         attempt_id: String,
+    },
+    /// Force-refresh stored OAuth credentials for a target.
+    RefreshAuth {
+        /// Target whose OAuth credential should be refreshed.
+        target: ClientAuthTarget,
     },
     /// Delete stored credentials for a target.
     LogoutAuth {
@@ -462,8 +462,8 @@ pub struct AccessSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthSnapshot {
-    /// Pending auth requirements in modal display order.
-    pub pending: Vec<AuthRequirementSnapshot>,
+    /// Last known secret-safe auth statuses by stable target key.
+    pub statuses: BTreeMap<String, AuthStatusSnapshot>,
     /// Active manual auth attempt, when one has started.
     #[serde(rename = "activeAttempt")]
     pub active_attempt: Option<AuthAttemptSnapshot>,
@@ -475,30 +475,59 @@ pub struct AuthSnapshot {
     pub complete: OperationSnapshot,
     /// Cancel auth operation state.
     pub cancel: OperationSnapshot,
+    /// Forced refresh operation state.
+    pub refresh: OperationSnapshot,
     /// Logout operation state.
     pub logout: OperationSnapshot,
 }
 
-/// One pending auth requirement.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+/// Secret-safe auth status exposed to UI shells.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct AuthRequirementSnapshot {
-    /// Target that requires authentication.
+pub struct AuthStatusSnapshot {
+    /// Target whose status is represented.
     pub target: ClientAuthTarget,
-    /// Human-readable reason.
+    /// Stable status kind name.
+    pub kind: String,
+    /// Supported authorization method names.
+    #[serde(rename = "supportedMethods")]
+    pub supported_methods: Vec<String>,
+    /// Credential expiry in Unix milliseconds, or zero when unknown.
+    #[serde(rename = "expiresAtMs")]
+    pub expires_at_ms: i64,
+    /// Non-secret provider or MCP metadata.
+    pub metadata: BTreeMap<String, String>,
+    /// Sanitized status detail.
     pub message: String,
-    /// Session whose work reported the requirement.
-    #[serde(rename = "sourceSessionId")]
-    pub source_session_id: Option<String>,
-    /// Sanitized upstream MCP bearer challenge context.
-    #[serde(rename = "mcpAuthorization")]
-    pub mcp_authorization: Option<McpAuthorizationRequirementSnapshot>,
+    /// Non-secret MCP registration method name.
+    #[serde(rename = "registrationMethod")]
+    pub registration_method: String,
+    /// Whether forced refresh is currently available.
+    #[serde(rename = "canRefresh")]
+    pub can_refresh: bool,
 }
 
-/// Sanitized upstream MCP bearer challenge context.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+/// Structured outbound authentication failure exposed to UI shells.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct McpAuthorizationRequirementSnapshot {
+pub struct AuthenticationFailureSnapshot {
+    /// Failure schema version.
+    pub version: u32,
+    /// Stable authentication domain name.
+    pub domain: String,
+    /// Stable authentication failure reason name.
+    pub reason: String,
+    /// Provider or MCP target that failed.
+    pub target: ClientAuthTarget,
+    /// Sanitized upstream MCP context, when supplied.
+    #[serde(rename = "mcpContext")]
+    pub mcp_context: Option<McpAuthorizationContextSnapshot>,
+}
+
+/// Sanitized upstream MCP authentication context.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAuthorizationContextSnapshot {
     /// Protected MCP endpoint, when safe.
     pub endpoint: Option<String>,
     /// HTTP status associated with the challenge.
@@ -593,6 +622,15 @@ pub enum ClientOperationView {
         /// Last operation error, when present.
         error: Option<String>,
     },
+    /// Forced auth refresh command result.
+    AuthRefresh {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Target being refreshed.
+        target: ClientAuthTarget,
+    },
     /// Logout command result.
     AuthLogout {
         /// Stable operation status name.
@@ -647,6 +685,9 @@ pub enum ClientOperationView {
         /// Session id submitted to.
         #[serde(rename = "sessionId")]
         session_id: String,
+        /// Structured outbound authentication failure, when present.
+        #[serde(rename = "authenticationFailure")]
+        authentication_failure: Option<AuthenticationFailureSnapshot>,
     },
     /// External request response command result.
     SessionRespondExternalRequest {
@@ -660,6 +701,9 @@ pub enum ClientOperationView {
         /// External request id.
         #[serde(rename = "requestId")]
         request_id: String,
+        /// Structured outbound authentication failure, when present.
+        #[serde(rename = "authenticationFailure")]
+        authentication_failure: Option<AuthenticationFailureSnapshot>,
     },
     /// Session interrupt command result.
     SessionInterrupt {
@@ -694,6 +738,9 @@ pub enum ClientOperationView {
         session_id: String,
         /// Rollback target continued from.
         target: RollbackTargetView,
+        /// Structured outbound authentication failure, when present.
+        #[serde(rename = "authenticationFailure")]
+        authentication_failure: Option<AuthenticationFailureSnapshot>,
     },
 }
 
@@ -1376,11 +1423,11 @@ impl ClientStateStream {
                 self.runtime.reducer.expire_waltr_access(error)
             }
             ClientCommand::RequestAuthStatuses
-            | ClientCommand::DismissAuthRequirement { .. }
             | ClientCommand::BeginAuth { .. }
             | ClientCommand::CompleteAuth { .. }
             | ClientCommand::PollAuthAttempt { .. }
             | ClientCommand::CancelAuth { .. }
+            | ClientCommand::RefreshAuth { .. }
             | ClientCommand::LogoutAuth { .. } => self.begin_auth_command(command),
             ClientCommand::RequestConfig
             | ClientCommand::AddProvider { .. }
@@ -1435,21 +1482,6 @@ impl ClientStateStream {
     fn begin_auth_command(&mut self, command: ClientCommand) -> ClientUpdate {
         match command {
             ClientCommand::RequestAuthStatuses => self.runtime.reducer.request_auth_statuses(),
-            ClientCommand::DismissAuthRequirement { target } => {
-                let target = target.into_auth_target();
-                if self
-                    .runtime
-                    .reducer
-                    .state()
-                    .auth
-                    .active_attempt
-                    .as_ref()
-                    .is_some_and(|attempt| attempt.target == target)
-                {
-                    self.cancel_auth_poll_effects(None);
-                }
-                self.runtime.reducer.dismiss_auth_requirement(target)
-            }
             ClientCommand::BeginAuth { target } => {
                 self.cancel_auth_poll_effects(None);
                 self.runtime.reducer.begin_auth(target.into_auth_target())
@@ -1465,6 +1497,9 @@ impl ClientStateStream {
             ClientCommand::CancelAuth { attempt_id } => {
                 self.cancel_auth_poll_effects(Some(&attempt_id));
                 self.runtime.reducer.cancel_auth(attempt_id)
+            }
+            ClientCommand::RefreshAuth { target } => {
+                self.runtime.reducer.refresh_auth(target.into_auth_target())
             }
             ClientCommand::LogoutAuth { target } => {
                 let target = target.into_auth_target();
@@ -2080,12 +2115,15 @@ impl ClientSnapshot {
                 active_attempt_id: state.access.active_attempt_id.clone(),
             },
             auth: AuthSnapshot {
-                pending: state
+                statuses: state
                     .auth
-                    .pending
+                    .statuses
                     .iter()
-                    .cloned()
-                    .map(AuthRequirementSnapshot::from)
+                    .filter_map(|(key, status)| {
+                        AuthStatusSnapshot::try_from(status.clone())
+                            .ok()
+                            .map(|status| (key.clone(), status))
+                    })
                     .collect(),
                 active_attempt: state
                     .auth
@@ -2096,6 +2134,7 @@ impl ClientSnapshot {
                 begin: OperationSnapshot::from_state(&state.auth.begin),
                 complete: OperationSnapshot::from_state(&state.auth.complete),
                 cancel: OperationSnapshot::from_state(&state.auth.cancel),
+                refresh: OperationSnapshot::from_state(&state.auth.refresh),
                 logout: OperationSnapshot::from_state(&state.auth.logout),
             },
             catalog: CatalogSnapshot {
@@ -2277,31 +2316,141 @@ impl From<AuthTarget> for ClientAuthTarget {
     }
 }
 
-impl From<AuthRequirement> for AuthRequirementSnapshot {
-    fn from(requirement: AuthRequirement) -> Self {
+impl TryFrom<AuthStatus> for AuthStatusSnapshot {
+    type Error = ();
+
+    fn try_from(status: AuthStatus) -> Result<Self, Self::Error> {
+        let target = status.target.ok_or(())?;
+        let metadata_target = target.target.as_ref().ok_or(())?;
+        let metadata = status
+            .metadata
+            .into_iter()
+            .filter(|(key, value)| auth_status_metadata_is_safe(metadata_target, key, value))
+            .collect();
+        Ok(Self {
+            target: ClientAuthTarget::from(target),
+            kind: match waltr::grpc::waltr::auth::v1::AuthStatusKind::try_from(status.kind) {
+                Ok(waltr::grpc::waltr::auth::v1::AuthStatusKind::NotConfigured) => "notConfigured",
+                Ok(waltr::grpc::waltr::auth::v1::AuthStatusKind::ApiKeyConfigured) => {
+                    "apiKeyConfigured"
+                }
+                Ok(waltr::grpc::waltr::auth::v1::AuthStatusKind::OauthConfigured) => {
+                    "oauthConfigured"
+                }
+                Ok(waltr::grpc::waltr::auth::v1::AuthStatusKind::Expired) => "expired",
+                Ok(waltr::grpc::waltr::auth::v1::AuthStatusKind::Unsupported) => "unsupported",
+                Ok(waltr::grpc::waltr::auth::v1::AuthStatusKind::AuthorizationRequired) => {
+                    "authorizationRequired"
+                }
+                _ => "unknown",
+            }
+            .to_owned(),
+            supported_methods: status
+                .supported_methods
+                .into_iter()
+                .map(|method| {
+                    match waltr::grpc::waltr::auth::v1::AuthMethod::try_from(method) {
+                        Ok(waltr::grpc::waltr::auth::v1::AuthMethod::OauthManual) => "oauthManual",
+                        Ok(waltr::grpc::waltr::auth::v1::AuthMethod::OauthDevice) => "oauthDevice",
+                        _ => "unknown",
+                    }
+                    .to_owned()
+                })
+                .collect(),
+            expires_at_ms: status.expires_at_ms,
+            metadata,
+            message: status.message,
+            registration_method:
+                match waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::try_from(
+                    status.registration_method,
+                ) {
+                    Ok(waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::Preregistered) => {
+                        "preregistered"
+                    }
+                    Ok(waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::ClientMetadata) => {
+                        "clientMetadata"
+                    }
+                    Ok(waltr::grpc::waltr::auth::v1::McpOAuthRegistrationMethod::Dynamic) => {
+                        "dynamic"
+                    }
+                    _ => "unknown",
+                }
+                .to_owned(),
+            can_refresh: status.can_refresh,
+        })
+    }
+}
+
+fn auth_status_metadata_is_safe(
+    target: &waltr::grpc::waltr::auth::v1::auth_target::Target,
+    key: &str,
+    value: &str,
+) -> bool {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return false;
+    }
+    match target {
+        waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(_) => {
+            key == "account_id" && value.len() <= 256
+        }
+        waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(_) => match key {
+            "resource" | "issuer" => value.len() <= 2_048,
+            "scope" => value.len() <= 1_024,
+            "registration_method" => value.len() <= 64,
+            _ => false,
+        },
+    }
+}
+
+impl From<OutboundAuthenticationFailure> for AuthenticationFailureSnapshot {
+    fn from(failure: OutboundAuthenticationFailure) -> Self {
         Self {
-            target: ClientAuthTarget::from(requirement.target),
-            message: requirement.message,
-            source_session_id: requirement.source_session_id,
-            mcp_authorization: requirement
-                .mcp_authorization
-                .map(McpAuthorizationRequirementSnapshot::from),
+            version: failure.version,
+            domain: authentication_domain_name(failure.domain).to_owned(),
+            reason: authentication_failure_reason_name(failure.reason).to_owned(),
+            target: ClientAuthTarget::from(failure.target),
+            mcp_context: failure
+                .mcp_context
+                .map(McpAuthorizationContextSnapshot::from),
         }
     }
 }
 
-impl From<McpAuthorizationRequirement> for McpAuthorizationRequirementSnapshot {
-    fn from(requirement: McpAuthorizationRequirement) -> Self {
+impl From<McpAuthorizationContext> for McpAuthorizationContextSnapshot {
+    fn from(context: McpAuthorizationContext) -> Self {
         Self {
-            endpoint: requirement.endpoint,
-            http_status: requirement.http_status,
-            resource_metadata_url: requirement.resource_metadata_url,
-            scope: requirement.scope,
-            error: requirement.error,
-            error_description: requirement.error_description,
-            error_uri: requirement.error_uri,
-            realm: requirement.realm,
+            endpoint: context.endpoint,
+            http_status: context.http_status,
+            resource_metadata_url: context.resource_metadata_url,
+            scope: context.scope,
+            error: context.error,
+            error_description: context.error_description,
+            error_uri: context.error_uri,
+            realm: context.realm,
         }
+    }
+}
+
+fn authentication_domain_name(value: i32) -> &'static str {
+    use waltr::grpc::waltr::auth::v1::AuthenticationDomain;
+    match AuthenticationDomain::try_from(value) {
+        Ok(AuthenticationDomain::OutboundProvider) => "outboundProvider",
+        Ok(AuthenticationDomain::OutboundMcp) => "outboundMcp",
+        Ok(AuthenticationDomain::WaltrAccess) => "waltrAccess",
+        _ => "unknown",
+    }
+}
+
+fn authentication_failure_reason_name(value: i32) -> &'static str {
+    use waltr::grpc::waltr::auth::v1::AuthenticationFailureReason;
+    match AuthenticationFailureReason::try_from(value) {
+        Ok(AuthenticationFailureReason::CredentialRequired) => "credentialRequired",
+        Ok(AuthenticationFailureReason::CredentialRejected) => "credentialRejected",
+        Ok(AuthenticationFailureReason::NetworkFailed) => "networkFailed",
+        Ok(AuthenticationFailureReason::TokenExchangeFailed) => "tokenExchangeFailed",
+        Ok(AuthenticationFailureReason::ResponseInvalid) => "responseInvalid",
+        Ok(AuthenticationFailureReason::ConfigurationRequired) => "configurationRequired",
+        _ => "unknown",
     }
 }
 
@@ -2382,6 +2531,16 @@ impl From<ClientOperationState> for ClientOperationView {
                 status: operation_status_name(status),
                 error,
             },
+            ClientOperationState::AuthRefresh {
+                status,
+                error,
+                target,
+                ..
+            } => Self::AuthRefresh {
+                status: operation_status_name(status),
+                error,
+                target: ClientAuthTarget::from(target),
+            },
             ClientOperationState::AuthLogout {
                 status,
                 error,
@@ -2428,21 +2587,25 @@ impl From<ClientOperationState> for ClientOperationView {
                 status,
                 error,
                 session_id,
+                authentication_failure,
             } => Self::SessionSubmitUserMessage {
                 status: operation_status_name(status),
                 error,
                 session_id,
+                authentication_failure: authentication_failure.map(Into::into),
             },
             ClientOperationState::SessionRespondExternalRequest {
                 status,
                 error,
                 session_id,
                 request_id,
+                authentication_failure,
             } => Self::SessionRespondExternalRequest {
                 status: operation_status_name(status),
                 error,
                 session_id,
                 request_id,
+                authentication_failure: authentication_failure.map(Into::into),
             },
             ClientOperationState::SessionInterrupt {
                 status,
@@ -2469,11 +2632,13 @@ impl From<ClientOperationState> for ClientOperationView {
                 error,
                 session_id,
                 target,
+                authentication_failure,
             } => Self::SessionContinue {
                 status: operation_status_name(status),
                 error,
                 session_id,
                 target: RollbackTargetView::from(&target),
+                authentication_failure: authentication_failure.map(Into::into),
             },
         }
     }
@@ -2552,6 +2717,142 @@ mod tests {
         );
         assert_eq!(snapshot.catalog.suggestions.request_id, "suggest-1");
         assert_eq!(snapshot.catalog.suggestions.status, "loading");
+    }
+
+    #[test]
+    fn snapshot_exposes_secret_safe_auth_statuses_and_refresh_capability() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Auth(crate::AuthEvent::Listed(vec![
+            AuthStatus {
+                target: Some(AuthTarget {
+                    target: Some(
+                        waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
+                            "codex".to_owned(),
+                        ),
+                    ),
+                }),
+                kind: waltr::grpc::waltr::auth::v1::AuthStatusKind::OauthConfigured as i32,
+                supported_methods: vec![waltr::grpc::waltr::auth::v1::AuthMethod::OauthManual as i32],
+                expires_at_ms: 42,
+                metadata: std::collections::HashMap::from([
+                    ("account_id".to_owned(), "account-1".to_owned()),
+                    (
+                        "token_url".to_owned(),
+                        "https://secret.example/token".to_owned(),
+                    ),
+                    ("client_id".to_owned(), "secret-client".to_owned()),
+                    (
+                        "redirect_uri".to_owned(),
+                        "https://secret.example/callback".to_owned(),
+                    ),
+                    ("access_token".to_owned(), "access-secret".to_owned()),
+                    ("resource".to_owned(), "https://mcp.example".to_owned()),
+                    ("unknown".to_owned(), "unknown-secret".to_owned()),
+                ]),
+                can_refresh: true,
+                ..AuthStatus::default()
+            },
+        ])));
+
+        let snapshot = ClientSnapshot::from_client(&client);
+        let status = &snapshot.auth.statuses["provider:codex"];
+        assert_eq!(status.kind, "oauthConfigured");
+        assert_eq!(status.supported_methods, ["oauthManual"]);
+        assert_eq!(status.metadata["account_id"], "account-1");
+        assert_eq!(status.metadata.len(), 1);
+        assert!(status.can_refresh);
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains("access_token"));
+        assert!(!rendered.contains("refresh_token"));
+        assert!(!rendered.contains("token_url"));
+        assert!(!rendered.contains("client_id"));
+        assert!(!rendered.contains("redirect_uri"));
+        assert!(!rendered.contains("unknown-secret"));
+    }
+
+    #[test]
+    fn snapshot_retains_only_mcp_safe_metadata() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Auth(crate::AuthEvent::Listed(vec![
+            AuthStatus {
+                target: Some(AuthTarget {
+                    target: Some(
+                        waltr::grpc::waltr::auth::v1::auth_target::Target::McpServerKey(
+                            "remote".to_owned(),
+                        ),
+                    ),
+                }),
+                metadata: std::collections::HashMap::from([
+                    (
+                        "resource".to_owned(),
+                        "https://mcp.example/tools".to_owned(),
+                    ),
+                    ("issuer".to_owned(), "https://auth.example".to_owned()),
+                    ("scope".to_owned(), "tools.read tools.write".to_owned()),
+                    ("registration_method".to_owned(), "dynamic".to_owned()),
+                    ("account_id".to_owned(), "provider-only".to_owned()),
+                    ("refresh_token".to_owned(), "refresh-secret".to_owned()),
+                    ("unknown".to_owned(), "unknown-secret".to_owned()),
+                ]),
+                ..AuthStatus::default()
+            },
+        ])));
+
+        let snapshot = ClientSnapshot::from_client(&client);
+        let metadata = &snapshot.auth.statuses["mcp:remote"].metadata;
+        assert_eq!(metadata.len(), 4);
+        assert_eq!(metadata["resource"], "https://mcp.example/tools");
+        assert_eq!(metadata["issuer"], "https://auth.example");
+        assert_eq!(metadata["scope"], "tools.read tools.write");
+        assert_eq!(metadata["registration_method"], "dynamic");
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains("provider-only"));
+        assert!(!rendered.contains("refresh-secret"));
+        assert!(!rendered.contains("unknown-secret"));
+    }
+
+    #[test]
+    fn auth_status_metadata_allowlists_are_bounded_and_target_specific() {
+        use waltr::grpc::waltr::auth::v1::auth_target::Target;
+
+        let provider = Target::ProviderKey("provider".to_owned());
+        let mcp = Target::McpServerKey("remote".to_owned());
+        assert!(auth_status_metadata_is_safe(
+            &provider,
+            "account_id",
+            "account-1"
+        ));
+        assert!(!auth_status_metadata_is_safe(
+            &provider,
+            "resource",
+            "https://mcp.example"
+        ));
+        assert!(auth_status_metadata_is_safe(
+            &mcp,
+            "resource",
+            "https://mcp.example"
+        ));
+        assert!(!auth_status_metadata_is_safe(
+            &mcp,
+            "account_id",
+            "account-1"
+        ));
+        assert!(!auth_status_metadata_is_safe(&mcp, "scope", ""));
+        assert!(!auth_status_metadata_is_safe(
+            &mcp,
+            "scope",
+            "tools.read\nsecret"
+        ));
+        assert!(!auth_status_metadata_is_safe(
+            &provider,
+            "account_id",
+            &"x".repeat(257)
+        ));
+        assert!(!auth_status_metadata_is_safe(
+            &mcp,
+            "resource",
+            &"x".repeat(2_049)
+        ));
     }
 
     #[test]
@@ -2853,17 +3154,6 @@ mod tests {
             in_flight: None,
             sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
         };
-        stream.runtime.reducer.require_auth(
-            AuthTarget {
-                target: Some(
-                    waltr::grpc::waltr::auth::v1::auth_target::Target::ProviderKey(
-                        "anthropic".to_owned(),
-                    ),
-                ),
-            },
-            "provider requirement",
-            None,
-        );
         stream.runtime.status_watch = Some((0, Box::pin(stream::pending())));
 
         stream
@@ -2878,7 +3168,6 @@ mod tests {
             stream.snapshot().access.error.as_deref(),
             Some("refresh failed")
         );
-        assert_eq!(stream.snapshot().auth.pending.len(), 1);
     }
 
     #[test]

@@ -2,15 +2,13 @@
 
 use std::fmt;
 
-use crate::{AuthTarget, McpAuthorizationRequirement};
+use crate::AuthTarget;
 
 /// Machine-readable category for a client error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientErrorKind {
     /// A transport or operation error unrelated to authentication.
     Other,
-    /// Waltr requires provider or upstream MCP credentials.
-    AuthorizationRequired,
     /// The caller must authenticate for access to Waltr itself.
     WaltrLoginRequired,
 }
@@ -19,9 +17,113 @@ pub enum ClientErrorKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientError {
     message: String,
-    auth_target: Option<AuthTarget>,
-    mcp_authorization: Option<McpAuthorizationRequirement>,
+    authentication_failure: Option<OutboundAuthenticationFailure>,
     kind: ClientErrorKind,
+}
+
+/// Structured outbound authentication failure safe to expose to clients.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboundAuthenticationFailure {
+    /// Failure schema version.
+    pub version: u32,
+    /// Exact authentication domain enum value.
+    pub domain: i32,
+    /// Exact authentication failure reason enum value.
+    pub reason: i32,
+    /// Provider or MCP target that failed.
+    pub target: AuthTarget,
+    /// Sanitized upstream MCP context, when supplied.
+    pub mcp_context: Option<McpAuthorizationContext>,
+}
+
+/// Sanitized upstream MCP authentication context safe for shell presentation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct McpAuthorizationContext {
+    /// Protected MCP endpoint, when safe.
+    pub endpoint: Option<String>,
+    /// HTTP status associated with the challenge.
+    pub http_status: u32,
+    /// Protected-resource metadata URL, when safe.
+    pub resource_metadata_url: Option<String>,
+    /// Requested OAuth scope.
+    pub scope: Option<String>,
+    /// OAuth bearer error code.
+    pub error: Option<String>,
+    /// OAuth bearer error description.
+    pub error_description: Option<String>,
+    /// OAuth bearer error documentation URL, when safe.
+    pub error_uri: Option<String>,
+    /// Bearer challenge realm.
+    pub realm: Option<String>,
+}
+
+impl OutboundAuthenticationFailure {
+    pub(crate) fn from_proto(
+        failure: waltr::grpc::waltr::auth::v1::AuthenticationFailure,
+    ) -> Option<Self> {
+        use waltr::grpc::waltr::auth::v1::{
+            AuthenticationDomain, AuthenticationFailureReason, auth_target,
+        };
+
+        if failure.version != 1 {
+            return None;
+        }
+        let domain = AuthenticationDomain::try_from(failure.domain).ok()?;
+        if !matches!(
+            domain,
+            AuthenticationDomain::OutboundProvider | AuthenticationDomain::OutboundMcp
+        ) {
+            return None;
+        }
+        let reason = AuthenticationFailureReason::try_from(failure.reason).ok()?;
+        if reason == AuthenticationFailureReason::Unspecified {
+            return None;
+        }
+        let target = failure.target?;
+        match (domain, target.target.as_ref()) {
+            (
+                AuthenticationDomain::OutboundProvider,
+                Some(auth_target::Target::ProviderKey(key)),
+            )
+            | (AuthenticationDomain::OutboundMcp, Some(auth_target::Target::McpServerKey(key)))
+                if !key.trim().is_empty() => {}
+            _ => return None,
+        }
+        Some(Self {
+            version: failure.version,
+            domain: failure.domain,
+            reason: failure.reason,
+            target,
+            mcp_context: failure.mcp_authorization.map(McpAuthorizationContext::from),
+        })
+    }
+}
+
+impl From<waltr::grpc::waltr::auth::v1::McpAuthorizationContext> for McpAuthorizationContext {
+    fn from(context: waltr::grpc::waltr::auth::v1::McpAuthorizationContext) -> Self {
+        Self {
+            endpoint: crate::coordination::state::safe_http_url(&context.endpoint),
+            http_status: context.http_status,
+            resource_metadata_url: context
+                .resource_metadata_url
+                .and_then(|value| crate::coordination::state::safe_http_url(&value)),
+            scope: context
+                .scope
+                .map(|value| crate::coordination::state::safe_text(&value, 1_024)),
+            error: context
+                .error
+                .map(|value| crate::coordination::state::safe_text(&value, 256)),
+            error_description: context
+                .error_description
+                .map(|value| crate::coordination::state::safe_text(&value, 1_024)),
+            error_uri: context
+                .error_uri
+                .and_then(|value| crate::coordination::state::safe_http_url(&value)),
+            realm: context
+                .realm
+                .map(|value| crate::coordination::state::safe_text(&value, 256)),
+        }
+    }
 }
 
 impl ClientError {
@@ -30,35 +132,21 @@ impl ClientError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            auth_target: None,
-            mcp_authorization: None,
+            authentication_failure: None,
             kind: ClientErrorKind::Other,
         }
     }
 
-    /// Create an authorization-required client error for a specific target.
+    /// Attach a structured outbound authentication failure.
     #[must_use]
-    pub fn authorization_required(message: impl Into<String>, target: AuthTarget) -> Self {
-        Self {
-            message: message.into(),
-            auth_target: Some(target),
-            mcp_authorization: None,
-            kind: ClientErrorKind::AuthorizationRequired,
-        }
-    }
-
-    /// Create an authorization-required error with sanitized MCP challenge context.
-    #[must_use]
-    pub fn mcp_authorization_required(
+    pub fn outbound_authentication(
         message: impl Into<String>,
-        target: AuthTarget,
-        authorization: McpAuthorizationRequirement,
+        failure: OutboundAuthenticationFailure,
     ) -> Self {
         Self {
             message: message.into(),
-            auth_target: Some(target),
-            mcp_authorization: Some(authorization),
-            kind: ClientErrorKind::AuthorizationRequired,
+            authentication_failure: Some(failure),
+            kind: ClientErrorKind::Other,
         }
     }
 
@@ -67,8 +155,7 @@ impl ClientError {
     pub fn waltr_login_required(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            auth_target: None,
-            mcp_authorization: None,
+            authentication_failure: None,
             kind: ClientErrorKind::WaltrLoginRequired,
         }
     }
@@ -79,16 +166,10 @@ impl ClientError {
         &self.message
     }
 
-    /// Return the auth target that must be completed before retrying, when known.
+    /// Return structured outbound authentication details, when supplied.
     #[must_use]
-    pub const fn auth_target(&self) -> Option<&AuthTarget> {
-        self.auth_target.as_ref()
-    }
-
-    /// Return sanitized MCP authorization context, when supplied.
-    #[must_use]
-    pub const fn mcp_authorization(&self) -> Option<&McpAuthorizationRequirement> {
-        self.mcp_authorization.as_ref()
+    pub const fn authentication_failure(&self) -> Option<&OutboundAuthenticationFailure> {
+        self.authentication_failure.as_ref()
     }
 
     /// Return the machine-readable error category.

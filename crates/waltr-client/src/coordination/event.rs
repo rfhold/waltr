@@ -3,10 +3,10 @@
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
     AccessAttemptId, AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientError,
-    Configuration, GenericAuthAttempt, GenericAuthAttemptStatus, McpAuthorizationRequirement,
-    OperationKey, Provider, RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest,
-    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
-    SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
+    Configuration, GenericAuthAttempt, GenericAuthAttemptStatus, OperationKey, Provider,
+    RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest, SessionSummary,
+    SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus,
+    TimelineEvent, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -133,22 +133,6 @@ pub enum AuthEvent {
     Listed(Vec<AuthStatus>),
     /// Auth statuses failed to load.
     ListFailed(ClientError),
-    /// A session run reported an auth target that must be completed.
-    AuthorizationRequired {
-        /// Target that requires authentication.
-        target: AuthTarget,
-        /// Human-readable reason.
-        message: String,
-        /// Session whose work reported the requirement.
-        source_session_id: Option<String>,
-        /// Sanitized upstream MCP bearer challenge context.
-        mcp_authorization: Option<McpAuthorizationRequirement>,
-    },
-    /// A caller dismissed one queued auth requirement.
-    Dismissed {
-        /// Target to remove from the pending queue.
-        target: AuthTarget,
-    },
     /// A caller requested a manual OAuth attempt.
     BeginRequested {
         /// Operation key allocated when the command was requested.
@@ -237,6 +221,27 @@ pub enum AuthEvent {
         /// Operation key allocated when the command was requested.
         operation_key: OperationKey,
         /// Failure returned by the cancel effect.
+        error: ClientError,
+    },
+    /// A caller requested forced refresh for a target.
+    RefreshRequested {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target whose OAuth credential should be refreshed.
+        target: AuthTarget,
+    },
+    /// Forced refresh completed successfully.
+    Refreshed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Secret-safe status after refresh.
+        status: AuthStatus,
+    },
+    /// Forced refresh failed.
+    RefreshFailed {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the refresh effect.
         error: ClientError,
     },
     /// A caller requested logout for a target.
@@ -570,15 +575,6 @@ pub enum SessionEvent {
         /// Failure returned by the submit effect.
         error: ClientError,
     },
-    /// A session run reported an auth target that must be completed.
-    AuthRequiredFromSession {
-        /// Target that requires authentication.
-        target: AuthTarget,
-        /// Human-readable reason.
-        message: String,
-        /// Session whose work reported the requirement.
-        session_id: String,
-    },
     /// A caller requested a response to an external request.
     ExternalRequestRespondRequested {
         /// Operation key allocated when the command was requested.
@@ -772,6 +768,13 @@ pub enum AuthEffect {
         operation_key: OperationKey,
         /// Attempt id returned by begin.
         attempt_id: String,
+    },
+    /// Force-refresh a target's OAuth credential.
+    Refresh {
+        /// Operation key allocated when the command was requested.
+        operation_key: OperationKey,
+        /// Target whose OAuth credential should be refreshed.
+        target: AuthTarget,
     },
     /// Delete stored credentials for a target.
     Logout {

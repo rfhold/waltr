@@ -1,8 +1,14 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use crate::{
-    AgentRuntimeBuilder, AgentsPromptConfig, AuthTarget, FilesystemPromptConfig, ModelApi,
-    ModelCost, ModelRef, PermissionEffect, PermissionPolicy, ProviderId, SkillsConfig,
+    AgentRuntimeBuilder, AgentsPromptConfig, AuthTarget, AuthenticationFailure,
+    BoxCompletionStream, BoxStreamFuture, CompletionRequest, FilesystemPromptConfig, LlmError,
+    LlmStream, ModelApi, ModelCost, ModelRef, PermissionEffect, PermissionPolicy, ProviderId,
+    SkillsConfig,
     filesystem::FilesystemConfig,
     mcp::{McpClientRuntime, McpConfig, McpServerConfig},
     provider::{
@@ -14,19 +20,21 @@ use crate::{
 };
 #[cfg(feature = "shell")]
 use crate::{ShellPromptConfig, shell::ShellConfig};
+use futures_util::StreamExt as _;
 use mcp::{McpTracePropagation, client::McpBearerProviderError};
 
 mod headers;
 mod oauth;
 
 use headers::{configured_credential, is_credential_header, resolve_provider_headers};
-use oauth::{RefreshFailureDisposition, now_ms, refresh_mcp_oauth, refresh_oauth};
+use oauth::now_ms;
+pub use oauth::{CredentialRefreshCoordinator, CredentialRefreshError, RefreshMode};
 
 use super::{
     AgentSessionRuntimeError, FileCredentialStore, McpOAuthEndpoints, McpOAuthRegistration,
-    McpOAuthRegistrationMethod, McpOAuthState, McpOAuthToken, McpRefreshClaim,
-    McpRefreshClaimResult, OAuthCredential, SessionCoordinator, SessionMcpServerRuntimeKind,
-    SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStore, StoredCredential,
+    McpOAuthRegistrationMethod, McpOAuthState, McpOAuthToken, OAuthCredential, SessionCoordinator,
+    SessionMcpServerRuntimeKind, SessionProviderRuntimeSettings, SessionRuntimeSettings,
+    SessionStore, StoredCredential,
 };
 
 const ENV_PREFIX: &str = "${env:";
@@ -199,11 +207,43 @@ impl AgentSessionRuntimeFactory {
         Ok(builder)
     }
 
+    #[cfg(test)]
     pub(crate) async fn mcp_config(
         &self,
         settings: &SessionRuntimeSettings,
     ) -> Result<McpConfig, AgentSessionRuntimeError> {
+        self.mcp_config_with_credentials(settings)
+            .await
+            .map(|(config, _)| config)
+    }
+
+    pub(crate) async fn mcp_config_and_credentialed_servers(
+        &self,
+        settings: &SessionRuntimeSettings,
+    ) -> Result<(McpConfig, BTreeSet<String>), AgentSessionRuntimeError> {
         self.mcp_config_with_credentials(settings).await
+    }
+
+    pub(crate) async fn preflight_cached_mcp_authentication(
+        &self,
+        settings: &SessionRuntimeSettings,
+        credentialed_servers: &BTreeSet<String>,
+    ) -> Result<(), AgentSessionRuntimeError> {
+        for server in settings
+            .mcp_servers
+            .iter()
+            .filter(|server| credentialed_servers.contains(&server.key))
+        {
+            if self.mcp_bearer_token(server).await?.is_none() {
+                return Err(AgentSessionRuntimeError::Authentication {
+                    target: AuthTarget::mcp_server(&server.key),
+                    message: "MCP OAuth credential is required".to_owned(),
+                    reason: crate::AuthenticationFailureReason::CredentialRequired,
+                    mcp_authorization: None,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn mcp_root_uri(&self) -> String {
@@ -235,7 +275,10 @@ impl AgentSessionRuntimeFactory {
                 provider_impl = apply_config_headers(provider_impl, &headers, oauth_active);
                 let model = ModelRef::new(provider_id(provider.api), model_id, provider.api);
                 Ok(builder_with_model_cost(
-                    AgentRuntimeBuilder::new(model, Arc::new(provider_impl)),
+                    AgentRuntimeBuilder::new(
+                        model,
+                        Arc::new(TargetedProvider::new(provider_impl, &provider.key)),
+                    ),
                     provider.model_cost.clone(),
                 ))
             }
@@ -252,7 +295,10 @@ impl AgentSessionRuntimeFactory {
                 }
                 let model = ModelRef::new(provider_id(provider.api), model_id, provider.api);
                 Ok(builder_with_model_cost(
-                    AgentRuntimeBuilder::new(model, Arc::new(provider_impl)),
+                    AgentRuntimeBuilder::new(
+                        model,
+                        Arc::new(TargetedProvider::new(provider_impl, &provider.key)),
+                    ),
                     provider.model_cost.clone(),
                 ))
             }
@@ -271,7 +317,10 @@ impl AgentSessionRuntimeFactory {
                 }
                 let model = ModelRef::new(provider_id(provider.api), model_id, provider.api);
                 Ok(builder_with_model_cost(
-                    AgentRuntimeBuilder::new(model, Arc::new(provider_impl)),
+                    AgentRuntimeBuilder::new(
+                        model,
+                        Arc::new(TargetedProvider::new(provider_impl, &provider.key)),
+                    ),
                     provider.model_cost.clone(),
                 ))
             }
@@ -290,7 +339,10 @@ impl AgentSessionRuntimeFactory {
                 }
                 let model = ModelRef::new(provider_id(provider.api), model_id, provider.api);
                 Ok(builder_with_model_cost(
-                    AgentRuntimeBuilder::new(model, Arc::new(provider_impl)),
+                    AgentRuntimeBuilder::new(
+                        model,
+                        Arc::new(TargetedProvider::new(provider_impl, &provider.key)),
+                    ),
                     provider.model_cost.clone(),
                 ))
             }
@@ -308,46 +360,27 @@ impl AgentSessionRuntimeFactory {
         let Some(definition) = provider.oauth.as_ref() else {
             return Ok(None);
         };
-        let Some(StoredCredential::OAuth(mut credential)) = self
-            .credential_store
-            .read(&AuthTarget::provider(&provider.key).credential_key())
+        let credential = self
+            .refresh_coordinator()
+            .refresh_provider(&provider.key, definition, RefreshMode::Normal)
             .await
-            .map_err(|error| {
-                AgentSessionRuntimeError::Internal(format!(
-                    "failed to read provider credentials: {error}"
-                ))
-            })?
-        else {
-            return Ok(None);
-        };
-
-        if credential.expires_at_ms <= now_ms() + 5 * 60 * 1000 {
-            if credential.refresh.is_empty() {
-                return Ok(None);
-            }
-            credential = refresh_oauth(definition, &credential).await?;
-            let stored = credential.clone();
-            self.credential_store
-                .modify(
-                    &AuthTarget::provider(&provider.key).credential_key(),
-                    |_| Some(StoredCredential::OAuth(stored)),
-                )
-                .await
-                .map_err(|error| {
-                    AgentSessionRuntimeError::Internal(format!(
-                        "failed to store refreshed credential: {error}"
-                    ))
-                })?;
-        }
-
-        Ok(Some(credential))
+            .map_err(|error| refresh_runtime_error(&error))?;
+        credential
+            .map(Some)
+            .ok_or_else(|| AgentSessionRuntimeError::Authentication {
+                target: AuthTarget::provider(&provider.key),
+                message: "provider OAuth credential is required".to_owned(),
+                reason: crate::AuthenticationFailureReason::CredentialRequired,
+                mcp_authorization: None,
+            })
     }
 
     async fn mcp_config_with_credentials(
         &self,
         settings: &SessionRuntimeSettings,
-    ) -> Result<McpConfig, AgentSessionRuntimeError> {
+    ) -> Result<(McpConfig, BTreeSet<String>), AgentSessionRuntimeError> {
         let mut mcp = McpConfig::new();
+        let mut credentialed_servers = BTreeSet::new();
         if settings.mcp_trace_propagation {
             mcp = mcp.with_trace_propagation(McpTracePropagation::TraceContext);
         }
@@ -382,6 +415,8 @@ impl AgentSessionRuntimeFactory {
                         ));
                         continue;
                     }
+                    self.mcp_bearer_token(server).await?;
+                    credentialed_servers.insert(server.key.clone());
                     let factory = self.clone();
                     let server_settings = server.clone();
                     let provider = Arc::new(move || {
@@ -392,11 +427,11 @@ impl AgentSessionRuntimeFactory {
                                 .mcp_bearer_token(&server)
                                 .await
                                 .map_err(|error| match error {
-                                    AgentSessionRuntimeError::AuthorizationRequired {
+                                    AgentSessionRuntimeError::Authentication {
                                         reason: crate::AuthenticationFailureReason::NetworkFailed,
                                         ..
                                     } => McpBearerProviderError::Unavailable,
-                                    AgentSessionRuntimeError::AuthorizationRequired { .. } => {
+                                    AgentSessionRuntimeError::Authentication { .. } => {
                                         McpBearerProviderError::Authorization
                                     }
                                     _ => McpBearerProviderError::Unavailable,
@@ -413,7 +448,7 @@ impl AgentSessionRuntimeFactory {
             };
             mcp = mcp.with_server(config);
         }
-        Ok(mcp)
+        Ok((mcp, credentialed_servers))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -421,209 +456,100 @@ impl AgentSessionRuntimeFactory {
         &self,
         server: &super::SessionMcpServerRuntimeSettings,
     ) -> Result<Option<String>, AgentSessionRuntimeError> {
-        let server_key = &server.key;
-        let credential_key = AuthTarget::mcp_server(server_key).credential_key();
-        let Some(stored) = self
-            .credential_store
-            .read(&credential_key)
+        self.refresh_coordinator()
+            .refresh_mcp(server, RefreshMode::Normal)
             .await
-            .map_err(|error| {
-                AgentSessionRuntimeError::Internal(format!(
-                    "failed to read mcp credentials: {error}"
-                ))
-            })?
-        else {
-            return Ok(None);
-        };
-        let legacy = matches!(&stored, StoredCredential::OAuth(_));
-        let Some(mut credential) = mcp_oauth_state(stored, &server.url) else {
-            return Ok(None);
-        };
-        validate_mcp_credential(server, &credential)?;
-        if legacy {
-            self.credential_store
-                .modify(&credential_key, |_| {
-                    Some(StoredCredential::McpOAuth(credential.clone()))
-                })
-                .await
-                .map_err(|error| {
-                    AgentSessionRuntimeError::Internal(format!(
-                        "failed to upgrade mcp credential: {error}"
-                    ))
-                })?;
-        }
-        validate_mcp_access_token(server_key, &credential)?;
+            .map(|credential| credential.map(|credential| credential.token.access_token))
+            .map_err(|error| refresh_runtime_error(&error))
+    }
 
-        if should_refresh_mcp_token(&credential) {
-            let Some(stored) =
-                self.credential_store
-                    .read(&credential_key)
-                    .await
-                    .map_err(|error| {
-                        AgentSessionRuntimeError::Internal(format!(
-                            "failed to re-read mcp credentials: {error}"
-                        ))
-                    })?
-            else {
-                return Err(AgentSessionRuntimeError::AuthorizationRequired {
-                    target: AuthTarget::mcp_server(server_key),
-                    message: "MCP OAuth credential is required".to_owned(),
-                    reason: crate::AuthenticationFailureReason::CredentialRequired,
-                    mcp_authorization: None,
-                });
-            };
-            let Some(current) = mcp_oauth_state(stored, &server.url) else {
-                return Ok(None);
-            };
-            validate_mcp_credential(server, &current)?;
-            validate_mcp_access_token(server_key, &current)?;
-            if !should_refresh_mcp_token(&current) {
-                return Ok(Some(current.token.access_token));
-            }
-            if current
-                .token
-                .refresh_token
-                .as_deref()
-                .is_none_or(str::is_empty)
-            {
-                if !current.token.expires_by(now_ms()) {
-                    return Ok(Some(current.token.access_token));
-                }
-                return Err(AgentSessionRuntimeError::AuthorizationRequired {
-                    target: AuthTarget::mcp_server(server_key),
-                    message: "MCP OAuth credential has expired".to_owned(),
-                    reason: crate::AuthenticationFailureReason::CredentialRequired,
-                    mcp_authorization: None,
-                });
-            }
-            let generation = current.token.refresh_generation;
-            let claim = McpRefreshClaim {
-                generation,
-                claim_id: uuid::Uuid::now_v7().to_string(),
-                lease_expires_at_ms: now_ms().saturating_add(30_000),
-            };
-            match self
-                .credential_store
-                .claim_mcp_refresh(&credential_key, claim.clone(), now_ms())
-                .await
-                .map_err(|error| {
-                    AgentSessionRuntimeError::Internal(format!(
-                        "failed to claim mcp credential refresh: {error}"
-                    ))
-                })? {
-                McpRefreshClaimResult::Current(current) => {
-                    validate_mcp_credential(server, &current)?;
-                    validate_mcp_access_token(server_key, &current)?;
-                    if should_refresh_mcp_token(&current) {
-                        return Err(mcp_authorization_error(
-                            server_key,
-                            "MCP OAuth refresh produced an expired credential",
-                            crate::AuthenticationFailureReason::CredentialRequired,
-                        ));
-                    }
-                    return Ok(Some(current.token.access_token));
-                }
-                McpRefreshClaimResult::ReauthorizationRequired => {
-                    return Err(AgentSessionRuntimeError::AuthorizationRequired {
-                        target: AuthTarget::mcp_server(server_key),
-                        message: "MCP OAuth refresh requires reauthorization".to_owned(),
-                        reason: crate::AuthenticationFailureReason::CredentialRequired,
-                        mcp_authorization: None,
-                    });
-                }
-                McpRefreshClaimResult::Claimed(_) => {}
-            }
-            let refreshed =
-                match refresh_mcp_oauth(&current, self.outbound_oauth_loopback_test_mode).await {
-                    Ok(credential) => credential,
-                    Err(error) => {
-                        let indeterminate = matches!(
-                            error.disposition,
-                            RefreshFailureDisposition::Indeterminate
-                                | RefreshFailureDisposition::ReauthorizationRequired
-                        );
-                        self.credential_store
-                            .abort_mcp_refresh(
-                                &credential_key,
-                                generation,
-                                &claim.claim_id,
-                                indeterminate,
-                            )
-                            .await
-                            .map_err(|store_error| {
-                                AgentSessionRuntimeError::Internal(format!(
-                                    "failed to abort mcp credential refresh: {store_error}"
-                                ))
-                            })?;
-                        if error.disposition == RefreshFailureDisposition::Indeterminate
-                            && !current.token.expires_by(now_ms())
-                        {
-                            return Ok(Some(current.token.access_token));
-                        }
-                        return Err(mcp_authorization_error(
-                            server_key,
-                            error.message,
-                            error.reason,
-                        ));
-                    }
-                };
-            let committed = self
-                .credential_store
-                .commit_mcp_refresh(&credential_key, generation, &claim.claim_id, refreshed)
-                .await
-                .map_err(|error| {
-                    AgentSessionRuntimeError::Internal(format!(
-                        "failed to store refreshed mcp credential: {error}"
-                    ))
-                })?;
-            if !committed {
-                let Some(StoredCredential::McpOAuth(current)) = self
-                    .credential_store
-                    .read(&credential_key)
-                    .await
-                    .map_err(|error| {
-                        AgentSessionRuntimeError::Internal(format!(
-                            "failed to read concurrently refreshed mcp credential: {error}"
-                        ))
-                    })?
-                else {
-                    return Err(mcp_authorization_error(
-                        server_key,
-                        "MCP OAuth credential changed during refresh",
-                        crate::AuthenticationFailureReason::CredentialRequired,
-                    ));
-                };
-                validate_mcp_credential(server, &current)?;
-                validate_mcp_access_token(server_key, &current)?;
-                if !should_refresh_mcp_token(&current) {
-                    return Ok(Some(current.token.access_token));
-                }
-                return Err(mcp_authorization_error(
-                    server_key,
-                    "MCP OAuth credential changed during refresh",
-                    crate::AuthenticationFailureReason::CredentialRequired,
-                ));
-            }
-            let Some(StoredCredential::McpOAuth(stored)) = self
-                .credential_store
-                .read(&credential_key)
-                .await
-                .map_err(|error| {
-                    AgentSessionRuntimeError::Internal(format!(
-                        "failed to read refreshed mcp credential: {error}"
-                    ))
-                })?
-            else {
-                return Err(AgentSessionRuntimeError::AuthorizationRequired {
-                    target: AuthTarget::mcp_server(server_key),
-                    message: "MCP OAuth credential disappeared during refresh".to_owned(),
-                    reason: crate::AuthenticationFailureReason::CredentialRequired,
-                    mcp_authorization: None,
-                });
-            };
-            credential = stored;
+    fn refresh_coordinator(&self) -> CredentialRefreshCoordinator {
+        let coordinator = CredentialRefreshCoordinator::new(self.credential_store.clone());
+        #[cfg(test)]
+        if self.outbound_oauth_loopback_test_mode {
+            return coordinator.with_loopback_test_mode();
         }
-        Ok(Some(credential.token.access_token))
+        coordinator
+    }
+}
+
+struct TargetedProvider<T> {
+    inner: T,
+    target: AuthTarget,
+}
+
+impl<T> TargetedProvider<T> {
+    fn new(inner: T, provider_key: &str) -> Self {
+        Self {
+            inner,
+            target: AuthTarget::provider(provider_key),
+        }
+    }
+}
+
+impl<T> LlmStream for TargetedProvider<T>
+where
+    T: LlmStream,
+{
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn project_request(&self, request: &CompletionRequest<'_>) -> Option<serde_json::Value> {
+        self.inner.project_request(request)
+    }
+
+    fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+        Box::pin(async move {
+            let stream = self
+                .inner
+                .stream_request(request)
+                .await
+                .map_err(|error| provider_authentication_error(error, &self.target))?;
+            Ok(Box::pin(stream.map({
+                let target = self.target.clone();
+                move |result| result.map_err(|error| provider_authentication_error(error, &target))
+            })) as BoxCompletionStream)
+        })
+    }
+}
+
+fn provider_authentication_error(error: LlmError, target: &AuthTarget) -> LlmError {
+    let rejected = match &error {
+        LlmError::Api {
+            status: Some(401), ..
+        } => true,
+        LlmError::WebSocket(error) => matches!(
+            error,
+            tokio_tungstenite::tungstenite::Error::Http(response)
+                if response.status() == http::StatusCode::UNAUTHORIZED
+        ),
+        _ => false,
+    };
+    if rejected {
+        LlmError::AuthenticationFailure {
+            failure: AuthenticationFailure {
+                target: target.clone(),
+                reason: crate::AuthenticationFailureReason::CredentialRejected,
+                mcp_authorization: None,
+            },
+            message: "provider rejected the configured credential".to_owned(),
+        }
+    } else {
+        error
+    }
+}
+
+fn refresh_runtime_error(error: &CredentialRefreshError) -> AgentSessionRuntimeError {
+    if error.is_internal() {
+        AgentSessionRuntimeError::Internal(error.message().to_owned())
+    } else {
+        AgentSessionRuntimeError::Authentication {
+            target: error.target().clone(),
+            message: error.message().to_owned(),
+            reason: error.reason(),
+            mcp_authorization: None,
+        }
     }
 }
 
@@ -708,7 +634,7 @@ fn validate_mcp_access_token(
     if credential.token.access_token.is_empty()
         || !credential.token.token_type.eq_ignore_ascii_case("bearer")
     {
-        return Err(AgentSessionRuntimeError::AuthorizationRequired {
+        return Err(AgentSessionRuntimeError::Authentication {
             target: AuthTarget::mcp_server(server_key),
             message: "MCP OAuth credential does not contain a supported bearer access token"
                 .to_owned(),
@@ -773,7 +699,7 @@ fn mcp_authorization_error(
     message: impl Into<String>,
     reason: crate::AuthenticationFailureReason,
 ) -> AgentSessionRuntimeError {
-    AgentSessionRuntimeError::AuthorizationRequired {
+    AgentSessionRuntimeError::Authentication {
         target: AuthTarget::mcp_server(server_key),
         message: message.into(),
         reason,
@@ -898,9 +824,13 @@ impl ConfigurableHeaders for OpenAiResponsesWebSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionOAuthProviderSettings, SessionOAuthTokenRequestStyle};
+    use crate::{
+        McpOAuthCredentialStore, McpOAuthStoreFuture, McpRefreshClaim, McpRefreshClaimResult,
+        SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+        SessionOAuthTokenRequestStyle,
+    };
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -924,6 +854,55 @@ mod tests {
         response: serde_json::Value,
         status: StatusCode,
         delay: Duration,
+    }
+
+    struct CurrentMcpStore {
+        initial: McpOAuthState,
+        current: McpOAuthState,
+    }
+
+    impl McpOAuthCredentialStore for CurrentMcpStore {
+        fn read(&self, _target_key: String) -> McpOAuthStoreFuture<'_, Option<McpOAuthState>> {
+            let initial = self.initial.clone();
+            Box::pin(async move { Ok(Some(initial)) })
+        }
+
+        fn write(&self, _target_key: String, _state: McpOAuthState) -> McpOAuthStoreFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn delete(&self, _target_key: String) -> McpOAuthStoreFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn claim_refresh(
+            &self,
+            _target_key: String,
+            _claim: McpRefreshClaim,
+        ) -> McpOAuthStoreFuture<'_, McpRefreshClaimResult> {
+            let current = self.current.clone();
+            Box::pin(async move { Ok(McpRefreshClaimResult::Current(Box::new(current))) })
+        }
+
+        fn commit_refresh(
+            &self,
+            _target_key: String,
+            _generation: u64,
+            _claim_id: String,
+            _state: McpOAuthState,
+        ) -> McpOAuthStoreFuture<'_, bool> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn abort_refresh(
+            &self,
+            _target_key: String,
+            _generation: u64,
+            _claim_id: String,
+            _indeterminate: bool,
+        ) -> McpOAuthStoreFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     async fn token_handler(
@@ -1064,6 +1043,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_config_reports_exact_servers_configured_with_bearer_providers() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        );
+        let mut credential = mcp_state("https://issuer.example/token".to_owned());
+        credential.token.expires_at_ms = i64::MAX;
+        factory
+            .credential_store
+            .modify(&AuthTarget::mcp_server("remote").credential_key(), |_| {
+                Some(StoredCredential::McpOAuth(credential))
+            })
+            .await
+            .expect("store credential");
+        let mut anonymous = mcp_server_settings();
+        anonymous.key = "anonymous".to_owned();
+
+        let (_, credentialed) = factory
+            .mcp_config_and_credentialed_servers(&SessionRuntimeSettings {
+                provider: SessionProviderRuntimeSettings {
+                    key: "test".to_owned(),
+                    api: ModelApi::OpenAiResponses,
+                    url: String::new(),
+                    model_id: "test-model".to_owned(),
+                    model_cost: None,
+                    headers: BTreeMap::new(),
+                    oauth: None,
+                    reasoning_effort: None,
+                },
+                mcp_servers: vec![mcp_server_settings(), anonymous],
+                mcp_trace_propagation: false,
+            })
+            .await
+            .expect("build MCP config");
+
+        assert_eq!(credentialed, BTreeSet::from(["remote".to_owned()]));
+    }
+
+    fn provider_oauth_settings(token_url: String) -> SessionOAuthProviderSettings {
+        SessionOAuthProviderSettings {
+            token_url,
+            client_id: "provider-client".to_owned(),
+            redirect_uri: "http://localhost/callback".to_owned(),
+            token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
+            token_fields: Vec::new(),
+            jwt_metadata: vec![SessionOAuthJwtMetadata {
+                token: SessionOAuthJwtToken::Id,
+                metadata_key: "account_id".to_owned(),
+                claim_names: vec!["account.id".to_owned()],
+                required: true,
+            }],
+        }
+    }
+
+    fn provider_credential(expires_at_ms: i64) -> OAuthCredential {
+        OAuthCredential {
+            access: "old-provider-access".to_owned(),
+            refresh: "old-provider-refresh".to_owned(),
+            expires_at_ms,
+            metadata: BTreeMap::from([
+                ("account_id".to_owned(), "old-account".to_owned()),
+                ("preserved".to_owned(), "preserved-value".to_owned()),
+            ]),
+        }
+    }
+
+    fn jwt(claims: &serde_json::Value) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret"),
+        )
+        .expect("encode JWT")
+    }
+
+    async fn provider_coordinator(
+        token_url: String,
+        credential: OAuthCredential,
+    ) -> (
+        CredentialRefreshCoordinator,
+        FileCredentialStore,
+        SessionOAuthProviderSettings,
+    ) {
+        let directory = tempfile::tempdir().expect("temp directory").keep();
+        let store = FileCredentialStore::new(directory.join("auth.json"));
+        store
+            .modify(&AuthTarget::provider("test").credential_key(), |_| {
+                Some(StoredCredential::OAuth(credential))
+            })
+            .await
+            .expect("store provider credential");
+        (
+            CredentialRefreshCoordinator::new(store.clone()).with_loopback_test_mode(),
+            store,
+            provider_oauth_settings(token_url),
+        )
+    }
+
+    #[tokio::test]
     #[allow(clippy::literal_string_with_formatting_args)]
     async fn runtime_builder_resolves_headers_at_agent_boundary() {
         let factory = AgentSessionRuntimeFactory::new(
@@ -1140,6 +1219,7 @@ mod tests {
                 redirect_uri: "http://localhost/callback".to_owned(),
                 token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
                 token_fields: Vec::new(),
+                jwt_metadata: Vec::new(),
             }),
             reasoning_effort: None,
         };
@@ -1154,7 +1234,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_oauth_without_refresh_token_is_not_used_when_expired() {
+    async fn configured_provider_oauth_without_credential_fails_before_provider_construction() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        );
+        let settings = SessionRuntimeSettings {
+            provider: SessionProviderRuntimeSettings {
+                key: "configured-provider".to_owned(),
+                api: ModelApi::OpenAiResponses,
+                url: "https://provider.example/v1/responses".to_owned(),
+                model_id: "test-model".to_owned(),
+                model_cost: None,
+                headers: BTreeMap::new(),
+                oauth: Some(provider_oauth_settings(
+                    "https://provider.example/oauth/token".to_owned(),
+                )),
+                reasoning_effort: None,
+            },
+            mcp_servers: Vec::new(),
+            mcp_trace_propagation: false,
+        };
+
+        let error = factory
+            .runtime_builder(&settings)
+            .await
+            .expect_err("missing configured OAuth credential must fail");
+
+        assert!(matches!(
+            error,
+            AgentSessionRuntimeError::Authentication {
+                target: AuthTarget::Provider { ref key },
+                reason: crate::AuthenticationFailureReason::CredentialRequired,
+                ..
+            } if key == "configured-provider"
+        ));
+    }
+
+    #[test]
+    fn provider_http_401_is_classified_for_exact_configured_target() {
+        let error = provider_authentication_error(
+            LlmError::Api {
+                provider: "test",
+                message: "secret response".to_owned(),
+                status: Some(401),
+                headers: Vec::new(),
+                code: None,
+                body: Some("secret response".to_owned()),
+            },
+            &AuthTarget::provider("configured-provider"),
+        );
+
+        assert!(matches!(
+            error,
+            LlmError::AuthenticationFailure {
+                failure: AuthenticationFailure {
+                    target: AuthTarget::Provider { ref key },
+                    reason: crate::AuthenticationFailureReason::CredentialRejected,
+                    ..
+                },
+                ref message,
+            } if key == "configured-provider" && !message.contains("secret response")
+        ));
+    }
+
+    #[test]
+    fn provider_websocket_401_is_classified_for_exact_configured_target() {
+        let response = http::Response::builder()
+            .status(http::StatusCode::UNAUTHORIZED)
+            .body(Some(Vec::new()))
+            .expect("websocket handshake response");
+        let error = provider_authentication_error(
+            LlmError::WebSocket(tokio_tungstenite::tungstenite::Error::Http(Box::new(
+                response,
+            ))),
+            &AuthTarget::provider("configured-websocket-provider"),
+        );
+
+        assert!(matches!(
+            error,
+            LlmError::AuthenticationFailure {
+                failure: AuthenticationFailure {
+                    target: AuthTarget::Provider { ref key },
+                    reason: crate::AuthenticationFailureReason::CredentialRejected,
+                    ..
+                },
+                ..
+            } if key == "configured-websocket-provider"
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_provider_oauth_without_refresh_token_fails_before_unauthenticated_call() {
         let auth_dir = std::env::temp_dir().join(format!(
             "waltr-agent-runtime-test-auth-{}",
             uuid::Uuid::new_v4()
@@ -1187,16 +1359,200 @@ mod tests {
                 redirect_uri: "http://localhost/callback".to_owned(),
                 token_request_style: SessionOAuthTokenRequestStyle::FormUrlencoded,
                 token_fields: Vec::new(),
+                jwt_metadata: Vec::new(),
             }),
             reasoning_effort: None,
         };
 
-        let credential = factory
+        let error = factory
             .oauth_access(&provider, &BTreeMap::new())
             .await
-            .expect("oauth lookup succeeds");
+            .expect_err("expired configured OAuth credential must fail");
 
-        assert!(credential.is_none());
+        assert!(matches!(
+            error,
+            AgentSessionRuntimeError::Authentication {
+                target: AuthTarget::Provider { ref key },
+                reason: crate::AuthenticationFailureReason::CredentialRequired,
+                ..
+            } if key == "test"
+        ));
+    }
+
+    #[tokio::test]
+    async fn forced_provider_refresh_preserves_and_reextracts_metadata_and_rotates_refresh() {
+        let (token_url, server) = token_server(
+            serde_json::json!({
+                "access_token": "new-provider-access",
+                "refresh_token": "rotated-provider-refresh",
+                "expires_in": 3600,
+                "id_token": jwt(&serde_json::json!({"account": {"id": "new-account"}}))
+            }),
+            Duration::ZERO,
+        )
+        .await;
+        let (coordinator, store, settings) =
+            provider_coordinator(token_url, provider_credential(now_ms() + 3_600_000)).await;
+
+        let refreshed = coordinator
+            .refresh_provider("test", &settings, RefreshMode::Forced)
+            .await
+            .expect("force provider refresh")
+            .expect("provider credential");
+
+        assert_eq!(refreshed.access, "new-provider-access");
+        assert_eq!(refreshed.refresh, "rotated-provider-refresh");
+        assert_eq!(
+            refreshed.metadata.get("account_id"),
+            Some(&"new-account".to_owned())
+        );
+        assert_eq!(
+            refreshed.metadata.get("preserved"),
+            Some(&"preserved-value".to_owned())
+        );
+        assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+        let Some(StoredCredential::OAuth(stored)) = store
+            .read(&AuthTarget::provider("test").credential_key())
+            .await
+            .expect("read provider credential")
+        else {
+            panic!("expected provider credential");
+        };
+        assert_eq!(stored.refresh, "rotated-provider-refresh");
+    }
+
+    #[tokio::test]
+    async fn normal_provider_refresh_retains_omitted_refresh_token_and_metadata() {
+        let (token_url, _) = token_server(
+            serde_json::json!({
+                "access_token": "new-provider-access",
+                "expires_in": 3600
+            }),
+            Duration::ZERO,
+        )
+        .await;
+        let (coordinator, _, settings) =
+            provider_coordinator(token_url, provider_credential(now_ms() + 1_000)).await;
+
+        let refreshed = coordinator
+            .refresh_provider("test", &settings, RefreshMode::Normal)
+            .await
+            .expect("normal provider refresh")
+            .expect("provider credential");
+
+        assert_eq!(refreshed.refresh, "old-provider-refresh");
+        assert_eq!(
+            refreshed.metadata.get("account_id"),
+            Some(&"old-account".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_rejects_error_and_invalid_responses_without_leaking_body() {
+        let (token_url, _) = token_error_server(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "invalid_grant", "detail": "private-response-body"}),
+        )
+        .await;
+        let (coordinator, _, settings) =
+            provider_coordinator(token_url, provider_credential(now_ms() - 1)).await;
+        let error = coordinator
+            .refresh_provider("test", &settings, RefreshMode::Normal)
+            .await
+            .expect_err("rejected refresh");
+        assert_eq!(
+            error.reason(),
+            crate::AuthenticationFailureReason::TokenExchangeFailed
+        );
+        assert!(!format!("{error:?}").contains("private-response-body"));
+        assert!(!error.to_string().contains("old-provider-refresh"));
+
+        let (token_url, _) =
+            token_server(serde_json::json!({"expires_in": 3600}), Duration::ZERO).await;
+        let (coordinator, _, settings) =
+            provider_coordinator(token_url, provider_credential(now_ms() - 1)).await;
+        let error = coordinator
+            .refresh_provider("test", &settings, RefreshMode::Normal)
+            .await
+            .expect_err("invalid refresh response");
+        assert_eq!(
+            error.reason(),
+            crate::AuthenticationFailureReason::ResponseInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn independently_constructed_provider_stores_share_singleflight() {
+        let (token_url, server) = token_server(
+            serde_json::json!({
+                "access_token": "new-provider-access",
+                "expires_in": 3600
+            }),
+            Duration::from_millis(50),
+        )
+        .await;
+        let (coordinator, store, settings) =
+            provider_coordinator(token_url, provider_credential(now_ms() - 1)).await;
+        let second = CredentialRefreshCoordinator::new(FileCredentialStore::new(store.path()))
+            .with_loopback_test_mode();
+
+        let (first, second) = tokio::join!(
+            coordinator.refresh_provider("test", &settings, RefreshMode::Normal),
+            second.refresh_provider("test", &settings, RefreshMode::Normal),
+        );
+
+        assert_eq!(
+            first.expect("first refresh").expect("credential").access,
+            "new-provider-access"
+        );
+        assert_eq!(
+            second.expect("second refresh").expect("credential").access,
+            "new-provider-access"
+        );
+        assert_eq!(server.request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_provider_refresh_cannot_replace_newer_credential() {
+        let (token_url, server) = token_server(
+            serde_json::json!({
+                "access_token": "stale-refreshed-access",
+                "expires_in": 3600
+            }),
+            Duration::from_millis(100),
+        )
+        .await;
+        let (coordinator, store, settings) =
+            provider_coordinator(token_url, provider_credential(now_ms() - 1)).await;
+        let task = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let settings = settings.clone();
+            async move {
+                coordinator
+                    .refresh_provider("test", &settings, RefreshMode::Normal)
+                    .await
+            }
+        });
+        while server.request_count.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let mut replacement = provider_credential(now_ms() + 3_600_000);
+        replacement.access = "newly-authorized-access".to_owned();
+        replacement.refresh = "newly-authorized-refresh".to_owned();
+        store
+            .modify(&AuthTarget::provider("test").credential_key(), |_| {
+                Some(StoredCredential::OAuth(replacement))
+            })
+            .await
+            .expect("replace provider credential");
+
+        let current = task
+            .await
+            .expect("refresh task")
+            .expect("coordinated refresh")
+            .expect("provider credential");
+        assert_eq!(current.access, "newly-authorized-access");
+        assert_eq!(current.refresh, "newly-authorized-refresh");
     }
 
     #[tokio::test]
@@ -1429,6 +1785,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forced_mcp_refresh_across_independent_stores_uses_generation_claim_coordination() {
+        let (token_url, server_state) = token_server(
+            serde_json::json!({
+                "access_token": "forced-access",
+                "refresh_token": "forced-rotated-refresh",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+            Duration::from_millis(50),
+        )
+        .await;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("auth.json");
+        let store = FileCredentialStore::new(&path);
+        let first = CredentialRefreshCoordinator::new(FileCredentialStore::new(&path))
+            .with_loopback_test_mode();
+        let second = CredentialRefreshCoordinator::new(FileCredentialStore::new(path))
+            .with_loopback_test_mode();
+        let key = AuthTarget::mcp_server("remote").credential_key();
+        let mut credential = mcp_state(token_url);
+        credential.token.expires_at_ms = now_ms() + 3_600_000;
+        store
+            .modify(&key, |_| Some(StoredCredential::McpOAuth(credential)))
+            .await
+            .expect("store credential");
+        let settings = mcp_server_settings();
+
+        let (first, second) = tokio::join!(
+            first.refresh_mcp(&settings, RefreshMode::Forced),
+            second.refresh_mcp(&settings, RefreshMode::Forced),
+        );
+
+        assert_eq!(
+            first
+                .expect("first forced refresh")
+                .expect("credential")
+                .token
+                .access_token,
+            "forced-access"
+        );
+        assert_eq!(
+            second
+                .expect("second forced refresh")
+                .expect("credential")
+                .token
+                .access_token,
+            "forced-access"
+        );
+        assert_eq!(server_state.request_count.load(Ordering::SeqCst), 1);
+        let Some(StoredCredential::McpOAuth(current)) = store.read(&key).await.expect("read state")
+        else {
+            panic!("expected MCP OAuth state");
+        };
+        assert_eq!(current.token.refresh_generation, 8);
+        assert_eq!(
+            current.token.refresh_token.as_deref(),
+            Some("forced-rotated-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_mcp_refresh_rejects_expired_direct_exchange_result() {
+        let (token_url, server_state) = token_server(
+            serde_json::json!({
+                "access_token": "already-expired-access",
+                "refresh_token": "rotated-refresh",
+                "token_type": "Bearer",
+                "expires_in": 0
+            }),
+            Duration::ZERO,
+        )
+        .await;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = FileCredentialStore::new(directory.path().join("auth.json"));
+        let coordinator =
+            CredentialRefreshCoordinator::new(store.clone()).with_loopback_test_mode();
+        let key = AuthTarget::mcp_server("remote").credential_key();
+        let mut initial = mcp_state(token_url);
+        initial.token.expires_at_ms = now_ms() + 3_600_000;
+        store
+            .modify(&key, |_| Some(StoredCredential::McpOAuth(initial)))
+            .await
+            .expect("store credential");
+
+        let error = coordinator
+            .refresh_mcp(&mcp_server_settings(), RefreshMode::Forced)
+            .await
+            .expect_err("expired refresh result must fail");
+
+        assert_eq!(
+            error.reason(),
+            crate::AuthenticationFailureReason::ResponseInvalid
+        );
+        assert_eq!(server_state.request_count.load(Ordering::SeqCst), 1);
+        let Some(StoredCredential::McpOAuth(current)) = store.read(&key).await.expect("read state")
+        else {
+            panic!("expected retained MCP OAuth state");
+        };
+        assert_eq!(current.token.refresh_generation, 7);
+        assert_eq!(current.token.access_token, "old-access");
+    }
+
+    #[tokio::test]
+    async fn forced_mcp_refresh_rejects_expired_current_claim_result() {
+        let mut initial = mcp_state("https://issuer.example/token".to_owned());
+        initial.token.expires_at_ms = now_ms() + 3_600_000;
+        let mut current = initial.clone();
+        current.token.access_token = "concurrent-expired-access".to_owned();
+        current.token.expires_at_ms = now_ms() - 1;
+        current.token.refresh_generation = 8;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = FileCredentialStore::new(directory.path().join("auth.json"))
+            .with_mcp_store(Arc::new(CurrentMcpStore { initial, current }));
+        let coordinator = CredentialRefreshCoordinator::new(store);
+
+        let error = coordinator
+            .refresh_mcp(&mcp_server_settings(), RefreshMode::Forced)
+            .await
+            .expect_err("expired current result must fail");
+
+        assert_eq!(
+            error.reason(),
+            crate::AuthenticationFailureReason::CredentialRequired
+        );
+        assert!(error.message().contains("usable credential"));
+    }
+
+    #[tokio::test]
+    async fn normal_mcp_refresh_rejects_near_expiry_current_claim_result() {
+        let mut initial = mcp_state("https://issuer.example/token".to_owned());
+        initial.token.expires_at_ms = now_ms() + 60_000;
+        let mut current = initial.clone();
+        current.token.access_token = "concurrent-near-expiry-access".to_owned();
+        current.token.refresh_generation = 8;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = FileCredentialStore::new(directory.path().join("auth.json"))
+            .with_mcp_store(Arc::new(CurrentMcpStore { initial, current }));
+        let coordinator = CredentialRefreshCoordinator::new(store);
+
+        let error = coordinator
+            .refresh_mcp(&mcp_server_settings(), RefreshMode::Normal)
+            .await
+            .expect_err("near-expiry current result must require refresh");
+
+        assert_eq!(
+            error.reason(),
+            crate::AuthenticationFailureReason::CredentialRequired
+        );
+        assert!(error.message().contains("usable credential"));
+    }
+
+    #[tokio::test]
+    async fn normal_mcp_refresh_rejects_near_expiry_current_after_failed_cas() {
+        let (token_url, server_state) = token_server(
+            serde_json::json!({
+                "access_token": "stale-refreshed-access",
+                "refresh_token": "stale-rotated-refresh",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            }),
+            Duration::from_millis(100),
+        )
+        .await;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = FileCredentialStore::new(directory.path().join("auth.json"));
+        let coordinator =
+            CredentialRefreshCoordinator::new(store.clone()).with_loopback_test_mode();
+        let key = AuthTarget::mcp_server("remote").credential_key();
+        let initial = mcp_state(token_url.clone());
+        store
+            .modify(&key, |_| Some(StoredCredential::McpOAuth(initial)))
+            .await
+            .expect("store initial credential");
+        let task = tokio::spawn({
+            let settings = mcp_server_settings();
+            async move {
+                coordinator
+                    .refresh_mcp(&settings, RefreshMode::Normal)
+                    .await
+            }
+        });
+        while server_state.request_count.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let mut concurrent = mcp_state(token_url);
+        concurrent.token.access_token = "concurrent-near-expiry-access".to_owned();
+        concurrent.token.expires_at_ms = now_ms() + 60_000;
+        concurrent.token.refresh_generation = 8;
+        store
+            .modify(&key, |_| Some(StoredCredential::McpOAuth(concurrent)))
+            .await
+            .expect("store concurrent credential");
+
+        let error = task
+            .await
+            .expect("refresh task")
+            .expect_err("near-expiry failed-CAS current must require refresh");
+
+        assert_eq!(
+            error.reason(),
+            crate::AuthenticationFailureReason::CredentialRequired
+        );
+        assert!(error.message().contains("changed during refresh"));
+        let Some(StoredCredential::McpOAuth(stored)) = store.read(&key).await.expect("read state")
+        else {
+            panic!("expected concurrent MCP OAuth state");
+        };
+        assert_eq!(stored.token.access_token, "concurrent-near-expiry-access");
+        assert_eq!(stored.token.refresh_generation, 8);
+    }
+
+    #[tokio::test]
     async fn invalid_grant_retains_secrets_and_blocks_replay() {
         let (token_url, server_state) = token_error_server(
             StatusCode::BAD_REQUEST,
@@ -1454,12 +2022,25 @@ mod tests {
             .expect("store credential");
 
         let error = factory
-            .mcp_bearer_token(&mcp_server_settings())
+            .mcp_config(&SessionRuntimeSettings {
+                provider: SessionProviderRuntimeSettings {
+                    key: "test".to_owned(),
+                    api: ModelApi::OpenAiResponses,
+                    url: String::new(),
+                    model_id: "test-model".to_owned(),
+                    model_cost: None,
+                    headers: BTreeMap::new(),
+                    oauth: None,
+                    reasoning_effort: None,
+                },
+                mcp_servers: vec![mcp_server_settings()],
+                mcp_trace_propagation: false,
+            })
             .await
-            .expect_err("invalid grant requires authorization");
+            .expect_err("runtime MCP refresh rejection is an authentication failure");
         assert!(matches!(
             error,
-            AgentSessionRuntimeError::AuthorizationRequired {
+            AgentSessionRuntimeError::Authentication {
                 reason: crate::AuthenticationFailureReason::CredentialRejected,
                 ..
             }
@@ -1478,7 +2059,7 @@ mod tests {
         factory
             .mcp_bearer_token(&mcp_server_settings())
             .await
-            .expect_err("blocked refresh requires authorization");
+            .expect_err("blocked refresh is an authentication failure");
         assert_eq!(server_state.request_count.load(Ordering::SeqCst), 1);
     }
 
@@ -1544,7 +2125,7 @@ mod tests {
             .expect_err("resource mismatch must fail");
         assert!(matches!(
             error,
-            AgentSessionRuntimeError::AuthorizationRequired {
+            AgentSessionRuntimeError::Authentication {
                 reason: crate::AuthenticationFailureReason::ConfigurationRequired,
                 ..
             }
@@ -1577,10 +2158,10 @@ mod tests {
         let error = factory
             .mcp_bearer_token(&mcp_server_settings())
             .await
-            .expect_err("expired credential requires authorization");
+            .expect_err("expired credential is an authentication failure");
         assert!(matches!(
             error,
-            AgentSessionRuntimeError::AuthorizationRequired {
+            AgentSessionRuntimeError::Authentication {
                 reason: crate::AuthenticationFailureReason::CredentialRequired,
                 ..
             }
@@ -1590,12 +2171,16 @@ mod tests {
     #[tokio::test]
     async fn mcp_refresh_refuses_redirects_without_replaying_refresh_secret() {
         let (token_url, redirected_requests) = malicious_token_server(false).await;
-        let error = refresh_mcp_oauth(&mcp_state(token_url), true)
-            .await
-            .expect_err("redirect must fail");
+        let error = oauth::refresh_mcp_oauth(
+            &AuthTarget::mcp_server("remote"),
+            &mcp_state(token_url),
+            true,
+        )
+        .await
+        .expect_err("redirect must fail");
 
         assert_eq!(
-            error.reason,
+            error.reason(),
             crate::AuthenticationFailureReason::ResponseInvalid
         );
         assert_eq!(redirected_requests.load(Ordering::SeqCst), 0);
@@ -1604,15 +2189,19 @@ mod tests {
     #[tokio::test]
     async fn mcp_refresh_rejects_oversized_token_response() {
         let (token_url, _) = malicious_token_server(true).await;
-        let error = refresh_mcp_oauth(&mcp_state(token_url), true)
-            .await
-            .expect_err("oversized response must fail");
+        let error = oauth::refresh_mcp_oauth(
+            &AuthTarget::mcp_server("remote"),
+            &mcp_state(token_url),
+            true,
+        )
+        .await
+        .expect_err("oversized response must fail");
 
         assert_eq!(
-            error.reason,
+            error.reason(),
             crate::AuthenticationFailureReason::ResponseInvalid
         );
-        assert!(error.message.contains("size limit"));
+        assert!(error.message().contains("size limit"));
     }
 
     #[tokio::test]

@@ -5,7 +5,8 @@ use std::{error::Error, fmt};
 use tokio::sync::oneshot;
 
 use crate::{
-    AuthTarget, AuthenticationFailureReason, LlmError, McpAuthorizationContext, ToolResult,
+    AuthTarget, AuthenticationFailure, AuthenticationFailureReason, LlmError,
+    McpAuthorizationContext, ToolResult,
 };
 
 use super::{ExternalRequestId, ExternalResponse, SessionId, SessionStatus};
@@ -24,9 +25,9 @@ pub enum AgentSessionRuntimeError {
     Internal(String),
     /// Runtime resolution failed with a provider-neutral agent error.
     Agent(LlmError),
-    /// Runtime resolution found a target that needs authentication.
-    AuthorizationRequired {
-        /// Target that requires authentication.
+    /// Runtime resolution encountered a structured authentication failure.
+    Authentication {
+        /// Target whose authentication failed.
         target: AuthTarget,
         /// Human-readable reason.
         message: String,
@@ -37,6 +38,27 @@ pub enum AgentSessionRuntimeError {
     },
 }
 
+impl AgentSessionRuntimeError {
+    /// Return structured authentication data carried by this runtime error.
+    #[must_use]
+    pub fn authentication_failure(&self) -> Option<AuthenticationFailure> {
+        match self {
+            Self::Authentication {
+                target,
+                reason,
+                mcp_authorization,
+                ..
+            } => Some(AuthenticationFailure {
+                target: target.clone(),
+                reason: *reason,
+                mcp_authorization: mcp_authorization.clone(),
+            }),
+            Self::Agent(error) => error.authentication_failure().cloned(),
+            Self::FailedPrecondition(_) | Self::Internal(_) => None,
+        }
+    }
+}
+
 impl fmt::Display for AgentSessionRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -44,13 +66,10 @@ impl fmt::Display for AgentSessionRuntimeError {
                 formatter.write_str(message)
             }
             Self::Agent(error) => write!(formatter, "{error}"),
-            Self::AuthorizationRequired {
+            Self::Authentication {
                 target, message, ..
             } => {
-                write!(
-                    formatter,
-                    "authentication required for {target:?}: {message}"
-                )
+                write!(formatter, "authentication failed for {target:?}: {message}")
             }
         }
     }
@@ -60,9 +79,7 @@ impl Error for AgentSessionRuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::FailedPrecondition(_)
-            | Self::Internal(_)
-            | Self::AuthorizationRequired { .. } => None,
+            Self::FailedPrecondition(_) | Self::Internal(_) | Self::Authentication { .. } => None,
         }
     }
 }
@@ -244,6 +261,18 @@ pub enum AgentSessionRunError {
 }
 
 impl AgentSessionRunError {
+    /// Return structured authentication data carried by this run error.
+    #[must_use]
+    pub fn authentication_failure(&self) -> Option<AuthenticationFailure> {
+        match self {
+            Self::Runtime(error) => error.authentication_failure(),
+            Self::Agent(error) => error.authentication_failure().cloned(),
+            Self::AlreadyRunning { .. } | Self::Canceled { .. } | Self::OutcomeDropped { .. } => {
+                None
+            }
+        }
+    }
+
     pub(super) fn canceled(session_id: SessionId, run_id: u64, reason: impl Into<String>) -> Self {
         Self::Canceled {
             session_id,

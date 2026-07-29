@@ -524,7 +524,11 @@ phase: SessionPhaseView,
 /**
  * Failure message, when phase is failed.
  */
-failedMessage: string, };
+failedMessage: string,
+/**
+ * Structured outbound authentication failure, when present.
+ */
+authenticationFailure: AuthenticationFailureSnapshot | null, };
 
 export type RuntimeConfigMatchView = "unspecified" | "configured" | "missing" | "changed" | "unknown";
 
@@ -814,6 +818,40 @@ kind: string,
  */
 key: string, };
 
+export type AuthStatusSnapshot = {
+/**
+ * Target whose status is represented.
+ */
+target: ClientAuthTarget,
+/**
+ * Stable status kind name.
+ */
+kind: string,
+/**
+ * Supported authorization method names.
+ */
+supportedMethods: Array<string>,
+/**
+ * Credential expiry in Unix milliseconds, or zero when unknown.
+ */
+expiresAtMs: bigint,
+/**
+ * Non-secret provider or MCP metadata.
+ */
+metadata: { [key in string]?: string },
+/**
+ * Sanitized status detail.
+ */
+message: string,
+/**
+ * Non-secret MCP registration method name.
+ */
+registrationMethod: string,
+/**
+ * Whether forced refresh is currently available.
+ */
+canRefresh: boolean, };
+
 export type AuthAttemptSnapshot = {
 /**
  * Target being authenticated.
@@ -864,7 +902,7 @@ lifecycle: string,
  */
 failureReason: string, };
 
-export type McpAuthorizationRequirementSnapshot = {
+export type McpAuthorizationContextSnapshot = {
 /**
  * Protected MCP endpoint, when safe.
  */
@@ -898,29 +936,33 @@ errorUri: string | null,
  */
 realm: string | null, };
 
-export type AuthRequirementSnapshot = {
+export type AuthenticationFailureSnapshot = {
 /**
- * Target that requires authentication.
+ * Failure schema version.
+ */
+version: number,
+/**
+ * Stable authentication domain name.
+ */
+domain: string,
+/**
+ * Stable authentication failure reason name.
+ */
+reason: string,
+/**
+ * Provider or MCP target that failed.
  */
 target: ClientAuthTarget,
 /**
- * Human-readable reason.
+ * Sanitized upstream MCP context, when supplied.
  */
-message: string,
-/**
- * Session whose work reported the requirement.
- */
-sourceSessionId: string | null,
-/**
- * Sanitized upstream MCP bearer challenge context.
- */
-mcpAuthorization: McpAuthorizationRequirementSnapshot | null, };
+mcpContext: McpAuthorizationContextSnapshot | null, };
 
 export type AuthSnapshot = {
 /**
- * Pending auth requirements in modal display order.
+ * Last known secret-safe auth statuses by stable target key.
  */
-pending: Array<AuthRequirementSnapshot>,
+statuses: { [key in string]?: AuthStatusSnapshot },
 /**
  * Active manual auth attempt, when one has started.
  */
@@ -941,6 +983,10 @@ complete: OperationSnapshot,
  * Cancel auth operation state.
  */
 cancel: OperationSnapshot,
+/**
+ * Forced refresh operation state.
+ */
+refresh: OperationSnapshot,
 /**
  * Logout operation state.
  */
@@ -978,7 +1024,19 @@ status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, } | { "kind": "authLogout",
+error: string | null, } | { "kind": "authRefresh",
+/**
+ * Stable operation status name.
+ */
+status: string,
+/**
+ * Last operation error, when present.
+ */
+error: string | null,
+/**
+ * Target being refreshed.
+ */
+target: ClientAuthTarget, } | { "kind": "authLogout",
 /**
  * Stable operation status name.
  */
@@ -1050,7 +1108,11 @@ error: string | null,
 /**
  * Session id submitted to.
  */
-sessionId: string, } | { "kind": "sessionRespondExternalRequest",
+sessionId: string,
+/**
+ * Structured outbound authentication failure, when present.
+ */
+authenticationFailure: AuthenticationFailureSnapshot | null, } | { "kind": "sessionRespondExternalRequest",
 /**
  * Stable operation status name.
  */
@@ -1066,7 +1128,11 @@ sessionId: string,
 /**
  * External request id.
  */
-requestId: string, } | { "kind": "sessionInterrupt",
+requestId: string,
+/**
+ * Structured outbound authentication failure, when present.
+ */
+authenticationFailure: AuthenticationFailureSnapshot | null, } | { "kind": "sessionInterrupt",
 /**
  * Stable operation status name.
  */
@@ -1110,7 +1176,11 @@ sessionId: string,
 /**
  * Rollback target continued from.
  */
-target: RollbackTargetView, };
+target: RollbackTargetView,
+/**
+ * Structured outbound authentication failure, when present.
+ */
+authenticationFailure: AuthenticationFailureSnapshot | null, };
 
 export type OperationCollectionSnapshot = {
 /**
@@ -1270,11 +1340,7 @@ attemptId: string, } | { "type": "reprobeWaltrAccess" } | { "type": "logoutWaltr
 /**
  * Safe expiry or refresh failure text.
  */
-error: string, } | { "type": "requestAuthStatuses" } | { "type": "dismissAuthRequirement",
-/**
- * Target to dismiss from the queue.
- */
-target: ClientAuthTarget, } | { "type": "beginAuth",
+error: string, } | { "type": "requestAuthStatuses" } | { "type": "beginAuth",
 /**
  * Target to authenticate.
  */
@@ -1294,7 +1360,11 @@ attemptId: string, } | { "type": "cancelAuth",
 /**
  * Attempt id returned by begin.
  */
-attemptId: string, } | { "type": "logoutAuth",
+attemptId: string, } | { "type": "refreshAuth",
+/**
+ * Target whose OAuth credential should be refreshed.
+ */
+target: ClientAuthTarget, } | { "type": "logoutAuth",
 /**
  * Target to log out.
  */

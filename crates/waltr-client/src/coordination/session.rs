@@ -2,8 +2,8 @@
 
 use crate::transport::{SessionWatchEvent, SessionWatchUpdate};
 use crate::{
-    AuthEvent, ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect,
-    SessionEvent, TimelineWatchKey,
+    ClientEffect, ClientState, ClientUpdate, OperationStatus, SessionEffect, SessionEvent,
+    TimelineWatchKey,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -248,27 +248,9 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             error,
         } => {
             let session_id = operation_session_id(state, &operation_key);
-            let message = error.to_string();
-            state.set_session_submit_user_message_failed(
-                operation_key,
-                session_id.clone(),
-                message.clone(),
-            );
-            outbound_auth_update(state, &error, message, session_id)
+            state.set_session_submit_user_message_failed(operation_key, session_id, &error);
+            ClientUpdate::default()
         }
-        SessionEvent::AuthRequiredFromSession {
-            target,
-            message,
-            session_id,
-        } => crate::coordination::auth::reduce(
-            state,
-            AuthEvent::AuthorizationRequired {
-                target,
-                message,
-                source_session_id: Some(session_id),
-                mcp_authorization: None,
-            },
-        ),
         SessionEvent::ExternalRequestRespondRequested {
             operation_key,
             session_id,
@@ -301,11 +283,11 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             let (session_id, request_id) = operation_session_and_request_id(state, &operation_key);
             state.set_session_respond_external_request_failed(
                 operation_key,
-                session_id.clone(),
+                session_id,
                 request_id,
-                error.to_string(),
+                &error,
             );
-            outbound_auth_update(state, &error, error.to_string(), session_id)
+            ClientUpdate::default()
         }
         SessionEvent::InterruptRequested {
             operation_key,
@@ -380,35 +362,10 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             error,
         } => {
             let (session_id, target) = operation_session_and_target(state, &operation_key);
-            state.set_session_continue_failed(
-                operation_key,
-                session_id.clone(),
-                target,
-                error.to_string(),
-            );
-            outbound_auth_update(state, &error, error.to_string(), session_id)
+            state.set_session_continue_failed(operation_key, session_id, target, &error);
+            ClientUpdate::default()
         }
     }
-}
-
-fn outbound_auth_update(
-    state: &mut ClientState,
-    error: &crate::ClientError,
-    message: String,
-    session_id: String,
-) -> ClientUpdate {
-    let Some(target) = error.auth_target().cloned() else {
-        return ClientUpdate::default();
-    };
-    crate::coordination::auth::reduce(
-        state,
-        AuthEvent::AuthorizationRequired {
-            target,
-            message,
-            source_session_id: Some(session_id),
-            mcp_authorization: error.mcp_authorization().cloned(),
-        },
-    )
 }
 
 pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
@@ -584,8 +541,13 @@ fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Client, ClientError, ClientEvent, McpAuthorizationRequirement, SessionEffect};
-    use waltr::grpc::waltr::auth::v1::auth_target;
+    use crate::{
+        Client, ClientError, ClientEvent, McpAuthorizationContext, OutboundAuthenticationFailure,
+        SessionEffect,
+    };
+    use waltr::grpc::waltr::auth::v1::{
+        AuthenticationDomain, AuthenticationFailureReason, BeginAuthResponse, auth_target,
+    };
 
     fn target() -> crate::AuthTarget {
         crate::AuthTarget {
@@ -594,74 +556,170 @@ mod tests {
     }
 
     fn auth_error() -> ClientError {
-        ClientError::mcp_authorization_required(
-            "authorize MCP",
-            target(),
-            McpAuthorizationRequirement {
-                endpoint: Some("https://mcp.example/rpc".to_owned()),
-                http_status: 401,
-                scope: Some("repo:read".to_owned()),
-                ..McpAuthorizationRequirement::default()
+        ClientError::outbound_authentication(
+            "unauthenticated: authorize MCP",
+            OutboundAuthenticationFailure {
+                version: 1,
+                domain: AuthenticationDomain::OutboundMcp as i32,
+                reason: AuthenticationFailureReason::NetworkFailed as i32,
+                target: target(),
+                mcp_context: Some(McpAuthorizationContext {
+                    endpoint: Some("https://mcp.example/rpc".to_owned()),
+                    http_status: 401,
+                    scope: Some("repo:read".to_owned()),
+                    ..McpAuthorizationContext::default()
+                }),
             },
         )
     }
 
+    fn seed_active_attempt(client: &mut Client) {
+        let update = client.begin_auth(target());
+        let [ClientEffect::Auth(crate::AuthEffect::Begin { operation_key, .. })] = update.effects()
+        else {
+            panic!("begin auth effect");
+        };
+        client.apply(ClientEvent::Auth(crate::AuthEvent::Begun {
+            operation_key: operation_key.clone(),
+            target: target(),
+            attempt: BeginAuthResponse {
+                attempt_id: "attempt-1".to_owned(),
+                auth_url: "https://auth.example/authorize".to_owned(),
+                ..BeginAuthResponse::default()
+            },
+        }));
+    }
+
+    fn assert_failed_operation(
+        client: &Client,
+        session_id: &str,
+        active_attempt: Option<&crate::AuthAttemptState>,
+    ) {
+        let operation = client
+            .state()
+            .operations
+            .values()
+            .find(|operation| {
+                matches!(
+                    operation,
+                    crate::ClientOperationState::SessionSubmitUserMessage { .. }
+                        | crate::ClientOperationState::SessionRespondExternalRequest { .. }
+                        | crate::ClientOperationState::SessionContinue { .. }
+                )
+            })
+            .expect("keyed operation");
+        let (actual_session_id, failure) = match operation {
+            crate::ClientOperationState::SessionSubmitUserMessage {
+                session_id,
+                authentication_failure,
+                ..
+            }
+            | crate::ClientOperationState::SessionRespondExternalRequest {
+                session_id,
+                authentication_failure,
+                ..
+            }
+            | crate::ClientOperationState::SessionContinue {
+                session_id,
+                authentication_failure,
+                ..
+            } => (session_id, authentication_failure.as_ref().unwrap()),
+            _ => panic!("session run operation"),
+        };
+        assert_eq!(actual_session_id, session_id);
+        assert_eq!(failure.domain, AuthenticationDomain::OutboundMcp as i32);
+        assert_eq!(
+            failure.reason,
+            AuthenticationFailureReason::NetworkFailed as i32
+        );
+        assert_eq!(failure.target, target());
+        assert_eq!(
+            failure
+                .mcp_context
+                .as_ref()
+                .and_then(|value| value.scope.as_deref()),
+            Some("repo:read")
+        );
+        assert_eq!(client.state().auth.active_attempt.as_ref(), active_attempt);
+
+        let exposed = match crate::ClientOperationView::from(operation.clone()) {
+            crate::ClientOperationView::SessionSubmitUserMessage {
+                authentication_failure,
+                ..
+            }
+            | crate::ClientOperationView::SessionRespondExternalRequest {
+                authentication_failure,
+                ..
+            }
+            | crate::ClientOperationView::SessionContinue {
+                authentication_failure,
+                ..
+            } => authentication_failure.unwrap(),
+            _ => panic!("session run operation view"),
+        };
+        assert_eq!(exposed.domain, "outboundMcp");
+        assert_eq!(exposed.reason, "networkFailed");
+        assert_eq!(exposed.target.key, "github");
+    }
+
     #[test]
-    fn all_session_run_entry_points_enqueue_structured_outbound_auth() {
-        let mut submit = Client::new();
-        let update = submit.submit_user_message("submit-session", "hello");
+    fn failed_submit_retains_outbound_auth_without_auth_effects() {
+        let mut client = Client::new();
+        seed_active_attempt(&mut client);
+        let active_attempt = client.state().auth.active_attempt.clone();
+        let update = client.submit_user_message("submit-session", "hello");
         let [ClientEffect::Session(SessionEffect::SubmitUserMessage { operation_key, .. })] =
             update.effects()
         else {
-            panic!("submit effect");
+            panic!("submit effect")
         };
-        submit.apply(ClientEvent::Session(
+        let update = client.apply(ClientEvent::Session(
             SessionEvent::UserMessageSubmitFailed {
                 operation_key: operation_key.clone(),
                 error: auth_error(),
             },
         ));
+        assert!(update.effects().is_empty());
+        assert_failed_operation(&client, "submit-session", active_attempt.as_ref());
+    }
 
-        let mut respond = Client::new();
-        let update = respond.respond_external_request("respond-session", "request", "{}");
+    #[test]
+    fn failed_response_retains_outbound_auth_without_auth_effects() {
+        let mut client = Client::new();
+        seed_active_attempt(&mut client);
+        let active_attempt = client.state().auth.active_attempt.clone();
+        let update = client.respond_external_request("respond-session", "request", "{}");
         let [ClientEffect::Session(SessionEffect::RespondExternalRequest { operation_key, .. })] =
             update.effects()
         else {
-            panic!("respond effect");
+            panic!("respond effect")
         };
-        respond.apply(ClientEvent::Session(
+        let update = client.apply(ClientEvent::Session(
             SessionEvent::ExternalRequestRespondFailed {
                 operation_key: operation_key.clone(),
                 error: auth_error(),
             },
         ));
+        assert!(update.effects().is_empty());
+        assert_failed_operation(&client, "respond-session", active_attempt.as_ref());
+    }
 
-        let mut continuation = Client::new();
-        let update = continuation.continue_session_from_turn("continue-session", 1);
+    #[test]
+    fn failed_continue_retains_outbound_auth_without_auth_effects() {
+        let mut client = Client::new();
+        seed_active_attempt(&mut client);
+        let active_attempt = client.state().auth.active_attempt.clone();
+        let update = client.continue_session_from_turn("continue-session", 1);
         let [ClientEffect::Session(SessionEffect::Continue { operation_key, .. })] =
             update.effects()
         else {
-            panic!("continue effect");
+            panic!("continue effect")
         };
-        continuation.apply(ClientEvent::Session(SessionEvent::ContinueFailed {
+        let update = client.apply(ClientEvent::Session(SessionEvent::ContinueFailed {
             operation_key: operation_key.clone(),
             error: auth_error(),
         }));
-
-        for (client, session_id) in [
-            (&submit, "submit-session"),
-            (&respond, "respond-session"),
-            (&continuation, "continue-session"),
-        ] {
-            let requirement = &client.state().auth.pending[0];
-            assert_eq!(requirement.source_session_id.as_deref(), Some(session_id));
-            assert_eq!(
-                requirement
-                    .mcp_authorization
-                    .as_ref()
-                    .and_then(|context| context.scope.as_deref()),
-                Some("repo:read")
-            );
-        }
+        assert!(update.effects().is_empty());
+        assert_failed_operation(&client, "continue-session", active_attempt.as_ref());
     }
 }

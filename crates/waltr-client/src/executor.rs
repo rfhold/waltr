@@ -269,6 +269,19 @@ impl GrpcEffectExecutor {
                     error,
                 })],
             },
+            ClientEffect::Auth(AuthEffect::Refresh {
+                operation_key,
+                target,
+            }) => match self.transport.refresh_auth(target).await {
+                Ok(status) => vec![ClientEvent::Auth(AuthEvent::Refreshed {
+                    operation_key,
+                    status,
+                })],
+                Err(error) => vec![ClientEvent::Auth(AuthEvent::RefreshFailed {
+                    operation_key,
+                    error,
+                })],
+            },
             ClientEffect::Auth(AuthEffect::Logout {
                 operation_key,
                 target,

@@ -20,19 +20,6 @@ pub fn reduce(state: &mut ClientState, event: AuthEvent) -> ClientUpdate {
             state.set_auth_list_failed(error.to_string());
             ClientUpdate::default()
         }
-        AuthEvent::AuthorizationRequired {
-            target,
-            message,
-            source_session_id,
-            mcp_authorization,
-        } => {
-            state.enqueue_auth_requirement(target, &message, source_session_id, mcp_authorization);
-            ClientUpdate::default()
-        }
-        AuthEvent::Dismissed { target } => {
-            state.remove_auth_requirement(&target);
-            ClientUpdate::default()
-        }
         AuthEvent::BeginRequested {
             operation_key,
             target,
@@ -132,6 +119,30 @@ pub fn reduce(state: &mut ClientState, event: AuthEvent) -> ClientUpdate {
             error,
         } => {
             state.set_auth_cancel_failed(operation_key, error.to_string());
+            ClientUpdate::default()
+        }
+        AuthEvent::RefreshRequested {
+            operation_key,
+            target,
+        } => {
+            state.set_auth_refresh_loading(operation_key.clone(), target.clone());
+            ClientUpdate::with_effect(ClientEffect::Auth(AuthEffect::Refresh {
+                operation_key,
+                target,
+            }))
+        }
+        AuthEvent::Refreshed {
+            operation_key,
+            status,
+        } => {
+            state.set_auth_refresh_ready(operation_key, status);
+            ClientUpdate::default()
+        }
+        AuthEvent::RefreshFailed {
+            operation_key,
+            error,
+        } => {
+            state.set_auth_refresh_failed(operation_key, error.to_string());
             ClientUpdate::default()
         }
         AuthEvent::LogoutRequested {
@@ -266,11 +277,6 @@ mod tests {
     #[test]
     fn successful_callback_updates_target_status_and_keeps_terminal_snapshot() {
         let mut client = Client::new();
-        client.require_auth(
-            target("github"),
-            "authorization required",
-            Some("session-1".to_owned()),
-        );
         let (attempt_id, poll_generation) = begin_callback(&mut client);
         let mut response = status(AuthAttemptLifecycle::Succeeded, target("github"));
         response.status = Some(crate::AuthStatus {
@@ -289,7 +295,6 @@ mod tests {
                 .effects()
                 .is_empty()
         );
-        assert!(client.state().auth.pending.is_empty());
         assert!(client.state().auth.statuses.contains_key("mcp:github"));
         assert_eq!(
             client
@@ -323,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn polling_stops_after_bounded_transport_failures_and_target_invalidation() {
+    fn polling_stops_after_bounded_transport_failures() {
         let mut client = Client::new();
         let (attempt_id, poll_generation) = begin_callback(&mut client);
         for failure in 1..=5 {
@@ -337,21 +342,6 @@ mod tests {
         let attempt = client.state().auth.active_attempt.as_ref().unwrap();
         assert_eq!(attempt.lifecycle, AuthAttemptLifecycle::Failed as i32);
         assert!(!attempt.failure_reason.contains("raw transport body"));
-
-        let mut dismissed = Client::new();
-        let (attempt_id, poll_generation) = begin_callback(&mut dismissed);
-        dismissed.dismiss_auth_requirement(target("github"));
-        assert!(
-            dismissed
-                .apply(ClientEvent::Auth(AuthEvent::Polled {
-                    attempt_id,
-                    poll_generation,
-                    response: status(AuthAttemptLifecycle::Succeeded, target("github")),
-                }))
-                .effects()
-                .is_empty()
-        );
-        assert!(dismissed.state().auth.active_attempt.is_none());
     }
 
     #[test]
@@ -371,5 +361,69 @@ mod tests {
                 .is_empty()
         );
         assert!(client.state().auth.statuses.is_empty());
+    }
+
+    #[test]
+    fn concurrent_target_refreshes_preserve_each_keyed_result() {
+        let mut client = Client::new();
+        let provider = AuthTarget {
+            target: Some(auth_target::Target::ProviderKey("provider".to_owned())),
+        };
+        let mcp = target("github");
+        let first = client.refresh_auth(provider.clone());
+        let [
+            ClientEffect::Auth(AuthEffect::Refresh {
+                operation_key: first_key,
+                ..
+            }),
+        ] = first.effects()
+        else {
+            panic!("first refresh effect");
+        };
+        let first_key = first_key.clone();
+        let second = client.refresh_auth(mcp.clone());
+        let [
+            ClientEffect::Auth(AuthEffect::Refresh {
+                operation_key: second_key,
+                ..
+            }),
+        ] = second.effects()
+        else {
+            panic!("second refresh effect");
+        };
+        let second_key = second_key.clone();
+
+        client.apply(ClientEvent::Auth(AuthEvent::Refreshed {
+            operation_key: first_key.clone(),
+            status: crate::AuthStatus {
+                target: Some(provider),
+                can_refresh: true,
+                ..crate::AuthStatus::default()
+            },
+        }));
+        client.apply(ClientEvent::Auth(AuthEvent::Refreshed {
+            operation_key: second_key.clone(),
+            status: crate::AuthStatus {
+                target: Some(mcp),
+                can_refresh: true,
+                ..crate::AuthStatus::default()
+            },
+        }));
+
+        assert!(matches!(
+            client.state().operations.get(&first_key),
+            Some(crate::ClientOperationState::AuthRefresh {
+                status: crate::OperationStatus::Ready,
+                ..
+            })
+        ));
+        assert!(matches!(
+            client.state().operations.get(&second_key),
+            Some(crate::ClientOperationState::AuthRefresh {
+                status: crate::OperationStatus::Ready,
+                ..
+            })
+        ));
+        assert_eq!(client.state().auth.statuses.len(), 2);
     }
 }

@@ -461,6 +461,9 @@ pub struct SessionStatus {
     /// Set when phase == SESSION_PHASE_FAILED.
     #[prost(string, tag="3")]
     pub failed_message: ::prost::alloc::string::String,
+    /// Set for a structured authentication failure when phase == SESSION_PHASE_FAILED.
+    #[prost(message, optional, tag="4")]
+    pub authentication_failure: ::core::option::Option<super::super::auth::v1::AuthenticationFailure>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Suspension {

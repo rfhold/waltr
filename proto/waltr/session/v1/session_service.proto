@@ -3,6 +3,7 @@ syntax = "proto3";
 package waltr.session.v1;
 
 import "google/protobuf/timestamp.proto";
+import "waltr/auth/v1/auth_service.proto";
 import "waltr/config/v1/config_service.proto";
 
 service SessionService {
@@ -378,6 +379,9 @@ message SessionStatus {
 
   // Set when phase == SESSION_PHASE_FAILED.
   string failed_message = 3;
+
+  // Set for a structured authentication failure when phase == SESSION_PHASE_FAILED.
+  optional waltr.auth.v1.AuthenticationFailure authentication_failure = 4;
 }
 
 enum SessionPhase {

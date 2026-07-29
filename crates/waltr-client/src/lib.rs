@@ -22,24 +22,25 @@ pub use coordination::event::{
     StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
-    AccessSnapshot, AuthAttemptSnapshot, AuthRequirementSnapshot, AuthSnapshot,
-    CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot, CatalogSnapshot, ClientAuthTarget,
-    ClientCommand, ClientCommandRequest, ClientOperationView, ClientRuntime,
-    ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
+    AccessSnapshot, AuthAttemptSnapshot, AuthSnapshot, AuthStatusSnapshot,
+    AuthenticationFailureSnapshot, CatalogMatchSuggestionSnapshot, CatalogModelSearchSnapshot,
+    CatalogSnapshot, ClientAuthTarget, ClientCommand, ClientCommandRequest, ClientOperationView,
+    ClientRuntime, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
-    McpAuthorizationRequirementSnapshot, OperationCollectionSnapshot, OperationSnapshot,
+    McpAuthorizationContextSnapshot, OperationCollectionSnapshot, OperationSnapshot,
     RollbackTargetView, SessionSnapshot, SessionTemplateOptionView, SessionTemplateSearchSnapshot,
     StatusSnapshot,
 };
 pub use coordination::state::{
     AccessAttemptId, AccessClientState, AccessStatus, AuthAttemptState, AuthClientState,
-    AuthRequirement, CatalogClientState, CatalogMatchSuggestionState, CatalogModelSearchState,
-    ClientOperationState, ClientState, ConfigClientState, McpAuthorizationRequirement,
-    OperationKey, OperationState, OperationStatus, SessionClientState, SessionTemplateSearchState,
-    StatusClientState, StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
-    watch_reconnect_delay_ms,
+    CatalogClientState, CatalogMatchSuggestionState, CatalogModelSearchState, ClientOperationState,
+    ClientState, ConfigClientState, OperationKey, OperationState, OperationStatus,
+    SessionClientState, SessionTemplateSearchState, StatusClientState, StreamClientState,
+    StreamState, StreamStatus, TimelineWatchKey, WatchState, watch_reconnect_delay_ms,
 };
-pub use error::{ClientError, ClientErrorKind};
+pub use error::{
+    ClientError, ClientErrorKind, McpAuthorizationContext, OutboundAuthenticationFailure,
+};
 pub use executor::{
     ConfigChange, ConfigChangeStream, GrpcEffectExecutor, SessionChangeStream, StatusChangeStream,
 };
@@ -70,9 +71,9 @@ pub use waltr::grpc::waltr::session::v1::{
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
 pub use transport::{
-    AuthAttempt, AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport,
-    GenericAuthAttempt, GenericAuthAttemptStatus, WaltrTransport, ProviderAuthStatus,
-    SessionTimelineWatchEvent, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
+    AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport, GenericAuthAttempt,
+    GenericAuthAttemptStatus, WaltrTransport, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
+    SessionWatchEvent, SessionWatchUpdate,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};

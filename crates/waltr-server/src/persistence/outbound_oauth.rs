@@ -139,6 +139,12 @@ impl OutboundOAuthStore {
         }
     }
 
+    pub(crate) async fn reauthorization_required(&self, target_key: &str) -> Result<bool, String> {
+        self.read_state_row(target_key)
+            .await
+            .map(|row| row.is_some_and(|(_, _, required)| required))
+    }
+
     pub(crate) async fn claim_attempt(
         &self,
         attempt_id: &str,
@@ -590,6 +596,7 @@ mod tests {
             .abort_refresh("mcp:abort".to_owned(), 0, "claim".to_owned(), true)
             .await
             .unwrap();
+        assert!(first.reauthorization_required("mcp:abort").await.unwrap());
         assert_eq!(
             second
                 .claim_refresh("mcp:abort".to_owned(), claim(0, "next", now_ms() + 5_000))
