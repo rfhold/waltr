@@ -158,11 +158,8 @@ Add Pulumi tests asserting resource shape and secret propagation. Avoid snapshot
 
 ## Pipeline Changes
 
-The committed `.tekton/waltr-preview.yaml` and `.tekton/waltr-release.yaml` definitions verify before deployment:
+The committed `.tekton/waltr-preview.yaml` and `.tekton/waltr-release.yaml` definitions build and deploy without running the Rust, web, or Pulumi test suites. They retain:
 
-- Rust formatting, the SQLite OAuth store target, Waltr server integration tests, and shared-client integration tests.
-- Web component tests.
-- Pulumi TypeScript build and mock/policy tests.
 - A private-material scan over Pulumi, Dockerfile, and pipeline inputs.
 - Multi-architecture runtime image build, manifest publication, digest verification, and revision-label verification.
 
