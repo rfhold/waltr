@@ -48,6 +48,7 @@ opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-proto", "logs", "metrics", "reqwest-blocking-client", "trace"] }
 opentelemetry-semantic-conventions = "0.32.0"
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+oauth2 = { version = "5.0.0", default-features = false }
 p256 = { version = "0.13.2", features = ["pkcs8"] }
 opendal = { version = "0.57.0", features = ["services-fs", "services-s3", "services-postgresql"] }
 prost = "0.14.1"

@@ -11,7 +11,6 @@ services:
       WALTR_AUTH_MODE: disabled
       WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
       WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
-      WALTR_AUTH_PATH: /data/auth.json
       WALTR_SESSION_STORE: filesystem
       WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
       WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
@@ -43,7 +42,6 @@ services:
       WALTR_AUTH_MODE: disabled
       WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
       WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
-      WALTR_AUTH_PATH: /data/auth.json
       WALTR_SESSION_STORE: filesystem
       WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
       WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json
@@ -204,7 +202,6 @@ services:
       WALTR_AUTH_MODE: oidc
       WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
       WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
-      WALTR_AUTH_PATH: /data/auth.json
       WALTR_SESSION_STORE: filesystem
       WALTR_SESSION_FILESYSTEM_ROOT: /data/sessions
       WALTR_MODELS_DEV_PATH: /fixtures/models-dev-api.fixture.json

@@ -551,7 +551,11 @@ async fn standard_sqlx_checksum_mismatch_is_rejected() {
 }
 
 #[tokio::test]
-async fn sqlite_upgrades_committed_migrations_through_outbound_oauth_and_reopens() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "migration contract test stages V4 and verifies every preserved and replaced field"
+)]
+async fn sqlite_v5_discards_credentials_preserves_attempts_and_reopens() {
     let database = TestDatabase::new();
     fs::create_dir_all(&database.root).expect("create test database directory");
     let legacy_migrations = database.root.join("legacy-migrations");
@@ -561,6 +565,7 @@ async fn sqlite_upgrades_committed_migrations_through_outbound_oauth_and_reopens
         "0001_schema_ownership.sql",
         "0002_oidc_access_auth.sql",
         "0003_mcp_oauth_login_continuations.sql",
+        "0004_outbound_oauth.sql",
     ] {
         fs::copy(
             migration_source.join(migration),
@@ -582,6 +587,33 @@ async fn sqlite_upgrades_committed_migrations_through_outbound_oauth_and_reopens
         .run(&pool)
         .await
         .expect("run committed migrations");
+    sqlx::query("INSERT INTO outbound_oauth_credentials (target_key, state_json, refresh_generation, refresh_claim_id, refresh_claim_expires_at_ms, reauthorization_required, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind("mcp:legacy")
+        .bind(r#"{"version":1,"token":{"access_token":"legacy-secret"}}"#)
+        .bind(7_i64)
+        .bind("legacy-claim")
+        .bind(12_345_i64)
+        .bind(true)
+        .bind(1_000_i64)
+        .execute(&pool)
+        .await
+        .expect("insert V4 credential");
+    sqlx::query("INSERT INTO outbound_oauth_attempts (attempt_id, state_digest, target_key, attempt_json, registration_method, completion_mode, status, completion_claim_id, completion_claim_expires_at_ms, failure_reason, expires_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind("preserved-attempt")
+        .bind(vec![9_u8; 32])
+        .bind("mcp:remote")
+        .bind(r#"{"verifier":"preserve-me"}"#)
+        .bind("dynamic")
+        .bind("server_callback")
+        .bind("completing")
+        .bind("worker")
+        .bind(20_000_i64)
+        .bind(Option::<String>::None)
+        .bind(30_000_i64)
+        .bind(2_000_i64)
+        .execute(&pool)
+        .await
+        .expect("insert V4 attempt");
     pool.close().await;
 
     let config = DatabaseConfig::from_url(&url).expect("create config");
@@ -589,11 +621,47 @@ async fn sqlite_upgrades_committed_migrations_through_outbound_oauth_and_reopens
         .await
         .expect("upgrade database");
     assert_component_histories(&upgraded).await;
-    assert!(
-        sqlite_tables(upgraded.sqlite_pool().expect("Waltr pool"))
+    let pool = upgraded.sqlite_pool().expect("Waltr pool");
+    let credential_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_oauth_credentials")
+            .fetch_one(pool)
             .await
-            .contains(&"outbound_oauth_credentials".to_owned())
+            .expect("count V5 credentials");
+    assert_eq!(credential_count, 0);
+    let attempt = sqlx::query_as::<_, (String, Vec<u8>, String, String, String, String, String, Option<String>, Option<i64>, Option<String>, i64, i64)>(
+        "SELECT attempt_id, state_digest, target_key, attempt_json, registration_method, completion_mode, status, completion_claim_id, completion_claim_expires_at_ms, failure_reason, expires_at_ms, updated_at_ms FROM outbound_oauth_attempts WHERE attempt_id = ?",
+    )
+    .bind("preserved-attempt")
+    .fetch_one(pool)
+    .await
+    .expect("read preserved attempt");
+    assert_eq!(
+        attempt,
+        (
+            "preserved-attempt".to_owned(),
+            vec![9_u8; 32],
+            "mcp:remote".to_owned(),
+            r#"{"verifier":"preserve-me"}"#.to_owned(),
+            "dynamic".to_owned(),
+            "server_callback".to_owned(),
+            "completing".to_owned(),
+            Some("worker".to_owned()),
+            Some(20_000),
+            None,
+            30_000,
+            2_000,
+        )
     );
+    let columns = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM pragma_table_info('outbound_oauth_credentials')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read V5 credential columns");
+    assert!(columns.contains(&"credential_json".to_owned()));
+    assert!(columns.contains(&"revision".to_owned()));
+    assert!(!columns.contains(&"state_json".to_owned()));
+    assert!(!columns.contains(&"refresh_generation".to_owned()));
     drop(upgraded);
 
     let reopened = Persistence::initialize(config)
@@ -675,7 +743,7 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .fetch_one(pool)
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (4, 3));
+    assert_eq!((waltr_count, mcp_count), (5, 3));
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT to_regclass('waltr.outbound_oauth_attempts')::text"
@@ -752,6 +820,108 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires Docker"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "migration contract test stages V4 and verifies preserved attempts and replaced columns"
+)]
+async fn postgres_v5_discards_credentials_and_preserves_attempts() {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "waltr")
+        .with_env_var("POSTGRES_PASSWORD", "waltr")
+        .with_env_var("POSTGRES_DB", "waltr");
+    let container = image.start().await.expect("start PostgreSQL container");
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .expect("read PostgreSQL port");
+    let url = format!("postgres://waltr:waltr@127.0.0.1:{port}/waltr?sslmode=disable");
+    let root = crate::test_support::temp_root();
+    let legacy_migrations = root.join("postgres-v4-migrations");
+    fs::create_dir_all(&legacy_migrations).expect("create migration directory");
+    let migration_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgresql");
+    for migration in [
+        "0001_schema_ownership.sql",
+        "0002_oidc_access_auth.sql",
+        "0003_mcp_oauth_login_continuations.sql",
+        "0004_outbound_oauth.sql",
+    ] {
+        fs::copy(
+            migration_source.join(migration),
+            legacy_migrations.join(migration),
+        )
+        .expect("copy committed migration");
+    }
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&url)
+        .await
+        .expect("connect PostgreSQL");
+    sqlx::migrate::Migrator::new(legacy_migrations)
+        .await
+        .expect("load V4 migrations")
+        .run(&pool)
+        .await
+        .expect("run V4 migrations");
+    sqlx::query("INSERT INTO waltr.outbound_oauth_credentials (target_key, state_json, refresh_generation, updated_at_ms) VALUES ($1, $2, $3, $4)")
+        .bind("provider:legacy")
+        .bind(r#"{"access":"legacy-secret"}"#)
+        .bind(4_i64)
+        .bind(1_000_i64)
+        .execute(&pool)
+        .await
+        .expect("insert V4 credential");
+    sqlx::query("INSERT INTO waltr.outbound_oauth_attempts (attempt_id, state_digest, target_key, attempt_json, registration_method, completion_mode, status, expires_at_ms, updated_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+        .bind("preserved-attempt")
+        .bind(vec![7_u8; 32])
+        .bind("mcp:remote")
+        .bind(r#"{"verifier":"preserve-me"}"#)
+        .bind("dynamic")
+        .bind("server_callback")
+        .bind("pending")
+        .bind(30_000_i64)
+        .bind(2_000_i64)
+        .execute(&pool)
+        .await
+        .expect("insert V4 attempt");
+    pool.close().await;
+
+    let persistence =
+        Persistence::initialize(DatabaseConfig::from_url(&url).expect("create PostgreSQL config"))
+            .await
+            .expect("apply V5 migration");
+    let pool = persistence.postgres_pool().expect("Waltr PostgreSQL pool");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM waltr.outbound_oauth_credentials")
+            .fetch_one(pool)
+            .await
+            .expect("count credentials"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT attempt_json FROM waltr.outbound_oauth_attempts WHERE attempt_id = $1"
+        )
+        .bind("preserved-attempt")
+        .fetch_one(pool)
+        .await
+        .expect("read preserved attempt"),
+        r#"{"verifier":"preserve-me"}"#
+    );
+    let columns = sqlx::query_scalar::<_, String>("SELECT column_name FROM information_schema.columns WHERE table_schema = 'waltr' AND table_name = 'outbound_oauth_credentials'")
+        .fetch_all(pool)
+        .await
+        .expect("read V5 columns");
+    assert!(columns.contains(&"credential_json".to_owned()));
+    assert!(columns.contains(&"revision".to_owned()));
+    assert!(!columns.contains(&"state_json".to_owned()));
+    assert!(!columns.contains(&"refresh_generation".to_owned()));
+}
+
 #[test]
 fn configuration_and_connection_diagnostics_are_sanitized() {
     let secret = "database-password-must-not-leak";
@@ -773,7 +943,7 @@ async fn assert_component_histories(persistence: &Persistence) {
         .fetch_one(persistence.mcp_sqlite_pool().expect("MCP pool"))
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (4, 3));
+    assert_eq!((waltr_count, mcp_count), (5, 3));
 }
 
 async fn sqlite_tables(pool: &SqlitePool) -> Vec<String> {

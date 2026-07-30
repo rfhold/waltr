@@ -140,9 +140,10 @@ pub enum SessionOAuthTokenFieldTarget {
 mod credentials;
 
 pub use credentials::{
-    FileCredentialStore, McpOAuthCredentialStore, McpOAuthEndpoints, McpOAuthRegistration,
-    McpOAuthRegistrationMethod, McpOAuthState, McpOAuthStoreFuture, McpOAuthToken, McpRefreshClaim,
-    McpRefreshClaimResult, OAuthCredential, StoredCredential,
+    CredentialStore, FileCredentialStore, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration,
+    McpOAuthRegistrationMethod, OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext,
+    OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim,
+    OAuthRefreshClaimResult, OAuthTokenSet, StoredCredential,
 };
 
 #[cfg(test)]

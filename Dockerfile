@@ -63,7 +63,6 @@ RUN apt-get update && \
     install -d -o 65532 -g 65532 /data
 
 ENV WALTR_SERVER_ADDR=0.0.0.0:14333
-ENV WALTR_AUTH_PATH=/data/auth.json
 ENV WALTR_SESSION_FILESYSTEM_ROOT=/data/sessions
 ENV WALTR_SESSION_STORE=filesystem
 ENV HOME=/data

@@ -3,8 +3,7 @@
 use crate::config::ConfigHandle;
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
 use waltr_agent::{
-    FileCredentialStore, FilesystemSessionStore, MemorySessionStore, SessionCoordinator,
-    SessionStore,
+    CredentialStore, FilesystemSessionStore, MemorySessionStore, SessionCoordinator, SessionStore,
 };
 use tonic::service::RoutesBuilder;
 
@@ -29,7 +28,7 @@ use storage::SessionStorageConfig;
 pub fn add_service_from_env(
     routes: &mut RoutesBuilder,
     config: ConfigHandle,
-    credential_store: FileCredentialStore,
+    credential_store: CredentialStore,
 ) -> Result<(), SessionStorageConfigError> {
     match SessionStorageConfig::from_env()? {
         SessionStorageConfig::Memory => {
@@ -52,20 +51,23 @@ pub fn add_service_from_env(
 }
 
 /// Add the default session service to the gRPC routes builder.
-pub fn add_default_service(routes: &mut RoutesBuilder) {
-    routes.add_service(SessionServiceServer::from_arc(SessionService::new(
-        MemorySessionStore::new(),
-    )));
+pub fn add_default_service(routes: &mut RoutesBuilder, credential_store: CredentialStore) {
+    routes.add_service(SessionServiceServer::from_arc(
+        SessionService::new_with_config(
+            MemorySessionStore::new(),
+            ConfigHandle::default(),
+            credential_store,
+        ),
+    ));
 }
 
 /// Add an in-memory session service using an explicit config store.
-pub fn add_memory_service(routes: &mut RoutesBuilder, config: ConfigHandle) {
-    add_store_service(
-        routes,
-        MemorySessionStore::new(),
-        config,
-        FileCredentialStore::from_env(),
-    );
+pub fn add_memory_service(
+    routes: &mut RoutesBuilder,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+) {
+    add_store_service(routes, MemorySessionStore::new(), config, credential_store);
 }
 
 /// Add an in-memory session service using an existing session coordinator.
@@ -73,7 +75,7 @@ pub fn add_sessions_service<S>(
     routes: &mut RoutesBuilder,
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
-    credential_store: FileCredentialStore,
+    credential_store: CredentialStore,
 ) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
@@ -86,7 +88,7 @@ fn add_store_service<S>(
     routes: &mut RoutesBuilder,
     store: S,
     config: ConfigHandle,
-    credential_store: FileCredentialStore,
+    credential_store: CredentialStore,
 ) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {

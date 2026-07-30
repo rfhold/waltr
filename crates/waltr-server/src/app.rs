@@ -5,7 +5,7 @@ use crate::{
         AccessAuthConfig, AccessAuthConfigError, AccessAuthError, AccessAuthHttpClient,
         AccessAuthenticator, GrpcAccessAuthLayer, GrpcTransportLayer,
     },
-    auth::{AuthService, FileCredentialStore},
+    auth::{AuthService, CredentialStore},
     catalog::{CatalogLoader, CatalogService},
     config::{ConfigError, ConfigHandle},
     config_service::ConfigService,
@@ -471,7 +471,7 @@ pub async fn build_app_with_services<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
     build_app_with_catalog_loader_and_access_authenticator(
         config_service,
@@ -495,7 +495,7 @@ pub async fn build_app_with_access_authenticator<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
@@ -521,7 +521,7 @@ pub async fn build_app_with_access_authenticator_and_mcp_oauth<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
@@ -546,7 +546,7 @@ pub async fn build_app_with_catalog_loader<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
     build_app_with_catalog_loader_and_access_authenticator(
         config_service,
@@ -580,7 +580,7 @@ pub async fn build_app_with_catalog_loader_and_access_authenticator<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
@@ -617,7 +617,7 @@ pub async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oaut
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, FileCredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
     tracing::debug!("building app router");
     let config = ConfigHandle::watching(
@@ -626,8 +626,7 @@ where
     )
     .await?;
     let outbound_oauth_store = persistence.outbound_oauth_store();
-    let credential_store =
-        FileCredentialStore::from_env().with_mcp_store(outbound_oauth_store.clone());
+    let credential_store = CredentialStore::shared(outbound_oauth_store.clone());
     let auth_service = AuthService::new(
         config_service.store().clone(),
         credential_store.clone(),

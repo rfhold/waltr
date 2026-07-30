@@ -34,7 +34,7 @@ use waltr::grpc::waltr::{
     },
 };
 use waltr_agent::{
-    AgentSessionRuntimeFactory, ExternalRequestId, FileCredentialStore, RunConflictPolicy,
+    AgentSessionRuntimeFactory, CredentialStore, ExternalRequestId, RunConflictPolicy,
     SessionCoordinator, SessionId, SessionListEvent, SessionStore, SessionTemplateKind,
     SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
     SessionTimelineEvent, TimelineCursor,
@@ -58,35 +58,12 @@ impl<S> SessionService<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    /// Create a session service from a store.
-    #[must_use]
-    pub fn new(store: S) -> Arc<Self> {
-        Self::from_sessions(SessionCoordinator::new(store))
-    }
-
-    /// Create a session service from an existing session coordinator.
-    #[must_use]
-    pub fn from_sessions(sessions: SessionCoordinator<S>) -> Arc<Self> {
-        let credential_store = FileCredentialStore::from_env();
-        let config = ConfigHandle::default();
-        let sessions = sessions.with_runtime_factory(AgentSessionRuntimeFactory::new(
-            default_root(),
-            credential_store,
-        ));
-        Arc::new(Self { sessions, config })
-    }
-}
-
-impl<S> SessionService<S>
-where
-    S: SessionStore + Clone + Send + Sync + 'static,
-{
     /// Create a session service from a store and config handle.
     #[must_use]
     pub fn new_with_config(
         store: S,
         config: ConfigHandle,
-        credential_store: FileCredentialStore,
+        credential_store: CredentialStore,
     ) -> Arc<Self> {
         Self::from_sessions_with_config(SessionCoordinator::new(store), config, credential_store)
     }
@@ -96,7 +73,7 @@ where
     pub fn from_sessions_with_config(
         sessions: SessionCoordinator<S>,
         config: ConfigHandle,
-        credential_store: FileCredentialStore,
+        credential_store: CredentialStore,
     ) -> Arc<Self> {
         let sessions = sessions.with_runtime_factory(AgentSessionRuntimeFactory::new(
             default_root(),

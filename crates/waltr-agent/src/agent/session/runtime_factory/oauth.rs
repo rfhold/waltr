@@ -10,16 +10,15 @@ use mcp::{
     McpOAuthGrantType, McpOAuthSecret, McpRefreshTokenRequest, McpTokenError, McpTokenErrorCode,
     McpTokenResponse,
 };
+use oauth2::{AccessToken, RefreshToken, Scope};
 use reqwest::{Client, Response, Url, header::CONTENT_TYPE};
 
-use super::{
-    mcp_oauth_state, should_refresh_mcp_token, validate_mcp_access_token, validate_mcp_credential,
-};
+use super::{should_refresh_mcp_token, validate_mcp_access_token, validate_mcp_credential};
 use crate::{
-    AuthTarget, AuthenticationFailureReason, FileCredentialStore, McpOAuthState, McpRefreshClaim,
-    McpRefreshClaimResult, OAuthCredential, SessionMcpServerRuntimeSettings,
-    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
-    SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle, StoredCredential,
+    AuthTarget, AuthenticationFailureReason, CredentialStore, OAuthCredential,
+    OAuthCredentialContext, OAuthCredentialRecord, OAuthRefreshClaim, OAuthRefreshClaimResult,
+    SessionMcpServerRuntimeSettings, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
+    SessionOAuthProviderSettings, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
 };
 
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
@@ -87,16 +86,16 @@ enum RefreshFailureDisposition {
 /// Reusable provider and remote MCP outbound credential refresh coordinator.
 #[derive(Debug, Clone)]
 pub struct CredentialRefreshCoordinator {
-    credential_store: FileCredentialStore,
+    credential_store: CredentialStore,
     allow_loopback_http: bool,
 }
 
 impl CredentialRefreshCoordinator {
     /// Create a coordinator over the supplied durable credential store.
     #[must_use]
-    pub const fn new(credential_store: FileCredentialStore) -> Self {
+    pub fn new(credential_store: impl Into<CredentialStore>) -> Self {
         Self {
-            credential_store,
+            credential_store: credential_store.into(),
             allow_loopback_http: false,
         }
     }
@@ -123,8 +122,8 @@ impl CredentialRefreshCoordinator {
     ) -> Result<Option<OAuthCredential>, CredentialRefreshError> {
         let target = AuthTarget::provider(provider_key);
         let credential_key = target.credential_key();
-        let initial = self.read_provider(&target, &credential_key).await?;
-        let Some(initial) = initial else {
+        let record = self.read_record(&target, &credential_key).await?;
+        let Some(record) = record else {
             return if mode == RefreshMode::Normal {
                 Ok(None)
             } else {
@@ -136,30 +135,14 @@ impl CredentialRefreshCoordinator {
                 ))
             };
         };
-        if mode == RefreshMode::Normal && !should_refresh_provider(&initial) {
-            return Ok(Some(initial));
+        validate_provider_credential(&target, &record)?;
+        if mode == RefreshMode::Normal && !should_refresh_provider(&record.credential) {
+            return Ok(Some(record.credential));
         }
-
-        let _guard = self
-            .credential_store
-            .lock_provider_refresh(&credential_key)
-            .await;
-        let current = self.read_provider(&target, &credential_key).await?;
-        let Some(current) = current else {
-            return Err(refresh_error(
-                target,
-                AuthenticationFailureReason::CredentialRequired,
-                "provider OAuth credential is required",
-                RefreshFailureDisposition::ReauthorizationRequired,
-            ));
-        };
-        if !credentials_match(&initial, &current)
-            || (mode == RefreshMode::Normal && !should_refresh_provider(&current))
-        {
-            return Ok(Some(current));
-        }
-        if current.refresh.is_empty() {
-            return if mode == RefreshMode::Normal {
+        if record.credential.token.refresh_token.is_none() {
+            return if mode == RefreshMode::Normal && !record.credential.token.expires_by(now_ms()) {
+                Ok(Some(record.credential))
+            } else if mode == RefreshMode::Normal {
                 Ok(None)
             } else {
                 Err(refresh_error(
@@ -170,37 +153,29 @@ impl CredentialRefreshCoordinator {
                 ))
             };
         }
-
-        let refreshed =
-            refresh_provider_oauth(&target, definition, &current, self.allow_loopback_http).await?;
-        let mut committed = false;
-        let candidate = refreshed.clone();
-        let baseline = current.clone();
-        let stored = self
-            .credential_store
-            .modify(&credential_key, |stored| match stored {
-                Some(StoredCredential::OAuth(existing))
-                    if credentials_match(&existing, &baseline) =>
-                {
-                    committed = true;
-                    Some(StoredCredential::OAuth(candidate))
-                }
-                other => other,
-            })
+        let claim = refresh_claim(record.revision);
+        if let Some(current) = self.claim_refresh(&target, &credential_key, &claim).await? {
+            validate_provider_credential(&target, &current)?;
+            return Ok(Some(current.credential));
+        }
+        let refreshed = match refresh_provider_oauth(
+            &target,
+            definition,
+            &record.credential,
+            self.allow_loopback_http,
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.abort_refresh(&target, &credential_key, &claim, &error)
+                    .await?;
+                return Err(error);
+            }
+        };
+        self.commit_refresh(&target, &credential_key, claim, refreshed)
             .await
-            .map_err(|_| storage_error(target.clone(), "failed to store provider credential"))?;
-        if committed {
-            return Ok(Some(refreshed));
-        }
-        match stored {
-            Some(StoredCredential::OAuth(current)) => Ok(Some(current)),
-            _ => Err(refresh_error(
-                target,
-                AuthenticationFailureReason::CredentialRequired,
-                "provider OAuth credential changed during refresh",
-                RefreshFailureDisposition::ReauthorizationRequired,
-            )),
-        }
+            .map(|record| Some(record.credential))
     }
 
     /// Refresh one remote MCP credential and return the committed current state.
@@ -216,15 +191,11 @@ impl CredentialRefreshCoordinator {
         &self,
         server: &SessionMcpServerRuntimeSettings,
         mode: RefreshMode,
-    ) -> Result<Option<McpOAuthState>, CredentialRefreshError> {
+    ) -> Result<Option<OAuthCredential>, CredentialRefreshError> {
         let target = AuthTarget::mcp_server(&server.key);
         let credential_key = target.credential_key();
-        let stored = self
-            .credential_store
-            .read(&credential_key)
-            .await
-            .map_err(|_| storage_error(target.clone(), "failed to read MCP credential"))?;
-        let Some(stored) = stored else {
+        let record = self.read_record(&target, &credential_key).await?;
+        let Some(record) = record else {
             return if mode == RefreshMode::Normal {
                 Ok(None)
             } else {
@@ -236,48 +207,13 @@ impl CredentialRefreshCoordinator {
                 ))
             };
         };
-        let legacy = match &stored {
-            StoredCredential::OAuth(credential) => Some(credential.clone()),
-            StoredCredential::McpOAuth(_) => None,
-        };
-        let Some(mut current) = mcp_oauth_state(stored, &server.url) else {
-            return Err(refresh_error(
-                target,
-                AuthenticationFailureReason::ConfigurationRequired,
-                "MCP OAuth credential binding is invalid",
-                RefreshFailureDisposition::RetrySafe,
-            ));
-        };
-        validate_mcp_state(&target, server, &current)?;
-        if let Some(legacy) = legacy {
-            let upgraded = current.clone();
-            let stored = self
-                .credential_store
-                .upgrade_legacy_mcp(&credential_key, &legacy, upgraded)
-                .await
-                .map_err(|_| storage_error(target.clone(), "failed to upgrade MCP credential"))?;
-            let Some(StoredCredential::McpOAuth(stored)) = stored else {
-                return Err(refresh_error(
-                    target,
-                    AuthenticationFailureReason::CredentialRequired,
-                    "MCP OAuth credential changed during legacy upgrade",
-                    RefreshFailureDisposition::ReauthorizationRequired,
-                ));
-            };
-            current = stored;
-            validate_mcp_state(&target, server, &current)?;
+        validate_mcp_state(&target, server, &record)?;
+        if mode == RefreshMode::Normal && !should_refresh_mcp_token(&record.credential) {
+            return Ok(Some(record.credential));
         }
-        if mode == RefreshMode::Normal && !should_refresh_mcp_token(&current) {
-            return Ok(Some(current));
-        }
-        if current
-            .token
-            .refresh_token
-            .as_deref()
-            .is_none_or(str::is_empty)
-        {
-            if mode == RefreshMode::Normal && !current.token.expires_by(now_ms()) {
-                return Ok(Some(current));
+        if record.credential.token.refresh_token.is_none() {
+            if mode == RefreshMode::Normal && !record.credential.token.expires_by(now_ms()) {
+                return Ok(Some(record.credential));
             }
             return Err(refresh_error(
                 target,
@@ -287,67 +223,38 @@ impl CredentialRefreshCoordinator {
             ));
         }
 
-        let generation = current.token.refresh_generation;
-        let claim = McpRefreshClaim {
-            generation,
-            claim_id: uuid::Uuid::now_v7().to_string(),
-            lease_expires_at_ms: now_ms().saturating_add(30_000),
-        };
-        match self
-            .credential_store
-            .claim_mcp_refresh(&credential_key, claim.clone(), now_ms())
-            .await
-            .map_err(|_| storage_error(target.clone(), "failed to claim MCP credential refresh"))?
-        {
-            McpRefreshClaimResult::Current(current) => {
-                validate_mcp_state(&target, server, &current)?;
-                if !mcp_refresh_result_is_usable(mode, &current) {
-                    return Err(refresh_error(
-                        target,
-                        AuthenticationFailureReason::CredentialRequired,
-                        "MCP OAuth refresh did not produce a usable credential",
-                        RefreshFailureDisposition::ReauthorizationRequired,
-                    ));
-                }
-                return Ok(Some(*current));
-            }
-            McpRefreshClaimResult::ReauthorizationRequired => {
+        let claim = refresh_claim(record.revision);
+        if let Some(current) = self.claim_refresh(&target, &credential_key, &claim).await? {
+            validate_mcp_state(&target, server, &current)?;
+            if !mcp_refresh_result_is_usable(mode, &current.credential) {
                 return Err(refresh_error(
                     target,
                     AuthenticationFailureReason::CredentialRequired,
-                    "MCP OAuth refresh requires reauthorization",
+                    "MCP OAuth refresh did not produce a usable credential",
                     RefreshFailureDisposition::ReauthorizationRequired,
                 ));
             }
-            McpRefreshClaimResult::Claimed(_) => {}
+            return Ok(Some(current.credential));
         }
 
-        let refreshed = match refresh_mcp_oauth(&target, &current, self.allow_loopback_http).await {
-            Ok(credential) => credential,
-            Err(error) => {
-                let indeterminate = matches!(
-                    error.disposition,
-                    RefreshFailureDisposition::Indeterminate
-                        | RefreshFailureDisposition::ReauthorizationRequired
-                );
-                self.credential_store
-                    .abort_mcp_refresh(&credential_key, generation, &claim.claim_id, indeterminate)
-                    .await
-                    .map_err(|_| {
-                        storage_error(target.clone(), "failed to abort MCP credential refresh")
-                    })?;
-                if mode == RefreshMode::Normal
-                    && error.disposition == RefreshFailureDisposition::Indeterminate
-                    && !current.token.expires_by(now_ms())
-                {
-                    return Ok(Some(current));
+        let refreshed =
+            match refresh_mcp_oauth(&target, &record.credential, self.allow_loopback_http).await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    self.abort_refresh(&target, &credential_key, &claim, &error)
+                        .await?;
+                    if mode == RefreshMode::Normal
+                        && error.disposition == RefreshFailureDisposition::Indeterminate
+                        && !record.credential.token.expires_by(now_ms())
+                    {
+                        return Ok(Some(record.credential));
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         if refreshed.token.expires_by(now_ms()) {
             self.credential_store
-                .abort_mcp_refresh(&credential_key, generation, &claim.claim_id, true)
+                .abort_refresh(&credential_key, claim.clone(), true)
                 .await
                 .map_err(|_| {
                     storage_error(target.clone(), "failed to abort MCP credential refresh")
@@ -359,34 +266,11 @@ impl CredentialRefreshCoordinator {
                 RefreshFailureDisposition::Indeterminate,
             ));
         }
-        let committed = self
-            .credential_store
-            .commit_mcp_refresh(
-                &credential_key,
-                generation,
-                &claim.claim_id,
-                refreshed.clone(),
-            )
-            .await
-            .map_err(|_| storage_error(target.clone(), "failed to store MCP credential"))?;
-        if committed {
-            return Ok(Some(refreshed));
-        }
-        let stored = self
-            .credential_store
-            .read(&credential_key)
-            .await
-            .map_err(|_| storage_error(target.clone(), "failed to read MCP credential"))?;
-        let Some(StoredCredential::McpOAuth(current)) = stored else {
-            return Err(refresh_error(
-                target,
-                AuthenticationFailureReason::CredentialRequired,
-                "MCP OAuth credential changed during refresh",
-                RefreshFailureDisposition::ReauthorizationRequired,
-            ));
-        };
+        let current = self
+            .commit_refresh(&target, &credential_key, claim, refreshed)
+            .await?;
         validate_mcp_state(&target, server, &current)?;
-        if !mcp_refresh_result_is_usable(mode, &current) {
+        if !mcp_refresh_result_is_usable(mode, &current.credential) {
             return Err(refresh_error(
                 target,
                 AuthenticationFailureReason::CredentialRequired,
@@ -394,30 +278,131 @@ impl CredentialRefreshCoordinator {
                 RefreshFailureDisposition::ReauthorizationRequired,
             ));
         }
-        Ok(Some(current))
+        Ok(Some(current.credential))
     }
 
-    async fn read_provider(
+    async fn read_record(
         &self,
         target: &AuthTarget,
         credential_key: &str,
-    ) -> Result<Option<OAuthCredential>, CredentialRefreshError> {
-        self.credential_store
+    ) -> Result<Option<OAuthCredentialRecord>, CredentialRefreshError> {
+        let record = self
+            .credential_store
             .read(credential_key)
             .await
-            .map_err(|_| storage_error(target.clone(), "failed to read provider credential"))
-            .map(|stored| match stored {
-                Some(StoredCredential::OAuth(credential)) => Some(credential),
-                _ => None,
+            .map_err(|_| storage_error(target.clone(), "failed to read OAuth credential"))?;
+        match record {
+            Some(record) if record.reauthorization_required => Err(refresh_error(
+                target.clone(),
+                AuthenticationFailureReason::CredentialRequired,
+                "OAuth credential requires reauthorization",
+                RefreshFailureDisposition::ReauthorizationRequired,
+            )),
+            record => Ok(record),
+        }
+    }
+
+    async fn claim_refresh(
+        &self,
+        target: &AuthTarget,
+        credential_key: &str,
+        claim: &OAuthRefreshClaim,
+    ) -> Result<Option<OAuthCredentialRecord>, CredentialRefreshError> {
+        match self
+            .credential_store
+            .claim_refresh(credential_key, claim.clone())
+            .await
+            .map_err(|_| {
+                storage_error(target.clone(), "failed to claim OAuth credential refresh")
+            })? {
+            OAuthRefreshClaimResult::Claimed(_) => Ok(None),
+            OAuthRefreshClaimResult::Current(current) => Ok(Some(*current)),
+            OAuthRefreshClaimResult::ReauthorizationRequired => Err(refresh_error(
+                target.clone(),
+                AuthenticationFailureReason::CredentialRequired,
+                "OAuth refresh requires reauthorization",
+                RefreshFailureDisposition::ReauthorizationRequired,
+            )),
+        }
+    }
+
+    async fn abort_refresh(
+        &self,
+        target: &AuthTarget,
+        credential_key: &str,
+        claim: &OAuthRefreshClaim,
+        error: &CredentialRefreshError,
+    ) -> Result<(), CredentialRefreshError> {
+        let indeterminate = matches!(
+            error.disposition,
+            RefreshFailureDisposition::Indeterminate
+                | RefreshFailureDisposition::ReauthorizationRequired
+        );
+        self.credential_store
+            .abort_refresh(credential_key, claim.clone(), indeterminate)
+            .await
+            .map_err(|_| {
+                storage_error(
+                    target.clone(),
+                    &format!(
+                        "failed to abort {} credential refresh",
+                        oauth_target_label(target)
+                    ),
+                )
             })
+    }
+
+    async fn commit_refresh(
+        &self,
+        target: &AuthTarget,
+        credential_key: &str,
+        claim: OAuthRefreshClaim,
+        refreshed: OAuthCredential,
+    ) -> Result<OAuthCredentialRecord, CredentialRefreshError> {
+        let committed = self
+            .credential_store
+            .commit_refresh(credential_key, claim, refreshed.clone())
+            .await
+            .map_err(|_| {
+                storage_error(
+                    target.clone(),
+                    &format!("failed to store {} credential", oauth_target_label(target)),
+                )
+            })?;
+        if committed {
+            return self
+                .read_record(target, credential_key)
+                .await?
+                .ok_or_else(|| {
+                    storage_error(target.clone(), "stored OAuth credential is missing")
+                });
+        }
+        self.read_record(target, credential_key)
+            .await?
+            .ok_or_else(|| {
+                refresh_error(
+                    target.clone(),
+                    AuthenticationFailureReason::CredentialRequired,
+                    "OAuth credential changed during refresh",
+                    RefreshFailureDisposition::ReauthorizationRequired,
+                )
+            })
+    }
+}
+
+const fn oauth_target_label(target: &AuthTarget) -> &'static str {
+    match target {
+        AuthTarget::Provider { .. } => "provider",
+        AuthTarget::McpServer { .. } => "MCP",
     }
 }
 
 fn validate_mcp_state(
     target: &AuthTarget,
     server: &SessionMcpServerRuntimeSettings,
-    credential: &McpOAuthState,
+    record: &OAuthCredentialRecord,
 ) -> Result<(), CredentialRefreshError> {
+    let credential = &record.credential;
     validate_mcp_credential(server, credential).map_err(|_| {
         refresh_error(
             target.clone(),
@@ -436,21 +421,51 @@ fn validate_mcp_state(
     })
 }
 
-fn credentials_match(left: &OAuthCredential, right: &OAuthCredential) -> bool {
-    left.access == right.access
-        && left.refresh == right.refresh
-        && left.expires_at_ms == right.expires_at_ms
-        && left.metadata == right.metadata
+fn validate_provider_credential(
+    target: &AuthTarget,
+    record: &OAuthCredentialRecord,
+) -> Result<(), CredentialRefreshError> {
+    if record.credential.version == crate::OAUTH_CREDENTIAL_VERSION
+        && matches!(
+            record.credential.context,
+            OAuthCredentialContext::Provider { .. }
+        )
+        && !record.credential.token.access_token.secret().is_empty()
+        && record
+            .credential
+            .token
+            .token_type
+            .eq_ignore_ascii_case("bearer")
+    {
+        Ok(())
+    } else {
+        Err(refresh_error(
+            target.clone(),
+            AuthenticationFailureReason::ResponseInvalid,
+            "provider OAuth credential is invalid",
+            RefreshFailureDisposition::ReauthorizationRequired,
+        ))
+    }
 }
 
 fn should_refresh_provider(credential: &OAuthCredential) -> bool {
-    credential.expires_at_ms <= now_ms().saturating_add(super::OAUTH_REFRESH_AHEAD_MS)
+    credential
+        .token
+        .expires_by(now_ms().saturating_add(super::OAUTH_REFRESH_AHEAD_MS))
 }
 
-fn mcp_refresh_result_is_usable(mode: RefreshMode, credential: &McpOAuthState) -> bool {
+fn mcp_refresh_result_is_usable(mode: RefreshMode, credential: &OAuthCredential) -> bool {
     match mode {
         RefreshMode::Normal => !should_refresh_mcp_token(credential),
         RefreshMode::Forced => !credential.token.expires_by(now_ms()),
+    }
+}
+
+fn refresh_claim(revision: u64) -> OAuthRefreshClaim {
+    OAuthRefreshClaim {
+        revision,
+        claim_id: uuid::Uuid::now_v7().to_string(),
+        lease_expires_at_ms: now_ms().saturating_add(30_000),
     }
 }
 
@@ -471,7 +486,22 @@ async fn refresh_provider_oauth(
     let pairs = vec![
         ("grant_type", "refresh_token"),
         ("client_id", definition.client_id.as_str()),
-        ("refresh_token", credential.refresh.as_str()),
+        (
+            "refresh_token",
+            credential
+                .token
+                .refresh_token
+                .as_ref()
+                .map(RefreshToken::secret)
+                .ok_or_else(|| {
+                    refresh_error(
+                        target.clone(),
+                        AuthenticationFailureReason::CredentialRequired,
+                        "provider OAuth credential does not include a refresh token",
+                        RefreshFailureDisposition::ReauthorizationRequired,
+                    )
+                })?,
+        ),
     ];
     let (token_url, client) =
         oauth_client_for(target, &definition.token_url, allow_loopback_http).await?;
@@ -509,13 +539,22 @@ async fn refresh_provider_oauth(
 #[allow(clippy::too_many_lines)]
 pub(super) async fn refresh_mcp_oauth(
     target: &AuthTarget,
-    credential: &McpOAuthState,
+    credential: &OAuthCredential,
     allow_loopback_http: bool,
-) -> Result<McpOAuthState, CredentialRefreshError> {
+) -> Result<OAuthCredential, CredentialRefreshError> {
+    let context = credential.mcp_context().ok_or_else(|| {
+        refresh_error(
+            target.clone(),
+            AuthenticationFailureReason::ConfigurationRequired,
+            "MCP OAuth credential binding is invalid",
+            RefreshFailureDisposition::RetrySafe,
+        )
+    })?;
     let refresh_token = credential
         .token
         .refresh_token
-        .as_deref()
+        .as_ref()
+        .map(RefreshToken::secret)
         .filter(|token| !token.is_empty())
         .ok_or_else(|| {
             refresh_error(
@@ -525,7 +564,7 @@ pub(super) async fn refresh_mcp_oauth(
                 RefreshFailureDisposition::ReauthorizationRequired,
             )
         })?;
-    if credential.endpoints.token.is_empty() || credential.registration.client_id.is_empty() {
+    if context.endpoints.token.is_empty() || context.registration.client_id.is_empty() {
         return Err(refresh_error(
             target.clone(),
             AuthenticationFailureReason::ConfigurationRequired,
@@ -536,12 +575,12 @@ pub(super) async fn refresh_mcp_oauth(
     let request = McpRefreshTokenRequest {
         grant_type: McpOAuthGrantType::RefreshToken,
         refresh_token: McpOAuthSecret::new(refresh_token),
-        client_id: credential.registration.client_id.clone(),
+        client_id: context.registration.client_id.clone(),
         scope: None,
-        resource: Some(credential.resource.clone()),
+        resource: Some(context.resource.clone()),
     };
     let (token_url, client) =
-        oauth_client_for(target, &credential.endpoints.token, allow_loopback_http).await?;
+        oauth_client_for(target, &context.endpoints.token, allow_loopback_http).await?;
     let response = client
         .post(token_url)
         .form(&request)
@@ -599,29 +638,31 @@ pub(super) async fn refresh_mcp_oauth(
         ));
     }
     let mut next = credential.clone();
-    token
-        .access_token
-        .expose_secret()
-        .clone_into(&mut next.token.access_token);
+    next.token.access_token = AccessToken::new(token.access_token.expose_secret().to_owned());
     "Bearer".clone_into(&mut next.token.token_type);
     if let Some(refresh_token) = token.refresh_token
         && !refresh_token.expose_secret().is_empty()
     {
-        next.token.refresh_token = Some(refresh_token.expose_secret().to_owned());
+        next.token.refresh_token =
+            Some(RefreshToken::new(refresh_token.expose_secret().to_owned()));
     }
     if let Some(scope) = token.scope {
-        next.token.granted_scopes = scope.split_whitespace().map(ToOwned::to_owned).collect();
+        next.token.scopes = scope
+            .split_whitespace()
+            .map(|scope| Scope::new(scope.to_owned()))
+            .collect();
     }
     if let Some(seconds) = token.expires_in {
-        next.token.expires_at_ms = now_ms().saturating_add(
-            i64::try_from(seconds)
-                .unwrap_or(i64::MAX)
-                .saturating_mul(1000),
+        next.token.expires_at_ms = Some(
+            now_ms().saturating_add(
+                i64::try_from(seconds)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(1000),
+            ),
         );
     } else {
-        next.token.set_expiry_unknown();
+        next.token.expires_at_ms = None;
     }
-    next.token.refresh_generation = credential.token.refresh_generation.saturating_add(1);
     if next.token.expires_by(now_ms()) {
         return Err(refresh_error(
             target.clone(),
@@ -647,6 +688,10 @@ fn pairs_to_json(pairs: &[(&str, &str)]) -> serde_json::Value {
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "provider token mapping keeps configured field and JWT extraction in one validation path"
+)]
 fn token_response_to_credential(
     target: &AuthTarget,
     definition: &SessionOAuthProviderSettings,
@@ -661,62 +706,83 @@ fn token_response_to_credential(
             RefreshFailureDisposition::Indeterminate,
         )
     })?;
-    let mut credential = OAuthCredential {
-        access: value
-            .get("access_token")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        refresh: value
-            .get("refresh_token")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&current.refresh)
-            .to_owned(),
-        expires_at_ms: value
-            .get("expires_in")
-            .and_then(serde_json::Value::as_i64)
-            .map_or(0, |seconds| {
-                now_ms().saturating_add(seconds.saturating_mul(1000))
-            }),
-        metadata: current.metadata.clone(),
-    };
+    let access = value
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let refresh = value
+        .get("refresh_token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            current
+                .token
+                .refresh_token
+                .as_ref()
+                .map(|token| token.secret().to_owned())
+        });
+    let expires_at_ms = value
+        .get("expires_in")
+        .and_then(serde_json::Value::as_i64)
+        .map(|seconds| now_ms().saturating_add(seconds.saturating_mul(1000)));
+    let metadata = current.provider_metadata().cloned().ok_or_else(|| {
+        refresh_error(
+            target.clone(),
+            AuthenticationFailureReason::ConfigurationRequired,
+            "provider OAuth credential binding is invalid",
+            RefreshFailureDisposition::RetrySafe,
+        )
+    })?;
+    let mut credential = OAuthCredential::provider(
+        crate::OAuthTokenSet::bearer(access, refresh, expires_at_ms),
+        metadata,
+    );
     for field in &definition.token_fields {
         let Some(field_value) = value.get(&field.source) else {
             continue;
         };
         match field.target {
             SessionOAuthTokenFieldTarget::Access => {
-                field_value
-                    .as_str()
-                    .unwrap_or_default()
-                    .clone_into(&mut credential.access);
+                credential.token.access_token =
+                    AccessToken::new(field_value.as_str().unwrap_or_default().to_owned());
             }
             SessionOAuthTokenFieldTarget::Refresh => {
                 if let Some(refresh) = field_value.as_str().filter(|value| !value.is_empty()) {
-                    refresh.clone_into(&mut credential.refresh);
+                    credential.token.refresh_token = Some(RefreshToken::new(refresh.to_owned()));
                 }
             }
             SessionOAuthTokenFieldTarget::ExpiresAtMs => {
-                credential.expires_at_ms = field_value.as_i64().unwrap_or_default();
+                credential.token.expires_at_ms = field_value.as_i64();
             }
             SessionOAuthTokenFieldTarget::ExpiresInSeconds => {
-                credential.expires_at_ms = now_ms().saturating_add(
-                    field_value
-                        .as_i64()
-                        .unwrap_or_default()
-                        .saturating_mul(1000),
+                credential.token.expires_at_ms = Some(
+                    now_ms().saturating_add(
+                        field_value
+                            .as_i64()
+                            .unwrap_or_default()
+                            .saturating_mul(1000),
+                    ),
                 );
             }
             SessionOAuthTokenFieldTarget::Metadata => {
                 credential
-                    .metadata
+                    .provider_metadata_mut()
+                    .expect("provider credential context")
                     .insert(field.source.clone(), json_scalar_to_string(field_value));
             }
         }
     }
-    extract_jwt_metadata(target, definition, &value, &mut credential.metadata)?;
-    if credential.access.is_empty() {
+    extract_jwt_metadata(
+        target,
+        definition,
+        &value,
+        credential
+            .provider_metadata_mut()
+            .expect("provider credential context"),
+    )?;
+    if credential.token.access_token.secret().is_empty() {
         return Err(refresh_error(
             target.clone(),
             AuthenticationFailureReason::ResponseInvalid,

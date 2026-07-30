@@ -73,7 +73,6 @@ test("only the dev service publishes its fixed loopback port", () => {
 test("all Waltr services have exact static environments", () => {
   const expectedCommonEnvironment = {
     WALTR_SERVER_ADDR: "0.0.0.0:14333",
-    WALTR_AUTH_PATH: "/data/auth.json",
     WALTR_DATABASE_URL: "sqlite:///data/waltr.sqlite3",
     WALTR_MCP_DATABASE_URL: "sqlite:///data/mcp.sqlite3",
     WALTR_MODELS_DEV_PATH: "/fixtures/models-dev-api.fixture.json",
