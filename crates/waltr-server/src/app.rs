@@ -5,7 +5,9 @@ use crate::{
         AccessAuthConfig, AccessAuthConfigError, AccessAuthError, AccessAuthHttpClient,
         AccessAuthenticator, GrpcAccessAuthLayer, GrpcTransportLayer,
     },
-    auth::{AuthService, CredentialStore},
+    auth::{
+        AuthService, CredentialStore, TrustedPrivateOriginsError, trusted_private_origins_from_env,
+    },
     catalog::{CatalogLoader, CatalogService},
     config::{ConfigError, ConfigHandle, DefaultConfigBuilder},
     config_service::ConfigService,
@@ -335,6 +337,8 @@ pub enum BuildAppError {
     AccessAuthStore(AccessAuthError),
     /// MCP OAuth environment configuration is invalid.
     McpOAuthConfig(McpOAuthConfigError),
+    /// Outbound MCP OAuth private-origin configuration is invalid.
+    OutboundOAuthConfig(TrustedPrivateOriginsError),
     /// MCP OAuth persistence, wrapping keys, or signing state could not initialize.
     McpOAuth(McpOAuthError),
 }
@@ -364,6 +368,9 @@ impl fmt::Display for BuildAppError {
                 formatter.write_str("failed to initialize access authentication persistence")
             }
             Self::McpOAuthConfig(_) => formatter.write_str("MCP OAuth configuration is invalid"),
+            Self::OutboundOAuthConfig(_) => {
+                formatter.write_str("outbound MCP OAuth configuration is invalid")
+            }
             Self::McpOAuth(_) => formatter.write_str("failed to initialize MCP OAuth server"),
         }
     }
@@ -379,6 +386,7 @@ impl Error for BuildAppError {
             Self::AccessAuthClient(error) => Some(error),
             Self::AccessAuthDiscovery(error) | Self::AccessAuthStore(error) => Some(error),
             Self::McpOAuthConfig(error) => Some(error),
+            Self::OutboundOAuthConfig(error) => Some(error),
             Self::McpOAuth(error) => Some(error),
         }
     }
@@ -402,6 +410,8 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         AccessAuthConfig::from_env().map_err(BuildAppError::AccessAuthConfig)?;
     let mcp_oauth_config =
         McpOAuthConfig::from_env(&access_auth_config).map_err(BuildAppError::McpOAuthConfig)?;
+    let outbound_private_origins =
+        trusted_private_origins_from_env().map_err(BuildAppError::OutboundOAuthConfig)?;
     let access_auth_client = AccessAuthHttpClient::build(
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -423,22 +433,28 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
                 .map_err(BuildAppError::McpOAuth)?,
         ),
     };
-    let trusted_mcp_oauth_origin = mcp_oauth
+    let automatic_self_mcp_resource = mcp_oauth
         .as_ref()
         .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
+    let session_private_origins = agent_trusted_origins(
+        outbound_private_origins.clone(),
+        automatic_self_mcp_resource.as_ref(),
+    );
     let mut session_storage = Ok(());
-    let router = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
+    let router = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
         config_service,
         persistence,
         catalog_loader,
         access_authenticator,
         mcp_oauth,
+        outbound_private_origins,
+        automatic_self_mcp_resource,
         |grpc_routes, config, credential_store| {
-            session_storage = session::add_service_from_env(
+            session_storage = session::add_service_from_env_with_oauth_policy(
                 grpc_routes,
                 config,
                 credential_store,
-                trusted_mcp_oauth_origin,
+                session_private_origins,
             );
         },
     )
@@ -446,6 +462,20 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
     .map_err(BuildAppError::Config)?;
     session_storage.map_err(BuildAppError::SessionStorage)?;
     Ok(router)
+}
+
+fn agent_trusted_origins(
+    mut configured: Vec<reqwest::Url>,
+    server_resource: Option<&reqwest::Url>,
+) -> Vec<reqwest::Url> {
+    if let Some(server_resource) = server_resource
+        && !configured
+            .iter()
+            .any(|origin| origin.origin() == server_resource.origin())
+    {
+        configured.push(server_resource.clone());
+    }
+    configured
 }
 
 /// Build the Axum application using an explicit config service.
@@ -634,6 +664,40 @@ pub async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oaut
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
+    let automatic_self_mcp_resource = mcp_oauth
+        .as_ref()
+        .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
+    build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
+        config_service,
+        persistence,
+        catalog_loader,
+        access_authenticator,
+        mcp_oauth,
+        Vec::new(),
+        automatic_self_mcp_resource,
+        add_session_service,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "router assembly consumes initialized services and OAuth policy in dependency order"
+)]
+async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy<F>(
+    config_service: Arc<ConfigService>,
+    persistence: Persistence,
+    catalog_loader: CatalogLoader,
+    access_authenticator: AccessAuthenticator,
+    mcp_oauth: Option<McpOAuthServer>,
+    outbound_private_origins: Vec<reqwest::Url>,
+    automatic_self_mcp_resource: Option<reqwest::Url>,
+    add_session_service: F,
+) -> Result<ServerApplication, ConfigError>
+where
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+{
     tracing::debug!("building app router");
     let config = ConfigHandle::watching(
         config_service.store().clone(),
@@ -642,14 +706,12 @@ where
     .await?;
     let outbound_oauth_store = persistence.outbound_oauth_store();
     let credential_store = CredentialStore::shared(outbound_oauth_store.clone());
-    let trusted_mcp_oauth_origin = mcp_oauth
-        .as_ref()
-        .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
     let auth_service = AuthService::new(
         config_service.store().clone(),
         credential_store.clone(),
         outbound_oauth_store,
-        trusted_mcp_oauth_origin,
+        outbound_private_origins,
+        automatic_self_mcp_resource,
     );
     let outbound_oauth_router = auth_service.router();
     let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
@@ -796,6 +858,18 @@ mod tests {
         assert_eq!(method, "GET");
         assert_eq!(path, "/oidc/callback");
         drop(request_span(&request));
+    }
+
+    #[test]
+    fn server_supplies_its_origin_to_agent_refresh_policy() {
+        let configured = reqwest::Url::parse("https://oauth.internal.example").unwrap();
+        let server = reqwest::Url::parse("https://preview-waltr.example/mcp").unwrap();
+        let origins = agent_trusted_origins(vec![configured.clone()], Some(&server));
+        assert_eq!(origins, [configured, server.clone()]);
+
+        let same_origin = reqwest::Url::parse("https://preview-waltr.example/oauth").unwrap();
+        let origins = agent_trusted_origins(vec![same_origin.clone()], Some(&server));
+        assert_eq!(origins, [same_origin]);
     }
 
     #[tokio::test]

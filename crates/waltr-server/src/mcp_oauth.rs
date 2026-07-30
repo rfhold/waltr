@@ -33,7 +33,7 @@ use mcp::{
         OAuthResourceOwnerAuthentication, OAuthResourceOwnerAuthenticationRequest,
         OAuthResourceOwnerAuthenticator, OAuthSigningKeyState, PostgresOAuthAuthorizationStore,
         PrivateNetworkOAuthCimdDestinationPolicy, SqliteOAuthAuthorizationStore,
-        VersionedOAuthWrappingKeyring,
+        TrustedPrivateOAuthCimdDestinationPolicy, VersionedOAuthWrappingKeyring,
     },
     server::BoxFuture,
 };
@@ -88,6 +88,7 @@ pub struct McpOAuthEnabledConfig {
     code_ttl: Duration,
     allow_dcr: bool,
     allow_cimd: bool,
+    cimd_trusted_private_origins: Vec<Url>,
     allow_private_test_destinations: bool,
 }
 
@@ -108,6 +109,7 @@ impl McpOAuthConfig {
             "WALTR_MCP_OAUTH_CODE_TTL",
             "WALTR_MCP_OAUTH_ALLOW_DCR",
             "WALTR_MCP_OAUTH_ALLOW_CIMD",
+            "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS",
             "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS",
         ];
         let mut values = HashMap::new();
@@ -127,6 +129,10 @@ impl McpOAuthConfig {
         Self::from_values(access, &values)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "hosted OAuth validation keeps interdependent deployment settings together"
+    )]
     fn from_values(
         access: &AccessAuthConfig,
         values: &HashMap<&str, String>,
@@ -193,6 +199,8 @@ impl McpOAuthConfig {
         )?;
         let allow_dcr = boolean(values, "WALTR_MCP_OAUTH_ALLOW_DCR")?;
         let allow_cimd = boolean(values, "WALTR_MCP_OAUTH_ALLOW_CIMD")?;
+        let cimd_trusted_private_origins =
+            trusted_origins(values, "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS")?;
         let allow_private_test_destinations =
             boolean(values, "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS")?;
         Ok(Self::Enabled(McpOAuthEnabledConfig {
@@ -207,6 +215,7 @@ impl McpOAuthConfig {
             code_ttl,
             allow_dcr,
             allow_cimd,
+            cimd_trusted_private_origins,
             allow_private_test_destinations,
         }))
     }
@@ -251,6 +260,7 @@ impl McpOAuthEnabledConfig {
             code_ttl: DEFAULT_CODE_TTL,
             allow_dcr: false,
             allow_cimd: false,
+            cimd_trusted_private_origins: Vec::new(),
             allow_private_test_destinations: false,
         })
     }
@@ -374,16 +384,21 @@ impl McpOAuthServer {
         )
         .map_err(|_| McpOAuthError::Configuration)?;
         if config.allow_dcr || config.allow_cimd {
-            let metadata_fetcher = config.allow_cimd.then(|| {
+            let metadata_fetcher = if config.allow_cimd {
                 let fetcher = HardenedOAuthClientMetadataFetcher::production();
                 let fetcher = if config.allow_private_test_destinations {
                     fetcher
                         .with_destination_policy(Arc::new(PrivateNetworkOAuthCimdDestinationPolicy))
                 } else {
-                    fetcher
+                    let origins = cimd_trusted_origins(&config);
+                    let policy = TrustedPrivateOAuthCimdDestinationPolicy::new(origins)
+                        .map_err(|_| McpOAuthError::Configuration)?;
+                    fetcher.with_destination_policy(Arc::new(policy))
                 };
-                Arc::new(fetcher) as _
-            });
+                Some(Arc::new(fetcher) as _)
+            } else {
+                None
+            };
             let registration = OAuthClientRegistrationOptions {
                 dynamic_registration: config.allow_dcr,
                 metadata_fetcher,
@@ -592,6 +607,22 @@ impl McpOAuthServer {
         }
         Ok(())
     }
+}
+
+fn cimd_trusted_origins(config: &McpOAuthEnabledConfig) -> Vec<Url> {
+    let mut origins = config.cimd_trusted_private_origins.clone();
+    let mut self_origin = Url::parse(&config.public_url)
+        .expect("validated WALTR_PUBLIC_URL should remain an absolute URL");
+    self_origin.set_path("/");
+    self_origin.set_query(None);
+    self_origin.set_fragment(None);
+    if !origins
+        .iter()
+        .any(|origin| origin.origin() == self_origin.origin())
+    {
+        origins.push(self_origin);
+    }
+    origins
 }
 
 async fn oauth_authorization_store(
@@ -961,6 +992,49 @@ fn boolean(values: &HashMap<&str, String>, name: &str) -> Result<bool, McpOAuthC
     }
 }
 
+fn trusted_origins(
+    values: &HashMap<&str, String>,
+    name: &str,
+) -> Result<Vec<Url>, McpOAuthConfigError> {
+    let Some(raw) = value(values, name) else {
+        return Ok(Vec::new());
+    };
+    let mut origins = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        let origin = Url::parse(entry).map_err(|_| {
+            McpOAuthConfigError::Invalid(format!(
+                "{name} must contain comma-separated HTTPS origins"
+            ))
+        })?;
+        if origin.scheme() != "https"
+            || origin.host_str().is_none()
+            || !origin.username().is_empty()
+            || origin.password().is_some()
+            || origin.path() != "/"
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+        {
+            return Err(McpOAuthConfigError::Invalid(format!(
+                "{name} must contain only HTTPS origins without paths, credentials, queries, or fragments"
+            )));
+        }
+        TrustedPrivateOAuthCimdDestinationPolicy::new([origin.clone()]).map_err(|_| {
+            McpOAuthConfigError::Invalid(format!("{name} contains a prohibited origin"))
+        })?;
+        if origins
+            .iter()
+            .any(|existing: &Url| existing.origin() == origin.origin())
+        {
+            return Err(McpOAuthConfigError::Invalid(format!(
+                "{name} contains a duplicate origin"
+            )));
+        }
+        origins.push(origin);
+    }
+    Ok(origins)
+}
+
 fn duration(
     values: &HashMap<&str, String>,
     name: &str,
@@ -1222,6 +1296,10 @@ mod tests {
         assert_eq!(config.issuer(), "https://waltr.example/base/oauth");
         assert_eq!(config.resource(), "https://waltr.example/base/mcp");
         assert_eq!(config.required_scopes(), ["mcp:use", "tools:read"]);
+        assert_eq!(
+            cimd_trusted_origins(&config),
+            [Url::parse("https://waltr.example/").expect("self origin")]
+        );
     }
 
     #[test]
@@ -1244,6 +1322,50 @@ mod tests {
             assert!(
                 McpOAuthConfig::from_values(&access_config(), &values).is_err(),
                 "{name}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn cimd_private_origins_are_exact_https_origins() {
+        let mut values = HashMap::from([
+            ("WALTR_MCP_REQUIRED_SCOPES", "mcp:use".to_owned()),
+            (
+                "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
+                "/run/secrets/mcp-keys".to_owned(),
+            ),
+            (
+                "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS",
+                "https://private.example, https://other.example:444".to_owned(),
+            ),
+        ]);
+        let McpOAuthConfig::Enabled(config) =
+            McpOAuthConfig::from_values(&access_config(), &values).expect("valid config")
+        else {
+            panic!("OIDC mode should enable hosted OAuth");
+        };
+        assert_eq!(config.cimd_trusted_private_origins.len(), 2);
+
+        for invalid in [
+            "http://private.example",
+            "https://private.example/path",
+            "https://user@private.example",
+            "https://private.example?query",
+            "https://private.example#fragment",
+            "https://private.example,",
+            "https://PRIVATE.example:443,https://private.example",
+            "https://localhost",
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://[::1]",
+        ] {
+            values.insert(
+                "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS",
+                invalid.to_owned(),
+            );
+            assert!(
+                McpOAuthConfig::from_values(&access_config(), &values).is_err(),
+                "{invalid}"
             );
         }
     }

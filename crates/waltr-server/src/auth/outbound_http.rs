@@ -1,6 +1,7 @@
-use std::{net::IpAddr, time::Duration};
+use std::{env, error::Error, fmt, net::IpAddr, time::Duration};
 
 use futures_util::StreamExt as _;
+use mcp::TrustedPrivateOAuthCimdDestinationPolicy;
 use reqwest::{Client, Response, Url, header::CONTENT_TYPE};
 use tonic::Status;
 
@@ -10,16 +11,23 @@ pub(super) const OAUTH_RESPONSE_LIMIT: usize = 64 * 1024;
 pub(super) struct OutboundHttpPolicy {
     allow_loopback_http: bool,
     allow_private_https: bool,
-    trusted_private_origin: Option<Url>,
+    configured_private_origins: Vec<Url>,
+    automatic_self_resource: Option<Url>,
+    active_private_origins: Vec<Url>,
 }
 
 impl OutboundHttpPolicy {
-    pub(super) fn production(trusted_private_origin: Option<Url>) -> Self {
+    pub(super) fn production(
+        configured_private_origins: Vec<Url>,
+        automatic_self_resource: Option<Url>,
+    ) -> Self {
         Self {
             allow_loopback_http: false,
             allow_private_https: std::env::var("WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS")
                 .is_ok_and(|value| value == "true"),
-            trusted_private_origin,
+            active_private_origins: configured_private_origins.clone(),
+            configured_private_origins,
+            automatic_self_resource,
         }
     }
 
@@ -28,7 +36,9 @@ impl OutboundHttpPolicy {
         Self {
             allow_loopback_http: true,
             allow_private_https: false,
-            trusted_private_origin: None,
+            configured_private_origins: Vec::new(),
+            automatic_self_resource: None,
+            active_private_origins: Vec::new(),
         }
     }
 
@@ -71,23 +81,27 @@ impl OutboundHttpPolicy {
         self.allow_loopback_http
     }
 
-    pub(super) const fn trusted_private_origin(&self) -> Option<&Url> {
-        self.trusted_private_origin.as_ref()
+    pub(super) fn trusted_private_origins(&self) -> &[Url] {
+        &self.active_private_origins
     }
 
     pub(super) fn for_mcp_resource(&self, resource: &str) -> Self {
         let mut policy = self.clone();
-        if Url::parse(resource).map_or(true, |url| {
-            self.trusted_private_origin.as_ref() != Some(&url)
-        }) {
-            policy.trusted_private_origin = None;
+        policy
+            .active_private_origins
+            .clone_from(&self.configured_private_origins);
+        if Url::parse(resource).ok().as_ref() == self.automatic_self_resource.as_ref()
+            && let Some(resource) = &self.automatic_self_resource
+            && !policy.trusts_private_origin(resource)
+        {
+            policy.active_private_origins.push(resource.clone());
         }
         policy
     }
 
-    pub(super) fn without_trusted_private_origin(&self) -> Self {
+    pub(super) fn without_trusted_private_origins(&self) -> Self {
         let mut policy = self.clone();
-        policy.trusted_private_origin = None;
+        policy.active_private_origins.clear();
         policy
     }
 
@@ -140,10 +154,77 @@ impl OutboundHttpPolicy {
     }
 
     fn trusts_private_origin(&self, url: &Url) -> bool {
-        self.trusted_private_origin
-            .as_ref()
-            .is_some_and(|trusted| trusted.origin() == url.origin())
+        self.active_private_origins
+            .iter()
+            .any(|trusted| trusted.origin() == url.origin())
     }
+}
+
+#[derive(Debug)]
+pub struct TrustedPrivateOriginsError(String);
+
+impl fmt::Display for TrustedPrivateOriginsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for TrustedPrivateOriginsError {}
+
+pub fn trusted_private_origins_from_env() -> Result<Vec<Url>, TrustedPrivateOriginsError> {
+    match env::var("WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS") {
+        Ok(value) => parse_trusted_private_origins(&value),
+        Err(env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(env::VarError::NotUnicode(_)) => Err(TrustedPrivateOriginsError(
+            "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS must contain valid UTF-8".to_owned(),
+        )),
+    }
+}
+
+fn parse_trusted_private_origins(value: &str) -> Result<Vec<Url>, TrustedPrivateOriginsError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut origins = Vec::new();
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        let origin = Url::parse(entry).map_err(|_| {
+            TrustedPrivateOriginsError(
+                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS must contain comma-separated HTTPS origins"
+                    .to_owned(),
+            )
+        })?;
+        if origin.scheme() != "https"
+            || origin.host_str().is_none()
+            || !origin.username().is_empty()
+            || origin.password().is_some()
+            || origin.path() != "/"
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+        {
+            return Err(TrustedPrivateOriginsError(
+                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS must contain only HTTPS origins without paths, credentials, queries, or fragments"
+                    .to_owned(),
+            ));
+        }
+        TrustedPrivateOAuthCimdDestinationPolicy::new([origin.clone()]).map_err(|_| {
+            TrustedPrivateOriginsError(
+                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS contains a prohibited origin"
+                    .to_owned(),
+            )
+        })?;
+        if origins
+            .iter()
+            .any(|existing: &Url| existing.origin() == origin.origin())
+        {
+            return Err(TrustedPrivateOriginsError(
+                "WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS contains a duplicate origin"
+                    .to_owned(),
+            ));
+        }
+        origins.push(origin);
+    }
+    Ok(origins)
 }
 
 pub(super) fn validate_response_peer(
@@ -235,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_policy_rejects_private_metadata_and_loopback_destinations() {
-        let policy = OutboundHttpPolicy::production(None);
+        let policy = OutboundHttpPolicy::production(Vec::new(), None);
         for endpoint in [
             "http://127.0.0.1/token",
             "https://10.0.0.1/token",
@@ -258,15 +339,18 @@ mod tests {
 
     #[tokio::test]
     async fn trusted_https_origin_accepts_only_private_addresses_on_that_origin() {
-        let policy = OutboundHttpPolicy::production(Some(
-            Url::parse("https://preview-waltr.example/mcp").expect("trusted URL"),
-        ));
+        let self_resource = Url::parse("https://preview-waltr.example/mcp").expect("trusted URL");
+        let configured = Url::parse("https://configured.example").expect("configured origin");
+        let policy = OutboundHttpPolicy::production(vec![configured], Some(self_resource));
+        let policy = policy.for_mcp_resource("https://preview-waltr.example/mcp");
         let trusted = Url::parse("https://preview-waltr.example/token").expect("endpoint URL");
         let other_host = Url::parse("https://other.example/token").expect("endpoint URL");
         let other_port =
             Url::parse("https://preview-waltr.example:444/token").expect("endpoint URL");
 
+        let configured = Url::parse("https://configured.example/token").expect("endpoint URL");
         assert!(policy.allows_address(&trusted, "10.0.0.1".parse().expect("private IP")));
+        assert!(policy.allows_address(&configured, "10.0.0.1".parse().expect("private IP")));
         assert!(policy.allows_address(&trusted, "fd00::1".parse().expect("private IP")));
         assert!(!policy.allows_address(&other_host, "10.0.0.1".parse().expect("private IP")));
         assert!(!policy.allows_address(&other_port, "10.0.0.1".parse().expect("private IP")));
@@ -274,29 +358,55 @@ mod tests {
         assert!(
             !policy.allows_address(&trusted, "169.254.169.254".parse().expect("link-local IP"))
         );
-        assert!(
+        assert_eq!(
             policy
                 .for_mcp_resource("https://other.example/mcp")
-                .trusted_private_origin()
-                .is_none()
+                .trusted_private_origins()
+                .len(),
+            1
         );
-        assert!(
+        assert_eq!(
             policy
                 .for_mcp_resource("https://preview-waltr.example/mcp")
-                .trusted_private_origin()
-                .is_some()
+                .trusted_private_origins()
+                .len(),
+            2
         );
-        assert!(
+        assert_eq!(
             policy
                 .for_mcp_resource("https://preview-waltr.example/other-mcp")
-                .trusted_private_origin()
-                .is_none()
+                .trusted_private_origins()
+                .len(),
+            1
         );
         assert!(
             policy
-                .without_trusted_private_origin()
-                .trusted_private_origin()
-                .is_none()
+                .without_trusted_private_origins()
+                .trusted_private_origins()
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn trusted_origin_parser_requires_exact_https_origins() {
+        let origins =
+            parse_trusted_private_origins("https://private.example, https://other.example:444")
+                .expect("valid origins");
+        assert_eq!(origins.len(), 2);
+        for invalid in [
+            "http://private.example",
+            "https://private.example/path",
+            "https://user@private.example",
+            "https://private.example?query",
+            "https://private.example#fragment",
+            "https://localhost",
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://[::1]",
+            "https://private.example,",
+            "https://PRIVATE.example:443,https://private.example",
+        ] {
+            assert!(parse_trusted_private_origins(invalid).is_err(), "{invalid}");
+        }
     }
 }

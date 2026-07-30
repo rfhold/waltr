@@ -12,6 +12,7 @@ use axum::http::HeaderMap;
 use futures_util::StreamExt as _;
 use reqwest::{Url, header, redirect::Policy};
 use sha2::{Digest as _, Sha256};
+use url::Host;
 
 use super::OAuthAuthorizationStoreError;
 use crate::{
@@ -110,6 +111,91 @@ impl OAuthCimdDestinationPolicy for PublicOAuthCimdDestinationPolicy {
     }
 }
 
+/// Production destination policy that permits private addresses only for explicit HTTPS origins.
+#[derive(Clone, Debug, Default)]
+pub struct TrustedPrivateOAuthCimdDestinationPolicy {
+    trusted_origins: Arc<Vec<Url>>,
+}
+
+impl TrustedPrivateOAuthCimdDestinationPolicy {
+    /// Validate and store exact trusted origins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless every value is a credential-free HTTPS origin.
+    pub fn new(origins: impl IntoIterator<Item = Url>) -> Result<Self> {
+        let mut trusted_origins = Vec::new();
+        for origin in origins {
+            if origin.scheme() != "https"
+                || origin.host_str().is_none()
+                || !origin.username().is_empty()
+                || origin.password().is_some()
+                || origin.path() != "/"
+                || origin.query().is_some()
+                || origin.fragment().is_some()
+                || !trusted_origin_host_is_permitted(&origin)
+            {
+                return Err(Error::protocol(
+                    "trusted CIMD destination must be an HTTPS origin",
+                ));
+            }
+            if !trusted_origins
+                .iter()
+                .any(|trusted: &Url| trusted.origin() == origin.origin())
+            {
+                trusted_origins.push(origin);
+            }
+        }
+        Ok(Self {
+            trusted_origins: Arc::new(trusted_origins),
+        })
+    }
+
+    fn trusts(&self, destination: &Url) -> bool {
+        self.trusted_origins
+            .iter()
+            .any(|trusted| trusted.origin() == destination.origin())
+    }
+}
+
+fn trusted_origin_host_is_permitted(origin: &Url) -> bool {
+    match origin.host() {
+        Some(Host::Domain(host)) => !host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_private() || is_public_ip(IpAddr::V4(address)),
+        Some(Host::Ipv6(address)) => address.is_unique_local() || is_public_ip(IpAddr::V6(address)),
+        None => false,
+    }
+}
+
+impl OAuthCimdDestinationPolicy for TrustedPrivateOAuthCimdDestinationPolicy {
+    fn resolve(&self, destination: Url) -> BoxFuture<Result<Vec<SocketAddr>>> {
+        let trusted = self.trusts(&destination);
+        Box::pin(async move {
+            let host = destination_host(&destination)?;
+            let port = destination
+                .port_or_known_default()
+                .ok_or_else(|| Error::protocol("CIMD destination requires a port"))?;
+            let addresses = tokio::time::timeout(
+                DEFAULT_DNS_TIMEOUT,
+                tokio::net::lookup_host((host.as_str(), port)),
+            )
+            .await
+            .map_err(|_| Error::protocol("CIMD DNS resolution timed out"))?
+            .map_err(|_| Error::protocol("CIMD DNS resolution failed"))?
+            .collect::<BTreeSet<_>>();
+            if addresses.is_empty()
+                || addresses.len() > DEFAULT_MAX_DNS_RESULTS
+                || addresses.iter().any(|address| {
+                    !(is_public_ip(address.ip()) || trusted && is_private_ip(address.ip()))
+                })
+            {
+                return Err(Error::protocol("CIMD destination is prohibited"));
+            }
+            Ok(addresses.into_iter().collect())
+        })
+    }
+}
+
 /// Explicit deterministic-test policy that permits loopback HTTP only.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoopbackOAuthCimdDestinationPolicy;
@@ -159,18 +245,21 @@ impl OAuthCimdDestinationPolicy for PrivateNetworkOAuthCimdDestinationPolicy {
             .map_err(|_| Error::protocol("CIMD DNS resolution timed out"))?
             .map_err(|_| Error::protocol("CIMD DNS resolution failed"))?
             .collect::<BTreeSet<_>>();
-            let private = |address: IpAddr| match address {
-                IpAddr::V4(address) => address.is_private(),
-                IpAddr::V6(address) => address.is_unique_local(),
-            };
             if addresses.is_empty()
                 || addresses.len() > DEFAULT_MAX_DNS_RESULTS
-                || addresses.iter().any(|address| !private(address.ip()))
+                || addresses.iter().any(|address| !is_private_ip(address.ip()))
             {
                 return Err(Error::protocol("CIMD test destination is not private"));
             }
             Ok(addresses.into_iter().collect())
         })
+    }
+}
+
+const fn is_private_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_private(),
+        IpAddr::V6(address) => address.is_unique_local(),
     }
 }
 
@@ -554,5 +643,79 @@ fn is_public_ip(address: IpAddr) -> bool {
 impl From<OAuthAuthorizationStoreError> for Error {
     fn from(_: OAuthAuthorizationStoreError) -> Self {
         Self::protocol("OAuth registration persistence failed")
+    }
+}
+
+#[cfg(test)]
+mod destination_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn trusted_private_origins_are_exact_and_keep_prohibited_addresses_blocked() {
+        let policy = TrustedPrivateOAuthCimdDestinationPolicy::new([
+            Url::parse("https://10.1.2.3").expect("private IPv4 origin"),
+            Url::parse("https://[fd00::1]").expect("private IPv6 origin"),
+        ])
+        .expect("trusted origins");
+
+        assert!(
+            policy
+                .resolve(Url::parse("https://10.1.2.3/client").expect("destination"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            policy
+                .resolve(Url::parse("https://[fd00::1]/client").expect("destination"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            policy
+                .resolve(Url::parse("https://10.1.2.3:444/client").expect("destination"))
+                .await
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve(Url::parse("https://127.0.0.1/client").expect("destination"))
+                .await
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve(Url::parse("https://169.254.169.254/client").expect("destination"))
+                .await
+                .is_err()
+        );
+        assert!(
+            policy
+                .resolve(Url::parse("https://1.1.1.1/client").expect("destination"))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn trusted_private_origin_configuration_requires_origins() {
+        for invalid in [
+            "http://private.example",
+            "https://private.example/path",
+            "https://user@private.example",
+            "https://private.example?query",
+            "https://private.example#fragment",
+            "https://localhost",
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://[::1]",
+        ] {
+            assert!(
+                TrustedPrivateOAuthCimdDestinationPolicy::new([
+                    Url::parse(invalid).expect("absolute URL")
+                ])
+                .is_err(),
+                "{invalid}"
+            );
+        }
     }
 }

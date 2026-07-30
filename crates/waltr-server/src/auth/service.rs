@@ -114,14 +114,18 @@ where
         config_store: S,
         credential_store: CredentialStore,
         outbound_store: Arc<OutboundOAuthStore>,
-        trusted_private_origin: Option<reqwest::Url>,
+        configured_private_origins: Vec<reqwest::Url>,
+        automatic_self_resource: Option<reqwest::Url>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config_store,
             credential_store,
             outbound_store,
             attempts: Mutex::new(HashMap::new()),
-            outbound_policy: OutboundHttpPolicy::production(trusted_private_origin),
+            outbound_policy: OutboundHttpPolicy::production(
+                configured_private_origins,
+                automatic_self_resource,
+            ),
             #[cfg(test)]
             outbound_redirect_uri: None,
             #[cfg(test)]
@@ -365,9 +369,9 @@ where
             AuthTarget::provider(provider_key),
             definition.definition,
             now_ms(),
-            &self.outbound_policy.without_trusted_private_origin(),
+            &self.outbound_policy.without_trusted_private_origins(),
         )?;
-        let policy = self.outbound_policy.without_trusted_private_origin();
+        let policy = self.outbound_policy.without_trusted_private_origins();
         policy
             .validate_destination(&attempt.definition().authorize_url)
             .await?;
@@ -454,11 +458,9 @@ where
                 let server = config.mcp_servers.get(key).ok_or_else(|| {
                     Status::not_found(format!("mcp server '{key}' does not exist"))
                 })?;
-                let mut coordinator = coordinator;
                 let policy = self.outbound_policy.for_mcp_resource(&server.url);
-                if let Some(origin) = policy.trusted_private_origin() {
-                    coordinator = coordinator.with_trusted_mcp_oauth_origin(origin.clone());
-                }
+                let coordinator = coordinator
+                    .with_trusted_mcp_oauth_origins(policy.trusted_private_origins().to_vec());
                 coordinator
                     .refresh_mcp(
                         &SessionMcpServerRuntimeSettings {
@@ -643,7 +645,7 @@ where
                     attempt,
                     input,
                     now_ms(),
-                    self.outbound_policy.without_trusted_private_origin(),
+                    self.outbound_policy.without_trusted_private_origins(),
                 )
                 .await
                 .map_err(|status| outbound_oauth_status(&target, &status))?;
@@ -1955,7 +1957,13 @@ mod tests {
             )
             .await
             .unwrap();
-        AuthService::new(config_store, credential_store, outbound_store, None)
+        AuthService::new(
+            config_store,
+            credential_store,
+            outbound_store,
+            Vec::new(),
+            None,
+        )
     }
 
     #[tokio::test]
@@ -2720,7 +2728,13 @@ mod tests {
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
         let credential_store = CredentialStore::shared(outbound_store.clone());
-        let service = AuthService::new(config_store, credential_store, outbound_store, None);
+        let service = AuthService::new(
+            config_store,
+            credential_store,
+            outbound_store,
+            Vec::new(),
+            None,
+        );
         let router = Router::new()
             .route(
                 "/outbound-oauth/callback",

@@ -1038,7 +1038,7 @@ END
                 catalog_loader,
                 authenticator,
                 mcp_oauth,
-                |routes, config, credential_store| {
+                move |routes, config, credential_store| {
                     session::add_sessions_service(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),
