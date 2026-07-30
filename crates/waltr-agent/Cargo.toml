@@ -19,6 +19,7 @@ ignore.workspace = true
 jsonwebtoken.workspace = true
 mcp.workspace = true
 opendal.workspace = true
+oauth2.workspace = true
 refinery = { workspace = true, features = ["tokio-postgres"] }
 reqwest = { workspace = true, features = ["form", "json", "rustls", "stream"] }
 rustls.workspace = true

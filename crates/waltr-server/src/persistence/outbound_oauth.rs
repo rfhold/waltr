@@ -1,6 +1,6 @@
 use waltr_agent::{
-    McpOAuthCredentialStore, McpOAuthState, McpOAuthStoreFuture, McpRefreshClaim,
-    McpRefreshClaimResult,
+    OAuthCredential, OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture,
+    OAuthRefreshClaim, OAuthRefreshClaimResult,
 };
 use sha2::{Digest as _, Sha256};
 use sqlx::{postgres::PgRow, sqlite::SqliteRow};
@@ -139,12 +139,6 @@ impl OutboundOAuthStore {
         }
     }
 
-    pub(crate) async fn reauthorization_required(&self, target_key: &str) -> Result<bool, String> {
-        self.read_state_row(target_key)
-            .await
-            .map(|row| row.is_some_and(|(_, _, required)| required))
-    }
-
     pub(crate) async fn claim_attempt(
         &self,
         attempt_id: &str,
@@ -197,16 +191,14 @@ impl OutboundOAuthStore {
         attempt_id: &str,
         claim_id: &str,
         target_key: &str,
-        state: &McpOAuthState,
+        credential: &OAuthCredential,
     ) -> Result<(), String> {
-        let json = serde_json::to_string(state)
-            .map_err(|_| "failed to encode outbound OAuth state".to_owned())?;
-        let generation = i64::try_from(state.token.refresh_generation).unwrap_or(i64::MAX);
+        let json = encode_credential(credential)?;
         match &self.pool {
             PersistencePool::Sqlite(pool) => {
                 let mut transaction = pool.begin().await.map_err(sanitized_store_error)?;
-                sqlx::query("INSERT INTO outbound_oauth_credentials (target_key, state_json, refresh_generation, updated_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT(target_key) DO UPDATE SET state_json = excluded.state_json, refresh_generation = excluded.refresh_generation, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = 0, updated_at_ms = excluded.updated_at_ms")
-                    .bind(target_key).bind(&json).bind(generation).bind(now_ms()).execute(&mut *transaction).await.map_err(sanitized_store_error)?;
+                sqlx::query("INSERT INTO outbound_oauth_credentials (target_key, credential_json, revision, updated_at_ms) VALUES (?, ?, 0, ?) ON CONFLICT(target_key) DO UPDATE SET credential_json = excluded.credential_json, revision = outbound_oauth_credentials.revision + 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = 0, updated_at_ms = excluded.updated_at_ms")
+                    .bind(target_key).bind(&json).bind(now_ms()).execute(&mut *transaction).await.map_err(sanitized_store_error)?;
                 let affected = sqlx::query("UPDATE outbound_oauth_attempts SET status = 'succeeded', completion_claim_id = NULL, completion_claim_expires_at_ms = NULL, failure_reason = NULL, updated_at_ms = ? WHERE attempt_id = ? AND status = 'completing' AND completion_claim_id = ?")
                     .bind(now_ms()).bind(attempt_id).bind(claim_id).execute(&mut *transaction).await.map_err(sanitized_store_error)?.rows_affected();
                 if affected != 1 {
@@ -216,8 +208,8 @@ impl OutboundOAuthStore {
             }
             PersistencePool::PostgreSql(pool) => {
                 let mut transaction = pool.begin().await.map_err(sanitized_store_error)?;
-                sqlx::query("INSERT INTO waltr.outbound_oauth_credentials (target_key, state_json, refresh_generation, updated_at_ms) VALUES ($1, $2, $3, $4) ON CONFLICT(target_key) DO UPDATE SET state_json = EXCLUDED.state_json, refresh_generation = EXCLUDED.refresh_generation, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = FALSE, updated_at_ms = EXCLUDED.updated_at_ms")
-                    .bind(target_key).bind(&json).bind(generation).bind(now_ms()).execute(&mut *transaction).await.map_err(sanitized_store_error)?;
+                sqlx::query("INSERT INTO waltr.outbound_oauth_credentials (target_key, credential_json, revision, updated_at_ms) VALUES ($1, $2, 0, $3) ON CONFLICT(target_key) DO UPDATE SET credential_json = EXCLUDED.credential_json, revision = waltr.outbound_oauth_credentials.revision + 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = FALSE, updated_at_ms = EXCLUDED.updated_at_ms")
+                    .bind(target_key).bind(&json).bind(now_ms()).execute(&mut *transaction).await.map_err(sanitized_store_error)?;
                 let affected = sqlx::query("UPDATE waltr.outbound_oauth_attempts SET status = 'succeeded', completion_claim_id = NULL, completion_claim_expires_at_ms = NULL, failure_reason = NULL, updated_at_ms = $1 WHERE attempt_id = $2 AND status = 'completing' AND completion_claim_id = $3")
                     .bind(now_ms()).bind(attempt_id).bind(claim_id).execute(&mut *transaction).await.map_err(sanitized_store_error)?.rows_affected();
                 if affected != 1 {
@@ -229,15 +221,16 @@ impl OutboundOAuthStore {
         Ok(())
     }
 
-    async fn mark_reauthorization(&self, target_key: &str, generation: u64) -> Result<(), String> {
+    async fn mark_reauthorization(&self, target_key: &str, revision: u64) -> Result<(), String> {
+        let revision = revision_i64(revision)?;
         match &self.pool {
             PersistencePool::Sqlite(pool) => {
-                sqlx::query("UPDATE outbound_oauth_credentials SET reauthorization_required = 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = ? WHERE target_key = ? AND refresh_generation = ?")
-                .bind(now_ms()).bind(target_key).bind(i64::try_from(generation).unwrap_or(i64::MAX)).execute(pool).await.map_err(sanitized_store_error)?;
+                sqlx::query("UPDATE outbound_oauth_credentials SET reauthorization_required = 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = ? WHERE target_key = ? AND revision = ?")
+                .bind(now_ms()).bind(target_key).bind(revision).execute(pool).await.map_err(sanitized_store_error)?;
             }
             PersistencePool::PostgreSql(pool) => {
-                sqlx::query("UPDATE waltr.outbound_oauth_credentials SET reauthorization_required = TRUE, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = $1 WHERE target_key = $2 AND refresh_generation = $3")
-                .bind(now_ms()).bind(target_key).bind(i64::try_from(generation).unwrap_or(i64::MAX)).execute(pool).await.map_err(sanitized_store_error)?;
+                sqlx::query("UPDATE waltr.outbound_oauth_credentials SET reauthorization_required = TRUE, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = $1 WHERE target_key = $2 AND revision = $3")
+                .bind(now_ms()).bind(target_key).bind(revision).execute(pool).await.map_err(sanitized_store_error)?;
             }
         }
         Ok(())
@@ -280,16 +273,23 @@ where
     })
 }
 
-impl McpOAuthCredentialStore for OutboundOAuthStore {
-    fn read(&self, target_key: String) -> McpOAuthStoreFuture<'_, Option<McpOAuthState>> {
-        Box::pin(async move { self.read_state(&target_key).await })
+impl OAuthCredentialStore for OutboundOAuthStore {
+    fn read(
+        &self,
+        target_key: String,
+    ) -> OAuthCredentialStoreFuture<'_, Option<OAuthCredentialRecord>> {
+        Box::pin(async move { self.read_credential(&target_key).await })
     }
 
-    fn write(&self, target_key: String, state: McpOAuthState) -> McpOAuthStoreFuture<'_, ()> {
-        Box::pin(async move { self.write_state(&target_key, &state).await })
+    fn write(
+        &self,
+        target_key: String,
+        credential: OAuthCredential,
+    ) -> OAuthCredentialStoreFuture<'_, ()> {
+        Box::pin(async move { self.write_credential(&target_key, &credential).await })
     }
 
-    fn delete(&self, target_key: String) -> McpOAuthStoreFuture<'_, ()> {
+    fn delete(&self, target_key: String) -> OAuthCredentialStoreFuture<'_, ()> {
         Box::pin(async move {
             match &self.pool {
                 PersistencePool::Sqlite(pool) => {
@@ -316,57 +316,57 @@ impl McpOAuthCredentialStore for OutboundOAuthStore {
     fn claim_refresh(
         &self,
         target_key: String,
-        claim: McpRefreshClaim,
-    ) -> McpOAuthStoreFuture<'_, McpRefreshClaimResult> {
+        claim: OAuthRefreshClaim,
+    ) -> OAuthCredentialStoreFuture<'_, OAuthRefreshClaimResult> {
         Box::pin(async move {
             let now = now_ms();
-            let generation = i64::try_from(claim.generation).unwrap_or(i64::MAX);
+            let revision = revision_i64(claim.revision)?;
             let affected = match &self.pool {
-                PersistencePool::Sqlite(pool) => sqlx::query("UPDATE outbound_oauth_credentials SET refresh_claim_id = ?, refresh_claim_expires_at_ms = ?, updated_at_ms = ? WHERE target_key = ? AND refresh_generation = ? AND reauthorization_required = 0 AND refresh_claim_id IS NULL")
-                    .bind(&claim.claim_id).bind(claim.lease_expires_at_ms).bind(now).bind(&target_key).bind(generation).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
-                PersistencePool::PostgreSql(pool) => sqlx::query("UPDATE waltr.outbound_oauth_credentials SET refresh_claim_id = $1, refresh_claim_expires_at_ms = $2, updated_at_ms = $3 WHERE target_key = $4 AND refresh_generation = $5 AND reauthorization_required = FALSE AND refresh_claim_id IS NULL")
-                    .bind(&claim.claim_id).bind(claim.lease_expires_at_ms).bind(now).bind(&target_key).bind(generation).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
+                PersistencePool::Sqlite(pool) => sqlx::query("UPDATE outbound_oauth_credentials SET refresh_claim_id = ?, refresh_claim_expires_at_ms = ?, updated_at_ms = ? WHERE target_key = ? AND revision = ? AND reauthorization_required = 0 AND refresh_claim_id IS NULL")
+                    .bind(&claim.claim_id).bind(claim.lease_expires_at_ms).bind(now).bind(&target_key).bind(revision).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
+                PersistencePool::PostgreSql(pool) => sqlx::query("UPDATE waltr.outbound_oauth_credentials SET refresh_claim_id = $1, refresh_claim_expires_at_ms = $2, updated_at_ms = $3 WHERE target_key = $4 AND revision = $5 AND reauthorization_required = FALSE AND refresh_claim_id IS NULL")
+                    .bind(&claim.claim_id).bind(claim.lease_expires_at_ms).bind(now).bind(&target_key).bind(revision).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
             };
             if affected == 1 {
-                return Ok(McpRefreshClaimResult::Claimed(claim));
+                return Ok(OAuthRefreshClaimResult::Claimed(claim));
             }
             for _ in 0..310 {
-                let Some((state, claimed_until, reauth)) = self.read_state_row(&target_key).await?
+                let Some((record, claimed_until, reauth)) =
+                    self.read_credential_row(&target_key).await?
                 else {
-                    return Ok(McpRefreshClaimResult::ReauthorizationRequired);
+                    return Ok(OAuthRefreshClaimResult::ReauthorizationRequired);
                 };
                 if reauth {
-                    return Ok(McpRefreshClaimResult::ReauthorizationRequired);
+                    return Ok(OAuthRefreshClaimResult::ReauthorizationRequired);
                 }
                 if claimed_until.is_some_and(|expiry| expiry <= now_ms()) {
-                    self.mark_reauthorization(&target_key, claim.generation)
+                    self.mark_reauthorization(&target_key, claim.revision)
                         .await?;
-                    return Ok(McpRefreshClaimResult::ReauthorizationRequired);
+                    return Ok(OAuthRefreshClaimResult::ReauthorizationRequired);
                 }
-                if state.token.refresh_generation != claim.generation {
-                    return Ok(McpRefreshClaimResult::Current(Box::new(state)));
+                if record.revision != claim.revision {
+                    return Ok(OAuthRefreshClaimResult::Current(Box::new(record)));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            Ok(McpRefreshClaimResult::ReauthorizationRequired)
+            Ok(OAuthRefreshClaimResult::ReauthorizationRequired)
         })
     }
 
     fn commit_refresh(
         &self,
         target_key: String,
-        generation: u64,
-        claim_id: String,
-        state: McpOAuthState,
-    ) -> McpOAuthStoreFuture<'_, bool> {
+        claim: OAuthRefreshClaim,
+        credential: OAuthCredential,
+    ) -> OAuthCredentialStoreFuture<'_, bool> {
         Box::pin(async move {
-            let json = serde_json::to_string(&state)
-                .map_err(|_| "failed to encode outbound OAuth state".to_owned())?;
+            let json = encode_credential(&credential)?;
+            let revision = revision_i64(claim.revision)?;
             let affected = match &self.pool {
-                PersistencePool::Sqlite(pool) => sqlx::query("UPDATE outbound_oauth_credentials SET state_json = ?, refresh_generation = ?, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = ? WHERE target_key = ? AND refresh_generation = ? AND refresh_claim_id = ? AND reauthorization_required = 0")
-                    .bind(json).bind(i64::try_from(state.token.refresh_generation).unwrap_or(i64::MAX)).bind(now_ms()).bind(target_key).bind(i64::try_from(generation).unwrap_or(i64::MAX)).bind(claim_id).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
-                PersistencePool::PostgreSql(pool) => sqlx::query("UPDATE waltr.outbound_oauth_credentials SET state_json = $1, refresh_generation = $2, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = $3 WHERE target_key = $4 AND refresh_generation = $5 AND refresh_claim_id = $6 AND reauthorization_required = FALSE")
-                    .bind(json).bind(i64::try_from(state.token.refresh_generation).unwrap_or(i64::MAX)).bind(now_ms()).bind(target_key).bind(i64::try_from(generation).unwrap_or(i64::MAX)).bind(claim_id).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
+                PersistencePool::Sqlite(pool) => sqlx::query("UPDATE outbound_oauth_credentials SET credential_json = ?, revision = revision + 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = ? WHERE target_key = ? AND revision = ? AND refresh_claim_id = ? AND reauthorization_required = 0")
+                    .bind(json).bind(now_ms()).bind(target_key).bind(revision).bind(claim.claim_id).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
+                PersistencePool::PostgreSql(pool) => sqlx::query("UPDATE waltr.outbound_oauth_credentials SET credential_json = $1, revision = revision + 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, updated_at_ms = $2 WHERE target_key = $3 AND revision = $4 AND refresh_claim_id = $5 AND reauthorization_required = FALSE")
+                    .bind(json).bind(now_ms()).bind(target_key).bind(revision).bind(claim.claim_id).execute(pool).await.map_err(sanitized_store_error)?.rows_affected(),
             };
             Ok(affected == 1)
         })
@@ -375,19 +375,19 @@ impl McpOAuthCredentialStore for OutboundOAuthStore {
     fn abort_refresh(
         &self,
         target_key: String,
-        generation: u64,
-        claim_id: String,
+        claim: OAuthRefreshClaim,
         indeterminate: bool,
-    ) -> McpOAuthStoreFuture<'_, ()> {
+    ) -> OAuthCredentialStoreFuture<'_, ()> {
         Box::pin(async move {
+            let revision = revision_i64(claim.revision)?;
             match &self.pool {
                 PersistencePool::Sqlite(pool) => {
-                    sqlx::query("UPDATE outbound_oauth_credentials SET refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = ?, updated_at_ms = ? WHERE target_key = ? AND refresh_generation = ? AND refresh_claim_id = ?")
-                    .bind(indeterminate).bind(now_ms()).bind(target_key).bind(i64::try_from(generation).unwrap_or(i64::MAX)).bind(claim_id).execute(pool).await.map_err(sanitized_store_error)?;
+                    sqlx::query("UPDATE outbound_oauth_credentials SET refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = ?, updated_at_ms = ? WHERE target_key = ? AND revision = ? AND refresh_claim_id = ?")
+                    .bind(indeterminate).bind(now_ms()).bind(target_key).bind(revision).bind(claim.claim_id).execute(pool).await.map_err(sanitized_store_error)?;
                 }
                 PersistencePool::PostgreSql(pool) => {
-                    sqlx::query("UPDATE waltr.outbound_oauth_credentials SET refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = $1, updated_at_ms = $2 WHERE target_key = $3 AND refresh_generation = $4 AND refresh_claim_id = $5")
-                    .bind(indeterminate).bind(now_ms()).bind(target_key).bind(i64::try_from(generation).unwrap_or(i64::MAX)).bind(claim_id).execute(pool).await.map_err(sanitized_store_error)?;
+                    sqlx::query("UPDATE waltr.outbound_oauth_credentials SET refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = $1, updated_at_ms = $2 WHERE target_key = $3 AND revision = $4 AND refresh_claim_id = $5")
+                    .bind(indeterminate).bind(now_ms()).bind(target_key).bind(revision).bind(claim.claim_id).execute(pool).await.map_err(sanitized_store_error)?;
                 }
             }
             Ok(())
@@ -396,62 +396,91 @@ impl McpOAuthCredentialStore for OutboundOAuthStore {
 }
 
 impl OutboundOAuthStore {
-    async fn read_state(&self, target_key: &str) -> Result<Option<McpOAuthState>, String> {
-        self.read_state_row(target_key)
+    async fn read_credential(
+        &self,
+        target_key: &str,
+    ) -> Result<Option<OAuthCredentialRecord>, String> {
+        self.read_credential_row(target_key)
             .await
             .map(|row| row.map(|row| row.0))
     }
 
-    async fn read_state_row(
+    async fn read_credential_row(
         &self,
         target_key: &str,
-    ) -> Result<Option<(McpOAuthState, Option<i64>, bool)>, String> {
+    ) -> Result<Option<(OAuthCredentialRecord, Option<i64>, bool)>, String> {
         match &self.pool {
-            PersistencePool::Sqlite(pool) => sqlx::query("SELECT state_json, refresh_claim_expires_at_ms, reauthorization_required FROM outbound_oauth_credentials WHERE target_key = ?")
+            PersistencePool::Sqlite(pool) => sqlx::query("SELECT credential_json, revision, refresh_claim_expires_at_ms, reauthorization_required FROM outbound_oauth_credentials WHERE target_key = ?")
                 .bind(target_key).fetch_optional(pool).await.map_err(sanitized_store_error)?
-                .as_ref().map(parse_state_row).transpose(),
-            PersistencePool::PostgreSql(pool) => sqlx::query("SELECT state_json, refresh_claim_expires_at_ms, reauthorization_required FROM waltr.outbound_oauth_credentials WHERE target_key = $1")
+                .as_ref().map(parse_credential_row).transpose(),
+            PersistencePool::PostgreSql(pool) => sqlx::query("SELECT credential_json, revision, refresh_claim_expires_at_ms, reauthorization_required FROM waltr.outbound_oauth_credentials WHERE target_key = $1")
                 .bind(target_key).fetch_optional(pool).await.map_err(sanitized_store_error)?
-                .as_ref().map(parse_state_row).transpose(),
+                .as_ref().map(parse_credential_row).transpose(),
         }
     }
 
-    async fn write_state(&self, target_key: &str, state: &McpOAuthState) -> Result<(), String> {
-        let json = serde_json::to_string(state)
-            .map_err(|_| "failed to encode outbound OAuth state".to_owned())?;
-        let generation = i64::try_from(state.token.refresh_generation).unwrap_or(i64::MAX);
+    async fn write_credential(
+        &self,
+        target_key: &str,
+        credential: &OAuthCredential,
+    ) -> Result<(), String> {
+        let json = encode_credential(credential)?;
         match &self.pool {
             PersistencePool::Sqlite(pool) => {
-                sqlx::query("INSERT INTO outbound_oauth_credentials (target_key, state_json, refresh_generation, updated_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT(target_key) DO UPDATE SET state_json = excluded.state_json, refresh_generation = excluded.refresh_generation, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = 0, updated_at_ms = excluded.updated_at_ms")
-                .bind(target_key).bind(json).bind(generation).bind(now_ms()).execute(pool).await.map_err(sanitized_store_error)?;
+                sqlx::query("INSERT INTO outbound_oauth_credentials (target_key, credential_json, revision, updated_at_ms) VALUES (?, ?, 0, ?) ON CONFLICT(target_key) DO UPDATE SET credential_json = excluded.credential_json, revision = outbound_oauth_credentials.revision + 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = 0, updated_at_ms = excluded.updated_at_ms")
+                .bind(target_key).bind(json).bind(now_ms()).execute(pool).await.map_err(sanitized_store_error)?;
             }
             PersistencePool::PostgreSql(pool) => {
-                sqlx::query("INSERT INTO waltr.outbound_oauth_credentials (target_key, state_json, refresh_generation, updated_at_ms) VALUES ($1, $2, $3, $4) ON CONFLICT(target_key) DO UPDATE SET state_json = EXCLUDED.state_json, refresh_generation = EXCLUDED.refresh_generation, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = FALSE, updated_at_ms = EXCLUDED.updated_at_ms")
-                .bind(target_key).bind(json).bind(generation).bind(now_ms()).execute(pool).await.map_err(sanitized_store_error)?;
+                sqlx::query("INSERT INTO waltr.outbound_oauth_credentials (target_key, credential_json, revision, updated_at_ms) VALUES ($1, $2, 0, $3) ON CONFLICT(target_key) DO UPDATE SET credential_json = EXCLUDED.credential_json, revision = waltr.outbound_oauth_credentials.revision + 1, refresh_claim_id = NULL, refresh_claim_expires_at_ms = NULL, reauthorization_required = FALSE, updated_at_ms = EXCLUDED.updated_at_ms")
+                .bind(target_key).bind(json).bind(now_ms()).execute(pool).await.map_err(sanitized_store_error)?;
             }
         }
         Ok(())
     }
 }
 
-fn parse_state_row<R>(row: &R) -> Result<(McpOAuthState, Option<i64>, bool), String>
+fn parse_credential_row<R>(row: &R) -> Result<(OAuthCredentialRecord, Option<i64>, bool), String>
 where
     R: sqlx::Row,
     for<'a> &'a str: sqlx::ColumnIndex<R>,
     String: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    i64: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
     Option<i64>: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
     bool: for<'a> sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
 {
-    let json: String = row.try_get("state_json").map_err(sanitized_store_error)?;
-    let state = serde_json::from_str(&json)
-        .map_err(|_| "stored outbound OAuth state is invalid".to_owned())?;
+    let json: String = row
+        .try_get("credential_json")
+        .map_err(sanitized_store_error)?;
+    let credential = serde_json::from_str(&json)
+        .map_err(|_| "stored outbound OAuth credential is invalid".to_owned())?;
+    let revision: i64 = row.try_get("revision").map_err(sanitized_store_error)?;
+    let revision = u64::try_from(revision)
+        .map_err(|_| "stored outbound OAuth credential revision is invalid".to_owned())?;
     let expiry = row
         .try_get("refresh_claim_expires_at_ms")
         .map_err(sanitized_store_error)?;
     let reauth = row
         .try_get("reauthorization_required")
         .map_err(sanitized_store_error)?;
-    Ok((state, expiry, reauth))
+    Ok((
+        OAuthCredentialRecord {
+            credential,
+            revision,
+            reauthorization_required: reauth,
+        },
+        expiry,
+        reauth,
+    ))
+}
+
+fn encode_credential(credential: &OAuthCredential) -> Result<String, String> {
+    serde_json::to_string(credential)
+        .map_err(|_| "failed to encode outbound OAuth credential".to_owned())
+}
+
+fn revision_i64(revision: u64) -> Result<i64, String> {
+    i64::try_from(revision)
+        .map_err(|_| "outbound OAuth credential revision is out of range".to_owned())
 }
 
 fn sanitized_store_error<E>(_error: E) -> String {
@@ -475,36 +504,31 @@ mod tests {
     use std::sync::Arc;
 
     use waltr_agent::{
-        McpOAuthCredentialStore as _, McpOAuthEndpoints, McpOAuthRegistration, McpOAuthToken,
+        McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, OAuthCredentialStore as _,
+        OAuthTokenSet,
     };
 
     use super::*;
     use crate::persistence::{DatabaseConfig, Persistence};
 
-    fn state(generation: u64, access: &str) -> McpOAuthState {
-        McpOAuthState {
-            version: 1,
-            resource: "https://mcp.example/resource".to_owned(),
-            issuer: "https://auth.example".to_owned(),
-            registration: McpOAuthRegistration {
-                client_id: "client".to_owned(),
-                redirect_uri: "https://waltr.example/outbound-oauth/callback".to_owned(),
-                token_endpoint_auth_method: "none".to_owned(),
-                ..McpOAuthRegistration::default()
+    fn state(_generation: u64, access: &str) -> OAuthCredential {
+        OAuthCredential::mcp(
+            OAuthTokenSet::bearer(access, Some("refresh".to_owned()), None),
+            McpOAuthContext {
+                resource: "https://mcp.example/resource".to_owned(),
+                issuer: "https://auth.example".to_owned(),
+                registration: McpOAuthRegistration {
+                    client_id: "client".to_owned(),
+                    redirect_uri: "https://waltr.example/outbound-oauth/callback".to_owned(),
+                    token_endpoint_auth_method: "none".to_owned(),
+                    ..McpOAuthRegistration::default()
+                },
+                endpoints: McpOAuthEndpoints {
+                    token: "https://auth.example/token".to_owned(),
+                    ..McpOAuthEndpoints::default()
+                },
             },
-            endpoints: McpOAuthEndpoints {
-                token: "https://auth.example/token".to_owned(),
-                ..McpOAuthEndpoints::default()
-            },
-            token: McpOAuthToken {
-                access_token: access.to_owned(),
-                refresh_token: Some("refresh".to_owned()),
-                token_type: "Bearer".to_owned(),
-                expires_at_ms: i64::MAX,
-                refresh_generation: generation,
-                ..McpOAuthToken::default()
-            },
-        }
+        )
     }
 
     async fn stores() -> (Arc<OutboundOAuthStore>, Arc<OutboundOAuthStore>) {
@@ -517,9 +541,9 @@ mod tests {
         )
     }
 
-    fn claim(generation: u64, id: &str, lease_expires_at_ms: i64) -> McpRefreshClaim {
-        McpRefreshClaim {
-            generation,
+    fn claim(revision: u64, id: &str, lease_expires_at_ms: i64) -> OAuthRefreshClaim {
+        OAuthRefreshClaim {
+            revision,
             claim_id: id.to_owned(),
             lease_expires_at_ms,
         }
@@ -534,10 +558,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             first
-                .claim_refresh("mcp:remote".to_owned(), claim(3, "first", now_ms() + 5_000))
+                .claim_refresh("mcp:remote".to_owned(), claim(0, "first", now_ms() + 5_000))
                 .await
                 .unwrap(),
-            McpRefreshClaimResult::Claimed(_)
+            OAuthRefreshClaimResult::Claimed(_)
         ));
         let waiter = tokio::spawn({
             let second = Arc::clone(&second);
@@ -545,35 +569,34 @@ mod tests {
                 second
                     .claim_refresh(
                         "mcp:remote".to_owned(),
-                        claim(3, "second", now_ms() + 5_000),
+                        claim(0, "second", now_ms() + 5_000),
                     )
                     .await
                     .unwrap()
             }
         });
         let mut refreshed = state(4, "new");
-        refreshed.token.refresh_token = Some("rotated".to_owned());
+        refreshed.token.refresh_token = Some(oauth2::RefreshToken::new("rotated".to_owned()));
         assert!(
             first
                 .commit_refresh(
                     "mcp:remote".to_owned(),
-                    3,
-                    "first".to_owned(),
+                    claim(0, "first", now_ms() + 5_000),
                     refreshed.clone()
                 )
                 .await
                 .unwrap()
         );
-        assert_eq!(
-            waiter.await.unwrap(),
-            McpRefreshClaimResult::Current(Box::new(refreshed))
-        );
+        let OAuthRefreshClaimResult::Current(current) = waiter.await.unwrap() else {
+            panic!("waiter should observe the current credential");
+        };
+        assert_eq!(current.credential, refreshed);
+        assert_eq!(current.revision, 1);
         assert!(
             !second
                 .commit_refresh(
                     "mcp:remote".to_owned(),
-                    3,
-                    "second".to_owned(),
+                    claim(0, "second", now_ms() + 5_000),
                     state(4, "stale")
                 )
                 .await
@@ -593,16 +616,27 @@ mod tests {
             .await
             .unwrap();
         first
-            .abort_refresh("mcp:abort".to_owned(), 0, "claim".to_owned(), true)
+            .abort_refresh(
+                "mcp:abort".to_owned(),
+                claim(0, "claim", now_ms() + 5_000),
+                true,
+            )
             .await
             .unwrap();
-        assert!(first.reauthorization_required("mcp:abort").await.unwrap());
+        assert!(
+            first
+                .read("mcp:abort".to_owned())
+                .await
+                .unwrap()
+                .unwrap()
+                .reauthorization_required
+        );
         assert_eq!(
             second
                 .claim_refresh("mcp:abort".to_owned(), claim(0, "next", now_ms() + 5_000))
                 .await
                 .unwrap(),
-            McpRefreshClaimResult::ReauthorizationRequired
+            OAuthRefreshClaimResult::ReauthorizationRequired
         );
 
         first
@@ -619,7 +653,7 @@ mod tests {
                 .claim_refresh("mcp:lease".to_owned(), claim(0, "next", now_ms() + 5_000))
                 .await
                 .unwrap(),
-            McpRefreshClaimResult::ReauthorizationRequired
+            OAuthRefreshClaimResult::ReauthorizationRequired
         );
     }
 
@@ -710,8 +744,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap()
+                .credential
                 .token
-                .access_token,
+                .access_token
+                .secret(),
             "access"
         );
         second.delete("mcp:remote".to_owned()).await.unwrap();

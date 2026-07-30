@@ -25,9 +25,10 @@ pub use runtime_factory::{
     AgentSessionRuntimeFactory, CredentialRefreshCoordinator, CredentialRefreshError, RefreshMode,
 };
 pub use settings::{
-    FileCredentialStore, McpOAuthCredentialStore, McpOAuthEndpoints, McpOAuthRegistration,
-    McpOAuthRegistrationMethod, McpOAuthState, McpOAuthStoreFuture, McpOAuthToken, McpRefreshClaim,
-    McpRefreshClaimResult, OAuthCredential, SessionMcpServerRuntimeKind,
+    CredentialStore, FileCredentialStore, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration,
+    McpOAuthRegistrationMethod, OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext,
+    OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim,
+    OAuthRefreshClaimResult, OAuthTokenSet, SessionMcpServerRuntimeKind,
     SessionMcpServerRuntimeSettings, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
     SessionOAuthProviderSettings, SessionOAuthTokenField, SessionOAuthTokenFieldTarget,
     SessionOAuthTokenRequestStyle, SessionProviderRuntimeSettings, SessionRuntimeSettings,

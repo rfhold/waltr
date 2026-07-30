@@ -1895,7 +1895,6 @@ async function startDevStack(state) {
       WALTR_AUTH_MODE: "disabled",
       WALTR_DATABASE_URL: `sqlite://${state.runRoot}/waltr.sqlite3`,
       WALTR_MCP_DATABASE_URL: `sqlite://${state.runRoot}/mcp.sqlite3`,
-      WALTR_AUTH_PATH: `${state.runRoot}/auth.json`,
       WALTR_MODELS_DEV_PATH: modelsDevFixture,
       WALTR_SESSION_FILESYSTEM_ROOT: `${state.runRoot}/sessions`,
       WALTR_SESSION_STORE: "filesystem",

@@ -6,117 +6,209 @@ use std::{
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
+use oauth2::{AccessToken, RefreshToken, Scope};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-type ProviderRefreshLocks = Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>;
+/// Current durable outbound OAuth credential representation.
+pub const OAUTH_CREDENTIAL_VERSION: u32 = 1;
 
-struct FileCredentialSynchronization {
-    lock: Arc<Mutex<()>>,
-    refresh_lock: Arc<Mutex<()>>,
-    refresh_claims: Arc<Mutex<HashMap<String, McpRefreshClaim>>>,
-    provider_refresh_locks: ProviderRefreshLocks,
-}
-
-impl FileCredentialSynchronization {
-    fn new() -> Self {
-        Self {
-            lock: Arc::new(Mutex::new(())),
-            refresh_lock: Arc::new(Mutex::new(())),
-            refresh_claims: Arc::new(Mutex::new(HashMap::new())),
-            provider_refresh_locks: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
+/// One provider or MCP OAuth credential.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OAuthCredential {
+    /// Stored representation version.
+    pub version: u32,
+    /// Shared token material.
+    pub token: OAuthTokenSet,
+    /// Target-specific non-secret context.
+    pub context: OAuthCredentialContext,
 }
 
 /// Durable credential stored outside shared config.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
-pub enum StoredCredential {
-    /// OAuth access and refresh tokens.
-    #[serde(rename = "o_auth", alias = "oauth")]
-    OAuth(OAuthCredential),
-    /// Standards-based OAuth state for an MCP server.
-    #[serde(rename = "mcp_oauth")]
-    McpOAuth(McpOAuthState),
+pub type StoredCredential = OAuthCredential;
+
+impl std::fmt::Debug for OAuthCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthCredential")
+            .field("version", &self.version)
+            .field("token", &self.token)
+            .field("context", &self.context)
+            .finish()
+    }
 }
 
-impl std::fmt::Debug for StoredCredential {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OAuth(_) => formatter.write_str("OAuth(<redacted>)"),
-            Self::McpOAuth(state) => formatter.debug_tuple("McpOAuth").field(state).finish(),
+impl OAuthCredential {
+    /// Create a provider credential.
+    #[must_use]
+    pub const fn provider(token: OAuthTokenSet, metadata: BTreeMap<String, String>) -> Self {
+        Self {
+            version: OAUTH_CREDENTIAL_VERSION,
+            token,
+            context: OAuthCredentialContext::Provider { metadata },
+        }
+    }
+
+    /// Create an MCP credential.
+    #[must_use]
+    pub fn mcp(token: OAuthTokenSet, context: McpOAuthContext) -> Self {
+        Self {
+            version: OAUTH_CREDENTIAL_VERSION,
+            token,
+            context: OAuthCredentialContext::Mcp(Box::new(context)),
+        }
+    }
+
+    /// Provider metadata when this is a provider credential.
+    #[must_use]
+    pub const fn provider_metadata(&self) -> Option<&BTreeMap<String, String>> {
+        match &self.context {
+            OAuthCredentialContext::Provider { metadata } => Some(metadata),
+            OAuthCredentialContext::Mcp(_) => None,
+        }
+    }
+
+    /// Mutable provider metadata when this is a provider credential.
+    #[must_use]
+    pub const fn provider_metadata_mut(&mut self) -> Option<&mut BTreeMap<String, String>> {
+        match &mut self.context {
+            OAuthCredentialContext::Provider { metadata } => Some(metadata),
+            OAuthCredentialContext::Mcp(_) => None,
+        }
+    }
+
+    /// MCP context when this is an MCP credential.
+    #[must_use]
+    pub fn mcp_context(&self) -> Option<&McpOAuthContext> {
+        match &self.context {
+            OAuthCredentialContext::Provider { .. } => None,
+            OAuthCredentialContext::Mcp(context) => Some(context.as_ref()),
+        }
+    }
+
+    /// Mutable MCP context when this is an MCP credential.
+    #[must_use]
+    pub fn mcp_context_mut(&mut self) -> Option<&mut McpOAuthContext> {
+        match &mut self.context {
+            OAuthCredentialContext::Provider { .. } => None,
+            OAuthCredentialContext::Mcp(context) => Some(context.as_mut()),
         }
     }
 }
 
-/// OAuth token material and non-secret metadata.
+/// Shared OAuth token set for provider and MCP credentials.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct OAuthCredential {
-    /// OAuth access token.
-    pub access: String,
-    /// OAuth refresh token.
-    pub refresh: String,
-    /// Expiration timestamp in Unix milliseconds.
-    pub expires_at_ms: i64,
-    /// Non-secret provider-specific metadata.
+pub struct OAuthTokenSet {
+    /// Current access token.
+    pub access_token: AccessToken,
+    /// Current refresh token, when issued.
+    pub refresh_token: Option<RefreshToken>,
+    /// OAuth token type, normally `Bearer`.
+    pub token_type: String,
+    /// Scopes granted to this token.
     #[serde(default)]
-    pub metadata: BTreeMap<String, String>,
+    pub scopes: Vec<Scope>,
+    /// Absolute expiration timestamp in Unix milliseconds, when supplied.
+    pub expires_at_ms: Option<i64>,
 }
 
-impl std::fmt::Debug for OAuthCredential {
+impl std::fmt::Debug for OAuthTokenSet {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let metadata_keys = self.metadata.keys().collect::<Vec<_>>();
         formatter
-            .debug_struct("OAuthCredential")
-            .field("access", &"<redacted>")
-            .field("refresh", &"<redacted>")
+            .debug_struct("OAuthTokenSet")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("token_type", &self.token_type)
+            .field("scopes", &self.scopes)
             .field("expires_at_ms", &self.expires_at_ms)
-            .field("metadata_keys", &metadata_keys)
             .finish()
     }
 }
 
-/// Durable, version-tolerant OAuth state for an MCP server.
+impl PartialEq for OAuthTokenSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.access_token.secret() == other.access_token.secret()
+            && self.refresh_token.as_ref().map(RefreshToken::secret)
+                == other.refresh_token.as_ref().map(RefreshToken::secret)
+            && self.token_type == other.token_type
+            && self.scopes == other.scopes
+            && self.expires_at_ms == other.expires_at_ms
+    }
+}
+
+impl Eq for OAuthTokenSet {}
+
+impl PartialEq for OAuthCredential {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version && self.token == other.token && self.context == other.context
+    }
+}
+
+impl Eq for OAuthCredential {}
+
+impl OAuthTokenSet {
+    /// Construct a bearer token set.
+    #[must_use]
+    pub fn bearer(
+        access_token: impl Into<String>,
+        refresh_token: Option<String>,
+        expires_at_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            access_token: AccessToken::new(access_token.into()),
+            refresh_token: refresh_token.map(RefreshToken::new),
+            token_type: "Bearer".to_owned(),
+            scopes: Vec::new(),
+            expires_at_ms,
+        }
+    }
+
+    pub(crate) fn expires_by(&self, deadline_ms: i64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= deadline_ms)
+    }
+}
+
+/// Typed non-secret context for an outbound OAuth credential.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpOAuthState {
-    /// Stored representation version.
-    #[serde(default = "mcp_oauth_state_version")]
-    pub version: u32,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OAuthCredentialContext {
+    /// Provider-specific extracted metadata.
+    Provider {
+        /// Non-secret provider-specific metadata.
+        #[serde(default)]
+        metadata: BTreeMap<String, String>,
+    },
+    /// MCP resource, registration, and endpoints.
+    Mcp(Box<McpOAuthContext>),
+}
+
+impl std::fmt::Debug for OAuthCredentialContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider { metadata } => formatter
+                .debug_struct("Provider")
+                .field("metadata_keys", &metadata.keys().collect::<Vec<_>>())
+                .finish(),
+            Self::Mcp(context) => formatter.debug_tuple("Mcp").field(context).finish(),
+        }
+    }
+}
+
+/// Durable MCP-specific OAuth context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpOAuthContext {
     /// Exact protected resource identifier.
-    #[serde(default)]
     pub resource: String,
     /// Selected authorization server issuer.
-    #[serde(default)]
     pub issuer: String,
     /// Client registration used for this resource and issuer.
-    #[serde(default)]
     pub registration: McpOAuthRegistration,
     /// Discovered authorization server endpoints.
-    #[serde(default)]
     pub endpoints: McpOAuthEndpoints,
-    /// Current token family state.
-    #[serde(default)]
-    pub token: McpOAuthToken,
-}
-
-impl std::fmt::Debug for McpOAuthState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("McpOAuthState")
-            .field("version", &self.version)
-            .field("resource", &self.resource)
-            .field("issuer", &self.issuer)
-            .field("registration", &self.registration)
-            .field("endpoints", &self.endpoints)
-            .field("token", &self.token)
-            .finish()
-    }
-}
-
-const fn mcp_oauth_state_version() -> u32 {
-    1
 }
 
 /// How an MCP OAuth client registration was obtained.
@@ -139,22 +231,16 @@ pub enum McpOAuthRegistrationMethod {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpOAuthRegistration {
     /// Registration mechanism.
-    #[serde(default)]
     pub method: McpOAuthRegistrationMethod,
     /// OAuth client identifier.
-    #[serde(default)]
     pub client_id: String,
     /// Exact redirect URI used by the client.
-    #[serde(default)]
     pub redirect_uri: String,
     /// Token endpoint authentication method.
-    #[serde(default)]
     pub token_endpoint_auth_method: String,
     /// Registration creation timestamp in Unix milliseconds.
-    #[serde(default)]
     pub created_at_ms: Option<i64>,
     /// Registration expiration timestamp in Unix milliseconds.
-    #[serde(default)]
     pub expires_at_ms: Option<i64>,
 }
 
@@ -162,165 +248,209 @@ pub struct McpOAuthRegistration {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpOAuthEndpoints {
     /// Authorization endpoint.
-    #[serde(default)]
     pub authorization: String,
     /// Token endpoint.
-    #[serde(default)]
     pub token: String,
     /// Optional token revocation endpoint.
-    #[serde(default)]
     pub revocation: Option<String>,
 }
 
-/// Durable MCP OAuth token family state.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpOAuthToken {
-    /// Current access token.
+/// Credential plus SQL/file storage envelope fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthCredentialRecord {
+    /// Typed credential payload.
+    pub credential: OAuthCredential,
+    /// Monotonic storage revision used for refresh compare-and-swap.
+    pub revision: u64,
+    /// Whether a possibly consumed token family requires authorization again.
     #[serde(default)]
-    pub access_token: String,
-    /// Current refresh token, when issued.
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-    /// OAuth token type.
-    #[serde(default)]
-    pub token_type: String,
-    /// Scopes granted to this token.
-    #[serde(default)]
-    pub granted_scopes: Vec<String>,
-    /// Actual access-token expiration timestamp in Unix milliseconds.
-    ///
-    /// Zero means expired or unspecified. A negative value means the
-    /// authorization server omitted expiry information for the current token.
-    #[serde(default)]
-    pub expires_at_ms: i64,
-    /// Monotonic token-family generation used for refresh compare-and-swap.
-    #[serde(default)]
-    pub refresh_generation: u64,
+    pub reauthorization_required: bool,
 }
 
-impl std::fmt::Debug for McpOAuthToken {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("McpOAuthToken")
-            .field("access_token", &"<redacted>")
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("token_type", &self.token_type)
-            .field("granted_scopes", &self.granted_scopes)
-            .field("expires_at_ms", &self.expires_at_ms)
-            .field("refresh_generation", &self.refresh_generation)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum McpOAuthTokenExpiry {
-    Unknown,
-    ExpiresAt(i64),
-}
-
-impl McpOAuthToken {
-    const fn expiry(&self) -> McpOAuthTokenExpiry {
-        match self.expires_at_ms {
-            ..0 => McpOAuthTokenExpiry::Unknown,
-            expires_at_ms => McpOAuthTokenExpiry::ExpiresAt(expires_at_ms),
-        }
-    }
-
-    pub(crate) const fn set_expiry_unknown(&mut self) {
-        self.expires_at_ms = -1;
-    }
-
-    pub(crate) const fn expires_by(&self, deadline_ms: i64) -> bool {
-        matches!(
-            self.expiry(),
-            McpOAuthTokenExpiry::ExpiresAt(expires_at_ms) if expires_at_ms <= deadline_ms
-        )
-    }
-}
-
-/// Identity and deadline for one refresh-generation lease.
+/// Identity and deadline for one refresh-revision lease.
 #[derive(Clone, PartialEq, Eq)]
-pub struct McpRefreshClaim {
-    /// Monotonic generation being refreshed.
-    pub generation: u64,
+pub struct OAuthRefreshClaim {
+    /// Monotonic revision being refreshed.
+    pub revision: u64,
     /// Opaque identity required for compare-and-swap completion.
     pub claim_id: String,
     /// Lease deadline in Unix milliseconds.
     pub lease_expires_at_ms: i64,
 }
 
-impl std::fmt::Debug for McpRefreshClaim {
+impl std::fmt::Debug for OAuthRefreshClaim {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("McpRefreshClaim")
-            .field("generation", &self.generation)
+            .debug_struct("OAuthRefreshClaim")
+            .field("revision", &self.revision)
             .field("claim_id", &"<redacted>")
             .field("lease_expires_at_ms", &self.lease_expires_at_ms)
             .finish()
     }
 }
 
-/// File-backed credential store.
-/// Result of trying to claim one MCP refresh generation.
+/// Result of trying to claim one credential refresh revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpRefreshClaimResult {
+pub enum OAuthRefreshClaimResult {
     /// This caller owns the bounded refresh lease.
-    Claimed(McpRefreshClaim),
-    /// Another caller committed a newer generation.
-    Current(Box<McpOAuthState>),
+    Claimed(OAuthRefreshClaim),
+    /// Another caller committed a newer revision.
+    Current(Box<OAuthCredentialRecord>),
     /// The token family may have been consumed and must not be retried.
     ReauthorizationRequired,
 }
 
-/// Boxed asynchronous result used by host-owned MCP OAuth stores.
-pub type McpOAuthStoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
+/// Boxed asynchronous result used by host-owned OAuth stores.
+pub type OAuthCredentialStoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
-/// Durable target-scoped MCP OAuth storage supplied by a host.
-pub trait McpOAuthCredentialStore: Send + Sync + 'static {
-    /// Read current state.
-    fn read(&self, target_key: String) -> McpOAuthStoreFuture<'_, Option<McpOAuthState>>;
-    /// Replace current state.
-    fn write(&self, target_key: String, state: McpOAuthState) -> McpOAuthStoreFuture<'_, ()>;
-    /// Delete current state unconditionally.
-    fn delete(&self, target_key: String) -> McpOAuthStoreFuture<'_, ()>;
-    /// Claim an exact refresh generation until `lease_expires_at_ms`.
+/// Durable target-scoped outbound OAuth storage supplied by a host.
+pub trait OAuthCredentialStore: Send + Sync + 'static {
+    /// Read the current credential and storage envelope.
+    fn read(
+        &self,
+        target_key: String,
+    ) -> OAuthCredentialStoreFuture<'_, Option<OAuthCredentialRecord>>;
+    /// Install or replace a credential, clearing refresh failure state.
+    fn write(
+        &self,
+        target_key: String,
+        credential: OAuthCredential,
+    ) -> OAuthCredentialStoreFuture<'_, ()>;
+    /// Delete a credential unconditionally.
+    fn delete(&self, target_key: String) -> OAuthCredentialStoreFuture<'_, ()>;
+    /// Claim an exact storage revision until the supplied deadline.
     fn claim_refresh(
         &self,
         target_key: String,
-        claim: McpRefreshClaim,
-    ) -> McpOAuthStoreFuture<'_, McpRefreshClaimResult>;
-    /// Commit refreshed state if this claim and generation still own the target.
+        claim: OAuthRefreshClaim,
+    ) -> OAuthCredentialStoreFuture<'_, OAuthRefreshClaimResult>;
+    /// Commit a refreshed credential if the claim still owns the revision.
     fn commit_refresh(
         &self,
         target_key: String,
-        generation: u64,
-        claim_id: String,
-        state: McpOAuthState,
-    ) -> McpOAuthStoreFuture<'_, bool>;
-    /// Release a claim, optionally marking an indeterminate token family unsafe.
-    /// Implementations must retain the credential material when marking it unsafe.
+        claim: OAuthRefreshClaim,
+        credential: OAuthCredential,
+    ) -> OAuthCredentialStoreFuture<'_, bool>;
+    /// Release a claim, optionally marking the token family unsafe.
     fn abort_refresh(
         &self,
         target_key: String,
-        generation: u64,
-        claim_id: String,
+        claim: OAuthRefreshClaim,
         indeterminate: bool,
-    ) -> McpOAuthStoreFuture<'_, ()>;
+    ) -> OAuthCredentialStoreFuture<'_, ()>;
 }
 
-/// Credential store with an optional host-owned durable MCP backend.
+/// Cloneable handle to a host-owned outbound credential store.
+#[derive(Clone)]
+pub struct CredentialStore(Arc<dyn OAuthCredentialStore>);
+
+impl std::fmt::Debug for CredentialStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CredentialStore {
+    /// Wrap a concrete credential store.
+    #[must_use]
+    pub fn new(store: impl OAuthCredentialStore) -> Self {
+        Self(Arc::new(store))
+    }
+
+    /// Wrap a shared concrete credential store.
+    #[must_use]
+    pub fn shared<T>(store: Arc<T>) -> Self
+    where
+        T: OAuthCredentialStore,
+    {
+        Self(store)
+    }
+
+    /// Read one target record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized storage error when the host store cannot be read.
+    pub async fn read(&self, target_key: &str) -> Result<Option<OAuthCredentialRecord>, String> {
+        self.0.read(target_key.to_owned()).await
+    }
+
+    /// Install one target credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized storage error when the host store cannot persist the credential.
+    pub async fn write(&self, target_key: &str, credential: OAuthCredential) -> Result<(), String> {
+        self.0.write(target_key.to_owned(), credential).await
+    }
+
+    /// Delete one target credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized storage error when the host store cannot delete the credential.
+    pub async fn delete(&self, target_key: &str) -> Result<(), String> {
+        self.0.delete(target_key.to_owned()).await
+    }
+
+    pub(crate) async fn claim_refresh(
+        &self,
+        target_key: &str,
+        claim: OAuthRefreshClaim,
+    ) -> Result<OAuthRefreshClaimResult, String> {
+        self.0.claim_refresh(target_key.to_owned(), claim).await
+    }
+
+    pub(crate) async fn commit_refresh(
+        &self,
+        target_key: &str,
+        claim: OAuthRefreshClaim,
+        credential: OAuthCredential,
+    ) -> Result<bool, String> {
+        self.0
+            .commit_refresh(target_key.to_owned(), claim, credential)
+            .await
+    }
+
+    pub(crate) async fn abort_refresh(
+        &self,
+        target_key: &str,
+        claim: OAuthRefreshClaim,
+        indeterminate: bool,
+    ) -> Result<(), String> {
+        self.0
+            .abort_refresh(target_key.to_owned(), claim, indeterminate)
+            .await
+    }
+}
+
+struct FileCredentialSynchronization {
+    lock: Arc<Mutex<()>>,
+    refresh_lock: Arc<Mutex<()>>,
+    refresh_claims: Arc<Mutex<HashMap<String, OAuthRefreshClaim>>>,
+}
+
+impl FileCredentialSynchronization {
+    fn new() -> Self {
+        Self {
+            lock: Arc::new(Mutex::new(())),
+            refresh_lock: Arc::new(Mutex::new(())),
+            refresh_claims: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// File-backed credential store for standalone agent embeddings.
 #[derive(Clone)]
 pub struct FileCredentialStore {
     path: PathBuf,
     _synchronization: Arc<FileCredentialSynchronization>,
     lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
-    refresh_claims: Arc<Mutex<HashMap<String, McpRefreshClaim>>>,
-    provider_refresh_locks: ProviderRefreshLocks,
-    mcp_store: Option<Arc<dyn McpOAuthCredentialStore>>,
+    refresh_claims: Arc<Mutex<HashMap<String, OAuthRefreshClaim>>>,
 }
 
 impl std::fmt::Debug for FileCredentialStore {
@@ -328,7 +458,6 @@ impl std::fmt::Debug for FileCredentialStore {
         formatter
             .debug_struct("FileCredentialStore")
             .field("path", &self.path)
-            .field("host_mcp_store", &self.mcp_store.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -345,19 +474,10 @@ impl FileCredentialStore {
             lock: Arc::clone(&synchronization.lock),
             refresh_lock: Arc::clone(&synchronization.refresh_lock),
             refresh_claims: Arc::clone(&synchronization.refresh_claims),
-            provider_refresh_locks: Arc::clone(&synchronization.provider_refresh_locks),
-            mcp_store: None,
         }
     }
 
-    /// Route MCP OAuth state through a host-owned durable backend.
-    #[must_use]
-    pub fn with_mcp_store(mut self, store: Arc<dyn McpOAuthCredentialStore>) -> Self {
-        self.mcp_store = Some(store);
-        self
-    }
-
-    /// Create a store from `WALTR_AUTH_PATH` or the user data default.
+    /// Create a standalone store from `WALTR_AUTH_PATH` or the user data default.
     #[must_use]
     pub fn from_env() -> Self {
         if let Some(path) = std::env::var_os("WALTR_AUTH_PATH") {
@@ -369,267 +489,13 @@ impl FileCredentialStore {
 
     /// Return the configured path.
     #[must_use]
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Read a credential by namespaced target key.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the configured backend cannot read the credential.
-    pub async fn read(&self, target_key: &str) -> Result<Option<StoredCredential>, std::io::Error> {
-        if target_key.starts_with("mcp:")
-            && let Some(store) = &self.mcp_store
-        {
-            return store
-                .read(target_key.to_owned())
-                .await
-                .map(|state| state.map(StoredCredential::McpOAuth))
-                .map_err(std::io::Error::other);
-        }
-        let _guard = self.lock.lock().await;
-        let credentials = self.read_unlocked().await?;
-        Ok(credentials.get(target_key).cloned())
-    }
-
-    /// Serialize a read-modify-write for a credential target.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the configured backend cannot read or write the credential.
-    pub async fn modify<F>(
+    async fn read_unlocked(
         &self,
-        target_key: &str,
-        f: F,
-    ) -> Result<Option<StoredCredential>, std::io::Error>
-    where
-        F: FnOnce(Option<StoredCredential>) -> Option<StoredCredential>,
-    {
-        if target_key.starts_with("mcp:")
-            && let Some(store) = &self.mcp_store
-        {
-            let current = store
-                .read(target_key.to_owned())
-                .await
-                .map_err(std::io::Error::other)?
-                .map(StoredCredential::McpOAuth);
-            let next = f(current);
-            match &next {
-                Some(StoredCredential::McpOAuth(state)) => store
-                    .write(target_key.to_owned(), state.clone())
-                    .await
-                    .map_err(std::io::Error::other)?,
-                Some(StoredCredential::OAuth(_)) => {
-                    return Err(std::io::Error::other(
-                        "MCP credential backend requires typed MCP OAuth state",
-                    ));
-                }
-                None => store
-                    .delete(target_key.to_owned())
-                    .await
-                    .map_err(std::io::Error::other)?,
-            }
-            return Ok(next);
-        }
-        let _guard = self.lock.lock().await;
-        let mut credentials = self.read_unlocked().await?;
-        let next = f(credentials.get(target_key).cloned());
-        match &next {
-            Some(credential) => {
-                credentials.insert(target_key.to_owned(), credential.clone());
-            }
-            None => {
-                credentials.remove(target_key);
-            }
-        }
-        self.write_unlocked(&credentials).await?;
-        Ok(next)
-    }
-
-    /// Delete a credential by namespaced target key.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the configured backend cannot delete the credential.
-    pub async fn delete(&self, target_key: &str) -> Result<(), std::io::Error> {
-        self.modify(target_key, |_| None).await.map(|_| ())
-    }
-
-    pub(crate) async fn upgrade_legacy_mcp(
-        &self,
-        target_key: &str,
-        expected: &OAuthCredential,
-        upgraded: McpOAuthState,
-    ) -> Result<Option<StoredCredential>, std::io::Error> {
-        self.modify(target_key, |stored| match stored {
-            Some(StoredCredential::OAuth(current))
-                if oauth_credentials_match(&current, expected) =>
-            {
-                Some(StoredCredential::McpOAuth(upgraded))
-            }
-            other => other,
-        })
-        .await
-    }
-
-    pub(crate) async fn lock_provider_refresh(
-        &self,
-        target_key: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self
-            .provider_refresh_locks
-            .lock()
-            .await
-            .entry(target_key.to_owned())
-            .or_default()
-            .clone();
-        lock.lock_owned().await
-    }
-
-    pub(crate) async fn claim_mcp_refresh(
-        &self,
-        target_key: &str,
-        claim: McpRefreshClaim,
-        now_ms: i64,
-    ) -> Result<McpRefreshClaimResult, std::io::Error> {
-        if let Some(store) = &self.mcp_store {
-            return store
-                .claim_refresh(target_key.to_owned(), claim)
-                .await
-                .map_err(std::io::Error::other);
-        }
-        let _guard = self.refresh_lock.lock().await;
-        let current = self.read(target_key).await?;
-        let Some(StoredCredential::McpOAuth(current)) = current else {
-            return Ok(McpRefreshClaimResult::ReauthorizationRequired);
-        };
-        if current.token.refresh_generation != claim.generation {
-            return Ok(McpRefreshClaimResult::Current(Box::new(current)));
-        }
-        let mut claims = self.refresh_claims.lock().await;
-        if claims
-            .get(target_key)
-            .is_some_and(|current| current.lease_expires_at_ms == i64::MAX)
-        {
-            return Ok(McpRefreshClaimResult::ReauthorizationRequired);
-        }
-        let active_claim = claims
-            .get(target_key)
-            .is_some_and(|current| current.lease_expires_at_ms > now_ms);
-        if active_claim {
-            drop(claims);
-            for _ in 0..1_200 {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                let current = self.read(target_key).await?;
-                if let Some(StoredCredential::McpOAuth(current)) = current
-                    && current.token.refresh_generation != claim.generation
-                {
-                    return Ok(McpRefreshClaimResult::Current(Box::new(current)));
-                }
-                let claims = self.refresh_claims.lock().await;
-                if claims
-                    .get(target_key)
-                    .is_none_or(|current| current.lease_expires_at_ms <= credential_now_ms())
-                {
-                    drop(claims);
-                    return Ok(McpRefreshClaimResult::ReauthorizationRequired);
-                }
-                drop(claims);
-            }
-            return Ok(McpRefreshClaimResult::ReauthorizationRequired);
-        }
-        if claims.contains_key(target_key) {
-            drop(claims);
-            return Ok(McpRefreshClaimResult::ReauthorizationRequired);
-        }
-        claims.insert(target_key.to_owned(), claim.clone());
-        drop(claims);
-        Ok(McpRefreshClaimResult::Claimed(claim))
-    }
-
-    pub(crate) async fn commit_mcp_refresh(
-        &self,
-        target_key: &str,
-        generation: u64,
-        claim_id: &str,
-        state: McpOAuthState,
-    ) -> Result<bool, std::io::Error> {
-        if let Some(store) = &self.mcp_store {
-            return store
-                .commit_refresh(
-                    target_key.to_owned(),
-                    generation,
-                    claim_id.to_owned(),
-                    state,
-                )
-                .await
-                .map_err(std::io::Error::other);
-        }
-        let claim_matches = self
-            .refresh_claims
-            .lock()
-            .await
-            .get(target_key)
-            .is_some_and(|claim| claim.generation == generation && claim.claim_id == claim_id);
-        if !claim_matches {
-            return Ok(false);
-        }
-        let committed = std::sync::atomic::AtomicBool::new(false);
-        self.modify(target_key, |stored| {
-            let matches = matches!(
-                &stored,
-                Some(StoredCredential::McpOAuth(current))
-                    if current.token.refresh_generation == generation
-            );
-            committed.store(matches, std::sync::atomic::Ordering::Relaxed);
-            matches
-                .then_some(StoredCredential::McpOAuth(state))
-                .or(stored)
-        })
-        .await?;
-        self.refresh_claims.lock().await.remove(target_key);
-        Ok(committed.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    pub(crate) async fn abort_mcp_refresh(
-        &self,
-        target_key: &str,
-        generation: u64,
-        claim_id: &str,
-        indeterminate: bool,
-    ) -> Result<(), std::io::Error> {
-        if let Some(store) = &self.mcp_store {
-            return store
-                .abort_refresh(
-                    target_key.to_owned(),
-                    generation,
-                    claim_id.to_owned(),
-                    indeterminate,
-                )
-                .await
-                .map_err(std::io::Error::other);
-        }
-        let mut claims = self.refresh_claims.lock().await;
-        let claim_matches = claims
-            .get(target_key)
-            .is_some_and(|claim| claim.generation == generation && claim.claim_id == claim_id);
-        if claim_matches {
-            if indeterminate {
-                // Retain the claim as an in-process replay barrier without deleting
-                // credentials that may still contain a usable access token.
-                if let Some(claim) = claims.get_mut(target_key) {
-                    claim.lease_expires_at_ms = i64::MAX;
-                }
-            } else {
-                claims.remove(target_key);
-            }
-        }
-        drop(claims);
-        Ok(())
-    }
-
-    async fn read_unlocked(&self) -> Result<BTreeMap<String, StoredCredential>, std::io::Error> {
+    ) -> Result<BTreeMap<String, OAuthCredentialRecord>, std::io::Error> {
         match tokio::fs::read(&self.path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
@@ -639,7 +505,7 @@ impl FileCredentialStore {
 
     async fn write_unlocked(
         &self,
-        credentials: &BTreeMap<String, StoredCredential>,
+        credentials: &BTreeMap<String, OAuthCredentialRecord>,
     ) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -661,6 +527,214 @@ impl FileCredentialStore {
     }
 }
 
+impl From<FileCredentialStore> for CredentialStore {
+    fn from(store: FileCredentialStore) -> Self {
+        Self::new(store)
+    }
+}
+
+impl OAuthCredentialStore for FileCredentialStore {
+    fn read(
+        &self,
+        target_key: String,
+    ) -> OAuthCredentialStoreFuture<'_, Option<OAuthCredentialRecord>> {
+        Box::pin(async move {
+            let _guard = self.lock.lock().await;
+            self.read_unlocked()
+                .await
+                .map(|credentials| credentials.get(&target_key).cloned())
+                .map_err(|_| "credential file read failed".to_owned())
+        })
+    }
+
+    fn write(
+        &self,
+        target_key: String,
+        credential: OAuthCredential,
+    ) -> OAuthCredentialStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let _refresh_guard = self.refresh_lock.lock().await;
+            let _guard = self.lock.lock().await;
+            let mut credentials = self
+                .read_unlocked()
+                .await
+                .map_err(|_| "credential file read failed".to_owned())?;
+            let revision = credentials
+                .get(&target_key)
+                .map_or(0, |record| record.revision.saturating_add(1));
+            credentials.insert(
+                target_key.clone(),
+                OAuthCredentialRecord {
+                    credential,
+                    revision,
+                    reauthorization_required: false,
+                },
+            );
+            self.write_unlocked(&credentials)
+                .await
+                .map_err(|_| "credential file write failed".to_owned())?;
+            self.refresh_claims.lock().await.remove(&target_key);
+            Ok(())
+        })
+    }
+
+    fn delete(&self, target_key: String) -> OAuthCredentialStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let _refresh_guard = self.refresh_lock.lock().await;
+            let _guard = self.lock.lock().await;
+            let mut credentials = self
+                .read_unlocked()
+                .await
+                .map_err(|_| "credential file read failed".to_owned())?;
+            credentials.remove(&target_key);
+            self.write_unlocked(&credentials)
+                .await
+                .map_err(|_| "credential file write failed".to_owned())?;
+            self.refresh_claims.lock().await.remove(&target_key);
+            Ok(())
+        })
+    }
+
+    fn claim_refresh(
+        &self,
+        target_key: String,
+        claim: OAuthRefreshClaim,
+    ) -> OAuthCredentialStoreFuture<'_, OAuthRefreshClaimResult> {
+        Box::pin(async move {
+            for _ in 0..310 {
+                let refresh_guard = self.refresh_lock.lock().await;
+                let Some(current) = OAuthCredentialStore::read(self, target_key.clone()).await?
+                else {
+                    return Ok(OAuthRefreshClaimResult::ReauthorizationRequired);
+                };
+                if current.reauthorization_required {
+                    return Ok(OAuthRefreshClaimResult::ReauthorizationRequired);
+                }
+                if current.revision != claim.revision {
+                    return Ok(OAuthRefreshClaimResult::Current(Box::new(current)));
+                }
+                let mut claims = self.refresh_claims.lock().await;
+                let existing = claims.get(&target_key).cloned();
+                if existing.is_none() {
+                    claims.insert(target_key.clone(), claim.clone());
+                    return Ok(OAuthRefreshClaimResult::Claimed(claim));
+                }
+                drop(claims);
+                drop(refresh_guard);
+
+                if let Some(existing) = existing
+                    && existing.lease_expires_at_ms <= unix_time_ms()
+                {
+                    let _refresh_guard = self.refresh_lock.lock().await;
+                    let mut claims = self.refresh_claims.lock().await;
+                    if claims.get(&target_key) != Some(&existing) {
+                        continue;
+                    }
+                    claims.remove(&target_key);
+                    drop(claims);
+                    let _guard = self.lock.lock().await;
+                    let mut credentials = self
+                        .read_unlocked()
+                        .await
+                        .map_err(|_| "credential file read failed".to_owned())?;
+                    if let Some(current) = credentials.get_mut(&target_key)
+                        && current.revision == claim.revision
+                    {
+                        current.reauthorization_required = true;
+                        self.write_unlocked(&credentials)
+                            .await
+                            .map_err(|_| "credential file write failed".to_owned())?;
+                    }
+                    return Ok(OAuthRefreshClaimResult::ReauthorizationRequired);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Ok(OAuthRefreshClaimResult::ReauthorizationRequired)
+        })
+    }
+
+    fn commit_refresh(
+        &self,
+        target_key: String,
+        claim: OAuthRefreshClaim,
+        credential: OAuthCredential,
+    ) -> OAuthCredentialStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let _refresh_guard = self.refresh_lock.lock().await;
+            let claim_matches = self
+                .refresh_claims
+                .lock()
+                .await
+                .get(&target_key)
+                .is_some_and(|current| current == &claim);
+            if !claim_matches {
+                return Ok(false);
+            }
+            let _guard = self.lock.lock().await;
+            let mut credentials = self
+                .read_unlocked()
+                .await
+                .map_err(|_| "credential file read failed".to_owned())?;
+            let Some(current) = credentials.get(&target_key) else {
+                return Ok(false);
+            };
+            if current.revision != claim.revision || current.reauthorization_required {
+                return Ok(false);
+            }
+            credentials.insert(
+                target_key.clone(),
+                OAuthCredentialRecord {
+                    credential,
+                    revision: claim.revision.saturating_add(1),
+                    reauthorization_required: false,
+                },
+            );
+            self.write_unlocked(&credentials)
+                .await
+                .map_err(|_| "credential file write failed".to_owned())?;
+            self.refresh_claims.lock().await.remove(&target_key);
+            Ok(true)
+        })
+    }
+
+    fn abort_refresh(
+        &self,
+        target_key: String,
+        claim: OAuthRefreshClaim,
+        indeterminate: bool,
+    ) -> OAuthCredentialStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let _refresh_guard = self.refresh_lock.lock().await;
+            let claim_matches = self
+                .refresh_claims
+                .lock()
+                .await
+                .get(&target_key)
+                .is_some_and(|current| current == &claim);
+            if !claim_matches {
+                return Ok(());
+            }
+            if indeterminate {
+                let _guard = self.lock.lock().await;
+                let mut credentials = self
+                    .read_unlocked()
+                    .await
+                    .map_err(|_| "credential file read failed".to_owned())?;
+                if let Some(current) = credentials.get_mut(&target_key)
+                    && current.revision == claim.revision
+                {
+                    current.reauthorization_required = true;
+                    self.write_unlocked(&credentials)
+                        .await
+                        .map_err(|_| "credential file write failed".to_owned())?;
+                }
+            }
+            self.refresh_claims.lock().await.remove(&target_key);
+            Ok(())
+        })
+    }
+}
+
 fn credential_synchronization(path: &Path) -> Arc<FileCredentialSynchronization> {
     static SYNCHRONIZATION: OnceLock<
         StdMutex<HashMap<PathBuf, Weak<FileCredentialSynchronization>>>,
@@ -676,13 +750,6 @@ fn credential_synchronization(path: &Path) -> Arc<FileCredentialSynchronization>
     let synchronization = Arc::new(FileCredentialSynchronization::new());
     registry.insert(path.to_path_buf(), Arc::downgrade(&synchronization));
     synchronization
-}
-
-fn oauth_credentials_match(left: &OAuthCredential, right: &OAuthCredential) -> bool {
-    left.access == right.access
-        && left.refresh == right.refresh
-        && left.expires_at_ms == right.expires_at_ms
-        && left.metadata == right.metadata
 }
 
 fn effective_credential_path(path: PathBuf) -> PathBuf {
@@ -714,257 +781,170 @@ fn effective_credential_path(path: PathBuf) -> PathBuf {
     effective
 }
 
-fn credential_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-        })
+fn unix_time_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::atomic::{AtomicUsize, Ordering},
-        time::Duration,
-    };
-
-    use serde_json::json;
-
     use super::*;
 
-    #[test]
-    fn legacy_oauth_credential_still_deserializes() {
-        let credential: StoredCredential = serde_json::from_value(json!({
-            "type": "o_auth",
-            "access": "access",
-            "refresh": "refresh",
-            "expires_at_ms": 123,
-            "metadata": {"token_url": "https://issuer.example/token"}
-        }))
-        .expect("legacy credential");
-
-        assert!(matches!(credential, StoredCredential::OAuth(_)));
+    fn provider(access: &str) -> OAuthCredential {
+        OAuthCredential::provider(
+            OAuthTokenSet::bearer(access, Some("refresh-secret".to_owned()), Some(10)),
+            BTreeMap::from([("account".to_owned(), "secret-metadata".to_owned())]),
+        )
     }
 
     #[test]
-    fn mcp_oauth_state_tolerates_missing_and_unknown_fields() {
-        let credential: StoredCredential = serde_json::from_value(json!({
-            "type": "mcp_oauth",
-            "resource": "https://mcp.example",
-            "future_field": true,
-            "registration": {"client_id": "client", "future_field": 1},
-            "token": {"access_token": "access", "token_type": "Bearer"}
-        }))
-        .expect("version-tolerant credential");
-
-        let StoredCredential::McpOAuth(state) = credential else {
-            panic!("expected MCP OAuth state");
-        };
-        assert_eq!(state.version, 1);
-        assert_eq!(state.registration.client_id, "client");
-        assert_eq!(state.token.refresh_generation, 0);
-        assert_eq!(state.token.expiry(), McpOAuthTokenExpiry::ExpiresAt(0));
+    fn unified_credential_round_trips_and_redacts_secrets() {
+        let credential = provider("access-secret");
+        let encoded = serde_json::to_string(&credential).unwrap();
+        let decoded: OAuthCredential = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, credential);
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains("access-secret"));
+        assert!(!debug.contains("refresh-secret"));
+        assert!(!debug.contains("secret-metadata"));
     }
 
-    #[test]
-    fn mcp_oauth_state_tolerates_future_registration_method() {
-        let credential: StoredCredential = serde_json::from_value(json!({
-            "type": "mcp_oauth",
-            "registration": {"method": "future_registration"}
-        }))
-        .expect("future registration method");
-
-        let StoredCredential::McpOAuth(state) = credential else {
-            panic!("expected MCP OAuth state");
-        };
-        assert_eq!(
-            state.registration.method,
-            McpOAuthRegistrationMethod::Unknown
-        );
-    }
-
-    #[test]
-    fn oauth_debug_redacts_token_and_claim_secrets() {
-        let provider = OAuthCredential {
-            access: "provider-access-secret".to_owned(),
-            refresh: "provider-refresh-secret".to_owned(),
-            expires_at_ms: 10,
-            metadata: BTreeMap::from([("future_secret".to_owned(), "metadata-secret".to_owned())]),
-        };
-        let provider_debug = format!("{provider:?}");
-        assert!(!provider_debug.contains("provider-access-secret"));
-        assert!(!provider_debug.contains("provider-refresh-secret"));
-        assert!(!provider_debug.contains("metadata-secret"));
-
-        let mut state = McpOAuthState {
-            version: 1,
-            resource: String::new(),
-            issuer: String::new(),
-            registration: McpOAuthRegistration::default(),
-            endpoints: McpOAuthEndpoints::default(),
-            token: McpOAuthToken::default(),
-        };
-        state.token.access_token = "access-secret".to_owned();
-        state.token.refresh_token = Some("refresh-secret".to_owned());
-        let state_debug = format!("{state:?}");
-        assert!(!state_debug.contains("access-secret"));
-        assert!(!state_debug.contains("refresh-secret"));
-
-        let claim = McpRefreshClaim {
-            generation: 1,
-            claim_id: "claim-secret".to_owned(),
-            lease_expires_at_ms: 10,
-        };
-        assert!(!format!("{claim:?}").contains("claim-secret"));
-    }
-
-    fn state(generation: u64) -> McpOAuthState {
-        McpOAuthState {
-            version: 1,
-            resource: "https://mcp.example".to_owned(),
-            issuer: "https://issuer.example".to_owned(),
-            registration: McpOAuthRegistration::default(),
-            endpoints: McpOAuthEndpoints::default(),
-            token: McpOAuthToken {
-                refresh_generation: generation,
-                ..McpOAuthToken::default()
-            },
+    #[tokio::test]
+    async fn file_store_uses_revision_claim_and_cas_for_every_target() {
+        for target in ["provider:test", "mcp:test"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = FileCredentialStore::new(directory.path().join("auth.json"));
+            OAuthCredentialStore::write(&store, target.to_owned(), provider("old"))
+                .await
+                .unwrap();
+            let current = OAuthCredentialStore::read(&store, target.to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            let claim = OAuthRefreshClaim {
+                revision: current.revision,
+                claim_id: "claim-secret".to_owned(),
+                lease_expires_at_ms: i64::MAX,
+            };
+            assert!(matches!(
+                OAuthCredentialStore::claim_refresh(&store, target.to_owned(), claim.clone())
+                    .await
+                    .unwrap(),
+                OAuthRefreshClaimResult::Claimed(_)
+            ));
+            assert!(
+                OAuthCredentialStore::commit_refresh(
+                    &store,
+                    target.to_owned(),
+                    claim,
+                    provider("new")
+                )
+                .await
+                .unwrap()
+            );
+            let current = OAuthCredentialStore::read(&store, target.to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.revision, 1);
+            assert_eq!(current.credential.token.access_token.secret(), "new");
         }
     }
 
     #[tokio::test]
-    async fn stale_refresh_claim_cannot_replace_newer_generation() {
-        let directory = tempfile::tempdir().expect("temp directory");
+    async fn indeterminate_file_refresh_retains_credential_and_requires_reauthorization() {
+        let directory = tempfile::tempdir().unwrap();
         let store = FileCredentialStore::new(directory.path().join("auth.json"));
-        let key = "mcp:remote";
-        store
-            .modify(key, |_| Some(StoredCredential::McpOAuth(state(7))))
+        OAuthCredentialStore::write(&store, "provider:test".to_owned(), provider("old"))
             .await
-            .expect("store state");
-        let claim = McpRefreshClaim {
-            generation: 7,
+            .unwrap();
+        let claim = OAuthRefreshClaim {
+            revision: 0,
             claim_id: "claim".to_owned(),
-            lease_expires_at_ms: credential_now_ms() + 5_000,
+            lease_expires_at_ms: i64::MAX,
         };
-        assert!(matches!(
-            store
-                .claim_mcp_refresh(key, claim.clone(), credential_now_ms())
-                .await
-                .expect("claim refresh"),
-            McpRefreshClaimResult::Claimed(_)
-        ));
-        store
-            .modify(key, |_| Some(StoredCredential::McpOAuth(state(8))))
+        OAuthCredentialStore::claim_refresh(&store, "provider:test".to_owned(), claim.clone())
             .await
-            .expect("advance state");
-
-        assert!(
-            !store
-                .commit_mcp_refresh(key, 7, &claim.claim_id, state(8))
-                .await
-                .expect("reject stale commit")
-        );
-        let Some(StoredCredential::McpOAuth(current)) =
-            store.read(key).await.expect("read current state")
-        else {
-            panic!("expected MCP OAuth state");
-        };
-        assert_eq!(current.token.refresh_generation, 8);
+            .unwrap();
+        OAuthCredentialStore::abort_refresh(&store, "provider:test".to_owned(), claim, true)
+            .await
+            .unwrap();
+        let current = OAuthCredentialStore::read(&store, "provider:test".to_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.reauthorization_required);
+        assert_eq!(current.credential.token.access_token.secret(), "old");
     }
 
     #[tokio::test]
-    async fn independently_constructed_stores_serialize_file_modifications() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let path = directory.path().join("auth.json");
-        let first = FileCredentialStore::new(&path);
-        let second = FileCredentialStore::new(path);
-        let active = Arc::new(AtomicUsize::new(0));
-        let maximum = Arc::new(AtomicUsize::new(0));
-
-        let modify = |store: FileCredentialStore, key: &'static str| {
-            let active = Arc::clone(&active);
-            let maximum = Arc::clone(&maximum);
-            async move {
-                store
-                    .modify(key, |_| {
-                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        maximum.fetch_max(count, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(25));
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        Some(StoredCredential::OAuth(OAuthCredential {
-                            access: key.to_owned(),
-                            refresh: String::new(),
-                            expires_at_ms: 1,
-                            metadata: BTreeMap::new(),
-                        }))
-                    })
-                    .await
-                    .expect("modify credentials");
-            }
+    async fn file_replacement_and_reauthorization_invalidate_stale_refresh_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileCredentialStore::new(directory.path().join("auth.json"));
+        let target = "provider:test".to_owned();
+        OAuthCredentialStore::write(&store, target.clone(), provider("old"))
+            .await
+            .unwrap();
+        let replacement_claim = OAuthRefreshClaim {
+            revision: 0,
+            claim_id: "replacement-claim".to_owned(),
+            lease_expires_at_ms: i64::MAX,
         };
-
-        tokio::join!(
-            modify(first.clone(), "provider:first"),
-            modify(second, "provider:second")
-        );
-
-        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        OAuthCredentialStore::claim_refresh(&store, target.clone(), replacement_claim.clone())
+            .await
+            .unwrap();
+        OAuthCredentialStore::write(&store, target.clone(), provider("replacement"))
+            .await
+            .unwrap();
         assert!(
-            first
-                .read("provider:first")
-                .await
-                .expect("read first")
-                .is_some()
+            !OAuthCredentialStore::commit_refresh(
+                &store,
+                target.clone(),
+                replacement_claim,
+                provider("stale")
+            )
+            .await
+            .unwrap()
         );
+
+        let reauthorization_claim = OAuthRefreshClaim {
+            revision: 1,
+            claim_id: "reauthorization-claim".to_owned(),
+            lease_expires_at_ms: i64::MAX,
+        };
+        OAuthCredentialStore::claim_refresh(&store, target.clone(), reauthorization_claim.clone())
+            .await
+            .unwrap();
+        OAuthCredentialStore::delete(&store, target.clone())
+            .await
+            .unwrap();
+        OAuthCredentialStore::write(&store, target.clone(), provider("reauthorized"))
+            .await
+            .unwrap();
         assert!(
-            first
-                .read("provider:second")
-                .await
-                .expect("read second")
-                .is_some()
+            !OAuthCredentialStore::commit_refresh(
+                &store,
+                target.clone(),
+                reauthorization_claim,
+                provider("stale")
+            )
+            .await
+            .unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn legacy_mcp_upgrade_does_not_replace_concurrent_reauthorization() {
-        let directory = tempfile::tempdir().expect("temp directory");
-        let path = directory.path().join("auth.json");
-        let first = FileCredentialStore::new(&path);
-        let second = FileCredentialStore::new(path);
-        let key = "mcp:remote";
-        let legacy = OAuthCredential {
-            access: "legacy-access".to_owned(),
-            refresh: "legacy-refresh".to_owned(),
-            expires_at_ms: 1,
-            metadata: BTreeMap::new(),
-        };
-        first
-            .modify(key, |_| Some(StoredCredential::OAuth(legacy.clone())))
+        let current = OAuthCredentialStore::read(&store, target)
             .await
-            .expect("store legacy credential");
-        let concurrent = state(12);
-        second
-            .modify(key, |_| {
-                Some(StoredCredential::McpOAuth(concurrent.clone()))
-            })
-            .await
-            .expect("store concurrent reauthorization");
-
-        let result = first
-            .upgrade_legacy_mcp(key, &legacy, state(1))
-            .await
-            .expect("attempt legacy upgrade");
-
-        let Some(StoredCredential::McpOAuth(actual)) = result else {
-            panic!("expected concurrent typed credential");
-        };
-        assert_eq!(actual.token.refresh_generation, 12);
-        let Some(StoredCredential::McpOAuth(stored)) =
-            first.read(key).await.expect("read current credential")
-        else {
-            panic!("expected stored typed credential");
-        };
-        assert_eq!(stored.token.refresh_generation, 12);
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.credential.token.access_token.secret(),
+            "reauthorized"
+        );
     }
 }

@@ -21,6 +21,7 @@ futures-util.workspace = true
 http-body.workspace = true
 jsonwebtoken.workspace = true
 mcp = { workspace = true, features = ["oauth-authorization-server-postgres", "oauth-authorization-server-sqlite", "progressive", "streamable-http-postgres", "streamable-http-sqlite"] }
+oauth2.workspace = true
 notify.workspace = true
 p256.workspace = true
 tokio-util.workspace = true

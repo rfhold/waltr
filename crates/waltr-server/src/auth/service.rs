@@ -19,8 +19,8 @@ use waltr::grpc::waltr::auth::v1::{
 };
 use waltr_agent::{
     AuthenticationFailureReason as AgentAuthenticationFailureReason, CredentialRefreshCoordinator,
-    CredentialRefreshError, McpOAuthRegistration, McpOAuthRegistrationMethod, McpOAuthState,
-    RefreshMode, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
+    CredentialRefreshError, CredentialStore, McpOAuthRegistration, McpOAuthRegistrationMethod,
+    OAuthCredential, RefreshMode, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
 };
 use mcp::oauth::{
     McpBearerChallenge, McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret,
@@ -34,7 +34,9 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 #[cfg(test)]
-use waltr_agent::{McpOAuthEndpoints, McpOAuthToken};
+use waltr_agent::{
+    McpOAuthContext, McpOAuthEndpoints, OAuthCredentialStore, OAuthRefreshClaim, OAuthTokenSet,
+};
 
 use crate::{
     config::{
@@ -47,7 +49,7 @@ use crate::{
 use super::outbound_http::{
     OAUTH_RESPONSE_LIMIT, OutboundHttpPolicy, read_json_body, validate_response_peer,
 };
-use super::{AuthTarget, FileCredentialStore, StoredCredential, oauth};
+use super::{AuthTarget, oauth};
 
 const OAUTH_COMPLETION_LEASE_MS: i64 = 30_000;
 
@@ -55,7 +57,7 @@ const OAUTH_COMPLETION_LEASE_MS: i64 = 30_000;
 #[derive(Debug)]
 pub struct AuthService<S> {
     config_store: S,
-    credential_store: FileCredentialStore,
+    credential_store: CredentialStore,
     outbound_store: Arc<OutboundOAuthStore>,
     attempts: Mutex<HashMap<String, PendingOAuthAttempt>>,
     outbound_policy: OutboundHttpPolicy,
@@ -73,7 +75,7 @@ enum PendingOAuthAttempt {
 #[cfg(test)]
 #[derive(Debug)]
 enum TestRefreshOutcome {
-    Success(Box<StoredCredential>),
+    Success(Box<OAuthCredential>),
     Failure {
         reason: AgentAuthenticationFailureReason,
         message: String,
@@ -110,7 +112,7 @@ where
     #[must_use]
     pub(crate) fn new(
         config_store: S,
-        credential_store: FileCredentialStore,
+        credential_store: CredentialStore,
         outbound_store: Arc<OutboundOAuthStore>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -129,7 +131,7 @@ where
     #[cfg(test)]
     fn new_for_tests(
         config_store: S,
-        credential_store: FileCredentialStore,
+        credential_store: CredentialStore,
         outbound_store: Arc<OutboundOAuthStore>,
         outbound_redirect_uri: Option<String>,
     ) -> Arc<Self> {
@@ -153,7 +155,7 @@ where
 
     /// Return the credential store used by this service.
     #[must_use]
-    pub const fn credential_store(&self) -> &FileCredentialStore {
+    pub const fn credential_store(&self) -> &CredentialStore {
         &self.credential_store
     }
 
@@ -164,6 +166,10 @@ where
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "provider status combines configuration capabilities with durable credential state"
+    )]
     async fn provider_status_for(&self, provider_key: &str) -> Result<AuthStatus, Status> {
         let config = self.config_store.load().await.map_err(|error| {
             Status::internal(format!("failed to load config for auth status: {error}"))
@@ -210,28 +216,35 @@ where
             .await
             .map_err(|error| Status::internal(format!("failed to read credentials: {error}")))?
         {
-            Some(StoredCredential::OAuth(credential)) => {
-                let expiry_known = credential.expires_at_ms != i64::MAX;
-                let expired = expiry_known && credential.expires_at_ms <= now_ms();
+            Some(record) if record.credential.provider_metadata().is_some() => {
+                let credential = record.credential;
+                let expires_at_ms = credential.token.expires_at_ms;
+                let expired = expires_at_ms.is_some_and(|expiry| expiry <= now_ms());
                 Ok(AuthStatus {
                     target: Some(proto_provider_target(provider_key)),
-                    kind: if expired {
+                    kind: if record.reauthorization_required {
+                        AuthStatusKind::AuthorizationRequired as i32
+                    } else if expired {
                         AuthStatusKind::Expired as i32
                     } else {
                         AuthStatusKind::OauthConfigured as i32
                     },
                     supported_methods,
-                    expires_at_ms: if expiry_known {
-                        credential.expires_at_ms
+                    expires_at_ms: expires_at_ms.unwrap_or_default(),
+                    metadata: display_safe_provider_metadata(
+                        credential.provider_metadata().cloned().unwrap_or_default(),
+                    ),
+                    can_refresh: credential.token.refresh_token.is_some()
+                        && !record.reauthorization_required,
+                    message: if record.reauthorization_required {
+                        "provider OAuth credential requires reauthorization".to_owned()
                     } else {
-                        0
+                        String::new()
                     },
-                    metadata: display_safe_provider_metadata(credential.metadata),
-                    can_refresh: !credential.refresh.is_empty(),
                     ..AuthStatus::default()
                 })
             }
-            Some(StoredCredential::McpOAuth(_)) | None => Ok(AuthStatus {
+            Some(_) | None => Ok(AuthStatus {
                 target: Some(proto_provider_target(provider_key)),
                 kind: AuthStatusKind::NotConfigured as i32,
                 supported_methods,
@@ -248,37 +261,19 @@ where
             Status::not_found(format!("mcp server '{server_key}' does not exist"))
         })?;
         let target = AuthTarget::mcp_server(server_key);
-        let reauthorization_required = self
-            .outbound_store
-            .reauthorization_required(&target.credential_key())
-            .await
-            .map_err(Status::internal)?;
         match self
             .credential_store
             .read(&target.credential_key())
             .await
             .map_err(|error| Status::internal(format!("failed to read credentials: {error}")))?
         {
-            Some(StoredCredential::McpOAuth(credential)) => Ok(mcp_oauth_status(
+            Some(record) if record.credential.mcp_context().is_some() => Ok(mcp_oauth_status(
                 server_key,
                 &server.url,
-                &credential,
-                reauthorization_required,
+                &record.credential,
+                record.reauthorization_required,
             )),
-            Some(StoredCredential::OAuth(credential)) => Ok(AuthStatus {
-                target: Some(proto_mcp_target(server_key)),
-                kind: if credential.expires_at_ms <= now_ms() {
-                    AuthStatusKind::Expired as i32
-                } else {
-                    AuthStatusKind::OauthConfigured as i32
-                },
-                supported_methods: vec![AuthMethod::OauthManual as i32],
-                expires_at_ms: credential.expires_at_ms,
-                metadata: display_safe_provider_metadata(credential.metadata),
-                can_refresh: !credential.refresh.is_empty(),
-                ..AuthStatus::default()
-            }),
-            None => Ok(AuthStatus {
+            Some(_) | None => Ok(AuthStatus {
                 target: Some(proto_mcp_target(server_key)),
                 kind: AuthStatusKind::NotConfigured as i32,
                 supported_methods: vec![AuthMethod::OauthManual as i32],
@@ -397,9 +392,8 @@ where
         Some(match outcome {
             TestRefreshOutcome::Success(credential) => self
                 .credential_store
-                .modify(&target.credential_key(), |_| Some(*credential))
+                .write(&target.credential_key(), *credential)
                 .await
-                .map(|_| ())
                 .map_err(|error| {
                     Status::internal(format!("failed to store refreshed credential: {error}"))
                 }),
@@ -560,13 +554,14 @@ where
         &self,
         request: &McpRegistrationRequest<'_>,
     ) -> Result<Option<McpOAuthRegistration>, Status> {
-        if let Some(StoredCredential::McpOAuth(current)) = self
+        if let Some(current) = self
             .credential_store
             .read(&request.target.credential_key())
             .await
             .map_err(|error| {
                 Status::internal(format!("failed to read MCP registration: {error}"))
             })?
+            && let Some(current) = current.credential.mcp_context()
             && current.issuer == request.authorization_server.issuer
             && current.resource == request.resource
             && current.registration.redirect_uri == request.redirect_uri
@@ -576,7 +571,7 @@ where
                 .is_none_or(|expiry| expiry > now_ms())
             && !current.registration.client_id.is_empty()
         {
-            Ok(Some(current.registration))
+            Ok(Some(current.registration.clone()))
         } else {
             Ok(None)
         }
@@ -643,24 +638,27 @@ where
                 )
                 .await
                 .map_err(|status| outbound_oauth_status(&target, &status))?;
-                credential.metadata.insert(
+                let metadata = credential
+                    .provider_metadata_mut()
+                    .expect("provider OAuth completion produces provider context");
+                metadata.insert(
                     "token_url".to_owned(),
                     attempt.definition().token_url.clone(),
                 );
-                credential.metadata.insert(
+                metadata.insert(
                     "client_id".to_owned(),
                     attempt.definition().client_id.clone(),
                 );
-                credential.metadata.insert(
+                metadata.insert(
                     "redirect_uri".to_owned(),
                     attempt.definition().redirect_uri.clone(),
                 );
-                (target, StoredCredential::OAuth(credential))
+                (target, credential)
             }
         };
         self.attempts.lock().await.remove(attempt_id);
         self.credential_store
-            .modify(&target.credential_key(), |_| Some(credential))
+            .write(&target.credential_key(), credential)
             .await
             .map_err(|error| Status::internal(format!("failed to store credential: {error}")))?;
         self.status_for(target).await
@@ -890,7 +888,9 @@ where
                 .await
                 .map_err(|error| Status::internal(format!("failed to read credential: {error}")))?
             {
-                Some(StoredCredential::McpOAuth(credential)) => Some(credential),
+                Some(record) if record.credential.mcp_context().is_some() => {
+                    Some(record.credential)
+                }
                 _ => None,
             }
         } else {
@@ -1244,19 +1244,22 @@ fn public_authorization_server_compatible(metadata: &mcp::McpAuthorizationServer
 fn mcp_oauth_status(
     server_key: &str,
     current_url: &str,
-    credential: &McpOAuthState,
+    credential: &OAuthCredential,
     reauthorization_required: bool,
 ) -> AuthStatus {
+    let context = credential
+        .mcp_context()
+        .expect("MCP status requires MCP credential context");
     let mut metadata = std::collections::HashMap::new();
-    if !credential.resource.is_empty() {
-        metadata.insert("resource".to_owned(), credential.resource.clone());
+    if !context.resource.is_empty() {
+        metadata.insert("resource".to_owned(), context.resource.clone());
     }
-    if !credential.issuer.is_empty() {
-        metadata.insert("issuer".to_owned(), credential.issuer.clone());
+    if !context.issuer.is_empty() {
+        metadata.insert("issuer".to_owned(), context.issuer.clone());
     }
     metadata.insert(
         "registration_method".to_owned(),
-        match credential.registration.method {
+        match context.registration.method {
             McpOAuthRegistrationMethod::Preregistered => "preregistered",
             McpOAuthRegistrationMethod::ClientMetadata => "client_metadata",
             McpOAuthRegistrationMethod::Dynamic => "dynamic",
@@ -1264,39 +1267,37 @@ fn mcp_oauth_status(
         }
         .to_owned(),
     );
-    if !credential.token.granted_scopes.is_empty() {
+    if !credential.token.scopes.is_empty() {
         metadata.insert(
             "scope".to_owned(),
-            credential.token.granted_scopes.join(" "),
+            credential
+                .token
+                .scopes
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .join(" "),
         );
     }
-    let resource_matches = credential.resource == current_url;
-    let authorization_required =
-        reauthorization_required || !resource_matches || credential.token.access_token.is_empty();
-    let expiry_known = credential.token.expires_at_ms != i64::MAX;
-    let can_refresh = !reauthorization_required
-        && resource_matches
-        && credential
-            .token
-            .refresh_token
-            .as_deref()
-            .is_some_and(|token| !token.is_empty());
+    let resource_matches = context.resource == current_url;
+    let authorization_required = reauthorization_required
+        || !resource_matches
+        || credential.token.access_token.secret().is_empty();
+    let expires_at_ms = credential.token.expires_at_ms;
+    let can_refresh =
+        !reauthorization_required && resource_matches && credential.token.refresh_token.is_some();
     AuthStatus {
         target: Some(proto_mcp_target(server_key)),
         kind: if authorization_required {
             AuthStatusKind::AuthorizationRequired as i32
-        } else if expiry_known && credential.token.expires_at_ms <= now_ms() {
+        } else if expires_at_ms.is_some_and(|expiry| expiry <= now_ms()) {
             AuthStatusKind::Expired as i32
         } else {
             AuthStatusKind::OauthConfigured as i32
         },
         supported_methods: vec![AuthMethod::OauthManual as i32],
-        expires_at_ms: if expiry_known {
-            credential.token.expires_at_ms
-        } else {
-            0
-        },
-        registration_method: proto_registration_method(credential.registration.method) as i32,
+        expires_at_ms: expires_at_ms.unwrap_or_default(),
+        registration_method: proto_registration_method(context.registration.method) as i32,
         metadata,
         message: if reauthorization_required {
             "MCP OAuth credential requires reauthorization".to_owned()
@@ -1309,20 +1310,33 @@ fn mcp_oauth_status(
     }
 }
 
-async fn revoke_mcp_credential(credential: &McpOAuthState) {
+async fn revoke_mcp_credential(credential: &OAuthCredential) {
     revoke_mcp_credential_with_policy(credential, OutboundHttpPolicy::production()).await;
 }
 
-async fn revoke_mcp_credential_with_policy(credential: &McpOAuthState, policy: OutboundHttpPolicy) {
-    let Some(endpoint) = credential.endpoints.revocation.as_deref() else {
+async fn revoke_mcp_credential_with_policy(
+    credential: &OAuthCredential,
+    policy: OutboundHttpPolicy,
+) {
+    let Some(context) = credential.mcp_context() else {
         return;
     };
-    let (token, token_type_hint) = credential.token.refresh_token.as_deref().map_or(
-        (
-            credential.token.access_token.as_str(),
-            McpRevocationTokenTypeHint::AccessToken,
-        ),
-        |refresh_token| (refresh_token, McpRevocationTokenTypeHint::RefreshToken),
+    let Some(endpoint) = context.endpoints.revocation.as_deref() else {
+        return;
+    };
+    let (token, token_type_hint) = credential.token.refresh_token.as_ref().map_or_else(
+        || {
+            (
+                credential.token.access_token.secret(),
+                McpRevocationTokenTypeHint::AccessToken,
+            )
+        },
+        |refresh_token| {
+            (
+                refresh_token.secret(),
+                McpRevocationTokenTypeHint::RefreshToken,
+            )
+        },
     );
     if token.is_empty() {
         return;
@@ -1330,7 +1344,7 @@ async fn revoke_mcp_credential_with_policy(credential: &McpOAuthState, policy: O
     let request = McpRevocationRequest {
         token: McpOAuthSecret::new(token),
         token_type_hint: Some(token_type_hint),
-        client_id: credential.registration.client_id.clone(),
+        client_id: context.registration.client_id.clone(),
     };
     let Ok((endpoint, client)) = policy.client_for(endpoint).await else {
         return;
@@ -1772,29 +1786,32 @@ mod tests {
 
     #[test]
     fn typed_mcp_status_reports_only_non_secret_metadata() {
-        let credential = McpOAuthState {
-            version: 1,
-            resource: "https://mcp.example/resource".to_owned(),
-            issuer: "https://auth.example".to_owned(),
-            registration: waltr_agent::McpOAuthRegistration {
-                method: McpOAuthRegistrationMethod::Dynamic,
-                client_id: "public-client".to_owned(),
-                ..waltr_agent::McpOAuthRegistration::default()
-            },
-            endpoints: waltr_agent::McpOAuthEndpoints {
-                authorization: "https://auth.example/authorize".to_owned(),
-                token: "https://auth.example/token".to_owned(),
-                revocation: Some("https://auth.example/revoke".to_owned()),
-            },
-            token: waltr_agent::McpOAuthToken {
-                access_token: "access-secret".to_owned(),
-                refresh_token: Some("refresh-secret".to_owned()),
+        let credential = OAuthCredential::mcp(
+            OAuthTokenSet {
+                access_token: oauth2::AccessToken::new("access-secret".to_owned()),
+                refresh_token: Some(oauth2::RefreshToken::new("refresh-secret".to_owned())),
                 token_type: "Bearer".to_owned(),
-                granted_scopes: vec!["read".to_owned(), "write".to_owned()],
-                expires_at_ms: i64::MAX,
-                refresh_generation: 4,
+                scopes: vec![
+                    oauth2::Scope::new("read".to_owned()),
+                    oauth2::Scope::new("write".to_owned()),
+                ],
+                expires_at_ms: None,
             },
-        };
+            McpOAuthContext {
+                resource: "https://mcp.example/resource".to_owned(),
+                issuer: "https://auth.example".to_owned(),
+                registration: waltr_agent::McpOAuthRegistration {
+                    method: McpOAuthRegistrationMethod::Dynamic,
+                    client_id: "public-client".to_owned(),
+                    ..waltr_agent::McpOAuthRegistration::default()
+                },
+                endpoints: waltr_agent::McpOAuthEndpoints {
+                    authorization: "https://auth.example/authorize".to_owned(),
+                    token: "https://auth.example/token".to_owned(),
+                    revocation: Some("https://auth.example/revoke".to_owned()),
+                },
+            },
+        );
 
         let status = mcp_oauth_status("remote", "https://mcp.example/resource", &credential, false);
 
@@ -1821,7 +1838,7 @@ mod tests {
         assert!(!rendered.contains("/revoke"));
 
         let mut expired = credential;
-        expired.token.expires_at_ms = 0;
+        expired.token.expires_at_ms = Some(0);
         let status = mcp_oauth_status("remote", "https://mcp.example/resource", &expired, false);
         assert_eq!(status.kind, AuthStatusKind::Expired as i32);
         assert_eq!(status.supported_methods, [AuthMethod::OauthManual as i32]);
@@ -1829,18 +1846,19 @@ mod tests {
 
     #[test]
     fn registration_only_status_and_attempt_failures_are_sanitized() {
-        let credential = McpOAuthState {
-            version: 1,
-            resource: "https://mcp.example/resource".to_owned(),
-            issuer: "https://auth.example".to_owned(),
-            registration: McpOAuthRegistration {
-                method: McpOAuthRegistrationMethod::ClientMetadata,
-                client_id: "https://waltr.example/.well-known/oauth-client/waltr".to_owned(),
-                ..McpOAuthRegistration::default()
+        let credential = OAuthCredential::mcp(
+            OAuthTokenSet::bearer("", None, None),
+            McpOAuthContext {
+                resource: "https://mcp.example/resource".to_owned(),
+                issuer: "https://auth.example".to_owned(),
+                registration: McpOAuthRegistration {
+                    method: McpOAuthRegistrationMethod::ClientMetadata,
+                    client_id: "https://waltr.example/.well-known/oauth-client/waltr".to_owned(),
+                    ..McpOAuthRegistration::default()
+                },
+                endpoints: McpOAuthEndpoints::default(),
             },
-            endpoints: McpOAuthEndpoints::default(),
-            token: McpOAuthToken::default(),
-        };
+        );
         let status = mcp_oauth_status("remote", "https://mcp.example/resource", &credential, false);
         assert_eq!(status.kind, AuthStatusKind::AuthorizationRequired as i32);
         assert_eq!(status.supported_methods, [AuthMethod::OauthManual as i32]);
@@ -1855,19 +1873,15 @@ mod tests {
 
     #[test]
     fn mcp_status_requires_reauthorization_for_durable_flag_or_resource_mismatch() {
-        let credential = McpOAuthState {
-            version: 1,
-            resource: "https://mcp.example/old".to_owned(),
-            issuer: "https://auth.example".to_owned(),
-            registration: McpOAuthRegistration::default(),
-            endpoints: McpOAuthEndpoints::default(),
-            token: McpOAuthToken {
-                access_token: "access-secret".to_owned(),
-                refresh_token: Some("refresh-secret".to_owned()),
-                expires_at_ms: i64::MAX,
-                ..McpOAuthToken::default()
+        let credential = OAuthCredential::mcp(
+            OAuthTokenSet::bearer("access-secret", Some("refresh-secret".to_owned()), None),
+            McpOAuthContext {
+                resource: "https://mcp.example/old".to_owned(),
+                issuer: "https://auth.example".to_owned(),
+                registration: McpOAuthRegistration::default(),
+                endpoints: McpOAuthEndpoints::default(),
             },
-        };
+        );
 
         let mismatch =
             mcp_oauth_status("remote", "https://mcp.example/current", &credential, false);
@@ -1899,38 +1913,75 @@ mod tests {
             .await
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
-        let credential_store =
-            FileCredentialStore::new(root.join("auth.json")).with_mcp_store(outbound_store.clone());
+        let credential_store = CredentialStore::shared(outbound_store.clone());
         credential_store
-            .modify(&AuthTarget::provider("codex").credential_key(), |_| {
-                Some(StoredCredential::OAuth(crate::auth::OAuthCredential {
-                    access: "provider-access-secret".to_owned(),
-                    refresh: "provider-refresh-secret".to_owned(),
-                    expires_at_ms: i64::MAX,
-                    metadata: std::collections::BTreeMap::new(),
-                }))
-            })
+            .write(
+                &AuthTarget::provider("codex").credential_key(),
+                OAuthCredential::provider(
+                    OAuthTokenSet::bearer(
+                        "provider-access-secret",
+                        Some("provider-refresh-secret".to_owned()),
+                        None,
+                    ),
+                    std::collections::BTreeMap::new(),
+                ),
+            )
             .await
             .unwrap();
         credential_store
-            .modify(&AuthTarget::mcp_server("remote").credential_key(), |_| {
-                Some(StoredCredential::McpOAuth(McpOAuthState {
-                    version: 1,
-                    resource: "https://mcp.example/resource".to_owned(),
-                    issuer: "https://auth.example".to_owned(),
-                    registration: McpOAuthRegistration::default(),
-                    endpoints: McpOAuthEndpoints::default(),
-                    token: McpOAuthToken {
-                        access_token: "mcp-access-secret".to_owned(),
-                        refresh_token: None,
-                        expires_at_ms: i64::MAX,
-                        ..McpOAuthToken::default()
+            .write(
+                &AuthTarget::mcp_server("remote").credential_key(),
+                OAuthCredential::mcp(
+                    OAuthTokenSet::bearer("mcp-access-secret", None, None),
+                    McpOAuthContext {
+                        resource: "https://mcp.example/resource".to_owned(),
+                        issuer: "https://auth.example".to_owned(),
+                        registration: McpOAuthRegistration::default(),
+                        endpoints: McpOAuthEndpoints::default(),
                     },
-                }))
-            })
+                ),
+            )
             .await
             .unwrap();
         AuthService::new(config_store, credential_store, outbound_store)
+    }
+
+    #[tokio::test]
+    async fn provider_status_requires_reauthorization_after_indeterminate_refresh() {
+        let service = generic_auth_service().await;
+        let target_key = AuthTarget::provider("codex").credential_key();
+        let record = service
+            .credential_store
+            .read(&target_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = OAuthRefreshClaim {
+            revision: record.revision,
+            claim_id: "provider-status-claim".to_owned(),
+            lease_expires_at_ms: i64::MAX,
+        };
+        OAuthCredentialStore::claim_refresh(
+            service.outbound_store.as_ref(),
+            target_key.clone(),
+            claim.clone(),
+        )
+        .await
+        .unwrap();
+        OAuthCredentialStore::abort_refresh(
+            service.outbound_store.as_ref(),
+            target_key,
+            claim,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let status = service.provider_status_for("codex").await.unwrap();
+
+        assert_eq!(status.kind, AuthStatusKind::AuthorizationRequired as i32);
+        assert!(!status.can_refresh);
+        assert!(status.message.contains("requires reauthorization"));
     }
 
     fn successful_oauth_router(base: &str, resource: &str) -> Router {
@@ -2049,8 +2100,7 @@ mod tests {
             .await
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
-        let credentials =
-            FileCredentialStore::new(root.join("auth.json")).with_mcp_store(outbound_store.clone());
+        let credentials = CredentialStore::shared(outbound_store.clone());
         let service = AuthService::new_for_tests(
             config_store,
             credentials,
@@ -2092,15 +2142,17 @@ mod tests {
             .save_mcp_attempt(&AuthTarget::mcp_server("remote"), &reauthorization)
             .await
             .unwrap();
-        let Some(StoredCredential::McpOAuth(still_usable)) = service
+        let still_usable = service
             .credential_store
             .read(&AuthTarget::mcp_server("remote").credential_key())
             .await
             .unwrap()
-        else {
-            panic!("existing MCP credential must remain installed");
-        };
-        assert_eq!(still_usable.token.access_token, "mcp-access-secret");
+            .expect("existing MCP credential must remain installed")
+            .credential;
+        assert_eq!(
+            still_usable.token.access_token.secret(),
+            "mcp-access-secret"
+        );
     }
 
     async fn assert_generic_target_lifecycle(
@@ -2251,26 +2303,26 @@ mod tests {
         let (service, server) = successful_lifecycle_service().await;
         service.refresh_outcomes.lock().await.insert(
             AuthTarget::provider("codex").credential_key(),
-            TestRefreshOutcome::Success(Box::new(StoredCredential::OAuth(
-                crate::auth::OAuthCredential {
-                    access: "refreshed-provider-access-secret".to_owned(),
-                    refresh: "refreshed-provider-refresh-secret".to_owned(),
-                    expires_at_ms: i64::MAX,
-                    metadata: std::collections::BTreeMap::from([
-                        ("account_id".to_owned(), "account-123".to_owned()),
-                        (
-                            "token_url".to_owned(),
-                            "https://secret.example/token".to_owned(),
-                        ),
-                        ("client_id".to_owned(), "secret-client".to_owned()),
-                        (
-                            "redirect_uri".to_owned(),
-                            "https://secret.example/callback".to_owned(),
-                        ),
-                        ("access_token".to_owned(), "access-secret".to_owned()),
-                        ("custom_secret".to_owned(), "must-not-cross".to_owned()),
-                    ]),
-                },
+            TestRefreshOutcome::Success(Box::new(OAuthCredential::provider(
+                OAuthTokenSet::bearer(
+                    "refreshed-provider-access-secret",
+                    Some("refreshed-provider-refresh-secret".to_owned()),
+                    None,
+                ),
+                std::collections::BTreeMap::from([
+                    ("account_id".to_owned(), "account-123".to_owned()),
+                    (
+                        "token_url".to_owned(),
+                        "https://secret.example/token".to_owned(),
+                    ),
+                    ("client_id".to_owned(), "secret-client".to_owned()),
+                    (
+                        "redirect_uri".to_owned(),
+                        "https://secret.example/callback".to_owned(),
+                    ),
+                    ("access_token".to_owned(), "access-secret".to_owned()),
+                    ("custom_secret".to_owned(), "must-not-cross".to_owned()),
+                ]),
             ))),
         );
         let provider = GeneratedAuthService::refresh_auth(
@@ -2292,19 +2344,19 @@ mod tests {
         let resource = config.mcp_servers["remote"].url.clone();
         service.refresh_outcomes.lock().await.insert(
             AuthTarget::mcp_server("remote").credential_key(),
-            TestRefreshOutcome::Success(Box::new(StoredCredential::McpOAuth(McpOAuthState {
-                version: 1,
-                resource,
-                issuer: "https://auth.example".to_owned(),
-                registration: McpOAuthRegistration::default(),
-                endpoints: McpOAuthEndpoints::default(),
-                token: McpOAuthToken {
-                    access_token: "refreshed-mcp-access-secret".to_owned(),
-                    refresh_token: Some("refreshed-mcp-refresh-secret".to_owned()),
-                    expires_at_ms: i64::MAX,
-                    ..McpOAuthToken::default()
+            TestRefreshOutcome::Success(Box::new(OAuthCredential::mcp(
+                OAuthTokenSet::bearer(
+                    "refreshed-mcp-access-secret",
+                    Some("refreshed-mcp-refresh-secret".to_owned()),
+                    None,
+                ),
+                McpOAuthContext {
+                    resource,
+                    issuer: "https://auth.example".to_owned(),
+                    registration: McpOAuthRegistration::default(),
+                    endpoints: McpOAuthEndpoints::default(),
                 },
-            }))),
+            ))),
         );
         let mcp = GeneratedAuthService::refresh_auth(
             service.as_ref(),
@@ -2366,14 +2418,13 @@ mod tests {
         .await;
         service
             .credential_store
-            .modify(&AuthTarget::provider("codex").credential_key(), |_| {
-                Some(StoredCredential::OAuth(crate::auth::OAuthCredential {
-                    access: "access-secret".to_owned(),
-                    refresh: String::new(),
-                    expires_at_ms: i64::MAX,
-                    metadata: std::collections::BTreeMap::new(),
-                }))
-            })
+            .write(
+                &AuthTarget::provider("codex").credential_key(),
+                OAuthCredential::provider(
+                    OAuthTokenSet::bearer("access-secret", None, None),
+                    std::collections::BTreeMap::new(),
+                ),
+            )
             .await
             .unwrap();
         assert_typed_refresh_failure(
@@ -2386,18 +2437,21 @@ mod tests {
     }
 
     async fn assert_mcp_refresh_failures(service: &AuthService<FilesystemConfigStore>) {
+        let key = AuthTarget::mcp_server("remote").credential_key();
+        let mut credential = service
+            .credential_store
+            .read(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .credential;
+        credential
+            .mcp_context_mut()
+            .expect("MCP credential context")
+            .resource = "https://mcp.example/different".to_owned();
         service
             .credential_store
-            .modify(
-                &AuthTarget::mcp_server("remote").credential_key(),
-                |stored| match stored {
-                    Some(StoredCredential::McpOAuth(mut credential)) => {
-                        credential.resource = "https://mcp.example/different".to_owned();
-                        Some(StoredCredential::McpOAuth(credential))
-                    }
-                    other => other,
-                },
-            )
+            .write(&key, credential)
             .await
             .unwrap();
         assert_typed_refresh_failure(
@@ -2587,24 +2641,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/revoke", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let credential = McpOAuthState {
-            version: 1,
-            resource: "https://mcp.example/resource".to_owned(),
-            issuer: "https://auth.example".to_owned(),
-            registration: McpOAuthRegistration {
-                client_id: "public-client".to_owned(),
-                ..McpOAuthRegistration::default()
+        let credential = OAuthCredential::mcp(
+            OAuthTokenSet::bearer("access-secret", Some("refresh-secret".to_owned()), None),
+            McpOAuthContext {
+                resource: "https://mcp.example/resource".to_owned(),
+                issuer: "https://auth.example".to_owned(),
+                registration: McpOAuthRegistration {
+                    client_id: "public-client".to_owned(),
+                    ..McpOAuthRegistration::default()
+                },
+                endpoints: McpOAuthEndpoints {
+                    revocation: Some(endpoint),
+                    ..McpOAuthEndpoints::default()
+                },
             },
-            endpoints: McpOAuthEndpoints {
-                revocation: Some(endpoint),
-                ..McpOAuthEndpoints::default()
-            },
-            token: McpOAuthToken {
-                access_token: "access-secret".to_owned(),
-                refresh_token: Some("refresh-secret".to_owned()),
-                ..McpOAuthToken::default()
-            },
-        };
+        );
         revoke_mcp_credential_with_policy(&credential, OutboundHttpPolicy::loopback_test()).await;
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
@@ -2653,8 +2704,7 @@ mod tests {
             .await
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
-        let credential_store =
-            FileCredentialStore::new(root.join("auth.json")).with_mcp_store(outbound_store.clone());
+        let credential_store = CredentialStore::shared(outbound_store.clone());
         let service = AuthService::new(config_store, credential_store, outbound_store);
         let router = Router::new()
             .route(

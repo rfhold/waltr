@@ -117,7 +117,9 @@ async fn start_router(
     let app = build_app_with_services(
         ConfigService::new(root)?,
         persistence,
-        |routes, config, _credential_store| session::add_memory_service(routes, config),
+        |routes, config, credential_store| {
+            session::add_memory_service(routes, config, credential_store);
+        },
     )
     .await?;
     TestRouter::start(app).await.map_err(Into::into)

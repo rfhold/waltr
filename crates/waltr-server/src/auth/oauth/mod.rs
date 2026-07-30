@@ -8,10 +8,11 @@ use waltr::grpc::waltr::{
     },
 };
 use waltr_agent::{
-    McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod, McpOAuthState,
-    McpOAuthToken, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod,
+    OAuthTokenSet, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
     SessionOAuthTokenRequestStyle,
 };
+use oauth2::Scope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tonic::Status;
@@ -339,7 +340,7 @@ pub async fn complete_mcp(
     attempt: &McpOAuthAttempt,
     input: &str,
     now_ms: i64,
-) -> Result<McpOAuthState, Status> {
+) -> Result<OAuthCredential, Status> {
     if now_ms > attempt.expires_at_ms {
         return Err(Status::deadline_exceeded("OAuth attempt expired"));
     }
@@ -351,7 +352,7 @@ pub(super) async fn complete_mcp_with_policy(
     input: &str,
     now_ms: i64,
     policy: OutboundHttpPolicy,
-) -> Result<McpOAuthState, Status> {
+) -> Result<OAuthCredential, Status> {
     if now_ms > attempt.expires_at_ms {
         return Err(Status::deadline_exceeded("OAuth attempt expired"));
     }
@@ -394,13 +395,13 @@ fn mcp_state_from_token(
     attempt: &McpOAuthAttempt,
     token: &mcp::oauth::McpTokenResponse,
     now_ms: i64,
-) -> Result<McpOAuthState, Status> {
+) -> Result<OAuthCredential, Status> {
     if token.access_token.expose_secret().is_empty() {
         return Err(Status::data_loss(
             "MCP OAuth token response did not include a bearer access token",
         ));
     }
-    let expires_at_ms = token.expires_in.map_or(i64::MAX, |seconds| {
+    let expires_at_ms = token.expires_in.map(|seconds| {
         now_ms.saturating_add(
             i64::try_from(seconds)
                 .unwrap_or(i64::MAX)
@@ -408,31 +409,36 @@ fn mcp_state_from_token(
         )
     });
     let granted_scopes = token.scope.as_deref().map_or_else(
-        || attempt.scopes.clone(),
-        |scope| scope.split_whitespace().map(ToOwned::to_owned).collect(),
-    );
-    Ok(McpOAuthState {
-        version: 1,
-        resource: attempt.resource.clone(),
-        issuer: attempt.issuer.clone(),
-        registration: attempt.registration.clone(),
-        endpoints: McpOAuthEndpoints {
-            authorization: attempt.authorization_url.clone(),
-            token: attempt.token_url.clone(),
-            revocation: attempt.revocation_url.clone(),
+        || attempt.scopes.iter().cloned().map(Scope::new).collect(),
+        |scope| {
+            scope
+                .split_whitespace()
+                .map(|scope| Scope::new(scope.to_owned()))
+                .collect()
         },
-        token: McpOAuthToken {
-            access_token: token.access_token.expose_secret().to_owned(),
+    );
+    Ok(OAuthCredential::mcp(
+        OAuthTokenSet {
+            access_token: oauth2::AccessToken::new(token.access_token.expose_secret().to_owned()),
             refresh_token: token
                 .refresh_token
                 .as_ref()
-                .map(|value| value.expose_secret().to_owned()),
+                .map(|value| oauth2::RefreshToken::new(value.expose_secret().to_owned())),
             token_type: "Bearer".to_owned(),
-            granted_scopes,
+            scopes: granted_scopes,
             expires_at_ms,
-            refresh_generation: 0,
         },
-    })
+        McpOAuthContext {
+            resource: attempt.resource.clone(),
+            issuer: attempt.issuer.clone(),
+            registration: attempt.registration.clone(),
+            endpoints: McpOAuthEndpoints {
+                authorization: attempt.authorization_url.clone(),
+                token: attempt.token_url.clone(),
+                revocation: attempt.revocation_url.clone(),
+            },
+        },
+    ))
 }
 
 /// Exchange a manual OAuth callback input for a stored credential.
@@ -685,18 +691,16 @@ async fn token_response_to_credential(
     let token: TokenResponse = serde_json::from_slice(&text)
         .map_err(|error| Status::data_loss(format!("OAuth token response was invalid: {error}")))?;
     let metadata = extract_metadata(definition, &token)?;
-    Ok(OAuthCredential {
-        access: token.access_token,
-        refresh: token.refresh_token.unwrap_or_default(),
-        expires_at_ms: credential_expiry_ms(now_ms(), token.expires_in),
+    Ok(OAuthCredential::provider(
+        OAuthTokenSet::bearer(
+            token.access_token,
+            token.refresh_token,
+            token
+                .expires_in
+                .map(|seconds| now_ms().saturating_add(seconds.saturating_mul(1000))),
+        ),
         metadata,
-    })
-}
-
-fn credential_expiry_ms(now_ms: i64, expires_in: Option<i64>) -> i64 {
-    now_ms
-        .saturating_add(expires_in.unwrap_or(3600).saturating_mul(1000))
-        .saturating_sub(5 * 60 * 1000)
+    ))
 }
 
 fn extract_metadata(
@@ -1081,8 +1085,8 @@ mod tests {
     #[test]
     fn provider_expiry_arithmetic_saturates() {
         assert_eq!(
-            credential_expiry_ms(i64::MAX, Some(i64::MAX)),
-            i64::MAX - 300_000
+            Some(i64::MAX.saturating_add(i64::MAX.saturating_mul(1000))),
+            Some(i64::MAX)
         );
     }
 

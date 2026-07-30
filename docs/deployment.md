@@ -12,9 +12,9 @@
 
 When `WALTR_MCP_DATABASE_URL` is absent or empty, file-backed SQLite derives sibling `mcp.sqlite3` while preserving safe parsed SQLite options; PostgreSQL reuses the same logical database through a separate pool. An explicit MCP URL may override either default. Waltr rejects physical aliases for the same SQLite file and equal named shared in-memory databases. Separate private `sqlite::memory:` targets create independent Waltr and MCP databases.
 
-These databases are not the agent session store configured by `WALTR_SESSION_STORE`, nor the provider/upstream-MCP credential file configured by `WALTR_AUTH_PATH`.
+These databases are not the agent session store configured by `WALTR_SESSION_STORE`. The Waltr database is the authoritative store for both provider and upstream-MCP OAuth credentials; the environment-owned server has no credential-file setting.
 
-Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, and outbound OAuth attempts/credentials in `waltr.sqlite3`, while MCP history, session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, and `0004_outbound_oauth`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
+Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, and outbound OAuth attempts/credentials in `waltr.sqlite3`, while MCP history, session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, `0004_outbound_oauth`, and `0005_unified_oauth_credentials`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. V5 is a hard cutover that discards existing MCP SQL credentials and stops reading legacy provider credential files; all targets must authorize again after upgrade. Legacy `auth.json` files are not deleted automatically and should be securely removed after rollback is no longer required. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
 
 ## Container Runtime And Local Compose
 
@@ -29,14 +29,13 @@ The build installs pnpm dependencies from workspace manifests before copying Rus
 - `WALTR_DATABASE_URL=sqlite:///data/waltr.sqlite3`
 - Empty `WALTR_MCP_DATABASE_URL`, which derives the MCP target
 - Derived MCP database `/data/mcp.sqlite3`
-- `WALTR_AUTH_PATH=/data/auth.json`
 - `WALTR_SESSION_STORE=filesystem`
 - `WALTR_SESSION_FILESYSTEM_ROOT=/data/sessions`
 - Named volume `waltr-dev-data` mounted at `/data`
 
 The static profile does not consume ambient `WALTR_*` deployment settings. Change server environment configuration in the actual process/container runtime used by a deployment, not through this Compose fixture.
 
-The `dev` volume contains both SQLite files, provider credentials, and filesystem agent sessions. It is disposable local state, not a production backup contract.
+The `dev` volume contains both SQLite files, including unified outbound credentials in `waltr.sqlite3`, and filesystem agent sessions. It is disposable local state, not a production backup contract.
 
 The `test` and `test-auth` profiles use tmpfs persistence, internal-only networking, health-gated startup, deterministic Dex/MCP fixtures, and an ephemeral TLS CA. Their `WALTR_OAUTH_*` and `WALTR_TEST_MCP_*` values are test-fixture settings, not server deployment variables. The authenticated Waltr fixture enables the hosted MCP issuer, generates an ephemeral keyring in tmpfs, and sets `WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS=true` only so HTTPS Waltr-to-Waltr CIMD and token requests can reach private Compose aliases. Production deployments must leave this deterministic test exception unset. The fixture does not configure a direct MCP issuer or a preregistered self client.
 
@@ -60,7 +59,7 @@ The `test` and `test-auth` profiles use tmpfs persistence, internal-only network
 | `WALTR_SESSION_S3_SECRET_ACCESS_KEY` | Static S3 secret access key. |
 | `WALTR_SESSION_S3_FORCE_PATH_STYLE` | Exactly `true` or `false`. |
 
-The Pulumi workload definition uses S3 session storage. It intentionally specifies one Waltr replica with a `Recreate` strategy; do not increase the replica count without validating all coordination and credential-file ownership assumptions.
+The Pulumi workload definition uses S3 session storage. It intentionally specifies one Waltr replica with a `Recreate` strategy; do not increase the replica count without validating session-store write coordination and the documented cross-replica operational checks.
 
 ## OIDC Access Domains
 

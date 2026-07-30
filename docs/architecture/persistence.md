@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Waltr server persistence initializes separately owned Waltr and MCP database targets for server-owned durable state, outbound MCP OAuth state, MCP Streamable HTTP sessions, and the hosted MCP authorization server. Startup completes both standard SQLx migrators before the router, health endpoint, or gRPC readiness service becomes available.
+Waltr server persistence initializes separately owned Waltr and MCP database targets for server-owned durable state, all outbound provider and MCP OAuth credentials, MCP Streamable HTTP sessions, and the hosted MCP authorization server. Startup completes both standard SQLx migrators before the router, health endpoint, or gRPC readiness service becomes available.
 
 This database is separate from agent session storage selected by `WALTR_SESSION_STORE`.
 
@@ -40,7 +40,8 @@ Waltr migrations are immutable and normalized identically across SQLite and Post
 | `0001_schema_ownership.sql` | Waltr | Establish Waltr schema ownership. |
 | `0002_oidc_access_auth.sql` | Waltr | Persist OIDC login attempts and browser sessions. |
 | `0003_mcp_oauth_login_continuations.sql` | Waltr | Persist browser-bound hosted-MCP authorization continuations. |
-| `0004_outbound_oauth.sql` | Waltr | Persist outbound OAuth attempts, credentials, and refresh claims. |
+| `0004_outbound_oauth.sql` | Waltr | Persist outbound OAuth attempts and the original MCP credential/refresh contract. |
+| `0005_unified_oauth_credentials.sql` | Waltr | Hard-cut over provider and MCP credentials to one typed payload and refresh contract. |
 
 The V2 access-authentication domain contains:
 
@@ -51,7 +52,9 @@ The V2 access-authentication domain contains:
 
 Admission is database-coordinated across server instances. The store permits at most 1,024 active login attempts, 1,024 active browser sessions globally, and 32 active browser sessions per issuer/subject. SQLite transactions and PostgreSQL advisory transaction locks make capacity checks and insertion atomic. Cleanup is bounded and opportunistic; expired or revoked records never authenticate even before cleanup.
 
-Waltr migration V3 owns the hosted server's browser-correlation continuation records. V4 owns outbound OAuth state. `outbound_oauth_attempts` persists state-bound callback attempts, registration/completion mode, expiry, sanitized lifecycle outcome, and an expiring identity-bound completion claim. Expired attempt-completion claims are reclaimable after a process crash, and stale claim identities cannot finish or commit. `outbound_oauth_credentials` persists target-scoped resource, issuer, registration, discovered endpoints, current access/refresh state, refresh generation, and an identity-bound compare-and-swap refresh claim. Callback completion and credential installation commit together. An indeterminate refresh or expired refresh lease marks the token family for reauthorization rather than risking reuse.
+Waltr migration V3 owns the hosted server's browser-correlation continuation records. V4 introduced outbound OAuth state. `outbound_oauth_attempts` persists state-bound callback attempts, registration/completion mode, expiry, sanitized lifecycle outcome, and an expiring identity-bound completion claim. Expired attempt-completion claims are reclaimable after a process crash, and stale claim identities cannot finish or commit.
+
+V5 is a hard cutover for `outbound_oauth_credentials`: applying it removes existing credential rows, so every previously authorized provider and MCP target must authorize again. The recreated table stores a versioned Waltr-owned credential payload containing a shared OAuth token set and typed provider or MCP context. Access and refresh token values use `oauth2` secret-bearing primitives, while Waltr owns absolute expiry, context, and serialization. Credential revision, claim identity/deadline, reauthorization state, and update time remain envelope columns. Both provider and MCP refreshes use the same database lease and compare-and-swap contract. Callback completion and credential installation commit together for durable MCP callback attempts; provider authorization attempts remain process-local. An indeterminate refresh or expired refresh lease marks the credential for reauthorization rather than risking reuse.
 
 MCP migrations are likewise immutable: V1 owns Streamable HTTP sessions/events, V2 adds the hosted authorization server's transactions, consents, digest-only codes and refresh tokens, grants, refresh families, access-token authorization records, and ES256 signing keys, and V3 adds normalized client-registration, redirect-URI, CIMD snapshot, admission, and rate-limit state. Private signing material is encrypted with the deployment keyring; wrapping keys are never stored in SQL. SQLite transactions and PostgreSQL locking implement the same one-time redemption, refresh rotation/replay, admission, revocation, and signing-key activation contract.
 
@@ -79,7 +82,7 @@ The environment-owned `build_app()` is therefore async and fallible. Explicit bu
 - `crates/waltr-server/src/session/` and `waltr-agent` continue to own agent session storage. `WALTR_SESSION_STORE` is not an alias for `WALTR_DATABASE_URL`.
 - Domain features should add purpose-specific stores and migrations rather than a generic key/value table.
 - `crates/waltr-server/src/access_auth/store.rs` owns the OIDC V2 domain store and admission rules; handlers do not issue SQL directly.
-- `crates/waltr-server/src/persistence/outbound_oauth.rs` owns Waltr migration V4, durable callbacks, outbound credentials, and refresh claims.
+- `crates/waltr-server/src/persistence/outbound_oauth.rs` owns durable callbacks, unified outbound credentials, and refresh claims.
 - `crates/mcp/src/oauth/server/` owns generic hosted-OAuth state transitions; Waltr only selects its MCP SQL pool and deployment policy.
 
 ## Tests
