@@ -64,8 +64,14 @@ where
         store: S,
         config: ConfigHandle,
         credential_store: CredentialStore,
+        trusted_mcp_oauth_origin: Option<reqwest::Url>,
     ) -> Arc<Self> {
-        Self::from_sessions_with_config(SessionCoordinator::new(store), config, credential_store)
+        Self::from_sessions_with_config(
+            SessionCoordinator::new(store),
+            config,
+            credential_store,
+            trusted_mcp_oauth_origin,
+        )
     }
 
     /// Create a session service from an existing session coordinator and config handle.
@@ -74,11 +80,13 @@ where
         sessions: SessionCoordinator<S>,
         config: ConfigHandle,
         credential_store: CredentialStore,
+        trusted_mcp_oauth_origin: Option<reqwest::Url>,
     ) -> Arc<Self> {
-        let sessions = sessions.with_runtime_factory(AgentSessionRuntimeFactory::new(
-            default_root(),
-            credential_store,
-        ));
+        let mut runtime_factory = AgentSessionRuntimeFactory::new(default_root(), credential_store);
+        if let Some(origin) = trusted_mcp_oauth_origin {
+            runtime_factory = runtime_factory.with_trusted_mcp_oauth_origin(origin);
+        }
+        let sessions = sessions.with_runtime_factory(runtime_factory);
         Arc::new(Self { sessions, config })
     }
 

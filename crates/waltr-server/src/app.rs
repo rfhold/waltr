@@ -423,6 +423,9 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
                 .map_err(BuildAppError::McpOAuth)?,
         ),
     };
+    let trusted_mcp_oauth_origin = mcp_oauth
+        .as_ref()
+        .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
     let mut session_storage = Ok(());
     let router = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
@@ -431,7 +434,12 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         access_authenticator,
         mcp_oauth,
         |grpc_routes, config, credential_store| {
-            session_storage = session::add_service_from_env(grpc_routes, config, credential_store);
+            session_storage = session::add_service_from_env(
+                grpc_routes,
+                config,
+                credential_store,
+                trusted_mcp_oauth_origin,
+            );
         },
     )
     .await
@@ -457,7 +465,7 @@ pub async fn build_app_with_config_service(
         config_service,
         persistence,
         |grpc_routes, config, credential_store| {
-            session::add_service_from_env(grpc_routes, config, credential_store)
+            session::add_service_from_env(grpc_routes, config, credential_store, None)
                 .expect("session service should start");
         },
     )
@@ -634,10 +642,14 @@ where
     .await?;
     let outbound_oauth_store = persistence.outbound_oauth_store();
     let credential_store = CredentialStore::shared(outbound_oauth_store.clone());
+    let trusted_mcp_oauth_origin = mcp_oauth
+        .as_ref()
+        .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
     let auth_service = AuthService::new(
         config_service.store().clone(),
         credential_store.clone(),
         outbound_oauth_store,
+        trusted_mcp_oauth_origin,
     );
     let outbound_oauth_router = auth_service.router();
     let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);

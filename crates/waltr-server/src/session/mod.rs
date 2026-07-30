@@ -29,10 +29,17 @@ pub fn add_service_from_env(
     routes: &mut RoutesBuilder,
     config: ConfigHandle,
     credential_store: CredentialStore,
+    trusted_mcp_oauth_origin: Option<reqwest::Url>,
 ) -> Result<(), SessionStorageConfigError> {
     match SessionStorageConfig::from_env()? {
         SessionStorageConfig::Memory => {
-            add_store_service(routes, MemorySessionStore::new(), config, credential_store);
+            add_store_service(
+                routes,
+                MemorySessionStore::new(),
+                config,
+                credential_store,
+                trusted_mcp_oauth_origin,
+            );
         }
         SessionStorageConfig::Filesystem { root } => {
             add_store_service(
@@ -40,10 +47,17 @@ pub fn add_service_from_env(
                 FilesystemSessionStore::new(root),
                 config,
                 credential_store,
+                trusted_mcp_oauth_origin,
             );
         }
         SessionStorageConfig::S3(s3_config) => {
-            add_store_service(routes, s3_config.into_store(), config, credential_store);
+            add_store_service(
+                routes,
+                s3_config.into_store(),
+                config,
+                credential_store,
+                trusted_mcp_oauth_origin,
+            );
         }
     }
 
@@ -57,6 +71,7 @@ pub fn add_default_service(routes: &mut RoutesBuilder, credential_store: Credent
             MemorySessionStore::new(),
             ConfigHandle::default(),
             credential_store,
+            None,
         ),
     ));
 }
@@ -67,7 +82,13 @@ pub fn add_memory_service(
     config: ConfigHandle,
     credential_store: CredentialStore,
 ) {
-    add_store_service(routes, MemorySessionStore::new(), config, credential_store);
+    add_store_service(
+        routes,
+        MemorySessionStore::new(),
+        config,
+        credential_store,
+        None,
+    );
 }
 
 /// Add an in-memory session service using an existing session coordinator.
@@ -76,11 +97,17 @@ pub fn add_sessions_service<S>(
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
     credential_store: CredentialStore,
+    trusted_mcp_oauth_origin: Option<reqwest::Url>,
 ) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     routes.add_service(SessionServiceServer::from_arc(
-        SessionService::from_sessions_with_config(sessions, config, credential_store),
+        SessionService::from_sessions_with_config(
+            sessions,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origin,
+        ),
     ));
 }
 
@@ -89,10 +116,11 @@ fn add_store_service<S>(
     store: S,
     config: ConfigHandle,
     credential_store: CredentialStore,
+    trusted_mcp_oauth_origin: Option<reqwest::Url>,
 ) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     routes.add_service(SessionServiceServer::from_arc(
-        SessionService::new_with_config(store, config, credential_store),
+        SessionService::new_with_config(store, config, credential_store, trusted_mcp_oauth_origin),
     ));
 }

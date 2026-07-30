@@ -702,6 +702,7 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                         SessionCoordinator::new(MemorySessionStore::new()),
                         config,
                         credential_store,
+                        None,
                     );
                 },
             )
@@ -867,7 +868,7 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
                 persistence,
                 catalog_loader,
                 |routes, config, credential_store| {
-                    session::add_sessions_service(routes, sessions, config, credential_store);
+                    session::add_sessions_service(routes, sessions, config, credential_store, None);
                 },
             )
             .await
@@ -1028,6 +1029,9 @@ END
             } else {
                 None
             };
+            let trusted_mcp_oauth_origin = mcp_oauth.as_ref().map(|oauth| {
+                reqwest::Url::parse(oauth.resource()).expect("test hosted MCP resource URL")
+            });
             let app = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
                 config_service,
                 persistence,
@@ -1040,6 +1044,7 @@ END
                         SessionCoordinator::new(MemorySessionStore::new()),
                         config,
                         credential_store,
+                        trusted_mcp_oauth_origin,
                     );
                 },
             )

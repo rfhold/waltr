@@ -88,6 +88,7 @@ enum RefreshFailureDisposition {
 pub struct CredentialRefreshCoordinator {
     credential_store: CredentialStore,
     allow_loopback_http: bool,
+    trusted_mcp_oauth_origin: Option<Url>,
 }
 
 impl CredentialRefreshCoordinator {
@@ -97,7 +98,15 @@ impl CredentialRefreshCoordinator {
         Self {
             credential_store: credential_store.into(),
             allow_loopback_http: false,
+            trusted_mcp_oauth_origin: None,
         }
+    }
+
+    /// Permit private HTTPS peers for one host-supplied MCP OAuth origin.
+    #[must_use]
+    pub fn with_trusted_mcp_oauth_origin(mut self, origin: Url) -> Self {
+        self.trusted_mcp_oauth_origin = Some(origin);
+        self
     }
 
     #[cfg(test)]
@@ -237,21 +246,27 @@ impl CredentialRefreshCoordinator {
             return Ok(Some(current.credential));
         }
 
-        let refreshed =
-            match refresh_mcp_oauth(&target, &record.credential, self.allow_loopback_http).await {
-                Ok(credential) => credential,
-                Err(error) => {
-                    self.abort_refresh(&target, &credential_key, &claim, &error)
-                        .await?;
-                    if mode == RefreshMode::Normal
-                        && error.disposition == RefreshFailureDisposition::Indeterminate
-                        && !record.credential.token.expires_by(now_ms())
-                    {
-                        return Ok(Some(record.credential));
-                    }
-                    return Err(error);
+        let refreshed = match refresh_mcp_oauth(
+            &target,
+            &record.credential,
+            self.allow_loopback_http,
+            self.trusted_mcp_oauth_origin.as_ref(),
+        )
+        .await
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.abort_refresh(&target, &credential_key, &claim, &error)
+                    .await?;
+                if mode == RefreshMode::Normal
+                    && error.disposition == RefreshFailureDisposition::Indeterminate
+                    && !record.credential.token.expires_by(now_ms())
+                {
+                    return Ok(Some(record.credential));
                 }
-            };
+                return Err(error);
+            }
+        };
         if refreshed.token.expires_by(now_ms()) {
             self.credential_store
                 .abort_refresh(&credential_key, claim.clone(), true)
@@ -504,7 +519,7 @@ async fn refresh_provider_oauth(
         ),
     ];
     let (token_url, client) =
-        oauth_client_for(target, &definition.token_url, allow_loopback_http).await?;
+        oauth_client_for(target, &definition.token_url, allow_loopback_http, None).await?;
     let builder = client.post(token_url);
     let response = match definition.token_request_style {
         SessionOAuthTokenRequestStyle::Json => builder.json(&pairs_to_json(&pairs)).send().await,
@@ -518,7 +533,7 @@ async fn refresh_provider_oauth(
             RefreshFailureDisposition::Indeterminate,
         )
     })?;
-    validate_response_peer(target, &response, allow_loopback_http)?;
+    validate_response_peer(target, &response, allow_loopback_http, None)?;
     let status = response.status();
     let body = read_json_body(target, response).await?;
     if !status.is_success() {
@@ -541,6 +556,7 @@ pub(super) async fn refresh_mcp_oauth(
     target: &AuthTarget,
     credential: &OAuthCredential,
     allow_loopback_http: bool,
+    trusted_private_origin: Option<&Url>,
 ) -> Result<OAuthCredential, CredentialRefreshError> {
     let context = credential.mcp_context().ok_or_else(|| {
         refresh_error(
@@ -572,6 +588,8 @@ pub(super) async fn refresh_mcp_oauth(
             RefreshFailureDisposition::RetrySafe,
         ));
     }
+    let trusted_private_origin =
+        trusted_origin_for_resource(trusted_private_origin, &context.resource);
     let request = McpRefreshTokenRequest {
         grant_type: McpOAuthGrantType::RefreshToken,
         refresh_token: McpOAuthSecret::new(refresh_token),
@@ -579,8 +597,13 @@ pub(super) async fn refresh_mcp_oauth(
         scope: None,
         resource: Some(context.resource.clone()),
     };
-    let (token_url, client) =
-        oauth_client_for(target, &context.endpoints.token, allow_loopback_http).await?;
+    let (token_url, client) = oauth_client_for(
+        target,
+        &context.endpoints.token,
+        allow_loopback_http,
+        trusted_private_origin,
+    )
+    .await?;
     let response = client
         .post(token_url)
         .form(&request)
@@ -594,7 +617,12 @@ pub(super) async fn refresh_mcp_oauth(
                 RefreshFailureDisposition::Indeterminate,
             )
         })?;
-    validate_response_peer(target, &response, allow_loopback_http)?;
+    validate_response_peer(
+        target,
+        &response,
+        allow_loopback_http,
+        trusted_private_origin,
+    )?;
     let status = response.status();
     let body = read_json_body(target, response).await?;
     if !status.is_success() {
@@ -868,6 +896,7 @@ async fn oauth_client_for(
     target: &AuthTarget,
     value: &str,
     allow_loopback_http: bool,
+    trusted_private_origin: Option<&Url>,
 ) -> Result<(Url, Client), CredentialRefreshError> {
     let url = Url::parse(value).map_err(|_| refresh_configuration_error(target))?;
     let host = url
@@ -900,9 +929,14 @@ async fn oauth_client_for(
         })?
         .collect::<Vec<_>>();
     if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| !allows_address(address.ip(), allow_loopback_http))
+        || addresses.iter().any(|address| {
+            !allows_address(
+                &url,
+                address.ip(),
+                allow_loopback_http,
+                trusted_private_origin,
+            )
+        })
     {
         return Err(refresh_configuration_error(target));
     }
@@ -929,11 +963,16 @@ fn validate_response_peer(
     target: &AuthTarget,
     response: &Response,
     allow_loopback_http: bool,
+    trusted_private_origin: Option<&Url>,
 ) -> Result<(), CredentialRefreshError> {
-    if response
-        .remote_addr()
-        .is_some_and(|peer| !allows_address(peer.ip(), allow_loopback_http))
-    {
+    if response.remote_addr().is_some_and(|peer| {
+        !allows_address(
+            response.url(),
+            peer.ip(),
+            allow_loopback_http,
+            trusted_private_origin,
+        )
+    }) {
         return Err(refresh_configuration_error(target));
     }
     Ok(())
@@ -1028,9 +1067,22 @@ fn refresh_error(
     }
 }
 
-fn allows_address(address: IpAddr, allow_loopback: bool) -> bool {
+fn allows_address(
+    url: &Url,
+    address: IpAddr,
+    allow_loopback: bool,
+    trusted_private_origin: Option<&Url>,
+) -> bool {
     if address.is_loopback() {
         return allow_loopback;
+    }
+    if trusted_private_origin.is_some_and(|trusted| trusted.origin() == url.origin())
+        && match address {
+            IpAddr::V4(address) => address.is_private(),
+            IpAddr::V6(address) => address.is_unique_local(),
+        }
+    {
+        return true;
     }
     match address {
         IpAddr::V4(address) => {
@@ -1049,7 +1101,12 @@ fn allows_address(address: IpAddr, allow_loopback: bool) -> bool {
         }
         IpAddr::V6(address) => {
             if let Some(mapped) = address.to_ipv4_mapped() {
-                return allows_address(IpAddr::V4(mapped), allow_loopback);
+                return allows_address(
+                    url,
+                    IpAddr::V4(mapped),
+                    allow_loopback,
+                    trusted_private_origin,
+                );
             }
             let segments = address.segments();
             !(address.is_unspecified()
@@ -1061,10 +1118,75 @@ fn allows_address(address: IpAddr, allow_loopback: bool) -> bool {
     }
 }
 
+fn trusted_origin_for_resource<'a>(trusted: Option<&'a Url>, resource: &str) -> Option<&'a Url> {
+    trusted.filter(|trusted| Url::parse(resource).is_ok_and(|resource| resource == **trusted))
+}
+
 pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| {
             i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_mcp_origin_accepts_only_rfc1918_and_ula_on_the_exact_origin() {
+        let trusted = Url::parse("https://preview-waltr.example/mcp").expect("trusted URL");
+        let token = Url::parse("https://preview-waltr.example/token").expect("token URL");
+        let other = Url::parse("https://other.example/token").expect("token URL");
+        let other_port = Url::parse("https://preview-waltr.example:444/token").expect("token URL");
+
+        assert!(allows_address(
+            &token,
+            "172.16.3.53".parse().expect("private IP"),
+            false,
+            Some(&trusted),
+        ));
+        assert!(allows_address(
+            &token,
+            "fd00::1".parse().expect("private IP"),
+            false,
+            Some(&trusted),
+        ));
+        assert!(!allows_address(
+            &other,
+            "172.16.3.53".parse().expect("private IP"),
+            false,
+            Some(&trusted),
+        ));
+        assert!(!allows_address(
+            &other_port,
+            "172.16.3.53".parse().expect("private IP"),
+            false,
+            Some(&trusted),
+        ));
+        assert!(!allows_address(
+            &token,
+            "127.0.0.1".parse().expect("loopback IP"),
+            false,
+            Some(&trusted),
+        ));
+        assert!(!allows_address(
+            &token,
+            "169.254.169.254".parse().expect("link-local IP"),
+            false,
+            Some(&trusted),
+        ));
+        assert!(
+            trusted_origin_for_resource(Some(&trusted), "https://preview-waltr.example/mcp")
+                .is_some()
+        );
+        assert!(
+            trusted_origin_for_resource(Some(&trusted), "https://remote.example/mcp").is_none()
+        );
+        assert!(
+            trusted_origin_for_resource(Some(&trusted), "https://preview-waltr.example/other-mcp")
+                .is_none()
+        );
+    }
 }
