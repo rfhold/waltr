@@ -55,6 +55,7 @@ pub struct AgentSessionRuntimeFactory {
     task_max_subagent_depth: usize,
     mcp_server_instructions_enabled: bool,
     outbound_oauth_loopback_test_mode: bool,
+    trusted_mcp_oauth_origin: Option<reqwest::Url>,
     runtime_builder_override: Option<RuntimeBuilderOverride>,
 }
 
@@ -73,6 +74,7 @@ impl std::fmt::Debug for AgentSessionRuntimeFactory {
                 "outbound_oauth_loopback_test_mode",
                 &self.outbound_oauth_loopback_test_mode,
             )
+            .field("trusted_mcp_oauth_origin", &self.trusted_mcp_oauth_origin)
             .field(
                 "runtime_builder_override",
                 &self.runtime_builder_override.as_ref().map(|_| "<override>"),
@@ -91,6 +93,7 @@ impl AgentSessionRuntimeFactory {
             task_max_subagent_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             mcp_server_instructions_enabled: true,
             outbound_oauth_loopback_test_mode: false,
+            trusted_mcp_oauth_origin: None,
             runtime_builder_override: None,
         }
     }
@@ -106,6 +109,13 @@ impl AgentSessionRuntimeFactory {
     #[must_use]
     pub const fn with_mcp_server_instructions_enabled(mut self, enabled: bool) -> Self {
         self.mcp_server_instructions_enabled = enabled;
+        self
+    }
+
+    /// Permit private HTTPS peers for one host-supplied MCP OAuth origin.
+    #[must_use]
+    pub fn with_trusted_mcp_oauth_origin(mut self, origin: reqwest::Url) -> Self {
+        self.trusted_mcp_oauth_origin = Some(origin);
         self
     }
 
@@ -465,7 +475,10 @@ impl AgentSessionRuntimeFactory {
     }
 
     fn refresh_coordinator(&self) -> CredentialRefreshCoordinator {
-        let coordinator = CredentialRefreshCoordinator::new(self.credential_store.clone());
+        let mut coordinator = CredentialRefreshCoordinator::new(self.credential_store.clone());
+        if let Some(origin) = &self.trusted_mcp_oauth_origin {
+            coordinator = coordinator.with_trusted_mcp_oauth_origin(origin.clone());
+        }
         #[cfg(test)]
         if self.outbound_oauth_loopback_test_mode {
             return coordinator.with_loopback_test_mode();
@@ -2234,6 +2247,7 @@ mod tests {
             &AuthTarget::mcp_server("remote"),
             &mcp_state(token_url),
             true,
+            None,
         )
         .await
         .expect_err("redirect must fail");
@@ -2252,6 +2266,7 @@ mod tests {
             &AuthTarget::mcp_server("remote"),
             &mcp_state(token_url),
             true,
+            None,
         )
         .await
         .expect_err("oversized response must fail");

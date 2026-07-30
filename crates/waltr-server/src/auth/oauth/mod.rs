@@ -124,6 +124,10 @@ impl McpOAuthAttempt {
         &self.registration.redirect_uri
     }
 
+    pub(super) fn resource(&self) -> &str {
+        &self.resource
+    }
+
     pub(super) fn validate_response_issuer(&self, issuer: Option<&str>) -> Result<(), Status> {
         if issuer.is_some_and(|value| value != self.issuer)
             || (self.response_issuer_required && issuer != Some(self.issuer.as_str()))
@@ -230,14 +234,19 @@ pub fn begin_manual(
     definition: OAuthProvider,
     now_ms: i64,
 ) -> Result<(OAuthAttempt, BeginAuthResponse), Status> {
-    begin_manual_with_policy(target, definition, now_ms, OutboundHttpPolicy::production())
+    begin_manual_with_policy(
+        target,
+        definition,
+        now_ms,
+        &OutboundHttpPolicy::production(None),
+    )
 }
 
 pub(super) fn begin_manual_with_policy(
     target: AuthTarget,
     definition: OAuthProvider,
     now_ms: i64,
-    policy: OutboundHttpPolicy,
+    policy: &OutboundHttpPolicy,
 ) -> Result<(OAuthAttempt, BeginAuthResponse), Status> {
     validate_definition(&definition, policy.allows_loopback_http())?;
     let verifier = pkce_verifier();
@@ -336,6 +345,7 @@ pub fn begin_mcp(
 }
 
 /// Exchange an MCP authorization code while preserving resource binding.
+#[cfg(test)]
 pub async fn complete_mcp(
     attempt: &McpOAuthAttempt,
     input: &str,
@@ -344,7 +354,7 @@ pub async fn complete_mcp(
     if now_ms > attempt.expires_at_ms {
         return Err(Status::deadline_exceeded("OAuth attempt expired"));
     }
-    complete_mcp_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production()).await
+    complete_mcp_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production(None)).await
 }
 
 pub(super) async fn complete_mcp_with_policy(
@@ -377,7 +387,7 @@ pub(super) async fn complete_mcp_with_policy(
         .send()
         .await
         .map_err(|error| Status::unavailable(format!("MCP OAuth token request failed: {error}")))?;
-    validate_response_peer(policy, &response)?;
+    validate_response_peer(&policy, &response)?;
     let status = response.status();
     let body = read_json_body(response, OAUTH_RESPONSE_LIMIT).await?;
     if !status.is_success() {
@@ -448,7 +458,7 @@ pub async fn complete_manual(
     input: &str,
     now_ms: i64,
 ) -> Result<OAuthCredential, Status> {
-    complete_manual_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production()).await
+    complete_manual_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production(None)).await
 }
 
 pub(super) async fn complete_manual_with_policy(
@@ -516,7 +526,7 @@ async fn request_token(
         OauthTokenRequestStyle::Unspecified => unreachable!("validated request style"),
     }
     .map_err(|error| Status::unavailable(format!("OAuth token request failed: {error}")))?;
-    validate_response_peer(policy, &response)?;
+    validate_response_peer(&policy, &response)?;
     token_response_to_credential(definition, response).await
 }
 

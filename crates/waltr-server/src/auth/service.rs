@@ -114,13 +114,14 @@ where
         config_store: S,
         credential_store: CredentialStore,
         outbound_store: Arc<OutboundOAuthStore>,
+        trusted_private_origin: Option<reqwest::Url>,
     ) -> Arc<Self> {
         Arc::new(Self {
             config_store,
             credential_store,
             outbound_store,
             attempts: Mutex::new(HashMap::new()),
-            outbound_policy: OutboundHttpPolicy::production(),
+            outbound_policy: OutboundHttpPolicy::production(trusted_private_origin),
             #[cfg(test)]
             outbound_redirect_uri: None,
             #[cfg(test)]
@@ -303,8 +304,8 @@ where
             ));
         }
 
-        let policy = self.outbound_policy;
-        let discovery = discover_mcp_auth(&target, &server.url, policy).await?;
+        let policy = self.outbound_policy.for_mcp_resource(&server.url);
+        let discovery = discover_mcp_auth(&target, &server.url, policy.clone()).await?;
         let auth_server = discovery.authorization_server;
         let (authorize_url, token_url) = required_authorization_endpoints(&target, &auth_server)?;
         #[cfg(not(test))]
@@ -364,9 +365,9 @@ where
             AuthTarget::provider(provider_key),
             definition.definition,
             now_ms(),
-            self.outbound_policy,
+            &self.outbound_policy.without_trusted_private_origin(),
         )?;
-        let policy = self.outbound_policy;
+        let policy = self.outbound_policy.without_trusted_private_origin();
         policy
             .validate_destination(&attempt.definition().authorize_url)
             .await?;
@@ -453,6 +454,11 @@ where
                 let server = config.mcp_servers.get(key).ok_or_else(|| {
                     Status::not_found(format!("mcp server '{key}' does not exist"))
                 })?;
+                let mut coordinator = coordinator;
+                let policy = self.outbound_policy.for_mcp_resource(&server.url);
+                if let Some(origin) = policy.trusted_private_origin() {
+                    coordinator = coordinator.with_trusted_mcp_oauth_origin(origin.clone());
+                }
                 coordinator
                     .refresh_mcp(
                         &SessionMcpServerRuntimeSettings {
@@ -596,10 +602,13 @@ where
                 token_endpoint_auth_method: McpTokenEndpointAuthMethod::None,
                 client_name: Some("Waltr outbound MCP client".to_owned()),
             };
-            let response =
-                register_public_client_hardened(request.policy, endpoint, &registration_request)
-                    .await
-                    .map_err(|status| outbound_oauth_status(request.target, &status))?;
+            let response = register_public_client_hardened(
+                request.policy.clone(),
+                endpoint,
+                &registration_request,
+            )
+            .await
+            .map_err(|status| outbound_oauth_status(request.target, &status))?;
             return Ok(McpOAuthRegistration {
                 method: McpOAuthRegistrationMethod::Dynamic,
                 client_id: response.client_id,
@@ -634,7 +643,7 @@ where
                     attempt,
                     input,
                     now_ms(),
-                    self.outbound_policy,
+                    self.outbound_policy.without_trusted_private_origin(),
                 )
                 .await
                 .map_err(|status| outbound_oauth_status(&target, &status))?;
@@ -669,7 +678,7 @@ where
         attempt_id: &str,
         input: &str,
     ) -> Result<AuthStatus, Status> {
-        self.complete_mcp_attempt_with_policy(attempt_id, input, Some(self.outbound_policy))
+        self.complete_mcp_attempt_with_policy(attempt_id, input, None)
             .await
     }
 
@@ -723,12 +732,9 @@ where
                 "OAuth attempt is no longer pending",
             ));
         }
-        let completion = match policy {
-            Some(policy) => {
-                oauth::complete_mcp_with_policy(&attempt, input, now_ms(), policy).await
-            }
-            None => oauth::complete_mcp(&attempt, input, now_ms()).await,
-        };
+        let policy =
+            policy.unwrap_or_else(|| self.outbound_policy.for_mcp_resource(attempt.resource()));
+        let completion = oauth::complete_mcp_with_policy(&attempt, input, now_ms(), policy).await;
         let credential = match completion {
             Ok(credential) => credential,
             Err(status) => {
@@ -901,7 +907,14 @@ where
             .await
             .map_err(|error| Status::internal(format!("failed to delete credential: {error}")))?;
         if let Some(credential) = mcp_credential {
-            revoke_mcp_credential(&credential).await;
+            let resource = credential
+                .mcp_context()
+                .map_or("", |context| context.resource.as_str());
+            revoke_mcp_credential_with_policy(
+                &credential,
+                self.outbound_policy.for_mcp_resource(resource),
+            )
+            .await;
         }
         let status = self.status_for(target).await?;
         Ok(Response::new(LogoutResponse {
@@ -1310,10 +1323,6 @@ fn mcp_oauth_status(
     }
 }
 
-async fn revoke_mcp_credential(credential: &OAuthCredential) {
-    revoke_mcp_credential_with_policy(credential, OutboundHttpPolicy::production()).await;
-}
-
 async fn revoke_mcp_credential_with_policy(
     credential: &OAuthCredential,
     policy: OutboundHttpPolicy,
@@ -1350,7 +1359,7 @@ async fn revoke_mcp_credential_with_policy(
         return;
     };
     if let Ok(response) = client.post(endpoint).form(&request).send().await {
-        drop(validate_response_peer(policy, &response));
+        drop(validate_response_peer(&policy, &response));
     }
 }
 
@@ -1457,7 +1466,7 @@ async fn discover_mcp_auth(
         .validate_destination(endpoint)
         .await
         .map_err(|status| outbound_oauth_status(target, &status))?;
-    let challenge = request_mcp_challenge(policy, endpoint)
+    let challenge = request_mcp_challenge(policy.clone(), endpoint)
         .await
         .map_err(|status| outbound_oauth_status(target, &status))?;
     if let Some(metadata_url) = challenge.resource_metadata.as_deref() {
@@ -1466,18 +1475,19 @@ async fn discover_mcp_auth(
             .await
             .map_err(|status| outbound_oauth_status(target, &status))?;
     }
-    let protected = discover_protected_resource(policy, endpoint, &challenge)
+    let protected = discover_protected_resource(policy.clone(), endpoint, &challenge)
         .await
         .map_err(|status| outbound_oauth_status(target, &status))?;
     for issuer in &protected.authorization_servers {
         if policy.validate_destination(issuer).await.is_err() {
             continue;
         }
-        let Ok(authorization_server) = discover_authorization_server(policy, issuer).await else {
+        let Ok(authorization_server) = discover_authorization_server(policy.clone(), issuer).await
+        else {
             continue;
         };
         if public_authorization_server_compatible(&authorization_server)
-            && validate_authorization_server_destinations(policy, &authorization_server)
+            && validate_authorization_server_destinations(policy.clone(), &authorization_server)
                 .await
                 .is_ok()
         {
@@ -1542,7 +1552,7 @@ async fn request_mcp_challenge(
         .map_err(|error| {
             Status::unavailable(format!("failed to request MCP OAuth challenge: {error}"))
         })?;
-    validate_response_peer(policy, &response)?;
+    validate_response_peer(&policy, &response)?;
     if !matches!(response.status().as_u16(), 401 | 403) {
         return Err(Status::failed_precondition(
             "MCP endpoint did not return an OAuth bearer challenge",
@@ -1573,7 +1583,7 @@ async fn discover_protected_resource(
         );
     for destination in destinations {
         let Ok(metadata) =
-            get_oauth_json::<mcp::McpProtectedResourceMetadata>(policy, &destination).await
+            get_oauth_json::<mcp::McpProtectedResourceMetadata>(policy.clone(), &destination).await
         else {
             continue;
         };
@@ -1592,7 +1602,8 @@ async fn discover_authorization_server(
 ) -> Result<mcp::McpAuthorizationServerMetadata, Status> {
     for destination in authorization_server_metadata_urls(issuer) {
         let Ok(metadata) =
-            get_oauth_json::<mcp::McpAuthorizationServerMetadata>(policy, &destination).await
+            get_oauth_json::<mcp::McpAuthorizationServerMetadata>(policy.clone(), &destination)
+                .await
         else {
             continue;
         };
@@ -1615,7 +1626,7 @@ async fn get_oauth_json<T: serde::de::DeserializeOwned>(
         .send()
         .await
         .map_err(|_| Status::unavailable("OAuth discovery request failed"))?;
-    validate_response_peer(policy, &response)?;
+    validate_response_peer(&policy, &response)?;
     if !response.status().is_success() {
         return Err(Status::failed_precondition(
             "OAuth discovery endpoint returned an error",
@@ -1638,7 +1649,7 @@ async fn register_public_client_hardened(
         .send()
         .await
         .map_err(|_| Status::unavailable("OAuth client registration request failed"))?;
-    validate_response_peer(policy, &response)?;
+    validate_response_peer(&policy, &response)?;
     if !response.status().is_success() {
         return Err(Status::failed_precondition(
             "OAuth client registration endpoint returned an error",
@@ -1944,7 +1955,7 @@ mod tests {
             )
             .await
             .unwrap();
-        AuthService::new(config_store, credential_store, outbound_store)
+        AuthService::new(config_store, credential_store, outbound_store, None)
     }
 
     #[tokio::test]
@@ -2599,9 +2610,10 @@ mod tests {
             );
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
         let policy = OutboundHttpPolicy::loopback_test();
-        let discovery = discover_mcp_auth(&AuthTarget::mcp_server("remote"), &endpoint, policy)
-            .await
-            .unwrap();
+        let discovery =
+            discover_mcp_auth(&AuthTarget::mcp_server("remote"), &endpoint, policy.clone())
+                .await
+                .unwrap();
         assert_eq!(discovery.protected.resource, endpoint);
         assert_eq!(discovery.authorization_server.issuer, issuer);
         assert_eq!(discovery.challenge.scope.as_deref(), Some("tools.read"));
@@ -2708,7 +2720,7 @@ mod tests {
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
         let credential_store = CredentialStore::shared(outbound_store.clone());
-        let service = AuthService::new(config_store, credential_store, outbound_store);
+        let service = AuthService::new(config_store, credential_store, outbound_store, None);
         let router = Router::new()
             .route(
                 "/outbound-oauth/callback",

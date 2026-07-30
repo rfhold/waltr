@@ -6,18 +6,20 @@ use tonic::Status;
 
 pub(super) const OAUTH_RESPONSE_LIMIT: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct OutboundHttpPolicy {
     allow_loopback_http: bool,
     allow_private_https: bool,
+    trusted_private_origin: Option<Url>,
 }
 
 impl OutboundHttpPolicy {
-    pub(super) fn production() -> Self {
+    pub(super) fn production(trusted_private_origin: Option<Url>) -> Self {
         Self {
             allow_loopback_http: false,
             allow_private_https: std::env::var("WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS")
                 .is_ok_and(|value| value == "true"),
+            trusted_private_origin,
         }
     }
 
@@ -26,10 +28,11 @@ impl OutboundHttpPolicy {
         Self {
             allow_loopback_http: true,
             allow_private_https: false,
+            trusted_private_origin: None,
         }
     }
 
-    pub(super) async fn client_for(self, value: &str) -> Result<(Url, Client), Status> {
+    pub(super) async fn client_for(&self, value: &str) -> Result<(Url, Client), Status> {
         let url = self.validate_url(value)?;
         let host = url
             .host_str()
@@ -44,7 +47,7 @@ impl OutboundHttpPolicy {
         if addresses.is_empty()
             || addresses
                 .iter()
-                .any(|address| !self.allows_address(address.ip()))
+                .any(|address| !self.allows_address(&url, address.ip()))
         {
             return Err(Status::failed_precondition(
                 "OAuth endpoint resolves to a disallowed destination",
@@ -64,15 +67,35 @@ impl OutboundHttpPolicy {
         Ok((url, client))
     }
 
-    pub(super) const fn allows_loopback_http(self) -> bool {
+    pub(super) const fn allows_loopback_http(&self) -> bool {
         self.allow_loopback_http
     }
 
-    pub(super) async fn validate_destination(self, value: &str) -> Result<Url, Status> {
+    pub(super) const fn trusted_private_origin(&self) -> Option<&Url> {
+        self.trusted_private_origin.as_ref()
+    }
+
+    pub(super) fn for_mcp_resource(&self, resource: &str) -> Self {
+        let mut policy = self.clone();
+        if Url::parse(resource).map_or(true, |url| {
+            self.trusted_private_origin.as_ref() != Some(&url)
+        }) {
+            policy.trusted_private_origin = None;
+        }
+        policy
+    }
+
+    pub(super) fn without_trusted_private_origin(&self) -> Self {
+        let mut policy = self.clone();
+        policy.trusted_private_origin = None;
+        policy
+    }
+
+    pub(super) async fn validate_destination(&self, value: &str) -> Result<Url, Status> {
         self.client_for(value).await.map(|(url, _)| url)
     }
 
-    fn validate_url(self, value: &str) -> Result<Url, Status> {
+    fn validate_url(&self, value: &str) -> Result<Url, Status> {
         let url = Url::parse(value)
             .map_err(|_| Status::failed_precondition("OAuth endpoint URL is invalid"))?;
         if url.fragment().is_some()
@@ -101,11 +124,11 @@ impl OutboundHttpPolicy {
         Ok(url)
     }
 
-    fn allows_address(self, address: IpAddr) -> bool {
+    fn allows_address(&self, url: &Url, address: IpAddr) -> bool {
         if address.is_loopback() {
             return self.allow_loopback_http;
         }
-        if self.allow_private_https
+        if (self.allow_private_https || self.trusts_private_origin(url))
             && match address {
                 IpAddr::V4(address) => address.is_private(),
                 IpAddr::V6(address) => address.is_unique_local(),
@@ -115,16 +138,22 @@ impl OutboundHttpPolicy {
         }
         is_public_address(address)
     }
+
+    fn trusts_private_origin(&self, url: &Url) -> bool {
+        self.trusted_private_origin
+            .as_ref()
+            .is_some_and(|trusted| trusted.origin() == url.origin())
+    }
 }
 
 pub(super) fn validate_response_peer(
-    policy: OutboundHttpPolicy,
+    policy: &OutboundHttpPolicy,
     response: &Response,
 ) -> Result<(), Status> {
     let peer = response.remote_addr().ok_or_else(|| {
         Status::permission_denied("OAuth response peer address could not be verified")
     })?;
-    if !policy.allows_address(peer.ip()) {
+    if !policy.allows_address(response.url(), peer.ip()) {
         return Err(Status::permission_denied(
             "OAuth response came from a disallowed destination",
         ));
@@ -206,7 +235,7 @@ mod tests {
 
     #[tokio::test]
     async fn production_policy_rejects_private_metadata_and_loopback_destinations() {
-        let policy = OutboundHttpPolicy::production();
+        let policy = OutboundHttpPolicy::production(None);
         for endpoint in [
             "http://127.0.0.1/token",
             "https://10.0.0.1/token",
@@ -224,6 +253,50 @@ mod tests {
                 .client_for("http://127.0.0.1/token")
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_https_origin_accepts_only_private_addresses_on_that_origin() {
+        let policy = OutboundHttpPolicy::production(Some(
+            Url::parse("https://preview-waltr.example/mcp").expect("trusted URL"),
+        ));
+        let trusted = Url::parse("https://preview-waltr.example/token").expect("endpoint URL");
+        let other_host = Url::parse("https://other.example/token").expect("endpoint URL");
+        let other_port =
+            Url::parse("https://preview-waltr.example:444/token").expect("endpoint URL");
+
+        assert!(policy.allows_address(&trusted, "10.0.0.1".parse().expect("private IP")));
+        assert!(policy.allows_address(&trusted, "fd00::1".parse().expect("private IP")));
+        assert!(!policy.allows_address(&other_host, "10.0.0.1".parse().expect("private IP")));
+        assert!(!policy.allows_address(&other_port, "10.0.0.1".parse().expect("private IP")));
+        assert!(!policy.allows_address(&trusted, "127.0.0.1".parse().expect("loopback IP")));
+        assert!(
+            !policy.allows_address(&trusted, "169.254.169.254".parse().expect("link-local IP"))
+        );
+        assert!(
+            policy
+                .for_mcp_resource("https://other.example/mcp")
+                .trusted_private_origin()
+                .is_none()
+        );
+        assert!(
+            policy
+                .for_mcp_resource("https://preview-waltr.example/mcp")
+                .trusted_private_origin()
+                .is_some()
+        );
+        assert!(
+            policy
+                .for_mcp_resource("https://preview-waltr.example/other-mcp")
+                .trusted_private_origin()
+                .is_none()
+        );
+        assert!(
+            policy
+                .without_trusted_private_origin()
+                .trusted_private_origin()
+                .is_none()
         );
     }
 }
