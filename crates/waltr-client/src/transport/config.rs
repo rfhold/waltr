@@ -4,8 +4,8 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use waltr::config::ConfigWatchUpdate;
 use waltr::grpc::waltr::config::v1::{
-    GetConfigRequest, McpServerMapPatch, PatchConfigRequest, ProviderMapPatch, WatchConfigRequest,
-    WatchConfigResponse,
+    GetConfigRequest, McpServerMapPatch, PatchConfigRequest, ProviderMapPatch, ResetConfigRequest,
+    WatchConfigRequest, WatchConfigResponse,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
@@ -73,6 +73,35 @@ where
                 .map(|mcp_servers| McpServerMapPatch { mcp_servers }),
             runtime_defaults: patch.runtime_defaults,
         })
+        .await
+        .map_err(|error| status_error(&error, &credentials))?
+        .into_inner();
+
+    Ok(response.config.unwrap_or_default())
+}
+
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
+pub(super) async fn reset_config<T>(
+    transport: &T,
+    expected_etag: String,
+) -> Result<Configuration, ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    let credentials = transport.request_credentials();
+    let response = transport
+        .config_client(&credentials)
+        .await?
+        .reset_config(ResetConfigRequest { expected_etag })
         .await
         .map_err(|error| status_error(&error, &credentials))?
         .into_inner();

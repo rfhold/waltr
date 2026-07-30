@@ -13,13 +13,29 @@ use waltr_client::{
 };
 use waltr_server::config::ConfigStore as _;
 
+pub async fn server_endpoint_with_unavailable_config_reset()
+-> Result<String, Box<dyn std::error::Error>> {
+    let root = waltr_server::test_support::temp_root();
+    let service = waltr_server::config_service::ConfigService::new(
+        &root,
+        waltr_server::config::DefaultConfigBuilder::new(
+            waltr_server::catalog::CatalogLoader::from_path(root.join("missing-catalog.json")),
+            "http://127.0.0.1:14333/mcp",
+        ),
+    )?;
+    service.store().save(runtime_config()).await?;
+    Ok(waltr_server::test_support::setup_server_with_services(service).base_url())
+}
+
 pub fn server_endpoint() -> String {
     waltr_server::test_support::setup_server().base_url()
 }
 
 pub async fn server_endpoint_with_runtime_config() -> Result<String, Box<dyn std::error::Error>> {
-    let config_service =
-        waltr_server::config_service::ConfigService::new(waltr_server::test_support::temp_root())?;
+    let config_service = waltr_server::config_service::ConfigService::new(
+        waltr_server::test_support::temp_root(),
+        waltr_server::test_support::default_config_builder(),
+    )?;
     config_service.store().save(runtime_config()).await?;
     Ok(waltr_server::test_support::setup_server_with_services(config_service).base_url())
 }

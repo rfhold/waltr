@@ -9,7 +9,7 @@ use waltr_client::{ClientCommand, ClientRuntime, ClientSnapshot, TimelineContent
 use waltr_server::{
     config::ConfigStore as _,
     config_service::ConfigService,
-    test_support::{setup_server_with_services, temp_root},
+    test_support::{default_config_builder, setup_server_with_services, temp_root},
 };
 
 use crate::support::snapshots::{dispatch_stream_command, no_sleep};
@@ -181,7 +181,8 @@ async fn next_live_snapshot_until(
 async fn setup_live_server(
     config: Configuration,
 ) -> &'static waltr_server::test_support::TestServer {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     config_service
         .store()
         .save(config)

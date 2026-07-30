@@ -103,6 +103,21 @@ impl GrpcEffectExecutor {
             .map(ConfigView::from)
     }
 
+    /// Reset the current configuration using its expected entity tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport rejects or cannot apply the reset.
+    pub async fn reset_config(
+        &self,
+        expected_etag: impl Into<String>,
+    ) -> Result<ConfigView, ClientError> {
+        self.transport
+            .reset_config(expected_etag.into())
+            .await
+            .map(ConfigView::from)
+    }
+
     /// Subscribe to configuration changes as stable shell-facing view models.
     ///
     /// # Errors
@@ -357,6 +372,19 @@ impl GrpcEffectExecutor {
                     config,
                 })],
                 Err(error) => vec![ClientEvent::Config(ConfigEvent::PatchFailed {
+                    operation_key,
+                    error,
+                })],
+            },
+            ClientEffect::Config(ConfigEffect::Reset {
+                operation_key,
+                expected_etag,
+            }) => match self.transport.reset_config(expected_etag).await {
+                Ok(config) => vec![ClientEvent::Config(ConfigEvent::Reset {
+                    operation_key,
+                    config,
+                })],
+                Err(error) => vec![ClientEvent::Config(ConfigEvent::ResetFailed {
                     operation_key,
                     error,
                 })],

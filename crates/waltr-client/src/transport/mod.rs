@@ -62,6 +62,12 @@ pub trait WaltrTransport {
         expected_etag: String,
     ) -> impl Future<Output = Result<Configuration, ClientError>>;
 
+    /// Reset the complete configuration to server defaults.
+    fn reset_config(
+        &self,
+        expected_etag: String,
+    ) -> impl Future<Output = Result<Configuration, ClientError>>;
+
     /// Subscribe to future configuration changes.
     fn watch_config(&self) -> impl Future<Output = Result<Self::ConfigWatchStream, ClientError>>;
 
@@ -278,6 +284,10 @@ where
         expected_etag: String,
     ) -> Result<Configuration, ClientError> {
         config::patch_config(self, patch, expected_etag).await
+    }
+
+    async fn reset_config(&self, expected_etag: String) -> Result<Configuration, ClientError> {
+        config::reset_config(self, expected_etag).await
     }
 
     async fn watch_config(&self) -> Result<Self::ConfigWatchStream, ClientError> {
@@ -1018,7 +1028,7 @@ mod tests {
     use waltr::grpc::waltr::auth::v1::auth_target;
     use waltr::grpc::waltr::config::v1::{
         GetConfigRequest, GetConfigResponse, PatchConfigRequest, PatchConfigResponse,
-        WatchConfigRequest, WatchConfigResponse,
+        ResetConfigRequest, ResetConfigResponse, WatchConfigRequest, WatchConfigResponse,
         config_service_server::{ConfigService, ConfigServiceServer},
     };
 
@@ -1054,6 +1064,14 @@ mod tests {
         ) -> Result<tonic::Response<GetConfigResponse>, tonic::Status> {
             self.record(&request);
             Ok(tonic::Response::new(GetConfigResponse::default()))
+        }
+
+        async fn reset_config(
+            &self,
+            request: tonic::Request<ResetConfigRequest>,
+        ) -> Result<tonic::Response<ResetConfigResponse>, tonic::Status> {
+            self.record(&request);
+            Ok(tonic::Response::new(ResetConfigResponse::default()))
         }
 
         type WatchConfigStream =

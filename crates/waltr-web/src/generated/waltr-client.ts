@@ -1060,6 +1060,18 @@ error: string | null,
 /**
  * Patched configuration, when the operation completed successfully.
  */
+config: ConfigView | null, } | { "kind": "configReset",
+/**
+ * Stable operation status name.
+ */
+status: string,
+/**
+ * Last operation error, when present.
+ */
+error: string | null,
+/**
+ * Reset configuration, when the operation completed successfully.
+ */
 config: ConfigView | null, } | { "kind": "sessionCreate",
 /**
  * Stable operation status name.
@@ -1216,6 +1228,10 @@ load: OperationSnapshot,
  */
 patch: OperationSnapshot,
 /**
+ * Configuration reset operation snapshot.
+ */
+reset: OperationSnapshot,
+/**
  * Configuration watch operation snapshot.
  */
 watch: OperationSnapshot, };
@@ -1368,7 +1384,7 @@ target: ClientAuthTarget, } | { "type": "logoutAuth",
 /**
  * Target to log out.
  */
-target: ClientAuthTarget, } | { "type": "requestConfig" } | { "type": "searchCatalogModels",
+target: ClientAuthTarget, } | { "type": "requestConfig" } | { "type": "resetConfig" } | { "type": "searchCatalogModels",
 /**
  * Runtime-local request identity.
  */
