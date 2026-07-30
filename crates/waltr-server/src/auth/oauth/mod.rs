@@ -238,7 +238,7 @@ pub fn begin_manual(
         target,
         definition,
         now_ms,
-        &OutboundHttpPolicy::production(None),
+        &OutboundHttpPolicy::production(Vec::new(), None),
     )
 }
 
@@ -354,7 +354,13 @@ pub async fn complete_mcp(
     if now_ms > attempt.expires_at_ms {
         return Err(Status::deadline_exceeded("OAuth attempt expired"));
     }
-    complete_mcp_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production(None)).await
+    complete_mcp_with_policy(
+        attempt,
+        input,
+        now_ms,
+        OutboundHttpPolicy::production(Vec::new(), None),
+    )
+    .await
 }
 
 pub(super) async fn complete_mcp_with_policy(
@@ -458,7 +464,13 @@ pub async fn complete_manual(
     input: &str,
     now_ms: i64,
 ) -> Result<OAuthCredential, Status> {
-    complete_manual_with_policy(attempt, input, now_ms, OutboundHttpPolicy::production(None)).await
+    complete_manual_with_policy(
+        attempt,
+        input,
+        now_ms,
+        OutboundHttpPolicy::production(Vec::new(), None),
+    )
+    .await
 }
 
 pub(super) async fn complete_manual_with_policy(

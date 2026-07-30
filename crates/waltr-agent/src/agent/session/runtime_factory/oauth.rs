@@ -88,7 +88,7 @@ enum RefreshFailureDisposition {
 pub struct CredentialRefreshCoordinator {
     credential_store: CredentialStore,
     allow_loopback_http: bool,
-    trusted_mcp_oauth_origin: Option<Url>,
+    configured_mcp_oauth_origins: Vec<Url>,
 }
 
 impl CredentialRefreshCoordinator {
@@ -98,15 +98,21 @@ impl CredentialRefreshCoordinator {
         Self {
             credential_store: credential_store.into(),
             allow_loopback_http: false,
-            trusted_mcp_oauth_origin: None,
+            configured_mcp_oauth_origins: Vec::new(),
         }
+    }
+
+    /// Permit private HTTPS peers for host-supplied MCP OAuth origins.
+    #[must_use]
+    pub fn with_trusted_mcp_oauth_origins(mut self, origins: Vec<Url>) -> Self {
+        self.configured_mcp_oauth_origins = origins;
+        self
     }
 
     /// Permit private HTTPS peers for one host-supplied MCP OAuth origin.
     #[must_use]
-    pub fn with_trusted_mcp_oauth_origin(mut self, origin: Url) -> Self {
-        self.trusted_mcp_oauth_origin = Some(origin);
-        self
+    pub fn with_trusted_mcp_oauth_origin(self, origin: Url) -> Self {
+        self.with_trusted_mcp_oauth_origins(vec![origin])
     }
 
     #[cfg(test)]
@@ -250,7 +256,7 @@ impl CredentialRefreshCoordinator {
             &target,
             &record.credential,
             self.allow_loopback_http,
-            self.trusted_mcp_oauth_origin.as_ref(),
+            &self.configured_mcp_oauth_origins,
         )
         .await
         {
@@ -519,7 +525,7 @@ async fn refresh_provider_oauth(
         ),
     ];
     let (token_url, client) =
-        oauth_client_for(target, &definition.token_url, allow_loopback_http, None).await?;
+        oauth_client_for(target, &definition.token_url, allow_loopback_http, &[]).await?;
     let builder = client.post(token_url);
     let response = match definition.token_request_style {
         SessionOAuthTokenRequestStyle::Json => builder.json(&pairs_to_json(&pairs)).send().await,
@@ -533,7 +539,7 @@ async fn refresh_provider_oauth(
             RefreshFailureDisposition::Indeterminate,
         )
     })?;
-    validate_response_peer(target, &response, allow_loopback_http, None)?;
+    validate_response_peer(target, &response, allow_loopback_http, &[])?;
     let status = response.status();
     let body = read_json_body(target, response).await?;
     if !status.is_success() {
@@ -556,7 +562,7 @@ pub(super) async fn refresh_mcp_oauth(
     target: &AuthTarget,
     credential: &OAuthCredential,
     allow_loopback_http: bool,
-    trusted_private_origin: Option<&Url>,
+    trusted_private_origins: &[Url],
 ) -> Result<OAuthCredential, CredentialRefreshError> {
     let context = credential.mcp_context().ok_or_else(|| {
         refresh_error(
@@ -588,8 +594,6 @@ pub(super) async fn refresh_mcp_oauth(
             RefreshFailureDisposition::RetrySafe,
         ));
     }
-    let trusted_private_origin =
-        trusted_origin_for_resource(trusted_private_origin, &context.resource);
     let request = McpRefreshTokenRequest {
         grant_type: McpOAuthGrantType::RefreshToken,
         refresh_token: McpOAuthSecret::new(refresh_token),
@@ -601,7 +605,7 @@ pub(super) async fn refresh_mcp_oauth(
         target,
         &context.endpoints.token,
         allow_loopback_http,
-        trusted_private_origin,
+        trusted_private_origins,
     )
     .await?;
     let response = client
@@ -621,7 +625,7 @@ pub(super) async fn refresh_mcp_oauth(
         target,
         &response,
         allow_loopback_http,
-        trusted_private_origin,
+        trusted_private_origins,
     )?;
     let status = response.status();
     let body = read_json_body(target, response).await?;
@@ -896,7 +900,7 @@ async fn oauth_client_for(
     target: &AuthTarget,
     value: &str,
     allow_loopback_http: bool,
-    trusted_private_origin: Option<&Url>,
+    trusted_private_origins: &[Url],
 ) -> Result<(Url, Client), CredentialRefreshError> {
     let url = Url::parse(value).map_err(|_| refresh_configuration_error(target))?;
     let host = url
@@ -934,7 +938,7 @@ async fn oauth_client_for(
                 &url,
                 address.ip(),
                 allow_loopback_http,
-                trusted_private_origin,
+                trusted_private_origins,
             )
         })
     {
@@ -963,14 +967,14 @@ fn validate_response_peer(
     target: &AuthTarget,
     response: &Response,
     allow_loopback_http: bool,
-    trusted_private_origin: Option<&Url>,
+    trusted_private_origins: &[Url],
 ) -> Result<(), CredentialRefreshError> {
     if response.remote_addr().is_some_and(|peer| {
         !allows_address(
             response.url(),
             peer.ip(),
             allow_loopback_http,
-            trusted_private_origin,
+            trusted_private_origins,
         )
     }) {
         return Err(refresh_configuration_error(target));
@@ -1071,12 +1075,14 @@ fn allows_address(
     url: &Url,
     address: IpAddr,
     allow_loopback: bool,
-    trusted_private_origin: Option<&Url>,
+    trusted_private_origins: &[Url],
 ) -> bool {
     if address.is_loopback() {
         return allow_loopback;
     }
-    if trusted_private_origin.is_some_and(|trusted| trusted.origin() == url.origin())
+    if trusted_private_origins
+        .iter()
+        .any(|trusted| trusted.origin() == url.origin())
         && match address {
             IpAddr::V4(address) => address.is_private(),
             IpAddr::V6(address) => address.is_unique_local(),
@@ -1105,7 +1111,7 @@ fn allows_address(
                     url,
                     IpAddr::V4(mapped),
                     allow_loopback,
-                    trusted_private_origin,
+                    trusted_private_origins,
                 );
             }
             let segments = address.segments();
@@ -1116,10 +1122,6 @@ fn allows_address(
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8))
         }
     }
-}
-
-fn trusted_origin_for_resource<'a>(trusted: Option<&'a Url>, resource: &str) -> Option<&'a Url> {
-    trusted.filter(|trusted| Url::parse(resource).is_ok_and(|resource| resource == **trusted))
 }
 
 pub(super) fn now_ms() -> i64 {
@@ -1145,48 +1147,37 @@ mod destination_tests {
             &token,
             "172.16.3.53".parse().expect("private IP"),
             false,
-            Some(&trusted),
+            std::slice::from_ref(&trusted),
         ));
         assert!(allows_address(
             &token,
             "fd00::1".parse().expect("private IP"),
             false,
-            Some(&trusted),
+            std::slice::from_ref(&trusted),
         ));
         assert!(!allows_address(
             &other,
             "172.16.3.53".parse().expect("private IP"),
             false,
-            Some(&trusted),
+            std::slice::from_ref(&trusted),
         ));
         assert!(!allows_address(
             &other_port,
             "172.16.3.53".parse().expect("private IP"),
             false,
-            Some(&trusted),
+            std::slice::from_ref(&trusted),
         ));
         assert!(!allows_address(
             &token,
             "127.0.0.1".parse().expect("loopback IP"),
             false,
-            Some(&trusted),
+            std::slice::from_ref(&trusted),
         ));
         assert!(!allows_address(
             &token,
             "169.254.169.254".parse().expect("link-local IP"),
             false,
-            Some(&trusted),
+            std::slice::from_ref(&trusted),
         ));
-        assert!(
-            trusted_origin_for_resource(Some(&trusted), "https://preview-waltr.example/mcp")
-                .is_some()
-        );
-        assert!(
-            trusted_origin_for_resource(Some(&trusted), "https://remote.example/mcp").is_none()
-        );
-        assert!(
-            trusted_origin_for_resource(Some(&trusted), "https://preview-waltr.example/other-mcp")
-                .is_none()
-        );
     }
 }

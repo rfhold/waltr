@@ -66,11 +66,25 @@ where
         credential_store: CredentialStore,
         trusted_mcp_oauth_origin: Option<reqwest::Url>,
     ) -> Arc<Self> {
-        Self::from_sessions_with_config(
+        Self::new_with_oauth_policy(
+            store,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origin.into_iter().collect(),
+        )
+    }
+
+    pub(crate) fn new_with_oauth_policy(
+        store: S,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    ) -> Arc<Self> {
+        Self::from_sessions_with_oauth_policy(
             SessionCoordinator::new(store),
             config,
             credential_store,
-            trusted_mcp_oauth_origin,
+            trusted_mcp_oauth_origins,
         )
     }
 
@@ -82,10 +96,22 @@ where
         credential_store: CredentialStore,
         trusted_mcp_oauth_origin: Option<reqwest::Url>,
     ) -> Arc<Self> {
-        let mut runtime_factory = AgentSessionRuntimeFactory::new(default_root(), credential_store);
-        if let Some(origin) = trusted_mcp_oauth_origin {
-            runtime_factory = runtime_factory.with_trusted_mcp_oauth_origin(origin);
-        }
+        Self::from_sessions_with_oauth_policy(
+            sessions,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origin.into_iter().collect(),
+        )
+    }
+
+    pub(crate) fn from_sessions_with_oauth_policy(
+        sessions: SessionCoordinator<S>,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    ) -> Arc<Self> {
+        let runtime_factory = AgentSessionRuntimeFactory::new(default_root(), credential_store)
+            .with_trusted_mcp_oauth_origins(trusted_mcp_oauth_origins);
         let sessions = sessions.with_runtime_factory(runtime_factory);
         Arc::new(Self { sessions, config })
     }

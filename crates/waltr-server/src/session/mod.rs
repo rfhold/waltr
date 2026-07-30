@@ -31,6 +31,20 @@ pub fn add_service_from_env(
     credential_store: CredentialStore,
     trusted_mcp_oauth_origin: Option<reqwest::Url>,
 ) -> Result<(), SessionStorageConfigError> {
+    add_service_from_env_with_oauth_policy(
+        routes,
+        config,
+        credential_store,
+        trusted_mcp_oauth_origin.into_iter().collect(),
+    )
+}
+
+pub(crate) fn add_service_from_env_with_oauth_policy(
+    routes: &mut RoutesBuilder,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+) -> Result<(), SessionStorageConfigError> {
     match SessionStorageConfig::from_env()? {
         SessionStorageConfig::Memory => {
             add_store_service(
@@ -38,7 +52,7 @@ pub fn add_service_from_env(
                 MemorySessionStore::new(),
                 config,
                 credential_store,
-                trusted_mcp_oauth_origin,
+                trusted_mcp_oauth_origins,
             );
         }
         SessionStorageConfig::Filesystem { root } => {
@@ -47,7 +61,7 @@ pub fn add_service_from_env(
                 FilesystemSessionStore::new(root),
                 config,
                 credential_store,
-                trusted_mcp_oauth_origin,
+                trusted_mcp_oauth_origins,
             );
         }
         SessionStorageConfig::S3(s3_config) => {
@@ -56,7 +70,7 @@ pub fn add_service_from_env(
                 s3_config.into_store(),
                 config,
                 credential_store,
-                trusted_mcp_oauth_origin,
+                trusted_mcp_oauth_origins,
             );
         }
     }
@@ -67,11 +81,11 @@ pub fn add_service_from_env(
 /// Add the default session service to the gRPC routes builder.
 pub fn add_default_service(routes: &mut RoutesBuilder, credential_store: CredentialStore) {
     routes.add_service(SessionServiceServer::from_arc(
-        SessionService::new_with_config(
+        SessionService::new_with_oauth_policy(
             MemorySessionStore::new(),
             ConfigHandle::default(),
             credential_store,
-            None,
+            Vec::new(),
         ),
     ));
 }
@@ -87,7 +101,7 @@ pub fn add_memory_service(
         MemorySessionStore::new(),
         config,
         credential_store,
-        None,
+        Vec::new(),
     );
 }
 
@@ -101,12 +115,30 @@ pub fn add_sessions_service<S>(
 ) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
+    add_sessions_service_with_oauth_policy(
+        routes,
+        sessions,
+        config,
+        credential_store,
+        trusted_mcp_oauth_origin.into_iter().collect(),
+    );
+}
+
+pub(crate) fn add_sessions_service_with_oauth_policy<S>(
+    routes: &mut RoutesBuilder,
+    sessions: SessionCoordinator<S>,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+) where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
     routes.add_service(SessionServiceServer::from_arc(
-        SessionService::from_sessions_with_config(
+        SessionService::from_sessions_with_oauth_policy(
             sessions,
             config,
             credential_store,
-            trusted_mcp_oauth_origin,
+            trusted_mcp_oauth_origins,
         ),
     ));
 }
@@ -116,11 +148,16 @@ fn add_store_service<S>(
     store: S,
     config: ConfigHandle,
     credential_store: CredentialStore,
-    trusted_mcp_oauth_origin: Option<reqwest::Url>,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
 ) where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     routes.add_service(SessionServiceServer::from_arc(
-        SessionService::new_with_config(store, config, credential_store, trusted_mcp_oauth_origin),
+        SessionService::new_with_oauth_policy(
+            store,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+        ),
     ));
 }

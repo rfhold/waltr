@@ -28,6 +28,10 @@ const mcpOAuthRefreshFamilyTtl = config.require("mcpOAuthRefreshFamilyTtl");
 const mcpOAuthCodeTtl = config.require("mcpOAuthCodeTtl");
 const mcpOAuthAllowDcr = config.requireBoolean("mcpOAuthAllowDcr");
 const mcpOAuthAllowCimd = config.requireBoolean("mcpOAuthAllowCimd");
+const mcpOAuthCimdTrustedPrivateOrigins =
+  config.getObject<string[]>("mcpOAuthCimdTrustedPrivateOrigins") ?? [];
+const mcpOutboundOAuthTrustedPrivateOrigins =
+  config.getObject<string[]>("mcpOutboundOAuthTrustedPrivateOrigins") ?? [];
 const wrappingKeyVersions = config.requireObject<string[]>(
   "mcpOAuthWrappingKeyVersions",
 );
@@ -362,6 +366,18 @@ const appSecret = new k8s.core.v1.Secret(
       WALTR_MCP_OAUTH_CODE_TTL: mcpOAuthCodeTtl,
       WALTR_MCP_OAUTH_ALLOW_DCR: String(mcpOAuthAllowDcr),
       WALTR_MCP_OAUTH_ALLOW_CIMD: String(mcpOAuthAllowCimd),
+      ...(mcpOAuthCimdTrustedPrivateOrigins.length > 0
+        ? {
+            WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS:
+              mcpOAuthCimdTrustedPrivateOrigins.join(","),
+          }
+        : {}),
+      ...(mcpOutboundOAuthTrustedPrivateOrigins.length > 0
+        ? {
+            WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS:
+              mcpOutboundOAuthTrustedPrivateOrigins.join(","),
+          }
+        : {}),
       WALTR_OTEL_EXPORT: "true",
       OTEL_EXPORTER_OTLP_ENDPOINT: "https://telemetry.holdenitdown.net:4318",
       OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
