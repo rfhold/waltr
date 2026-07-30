@@ -11,7 +11,9 @@ use waltr_client::{
 use waltr_server::{
     config::ConfigStore as _,
     config_service::ConfigService,
-    test_support::{TestServer, setup_server, setup_server_with_services, temp_root},
+    test_support::{
+        TestServer, default_config_builder, setup_server, setup_server_with_services, temp_root,
+    },
 };
 use waltr_tui::app::{App, AppAction};
 
@@ -221,7 +223,8 @@ async fn session_detail_updates_runtime_config_with_real_server() {
 }
 
 async fn setup_runtime_configured_server() -> &'static TestServer {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     config_service
         .store()
         .save(Configuration {

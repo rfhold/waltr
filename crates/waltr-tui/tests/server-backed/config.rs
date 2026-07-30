@@ -14,3 +14,6 @@ mod mcp;
 
 #[path = "config/defaults.rs"]
 mod defaults;
+
+#[path = "config/reset.rs"]
+mod reset;

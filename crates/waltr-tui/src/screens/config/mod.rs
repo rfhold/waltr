@@ -15,15 +15,105 @@ pub use defaults::RuntimeDefaultsSection;
 pub use mcp::{McpForm, McpFormMode, McpSection};
 pub use providers::{ModelForm, ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection};
 
-use waltr_client::ClientSnapshot;
+use waltr_client::{ClientCommand, ClientOperationView, ClientSnapshot};
 use ratatui::{
     Frame,
+    crossterm::event::{KeyCode, KeyEvent},
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::{Clear, Paragraph, Wrap},
 };
 
-use crate::{app::App, theme::THEME, ui};
+use crate::{
+    app::App,
+    screens::{OperationResult, OperationTracker, SectionAction},
+    theme::THEME,
+    ui,
+};
+
+/// Config-shell state for resetting every configuration section.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConfigResetState {
+    open: bool,
+    operation: OperationTracker,
+}
+
+impl ConfigResetState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            open: false,
+            operation: OperationTracker::new(),
+        }
+    }
+
+    pub(crate) const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub(crate) const fn is_pending(&self) -> bool {
+        self.operation.is_pending()
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.operation.error()
+    }
+
+    pub(crate) fn open(&mut self) {
+        self.open = true;
+        self.operation.clear_error();
+    }
+
+    pub(crate) fn dismiss(&mut self) -> bool {
+        if !self.open || self.operation.is_pending() {
+            return false;
+        }
+        self.open = false;
+        self.operation.clear();
+        true
+    }
+
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> SectionAction {
+        if !self.open || self.operation.is_pending() {
+            return SectionAction::Continue;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                self.operation.begin();
+                SectionAction::ClientCommand(ClientCommand::ResetConfig)
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.dismiss();
+                SectionAction::Continue
+            }
+            _ => SectionAction::Continue,
+        }
+    }
+
+    pub(crate) fn reconcile(&mut self, snapshot: &ClientSnapshot) -> bool {
+        let result = self
+            .operation
+            .reconcile(&snapshot.config.reset, snapshot, |operation| {
+                let ClientOperationView::ConfigReset { status, error, .. } = operation else {
+                    return None;
+                };
+                Some(match *status {
+                    "loading" => OperationResult::Pending,
+                    "ready" => OperationResult::Ready(()),
+                    "failed" => OperationResult::Failed(
+                        error
+                            .clone()
+                            .unwrap_or_else(|| "configuration reset failed".to_owned()),
+                    ),
+                    _ => OperationResult::Pending,
+                })
+            });
+        if result.as_ref().is_some_and(Result::is_ok) {
+            self.open = false;
+            return true;
+        }
+        false
+    }
+}
 
 /// Active config tab.
 ///
@@ -88,7 +178,8 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ])
     .areas(body_area);
 
-    frame.render_widget(tab_strip(active_tab), tabs_area);
+    let config_loaded = snapshot.is_some_and(|snapshot| snapshot.config.current.is_some());
+    frame.render_widget(tab_strip(active_tab, config_loaded), tabs_area);
     ui::render_panel_gap(frame, tabs_gap);
 
     // Pending = no config data available, and no load or watch error has
@@ -145,6 +236,8 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
             section.render_overlay(frame, modal_area, config);
         }
     }
+
+    render_reset_overlay(frame, modal_area, app);
 }
 
 const fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
@@ -222,13 +315,55 @@ fn status_widget(snapshot: Option<&ClientSnapshot>) -> Paragraph<'static> {
 }
 
 /// Render the tab strip as labeled segments on the modal surface.
-fn tab_strip(active: ConfigTab) -> Paragraph<'static> {
+fn tab_strip(active: ConfigTab, config_loaded: bool) -> Paragraph<'static> {
     let mut spans = Vec::new();
     spans.push(Span::raw(" "));
     for tab in ConfigTab::ALL {
         spans.push(ui::tab_label(tab.label(), tab == active));
         spans.push(Span::raw(" "));
     }
+    if config_loaded {
+        spans.push(Span::styled("R Reset configuration", THEME.focus_style()));
+    }
 
     Paragraph::new(Line::from(spans)).style(THEME.panel_style())
+}
+
+fn render_reset_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if !app.config_reset_open() {
+        return;
+    }
+
+    let reset_area = ui::centered_percent_rect(area, 82, 13);
+    frame.render_widget(Clear, reset_area);
+    let footer = if app.config_reset_pending() {
+        "Reset in progress"
+    } else if app.config_reset_error().is_some() {
+        "Enter/y retry  n/Esc cancel"
+    } else {
+        "Enter/y confirm  n/Esc cancel"
+    };
+    let body = render_modal_frame(frame, reset_area, "Reset configuration", footer);
+    let mut lines = vec![
+        Line::from("Providers, MCP servers, and runtime defaults will return"),
+        Line::from("to server defaults. Credentials remain untouched."),
+        Line::from(""),
+    ];
+    if app.config_reset_pending() {
+        lines.push(ui::loading_line("Resetting configuration..."));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "This replaces all current configuration sections.",
+            THEME.muted_text_style(),
+        )));
+    }
+    if let Some(error) = app.config_reset_error() {
+        lines.push(ui::error_line(error));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(THEME.panel_style())
+            .wrap(Wrap { trim: false }),
+        body,
+    );
 }

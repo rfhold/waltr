@@ -7,7 +7,7 @@ expression: render_app(&app)
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults                                    "
+"          Providers   MCP Servers   Defaults  R Reset configuration             "
 "                                                                                "
 "         Default model anthropic/sonnet                                         "
 "         Reasoning not supported                                                "

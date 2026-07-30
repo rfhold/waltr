@@ -195,6 +195,30 @@ pub(crate) fn config_patch_snapshot_from(
     snapshot
 }
 
+pub(crate) fn config_reset_snapshot_from(
+    mut snapshot: ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) -> ClientSnapshot {
+    snapshot.config.reset = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::ConfigReset {
+            status,
+            error: error.map(str::to_owned),
+            config: (status == "ready")
+                .then(|| snapshot.config.current.clone())
+                .flatten(),
+        },
+    );
+    snapshot
+}
+
 pub(crate) fn watched_sessions_snapshot(sessions: Vec<SessionView>) -> ClientSnapshot {
     let mut snapshot = ready_snapshot();
     snapshot.sessions.current = sessions;
@@ -693,6 +717,11 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 key: None,
             },
             patch: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            reset: OperationSnapshot {
                 status: "idle",
                 error: None,
                 key: None,
