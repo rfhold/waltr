@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/server-backed/config/providers.rs
+assertion_line: 39
 expression: rendered
 ---
 "                                                                                "
@@ -7,7 +8,7 @@ expression: rendered
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults                                    "
+"          Providers   MCP Servers   Defaults  R Reset configuration             "
 "                                                                                "
 "        > anthropic  anthropic-messages  no-oauth                               "
 "        https://api.anthropic.com/v1/messages                                   "
@@ -17,10 +18,10 @@ expression: rendered
 "          claude-code  anthropic-messages  oauth                                "
 "        https://api.anthropic.com/v1/messages?beta=true  not connected          "
 "          codex  openai-responses  oauth                                        "
-"        https://chatgpt.com/backend-api/codex/responses  connected              "
-"        (OAuth)                                                                 "
+"        https://chatgpt.com/backend-api/codex/responses  not connected          "
 "          openai  openai-chat-completions  no-oauth                             "
 "        https://api.openai.com/v1/chat/completions  not connected               "
+"                                                                                "
 "                                                                                "
 "         Esc back Tab switch C-x c create Enter edit Del delete a/f/r           "
 "                                                                                "

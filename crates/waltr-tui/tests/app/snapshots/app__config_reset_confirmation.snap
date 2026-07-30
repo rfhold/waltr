@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/config.rs
+expression: render_app(&app)
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"         Configuration                                                          "
+"                                                                                "
+"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"                                                                                "
+"        > an    Reset configuration                                             "
+"        http                                                                    "
+"               Providers, MCP servers, and runtime defaults will                "
+"               return                                                           "
+"               to server defaults. Credentials remain untouched.                "
+"                                                                                "
+"               This replaces all current configuration sections.                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                Enter/y confirm  n/Esc cancel                                   "
+"                                                                                "
+"                                                                                "
+"         Esc back Tab switch C-x c create Enter edit Del delete a/f/r           "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

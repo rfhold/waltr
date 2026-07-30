@@ -42,7 +42,8 @@ async fn client_stream_creates_edits_and_deletes_provider_with_real_server() {
     // Switching tabs moves through MCP and Defaults, then back to providers.
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let switched = render_app(&app);
-    assert!(switched.contains("No MCP servers configured."));
+    assert!(switched.contains("waltr"));
+    assert!(switched.contains("http://127.0.0.1:14333/mcp"));
     insta::assert_snapshot!("config_mcp_empty_real_server", switched);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let defaults = render_app(&app);

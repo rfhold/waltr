@@ -7,7 +7,7 @@ expression: rendered
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults                                    "
+"          Providers   MCP Servers   Defaults  R Reset configuration             "
 "                                                                                "
 "        > remote  sse  https://mcp.example/sse                                  "
 "            status: authorization required                                      "

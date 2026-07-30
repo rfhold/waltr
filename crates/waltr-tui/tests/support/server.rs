@@ -113,6 +113,21 @@ pub async fn dispatch_app_command(
         .await;
     }
 
+    if let Some(key) = snapshot.config.reset.key.clone()
+        && snapshot.config.reset.status == "loading"
+    {
+        return next_snapshot_until(stream, app, |snapshot| {
+            matches!(
+                snapshot.operations.current.get(&key),
+                Some(ClientOperationView::ConfigReset {
+                    status: "ready" | "failed",
+                    ..
+                })
+            )
+        })
+        .await;
+    }
+
     if snapshot.config.load.status == "loading" {
         return next_snapshot_until(stream, app, |snapshot| snapshot.config.current.is_some())
             .await;

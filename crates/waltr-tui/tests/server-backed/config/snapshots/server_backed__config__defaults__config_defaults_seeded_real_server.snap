@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/server-backed/config/defaults.rs
+assertion_line: 43
 expression: render_app(&app)
 ---
 "                                                                                "
@@ -7,7 +8,7 @@ expression: render_app(&app)
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults                                    "
+"          Providers   MCP Servers   Defaults  R Reset configuration             "
 "                                                                                "
 "         Default model anthropic/sonnet                                         "
 "         Reasoning not supported                                                "

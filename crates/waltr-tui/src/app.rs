@@ -16,8 +16,9 @@ use crate::{
     keys::{KeyCommand, LeaderCommand, key_command},
     native_auth::NativeAuthAction,
     screens::{
-        ConfigAuthState, ConfigTab, McpSection, ProviderSection, RuntimeDefaultsSection,
-        SectionAction, SessionsSection, register_timeline_watch_command, targets_match,
+        ConfigAuthState, ConfigResetState, ConfigTab, McpSection, ProviderSection,
+        RuntimeDefaultsSection, SectionAction, SessionsSection, register_timeline_watch_command,
+        targets_match,
     },
     ui,
     ui::Notice,
@@ -100,6 +101,7 @@ pub struct App {
     screen: AppScreen,
     access_return_screen: Option<AppScreen>,
     config_auth: ConfigAuthState,
+    config_reset: ConfigResetState,
     client_snapshot: Option<ClientSnapshot>,
     native_login: NativeLoginState,
     has_native_credential: bool,
@@ -124,6 +126,7 @@ impl App {
             screen: AppScreen::Waiting,
             access_return_screen: None,
             config_auth: ConfigAuthState::new(),
+            config_reset: ConfigResetState::new(),
             client_snapshot: None,
             native_login: NativeLoginState::Idle,
             has_native_credential: false,
@@ -563,6 +566,18 @@ impl App {
         &self.config_auth
     }
 
+    pub(crate) const fn config_reset_open(&self) -> bool {
+        self.config_reset.is_open()
+    }
+
+    pub(crate) const fn config_reset_pending(&self) -> bool {
+        self.config_reset.is_pending()
+    }
+
+    pub(crate) fn config_reset_error(&self) -> Option<&str> {
+        self.config_reset.error()
+    }
+
     /// Whether a Config authentication action is pending for one target.
     #[must_use]
     pub fn config_auth_action_pending(&self, target: &ClientAuthTarget) -> bool {
@@ -939,6 +954,12 @@ impl App {
                 commands.push(ClientCommand::RequestAuthStatuses);
             }
             self.runtime_defaults_section.reconcile_patch(&snapshot);
+            if self.config_reset.reconcile(&snapshot) {
+                self.notice = Some(TransientNotice {
+                    text: "configuration reset to server defaults".to_owned(),
+                    expires_at: self.now.unwrap_or_else(Instant::now) + NOTICE_DURATION,
+                });
+            }
             self.sessions_section.reconcile_operations(&snapshot);
 
             if let Some(config) = snapshot.config.current.as_ref() {
@@ -988,13 +1009,16 @@ impl App {
         self.screen = AppScreen::Waiting;
         self.access_return_screen = None;
         self.config_auth = ConfigAuthState::new();
+        self.config_reset = ConfigResetState::new();
         self.client_snapshot = None;
         self.has_native_credential = false;
         self.logout_snapshot_barrier = LogoutSnapshotBarrier::None;
     }
 
     fn active_section_has_overlay(&self) -> bool {
-        self.active_section_has_content_overlay() || self.config_auth.has_reset()
+        self.config_reset.is_open()
+            || self.active_section_has_content_overlay()
+            || self.config_auth.has_reset()
     }
 
     fn active_section_has_content_overlay(&self) -> bool {
@@ -1006,6 +1030,9 @@ impl App {
     }
 
     fn dismiss_active_overlay(&mut self) -> bool {
+        if self.config_reset.dismiss() {
+            return true;
+        }
         if self.config_auth.dismiss_reset() {
             return true;
         }
@@ -1017,6 +1044,14 @@ impl App {
     }
 
     fn handle_config_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        if self.config_reset.is_open() {
+            return match self.config_reset.handle_key(key) {
+                SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
+                SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+            };
+        }
+
         // Tab switches the active config section only while no section overlay
         // is active (overlays consume Tab for their own field navigation).
         if key.code == KeyCode::Tab && !self.active_section_has_overlay() {
@@ -1034,6 +1069,11 @@ impl App {
             .as_ref()
             .and_then(|snapshot| snapshot.config.current.as_ref())
             .cloned();
+        if key.code == KeyCode::Char('R') && config.is_some() && !self.active_section_has_overlay()
+        {
+            self.config_reset.open();
+            return AppAction::Continue;
+        }
         let statuses = self
             .client_snapshot
             .as_ref()

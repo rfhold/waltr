@@ -105,7 +105,179 @@ fn config_surface_renders_tab_strip_with_active_providers_tab() {
     let rendered = render_app(&app);
     assert!(rendered.contains("Providers"));
     assert!(rendered.contains("MCP Servers"));
+    assert!(rendered.contains("R Reset configuration"));
     assert!(rendered.contains("> anthropic"));
+}
+
+#[test]
+fn config_reset_is_discoverable_from_every_loaded_tab() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+
+    for expected_tab in [ConfigTab::Providers, ConfigTab::Mcp, ConfigTab::Defaults] {
+        assert_eq!(app.active_config_tab(), expected_tab);
+        assert!(render_app(&app).contains("R Reset configuration"));
+        drop(app.handle_event(&tab_press(), now));
+    }
+}
+
+#[test]
+fn config_reset_confirmation_cancels_without_dispatch() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+
+    assert_eq!(app.handle_event(&char_press('R'), now), AppAction::Continue);
+    insta::assert_snapshot!("config_reset_confirmation", render_app(&app));
+    assert_eq!(app.handle_event(&char_press('n'), now), AppAction::Continue);
+    assert!(!render_app(&app).contains("return to server defaults"));
+
+    drop(app.handle_event(&tab_press(), now));
+    assert_eq!(app.active_config_tab(), ConfigTab::Mcp);
+    drop(app.handle_event(&char_press('R'), now));
+    assert_eq!(app.handle_event(&escape_press(), now), AppAction::Continue);
+    assert_eq!(app.active_config_tab(), ConfigTab::Mcp);
+    assert!(!render_app(&app).contains("return to server defaults"));
+}
+
+#[test]
+fn config_reset_pending_blocks_duplicate_and_conflicting_input() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+
+    drop(app.handle_event(&char_press('R'), now));
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::ResetConfig)
+    );
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            watched_config_snapshot(),
+            "reset-1",
+            "loading",
+            None,
+        ))),
+        now,
+    ));
+    insta::assert_snapshot!("config_reset_pending", render_app(&app));
+
+    for input in [char_press('R'), enter_press(), escape_press(), tab_press()] {
+        assert_eq!(app.handle_event(&input, now), AppAction::Continue);
+    }
+    assert_eq!(app.active_config_tab(), ConfigTab::Providers);
+    assert!(render_app(&app).contains("Resetting configuration..."));
+}
+
+#[test]
+fn config_reset_failure_retains_context_and_retry_uses_new_matching_key() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+    drop(app.handle_event(&char_press('R'), now));
+    assert_eq!(
+        app.handle_event(&char_press('y'), now),
+        AppAction::ClientCommand(ClientCommand::ResetConfig)
+    );
+
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            watched_config_snapshot(),
+            "reset-1",
+            "loading",
+            None,
+        ))),
+        now,
+    ));
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            watched_config_snapshot(),
+            "reset-1",
+            "failed",
+            Some("catalog unavailable"),
+        ))),
+        now,
+    ));
+    insta::assert_snapshot!("config_reset_failure", render_app(&app));
+    assert!(render_app(&app).contains("catalog unavailable"));
+
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::ResetConfig)
+    );
+    assert!(!render_app(&app).contains("catalog unavailable"));
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            watched_config_snapshot(),
+            "reset-2",
+            "loading",
+            None,
+        ))),
+        now,
+    ));
+    assert!(render_app(&app).contains("Resetting configuration..."));
+}
+
+#[test]
+fn config_reset_ignores_stale_and_mismatched_operations_then_renders_matching_success() {
+    let mut app = open_config_app_with_mcp();
+    let now = Instant::now();
+    drop(app.handle_event(&char_press('R'), now));
+    drop(app.handle_event(&enter_press(), now));
+
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            watched_config_snapshot(),
+            "stale-reset",
+            "ready",
+            None,
+        ))),
+        now,
+    ));
+    assert!(render_app(&app).contains("Resetting configuration..."));
+
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            watched_config_snapshot(),
+            "reset-1",
+            "loading",
+            None,
+        ))),
+        now,
+    ));
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            watched_config_snapshot(),
+            "other-reset",
+            "ready",
+            None,
+        ))),
+        now,
+    ));
+    assert!(render_app(&app).contains("Resetting configuration..."));
+
+    let mut reset_config = watched_config_snapshot();
+    reset_config
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap()
+        .name = "server-default".to_owned();
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(config_reset_snapshot_from(
+            reset_config,
+            "reset-1",
+            "ready",
+            None,
+        ))),
+        now,
+    ));
+
+    let rendered = render_app(&app);
+    assert!(!rendered.contains("Resetting configuration..."));
+    assert!(rendered.contains("server-default"));
+    assert!(rendered.contains("configuration reset to server defaults"));
+    insta::assert_snapshot!("config_reset_success", rendered);
 }
 
 #[test]

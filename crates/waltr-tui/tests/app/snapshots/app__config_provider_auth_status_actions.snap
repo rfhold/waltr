@@ -7,7 +7,7 @@ expression: render_app(&app)
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults                                    "
+"          Providers   MCP Servers   Defaults  R Reset configuration             "
 "                                                                                "
 "        > anthropic  anthropic-messages  oauth  no-url                          "
 "            status: connected (OAuth)                                           "

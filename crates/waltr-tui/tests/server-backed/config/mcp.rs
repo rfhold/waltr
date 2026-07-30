@@ -10,7 +10,9 @@ use waltr_tui::{
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::support::{
-    input::{char_press, ctrl_x_press, delete_press, enter_press, right_press, tab_press},
+    input::{
+        char_press, ctrl_x_press, delete_press, down_press, enter_press, right_press, tab_press,
+    },
     render::render_app,
     server::{
         dispatch_app_command, drive_app_to_landing, next_snapshot_until, no_sleep,
@@ -37,7 +39,8 @@ async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     let rendered = render_app(&app);
     assert!(rendered.contains("MCP Servers"));
-    assert!(rendered.contains("No MCP servers configured."));
+    assert!(rendered.contains("waltr"));
+    assert!(rendered.contains("http://127.0.0.1:14333/mcp"));
 
     // Create an sse server with a url.
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
@@ -72,7 +75,8 @@ async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
     assert_eq!(server_view.url, "https://mcp.example");
     insta::assert_snapshot!("config_mcp_saved_real_server", render_app(&app));
 
-    // Edit the selected server (still on the MCP tab).
+    // Select and edit the added server (still on the MCP tab).
+    assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
     let action = app.handle_event(&enter_press(), now);
     let edited = dispatch_app_command(&mut stream, &mut app, action).await;
@@ -90,11 +94,9 @@ async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
     let action = app.handle_event(&enter_press(), now);
     let deleted = dispatch_app_command(&mut stream, &mut app, action).await;
     assert!(
-        deleted
-            .config
-            .current
-            .as_ref()
-            .is_some_and(|config| config.mcp_servers.is_empty()),
+        deleted.config.current.as_ref().is_some_and(|config| {
+            config.mcp_servers.contains_key("waltr") && !config.mcp_servers.contains_key("remote")
+        }),
         "deleted MCP server should be removed from persisted config"
     );
 }
