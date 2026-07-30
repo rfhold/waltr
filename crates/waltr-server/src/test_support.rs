@@ -279,6 +279,8 @@ impl AccessAuthBrowserFixture {
             session_ttl,
             false,
             false,
+            false,
+            false,
         )
     }
 
@@ -295,6 +297,8 @@ impl AccessAuthBrowserFixture {
             None,
             &self.database_url,
             session_ttl,
+            false,
+            false,
             false,
             false,
         )
@@ -315,6 +319,8 @@ impl AccessAuthBrowserFixture {
             session_ttl,
             false,
             false,
+            false,
+            false,
         )
     }
 
@@ -331,6 +337,8 @@ impl AccessAuthBrowserFixture {
             None,
             &self.database_url,
             session_ttl,
+            false,
+            false,
             false,
             false,
         )
@@ -403,6 +411,8 @@ impl AccessAuthBrowserFixture {
             session_ttl,
             true,
             false,
+            false,
+            false,
         )
     }
 
@@ -420,6 +430,28 @@ impl AccessAuthBrowserFixture {
             session_ttl,
             false,
             true,
+            false,
+            false,
+        )
+    }
+
+    /// Start an app with DCR and an explicit HTTP loopback redirect policy.
+    #[must_use]
+    pub fn start_server_with_mcp_oauth_dcr(
+        &self,
+        session_ttl: Duration,
+        allow_loopback_redirects: bool,
+    ) -> RestartableAccessAuthServer {
+        start_restartable_auth_server(
+            &self.issuer,
+            "waltr-test-client",
+            None,
+            &self.database_url,
+            session_ttl,
+            false,
+            true,
+            true,
+            allow_loopback_redirects,
         )
     }
 
@@ -905,6 +937,8 @@ fn start_restartable_auth_server(
     session_ttl: Duration,
     fail_callback_cleanup: bool,
     enable_mcp_oauth: bool,
+    allow_mcp_oauth_dcr: bool,
+    allow_mcp_oauth_loopback_redirects: bool,
 ) -> RestartableAccessAuthServer {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1000,6 +1034,8 @@ END
                         key_file,
                     )
                     .expect("test MCP OAuth config should be valid")
+                    .with_client_registration(allow_mcp_oauth_dcr, false)
+                    .with_loopback_redirects(allow_mcp_oauth_loopback_redirects)
                     .with_access_token_ttl(Duration::from_hours(1)),
                     &persistence,
                     authenticator.clone(),

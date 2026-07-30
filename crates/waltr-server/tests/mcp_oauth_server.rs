@@ -15,6 +15,49 @@ const RESOURCE: &str = "https://waltr.example/mcp";
 const VERIFIER: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
 
 #[tokio::test]
+async fn dynamic_registration_requires_explicit_native_loopback_redirect_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup_access_auth_browser_fixture();
+    let denied_server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1), false);
+    let client = reqwest::Client::new();
+    let request = json!({
+        "redirect_uris": ["http://127.0.0.1:19876/mcp/oauth/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "client_name": "OpenCode",
+        "client_uri": "https://opencode.ai",
+        "scope": "mcp:use"
+    });
+    let denied = client
+        .post(denied_server.url("/oauth/register"))
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+
+    let enabled_server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1), true);
+    let registration = client
+        .post(enabled_server.url("/oauth/register"))
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(registration.status(), StatusCode::CREATED);
+    let registration: Value = registration.json().await?;
+    assert!(
+        registration["client_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert_eq!(
+        registration["redirect_uris"],
+        json!(["http://127.0.0.1:19876/mcp/oauth/callback"])
+    );
+    assert_eq!(registration["token_endpoint_auth_method"], "none");
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
 -> Result<(), Box<dyn std::error::Error>> {

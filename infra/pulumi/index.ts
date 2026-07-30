@@ -27,6 +27,9 @@ const mcpOAuthRefreshTokenTtl = config.require("mcpOAuthRefreshTokenTtl");
 const mcpOAuthRefreshFamilyTtl = config.require("mcpOAuthRefreshFamilyTtl");
 const mcpOAuthCodeTtl = config.require("mcpOAuthCodeTtl");
 const mcpOAuthAllowDcr = config.requireBoolean("mcpOAuthAllowDcr");
+const mcpOAuthAllowLoopbackRedirects = config.requireBoolean(
+  "mcpOAuthAllowLoopbackRedirects",
+);
 const mcpOAuthAllowCimd = config.requireBoolean("mcpOAuthAllowCimd");
 const mcpOAuthCimdTrustedPrivateOrigins =
   config.getObject<string[]>("mcpOAuthCimdTrustedPrivateOrigins") ?? [];
@@ -365,6 +368,9 @@ const appSecret = new k8s.core.v1.Secret(
       WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL: mcpOAuthRefreshFamilyTtl,
       WALTR_MCP_OAUTH_CODE_TTL: mcpOAuthCodeTtl,
       WALTR_MCP_OAUTH_ALLOW_DCR: String(mcpOAuthAllowDcr),
+      WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS: String(
+        mcpOAuthAllowLoopbackRedirects,
+      ),
       WALTR_MCP_OAUTH_ALLOW_CIMD: String(mcpOAuthAllowCimd),
       ...(mcpOAuthCimdTrustedPrivateOrigins.length > 0
         ? {

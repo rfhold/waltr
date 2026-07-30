@@ -87,6 +87,7 @@ pub struct McpOAuthEnabledConfig {
     refresh_family_ttl: Duration,
     code_ttl: Duration,
     allow_dcr: bool,
+    allow_loopback_redirects: bool,
     allow_cimd: bool,
     cimd_trusted_private_origins: Vec<Url>,
     allow_private_test_destinations: bool,
@@ -108,6 +109,7 @@ impl McpOAuthConfig {
             "WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL",
             "WALTR_MCP_OAUTH_CODE_TTL",
             "WALTR_MCP_OAUTH_ALLOW_DCR",
+            "WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS",
             "WALTR_MCP_OAUTH_ALLOW_CIMD",
             "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS",
             "WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS",
@@ -198,6 +200,7 @@ impl McpOAuthConfig {
             Duration::from_mins(10),
         )?;
         let allow_dcr = boolean(values, "WALTR_MCP_OAUTH_ALLOW_DCR")?;
+        let allow_loopback_redirects = boolean(values, "WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS")?;
         let allow_cimd = boolean(values, "WALTR_MCP_OAUTH_ALLOW_CIMD")?;
         let cimd_trusted_private_origins =
             trusted_origins(values, "WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS")?;
@@ -214,6 +217,7 @@ impl McpOAuthConfig {
             refresh_family_ttl,
             code_ttl,
             allow_dcr,
+            allow_loopback_redirects,
             allow_cimd,
             cimd_trusted_private_origins,
             allow_private_test_destinations,
@@ -259,6 +263,7 @@ impl McpOAuthEnabledConfig {
             refresh_family_ttl: DEFAULT_REFRESH_FAMILY_TTL,
             code_ttl: DEFAULT_CODE_TTL,
             allow_dcr: false,
+            allow_loopback_redirects: false,
             allow_cimd: false,
             cimd_trusted_private_origins: Vec::new(),
             allow_private_test_destinations: false,
@@ -288,6 +293,13 @@ impl McpOAuthEnabledConfig {
     pub const fn with_client_registration(mut self, allow_dcr: bool, allow_cimd: bool) -> Self {
         self.allow_dcr = allow_dcr;
         self.allow_cimd = allow_cimd;
+        self
+    }
+
+    /// Configure whether dynamically registered clients may use HTTP loopback redirects.
+    #[must_use]
+    pub const fn with_loopback_redirects(mut self, allow: bool) -> Self {
+        self.allow_loopback_redirects = allow;
         self
     }
 
@@ -401,6 +413,7 @@ impl McpOAuthServer {
             };
             let registration = OAuthClientRegistrationOptions {
                 dynamic_registration: config.allow_dcr,
+                allow_loopback_redirects: config.allow_loopback_redirects,
                 metadata_fetcher,
                 ..OAuthClientRegistrationOptions::default()
             };
@@ -1296,6 +1309,7 @@ mod tests {
         assert_eq!(config.issuer(), "https://waltr.example/base/oauth");
         assert_eq!(config.resource(), "https://waltr.example/base/mcp");
         assert_eq!(config.required_scopes(), ["mcp:use", "tools:read"]);
+        assert!(!config.allow_loopback_redirects);
         assert_eq!(
             cimd_trusted_origins(&config),
             [Url::parse("https://waltr.example/").expect("self origin")]
@@ -1316,6 +1330,7 @@ mod tests {
             ("WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL", "0"),
             ("WALTR_MCP_OAUTH_CODE_TTL", "601"),
             ("WALTR_MCP_OAUTH_ALLOW_DCR", "yes"),
+            ("WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS", "yes"),
         ] {
             let mut values = base.clone();
             values.insert(name, value.to_owned());

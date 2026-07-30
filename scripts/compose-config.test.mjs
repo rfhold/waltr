@@ -99,6 +99,7 @@ test("all Waltr services have exact static environments", () => {
       WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL: "2592000",
       WALTR_MCP_OAUTH_CODE_TTL: "300",
       WALTR_MCP_OAUTH_ALLOW_DCR: "true",
+      WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS: "true",
       WALTR_MCP_OAUTH_ALLOW_CIMD: "true",
       WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS: "true",
       WALTR_OIDC_AUDIENCE: "waltr-access-test",
