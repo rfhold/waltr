@@ -229,6 +229,8 @@ pub struct ConfigClientState {
     pub load: OperationState,
     /// Configuration patch operation state.
     pub patch: OperationState,
+    /// Configuration reset operation state.
+    pub reset: OperationState,
     /// Configuration watch operation state.
     pub watch: WatchState,
 }
@@ -385,6 +387,15 @@ pub enum ClientOperationState {
         /// Patched configuration, when the operation completed successfully.
         config: Option<Configuration>,
     },
+    /// Configuration reset command result.
+    ConfigReset {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Reset configuration, when the operation completed successfully.
+        config: Option<Configuration>,
+    },
     /// Session creation command result.
     SessionCreate {
         /// Current operation status.
@@ -510,6 +521,11 @@ impl ClientOperationState {
                 status,
                 error,
                 config,
+            }
+            | Self::ConfigReset {
+                status,
+                error,
+                config,
             } => fail_loading_operation(status, error, MESSAGE, || *config = None),
             Self::SessionCreate {
                 status,
@@ -558,6 +574,7 @@ impl ClientOperationState {
             Self::AuthComplete { .. }
             | Self::AuthCancel { .. }
             | Self::ConfigPatch { .. }
+            | Self::ConfigReset { .. }
             | Self::SessionCreate { .. }
             | Self::SessionRuntimeConfigUpdate { .. } => {}
         }
@@ -1353,6 +1370,49 @@ impl ClientState {
         self.operations.insert(
             key,
             ClientOperationState::ConfigPatch {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                config: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_config_reset_loading(&mut self, key: OperationKey) {
+        self.config.reset.status = OperationStatus::Loading;
+        self.config.reset.error = None;
+        self.config.reset.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::ConfigReset {
+                status: OperationStatus::Loading,
+                error: None,
+                config: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_config_reset_ready(&mut self, key: OperationKey, config: Configuration) {
+        self.config.current = Some(config.clone());
+        self.config.reset.status = OperationStatus::Ready;
+        self.config.reset.error = None;
+        self.config.reset.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::ConfigReset {
+                status: OperationStatus::Ready,
+                error: None,
+                config: Some(config),
+            },
+        );
+    }
+
+    pub(crate) fn set_config_reset_failed(&mut self, key: OperationKey, message: String) {
+        self.config.reset.status = OperationStatus::Failed;
+        self.config.reset.error = Some(message.clone());
+        self.config.reset.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::ConfigReset {
                 status: OperationStatus::Failed,
                 error: Some(message),
                 config: None,

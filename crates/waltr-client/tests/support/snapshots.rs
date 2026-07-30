@@ -21,7 +21,7 @@ pub fn assert_config_matches_without_etag(actual: &ConfigView, expected: &Config
 pub fn assert_watch_event(event: &ConfigChange, initial_etag: &str, patched: &ConfigView) {
     assert_eq!(event.previous_etag, initial_etag);
     assert_eq!(event.etag, patched.etag);
-    assert_eq!(event.changed_keys, vec!["providers"]);
+    assert_eq!(event.changed_keys, vec!["mcp_servers", "providers"]);
     assert!(event.error.is_empty());
     assert_config_matches(
         event

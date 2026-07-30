@@ -292,6 +292,22 @@ pub enum ConfigEvent {
         /// Failure returned by the patch effect.
         error: ClientError,
     },
+    /// A caller requested a configuration reset.
+    ResetRequested(OperationKey),
+    /// The configuration reset completed successfully.
+    Reset {
+        /// Operation key allocated when the reset was requested.
+        operation_key: OperationKey,
+        /// Reset configuration returned by the server.
+        config: Configuration,
+    },
+    /// The configuration reset failed.
+    ResetFailed {
+        /// Operation key allocated when the reset was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the reset effect.
+        error: ClientError,
+    },
     /// A caller registered interest in configuration watch updates.
     WatchInterestRegistered,
     /// A caller released interest in configuration watch updates.
@@ -808,6 +824,13 @@ pub enum ConfigEffect {
         operation_key: OperationKey,
         /// Top-level section patch to submit.
         patch: ConfigPatch,
+        /// Entity tag expected by the caller.
+        expected_etag: String,
+    },
+    /// Reset the complete configuration using an expected entity tag.
+    Reset {
+        /// Operation key allocated when the reset was requested.
+        operation_key: OperationKey,
         /// Entity tag expected by the caller.
         expected_etag: String,
     },

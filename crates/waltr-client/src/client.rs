@@ -518,6 +518,26 @@ impl Client {
         self.request_config_patch_with_key(patch, expected_etag, operation_key)
     }
 
+    /// Request that the latest configuration be reset to server defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no configuration has loaded.
+    pub fn reset_config(&mut self) -> Result<ClientUpdate, ClientError> {
+        let expected_etag = self.current_config()?.etag;
+        let operation_key = self.state.next_operation_key();
+        let mut update = self.apply(ClientEvent::Config(ConfigEvent::ResetRequested(
+            operation_key.clone(),
+        )));
+        update
+            .effects
+            .push(ClientEffect::Config(ConfigEffect::Reset {
+                operation_key,
+                expected_etag,
+            }));
+        Ok(update)
+    }
+
     fn request_config_patch_with_key(
         &mut self,
         patch: ConfigPatch,
@@ -989,6 +1009,10 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             | ConfigEvent::PatchFailed { operation_key, .. },
         ) => operation_is_current(state.config.patch.key.as_ref(), operation_key),
         ClientEvent::Config(
+            ConfigEvent::Reset { operation_key, .. }
+            | ConfigEvent::ResetFailed { operation_key, .. },
+        ) => operation_is_current(state.config.reset.key.as_ref(), operation_key),
+        ClientEvent::Config(
             ConfigEvent::WatchStartedForOpen { open_id }
             | ConfigEvent::WatchOpenFailed { open_id, .. },
         ) => state.config.watch.open_id == Some(*open_id),
@@ -1088,6 +1112,7 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
         | ClientEvent::Config(
             ConfigEvent::LoadFailed(error)
             | ConfigEvent::PatchFailed { error, .. }
+            | ConfigEvent::ResetFailed { error, .. }
             | ConfigEvent::WatchFailed(error)
             | ConfigEvent::WatchOpenFailed { error, .. },
         )
@@ -1729,6 +1754,52 @@ mod tests {
         assert_eq!(client.state().config.watch.status, OperationStatus::Idle);
         assert_eq!(client.state().config.watch.error.as_deref(), None);
         assert_eq!(client.state().config.current.as_ref(), Some(&config));
+    }
+
+    #[test]
+    fn config_reset_uses_current_etag_and_ignores_stale_completion() {
+        let mut client = Client::new();
+        let current = config_with_provider("custom", "etag-1");
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(current.clone())));
+
+        let first = client.reset_config().expect("reset should start");
+        let (first_key, expected_etag) = only_reset_config(&first);
+        assert_eq!(expected_etag, "etag-1");
+        let first_key = first_key.to_owned();
+
+        let second = client.reset_config().expect("newer reset should start");
+        let (second_key, _) = only_reset_config(&second);
+        let second_key = second_key.to_owned();
+        assert_ne!(first_key, second_key);
+
+        client.apply(ClientEvent::Config(ConfigEvent::Reset {
+            operation_key: first_key,
+            config: config_with_provider("stale", "etag-stale"),
+        }));
+
+        assert_eq!(client.state().config.current.as_ref(), Some(&current));
+        assert_eq!(client.state().config.reset.status, OperationStatus::Loading);
+        assert_eq!(client.state().config.reset.key.as_ref(), Some(&second_key));
+
+        let reset = config_with_provider("anthropic", "etag-2");
+        client.apply(ClientEvent::Config(ConfigEvent::Reset {
+            operation_key: second_key,
+            config: reset.clone(),
+        }));
+        assert_eq!(client.state().config.current.as_ref(), Some(&reset));
+        assert_eq!(client.state().config.reset.status, OperationStatus::Ready);
+    }
+
+    #[test]
+    fn config_reset_rejects_before_config_snapshot() {
+        let mut client = Client::new();
+
+        let error = client
+            .reset_config()
+            .expect_err("reset needs a config snapshot");
+
+        assert_eq!(error.message(), "configuration not loaded");
+        assert_eq!(client.state().config.reset.status, OperationStatus::Idle);
     }
 
     #[test]
@@ -3013,6 +3084,17 @@ mod tests {
                 ..
             }) => (patch, expected_etag),
             effect => panic!("expected patch effect, got {effect:?}"),
+        }
+    }
+
+    fn only_reset_config(update: &ClientUpdate) -> (&OperationKey, &str) {
+        assert_eq!(update.effects().len(), 1);
+        match &update.effects()[0] {
+            ClientEffect::Config(ConfigEffect::Reset {
+                operation_key,
+                expected_etag,
+            }) => (operation_key, expected_etag),
+            effect => panic!("expected reset effect, got {effect:?}"),
         }
     }
 

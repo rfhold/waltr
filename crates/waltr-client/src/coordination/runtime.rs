@@ -107,6 +107,8 @@ pub enum ClientCommand {
     },
     /// Load the current configuration.
     RequestConfig,
+    /// Reset the latest configuration to server defaults.
+    ResetConfig,
     /// Search the model catalog.
     SearchCatalogModels {
         /// Runtime-local request identity.
@@ -649,6 +651,15 @@ pub enum ClientOperationView {
         /// Patched configuration, when the operation completed successfully.
         config: Option<ConfigView>,
     },
+    /// Configuration reset command result.
+    ConfigReset {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Reset configuration, when the operation completed successfully.
+        config: Option<ConfigView>,
+    },
     /// Session creation command result.
     SessionCreate {
         /// Stable operation status name.
@@ -786,6 +797,8 @@ pub struct ConfigSnapshot {
     pub load: OperationSnapshot,
     /// Configuration patch operation snapshot.
     pub patch: OperationSnapshot,
+    /// Configuration reset operation snapshot.
+    pub reset: OperationSnapshot,
     /// Configuration watch operation snapshot.
     pub watch: OperationSnapshot,
 }
@@ -1430,6 +1443,7 @@ impl ClientStateStream {
             | ClientCommand::RefreshAuth { .. }
             | ClientCommand::LogoutAuth { .. } => self.begin_auth_command(command),
             ClientCommand::RequestConfig
+            | ClientCommand::ResetConfig
             | ClientCommand::AddProvider { .. }
             | ClientCommand::UpdateProvider { .. }
             | ClientCommand::DeleteProvider { .. }
@@ -1526,6 +1540,7 @@ impl ClientStateStream {
     ) -> Result<ClientUpdate, ClientError> {
         Ok(match command {
             ClientCommand::RequestConfig => self.runtime.reducer.request_config(),
+            ClientCommand::ResetConfig => self.runtime.reducer.reset_config()?,
             ClientCommand::AddProvider { provider } => {
                 self.runtime.reducer.add_provider(provider.into())?
             }
@@ -2181,6 +2196,7 @@ impl ClientSnapshot {
                 current: state.config.current.clone().map(ConfigView::from),
                 load: OperationSnapshot::from_state(&state.config.load),
                 patch: OperationSnapshot::from_state(&state.config.patch),
+                reset: OperationSnapshot::from_state(&state.config.reset),
                 watch: OperationSnapshot::from_parts(
                     state.config.watch.status,
                     state.config.watch.error.clone(),
@@ -2556,6 +2572,15 @@ impl From<ClientOperationState> for ClientOperationView {
                 error,
                 config,
             } => Self::ConfigPatch {
+                status: operation_status_name(status),
+                error,
+                config: config.map(ConfigView::from),
+            },
+            ClientOperationState::ConfigReset {
+                status,
+                error,
+                config,
+            } => Self::ConfigReset {
                 status: operation_status_name(status),
                 error,
                 config: config.map(ConfigView::from),
