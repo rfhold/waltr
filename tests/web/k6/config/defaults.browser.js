@@ -1,7 +1,7 @@
-import { check } from "k6";
+import { check, sleep } from "k6";
 
 import { baseUrl, options as browserOptions, screenshot, withPage } from "../support/browser.js";
-import { typeAndKeepFocus, waitForPathname, waitForSelectOption, waitForText } from "../support/checks.js";
+import { typeAndKeepFocus, waitForMissingText, waitForPathname, waitForSelectOption, waitForText } from "../support/checks.js";
 import { includesText } from "../support/text.js";
 
 export const options = browserOptions;
@@ -55,9 +55,62 @@ export default async function () {
     await waitForText(page, 'section[aria-labelledby="runtime-defaults-title"]', "Clear defaults");
     await screenshot(page, "config-defaults-saved");
 
-    check({ defaultsRoute, explicitDefaults }, {
+    await page.locator(".config__header button").click();
+    const resetConfirmation = await waitForText(
+      page,
+      '[aria-label="Reset configuration confirmation"]',
+      "Credentials remain untouched",
+    );
+    await page.locator('button[aria-label="Confirm reset configuration"]').click();
+    const resetSuccess = await waitForText(page, ".config", "Configuration reset.");
+
+    await page.locator('a[href="/config/provider"]').click();
+    const resetProviders = await waitForText(page, '[aria-label="Provider list"]', "claude-code");
+    await waitForText(page, '[aria-label="Provider list"]', "anthropic");
+    await waitForText(page, '[aria-label="Provider list"]', "openai");
+    await waitForText(page, '[aria-label="Provider list"]', "codex");
+    const customProviderRemoved = await waitForMissingText(page, '[aria-label="Provider list"]', PROVIDER);
+
+    await page.locator('a[href="/config/mcp"]').click();
+    const resetMcpServers = await waitForText(page, ".config__list", "waltr");
+    const customMcpRemoved = await waitForMissingText(page, ".config__list", "localstdio");
+
+    await page.locator('a[href="/config/defaults"]').click();
+    const resetProviderDefault = await waitForSelectValue(page, "#runtime-default-provider", "");
+    const resetModelDefault = await waitForSelectValue(page, "#runtime-default-model", "");
+
+    check({
+      defaultsRoute,
+      explicitDefaults,
+      resetConfirmation,
+      resetSuccess,
+      resetProviders,
+      customProviderRemoved,
+      resetMcpServers,
+      customMcpRemoved,
+      resetProviderDefault,
+      resetModelDefault,
+    }, {
       "runtime defaults screen saves explicit MCP default": ({ defaultsRoute, explicitDefaults }) =>
         defaultsRoute && includesText(explicitDefaults, "localstdio"),
+      "configuration reset restores stable server defaults": ({
+        resetConfirmation,
+        resetSuccess,
+        resetProviders,
+        customProviderRemoved,
+        resetMcpServers,
+        customMcpRemoved,
+        resetProviderDefault,
+        resetModelDefault,
+      }) =>
+        includesText(resetConfirmation, "Credentials remain untouched") &&
+        includesText(resetSuccess, "Configuration reset.") &&
+        ["anthropic", "claude-code", "openai", "codex"].every((provider) => includesText(resetProviders, provider)) &&
+        !includesText(customProviderRemoved, PROVIDER) &&
+        includesText(resetMcpServers, "waltr") &&
+        !includesText(customMcpRemoved, "localstdio") &&
+        resetProviderDefault === "" &&
+        resetModelDefault === "",
     });
   });
 }
@@ -86,6 +139,31 @@ async function setSelectValue(page, selector, value) {
     select.value = value;
     select.dispatchEvent(new Event("change", { bubbles: true }));
   }, { selector, value });
+}
+
+async function waitForSelectValue(page, selector, expectedValue) {
+  const deadline = Date.now() + 10_000;
+  let value = null;
+
+  while (Date.now() < deadline) {
+    value = await page.evaluate((selectSelector) => {
+      const select = document.querySelector(selectSelector);
+
+      if (!(select instanceof HTMLSelectElement)) {
+        throw new Error(`Select not found: ${selectSelector}`);
+      }
+
+      return select.value;
+    }, selector);
+
+    if (value === expectedValue) {
+      return value;
+    }
+
+    sleep(0.25);
+  }
+
+  throw new Error(`Timed out waiting for ${selector} to equal ${expectedValue}; saw ${value}`);
 }
 
 async function setExplicitMcpDefault(page, server, checked) {

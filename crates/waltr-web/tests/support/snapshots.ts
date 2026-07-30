@@ -25,6 +25,7 @@ export function snapshotWithConfig(
       current: config,
       load: operationSnapshot("idle"),
       patch: operationSnapshot("idle"),
+      reset: operationSnapshot("idle"),
       watch: operationSnapshot("received"),
     },
     status: {

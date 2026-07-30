@@ -26,6 +26,7 @@ export type AppState = {
   dispatchLogoutAuth: (target: ClientAuthTarget) => Promise<ClientSnapshot>;
   clearExplicitAuthTarget: () => void;
   dispatchConfigPatch: (command: ClientCommand) => Promise<ClientSnapshot>;
+  dispatchResetConfig: () => Promise<ClientSnapshot>;
   dispatchCreateSession: () => Promise<ClientSnapshot>;
   dispatchDeleteSession: (id: string) => Promise<ClientSnapshot>;
   dispatchUpdateSessionRuntimeConfig: (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => Promise<ClientSnapshot>;

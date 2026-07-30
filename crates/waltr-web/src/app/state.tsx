@@ -97,6 +97,16 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
   };
 
+  const dispatchResetConfig = async () => {
+    return dispatchAndWaitForOperation({
+      command: { type: "resetConfig" },
+      key: (snapshot) => snapshot.config.reset.key,
+      kind: "configReset",
+      missingKeyMessage: "config reset command did not produce an operation key",
+      failureMessage: "config reset failed",
+    });
+  };
+
   const dispatchBeginAuth = (target: Extract<ClientCommand, { type: "beginAuth" }>["target"]) =>
     dispatchAndWaitForOperation({
       command: { type: "beginAuth", target },
@@ -300,6 +310,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
         dispatchLogoutAuth,
         clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
         dispatchConfigPatch,
+        dispatchResetConfig,
         dispatchCreateSession,
         dispatchDeleteSession,
         dispatchUpdateSessionRuntimeConfig,
