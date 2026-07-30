@@ -7,7 +7,7 @@ use crate::{
     },
     auth::{AuthService, CredentialStore},
     catalog::{CatalogLoader, CatalogService},
-    config::{ConfigError, ConfigHandle},
+    config::{ConfigError, ConfigHandle, DefaultConfigBuilder},
     config_service::ConfigService,
     mcp_oauth::{McpOAuthConfig, McpOAuthConfigError, McpOAuthError, McpOAuthServer},
     mcp_service::WaltrMcpServer,
@@ -394,7 +394,10 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
     let persistence = Persistence::from_env()
         .await
         .map_err(BuildAppError::Persistence)?;
-    let config_service = ConfigService::from_current_dir().map_err(BuildAppError::Config)?;
+    let catalog_loader = CatalogLoader::from_env();
+    let config_service =
+        ConfigService::from_current_dir(DefaultConfigBuilder::from_env(catalog_loader.clone()))
+            .map_err(BuildAppError::Config)?;
     let access_auth_config =
         AccessAuthConfig::from_env().map_err(BuildAppError::AccessAuthConfig)?;
     let mcp_oauth_config =
@@ -421,9 +424,10 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         ),
     };
     let mut session_storage = Ok(());
-    let router = build_app_with_access_authenticator_and_mcp_oauth(
+    let router = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
         persistence,
+        catalog_loader,
         access_authenticator,
         mcp_oauth,
         |grpc_routes, config, credential_store| {
@@ -473,10 +477,11 @@ pub async fn build_app_with_services<F>(
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
+    let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator(
         config_service,
         persistence,
-        CatalogLoader::from_env(),
+        catalog_loader,
         AccessAuthenticator::disabled(),
         add_session_service,
     )
@@ -497,10 +502,11 @@ pub async fn build_app_with_access_authenticator<F>(
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
+    let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
         persistence,
-        CatalogLoader::from_env(),
+        catalog_loader,
         access_authenticator,
         None,
         add_session_service,
@@ -523,10 +529,11 @@ pub async fn build_app_with_access_authenticator_and_mcp_oauth<F>(
 where
     F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
 {
+    let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
         persistence,
-        CatalogLoader::from_env(),
+        catalog_loader,
         access_authenticator,
         mcp_oauth,
         add_session_service,

@@ -1,12 +1,12 @@
 //! Implementation of the generated `ConfigService`.
 
 use crate::config::{
-    ConfigError, ConfigPatch, ConfigPubSub, ConfigStore, ConfigWatchEvent, FilesystemConfigPubSub,
-    FilesystemConfigStore,
+    ConfigError, ConfigPatch, ConfigPubSub, ConfigStore, ConfigWatchEvent, DefaultConfigBuilder,
+    FilesystemConfigPubSub, FilesystemConfigStore,
 };
 use waltr::grpc::waltr::config::v1::{
     GetConfigRequest, GetConfigResponse, PatchConfigRequest, PatchConfigResponse,
-    WatchConfigRequest, WatchConfigResponse,
+    ResetConfigRequest, ResetConfigResponse, WatchConfigRequest, WatchConfigResponse,
     config_service_server::ConfigService as GeneratedConfigService,
 };
 use std::{fmt, path::PathBuf, pin::Pin, sync::Arc};
@@ -38,10 +38,12 @@ impl ConfigService<FilesystemConfigStore, FilesystemConfigPubSub> {
     /// # Errors
     ///
     /// Returns an error when the current directory cannot be resolved or the watcher cannot start.
-    pub fn from_current_dir() -> Result<Arc<Self>, ConfigError> {
+    pub fn from_current_dir(
+        default_builder: DefaultConfigBuilder,
+    ) -> Result<Arc<Self>, ConfigError> {
         let root = std::env::current_dir().map_err(ConfigError::current_dir)?;
         tracing::debug!(root = %root.display(), "creating config service from current directory");
-        Self::new(root)
+        Self::new(root, default_builder)
     }
 
     /// Create a service rooted at `root`.
@@ -49,12 +51,19 @@ impl ConfigService<FilesystemConfigStore, FilesystemConfigPubSub> {
     /// # Errors
     ///
     /// Returns an error when the filesystem watcher cannot start.
-    pub fn new(root: impl Into<PathBuf>) -> Result<Arc<Self>, ConfigError> {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        default_builder: DefaultConfigBuilder,
+    ) -> Result<Arc<Self>, ConfigError> {
         let root = root.into();
         tracing::debug!(root = %root.display(), "creating config service");
-        let store = FilesystemConfigStore::new(root);
+        let store = FilesystemConfigStore::new(root, default_builder);
         let pubsub = FilesystemConfigPubSub::watching_file_store(store.clone())?;
         Ok(Self::from_parts(store, pubsub))
+    }
+
+    pub(crate) fn catalog_loader(&self) -> crate::catalog::CatalogLoader {
+        self.store.catalog_loader()
     }
 }
 
@@ -142,6 +151,32 @@ where
         }))
     }
 
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
+        fields(operation = "reset_config", expected_etag, etag)
+    )]
+    async fn reset_config(
+        &self,
+        request: Request<ResetConfigRequest>,
+    ) -> Result<Response<ResetConfigResponse>, Status> {
+        let request = request.into_inner();
+        tracing::Span::current().record("expected_etag", request.expected_etag.as_str());
+        let config = self
+            .store
+            .reset(&request.expected_etag)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "config reset failed");
+                config_error_to_status(&error)
+            })?;
+        tracing::Span::current().record("etag", config.etag.as_str());
+
+        Ok(Response::new(ResetConfigResponse {
+            config: Some(config),
+        }))
+    }
+
     async fn watch_config(
         &self,
         _request: Request<WatchConfigRequest>,
@@ -200,6 +235,8 @@ fn config_error_to_status(error: &ConfigError) -> Status {
         Status::failed_precondition(error.to_string())
     } else if error.is_invalid() {
         Status::invalid_argument(error.to_string())
+    } else if error.is_unavailable() {
+        Status::unavailable(error.to_string())
     } else {
         Status::internal(error.to_string())
     }

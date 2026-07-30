@@ -2,7 +2,7 @@
 
 use crate::{
     auth::oauth,
-    config::{ConfigError, ConfigPatch, ConfigStore, default_configuration},
+    config::{ConfigError, ConfigPatch, ConfigStore, DefaultConfigBuilder},
 };
 use waltr::grpc::waltr::config::v1::{
     Configuration, McpServer, McpServerType, Model, ModelType, OAuthProvider, OauthTokenField,
@@ -21,16 +21,18 @@ const CONFIG_FILE: &str = "waltr.toml";
 pub struct FilesystemConfigStore {
     root: Arc<PathBuf>,
     write_lock: Arc<Mutex<()>>,
+    default_builder: DefaultConfigBuilder,
 }
 
 impl FilesystemConfigStore {
     /// Build a store rooted at `root`.
     #[must_use]
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, default_builder: DefaultConfigBuilder) -> Self {
         tracing::debug!(root = %root.display(), "creating filesystem config store");
         Self {
             root: Arc::new(root),
             write_lock: Arc::new(Mutex::new(())),
+            default_builder,
         }
     }
 
@@ -45,6 +47,10 @@ impl FilesystemConfigStore {
     pub(crate) fn root_path(&self) -> &PathBuf {
         self.root.as_ref()
     }
+
+    pub(crate) fn catalog_loader(&self) -> crate::catalog::CatalogLoader {
+        self.default_builder.catalog_loader()
+    }
 }
 
 impl ConfigStore for FilesystemConfigStore {
@@ -53,13 +59,15 @@ impl ConfigStore for FilesystemConfigStore {
             return Ok(config);
         }
 
+        let default = self.default_builder.build().await?;
         let _guard = self.write_lock.lock().await;
         if let Some(config) = self.load_unlocked().await? {
             return Ok(config);
         }
         let path = self.config_path();
         tracing::debug!(path = %path.display(), "config file missing; creating default config");
-        self.save_unlocked(default_configuration()).await
+        validate_config(&default)?;
+        self.save_unlocked(default).await
     }
 
     async fn save(&self, config: Configuration) -> Result<Configuration, ConfigError> {
@@ -74,14 +82,12 @@ impl ConfigStore for FilesystemConfigStore {
         patch: ConfigPatch,
         expected_etag: &str,
     ) -> Result<Configuration, ConfigError> {
+        self.load().await?;
         let _guard = self.write_lock.lock().await;
-        let current = if let Some(config) = self.load_unlocked().await? {
-            config
-        } else {
-            let config_path = self.config_path();
-            tracing::debug!(path = %config_path.display(), "config file missing during patch; creating default config");
-            self.save_unlocked(default_configuration()).await?
-        };
+        let current = self
+            .load_unlocked()
+            .await?
+            .ok_or_else(|| ConfigError::invalid("config file disappeared during patch"))?;
 
         if current.etag != expected_etag {
             tracing::warn!(expected_etag, current_etag = %current.etag, "config patch rejected due to etag mismatch");
@@ -100,6 +106,23 @@ impl ConfigStore for FilesystemConfigStore {
             next.runtime_defaults = Some(runtime_defaults);
         }
         validate_config(&next)?;
+        self.save_unlocked(next).await
+    }
+
+    async fn reset(&self, expected_etag: &str) -> Result<Configuration, ConfigError> {
+        let next = self.default_builder.build().await?;
+        validate_config(&next)?;
+
+        let _guard = self.write_lock.lock().await;
+        let current = self
+            .load_unlocked()
+            .await?
+            .ok_or_else(|| ConfigError::invalid("config file is missing during reset"))?;
+        if current.etag != expected_etag {
+            tracing::warn!(expected_etag, current_etag = %current.etag, "config reset rejected due to etag mismatch");
+            return Err(ConfigError::etag_mismatch(expected_etag, &current.etag));
+        }
+
         self.save_unlocked(next).await
     }
 }
@@ -465,13 +488,15 @@ fn validate_provider_name(name: &str) -> Result<(), ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use waltr::grpc::waltr::config::v1::{Provider, ProviderType};
 
     #[tokio::test]
     async fn missing_file_creates_default_config_file() {
         let root = temp_root();
-        let store = FilesystemConfigStore::new(root.clone());
+        let store = FilesystemConfigStore::new(root.clone(), test_builder());
 
         let config = store.load().await.expect("missing file should load");
 
@@ -493,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn save_creates_config_file() {
         let root = temp_root();
-        let store = FilesystemConfigStore::new(root.clone());
+        let store = FilesystemConfigStore::new(root.clone(), test_builder());
 
         let saved = store
             .save(config_with_provider("anthropic"))
@@ -542,7 +567,7 @@ image = false
         .await
         .expect("config file should be written");
 
-        let config = FilesystemConfigStore::new(root)
+        let config = FilesystemConfigStore::new(root, test_builder())
             .load()
             .await
             .expect("old config should load");
@@ -557,7 +582,7 @@ image = false
 
     #[tokio::test]
     async fn patch_rejects_stale_etag() {
-        let store = FilesystemConfigStore::new(temp_root());
+        let store = FilesystemConfigStore::new(temp_root(), test_builder());
         let current = store.load().await.expect("config should load");
 
         let error = store
@@ -576,6 +601,139 @@ image = false
         assert_ne!(current.etag, "stale");
     }
 
+    #[tokio::test]
+    async fn missing_file_catalog_failure_does_not_create_partial_config() {
+        let root = temp_root();
+        let builder = DefaultConfigBuilder::new(
+            crate::catalog::CatalogLoader::from_path(root.join("missing-catalog.json")),
+            "http://127.0.0.1/mcp",
+        );
+        let store = FilesystemConfigStore::new(root.clone(), builder);
+
+        let error = store
+            .load()
+            .await
+            .expect_err("catalog failure should fail load");
+
+        assert!(error.is_unavailable());
+        assert!(!root.join(CONFIG_DIR).join(CONFIG_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn existing_file_load_does_not_require_catalog_or_rewrite() {
+        let root = temp_root();
+        let seeded = FilesystemConfigStore::new(root.clone(), test_builder())
+            .save(config_with_provider("custom"))
+            .await
+            .expect("existing config should seed");
+        let path = root.join(CONFIG_DIR).join(CONFIG_FILE);
+        let before = tokio::fs::read(&path)
+            .await
+            .expect("seeded file should read");
+        let unavailable = DefaultConfigBuilder::new(
+            crate::catalog::CatalogLoader::from_path(root.join("missing-catalog.json")),
+            "http://127.0.0.1/mcp",
+        );
+
+        let loaded = FilesystemConfigStore::new(root, unavailable)
+            .load()
+            .await
+            .expect("existing config should not load catalog");
+
+        assert_eq!(loaded, seeded);
+        assert_eq!(
+            tokio::fs::read(path).await.expect("file should remain"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_replaces_every_section_and_persists_reconstructed_defaults() {
+        let root = temp_root();
+        let store = FilesystemConfigStore::new(root.clone(), test_builder());
+        let initial = store.load().await.expect("defaults should load");
+        let current = store
+            .save(Configuration {
+                providers: config_with_provider("custom").providers,
+                mcp_servers: HashMap::from([(
+                    "custom".to_owned(),
+                    McpServer {
+                        name: "custom".to_owned(),
+                        r#type: McpServerType::Sse as i32,
+                        url: "https://mcp.example".to_owned(),
+                        ..McpServer::default()
+                    },
+                )]),
+                runtime_defaults: Some(RuntimeDefaults {
+                    enabled_mcp_server_keys: vec!["custom".to_owned()],
+                    ..RuntimeDefaults::default()
+                }),
+                ..Configuration::default()
+            })
+            .await
+            .expect("custom config should save");
+
+        let reset = store
+            .reset(&current.etag)
+            .await
+            .expect("reset should succeed");
+
+        assert_eq!(reset.providers, initial.providers);
+        assert_eq!(reset.mcp_servers, initial.mcp_servers);
+        assert!(reset.runtime_defaults.is_none());
+        assert_ne!(reset.etag, current.etag);
+        let reconstructed = FilesystemConfigStore::new(root, test_builder())
+            .load()
+            .await
+            .expect("reset config should persist");
+        assert_eq!(reconstructed, reset);
+    }
+
+    #[tokio::test]
+    async fn reset_rejects_stale_etag_without_mutating_current_config() {
+        let store = FilesystemConfigStore::new(temp_root(), test_builder());
+        let current = store
+            .save(config_with_provider("custom"))
+            .await
+            .expect("custom config should save");
+
+        let error = store
+            .reset("stale")
+            .await
+            .expect_err("stale reset should fail");
+
+        assert!(error.is_etag_mismatch());
+        assert_eq!(
+            store.load().await.expect("current config should remain"),
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_catalog_failure_does_not_mutate_current_config() {
+        let root = temp_root();
+        let builder = DefaultConfigBuilder::new(
+            crate::catalog::CatalogLoader::from_path(root.join("missing-catalog.json")),
+            "http://127.0.0.1/mcp",
+        );
+        let store = FilesystemConfigStore::new(root, builder);
+        let current = store
+            .save(config_with_provider("custom"))
+            .await
+            .expect("custom config should save");
+
+        let error = store
+            .reset(&current.etag)
+            .await
+            .expect_err("catalog failure should fail reset");
+
+        assert!(error.is_unavailable());
+        assert_eq!(
+            store.load().await.expect("current config should remain"),
+            current
+        );
+    }
+
     fn config_with_provider(name: &str) -> Configuration {
         Configuration {
             providers: std::collections::HashMap::from([(
@@ -592,5 +750,9 @@ image = false
 
     fn temp_root() -> PathBuf {
         crate::test_support::temp_root()
+    }
+
+    fn test_builder() -> DefaultConfigBuilder {
+        crate::test_support::default_config_builder()
     }
 }

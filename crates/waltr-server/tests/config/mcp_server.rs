@@ -5,7 +5,7 @@ use waltr_server::{
     config_service::ConfigService,
     persistence::{DatabaseConfig, Persistence},
     session,
-    test_support::{blocked_cleanup_application, setup_server, temp_root},
+    test_support::{blocked_cleanup_application, default_config_builder, setup_server, temp_root},
 };
 use mcp::server::{
     StreamableHttpInspectSession, StreamableHttpSessionKey, StreamableHttpSessionOwner,
@@ -115,7 +115,7 @@ async fn start_router(
     persistence: Persistence,
 ) -> Result<TestRouter, Box<dyn std::error::Error>> {
     let app = build_app_with_services(
-        ConfigService::new(root)?,
+        ConfigService::new(root, default_config_builder())?,
         persistence,
         |routes, config, credential_store| {
             session::add_memory_service(routes, config, credential_store);

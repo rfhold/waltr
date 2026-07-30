@@ -4,6 +4,7 @@ package waltr.config.v1;
 
 service ConfigService {
   rpc PatchConfig(PatchConfigRequest) returns (PatchConfigResponse);
+  rpc ResetConfig(ResetConfigRequest) returns (ResetConfigResponse);
   rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
   rpc WatchConfig(WatchConfigRequest) returns (stream WatchConfigResponse);
 }
@@ -175,6 +176,14 @@ message McpServerMapPatch {
 }
 
 message PatchConfigResponse {
+  Configuration config = 1;
+}
+
+message ResetConfigRequest {
+  string expected_etag = 1;
+}
+
+message ResetConfigResponse {
   Configuration config = 1;
 }
 

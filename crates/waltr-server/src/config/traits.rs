@@ -22,6 +22,12 @@ pub trait ConfigStore: Send + Sync + 'static {
         patch: ConfigPatch,
         expected_etag: &str,
     ) -> impl Future<Output = Result<Configuration, ConfigError>> + Send;
+
+    /// Replace the complete configuration with freshly built defaults using etag protection.
+    fn reset(
+        &self,
+        expected_etag: &str,
+    ) -> impl Future<Output = Result<Configuration, ConfigError>> + Send;
 }
 
 /// Sparse top-level configuration patch.

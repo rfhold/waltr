@@ -15,13 +15,14 @@ use waltr::grpc::waltr::{
 use waltr_server::{
     config::ConfigStore as _,
     config_service::ConfigService,
-    test_support::{setup_server_with_services, temp_root},
+    test_support::{default_config_builder, setup_server_with_services, temp_root},
 };
 use tonic::transport::Channel;
 
 #[tokio::test]
 async fn create_session_uses_runtime_defaults() -> Result<(), Box<dyn std::error::Error>> {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     config_service
         .store()
         .save(config_with_defaults())
@@ -48,7 +49,8 @@ async fn create_session_uses_runtime_defaults() -> Result<(), Box<dyn std::error
 #[tokio::test]
 async fn create_session_uses_runtime_default_reasoning_effort()
 -> Result<(), Box<dyn std::error::Error>> {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     let mut config = config_with_defaults();
     config
         .runtime_defaults
@@ -83,7 +85,8 @@ async fn create_session_uses_runtime_default_reasoning_effort()
 #[tokio::test]
 async fn create_session_without_provider_default_keeps_runtime_unset()
 -> Result<(), Box<dyn std::error::Error>> {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     let mut config = config_with_defaults();
     config.runtime_defaults = Some(RuntimeDefaults {
         provider_key: String::new(),
@@ -114,7 +117,8 @@ async fn create_session_without_provider_default_keeps_runtime_unset()
 #[tokio::test]
 async fn create_session_manual_runtime_config_wins_over_defaults()
 -> Result<(), Box<dyn std::error::Error>> {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     config_service
         .store()
         .save(config_with_defaults())
@@ -155,7 +159,8 @@ async fn create_session_manual_runtime_config_wins_over_defaults()
 #[tokio::test]
 async fn create_session_preserves_unresolved_header_templates()
 -> Result<(), Box<dyn std::error::Error>> {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     let mut config = config_with_defaults();
     config
         .providers
@@ -193,7 +198,8 @@ async fn create_session_preserves_unresolved_header_templates()
 #[tokio::test]
 async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn std::error::Error>>
 {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     config_service
         .store()
         .save(config_with_defaults())
@@ -266,7 +272,8 @@ async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn 
 #[tokio::test]
 async fn update_runtime_config_rejects_unconfigured_reasoning_effort()
 -> Result<(), Box<dyn std::error::Error>> {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     config_service
         .store()
         .save(config_with_defaults())
@@ -303,7 +310,8 @@ async fn update_runtime_config_rejects_unconfigured_reasoning_effort()
 #[tokio::test]
 async fn session_runtime_summary_marks_changed_provider_and_missing_mcp()
 -> Result<(), Box<dyn std::error::Error>> {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = ConfigService::new(temp_root(), default_config_builder())
+        .expect("config service should start");
     config_service
         .store()
         .save(config_with_defaults())
