@@ -20,6 +20,7 @@ config:
   waltr:mcpOAuthRefreshFamilyTtl: "2592000"
   waltr:mcpOAuthCodeTtl: "300"
   waltr:mcpOAuthAllowDcr: true
+  waltr:mcpOAuthAllowLoopbackRedirects: true
   waltr:mcpOAuthAllowCimd: true
   waltr:mcpOAuthWrappingKeyVersions: [v1]
   waltr:mcpOAuthActiveWrappingKeyVersion: v1

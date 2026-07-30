@@ -84,6 +84,7 @@ WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL=86400
 WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL=2592000
 WALTR_MCP_OAUTH_CODE_TTL=300
 WALTR_MCP_OAUTH_ALLOW_DCR=true
+WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS=true
 WALTR_MCP_OAUTH_ALLOW_CIMD=true
 WALTR_TRUSTED_PROXIES=10.0.0.0/8,2001:db8::/32
 ```
@@ -96,7 +97,7 @@ The browser, native Waltr API, and inbound MCP endpoint are separate authorizati
 | Native Waltr API bearer | `WALTR_API_OIDC_ISSUER`, falling back to `WALTR_OIDC_ISSUER` | `WALTR_API_OIDC_AUDIENCE`, falling back to legacy `WALTR_OIDC_AUDIENCE` | `WALTR_API_REQUIRED_SCOPES`, empty when omitted |
 | Inbound MCP bearer | Local `WALTR_MCP_OAUTH_ISSUER` | Exact public `/mcp` resource | `WALTR_MCP_REQUIRED_SCOPES` |
 
-The hosted issuer is enabled only in OIDC mode. `WALTR_MCP_REQUIRED_SCOPES` and `WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE` are required. The issuer defaults to the exact `WALTR_PUBLIC_URL` path plus `/oauth`; an override must equal that same HTTPS deployment-relative URL. Token/code lifetime bounds and defaults are documented in [Access Authentication](architecture/access-authentication.md). DCR and CIMD default off and must be enabled independently.
+The hosted issuer is enabled only in OIDC mode. `WALTR_MCP_REQUIRED_SCOPES` and `WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE` are required. The issuer defaults to the exact `WALTR_PUBLIC_URL` path plus `/oauth`; an override must equal that same HTTPS deployment-relative URL. Token/code lifetime bounds and defaults are documented in [Access Authentication](architecture/access-authentication.md). DCR, native HTTP loopback redirects, and CIMD default off and must be enabled independently. Enabling loopback redirects permits public clients resolved through either DCR or CIMD to use them.
 
 Private OAuth destinations are denied by default. Two optional, comma-separated allowlists admit RFC 1918 IPv4 and IPv6 unique-local addresses at exact HTTPS origins:
 

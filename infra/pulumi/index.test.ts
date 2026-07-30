@@ -37,6 +37,7 @@ before(async () => {
     "waltr:mcpOAuthRefreshFamilyTtl": "2592000",
     "waltr:mcpOAuthCodeTtl": "300",
     "waltr:mcpOAuthAllowDcr": "true",
+    "waltr:mcpOAuthAllowLoopbackRedirects": "true",
     "waltr:mcpOAuthAllowCimd": "true",
     "waltr:mcpOAuthCimdTrustedPrivateOrigins":
       '["https://client-metadata.internal.example"]',
@@ -171,6 +172,7 @@ describe("hosted MCP OAuth deployment", () => {
       "https://waltr.example.test/oauth",
     );
     assert.equal(values.WALTR_MCP_REQUIRED_SCOPES, "mcp:use");
+    assert.equal(values.WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS, "true");
     assert.equal(values.WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS, undefined);
   });
 
