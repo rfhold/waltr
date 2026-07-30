@@ -7,8 +7,8 @@ flowchart LR
     Ui[Web or TUI<br/>drafts and presentation]
     Client[waltr-client<br/>config reducer]
     Transport[WaltrTransport]
-    Service[ConfigService<br/>Get, Patch, Watch]
-    Store[ConfigStore<br/>load, validate, save, patch]
+    Service[ConfigService<br/>Get, Patch, Reset, Watch]
+    Store[ConfigStore<br/>load, validate, save, patch, reset]
     Watcher[Filesystem watcher]
     PubSub[ConfigPubSub]
     File[.waltr/waltr.toml]
@@ -31,7 +31,7 @@ flowchart LR
 | Layer | Owns |
 | --- | --- |
 | Server config store | Loading, saving, validating, hashing, and patching config. |
-| Server config service | `GetConfig`, `PatchConfig`, and `WatchConfig` RPC behavior. |
+| Server config service | `GetConfig`, `PatchConfig`, `ResetConfig`, and `WatchConfig` RPC behavior. |
 | Server config watcher | Filesystem change detection, debounce, changed-key calculation, and pubsub publication. |
 | Client reducer | Config load/patch/watch state, ETag-aware watch merging, retry state, and reload decisions. |
 | Web and TUI | Local drafts and presentation of shared client snapshots. |
@@ -50,6 +50,20 @@ The config RPC model is `waltr.config.v1.Configuration`:
 The filesystem store persists `.waltr/waltr.toml`. ETags are not persisted as authoritative data. On load or save, the store clears `etag`, serializes the config, hashes the serialized content with SHA-256, and returns an `etag` prefixed with `sha256:`.
 
 Provider entries may contain public-client OAuth compatibility and settings, including authorization/token endpoints, client ID, redirect URI, scopes, request encoding, authorization parameters, and JWT metadata mappings. Credential values are not configuration and never enter config snapshots. Remote MCP entries contain transport command or URL only; OAuth discovery, registration, credential status, refresh, and reset remain in the target-scoped auth lifecycle rather than `PatchConfig`.
+
+## Server Defaults
+
+When `.waltr/waltr.toml` does not exist, the server builds and persists a default configuration from the models.dev catalog. Existing files are loaded as-is; startup does not merge new defaults into persisted configuration.
+
+The default inventory uses these selection rules:
+
+- `anthropic` and `claude-code` contain the canonical, non-date-stamped IDs for Claude Haiku 4.5; Sonnet 4.5, 4.6, and 5; Opus 4.5, 4.6, 4.7, 4.8, and 5; and Fable 5.
+- `openai` and `codex` contain every non-deprecated catalog model whose ID represents GPT major version 5 and minor version 3 or later.
+- Catalog metadata supplies model names, limits, costs, capabilities, reasoning metadata, and catalog matches.
+- `mcp_servers.waltr` is an ordinary Streamable HTTP server entry for Waltr's own `/mcp` endpoint.
+- `runtime_defaults` is absent.
+
+Default construction is strict. If the catalog cannot load or a required canonical Claude model is absent, first-time initialization fails rather than persisting a partial default. See [Deployment](../deployment.md) for catalog and self-MCP URL requirements.
 
 ## Partial Updates
 
@@ -71,6 +85,10 @@ The server validates the resulting full config before saving. Invalid provider n
 ## ETag Behavior
 
 `PatchConfigRequest.expected_etag` must match the current server config `etag`.
+
+`ResetConfigRequest.expected_etag` has the same optimistic-concurrency requirement. A reset builds the complete current server default before taking the configuration write lock, then compares the ETag and atomically replaces providers, MCP servers, and runtime defaults. Catalog or validation failure leaves the existing file unchanged. A successful reset returns the complete saved configuration and is published through the normal filesystem watch path.
+
+Reset changes configuration only. Provider API keys, provider OAuth credentials, and outbound MCP OAuth credentials remain in their target-scoped credential stores.
 
 Write flow:
 
@@ -207,6 +225,7 @@ Client implementations should react to config coordination through `waltr-client
 
 - On ETag patch errors, keep the user's local draft visible if appropriate, show the patch error, and let the shared client receive a watch update or dispatch a config reload before retrying.
 - For config patch commands, keep save/delete UI pending until the keyed `ConfigPatch` result in `snapshot.operations.current` is `ready` or `failed`; the immediate dispatch snapshot only identifies the operation.
+- For reset commands, require explicit confirmation and keep the action pending until the matching keyed reset result is `ready` or `failed`.
 - Do not blindly resubmit a stale patch with the same `expected_etag`.
 - After a stale-edit conflict, rebuild the patch from the latest `state.config.current` before retrying.
 - On watch updates, render from the updated `state.config.current`; do not maintain a second server config cache in web or TUI code.
