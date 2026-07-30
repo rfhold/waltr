@@ -12,6 +12,7 @@ use crate::{
     },
     build_app_with_catalog_loader,
     catalog::CatalogLoader,
+    config::DefaultConfigBuilder,
     config_service::ConfigService,
     mcp_oauth::{McpOAuthEnabledConfig, McpOAuthServer},
     persistence::{DatabaseConfig, Persistence},
@@ -56,6 +57,28 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 static TEMP_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Return the deterministic catalog loader used by server tests.
+#[must_use]
+pub fn default_catalog_loader() -> CatalogLoader {
+    CatalogLoader::from_path(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models-dev-defaults.json"),
+    )
+}
+
+/// Return deterministic catalog-backed defaults used by server tests.
+#[must_use]
+pub fn default_config_builder() -> DefaultConfigBuilder {
+    DefaultConfigBuilder::new(default_catalog_loader(), "http://127.0.0.1:14333/mcp")
+}
+
+fn config_service_with_loader(loader: &CatalogLoader) -> Arc<ConfigService> {
+    ConfigService::new(
+        temp_root(),
+        DefaultConfigBuilder::new(loader.clone(), "http://127.0.0.1:14333/mcp"),
+    )
+    .expect("config service should start")
+}
 
 /// Observability and join controls for a server application with blocked cleanup.
 #[derive(Debug)]
@@ -666,12 +689,12 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                 })
                 .await
                 .expect("browser session should seed");
-            let config_service =
-                ConfigService::new(temp_root()).expect("auth test config service should start");
+            let catalog_loader = default_catalog_loader();
+            let config_service = config_service_with_loader(&catalog_loader);
             let app = build_app_with_catalog_loader_and_access_authenticator(
                 config_service,
                 persistence,
-                CatalogLoader::from_env(),
+                catalog_loader,
                 authenticator,
                 |routes, config, credential_store| {
                     session::add_sessions_service(
@@ -711,17 +734,19 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
 /// Start an isolated integration test server.
 #[must_use]
 pub fn setup_server() -> &'static TestServer {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let catalog_loader = default_catalog_loader();
+    let config_service = config_service_with_loader(&catalog_loader);
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
-    setup_server_with_listener(config_service, listener)
+    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader)
 }
 
 /// Start an isolated integration test server at a fixed address.
 #[must_use]
 pub fn setup_server_at(addr: SocketAddr) -> &'static TestServer {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let catalog_loader = default_catalog_loader();
+    let config_service = config_service_with_loader(&catalog_loader);
     let listener = TcpListener::bind(addr).expect("test server should bind fixed address");
-    setup_server_with_listener(config_service, listener)
+    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader)
 }
 
 /// Start an isolated integration test server with an explicit config service.
@@ -734,7 +759,7 @@ pub fn setup_server_with_services(config_service: Arc<ConfigService>) -> &'stati
 /// Start an isolated integration test server with an explicit catalog loader.
 #[must_use]
 pub fn setup_server_with_catalog_loader(catalog_loader: CatalogLoader) -> &'static TestServer {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let config_service = config_service_with_loader(&catalog_loader);
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
     setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader)
 }
@@ -743,11 +768,16 @@ pub fn setup_server_with_catalog_loader(catalog_loader: CatalogLoader) -> &'stat
 #[must_use]
 pub fn setup_server_with_sessions() -> (&'static TestServer, SessionCoordinator<MemorySessionStore>)
 {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let catalog_loader = default_catalog_loader();
+    let config_service = config_service_with_loader(&catalog_loader);
     let sessions = SessionCoordinator::new(MemorySessionStore::new());
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
-    let server =
-        setup_server_with_listener_and_sessions(config_service, listener, sessions.clone());
+    let server = setup_server_with_listener_sessions_and_catalog_loader(
+        config_service,
+        listener,
+        sessions.clone(),
+        catalog_loader,
+    );
     (server, sessions)
 }
 
@@ -756,9 +786,15 @@ pub fn setup_server_with_sessions() -> (&'static TestServer, SessionCoordinator<
 pub fn setup_server_with_seeded_sessions(
     sessions: SessionCoordinator<MemorySessionStore>,
 ) -> &'static TestServer {
-    let config_service = ConfigService::new(temp_root()).expect("config service should start");
+    let catalog_loader = default_catalog_loader();
+    let config_service = config_service_with_loader(&catalog_loader);
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
-    setup_server_with_listener_and_sessions(config_service, listener, sessions)
+    setup_server_with_listener_sessions_and_catalog_loader(
+        config_service,
+        listener,
+        sessions,
+        catalog_loader,
+    )
 }
 
 fn setup_server_with_listener(
@@ -790,11 +826,12 @@ fn setup_server_with_listener_and_sessions(
     listener: TcpListener,
     sessions: SessionCoordinator<MemorySessionStore>,
 ) -> &'static TestServer {
+    let catalog_loader = config_service.catalog_loader();
     setup_server_with_listener_sessions_and_catalog_loader(
         config_service,
         listener,
         sessions,
-        CatalogLoader::from_env(),
+        catalog_loader,
     )
 }
 
@@ -930,8 +967,8 @@ END
                 .await
                 .expect("callback cleanup failure trigger should install");
             }
-            let config_service =
-                ConfigService::new(temp_root()).expect("browser flow config service should start");
+            let catalog_loader = default_catalog_loader();
+            let config_service = config_service_with_loader(&catalog_loader);
             let mcp_oauth = if enable_mcp_oauth {
                 let key_file = PathBuf::from(
                     database_url
@@ -994,7 +1031,7 @@ END
             let app = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
                 config_service,
                 persistence,
-                CatalogLoader::from_env(),
+                catalog_loader,
                 authenticator,
                 mcp_oauth,
                 |routes, config, credential_store| {

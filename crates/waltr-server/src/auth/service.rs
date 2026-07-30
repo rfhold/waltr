@@ -1897,7 +1897,8 @@ mod tests {
 
     async fn generic_auth_service() -> Arc<AuthService<FilesystemConfigStore>> {
         let root = crate::test_support::temp_root();
-        let config_store = FilesystemConfigStore::new(root.clone());
+        let config_store =
+            FilesystemConfigStore::new(root.clone(), crate::test_support::default_config_builder());
         let mut config = default_configuration();
         config.mcp_servers.insert(
             "remote".to_owned(),
@@ -2077,7 +2078,8 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
         let root = crate::test_support::temp_root();
-        let config_store = FilesystemConfigStore::new(root.clone());
+        let config_store =
+            FilesystemConfigStore::new(root.clone(), crate::test_support::default_config_builder());
         let mut config = default_configuration();
         let provider = config.providers.get_mut("codex").unwrap();
         let settings = provider.oauth_settings.as_mut().unwrap();
@@ -2688,7 +2690,8 @@ mod tests {
         let token_server = tokio::spawn(async move { axum::serve(listener, token_app).await });
 
         let root = crate::test_support::temp_root();
-        let config_store = FilesystemConfigStore::new(root.clone());
+        let config_store =
+            FilesystemConfigStore::new(root.clone(), crate::test_support::default_config_builder());
         let mut config = default_configuration();
         config.mcp_servers.insert(
             "hosted".to_owned(),

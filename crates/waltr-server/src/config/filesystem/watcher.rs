@@ -259,7 +259,10 @@ mod tests {
 
     #[tokio::test]
     async fn save_publishes_filesystem_watch_event() {
-        let store = FilesystemConfigStore::new(crate::test_support::temp_root());
+        let store = FilesystemConfigStore::new(
+            crate::test_support::temp_root(),
+            crate::test_support::default_config_builder(),
+        );
         let pubsub = FilesystemConfigPubSub::new();
         let _watcher =
             spawn_config_watcher(store.clone(), pubsub.clone()).expect("watcher should start");
@@ -297,7 +300,7 @@ mod tests {
             } => {
                 assert_eq!(previous_etag, current.etag);
                 assert_eq!(etag, saved.etag);
-                assert_eq!(changed_keys, vec!["providers"]);
+                assert_eq!(changed_keys, vec!["mcp_servers", "providers"]);
                 assert_eq!(config.providers, saved.providers);
             }
             ConfigWatchEvent::Error { error } => panic!("unexpected watch error: {error}"),
@@ -306,7 +309,10 @@ mod tests {
 
     #[tokio::test]
     async fn external_edit_publishes_filesystem_watch_event() {
-        let store = FilesystemConfigStore::new(crate::test_support::temp_root());
+        let store = FilesystemConfigStore::new(
+            crate::test_support::temp_root(),
+            crate::test_support::default_config_builder(),
+        );
         tokio::fs::create_dir_all(store.config_dir())
             .await
             .expect("config dir should be created");
@@ -359,7 +365,10 @@ mod tests {
 
     #[tokio::test]
     async fn event_buffer_pressure_still_observes_config_change() {
-        let store = FilesystemConfigStore::new(crate::test_support::temp_root());
+        let store = FilesystemConfigStore::new(
+            crate::test_support::temp_root(),
+            crate::test_support::default_config_builder(),
+        );
         let pubsub = FilesystemConfigPubSub::new();
         let _watcher =
             spawn_config_watcher(store.clone(), pubsub.clone()).expect("watcher should start");
@@ -408,7 +417,7 @@ mod tests {
     #[test]
     fn event_targets_config_accepts_config_file_and_directory() {
         let root = crate::test_support::temp_root();
-        let store = FilesystemConfigStore::new(root);
+        let store = FilesystemConfigStore::new(root, crate::test_support::default_config_builder());
         let config_dir = store.config_dir();
         let config_path = store.config_path();
 
@@ -427,7 +436,8 @@ mod tests {
     #[test]
     fn event_targets_config_rejects_unrelated_paths() {
         let root = crate::test_support::temp_root();
-        let store = FilesystemConfigStore::new(root.clone());
+        let store =
+            FilesystemConfigStore::new(root.clone(), crate::test_support::default_config_builder());
 
         assert!(!event_targets_config(
             &event_with_path(root.join("unrelated.toml")),

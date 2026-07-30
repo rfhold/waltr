@@ -21,6 +21,18 @@ const CACHE_RELATIVE_PATH: &[&str] = &[".local", "share", "waltr", "cache", "mod
 const CATALOG_FRESHNESS: Duration = Duration::from_hours(24);
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
+const REQUIRED_CLAUDE_MODELS: [&str; 10] = [
+    "claude-haiku-4-5",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-opus-4-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-fable-5",
+];
 
 /// Loaded catalog with freshness metadata.
 #[derive(Clone, Debug)]
@@ -113,6 +125,76 @@ impl CatalogLoader {
             CatalogRefreshRole::Follower(generation) => generation.wait().await.into_result(),
             CatalogRefreshRole::Leader(generation) => self.run_refresh_generation(generation).await,
         }
+    }
+
+    pub(crate) async fn build_default_configuration(
+        &self,
+        mcp_url: &str,
+    ) -> Result<config_proto::Configuration, ConfigError> {
+        let loaded = self
+            .load()
+            .await
+            .map_err(|error| ConfigError::unavailable(error.to_string()))?;
+        let catalog = loaded.catalog();
+        let anthropic = catalog.provider("anthropic").ok_or_else(|| {
+            ConfigError::unavailable("models.dev catalog is missing provider 'anthropic'")
+        })?;
+        let openai = catalog.provider("openai").ok_or_else(|| {
+            ConfigError::unavailable("models.dev catalog is missing provider 'openai'")
+        })?;
+
+        let mut claude_models = std::collections::HashMap::new();
+        for model_id in REQUIRED_CLAUDE_MODELS {
+            let model = anthropic.models.get(model_id).ok_or_else(|| {
+                ConfigError::unavailable(format!(
+                    "models.dev catalog is missing required model 'anthropic/{model_id}'"
+                ))
+            })?;
+            claude_models.insert(
+                model_id.to_owned(),
+                configured_catalog_model(model, "anthropic"),
+            );
+        }
+
+        let openai_models = openai
+            .models
+            .values()
+            .filter(|model| is_supported_gpt_5_model(model))
+            .map(|model| (model.id.clone(), configured_catalog_model(model, "openai")))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let mut config = crate::config::defaults::provider_templates();
+        config
+            .providers
+            .get_mut("anthropic")
+            .expect("anthropic provider template")
+            .models = claude_models.clone();
+        config
+            .providers
+            .get_mut("claude-code")
+            .expect("claude-code provider template")
+            .models = claude_models;
+        config
+            .providers
+            .get_mut("openai")
+            .expect("openai provider template")
+            .models = openai_models.clone();
+        config
+            .providers
+            .get_mut("codex")
+            .expect("codex provider template")
+            .models = openai_models;
+        config.mcp_servers.insert(
+            "waltr".to_owned(),
+            config_proto::McpServer {
+                name: "waltr".to_owned(),
+                r#type: config_proto::McpServerType::Sse as i32,
+                command: String::new(),
+                url: mcp_url.to_owned(),
+            },
+        );
+        config.runtime_defaults = None;
+        Ok(config)
     }
 
     async fn fresh_cached(&self) -> Option<LoadedCatalog> {
@@ -220,6 +302,54 @@ impl CatalogLoader {
             .await
             .map_err(|_| CatalogLoadError::new("replace catalog cache", CatalogFailureKind::Io))
     }
+}
+
+fn configured_catalog_model(
+    catalog_model: &models_dev::CatalogModel,
+    provider_id: &str,
+) -> config_proto::Model {
+    let catalog_match = config_proto::ModelCatalogMatch {
+        provider_id: provider_id.to_owned(),
+        model_id: catalog_model.id.clone(),
+        source: config_proto::CatalogMatchSource::Applied as i32,
+        ..config_proto::ModelCatalogMatch::default()
+    };
+    let mut model = config_proto::Model::default();
+    apply_defaults(
+        &mut model,
+        catalog_model,
+        &catalog_match,
+        RequestedDefaultFields {
+            name: true,
+            model_type: true,
+            limits: true,
+            capabilities: true,
+            cost: true,
+        },
+    );
+    model
+}
+
+fn is_supported_gpt_5_model(model: &models_dev::CatalogModel) -> bool {
+    if model
+        .status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+    {
+        return false;
+    }
+    let Some(version) = model.id.strip_prefix("gpt-5.") else {
+        return false;
+    };
+    let minor = version
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .collect::<Vec<_>>();
+    !minor.is_empty()
+        && std::str::from_utf8(&minor)
+            .ok()
+            .and_then(|minor| minor.parse::<u32>().ok())
+            .is_some_and(|minor| minor >= 3)
 }
 
 #[derive(Debug, Default)]
@@ -830,6 +960,116 @@ mod loader_tests {
             .to_string();
         assert_eq!(error, "failed to decode catalog (decode)");
         assert!(!error.contains("SENTINEL_CATALOG_BODY"));
+    }
+}
+
+#[cfg(test)]
+mod default_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn defaults_select_exact_claude_and_semantic_gpt_inventory_with_metadata() {
+        let config = crate::test_support::default_config_builder()
+            .build()
+            .await
+            .expect("fixture defaults should build");
+        let expected_claude = REQUIRED_CLAUDE_MODELS
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let anthropic = &config.providers["anthropic"];
+        let claude_code = &config.providers["claude-code"];
+        assert_eq!(
+            anthropic.models.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_claude
+        );
+        assert_eq!(claude_code.models, anthropic.models);
+        assert!(!anthropic.models.contains_key("claude-sonnet-4-5-20250929"));
+
+        let expected_openai = ["gpt-5.3", "gpt-5.3-mini", "gpt-5.10"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let openai = &config.providers["openai"];
+        assert_eq!(
+            openai.models.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_openai
+        );
+        assert_eq!(config.providers["codex"].models, openai.models);
+
+        let model = &openai.models["gpt-5.3"];
+        assert_eq!(model.name, "GPT 5.3");
+        assert_eq!(
+            model.limits.as_ref().and_then(|limits| limits.context),
+            Some(400_000)
+        );
+        assert_eq!(
+            model
+                .cost
+                .as_ref()
+                .and_then(|cost| cost.input_per_million_tokens),
+            Some(2.0)
+        );
+        assert!(
+            model
+                .capabilities
+                .as_ref()
+                .is_some_and(|value| value.tools && value.image)
+        );
+        assert_eq!(
+            model
+                .options
+                .as_ref()
+                .map(|value| value.reasoning_efforts.clone()),
+            Some(vec![
+                "high".to_owned(),
+                "low".to_owned(),
+                "medium".to_owned()
+            ])
+        );
+        assert_eq!(
+            model
+                .catalog_match
+                .as_ref()
+                .map(|value| (value.provider_id.as_str(), value.model_id.as_str())),
+            Some(("openai", "gpt-5.3"))
+        );
+        assert_eq!(config.mcp_servers["waltr"].url, "http://127.0.0.1:14333/mcp");
+        assert!(config.runtime_defaults.is_none());
+    }
+
+    #[tokio::test]
+    async fn defaults_fail_when_catalog_is_unavailable_or_required_claude_is_missing() {
+        let unavailable = crate::config::DefaultConfigBuilder::new(
+            CatalogLoader::from_path(crate::test_support::temp_root().join("missing.json")),
+            "http://127.0.0.1/mcp",
+        )
+        .build()
+        .await
+        .expect_err("missing catalog should fail");
+        assert!(unavailable.is_unavailable());
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/models-dev-defaults.json");
+        let data = tokio::fs::read_to_string(fixture)
+            .await
+            .expect("read defaults fixture")
+            .replace("\"claude-fable-5\"", "\"missing-fable\"");
+        let path = crate::test_support::temp_root().join("catalog.json");
+        tokio::fs::write(&path, data)
+            .await
+            .expect("write incomplete fixture");
+        let missing = crate::config::DefaultConfigBuilder::new(
+            CatalogLoader::from_path(path),
+            "http://127.0.0.1/mcp",
+        )
+        .build()
+        .await
+        .expect_err("missing required Claude should fail");
+        assert!(missing.is_unavailable());
+        assert!(missing.to_string().contains("claude-fable-5"));
     }
 }
 

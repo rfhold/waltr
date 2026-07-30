@@ -1,15 +1,58 @@
 //! Server-owned default configuration.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
+use crate::{DEFAULT_LISTEN_ADDR, catalog::CatalogLoader};
 use waltr::grpc::waltr::config::v1::{
-    Configuration, Model, ModelCapabilities, ModelType, OAuthProvider, OauthJwtMetadata,
-    OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider, ProviderType,
+    Configuration, OAuthProvider, OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle,
+    OauthUrlParam, Provider, ProviderType,
 };
 
-/// Return the built-in configuration used when no config file exists.
-#[must_use]
-pub fn default_configuration() -> Configuration {
+use super::ConfigError;
+
+/// Catalog-backed builder for fresh server configuration.
+#[derive(Clone, Debug)]
+pub struct DefaultConfigBuilder {
+    catalog_loader: CatalogLoader,
+    mcp_url: Result<String, String>,
+}
+
+impl DefaultConfigBuilder {
+    /// Build defaults from a shared catalog loader and deployment environment.
+    #[must_use]
+    pub fn from_env(catalog_loader: CatalogLoader) -> Self {
+        Self {
+            catalog_loader,
+            mcp_url: default_mcp_url(),
+        }
+    }
+
+    /// Build defaults from a shared catalog loader and explicit self-MCP URL.
+    #[must_use]
+    pub fn new(catalog_loader: CatalogLoader, mcp_url: impl Into<String>) -> Self {
+        Self {
+            catalog_loader,
+            mcp_url: Ok(mcp_url.into()),
+        }
+    }
+
+    /// Construct a complete fresh configuration.
+    pub async fn build(&self) -> Result<Configuration, ConfigError> {
+        let mcp_url = self
+            .mcp_url
+            .as_deref()
+            .map_err(|message| ConfigError::invalid(message.to_owned()))?;
+        self.catalog_loader
+            .build_default_configuration(mcp_url)
+            .await
+    }
+
+    pub(crate) fn catalog_loader(&self) -> CatalogLoader {
+        self.catalog_loader.clone()
+    }
+}
+
+pub(crate) fn provider_templates() -> Configuration {
     Configuration {
         providers: HashMap::from([
             (
@@ -19,7 +62,6 @@ pub fn default_configuration() -> Configuration {
                     ProviderType::AnthropicMessages,
                     "https://api.anthropic.com/v1/messages",
                     false,
-                    "claude-haiku-4-5",
                     HashMap::from([(
                         "x-api-key".to_owned(),
                         "${env:ANTHROPIC_API_KEY}".to_owned(),
@@ -34,7 +76,6 @@ pub fn default_configuration() -> Configuration {
                     ProviderType::AnthropicMessages,
                     "https://api.anthropic.com/v1/messages?beta=true",
                     true,
-                    "claude-haiku-4-5",
                     HashMap::from([
                         (
                             "anthropic-beta".to_owned(),
@@ -53,7 +94,6 @@ pub fn default_configuration() -> Configuration {
                     ProviderType::OpenaiChatCompletions,
                     "https://api.openai.com/v1/chat/completions",
                     false,
-                    "gpt-5-nano",
                     HashMap::from([(
                         "Authorization".to_owned(),
                         concat!("Bearer ", "${env:OPENAI_API_KEY}").to_owned(),
@@ -68,7 +108,6 @@ pub fn default_configuration() -> Configuration {
                     ProviderType::OpenaiResponses,
                     "https://chatgpt.com/backend-api/codex/responses",
                     true,
-                    "gpt-5-codex",
                     HashMap::from([
                         ("accept".to_owned(), "text/event-stream".to_owned()),
                         (
@@ -94,7 +133,6 @@ fn provider(
     provider_type: ProviderType,
     url: &str,
     oauth_compatible: bool,
-    model_key: &str,
     headers: HashMap<String, String>,
     oauth_settings: Option<OAuthProvider>,
 ) -> Provider {
@@ -105,19 +143,59 @@ fn provider(
         oauth_compatible,
         headers,
         oauth_settings,
-        models: HashMap::from([(
-            model_key.to_owned(),
-            Model {
-                name: model_key.to_owned(),
-                r#type: ModelType::Llm as i32,
-                capabilities: Some(ModelCapabilities {
-                    tools: true,
-                    image: false,
-                }),
-                ..Model::default()
-            },
-        )]),
+        models: HashMap::new(),
     }
+}
+
+fn default_mcp_url() -> Result<String, String> {
+    mcp_url_from_values(
+        std::env::var("WALTR_PUBLIC_URL").ok().as_deref(),
+        std::env::var("WALTR_SERVER_ADDR").ok().as_deref(),
+    )
+}
+
+fn mcp_url_from_values(
+    public_url: Option<&str>,
+    server_addr: Option<&str>,
+) -> Result<String, String> {
+    if let Some(public_url) = public_url {
+        return append_mcp_path(public_url);
+    }
+
+    let address = server_addr
+        .unwrap_or(DEFAULT_LISTEN_ADDR)
+        .parse::<SocketAddr>()
+        .or_else(|_| DEFAULT_LISTEN_ADDR.parse::<SocketAddr>())
+        .expect("DEFAULT_LISTEN_ADDR must be a socket address");
+    Ok(format!("http://127.0.0.1:{}/mcp", address.port()))
+}
+
+fn append_mcp_path(value: &str) -> Result<String, String> {
+    let mut url = url::Url::parse(value)
+        .map_err(|_| "WALTR_PUBLIC_URL must be an absolute HTTP(S) URL".to_owned())?;
+    let loopback_http = url.scheme() == "http"
+        && match url.host() {
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(address)) => address.is_loopback(),
+            Some(url::Host::Ipv6(address)) => address.is_loopback(),
+            None => false,
+        };
+    if !(url.scheme() == "https" || loopback_http)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "WALTR_PUBLIC_URL must use HTTPS (except loopback HTTP) without userinfo, query, or fragment"
+                .to_owned(),
+        );
+    }
+    let path = format!("{}/mcp", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.into())
 }
 
 pub(crate) fn claude_code_oauth_settings() -> OAuthProvider {
@@ -192,11 +270,11 @@ pub(crate) fn openai_codex_oauth_settings() -> OAuthProvider {
 mod tests {
     use waltr::grpc::waltr::config::v1::ProviderType;
 
-    use super::default_configuration;
+    use super::{append_mcp_path, mcp_url_from_values, provider_templates};
 
     #[test]
     fn defaults_split_api_key_and_oauth_providers() {
-        let config = default_configuration();
+        let config = provider_templates();
 
         let anthropic = &config.providers["anthropic"];
         assert_eq!(anthropic.r#type, ProviderType::AnthropicMessages as i32);
@@ -233,5 +311,37 @@ mod tests {
         assert!(codex.oauth_compatible);
         assert!(codex.oauth_settings.is_some());
         assert!(!config.providers.contains_key("openai-codex"));
+    }
+
+    #[test]
+    fn public_url_appends_mcp_without_discarding_a_path_prefix() {
+        assert_eq!(
+            append_mcp_path("https://waltr.example/prefix/").as_deref(),
+            Ok("https://waltr.example/prefix/mcp")
+        );
+        assert!(append_mcp_path("http://127.0.0.1:14333").is_ok());
+        for invalid in [
+            "not a url",
+            "http://waltr.example",
+            "https://user:password@waltr.example",
+            "https://waltr.example?query=forbidden",
+            "https://waltr.example#fragment-forbidden",
+        ] {
+            assert!(append_mcp_path(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn mcp_url_uses_public_url_or_loopback_listen_port() {
+        assert_eq!(
+            mcp_url_from_values(Some("https://waltr.example/base/"), Some("0.0.0.0:9999"))
+                .as_deref(),
+            Ok("https://waltr.example/base/mcp")
+        );
+        assert!(mcp_url_from_values(Some("invalid"), Some("[::]:4567")).is_err());
+        assert_eq!(
+            mcp_url_from_values(None, None).as_deref(),
+            Ok("http://127.0.0.1:14333/mcp")
+        );
     }
 }

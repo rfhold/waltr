@@ -31,6 +31,9 @@ enum ConfigErrorKind {
     Invalid {
         message: String,
     },
+    Unavailable {
+        message: String,
+    },
     Watch {
         source: notify::Error,
     },
@@ -79,6 +82,14 @@ impl ConfigError {
         }
     }
 
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: ConfigErrorKind::Unavailable {
+                message: message.into(),
+            },
+        }
+    }
+
     pub(crate) const fn watch(source: notify::Error) -> Self {
         Self {
             kind: ConfigErrorKind::Watch { source },
@@ -105,6 +116,12 @@ impl ConfigError {
     pub const fn is_invalid(&self) -> bool {
         matches!(self.kind, ConfigErrorKind::Invalid { .. })
     }
+
+    /// Whether this error is caused by an unavailable default source.
+    #[must_use]
+    pub const fn is_unavailable(&self) -> bool {
+        matches!(self.kind, ConfigErrorKind::Unavailable { .. })
+    }
 }
 
 impl fmt::Display for ConfigError {
@@ -126,6 +143,7 @@ impl fmt::Display for ConfigError {
                 write!(f, "failed to serialize config: {source}")
             }
             ConfigErrorKind::Invalid { message } => write!(f, "invalid config: {message}"),
+            ConfigErrorKind::Unavailable { message } => f.write_str(message),
             ConfigErrorKind::Watch { source } => write!(f, "failed to watch config: {source}"),
             ConfigErrorKind::EtagMismatch { expected, actual } => write!(
                 f,

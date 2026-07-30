@@ -14,6 +14,9 @@ mod providers;
 #[path = "config/stale_etag.rs"]
 mod stale_etag;
 
+#[path = "config/reset.rs"]
+mod reset;
+
 #[path = "config/validation.rs"]
 mod validation;
 

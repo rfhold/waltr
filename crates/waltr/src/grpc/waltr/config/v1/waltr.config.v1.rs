@@ -221,6 +221,18 @@ pub struct PatchConfigResponse {
     pub config: ::core::option::Option<Configuration>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResetConfigRequest {
+    #[prost(string, tag="1")]
+    pub expected_etag: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResetConfigResponse {
+    #[prost(message, optional, tag="1")]
+    pub config: ::core::option::Option<Configuration>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetConfigRequest {
 }
