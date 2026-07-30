@@ -14,6 +14,7 @@ describe("status wiring", () => {
           current: { etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null },
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
+          reset: operationSnapshot("idle"),
           watch: operationSnapshot("received"),
         },
         status: {
@@ -35,6 +36,7 @@ describe("status wiring", () => {
           current: null,
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
+          reset: operationSnapshot("idle"),
           watch: operationSnapshot("opened"),
         },
         status: {

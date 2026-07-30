@@ -396,6 +396,7 @@ export function renderWithAppState(
           dispatchLogoutAuth: (target) => dispatch({ type: "logoutAuth", target }),
           clearExplicitAuthTarget: () => setExplicitAuthTarget(undefined),
           dispatchConfigPatch,
+          dispatchResetConfig: () => dispatch({ type: "resetConfig" }),
           dispatchCreateSession,
           dispatchDeleteSession,
           dispatchUpdateSessionRuntimeConfig,

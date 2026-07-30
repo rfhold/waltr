@@ -438,8 +438,25 @@
 
 .config__header {
   display: flex;
-  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.config__heading,
+.config__reset-control {
+  display: grid;
   gap: 0.35rem;
+}
+
+.config__reset-control {
+  justify-items: end;
+  max-width: 48rem;
+}
+
+.config__reset-control .ui-confirm {
+  justify-content: flex-end;
+  text-align: right;
 }
 
 .sessions {
@@ -2478,6 +2495,21 @@
 }
 
 @media (max-width: 700px) {
+  .config__header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .config__reset-control {
+    justify-items: stretch;
+  }
+
+  .config__reset-control .ui-confirm {
+    justify-content: flex-start;
+    padding: 0;
+    text-align: left;
+  }
+
   .shell {
     grid-template-columns: 1fr;
     grid-template-rows: auto minmax(0, 1fr);

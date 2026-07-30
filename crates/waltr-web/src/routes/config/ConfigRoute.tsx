@@ -1,9 +1,9 @@
 import { Navigate, useLocation, useNavigate } from "@solidjs/router";
-import { Match, Switch, createEffect, createMemo, createSignal, on, onCleanup, untrack } from "solid-js";
+import { Match, Show, Switch, createEffect, createMemo, createSignal, on, onCleanup, untrack } from "solid-js";
 import type { ParentProps } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { InlineAlert, TabPanel, Tabs } from "../../components/ui";
+import { ConfirmAction, InlineAlert, TabPanel, Tabs } from "../../components/ui";
 import type { TabItem } from "../../components/ui";
 import type { ClientCommand } from "../../generated/waltr-client";
 import { McpServersSection } from "./McpServersSection";
@@ -41,6 +41,10 @@ export function ConfigRoute(props: ParentProps) {
   );
   const loading = createMemo(() => !watchedConfig() && !error());
   const [activeTab, setActiveTab] = createSignal<ConfigTabId>(CONFIG_TABS[0]!.id);
+  const [resetConfirmationOpen, setResetConfirmationOpen] = createSignal(false);
+  const [resetPending, setResetPending] = createSignal(false);
+  const [resetError, setResetError] = createSignal<string>();
+  const [resetSucceeded, setResetSucceeded] = createSignal(false);
   const routeTab = createMemo<ConfigTabId | undefined>(() => {
     if (location.pathname.startsWith("/config/mcp")) {
       return "mcp";
@@ -87,13 +91,76 @@ export function ConfigRoute(props: ParentProps) {
     });
   });
 
+  const resetConfig = async () => {
+    if (resetPending()) {
+      return;
+    }
+
+    setResetPending(true);
+    setResetError(undefined);
+    setResetSucceeded(false);
+    try {
+      await app.dispatchResetConfig();
+      setResetConfirmationOpen(false);
+      setResetSucceeded(true);
+    } catch (error) {
+      setResetError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setResetPending(false);
+    }
+  };
+
   return (
     <section class="config" aria-labelledby="config-title">
       <ShowRedirect when={location.pathname === "/config" || location.pathname === "/config/"} />
       <header class="config__header">
-        <p class="eyebrow">Configuration</p>
-        <h1 id="config-title">Settings</h1>
+        <div class="config__heading">
+          <p class="eyebrow">Configuration</p>
+          <h1 id="config-title">Settings</h1>
+        </div>
+        <Show when={watchedConfig()}>
+          <div class="config__reset-control">
+            <Show
+              when={resetConfirmationOpen()}
+              fallback={
+                <button
+                  class="ui-button ui-button--danger"
+                  type="button"
+                  onClick={() => {
+                    setResetError(undefined);
+                    setResetSucceeded(false);
+                    setResetConfirmationOpen(true);
+                  }}
+                >
+                  Reset configuration
+                </button>
+              }
+            >
+              <ConfirmAction
+                label="Reset configuration confirmation"
+                prompt="Reset providers, MCP servers, and runtime defaults to server defaults? Credentials remain untouched."
+                confirmLabel={resetPending() ? "Resetting..." : "Reset configuration"}
+                confirmAriaLabel="Confirm reset configuration"
+                cancelAriaLabel="Cancel reset configuration"
+                pending={resetPending()}
+                onConfirm={() => void resetConfig()}
+                onCancel={() => {
+                  if (!resetPending()) {
+                    setResetConfirmationOpen(false);
+                    setResetError(undefined);
+                  }
+                }}
+              />
+            </Show>
+            <Show when={resetError()}>
+              {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
+            </Show>
+          </div>
+        </Show>
       </header>
+      <Show when={resetSucceeded()}>
+        <InlineAlert tone="success">Configuration reset.</InlineAlert>
+      </Show>
       <Tabs
         id="config-sections"
         label="Configuration sections"
