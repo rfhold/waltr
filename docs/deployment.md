@@ -61,6 +61,8 @@ The `test` and `test-auth` profiles use tmpfs persistence, internal-only network
 
 The Pulumi workload definition uses S3 session storage. It intentionally specifies one Waltr replica with a `Recreate` strategy; do not increase the replica count without validating session-store write coordination and the documented cross-replica operational checks.
 
+The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not modify either Waltr or MCP SQL data, authentication sessions, OAuth credentials, or configuration. The operation is a blind delete without active-run or cross-replica coordination; stop session activity before invoking it or concurrent work may recreate records.
+
 ## OIDC Access Domains
 
 Production OIDC deployment requires:

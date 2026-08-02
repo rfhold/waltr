@@ -23,7 +23,7 @@ Adjacent layers should treat the agent as a hostable capability:
 
 | Layer | Relationship To Agent |
 | --- | --- |
-| Server | May host or coordinate agent sessions, but server state and RPC contracts stay outside the agent crate. |
+| Server | Hosts and coordinates agent sessions through `SessionCoordinator`, while server state, authorization, and RPC/MCP contracts stay outside the agent crate. |
 | Shared client | May render or control server-exposed agent state, but shared client reducers stay outside the agent crate. |
 | Web and TUI | May present agent output, prompts, approvals, and session state, but UI routing and rendering stay outside the agent crate. |
 | Tests | Exercise the agent directly through scripted providers, live providers, tools, and storage backends. |
@@ -117,6 +117,10 @@ Middleware can:
 
 Agent sessions are event-sourced. A session store persists cursor-assigned timeline events and internal `SessionJournalEvent` records identified by `SessionId` and guarded by revisions. Runtime snapshots are derived from the persisted journal and are used to resume with a new prompt, external response, tool results, or interruption.
 
+`waltr-server` currently hosts sessions and exposes the same registered session service and coordinator through gRPC and the MCP `sessions` tool. MCP supports list, get, interrupt, wait, send, and wipe operations. Both surfaces must share that coordinator because active runs, queues, and live broadcasts are process-local.
+
+The global session wipe directly removes every raw record from the configured session store, clears cached session MCP runtimes, and publishes one session-list cleared event. It does not inspect, reject, cancel, wait for, or gate running or queued work. Operators must stop session activity first; work that continues concurrently may recreate records after deletion. The gRPC and MCP surfaces invoke this same coordinator operation and require explicit confirmation.
+
 Session storage implementations include memory, filesystem, OpenDAL-backed stores, S3, Scylla, and PostgreSQL through OpenDAL helpers. Storage details are below the `SessionStore` trait; the agent loop only depends on the trait contract.
 
 Crash recovery is retry-the-turn. The request is journaled before provider dispatch, while parser progress inside an in-flight provider stream is not persisted as an authoritative checkpoint.
@@ -134,8 +138,8 @@ Current and expected dependents include:
 | Dependent | Uses |
 | --- | --- |
 | Agent tests | Scripted-provider, live-provider, session, permission, MCP, filesystem, shell, question, and loop coverage. |
-| Future host runtimes | Agent configuration, timeline streams, durable sessions, suspensions, and resume inputs. |
-| UI or server layers | Public agent timeline events and derived session projections after a host layer chooses to expose them. |
+| Host runtimes | Agent configuration, timeline streams, durable sessions, suspensions, and resume inputs. |
+| UI or server layers | Public timeline events after a host layer chooses how to authorize and expose them. |
 
 ## Invariants
 
