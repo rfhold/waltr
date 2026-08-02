@@ -196,7 +196,7 @@ mod tests {
         let sink = ToolProgressSink::timeline(
             SessionId::new("session-1"),
             1,
-            TimelineItemId::new("tool-call-1"),
+            TimelineItemId::from_first_cursor(crate::TimelineCursor::new(1)),
             {
                 let events = Arc::clone(&events);
                 move |event: PendingTimelineEvent| {
@@ -325,7 +325,10 @@ mod tests {
     }
 
     fn is_progress_delta(event: &PendingTimelineEvent, channel: &str, delta: &str) -> bool {
-        event.parent_id == Some(TimelineItemId::new("tool-call-1"))
+        event.parent_id
+            == Some(TimelineItemId::from_first_cursor(
+                crate::TimelineCursor::new(1),
+            ))
             && event.channel == Some(TimelineChannel::from(channel))
             && matches!(&event.content, TimelineContent::TextDelta { delta: event_delta } if event_delta == delta)
     }

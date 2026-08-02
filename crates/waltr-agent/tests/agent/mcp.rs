@@ -327,6 +327,74 @@ async fn mcp_shutdown_releases_coordinator_lock_attempts_all_servers_and_propaga
 }
 
 #[tokio::test]
+async fn session_wipe_clear_and_cleanup_survive_request_cancellation() -> waltr_agent::Result<()> {
+    let failing = Arc::new(ShutdownProbe::new(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        true,
+    ));
+    let succeeding = Arc::new(ShutdownProbe::new(axum::http::StatusCode::ACCEPTED, false));
+    let (failing_endpoint, failing_task) = start_shutdown_probe(failing.clone()).await?;
+    let (succeeding_endpoint, succeeding_task) = start_shutdown_probe(succeeding.clone()).await?;
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_wipe_shutdown_provider",
+        vec![vec![CompletionEvent::Finished]],
+    ));
+    let sessions = mcp_sessions(provider);
+    let session_id = sessions.create().await?.id().clone();
+    sessions
+        .set_runtime_settings(
+            &session_id,
+            Some(test_runtime_settings(vec![
+                http_runtime_endpoint("a_failing", failing_endpoint),
+                http_runtime_endpoint("b_succeeding", succeeding_endpoint),
+            ])),
+        )
+        .await?;
+    let submission = sessions
+        .submit_prompt(
+            session_id,
+            "start MCP runtimes",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?;
+    submission.handle.wait().await?;
+    let mut watch = sessions.watch_sessions();
+    let (wipe_tx, wipe_rx) = tokio::sync::oneshot::channel();
+    let wipe_sessions = sessions.clone();
+    let request = tokio::spawn(async move {
+        drop(wipe_tx.send(wipe_sessions.wipe_sessions().await));
+        futures_util::future::pending::<()>().await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), failing.delete_started.notified())
+        .await
+        .expect("first MCP shutdown starts");
+    tokio::time::timeout(Duration::from_secs(1), wipe_rx)
+        .await
+        .expect("wipe result while shutdown is pending")
+        .expect("wipe result sender remains open")?;
+
+    assert!(sessions.list().await?.is_empty());
+    let update = tokio::time::timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("wipe clear update")
+        .expect("wipe clear update item");
+    assert_eq!(update.event, waltr_agent::SessionListEvent::Cleared);
+
+    request.abort();
+    failing.release_delete.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), succeeding.delete_started.notified())
+        .await
+        .expect("remaining MCP shutdown continues after request cancellation");
+    assert_eq!(failing.deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(succeeding.deletes.load(Ordering::SeqCst), 1);
+
+    failing_task.abort();
+    succeeding_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_progress_notifications_are_forwarded_to_timeline() -> waltr_agent::Result<()> {
     let stdio_command = test_stdio_server_command();
     let provider = Arc::new(ScriptedProvider::from_turns(
@@ -355,14 +423,20 @@ async fn mcp_progress_notifications_are_forwarded_to_timeline() -> waltr_agent::
         tool_result_text(&session).contains("stdio-mcp-progress-result-919"),
         "{session:#?}"
     );
+    let tool_item_id = session
+        .timeline
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ToolCall { call } if call.id == "call_direct_progress" => {
+                Some(event.item_id.clone())
+            }
+            _ => None,
+        })
+        .expect("tool call timeline item");
     assert!(
         session.timeline.iter().any(|event| {
             crate::session::channel_is(event, CHANNEL_TOOL_PROGRESS_INFO)
-                && event
-                    .parent_id
-                    .as_ref()
-                    .map(waltr_agent::TimelineItemId::as_str)
-                    == Some("tool-call:call_direct_progress")
+                && event.parent_id.as_ref() == Some(&tool_item_id)
                 && matches!(
                     &event.content,
                     TimelineContent::TextDelta { delta }

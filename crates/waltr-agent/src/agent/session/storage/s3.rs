@@ -156,6 +156,43 @@ impl S3SessionStore {
         self.save_record(&record).await?;
         Ok(record)
     }
+
+    async fn wipe_records(&self) -> SessionStoreResult<()> {
+        let mut continuation_token = None;
+        let mut keys = Vec::new();
+        loop {
+            let output = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&self.prefix)
+                .set_continuation_token(continuation_token)
+                .send()
+                .await
+                .map_err(backend_error)?;
+            keys.extend(
+                output
+                    .contents()
+                    .iter()
+                    .filter_map(|object| object.key().map(str::to_owned)),
+            );
+            if output.is_truncated().unwrap_or(false) {
+                continuation_token = output.next_continuation_token().map(str::to_owned);
+            } else {
+                break;
+            }
+        }
+        for key in keys {
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(backend_error)?;
+        }
+        Ok(())
+    }
 }
 
 impl SessionStore for S3SessionStore {
@@ -246,6 +283,11 @@ impl SessionStore for S3SessionStore {
                 .map_err(backend_error)?;
             Ok(())
         }
+    }
+
+    fn wipe(&self) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        async move { store.wipe_records().await }
     }
 
     fn list(

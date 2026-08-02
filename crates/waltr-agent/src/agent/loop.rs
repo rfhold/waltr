@@ -1,7 +1,7 @@
 //! Internal agent loop.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     hash::{Hash, Hasher},
     path::PathBuf,
     pin::Pin,
@@ -15,11 +15,11 @@ use serde_json::{Value, json};
 use crate::permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState};
 use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
-    ModelRef, PendingTimelineEvent, PermissionClaim, PermissionLevel, PermissionOperation,
-    PermissionPattern, PermissionPolicy, PermissionResource, PermissionResourcePattern,
-    PermissionResponse, PromptTurn, Result, TimelineChannel, TimelineContent, TimelineEventKind,
-    TimelineItemId, ToolCall, ToolDefinition, ToolExecutionContext, ToolProgressSink, ToolResult,
-    TurnItem,
+    ModelRef, PendingTimelineEvent, PendingTimelineItemId, PermissionClaim, PermissionLevel,
+    PermissionOperation, PermissionPattern, PermissionPolicy, PermissionResource,
+    PermissionResourcePattern, PermissionResponse, PromptTurn, Result, TimelineChannel,
+    TimelineContent, TimelineEventKind, TimelineItemId, ToolCall, ToolDefinition,
+    ToolExecutionContext, ToolProgressSink, ToolResult, TurnItem,
     middleware::{
         self as middleware, HookOutcome,
         chain::MiddlewareChain,
@@ -81,6 +81,9 @@ where
     cancellation_token: CancellationToken,
     template_base_dir: Option<PathBuf>,
     turn_span: Option<Span>,
+    assistant_item_id: Option<(u64, TimelineItemId)>,
+    thinking_item_id: Option<(u64, TimelineItemId)>,
+    tool_item_ids: HashMap<String, TimelineItemId>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +173,9 @@ where
             cancellation_token: run.cancellation_token,
             template_base_dir: run.template_base_dir,
             turn_span: None,
+            assistant_item_id: None,
+            thinking_item_id: None,
+            tool_item_ids: HashMap::new(),
         }
     }
 
@@ -359,6 +365,8 @@ where
                             Ok(event) => event,
                             Err(error) => return Some((Err(error), self)),
                         };
+                        self.tool_item_ids
+                            .insert(call.id.clone(), event.item_id.clone());
                         streaming.tool_calls.push(call);
                         self.phase = AgentLoopPhase::Streaming(streaming);
                         return Some((Ok(event), self));
@@ -673,10 +681,11 @@ where
         }
 
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let parent_id = self.tool_item_id(&call.id)?;
         let progress = ToolProgressSink::timeline(
             self.session_id.clone(),
             self.turn as u64,
-            tool_call_item_id(&call.id),
+            parent_id,
             move |event| {
                 drop(progress_tx.send(event));
                 Ok(())
@@ -749,6 +758,7 @@ where
     }
 
     async fn finish_tool_result(&mut self, result: ToolResult) -> Result<()> {
+        let parent_id = self.tool_item_id(&result.call_id)?;
         CompletionTurn::entry(&mut self.turns, self.turn as u64)
             .items
             .push(TurnItem::ToolResult(result.clone()));
@@ -758,6 +768,7 @@ where
             .append_timeline_event(tool_result_timeline_event(
                 &self.session_id,
                 self.turn as u64,
+                parent_id,
                 result,
             ))
             .await?;
@@ -1072,6 +1083,35 @@ where
         self.turns = snapshot.turns;
         self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
+        let current_turn = self.turn as u64;
+        self.assistant_item_id = None;
+        self.thinking_item_id = None;
+        self.tool_item_ids.clear();
+        for event in record.timeline_events() {
+            match &event.content {
+                TimelineContent::ToolCall { call } => {
+                    self.tool_item_ids
+                        .insert(call.id.clone(), event.item_id.clone());
+                }
+                TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. }
+                    if event.turn == current_turn
+                        && event.channel.as_ref().is_some_and(|channel| {
+                            channel.as_str() == crate::timeline::CHANNEL_ASSISTANT_TEXT
+                        }) =>
+                {
+                    self.assistant_item_id = Some((event.turn, event.item_id.clone()));
+                }
+                TimelineContent::TextDelta { .. }
+                    if event.turn == current_turn
+                        && event.channel.as_ref().is_some_and(|channel| {
+                            channel.as_str() == crate::timeline::CHANNEL_THINKING
+                        }) =>
+                {
+                    self.thinking_item_id = Some((event.turn, event.item_id.clone()));
+                }
+                _ => {}
+            }
+        }
     }
 
     fn prompt_turns(&self) -> Vec<PromptTurn> {
@@ -1192,24 +1232,52 @@ where
         Ok(assigned)
     }
 
+    fn tool_item_id(&self, call_id: &str) -> Result<TimelineItemId> {
+        self.tool_item_ids.get(call_id).cloned().ok_or_else(|| {
+            session_store_error(format!("timeline item missing for tool call: {call_id}"))
+        })
+    }
+
     async fn append_assistant_delta(&mut self, delta: String) -> Result<AgentTimelineEvent> {
-        self.append_timeline_event(PendingTimelineEvent::assistant_text_delta(
-            self.session_id.clone(),
-            self.turn as u64,
-            assistant_text_item_id(self.turn as u64),
-            delta,
-        ))
-        .await
+        let turn = self.turn as u64;
+        let item_id = self
+            .assistant_item_id
+            .as_ref()
+            .filter(|(item_turn, _)| *item_turn == turn)
+            .map_or(PendingTimelineItemId::New, |(_, item_id)| {
+                PendingTimelineItemId::Existing(item_id.clone())
+            });
+        let event = self
+            .append_timeline_event(PendingTimelineEvent::assistant_text_delta(
+                self.session_id.clone(),
+                turn,
+                item_id,
+                delta,
+            ))
+            .await?;
+        self.assistant_item_id = Some((turn, event.item_id.clone()));
+        Ok(event)
     }
 
     async fn append_thinking_delta(&mut self, delta: String) -> Result<AgentTimelineEvent> {
-        self.append_timeline_event(PendingTimelineEvent::thinking_delta(
-            self.session_id.clone(),
-            self.turn as u64,
-            thinking_item_id(self.turn as u64),
-            delta,
-        ))
-        .await
+        let turn = self.turn as u64;
+        let item_id = self
+            .thinking_item_id
+            .as_ref()
+            .filter(|(item_turn, _)| *item_turn == turn)
+            .map_or(PendingTimelineItemId::New, |(_, item_id)| {
+                PendingTimelineItemId::Existing(item_id.clone())
+            });
+        let event = self
+            .append_timeline_event(PendingTimelineEvent::thinking_delta(
+                self.session_id.clone(),
+                turn,
+                item_id,
+                delta,
+            ))
+            .await?;
+        self.thinking_item_id = Some((turn, event.item_id.clone()));
+        Ok(event)
     }
 
     async fn append_final_assistant_snapshot(&mut self) -> Result<Option<AgentTimelineEvent>> {
@@ -1222,21 +1290,31 @@ where
         if text.is_empty() {
             return Ok(None);
         }
-        self.append_timeline_event(PendingTimelineEvent::assistant_text_snapshot(
-            self.session_id.clone(),
-            self.turn as u64,
-            assistant_text_item_id(self.turn as u64),
-            text,
-        ))
-        .await
-        .map(Some)
+        let turn = self.turn as u64;
+        let item_id = self
+            .assistant_item_id
+            .as_ref()
+            .filter(|(item_turn, _)| *item_turn == turn)
+            .map_or(PendingTimelineItemId::New, |(_, item_id)| {
+                PendingTimelineItemId::Existing(item_id.clone())
+            });
+        let event = self
+            .append_timeline_event(PendingTimelineEvent::assistant_text_snapshot(
+                self.session_id.clone(),
+                turn,
+                item_id,
+                text,
+            ))
+            .await?;
+        self.assistant_item_id = Some((turn, event.item_id.clone()));
+        Ok(Some(event))
     }
 
     async fn append_finished_status_event(&mut self) -> Result<AgentTimelineEvent> {
         let mut event = PendingTimelineEvent::new(
             self.session_id.clone(),
             self.turn as u64,
-            session_status_item_id(),
+            PendingTimelineItemId::New,
             TimelineEventKind::SessionStatusChanged,
             None,
             TimelineContent::Empty,
@@ -1331,7 +1409,7 @@ where
         let mut event = PendingTimelineEvent::new(
             self.session_id.clone(),
             self.turn as u64,
-            session_status_item_id(),
+            PendingTimelineItemId::New,
             TimelineEventKind::SessionStatusChanged,
             None,
             TimelineContent::Json {
@@ -1444,6 +1522,7 @@ where
             self.turn as u64,
             request,
             TimelineEventKind::ExternalRequestOpened,
+            PendingTimelineItemId::New,
         ))
         .await
     }
@@ -1474,30 +1553,6 @@ where
     }
 }
 
-fn assistant_text_item_id(turn: u64) -> TimelineItemId {
-    TimelineItemId::new(format!("assistant-turn-{turn}"))
-}
-
-fn user_text_item_id(turn: u64, prompt_index: usize) -> TimelineItemId {
-    TimelineItemId::new(format!("user-turn-{turn}-prompt-{prompt_index}"))
-}
-
-fn thinking_item_id(turn: u64) -> TimelineItemId {
-    TimelineItemId::new(format!("thinking-turn-{turn}"))
-}
-
-fn tool_call_item_id(call_id: &str) -> TimelineItemId {
-    TimelineItemId::new(format!("tool-call:{call_id}"))
-}
-
-fn tool_result_item_id(call_id: &str) -> TimelineItemId {
-    TimelineItemId::new(format!("tool-result:{call_id}"))
-}
-
-fn external_request_item_id(request_id: &ExternalRequestId) -> TimelineItemId {
-    TimelineItemId::new(format!("external-request:{}", request_id.as_str()))
-}
-
 fn drain_progress_events(
     progress_rx: &mut mpsc::UnboundedReceiver<PendingTimelineEvent>,
 ) -> Vec<PendingTimelineEvent> {
@@ -1508,28 +1563,24 @@ fn drain_progress_events(
     events
 }
 
-fn session_status_item_id() -> TimelineItemId {
-    TimelineItemId::new("session-status")
-}
-
 fn tool_call_timeline_event(
     session_id: &SessionId,
     turn: u64,
     call: ToolCall,
 ) -> PendingTimelineEvent {
-    PendingTimelineEvent::tool_call(session_id.clone(), turn, tool_call_item_id(&call.id), call)
+    PendingTimelineEvent::tool_call(session_id.clone(), turn, PendingTimelineItemId::New, call)
 }
 
 fn user_prompt_timeline_event(
     session_id: &SessionId,
     turn: u64,
-    prompt_index: usize,
+    _prompt_index: usize,
     prompt: String,
 ) -> PendingTimelineEvent {
     PendingTimelineEvent::user_text_snapshot(
         session_id.clone(),
         turn,
-        user_text_item_id(turn, prompt_index),
+        PendingTimelineItemId::New,
         prompt,
     )
 }
@@ -1544,7 +1595,7 @@ fn provider_metrics_timeline_event(
     PendingTimelineEvent::new(
         session_id.clone(),
         turn,
-        format!("metrics:{turn}"),
+        PendingTimelineItemId::New,
         TimelineEventKind::ItemFinished,
         Some(TimelineChannel::from(CHANNEL_METRICS)),
         TimelineContent::Json {
@@ -1580,14 +1631,14 @@ fn provider_metrics_timeline_event(
 fn tool_result_timeline_event(
     session_id: &SessionId,
     turn: u64,
+    parent_id: TimelineItemId,
     result: ToolResult,
 ) -> PendingTimelineEvent {
-    let call_id = result.call_id.clone();
     PendingTimelineEvent::tool_result(
         session_id.clone(),
         turn,
-        tool_result_item_id(&call_id),
-        tool_call_item_id(&call_id),
+        PendingTimelineItemId::New,
+        parent_id,
         result,
     )
 }
@@ -1597,11 +1648,12 @@ fn external_request_timeline_event(
     turn: u64,
     request: ExternalRequest,
     kind: TimelineEventKind,
+    item_id: PendingTimelineItemId,
 ) -> PendingTimelineEvent {
     PendingTimelineEvent::new(
         session_id.clone(),
         turn,
-        external_request_item_id(&request.id),
+        item_id,
         kind,
         Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
         TimelineContent::ExternalRequest { request },

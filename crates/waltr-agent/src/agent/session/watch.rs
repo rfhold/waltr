@@ -28,6 +28,8 @@ pub enum SessionListEvent {
     Upsert(SessionSummary),
     /// A session was deleted.
     Deleted(SessionId),
+    /// Every session was deleted.
+    Cleared,
 }
 
 /// A session list update emitted by [`SessionCoordinator`](super::SessionCoordinator).

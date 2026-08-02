@@ -115,6 +115,24 @@ impl OpenDalSessionStore {
         self.save_record(&record).await?;
         Ok(record)
     }
+
+    async fn wipe_records(&self) -> SessionStoreResult<()> {
+        let mut paths = self
+            .operator
+            .list_with(&self.prefix)
+            .recursive(true)
+            .await
+            .map_err(backend_error)?
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .filter(|path| path != &self.prefix)
+            .collect::<Vec<_>>();
+        paths.sort_by(|left, right| right.cmp(left));
+        for path in paths {
+            self.operator.delete(&path).await.map_err(backend_error)?;
+        }
+        Ok(())
+    }
 }
 
 impl SessionStore for OpenDalSessionStore {
@@ -201,6 +219,11 @@ impl SessionStore for OpenDalSessionStore {
                 Err(error) => Err(backend_error(error)),
             }
         }
+    }
+
+    fn wipe(&self) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        async move { store.wipe_records().await }
     }
 
     fn list(
@@ -324,5 +347,38 @@ impl SessionStore for OpenDalSessionStore {
 fn backend_error(error: impl std::error::Error) -> SessionStoreError {
     SessionStoreError::Backend {
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use opendal::services;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn wipe_removes_valid_and_invalid_raw_objects_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let builder = services::Fs::default().root(temp.path().to_str().unwrap());
+        let operator = Operator::new(builder).unwrap().finish();
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions");
+        store.create(SessionId::new("valid")).await.unwrap();
+        operator
+            .write("sessions/legacy-record", "not a session record")
+            .await
+            .unwrap();
+
+        store.wipe().await.unwrap();
+        store.wipe().await.unwrap();
+
+        assert!(
+            operator
+                .list_with("sessions/")
+                .recursive(true)
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|entry| entry.path() == "sessions/")
+        );
     }
 }

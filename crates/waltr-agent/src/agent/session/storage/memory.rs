@@ -44,7 +44,7 @@ impl MemorySessionStore {
             .lock()
             .map_err(|_| SessionStoreError::LockPoisoned)?;
         let record = records
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
 
         if record.revision != expected_revision {
@@ -56,8 +56,10 @@ impl MemorySessionStore {
         }
 
         let next_revision = record.revision.next();
-        record.revision = next_revision;
-        let value = update(record, next_revision)?;
+        let mut updated = record.clone();
+        updated.revision = next_revision;
+        let value = update(&mut updated, next_revision)?;
+        records.insert(id.clone(), updated);
         drop(records);
 
         Ok((next_revision, value))
@@ -170,6 +172,18 @@ impl SessionStore for MemorySessionStore {
                 .map_err(|_| SessionStoreError::LockPoisoned)?;
             records.remove(&id);
             drop(records);
+            Ok(())
+        }
+    }
+
+    fn wipe(&self) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        async move {
+            store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?
+                .clear();
             Ok(())
         }
     }
@@ -323,6 +337,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::PendingTimelineItemId;
     use crate::agent::session::{
         CancelReason, ExternalRequest, ExternalRequestKind, ExternalRequestStatus, RequestId,
         RequestRecord, SessionStatus,
@@ -374,7 +389,7 @@ mod tests {
         PendingTimelineEvent::assistant_text_delta(
             id.clone(),
             0,
-            format!("assistant-{index}"),
+            PendingTimelineItemId::New,
             format!("delta-{index}"),
         )
     }
@@ -383,16 +398,16 @@ mod tests {
         PendingTimelineEvent::thinking_delta(
             id.clone(),
             0,
-            format!("thinking-{index}"),
+            PendingTimelineItemId::New,
             format!("thought-{index}"),
         )
     }
 
-    fn pending_status(id: &SessionId, index: usize) -> PendingTimelineEvent {
+    fn pending_status(id: &SessionId, _index: usize) -> PendingTimelineEvent {
         let mut event = PendingTimelineEvent::new(
             id.clone(),
             0,
-            format!("status-{index}"),
+            PendingTimelineItemId::New,
             TimelineEventKind::SessionStatusChanged,
             None,
             TimelineContent::Empty,
@@ -408,7 +423,7 @@ mod tests {
         PendingTimelineEvent::new(
             session_id.clone(),
             1,
-            format!("external-request:{}", request.id.as_str()),
+            PendingTimelineItemId::New,
             TimelineEventKind::ExternalRequestOpened,
             Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
             TimelineContent::ExternalRequest { request },
@@ -448,6 +463,19 @@ mod tests {
 
         let error = store.load(&id).await.unwrap_err();
         assert_eq!(error, SessionStoreError::NotFound { id });
+    }
+
+    #[tokio::test]
+    async fn wipe_is_idempotent_and_removes_all_records() {
+        let store = MemorySessionStore::new();
+
+        store.wipe().await.unwrap();
+        store.create(SessionId::new("session-one")).await.unwrap();
+        store.create(SessionId::new("session-two")).await.unwrap();
+        store.wipe().await.unwrap();
+        store.wipe().await.unwrap();
+
+        assert!(store.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -653,6 +681,45 @@ mod tests {
 
         assert!(matches!(error, SessionStoreError::StaleRevision { .. }));
         assert_eq!(store.load(&id).await.unwrap().timeline_events().count(), 1);
+        let assigned = store
+            .append_timeline(&id, Revision::new(1), vec![pending_delta(&id, 3)])
+            .await
+            .unwrap();
+        assert_eq!(assigned[0].cursor, TimelineCursor::new(2));
+        assert_eq!(assigned[0].item_id.as_str(), "i2");
+    }
+
+    #[tokio::test]
+    async fn invalid_item_reference_does_not_mutate_record() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+
+        let missing = TimelineItemId::from_first_cursor(TimelineCursor::new(99));
+        let error = store
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                vec![PendingTimelineEvent::assistant_text_delta(
+                    id.clone(),
+                    0,
+                    missing.clone(),
+                    "orphaned",
+                )],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            SessionStoreError::TimelineItemNotFound {
+                id: id.clone(),
+                item_id: missing,
+            }
+        );
+        let record = store.load(&id).await.unwrap();
+        assert_eq!(record.revision, Revision::ZERO);
+        assert_eq!(record.timeline_events().count(), 0);
     }
 
     #[tokio::test]
@@ -681,14 +748,14 @@ mod tests {
                     PendingTimelineEvent::tool_call(
                         id.clone(),
                         1,
-                        "tool-call:call-1",
+                        PendingTimelineItemId::New,
                         call.clone(),
                     ),
                     PendingTimelineEvent::tool_result(
                         id.clone(),
                         1,
-                        "tool-result:call-1",
-                        "tool-call:call-1",
+                        PendingTimelineItemId::New,
+                        TimelineItemId::from_first_cursor(TimelineCursor::new(1)),
                         result.clone(),
                     ),
                 ],
@@ -892,9 +959,45 @@ mod tests {
         assert_eq!(assigned[0].cursor, TimelineCursor::new(1));
         assert_eq!(assigned[1].cursor, TimelineCursor::new(2));
         assert_eq!(next[0].cursor, TimelineCursor::new(3));
+        assert_eq!(assigned[0].item_id.as_str(), "i1");
+        assert_eq!(assigned[1].item_id.as_str(), "i2");
+        assert_eq!(next[0].item_id.as_str(), "i3");
         let loaded = store.load(&id).await.unwrap();
         assert_eq!(loaded.revision, Revision::new(2));
         assert_eq!(loaded.timeline_events().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn existing_item_updates_create_gaps_in_item_ids() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+
+        let first = store
+            .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
+            .await
+            .unwrap();
+        let first_id = first[0].item_id.clone();
+        let assigned = store
+            .append_timeline(
+                &id,
+                Revision::new(1),
+                vec![
+                    PendingTimelineEvent::assistant_text_delta(
+                        id.clone(),
+                        0,
+                        first_id.clone(),
+                        "continued",
+                    ),
+                    pending_thinking_delta(&id, 2),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first_id.as_str(), "i1");
+        assert_eq!(assigned[0].item_id, first_id);
+        assert_eq!(assigned[1].item_id.as_str(), "i3");
     }
 
     #[tokio::test]
@@ -912,7 +1015,12 @@ mod tests {
                     pending_thinking_delta(&id, 2),
                     pending_status(&id, 3),
                     pending_delta(&id, 4),
-                    PendingTimelineEvent::tool_call(id.clone(), 0, "tool-call:5", tool_call("5")),
+                    PendingTimelineEvent::tool_call(
+                        id.clone(),
+                        0,
+                        PendingTimelineItemId::New,
+                        tool_call("5"),
+                    ),
                 ],
             )
             .await
@@ -1014,7 +1122,7 @@ mod tests {
         let store = MemorySessionStore::new();
         let id = session_id();
         store.create(id.clone()).await.unwrap();
-        let item_id = TimelineItemId::new("assistant-shared");
+        let item_id = TimelineItemId::from_first_cursor(TimelineCursor::new(1));
         let mut snapshot = PendingTimelineEvent::new(
             id.clone(),
             0,
@@ -1034,7 +1142,7 @@ mod tests {
                     PendingTimelineEvent::assistant_text_delta(
                         id.clone(),
                         0,
-                        item_id.clone(),
+                        PendingTimelineItemId::New,
                         "hello ",
                     ),
                     pending_thinking_delta(&id, 1),
@@ -1062,8 +1170,8 @@ mod tests {
     async fn timeline_item_text_distinguishes_missing_non_text_and_refs() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        let tool_item = TimelineItemId::new("tool-call:non-text");
-        let ref_item = TimelineItemId::new("content-ref");
+        let tool_item = TimelineItemId::from_first_cursor(TimelineCursor::new(1));
+        let ref_item = TimelineItemId::from_first_cursor(TimelineCursor::new(2));
         store.create(id.clone()).await.unwrap();
         store
             .append_timeline(
@@ -1073,13 +1181,13 @@ mod tests {
                     PendingTimelineEvent::tool_call(
                         id.clone(),
                         0,
-                        tool_item.clone(),
+                        PendingTimelineItemId::New,
                         tool_call("non-text"),
                     ),
                     PendingTimelineEvent::new(
                         id.clone(),
                         0,
-                        ref_item.clone(),
+                        PendingTimelineItemId::New,
                         TimelineEventKind::ItemUpdated,
                         Some(TimelineChannel::from(CHANNEL_THINKING)),
                         TimelineContent::content_ref("content-1", 100),
@@ -1091,7 +1199,10 @@ mod tests {
 
         let tool_text = store.timeline_item_text(&id, &tool_item).await.unwrap();
         let missing = store
-            .timeline_item_text(&id, &TimelineItemId::new("missing"))
+            .timeline_item_text(
+                &id,
+                &TimelineItemId::from_first_cursor(TimelineCursor::new(999)),
+            )
             .await
             .unwrap_err();
         let unavailable = store.timeline_item_text(&id, &ref_item).await.unwrap_err();

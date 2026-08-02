@@ -6,8 +6,8 @@ use crate::{
     AuthenticationFailure, LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
     permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
     timeline::{
-        CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
-        TimelineCursor, TimelineEventKind, TimelineItemId,
+        CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, PendingTimelineItemId, TimelineChannel,
+        TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
     },
 };
 
@@ -305,6 +305,7 @@ where
         let mut cancellation_timeline = Vec::new();
         let mut status_timeline = Vec::new();
         for request in pending_external_requests(&snapshot) {
+            let item_id = external_request_item_id(&record, &request.id)?;
             let reason = CancelReason::SessionInterrupted;
             journal.push(SessionJournalEvent::ExternalRequestCanceled {
                 request_id: request.id.clone(),
@@ -317,12 +318,15 @@ where
                 snapshot.turn,
                 request,
                 TimelineEventKind::ExternalRequestResolved,
+                PendingTimelineItemId::Existing(item_id),
             ));
         }
         for work in pending_work(&snapshot) {
             if let Some(result) = interrupted_tool_result(work) {
-                cancellation_timeline
-                    .push(tool_result_timeline_event(&record.id, work.turn, result));
+                let parent_id = tool_call_item_id(&record, &result.call_id)?;
+                cancellation_timeline.push(tool_result_timeline_event(
+                    &record.id, work.turn, parent_id, result,
+                ));
             }
             journal.push(SessionJournalEvent::WorkCanceled {
                 work_id: work.id.clone(),
@@ -394,6 +398,7 @@ where
         let mut cancellation_timeline = Vec::new();
         let mut prompt_timeline = Vec::new();
         for request in pending_external_requests(&snapshot) {
+            let item_id = external_request_item_id(&record, &request.id)?;
             let reason = CancelReason::SupersededByUserPrompt;
             journal.push(SessionJournalEvent::ExternalRequestCanceled {
                 request_id: request.id.clone(),
@@ -406,12 +411,15 @@ where
                 snapshot.turn,
                 request,
                 TimelineEventKind::ExternalRequestResolved,
+                PendingTimelineItemId::Existing(item_id),
             ));
         }
         for work in pending_work(&snapshot) {
             if let Some(result) = interrupted_tool_result(work) {
-                cancellation_timeline
-                    .push(tool_result_timeline_event(&record.id, work.turn, result));
+                let parent_id = tool_call_item_id(&record, &result.call_id)?;
+                cancellation_timeline.push(tool_result_timeline_event(
+                    &record.id, work.turn, parent_id, result,
+                ));
             }
             journal.push(SessionJournalEvent::WorkCanceled {
                 work_id: work.id.clone(),
@@ -460,6 +468,7 @@ where
     ) -> Result<RuntimeResumeOutput> {
         let snapshot = record.snapshot();
         let request = validate_pending_external_response(&snapshot, &request_id)?;
+        let request_item_id = external_request_item_id(&record, &request_id)?;
         let turn = snapshot.turn;
         let mut record = self
             .append_journal_and_reload(
@@ -482,6 +491,7 @@ where
                     turn,
                     resolved_request,
                     TimelineEventKind::ExternalRequestResolved,
+                    PendingTimelineItemId::Existing(request_item_id),
                 )],
             )
             .await?;
@@ -502,10 +512,16 @@ where
                         external_response_content(&response),
                     );
                     let session_id = record.id.clone();
+                    let parent_id = tool_call_item_id(&record, &result.call_id)?;
                     record = self
                         .append_timeline_and_reload(
                             record,
-                            vec![tool_result_timeline_event(&session_id, turn, result)],
+                            vec![tool_result_timeline_event(
+                                &session_id,
+                                turn,
+                                parent_id,
+                                result,
+                            )],
                         )
                         .await?;
                     record = self
@@ -558,10 +574,16 @@ where
                         message.unwrap_or_else(|| "permission denied".to_owned()),
                     );
                     let session_id = record.id.clone();
+                    let parent_id = tool_call_item_id(&record, &result.call_id)?;
                     let record = self
                         .append_timeline_and_reload(
                             record,
-                            vec![tool_result_timeline_event(&session_id, turn, result)],
+                            vec![tool_result_timeline_event(
+                                &session_id,
+                                turn,
+                                parent_id,
+                                result,
+                            )],
                         )
                         .await?;
                     self.append_journal_and_reload(
@@ -594,8 +616,13 @@ where
         if !results.is_empty() {
             let events = results
                 .into_iter()
-                .map(|result| tool_result_timeline_event(&record.id, turn, result))
-                .collect();
+                .map(|result| {
+                    let parent_id = tool_call_item_id(&record, &result.call_id)?;
+                    Ok(tool_result_timeline_event(
+                        &record.id, turn, parent_id, result,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
             record = self.append_timeline_and_reload(record, events).await?;
             record = self
                 .append_journal_and_reload(record, vec![SessionJournalEvent::TurnFinished { turn }])
@@ -755,17 +782,49 @@ fn permission_state_event(state: &PermissionRuntimeState) -> SessionJournalEvent
     }
 }
 
+fn tool_call_item_id(record: &SessionRecord, call_id: &str) -> Result<TimelineItemId> {
+    record
+        .timeline_events()
+        .filter_map(|event| match &event.content {
+            TimelineContent::ToolCall { call } if call.id == call_id => Some(event.item_id.clone()),
+            _ => None,
+        })
+        .last()
+        .ok_or_else(|| runtime_error(format!("timeline item missing for tool call: {call_id}")))
+}
+
+fn external_request_item_id(
+    record: &SessionRecord,
+    request_id: &ExternalRequestId,
+) -> Result<TimelineItemId> {
+    record
+        .timeline_events()
+        .filter_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } if request.id == *request_id => {
+                Some(event.item_id.clone())
+            }
+            _ => None,
+        })
+        .last()
+        .ok_or_else(|| {
+            runtime_error(format!(
+                "timeline item missing for external request: {}",
+                request_id.as_str()
+            ))
+        })
+}
+
 fn tool_result_timeline_event(
     session_id: &SessionId,
     turn: u64,
+    parent_id: TimelineItemId,
     result: ToolResult,
 ) -> PendingTimelineEvent {
-    let call_id = result.call_id.clone();
     PendingTimelineEvent::tool_result(
         session_id.clone(),
         turn,
-        format!("tool-result:{call_id}"),
-        format!("tool-call:{call_id}"),
+        PendingTimelineItemId::New,
+        parent_id,
         result,
     )
 }
@@ -773,19 +832,15 @@ fn tool_result_timeline_event(
 fn user_prompt_timeline_event(
     session_id: &SessionId,
     turn: u64,
-    prompt_index: usize,
+    _prompt_index: usize,
     prompt: String,
 ) -> PendingTimelineEvent {
     PendingTimelineEvent::user_text_snapshot(
         session_id.clone(),
         turn,
-        user_text_item_id(turn, prompt_index),
+        PendingTimelineItemId::New,
         prompt,
     )
-}
-
-fn user_text_item_id(turn: u64, prompt_index: usize) -> TimelineItemId {
-    TimelineItemId::new(format!("user-turn-{turn}-prompt-{prompt_index}"))
 }
 
 fn open_prompt_turn(snapshot: &SessionSnapshot) -> Option<u64> {
@@ -798,11 +853,12 @@ fn external_request_timeline_event(
     turn: u64,
     request: ExternalRequest,
     kind: TimelineEventKind,
+    item_id: PendingTimelineItemId,
 ) -> PendingTimelineEvent {
     PendingTimelineEvent::new(
         session_id.clone(),
         turn,
-        format!("external-request:{}", request.id.as_str()),
+        item_id,
         kind,
         Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
         TimelineContent::ExternalRequest { request },
@@ -813,7 +869,7 @@ fn interrupted_status_timeline_event(session_id: &SessionId, turn: u64) -> Pendi
     let mut event = PendingTimelineEvent::new(
         session_id.clone(),
         turn,
-        "session-status",
+        PendingTimelineItemId::New,
         TimelineEventKind::SessionStatusChanged,
         None,
         TimelineContent::Empty,
@@ -895,7 +951,7 @@ mod tests {
                         PendingTimelineEvent::tool_call(
                             id.clone(),
                             0,
-                            "tool-call:call-question",
+                            PendingTimelineItemId::New,
                             ToolCall::new("call-question", "question", json!({})),
                         ),
                         external_request_timeline_event(
@@ -903,6 +959,7 @@ mod tests {
                             0,
                             external_request("question-1"),
                             TimelineEventKind::ExternalRequestOpened,
+                            PendingTimelineItemId::New,
                         ),
                     ],
                 )

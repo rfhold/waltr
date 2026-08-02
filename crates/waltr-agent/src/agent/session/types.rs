@@ -1190,8 +1190,8 @@ mod tests {
     use crate::{
         ThinkingBlockKind,
         timeline::{
-            CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, TimelineChannel, TimelineContent,
-            TimelineCursor, TimelineEventKind,
+            CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, PendingTimelineItemId, TimelineChannel,
+            TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
         },
     };
 
@@ -1295,13 +1295,18 @@ mod tests {
                 PendingTimelineEvent::assistant_text_delta(
                     session_id.clone(),
                     0,
-                    "assistant-turn-0",
+                    PendingTimelineItemId::New,
                     "hello",
                 ),
             ),
             assigned(
                 2,
-                PendingTimelineEvent::thinking_delta(session_id.clone(), 0, "thinking-0", "think"),
+                PendingTimelineEvent::thinking_delta(
+                    session_id.clone(),
+                    0,
+                    PendingTimelineItemId::New,
+                    "think",
+                ),
             ),
             SessionJournalEvent::ProviderThinkingBlockRecorded {
                 turn: 0,
@@ -1312,7 +1317,7 @@ mod tests {
                 PendingTimelineEvent::tool_call(
                     session_id.clone(),
                     0,
-                    "tool-call:call-1",
+                    PendingTimelineItemId::New,
                     call.clone(),
                 ),
             ),
@@ -1321,8 +1326,8 @@ mod tests {
                 PendingTimelineEvent::tool_result(
                     session_id.clone(),
                     0,
-                    "tool-result:call-1",
-                    "tool-call:call-1",
+                    PendingTimelineItemId::New,
+                    TimelineItemId::from_first_cursor(TimelineCursor::new(3)),
                     result.clone(),
                 ),
             ),
@@ -1393,7 +1398,7 @@ mod tests {
         let pending = PendingTimelineEvent::new(
             id.clone(),
             0,
-            "external-request:request-1",
+            PendingTimelineItemId::New,
             TimelineEventKind::ExternalRequestOpened,
             Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
             TimelineContent::ExternalRequest {

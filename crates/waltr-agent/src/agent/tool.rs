@@ -1,18 +1,10 @@
 //! Agent tool abstractions.
 
-use std::{
-    fmt,
-    future::Future,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
 use crate::{
-    PendingTimelineEvent, Result, TimelineChannel, TimelineContent, TimelineEventKind,
-    TimelineItemId, ToolCall, ToolDefinition, ToolResult,
+    PendingTimelineEvent, PendingTimelineItemId, Result, TimelineChannel, TimelineContent,
+    TimelineEventKind, TimelineItemId, ToolCall, ToolDefinition, ToolResult,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -133,7 +125,6 @@ enum ToolProgressSinkInner {
         session_id: SessionId,
         turn: u64,
         parent_id: TimelineItemId,
-        next_sequence: AtomicU64,
         emit: Arc<ToolProgressEmitter>,
     },
 }
@@ -160,7 +151,6 @@ impl ToolProgressSink {
                 session_id: session_id.into(),
                 turn,
                 parent_id: parent_id.into(),
-                next_sequence: AtomicU64::new(0),
                 emit: Arc::new(emit),
             }),
         }
@@ -178,12 +168,11 @@ impl ToolProgressSink {
                 session_id,
                 turn,
                 parent_id,
-                next_sequence,
                 emit,
             } => emit(PendingTimelineEvent::tool_progress_info(
                 session_id.clone(),
                 *turn,
-                progress_item_id(parent_id, next_sequence.fetch_add(1, Ordering::Relaxed)),
+                PendingTimelineItemId::New,
                 parent_id.clone(),
                 delta,
             )),
@@ -202,12 +191,11 @@ impl ToolProgressSink {
                 session_id,
                 turn,
                 parent_id,
-                next_sequence,
                 emit,
             } => emit(PendingTimelineEvent::tool_progress_error(
                 session_id.clone(),
                 *turn,
-                progress_item_id(parent_id, next_sequence.fetch_add(1, Ordering::Relaxed)),
+                PendingTimelineItemId::New,
                 parent_id.clone(),
                 delta,
             )),
@@ -230,13 +218,12 @@ impl ToolProgressSink {
                 session_id,
                 turn,
                 parent_id,
-                next_sequence,
                 emit,
             } => {
                 let mut event = PendingTimelineEvent::new(
                     session_id.clone(),
                     *turn,
-                    progress_item_id(parent_id, next_sequence.fetch_add(1, Ordering::Relaxed)),
+                    PendingTimelineItemId::New,
                     TimelineEventKind::ContentDelta,
                     Some(channel.into()),
                     content,
@@ -305,10 +292,6 @@ impl AgentTool {
     pub(crate) fn call(&self, context: ToolExecutionContext) -> ToolFuture {
         (self.handler)(context)
     }
-}
-
-fn progress_item_id(parent_id: &TimelineItemId, sequence: u64) -> TimelineItemId {
-    TimelineItemId::new(format!("{}/progress/{sequence}", parent_id.as_str()))
 }
 
 impl fmt::Debug for AgentTool {
