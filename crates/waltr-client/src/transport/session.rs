@@ -9,7 +9,8 @@ use waltr::grpc::waltr::session::v1::{
     SearchSessionTemplatesResponse, SessionRuntimeConfigRequest, SessionSummary,
     SubmitUserMessageRequest, TimelineEvent, TimelineQuery, TimelineTruncation,
     UpdateSessionRuntimeConfigRequest, WatchSessionsRequest, WatchSessionsResponse,
-    WatchTimelineRequest, WatchTimelineResponse, watch_sessions_response, watch_timeline_response,
+    WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest, watch_sessions_response,
+    watch_timeline_response,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
@@ -42,6 +43,8 @@ pub enum SessionWatchEvent {
     Upsert(SessionSummary),
     /// Deleted session id.
     Deleted(String),
+    /// Every session was deleted.
+    Cleared,
 }
 
 /// Internal timeline watch update from the transport layer.
@@ -139,6 +142,31 @@ where
         .session_client(&credentials)
         .await?
         .delete_session(DeleteSessionRequest { id })
+        .await
+        .map_err(|error| status_error(&error, &credentials))?;
+
+    Ok(())
+}
+
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
+pub(super) async fn wipe_sessions<T>(transport: &T) -> Result<(), ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    let credentials = transport.request_credentials();
+    transport
+        .session_client(&credentials)
+        .await?
+        .wipe_sessions(WipeSessionsRequest { confirm: true })
         .await
         .map_err(|error| status_error(&error, &credentials))?;
 
@@ -495,6 +523,7 @@ fn session_watch_update(
             SessionWatchEvent::Upsert(session)
         }
         Some(watch_sessions_response::Event::DeletedId(id)) => SessionWatchEvent::Deleted(id),
+        Some(watch_sessions_response::Event::Cleared(_)) => SessionWatchEvent::Cleared,
         None => {
             return Err(tonic::Status::data_loss(
                 "session watch response missing event",

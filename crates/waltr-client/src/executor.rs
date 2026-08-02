@@ -177,6 +177,15 @@ impl GrpcEffectExecutor {
         self.transport.delete_session(id.into()).await
     }
 
+    /// Delete every server-side session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transport cannot wipe sessions.
+    pub async fn wipe_sessions(&self) -> Result<(), ClientError> {
+        self.transport.wipe_sessions().await
+    }
+
     /// Subscribe to session changes.
     ///
     /// # Errors
@@ -432,6 +441,15 @@ impl GrpcEffectExecutor {
                     Err(error) => vec![ClientEvent::Session(SessionEvent::DeleteFailed {
                         operation_key,
                         id,
+                        error,
+                    })],
+                }
+            }
+            ClientEffect::Session(SessionEffect::Wipe { operation_key }) => {
+                match self.transport.wipe_sessions().await {
+                    Ok(()) => vec![ClientEvent::Session(SessionEvent::Wiped { operation_key })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::WipeFailed {
+                        operation_key,
                         error,
                     })],
                 }

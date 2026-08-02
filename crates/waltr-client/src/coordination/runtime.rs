@@ -188,6 +188,8 @@ pub enum ClientCommand {
         /// Session id to delete.
         id: String,
     },
+    /// Delete every server-side session after local confirmation.
+    WipeSessions,
     /// Replace runtime config metadata for a server-side session.
     UpdateSessionRuntimeConfig {
         /// Session id to update.
@@ -678,6 +680,13 @@ pub enum ClientOperationView {
         /// Deleted session id.
         id: String,
     },
+    /// Session wipe command result.
+    SessionWipe {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+    },
     /// Session runtime metadata update command result.
     SessionRuntimeConfigUpdate {
         /// Stable operation status name.
@@ -825,6 +834,8 @@ pub struct SessionSnapshot {
     pub list: OperationSnapshot,
     /// Session delete operation snapshot.
     pub delete: OperationSnapshot,
+    /// Session wipe operation snapshot.
+    pub wipe: OperationSnapshot,
     /// Session runtime metadata update operation snapshot.
     pub runtime_config_update: OperationSnapshot,
     /// User message submit operation snapshot.
@@ -1457,6 +1468,7 @@ impl ClientStateStream {
             | ClientCommand::SuggestCatalogMatches { .. } => self.begin_catalog_command(command),
             ClientCommand::CreateSession
             | ClientCommand::DeleteSession { .. }
+            | ClientCommand::WipeSessions
             | ClientCommand::UpdateSessionRuntimeConfig { .. }
             | ClientCommand::SearchSessionTemplates { .. }
             | ClientCommand::RegisterSessionWatchInterest
@@ -1634,6 +1646,7 @@ impl ClientStateStream {
         match command {
             ClientCommand::CreateSession => self.runtime.reducer.create_session(),
             ClientCommand::DeleteSession { id } => self.runtime.reducer.delete_session(id),
+            ClientCommand::WipeSessions => self.runtime.reducer.wipe_sessions(),
             ClientCommand::UpdateSessionRuntimeConfig {
                 id,
                 provider_key,
@@ -1930,6 +1943,7 @@ impl ClientStateStream {
         };
 
         for event in events {
+            self.clear_session_runtime_for_event(&event);
             let update = self
                 .runtime
                 .reducer
@@ -1942,9 +1956,44 @@ impl ClientStateStream {
     #[allow(clippy::future_not_send, reason = "watch streams are locally polled")]
     async fn apply_next_watch_event(&mut self) {
         let event = self.runtime.next_watch_event().await;
+        self.clear_session_runtime_for_event(&event);
         let update = self.runtime.reducer.apply(event);
         self.extend_effects(&update);
         self.suspend_if_access_lost();
+    }
+
+    fn clear_session_runtime_for_event(&mut self, event: &ClientEvent) {
+        let should_clear = match event {
+            ClientEvent::Session(SessionEvent::Wiped { operation_key }) => self
+                .runtime
+                .reducer
+                .state()
+                .sessions
+                .wipe
+                .key
+                .as_ref()
+                .is_some_and(|current| current == operation_key),
+            ClientEvent::Session(SessionEvent::WatchChanged(update)) => {
+                matches!(update.event, crate::SessionWatchEvent::Cleared)
+            }
+            _ => false,
+        };
+        if !should_clear {
+            return;
+        }
+
+        self.runtime.timeline_watches.clear();
+        self.cancel_effects(|effect| {
+            matches!(
+                effect,
+                ClientEffect::Session(
+                    SessionEffect::List
+                        | SessionEffect::GetTimeline { .. }
+                        | SessionEffect::SearchTemplates { .. }
+                        | SessionEffect::WatchTimeline { .. }
+                )
+            )
+        });
     }
 
     fn extend_effects(&mut self, update: &ClientUpdate) {
@@ -2220,6 +2269,7 @@ impl ClientSnapshot {
                 create: OperationSnapshot::from_state(&state.sessions.create),
                 list: OperationSnapshot::from_state(&state.sessions.list),
                 delete: OperationSnapshot::from_state(&state.sessions.delete),
+                wipe: OperationSnapshot::from_state(&state.sessions.wipe),
                 runtime_config_update: OperationSnapshot::from_state(
                     &state.sessions.runtime_config_update,
                 ),
@@ -2598,6 +2648,10 @@ impl From<ClientOperationState> for ClientOperationView {
                 status: operation_status_name(status),
                 error,
                 id,
+            },
+            ClientOperationState::SessionWipe { status, error } => Self::SessionWipe {
+                status: operation_status_name(status),
+                error,
             },
             ClientOperationState::SessionRuntimeConfigUpdate {
                 status,
@@ -3320,6 +3374,164 @@ mod tests {
         assert!(ClientCommand::decl().contains("reprobeWaltrAccess"));
     }
 
+    #[test]
+    fn wipe_sessions_command_has_stable_json_contract() {
+        let json =
+            serde_json::to_value(ClientCommand::WipeSessions).expect("command should serialize");
+
+        assert_eq!(json, serde_json::json!({ "type": "wipeSessions" }));
+        assert!(ClientCommand::decl().contains("wipeSessions"));
+    }
+
+    #[test]
+    fn session_clear_drops_timeline_runtime_state_but_preserves_list_watch_work() {
+        let mut stream =
+            ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream(no_sleep);
+        let key = TimelineWatchKey::new("session".to_owned(), None, Vec::new(), None);
+        stream
+            .runtime
+            .timeline_watches
+            .insert(key.clone(), Box::pin(stream::pending()));
+        stream.effects = vec![
+            QueuedEffect {
+                access_generation: 0,
+                effect: ClientEffect::Session(SessionEffect::Watch { open_id: 1 }),
+            },
+            QueuedEffect {
+                access_generation: 0,
+                effect: ClientEffect::Session(SessionEffect::List),
+            },
+            QueuedEffect {
+                access_generation: 0,
+                effect: ClientEffect::Session(SessionEffect::WatchTimeline {
+                    key: key.clone(),
+                    open_id: 2,
+                }),
+            },
+            QueuedEffect {
+                access_generation: 0,
+                effect: ClientEffect::Session(SessionEffect::GetTimeline {
+                    session_id: "session".to_owned(),
+                    query: None,
+                }),
+            },
+            QueuedEffect {
+                access_generation: 0,
+                effect: ClientEffect::Session(SessionEffect::SearchTemplates {
+                    request_id: "search".to_owned(),
+                    session_id: "session".to_owned(),
+                    query: String::new(),
+                    limit: 1,
+                    kinds: Vec::new(),
+                    target: crate::SessionTemplateSearchTarget::Resources,
+                    cursor: None,
+                }),
+            },
+        ];
+        let event = ClientEvent::Session(SessionEvent::WatchChanged(crate::SessionWatchUpdate {
+            sequence: 1,
+            event: crate::SessionWatchEvent::Cleared,
+        }));
+
+        stream.clear_session_runtime_for_event(&event);
+
+        assert!(stream.runtime.timeline_watches.is_empty());
+        assert!(matches!(
+            stream.effects.as_slice(),
+            [QueuedEffect {
+                effect: ClientEffect::Session(SessionEffect::Watch { open_id: 1 }),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn stale_wipe_completion_does_not_cancel_current_session_runtime() {
+        let mut stream =
+            ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream(no_sleep);
+        let wipe = stream.runtime.reducer.wipe_sessions();
+        let [ClientEffect::Session(SessionEffect::Wipe { operation_key })] = wipe.effects() else {
+            panic!("session wipe effect");
+        };
+        let operation_key = operation_key.clone();
+        let key = TimelineWatchKey::new("session".to_owned(), None, Vec::new(), None);
+        stream
+            .runtime
+            .timeline_watches
+            .insert(key, Box::pin(stream::pending()));
+        stream.in_flight = Some(InFlightEffect {
+            access_generation: 0,
+            effect: ClientEffect::Session(SessionEffect::List),
+            future: async {
+                ExecutedEffect::Events(vec![ClientEvent::Session(SessionEvent::Listed(vec![
+                    crate::SessionSummary {
+                        id: "stale".to_owned(),
+                        ..crate::SessionSummary::default()
+                    },
+                ]))])
+            }
+            .boxed_local(),
+        });
+
+        stream.clear_session_runtime_for_event(&ClientEvent::Session(SessionEvent::Wiped {
+            operation_key: "stale".to_owned(),
+        }));
+        assert_eq!(stream.runtime.timeline_watches.len(), 1);
+        assert!(stream.in_flight.is_some());
+
+        stream.clear_session_runtime_for_event(&ClientEvent::Session(SessionEvent::Wiped {
+            operation_key,
+        }));
+        assert!(stream.runtime.timeline_watches.is_empty());
+        assert!(stream.in_flight.is_none());
+        assert!(stream.runtime.reducer.state().sessions.current.is_empty());
+    }
+
+    #[test]
+    fn remote_clear_cancels_in_flight_list_before_stale_completion() {
+        let mut stream =
+            ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream(no_sleep);
+        let update = stream.runtime.reducer.request_sessions();
+        assert_eq!(
+            update.effects(),
+            &[ClientEffect::Session(SessionEffect::List)]
+        );
+        let (sender, receiver) = oneshot::channel();
+        stream.in_flight = Some(InFlightEffect {
+            access_generation: 0,
+            effect: ClientEffect::Session(SessionEffect::List),
+            future: async move {
+                ExecutedEffect::Events(vec![ClientEvent::Session(SessionEvent::Listed(
+                    receiver.await.expect("list completion sender"),
+                ))])
+            }
+            .boxed_local(),
+        });
+        let clear = ClientEvent::Session(SessionEvent::WatchChanged(crate::SessionWatchUpdate {
+            sequence: 1,
+            event: crate::SessionWatchEvent::Cleared,
+        }));
+
+        stream.clear_session_runtime_for_event(&clear);
+        drop(stream.runtime.reducer.apply(clear));
+        let stale = vec![crate::SessionSummary {
+            id: "stale".to_owned(),
+            ..crate::SessionSummary::default()
+        }];
+
+        assert!(stream.in_flight.is_none());
+        assert!(sender.send(stale).is_err());
+        assert!(stream.runtime.reducer.state().sessions.current.is_empty());
+        assert_eq!(
+            stream.runtime.reducer.state().sessions.list.status,
+            OperationStatus::Ready
+        );
+        assert_eq!(
+            stream.runtime.reducer.request_sessions().effects(),
+            &[ClientEffect::Session(SessionEffect::List)]
+        );
+    }
+
     #[tokio::test]
     async fn ready_state_without_config_interest_yields_without_waiting_for_status_watch() {
         let mut runtime = ClientRuntime::for_endpoint("http://127.0.0.1:0");
@@ -3840,7 +4052,7 @@ mod tests {
         TimelineEvent {
             session_id: session_id.to_owned(),
             cursor,
-            item_id: format!("item-{cursor}"),
+            item_id: format!("i{cursor}"),
             ..TimelineEvent::default()
         }
     }

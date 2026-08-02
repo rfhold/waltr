@@ -1096,7 +1096,15 @@ error: string | null,
 /**
  * Deleted session id.
  */
-id: string, } | { "kind": "sessionRuntimeConfigUpdate",
+id: string, } | { "kind": "sessionWipe",
+/**
+ * Stable operation status name.
+ */
+status: string,
+/**
+ * Last operation error, when present.
+ */
+error: string | null, } | { "kind": "sessionRuntimeConfigUpdate",
 /**
  * Stable operation status name.
  */
@@ -1263,6 +1271,10 @@ list: OperationSnapshot,
  * Session delete operation snapshot.
  */
 delete: OperationSnapshot,
+/**
+ * Session wipe operation snapshot.
+ */
+wipe: OperationSnapshot,
 /**
  * Session runtime metadata update operation snapshot.
  */
@@ -1456,7 +1468,7 @@ defaults: RuntimeDefaultsView | null, } | { "type": "registerConfigWatchInterest
 /**
  * Session id to delete.
  */
-id: string, } | { "type": "updateSessionRuntimeConfig",
+id: string, } | { "type": "wipeSessions" } | { "type": "updateSessionRuntimeConfig",
 /**
  * Session id to update.
  */
