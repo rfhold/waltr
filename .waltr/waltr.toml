@@ -1,69 +1,5 @@
 etag = ""
 
-[providers.agent-gateway-anthropic]
-type = 1
-name = "agent-gateway-anthropic"
-url = "https://agent-gateway.holdenitdown.net/v1/messages"
-oauth_compatible = false
-
-[providers.agent-gateway-anthropic.headers]
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6"]
-name = "Sonnet 4.6"
-type = 1
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".options]
-reasoning_efforts = []
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".limits]
-
-[providers.agent-gateway-anthropic.models."anthropic/claude-sonnet-4-6".capabilities]
-tools = false
-image = false
-
-[providers.agent-gateway-openai]
-type = 2
-name = "agent-gateway-openai"
-url = "https://agent-gateway.holdenitdown.net/v1/chat/completions"
-oauth_compatible = false
-
-[providers.agent-gateway-openai.headers]
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5"]
-name = "GPT 5.5"
-type = 1
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5".options]
-reasoning_efforts = []
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5".limits]
-
-[providers.agent-gateway-openai.models."openai/gpt-5.5".capabilities]
-tools = true
-image = true
-
-[providers.openai]
-type = 2
-name = "openai"
-url = "https://api.openai.com/v1/chat/completions"
-oauth_compatible = false
-
-[providers.openai.headers]
-Authorization = "Bearer ${env:OPENAI_API_KEY}"
-
-[providers.openai.models."gpt-5.5"]
-name = "GPT 5.5"
-type = 1
-
-[providers.openai.models."gpt-5.5".options]
-reasoning_efforts = []
-
-[providers.openai.models."gpt-5.5".limits]
-
-[providers.openai.models."gpt-5.5".capabilities]
-tools = true
-image = true
-
 [providers.anthropic]
 type = 1
 name = "anthropic"
@@ -73,12 +9,42 @@ oauth_compatible = false
 [providers.anthropic.headers]
 x-api-key = "${env:ANTHROPIC_API_KEY}"
 
-[providers.anthropic.models.claude-haiku-4-5]
-name = "Claude Haiku 4.5"
+[providers.anthropic.models.claude-fable-5]
+name = "Claude Fable 5"
 type = 1
 
-[providers.anthropic.models.claude-haiku-4-5.options]
-reasoning_efforts = []
+[providers.anthropic.models.claude-fable-5.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.anthropic.models.claude-fable-5.limits]
+context = 1000000
+output = 128000
+
+[providers.anthropic.models.claude-fable-5.capabilities]
+tools = true
+image = true
+
+[providers.anthropic.models.claude-fable-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-fable-5"
+source = 3
+
+[providers.anthropic.models.claude-fable-5.cost]
+input_per_million_tokens = 10.0
+output_per_million_tokens = 50.0
+cache_read_per_million_tokens = 1.0
+cache_write_per_million_tokens = 12.5
+currency = "USD"
+
+[providers.anthropic.models.claude-haiku-4-5]
+name = "Claude Haiku 4.5 (latest)"
+type = 1
 
 [providers.anthropic.models.claude-haiku-4-5.limits]
 context = 200000
@@ -93,15 +59,181 @@ provider_id = "anthropic"
 model_id = "claude-haiku-4-5"
 source = 3
 
-[providers.anthropic.models.claude-sonnet-4-5]
-name = "Claude Sonnet 4.5"
+[providers.anthropic.models.claude-haiku-4-5.cost]
+input_per_million_tokens = 1.0
+output_per_million_tokens = 5.0
+cache_read_per_million_tokens = 0.1
+cache_write_per_million_tokens = 1.25
+currency = "USD"
+
+[providers.anthropic.models.claude-opus-4-5]
+name = "Claude Opus 4.5 (latest)"
 type = 1
 
-[providers.anthropic.models.claude-sonnet-4-5.options]
-reasoning_efforts = []
+[providers.anthropic.models.claude-opus-4-5.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+]
+
+[providers.anthropic.models.claude-opus-4-5.limits]
+context = 200000
+output = 64000
+
+[providers.anthropic.models.claude-opus-4-5.capabilities]
+tools = true
+image = true
+
+[providers.anthropic.models.claude-opus-4-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-5"
+source = 3
+
+[providers.anthropic.models.claude-opus-4-5.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.anthropic.models.claude-opus-4-6]
+name = "Claude Opus 4.6"
+type = 1
+
+[providers.anthropic.models.claude-opus-4-6.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+]
+
+[providers.anthropic.models.claude-opus-4-6.limits]
+context = 1000000
+output = 128000
+
+[providers.anthropic.models.claude-opus-4-6.capabilities]
+tools = true
+image = true
+
+[providers.anthropic.models.claude-opus-4-6.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-6"
+source = 3
+
+[providers.anthropic.models.claude-opus-4-6.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.anthropic.models.claude-opus-4-7]
+name = "Claude Opus 4.7"
+type = 1
+
+[providers.anthropic.models.claude-opus-4-7.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.anthropic.models.claude-opus-4-7.limits]
+context = 1000000
+output = 128000
+
+[providers.anthropic.models.claude-opus-4-7.capabilities]
+tools = true
+image = true
+
+[providers.anthropic.models.claude-opus-4-7.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-7"
+source = 3
+
+[providers.anthropic.models.claude-opus-4-7.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.anthropic.models.claude-opus-4-8]
+name = "Claude Opus 4.8"
+type = 1
+
+[providers.anthropic.models.claude-opus-4-8.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.anthropic.models.claude-opus-4-8.limits]
+context = 1000000
+output = 128000
+
+[providers.anthropic.models.claude-opus-4-8.capabilities]
+tools = true
+image = true
+
+[providers.anthropic.models.claude-opus-4-8.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-8"
+source = 3
+
+[providers.anthropic.models.claude-opus-4-8.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.anthropic.models.claude-opus-5]
+name = "Claude Opus 5"
+type = 1
+
+[providers.anthropic.models.claude-opus-5.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.anthropic.models.claude-opus-5.limits]
+context = 1000000
+output = 128000
+
+[providers.anthropic.models.claude-opus-5.capabilities]
+tools = true
+image = true
+
+[providers.anthropic.models.claude-opus-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-5"
+source = 3
+
+[providers.anthropic.models.claude-opus-5.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.anthropic.models.claude-sonnet-4-5]
+name = "Claude Sonnet 4.5 (latest)"
+type = 1
 
 [providers.anthropic.models.claude-sonnet-4-5.limits]
-context = 200000
+context = 1000000
 output = 64000
 
 [providers.anthropic.models.claude-sonnet-4-5.capabilities]
@@ -112,6 +244,13 @@ image = true
 provider_id = "anthropic"
 model_id = "claude-sonnet-4-5"
 source = 3
+
+[providers.anthropic.models.claude-sonnet-4-5.cost]
+input_per_million_tokens = 3.0
+output_per_million_tokens = 15.0
+cache_read_per_million_tokens = 0.3
+cache_write_per_million_tokens = 3.75
+currency = "USD"
 
 [providers.anthropic.models.claude-sonnet-4-6]
 name = "Claude Sonnet 4.6"
@@ -127,7 +266,7 @@ reasoning_efforts = [
 
 [providers.anthropic.models.claude-sonnet-4-6.limits]
 context = 1000000
-output = 64000
+output = 128000
 
 [providers.anthropic.models.claude-sonnet-4-6.capabilities]
 tools = true
@@ -138,18 +277,28 @@ provider_id = "anthropic"
 model_id = "claude-sonnet-4-6"
 source = 3
 
+[providers.anthropic.models.claude-sonnet-4-6.cost]
+input_per_million_tokens = 3.0
+output_per_million_tokens = 15.0
+cache_read_per_million_tokens = 0.3
+cache_write_per_million_tokens = 3.75
+currency = "USD"
+
 [providers.anthropic.models.claude-sonnet-5]
 name = "Claude Sonnet 5"
 type = 1
 
 [providers.anthropic.models.claude-sonnet-5.options]
 reasoning_efforts = [
-    "medium",
     "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
 ]
 
 [providers.anthropic.models.claude-sonnet-5.limits]
-context = 128000
+context = 1000000
 output = 128000
 
 [providers.anthropic.models.claude-sonnet-5.capabilities]
@@ -159,7 +308,14 @@ image = true
 [providers.anthropic.models.claude-sonnet-5.catalog_match]
 provider_id = "anthropic"
 model_id = "claude-sonnet-5"
-source = 2
+source = 3
+
+[providers.anthropic.models.claude-sonnet-5.cost]
+input_per_million_tokens = 2.0
+output_per_million_tokens = 10.0
+cache_read_per_million_tokens = 0.2
+cache_write_per_million_tokens = 2.5
+currency = "USD"
 
 [providers.claude-code]
 type = 1
@@ -172,12 +328,42 @@ anthropic-beta = "claude-code-20250219,oauth-2025-04-20"
 user-agent = "claude-cli/2.1.75"
 x-app = "cli"
 
-[providers.claude-code.models.claude-haiku-4-5]
-name = "Claude Haiku 4.5"
+[providers.claude-code.models.claude-fable-5]
+name = "Claude Fable 5"
 type = 1
 
-[providers.claude-code.models.claude-haiku-4-5.options]
-reasoning_efforts = []
+[providers.claude-code.models.claude-fable-5.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.claude-code.models.claude-fable-5.limits]
+context = 1000000
+output = 128000
+
+[providers.claude-code.models.claude-fable-5.capabilities]
+tools = true
+image = true
+
+[providers.claude-code.models.claude-fable-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-fable-5"
+source = 3
+
+[providers.claude-code.models.claude-fable-5.cost]
+input_per_million_tokens = 10.0
+output_per_million_tokens = 50.0
+cache_read_per_million_tokens = 1.0
+cache_write_per_million_tokens = 12.5
+currency = "USD"
+
+[providers.claude-code.models.claude-haiku-4-5]
+name = "Claude Haiku 4.5 (latest)"
+type = 1
 
 [providers.claude-code.models.claude-haiku-4-5.limits]
 context = 200000
@@ -192,15 +378,181 @@ provider_id = "anthropic"
 model_id = "claude-haiku-4-5"
 source = 3
 
-[providers.claude-code.models.claude-sonnet-4-5]
-name = "Claude Sonnet 4.5"
+[providers.claude-code.models.claude-haiku-4-5.cost]
+input_per_million_tokens = 1.0
+output_per_million_tokens = 5.0
+cache_read_per_million_tokens = 0.1
+cache_write_per_million_tokens = 1.25
+currency = "USD"
+
+[providers.claude-code.models.claude-opus-4-5]
+name = "Claude Opus 4.5 (latest)"
 type = 1
 
-[providers.claude-code.models.claude-sonnet-4-5.options]
-reasoning_efforts = []
+[providers.claude-code.models.claude-opus-4-5.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+]
+
+[providers.claude-code.models.claude-opus-4-5.limits]
+context = 200000
+output = 64000
+
+[providers.claude-code.models.claude-opus-4-5.capabilities]
+tools = true
+image = true
+
+[providers.claude-code.models.claude-opus-4-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-5"
+source = 3
+
+[providers.claude-code.models.claude-opus-4-5.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.claude-code.models.claude-opus-4-6]
+name = "Claude Opus 4.6"
+type = 1
+
+[providers.claude-code.models.claude-opus-4-6.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+]
+
+[providers.claude-code.models.claude-opus-4-6.limits]
+context = 1000000
+output = 128000
+
+[providers.claude-code.models.claude-opus-4-6.capabilities]
+tools = true
+image = true
+
+[providers.claude-code.models.claude-opus-4-6.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-6"
+source = 3
+
+[providers.claude-code.models.claude-opus-4-6.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.claude-code.models.claude-opus-4-7]
+name = "Claude Opus 4.7"
+type = 1
+
+[providers.claude-code.models.claude-opus-4-7.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.claude-code.models.claude-opus-4-7.limits]
+context = 1000000
+output = 128000
+
+[providers.claude-code.models.claude-opus-4-7.capabilities]
+tools = true
+image = true
+
+[providers.claude-code.models.claude-opus-4-7.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-7"
+source = 3
+
+[providers.claude-code.models.claude-opus-4-7.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.claude-code.models.claude-opus-4-8]
+name = "Claude Opus 4.8"
+type = 1
+
+[providers.claude-code.models.claude-opus-4-8.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.claude-code.models.claude-opus-4-8.limits]
+context = 1000000
+output = 128000
+
+[providers.claude-code.models.claude-opus-4-8.capabilities]
+tools = true
+image = true
+
+[providers.claude-code.models.claude-opus-4-8.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-4-8"
+source = 3
+
+[providers.claude-code.models.claude-opus-4-8.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.claude-code.models.claude-opus-5]
+name = "Claude Opus 5"
+type = 1
+
+[providers.claude-code.models.claude-opus-5.options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
+]
+
+[providers.claude-code.models.claude-opus-5.limits]
+context = 1000000
+output = 128000
+
+[providers.claude-code.models.claude-opus-5.capabilities]
+tools = true
+image = true
+
+[providers.claude-code.models.claude-opus-5.catalog_match]
+provider_id = "anthropic"
+model_id = "claude-opus-5"
+source = 3
+
+[providers.claude-code.models.claude-opus-5.cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 25.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.claude-code.models.claude-sonnet-4-5]
+name = "Claude Sonnet 4.5 (latest)"
+type = 1
 
 [providers.claude-code.models.claude-sonnet-4-5.limits]
-context = 200000
+context = 1000000
 output = 64000
 
 [providers.claude-code.models.claude-sonnet-4-5.capabilities]
@@ -211,6 +563,13 @@ image = true
 provider_id = "anthropic"
 model_id = "claude-sonnet-4-5"
 source = 3
+
+[providers.claude-code.models.claude-sonnet-4-5.cost]
+input_per_million_tokens = 3.0
+output_per_million_tokens = 15.0
+cache_read_per_million_tokens = 0.3
+cache_write_per_million_tokens = 3.75
+currency = "USD"
 
 [providers.claude-code.models.claude-sonnet-4-6]
 name = "Claude Sonnet 4.6"
@@ -226,7 +585,7 @@ reasoning_efforts = [
 
 [providers.claude-code.models.claude-sonnet-4-6.limits]
 context = 1000000
-output = 64000
+output = 128000
 
 [providers.claude-code.models.claude-sonnet-4-6.capabilities]
 tools = true
@@ -237,18 +596,28 @@ provider_id = "anthropic"
 model_id = "claude-sonnet-4-6"
 source = 3
 
+[providers.claude-code.models.claude-sonnet-4-6.cost]
+input_per_million_tokens = 3.0
+output_per_million_tokens = 15.0
+cache_read_per_million_tokens = 0.3
+cache_write_per_million_tokens = 3.75
+currency = "USD"
+
 [providers.claude-code.models.claude-sonnet-5]
 name = "Claude Sonnet 5"
 type = 1
 
 [providers.claude-code.models.claude-sonnet-5.options]
 reasoning_efforts = [
-    "medium",
     "high",
+    "low",
+    "max",
+    "medium",
+    "xhigh",
 ]
 
 [providers.claude-code.models.claude-sonnet-5.limits]
-context = 128000
+context = 1000000
 output = 128000
 
 [providers.claude-code.models.claude-sonnet-5.capabilities]
@@ -258,7 +627,14 @@ image = true
 [providers.claude-code.models.claude-sonnet-5.catalog_match]
 provider_id = "anthropic"
 model_id = "claude-sonnet-5"
-source = 2
+source = 3
+
+[providers.claude-code.models.claude-sonnet-5.cost]
+input_per_million_tokens = 2.0
+output_per_million_tokens = 10.0
+cache_read_per_million_tokens = 0.2
+cache_write_per_million_tokens = 2.5
+currency = "USD"
 
 [providers.claude-code.oauth_settings]
 name = "Claude Code"
@@ -283,30 +659,73 @@ key = "code"
 value = "true"
 
 [providers.codex]
-type = 4
+type = 3
 name = "codex"
-url = "wss://chatgpt.com/backend-api/codex/responses"
+url = "https://chatgpt.com/backend-api/codex/responses"
 oauth_compatible = true
 
 [providers.codex.headers]
 OpenAI-Beta = "responses=experimental"
+accept = "text/event-stream"
 originator = "waltr"
 
-[providers.codex.models.gpt-5-codex]
-name = "gpt-5-codex"
+[providers.codex.models."gpt-5.3-chat-latest"]
+name = "GPT-5.3 Chat (latest)"
 type = 1
 
-[providers.codex.models.gpt-5-codex.options]
-reasoning_efforts = []
+[providers.codex.models."gpt-5.3-chat-latest".limits]
+context = 128000
+output = 16384
 
-[providers.codex.models.gpt-5-codex.limits]
-
-[providers.codex.models.gpt-5-codex.capabilities]
+[providers.codex.models."gpt-5.3-chat-latest".capabilities]
 tools = true
-image = false
+image = true
+
+[providers.codex.models."gpt-5.3-chat-latest".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.3-chat-latest"
+source = 3
+
+[providers.codex.models."gpt-5.3-chat-latest".cost]
+input_per_million_tokens = 1.75
+output_per_million_tokens = 14.0
+cache_read_per_million_tokens = 0.175
+currency = "USD"
+
+[providers.codex.models."gpt-5.3-codex"]
+name = "GPT-5.3 Codex"
+type = 1
+
+[providers.codex.models."gpt-5.3-codex".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.3-codex".limits]
+context = 400000
+output = 128000
+
+[providers.codex.models."gpt-5.3-codex".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.3-codex".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.3-codex"
+source = 3
+
+[providers.codex.models."gpt-5.3-codex".cost]
+input_per_million_tokens = 1.75
+output_per_million_tokens = 14.0
+cache_read_per_million_tokens = 0.175
+currency = "USD"
 
 [providers.codex.models."gpt-5.3-codex-spark"]
-name = "GPT 5.3 Codex Spark"
+name = "GPT-5.3 Codex Spark"
 type = 1
 
 [providers.codex.models."gpt-5.3-codex-spark".options]
@@ -337,8 +756,133 @@ output_per_million_tokens = 14.0
 cache_read_per_million_tokens = 0.175
 currency = "USD"
 
+[providers.codex.models."gpt-5.4"]
+name = "GPT-5.4"
+type = 1
+
+[providers.codex.models."gpt-5.4".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.4".limits]
+context = 1050000
+output = 128000
+
+[providers.codex.models."gpt-5.4".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.4".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4"
+source = 3
+
+[providers.codex.models."gpt-5.4".cost]
+input_per_million_tokens = 2.5
+output_per_million_tokens = 15.0
+cache_read_per_million_tokens = 0.25
+currency = "USD"
+
+[providers.codex.models."gpt-5.4-mini"]
+name = "GPT-5.4 mini"
+type = 1
+
+[providers.codex.models."gpt-5.4-mini".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.4-mini".limits]
+context = 400000
+output = 128000
+
+[providers.codex.models."gpt-5.4-mini".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.4-mini".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4-mini"
+source = 3
+
+[providers.codex.models."gpt-5.4-mini".cost]
+input_per_million_tokens = 0.75
+output_per_million_tokens = 4.5
+cache_read_per_million_tokens = 0.075
+currency = "USD"
+
+[providers.codex.models."gpt-5.4-nano"]
+name = "GPT-5.4 nano"
+type = 1
+
+[providers.codex.models."gpt-5.4-nano".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.4-nano".limits]
+context = 400000
+output = 128000
+
+[providers.codex.models."gpt-5.4-nano".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.4-nano".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4-nano"
+source = 3
+
+[providers.codex.models."gpt-5.4-nano".cost]
+input_per_million_tokens = 0.2
+output_per_million_tokens = 1.25
+cache_read_per_million_tokens = 0.02
+currency = "USD"
+
+[providers.codex.models."gpt-5.4-pro"]
+name = "GPT-5.4 Pro"
+type = 1
+
+[providers.codex.models."gpt-5.4-pro".options]
+reasoning_efforts = [
+    "high",
+    "medium",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.4-pro".limits]
+context = 1050000
+output = 128000
+
+[providers.codex.models."gpt-5.4-pro".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.4-pro".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4-pro"
+source = 3
+
+[providers.codex.models."gpt-5.4-pro".cost]
+input_per_million_tokens = 30.0
+output_per_million_tokens = 180.0
+currency = "USD"
+
 [providers.codex.models."gpt-5.5"]
-name = "GPT 5.5"
+name = "GPT-5.5"
 type = 1
 
 [providers.codex.models."gpt-5.5".options]
@@ -351,7 +895,7 @@ reasoning_efforts = [
 ]
 
 [providers.codex.models."gpt-5.5".limits]
-context = 128000
+context = 1050000
 output = 128000
 
 [providers.codex.models."gpt-5.5".capabilities]
@@ -367,6 +911,171 @@ source = 3
 input_per_million_tokens = 5.0
 output_per_million_tokens = 30.0
 cache_read_per_million_tokens = 0.5
+currency = "USD"
+
+[providers.codex.models."gpt-5.5-pro"]
+name = "GPT-5.5 Pro"
+type = 1
+
+[providers.codex.models."gpt-5.5-pro".options]
+reasoning_efforts = [
+    "high",
+    "medium",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.5-pro".limits]
+context = 1050000
+output = 128000
+
+[providers.codex.models."gpt-5.5-pro".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.5-pro".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.5-pro"
+source = 3
+
+[providers.codex.models."gpt-5.5-pro".cost]
+input_per_million_tokens = 30.0
+output_per_million_tokens = 180.0
+currency = "USD"
+
+[providers.codex.models."gpt-5.6"]
+name = "GPT-5.6"
+type = 1
+
+[providers.codex.models."gpt-5.6".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.6".limits]
+context = 1050000
+output = 128000
+
+[providers.codex.models."gpt-5.6".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.6".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6"
+source = 3
+
+[providers.codex.models."gpt-5.6".cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 30.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.codex.models."gpt-5.6-luna"]
+name = "GPT-5.6 Luna"
+type = 1
+
+[providers.codex.models."gpt-5.6-luna".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.6-luna".limits]
+context = 1050000
+output = 128000
+
+[providers.codex.models."gpt-5.6-luna".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.6-luna".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6-luna"
+source = 3
+
+[providers.codex.models."gpt-5.6-luna".cost]
+input_per_million_tokens = 0.2
+output_per_million_tokens = 1.2
+cache_read_per_million_tokens = 0.02
+cache_write_per_million_tokens = 0.25
+currency = "USD"
+
+[providers.codex.models."gpt-5.6-sol"]
+name = "GPT-5.6 Sol"
+type = 1
+
+[providers.codex.models."gpt-5.6-sol".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.6-sol".limits]
+context = 1050000
+output = 128000
+
+[providers.codex.models."gpt-5.6-sol".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.6-sol".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6-sol"
+source = 3
+
+[providers.codex.models."gpt-5.6-sol".cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 30.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.codex.models."gpt-5.6-terra"]
+name = "GPT-5.6 Terra"
+type = 1
+
+[providers.codex.models."gpt-5.6-terra".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.codex.models."gpt-5.6-terra".limits]
+context = 1050000
+output = 128000
+
+[providers.codex.models."gpt-5.6-terra".capabilities]
+tools = true
+image = true
+
+[providers.codex.models."gpt-5.6-terra".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6-terra"
+source = 3
+
+[providers.codex.models."gpt-5.6-terra".cost]
+input_per_million_tokens = 2.0
+output_per_million_tokens = 12.0
+cache_read_per_million_tokens = 0.2
+cache_write_per_million_tokens = 2.5
 currency = "USD"
 
 [providers.codex.oauth_settings]
@@ -407,15 +1116,432 @@ claim_names = [
 ]
 required = true
 
-[mcp_servers.playwrite]
-name = "playwrite"
+[providers.openai]
+type = 2
+name = "openai"
+url = "https://api.openai.com/v1/chat/completions"
+oauth_compatible = false
+
+[providers.openai.headers]
+Authorization = "Bearer ${env:OPENAI_API_KEY}"
+
+[providers.openai.models."gpt-5.3-chat-latest"]
+name = "GPT-5.3 Chat (latest)"
 type = 1
-command = "pnpx @playwright/mcp@latest"
-url = ""
+
+[providers.openai.models."gpt-5.3-chat-latest".limits]
+context = 128000
+output = 16384
+
+[providers.openai.models."gpt-5.3-chat-latest".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.3-chat-latest".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.3-chat-latest"
+source = 3
+
+[providers.openai.models."gpt-5.3-chat-latest".cost]
+input_per_million_tokens = 1.75
+output_per_million_tokens = 14.0
+cache_read_per_million_tokens = 0.175
+currency = "USD"
+
+[providers.openai.models."gpt-5.3-codex"]
+name = "GPT-5.3 Codex"
+type = 1
+
+[providers.openai.models."gpt-5.3-codex".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.3-codex".limits]
+context = 400000
+output = 128000
+
+[providers.openai.models."gpt-5.3-codex".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.3-codex".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.3-codex"
+source = 3
+
+[providers.openai.models."gpt-5.3-codex".cost]
+input_per_million_tokens = 1.75
+output_per_million_tokens = 14.0
+cache_read_per_million_tokens = 0.175
+currency = "USD"
+
+[providers.openai.models."gpt-5.3-codex-spark"]
+name = "GPT-5.3 Codex Spark"
+type = 1
+
+[providers.openai.models."gpt-5.3-codex-spark".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.3-codex-spark".limits]
+context = 128000
+output = 32000
+
+[providers.openai.models."gpt-5.3-codex-spark".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.3-codex-spark".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.3-codex-spark"
+source = 3
+
+[providers.openai.models."gpt-5.3-codex-spark".cost]
+input_per_million_tokens = 1.75
+output_per_million_tokens = 14.0
+cache_read_per_million_tokens = 0.175
+currency = "USD"
+
+[providers.openai.models."gpt-5.4"]
+name = "GPT-5.4"
+type = 1
+
+[providers.openai.models."gpt-5.4".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.4".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.4".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.4".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4"
+source = 3
+
+[providers.openai.models."gpt-5.4".cost]
+input_per_million_tokens = 2.5
+output_per_million_tokens = 15.0
+cache_read_per_million_tokens = 0.25
+currency = "USD"
+
+[providers.openai.models."gpt-5.4-mini"]
+name = "GPT-5.4 mini"
+type = 1
+
+[providers.openai.models."gpt-5.4-mini".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.4-mini".limits]
+context = 400000
+output = 128000
+
+[providers.openai.models."gpt-5.4-mini".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.4-mini".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4-mini"
+source = 3
+
+[providers.openai.models."gpt-5.4-mini".cost]
+input_per_million_tokens = 0.75
+output_per_million_tokens = 4.5
+cache_read_per_million_tokens = 0.075
+currency = "USD"
+
+[providers.openai.models."gpt-5.4-nano"]
+name = "GPT-5.4 nano"
+type = 1
+
+[providers.openai.models."gpt-5.4-nano".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.4-nano".limits]
+context = 400000
+output = 128000
+
+[providers.openai.models."gpt-5.4-nano".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.4-nano".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4-nano"
+source = 3
+
+[providers.openai.models."gpt-5.4-nano".cost]
+input_per_million_tokens = 0.2
+output_per_million_tokens = 1.25
+cache_read_per_million_tokens = 0.02
+currency = "USD"
+
+[providers.openai.models."gpt-5.4-pro"]
+name = "GPT-5.4 Pro"
+type = 1
+
+[providers.openai.models."gpt-5.4-pro".options]
+reasoning_efforts = [
+    "high",
+    "medium",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.4-pro".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.4-pro".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.4-pro".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.4-pro"
+source = 3
+
+[providers.openai.models."gpt-5.4-pro".cost]
+input_per_million_tokens = 30.0
+output_per_million_tokens = 180.0
+currency = "USD"
+
+[providers.openai.models."gpt-5.5"]
+name = "GPT-5.5"
+type = 1
+
+[providers.openai.models."gpt-5.5".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.5".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.5".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.5".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.5"
+source = 3
+
+[providers.openai.models."gpt-5.5".cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 30.0
+cache_read_per_million_tokens = 0.5
+currency = "USD"
+
+[providers.openai.models."gpt-5.5-pro"]
+name = "GPT-5.5 Pro"
+type = 1
+
+[providers.openai.models."gpt-5.5-pro".options]
+reasoning_efforts = [
+    "high",
+    "medium",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.5-pro".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.5-pro".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.5-pro".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.5-pro"
+source = 3
+
+[providers.openai.models."gpt-5.5-pro".cost]
+input_per_million_tokens = 30.0
+output_per_million_tokens = 180.0
+currency = "USD"
+
+[providers.openai.models."gpt-5.6"]
+name = "GPT-5.6"
+type = 1
+
+[providers.openai.models."gpt-5.6".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.6".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.6".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.6".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6"
+source = 3
+
+[providers.openai.models."gpt-5.6".cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 30.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.openai.models."gpt-5.6-luna"]
+name = "GPT-5.6 Luna"
+type = 1
+
+[providers.openai.models."gpt-5.6-luna".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.6-luna".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.6-luna".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.6-luna".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6-luna"
+source = 3
+
+[providers.openai.models."gpt-5.6-luna".cost]
+input_per_million_tokens = 0.2
+output_per_million_tokens = 1.2
+cache_read_per_million_tokens = 0.02
+cache_write_per_million_tokens = 0.25
+currency = "USD"
+
+[providers.openai.models."gpt-5.6-sol"]
+name = "GPT-5.6 Sol"
+type = 1
+
+[providers.openai.models."gpt-5.6-sol".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.6-sol".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.6-sol".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.6-sol".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6-sol"
+source = 3
+
+[providers.openai.models."gpt-5.6-sol".cost]
+input_per_million_tokens = 5.0
+output_per_million_tokens = 30.0
+cache_read_per_million_tokens = 0.5
+cache_write_per_million_tokens = 6.25
+currency = "USD"
+
+[providers.openai.models."gpt-5.6-terra"]
+name = "GPT-5.6 Terra"
+type = 1
+
+[providers.openai.models."gpt-5.6-terra".options]
+reasoning_efforts = [
+    "high",
+    "low",
+    "max",
+    "medium",
+    "none",
+    "xhigh",
+]
+
+[providers.openai.models."gpt-5.6-terra".limits]
+context = 1050000
+output = 128000
+
+[providers.openai.models."gpt-5.6-terra".capabilities]
+tools = true
+image = true
+
+[providers.openai.models."gpt-5.6-terra".catalog_match]
+provider_id = "openai"
+model_id = "gpt-5.6-terra"
+source = 3
+
+[providers.openai.models."gpt-5.6-terra".cost]
+input_per_million_tokens = 2.0
+output_per_million_tokens = 12.0
+cache_read_per_million_tokens = 0.2
+cache_write_per_million_tokens = 2.5
+currency = "USD"
+
+[mcp_servers.waltr]
+name = "waltr"
+type = 2
+command = ""
+url = "http://127.0.0.1:14333/mcp"
 
 [runtime_defaults]
 provider_key = "codex"
-model_key = "gpt-5.5"
+model_key = "gpt-5.6-sol"
 mcp_default_enabled = false
-enabled_mcp_server_keys = []
-reasoning_effort = "medium"
+enabled_mcp_server_keys = ["waltr"]
