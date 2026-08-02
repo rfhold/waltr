@@ -1482,7 +1482,7 @@ describe("sessions route", () => {
     timeline.events = [
       timelineEvent({
         cursor: 1n,
-        itemId: "external-request:permission-1",
+        itemId: "i1",
         kind: "externalRequestOpened",
         content: {
           kind: "externalRequest",
@@ -1495,7 +1495,7 @@ describe("sessions route", () => {
       }),
       timelineEvent({
         cursor: 2n,
-        itemId: "external-request:permission-1",
+        itemId: "i1",
         kind: "externalRequestResolved",
         status: "resolved",
         content: {
@@ -1529,7 +1529,7 @@ describe("sessions route", () => {
       timelineEvent({
         cursor: 3n,
         sessionId: "session-permission-reanswer",
-        itemId: "external-request:permission-1",
+        itemId: "i1",
         kind: "externalRequestOpened",
         content: {
           kind: "externalRequest",
@@ -1543,7 +1543,7 @@ describe("sessions route", () => {
       timelineEvent({
         cursor: 4n,
         sessionId: "session-permission-reanswer",
-        itemId: "external-request:permission-1",
+        itemId: "i1",
         kind: "externalRequestResolved",
         status: "resolved",
         content: {
@@ -1597,7 +1597,7 @@ describe("sessions route", () => {
       timelineEvent({
         cursor: 5n,
         sessionId: "session-question-reanswer",
-        itemId: "external-request:question-1",
+        itemId: "i1",
         kind: "externalRequestOpened",
         content: {
           kind: "externalRequest",
@@ -1607,7 +1607,7 @@ describe("sessions route", () => {
       timelineEvent({
         cursor: 6n,
         sessionId: "session-question-reanswer",
-        itemId: "external-request:question-1",
+        itemId: "i1",
         kind: "externalRequestResolved",
         status: "resolved",
         content: {
@@ -2130,7 +2130,7 @@ function timelineEvent(overrides: Partial<TimelineEventView> = {}): TimelineEven
     cursor: 1n,
     sessionId: "session-tools",
     turn: 1n,
-    itemId: "item-1",
+    itemId: "i1",
     parentId: null,
     kind: "itemUpdated",
     channel: null,
@@ -2149,7 +2149,7 @@ function externalRequestOpenEvent(options: {
 }): TimelineEventView {
   return timelineEvent({
     sessionId: options.sessionId,
-    itemId: `external-request:${options.requestId}`,
+    itemId: "i1",
     kind: "externalRequestOpened",
     channel: "external_request",
     content: {

@@ -108,6 +108,22 @@ export function SessionsRoute(props: ParentProps) {
       && sessionsSnapshot.watch.status !== "opened"
       && sessionsSnapshot.watch.status !== "received";
   });
+  let observedDetailSessionId: string | undefined;
+
+  createEffect(() => {
+    const id = params.sessionId;
+    if (!id || id === "data") {
+      observedDetailSessionId = undefined;
+      return;
+    }
+
+    if (sessions().some((session) => session.id === id)) {
+      observedDetailSessionId = id;
+    } else if (observedDetailSessionId === id) {
+      observedDetailSessionId = undefined;
+      navigate("/sessions");
+    }
+  });
   let registeredSessionWatchInterest = false;
   let requestedConfig = false;
   const readyForSessionWatch = createMemo(() => app.clientLoaded() && app.systemReady());
@@ -218,13 +234,16 @@ export function SessionsListRoute() {
       <SessionsHeader
         title="Sessions"
         action={
-          <button
-            type="button"
-            onClick={() => void sessions.createSession()}
-            disabled={sessions.createDisabled()}
-          >
-            {sessions.creating() ? "Creating..." : "Create session"}
-          </button>
+          <div class="sessions__header-actions">
+            <A class="sessions__data-link" href="/sessions/data">Manage session data</A>
+            <button
+              type="button"
+              onClick={() => void sessions.createSession()}
+              disabled={sessions.createDisabled()}
+            >
+              {sessions.creating() ? "Creating..." : "Create session"}
+            </button>
+          </div>
         }
       />
 
@@ -264,6 +283,90 @@ export function SessionsListRoute() {
           </ul>
         </Show>
       </section>
+    </section>
+  );
+}
+
+export function SessionsDataRoute() {
+  const app = useAppState();
+  const [confirmationOpen, setConfirmationOpen] = createSignal(false);
+  const [pending, setPending] = createSignal(false);
+  const [error, setError] = createSignal<string>();
+  const [succeeded, setSucceeded] = createSignal(false);
+  let wipeTrigger: HTMLButtonElement | undefined;
+
+  const wipeSessions = async () => {
+    if (pending()) return;
+
+    setPending(true);
+    setError(undefined);
+    setSucceeded(false);
+    try {
+      await app.dispatchWipeSessions();
+      setConfirmationOpen(false);
+      setSucceeded(true);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Unable to wipe agent sessions.");
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <section class="sessions sessions--data" aria-labelledby="sessions-title">
+      <nav class="sessions__breadcrumb" aria-label="Session data breadcrumb">
+        <A href="/sessions">Sessions</A>
+        <span>/</span>
+        <span>Data</span>
+      </nav>
+      <SessionsHeader title="Session data" />
+      <div class="sessions__data-panel">
+        <h2>Delete all agent sessions</h2>
+        <p>This permanently deletes all agent sessions and their conversation history.</p>
+        <p>This does not affect configuration, authentication, OAuth credentials, or MCP/Waltr SQL state.</p>
+        <Show
+          when={confirmationOpen()}
+          fallback={
+            <button
+              class="ui-button ui-button--danger"
+              type="button"
+              ref={wipeTrigger}
+              disabled={pending() || !app.clientLoaded() || !app.systemReady()}
+              onClick={() => {
+                setError(undefined);
+                setSucceeded(false);
+                setConfirmationOpen(true);
+              }}
+            >
+              Delete all sessions
+            </button>
+          }
+        >
+          <ConfirmAction
+            label="Delete all sessions confirmation"
+            prompt="Delete all agent sessions? This cannot be undone."
+            confirmLabel={pending() ? "Deleting..." : "Delete all sessions"}
+            confirmAriaLabel="Confirm delete all sessions"
+            cancelAriaLabel="Cancel delete all sessions"
+            focusConfirmOnMount
+            pending={pending()}
+            onConfirm={() => void wipeSessions()}
+            onCancel={() => {
+              if (!pending()) {
+                setConfirmationOpen(false);
+                setError(undefined);
+                queueMicrotask(() => wipeTrigger?.focus());
+              }
+            }}
+          />
+        </Show>
+        <Show when={error()}>
+          {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
+        </Show>
+        <Show when={succeeded()}>
+          <InlineAlert tone="success">All agent sessions deleted.</InlineAlert>
+        </Show>
+      </div>
     </section>
   );
 }

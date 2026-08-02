@@ -75,6 +75,24 @@ export default async function () {
     await waitForPathname(page, "/sessions");
     const listAfterDelete = await waitForMissingText(page, ".sessions__list-panel", sessionId);
 
+    await page.locator(".sessions__header button").click();
+    await waitForText(page, '[aria-label="Session detail"]', "");
+    const wipeSessionPathname = await page.evaluate(() => window.location.pathname);
+    const wipeSessionId = decodeURIComponent(wipeSessionPathname.replace(/^\/sessions\//, ""));
+    await page.locator('.shell__nav a[href="/sessions"]').click();
+    await waitForPathname(page, "/sessions");
+    await page.locator('a[href="/sessions/data"]').click();
+    await waitForPathname(page, "/sessions/data");
+    const wipeCopy = await waitForText(page, ".sessions__data-panel", "does not affect configuration, authentication, OAuth credentials, or MCP/Waltr SQL state");
+    await clickButtonByText(page, "Delete all sessions");
+    await screenshot(page, "sessions-wipe-confirmation");
+    await clickButtonByLabel(page, "Confirm delete all sessions");
+    const wipeSuccess = await waitForText(page, ".sessions__data-panel", "All agent sessions deleted.");
+    await waitForPathname(page, "/sessions/data");
+    await page.locator('.shell__nav a[href="/sessions"]').click();
+    await waitForPathname(page, "/sessions");
+    const listAfterWipe = await waitForMissingText(page, ".sessions__list-panel", wipeSessionId);
+
     check(null, {
       "session detail route reached": () => createdPathname.startsWith("/sessions/") && sessionId.length > 0,
       "session detail shows empty timeline": () => includesText(detailTimeline, "No messages yet."),
@@ -89,6 +107,10 @@ export default async function () {
       "session list contains created session": () => includesText(listedSession, sessionId),
       "session selection reopens detail": () => includesText(reopenedDetail, `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`),
       "session list omits deleted session": () => !includesText(listAfterDelete, sessionId),
+      "session wipe target created": () => wipeSessionPathname.startsWith("/sessions/") && wipeSessionId.length > 0,
+      "session wipe copy preserves unrelated state": () => includesText(wipeCopy, "configuration") && includesText(wipeCopy, "OAuth credentials"),
+      "session wipe succeeds in place": () => includesText(wipeSuccess, "All agent sessions deleted."),
+      "session list omits wiped session": () => !includesText(listAfterWipe, wipeSessionId),
     });
   });
 }
