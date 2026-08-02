@@ -1,38 +1,46 @@
-# Progressive Workflow Servers
+# Progressive Tool Servers
 
-The `mcp` crate exposes an opinionated progressive-workflow server pattern behind the `progressive` feature. It is implemented by `#[mcp::progressive_server]` and runtime helpers in `mcp::progressive`.
+The `mcp` crate exposes an opinionated progressive-tool server pattern behind the `progressive` feature. It is implemented by `#[mcp::progressive_server]` and runtime helpers in `mcp::progressive`.
 
-Progressive servers expose one tool, `exec`. Clients choose a dot-notated `action`, optional action-specific `input`, and an optional jq-compatible `filter` applied to JSON output.
+A progressive server declares one or more named MCP tools. Each tool accepts an `action`, optional action-specific `input`, and optional jq-compatible `filter`. Tools own separate actions, namespaces, help, schemas, runbooks, and runbook resource templates.
 
 ## Server Surface
 
 | Surface | Generated Behavior |
 | --- | --- |
-| Tool | One `exec` tool with `action`, `input`, and `filter` fields. |
-| Help actions | Built-in `help`, `help.<namespace>`, `help.workflows`, and `workflows.load` actions. |
-| Actions | `#[action(name = "namespace.action")]` methods dispatch through `exec`. |
-| Workflows | `#[workflow(name = "...")]` methods dispatch through `workflows.load`, prompts, and a workflow resource template. |
+| Tools | Every nested `tool(...)` declaration produces an independently described MCP tool. |
+| Help actions | Each tool provides `help`, `help.<namespace>`, and, when applicable, `help.runbooks`. |
+| Actions | `#[action(tool = "...", name = "...")]` methods dispatch only through their declared tool. |
+| Runbooks | `#[runbook(tool = "...", name = "...")]` methods are available through that tool's `runbooks.load`, prompts, and resource template. |
 | Resources | Actions can opt into fixed resources with `resource = "..."` or templates with `resource_template = "..."`. |
-| Instructions | Initialize instructions tell clients to call `exec` with action `help` first unless the user supplied a specific action. |
-| HTTP auth | If a `#[token_validator]` method is present, the macro generates the same Streamable HTTP protected-resource helpers as `#[mcp::mcp_server]`. Stdio remains unauthenticated. |
+| Instructions | Initialize instructions list the progressive tools and direct clients to call the relevant tool with action `help` first. |
+| HTTP auth | A `#[token_validator]` method generates the same Streamable HTTP protected-resource helpers as `#[mcp::mcp_server]`. Authentication is server-wide; stdio remains unauthenticated. |
 
-The default workflow resource template is `workflows://{workflow}`. Override it with `workflow_uri_template = "..."`.
+Tool declarations are explicit. There is no implicit `exec` tool. Each declaration requires a unique, non-empty name and a description. Namespaces and `runbook_uri_template` belong to the tool declaration rather than the server.
 
-`workflows.load` returns the workflow Markdown as text content and also includes object-shaped structured content with `workflow` and `markdown` fields.
+A tool that owns runbooks must declare a `runbook_uri_template` containing the `{runbook}` binding. Effective runbook templates must be unique across tools. `runbooks.load` returns Markdown as text content and object-shaped structured content containing `runbook` and `markdown`.
+
+## Tool Isolation
+
+Each listed tool has an independent action enum and action-specific `input.oneOf` schema. A call first selects the MCP tool and can then dispatch only an action owned by that tool. The same flat action name may exist in different tools.
+
+Actions may use flat names such as `list` or dot-namespaced names such as `releases.get`. Namespaced actions must use a namespace declared by their tool. Root `help` lists flat actions and declared namespaces; `help.<namespace>` lists that namespace's actions with descriptions, guidance, schemas, and resource bindings.
+
+Runbooks are tool-owned for loading and help, while MCP prompts are server-global. Runbook names must therefore be unique across the complete server and remain unprefixed in prompt listings.
+
+Prompts and resources exposed by the server are the union of declarations owned by its tools.
 
 ## Help Content
 
-Namespaces are declared on the server macro with descriptions. Root `help` lists each namespace and when to use it.
+Every `#[action]` and `#[runbook]` method must have a doc comment. The first non-empty line becomes the short description. The remaining body explains why and when an LLM should use it.
 
-Every `#[action]` and `#[workflow]` method must have a doc comment. The first non-empty doc line becomes the short description. The remaining doc body becomes guidance for why and when an LLM should use it.
-
-Namespace-specific help, such as `help.releases`, lists the namespace actions with their descriptions, guidance, input schemas, and resource bindings. `help.workflows` lists workflows with prompt and resource links.
+`help.runbooks` lists only the runbooks belonging to the called tool, with prompt and resource links. `runbooks.load` cannot load another tool's runbook.
 
 ## Input Schemas And Filters
 
-Action input types should derive `serde::Deserialize` and `schemars::JsonSchema`. The macro uses those schemas to build the `exec.input` `oneOf` schema.
+Action input types should derive `serde::Deserialize` and `schemars::JsonSchema`. The macro uses those schemas to build the owning tool's `input.oneOf` schema.
 
-The optional `filter` field uses a pure-Rust jaq evaluator. Tests cover common jq-style filters such as `.[].id`; invalid filters return MCP invalid-params errors.
+The optional `filter` field uses a pure-Rust jaq evaluator. Tests cover common jq-style filters such as `.[].id`; invalid filters return MCP invalid-params errors. Action results keep their original text representation. Because MCP structured content must be an object, scalar, array, and null results are exposed as `structuredContent.result`.
 
 ## Example
 
@@ -43,7 +51,7 @@ use mcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Clone, Default)]
 struct ReleaseServer;
@@ -58,8 +66,16 @@ struct GetReleaseInput {
     name = "release-desk",
     version = "1.0.0",
     description = "Release management for the example org.",
-    namespace(releases, description = "Query and inspect product releases."),
-    workflow_uri_template = "playbooks://{workflow}",
+    tool(
+        name = "releases",
+        description = "Inspect product releases.",
+        namespace(releases, description = "Query and inspect product releases."),
+        runbook_uri_template = "playbooks://{runbook}"
+    ),
+    tool(
+        name = "sessions",
+        description = "Inspect release automation sessions."
+    ),
     auth(
         scopes = ["releases:read"],
         required_scopes = ["releases:read"],
@@ -72,7 +88,7 @@ impl ReleaseServer {
     ///
     /// Use this after listing releases or when a resource URI already contains
     /// the release id.
-    #[action(name = "releases.get", resource_template = "releases://{id}")]
+    #[action(tool = "releases", name = "releases.get", resource_template = "releases://{id}")]
     fn get_release(
         &self,
         input: GetReleaseInput,
@@ -83,11 +99,16 @@ impl ReleaseServer {
 
     /// Promote a release candidate to production with required pre-checks.
     ///
-    /// Load this workflow when the user wants an end-to-end production
-    /// promotion procedure rather than a single release fact.
-    #[workflow(name = "promote-to-production")]
-    fn promote_workflow(&self) -> ServerResult<String> {
+    /// Load this runbook for an end-to-end production procedure.
+    #[runbook(tool = "releases", name = "promote-to-production")]
+    fn promote_runbook(&self) -> ServerResult<String> {
         Ok("## Promote to production\n1. Load release details.\n2. Check policy.\n".to_owned())
+    }
+
+    /// List recent release automation sessions.
+    #[action(tool = "sessions", name = "list")]
+    fn list_sessions(&self) -> ServerResult<Value> {
+        Ok(json!([]))
     }
 
     #[token_validator]

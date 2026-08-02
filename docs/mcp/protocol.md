@@ -23,7 +23,7 @@ The crate must not depend on `waltr-agent`, `waltr-server`, `waltr-client`, `wal
 | [`client`](../../crates/mcp/src/client/) | Typed MCP client, connection loop, handler callbacks, and transports. |
 | [`server`](../../crates/mcp/src/server/mod.rs) | Typed MCP server handlers, server context, stdio serving, and Streamable HTTP router. |
 | [`oauth`](../../crates/mcp/src/oauth.rs) | Protected-resource and authorization-server metadata, bearer challenges, discovery/client helpers, and feature-gated hosted authorization. |
-| [`progressive`](../../crates/mcp/src/progressive.rs) | Feature-gated helpers for the opinionated progressive-workflow `exec` tool server pattern. |
+| [`progressive`](../../crates/mcp/src/progressive.rs) | Feature-gated helpers for explicit multi-tool progressive servers with tool-scoped actions and runbooks. |
 | [`protocol`](../../crates/mcp/src/protocol.rs) | JSON-RPC helpers, protocol version, cancellation helpers, and parse/format utilities. |
 | [`capabilities`](../../crates/mcp/src/capabilities.rs) | Capability parsing for initialized peers. |
 | [`tool`](../../crates/mcp/src/tool.rs) | Tool definitions, calls, result formatting, and schemas. |
@@ -122,7 +122,7 @@ MCP tests are split by purpose:
 | --- | --- |
 | [../../crates/mcp/tests/spec.rs](../../crates/mcp/tests/spec.rs) and [../../crates/mcp/tests/spec/](../../crates/mcp/tests/spec/) | Protocol conformance tests for the single supported revision, `2025-11-25`. Older revision tests are used only as migration scaffolding and should not remain active. |
 | [../../crates/mcp/tests/ecosystem.rs](../../crates/mcp/tests/ecosystem.rs) and [../../crates/mcp/tests/ecosystem/](../../crates/mcp/tests/ecosystem/) | Interoperability against ecosystem clients and servers such as `rmcp`. |
-| [../../crates/mcp/tests/progressive.rs](../../crates/mcp/tests/progressive.rs) | Feature-gated coverage for the progressive server macro, generated help, workflows, resources, filters, and auth helpers. |
+| [../../crates/mcp/tests/progressive.rs](../../crates/mcp/tests/progressive.rs) | Feature-gated coverage for progressive tool isolation, generated help, runbooks, resources, filters, and auth helpers. |
 | [../../crates/mcp/tests/streamable_http_sqlite_store.rs](../../crates/mcp/tests/streamable_http_sqlite_store.rs) | Feature-gated SQLite store contract, migration history, persisted-data safeguards, and concurrency. |
 | [../../crates/mcp/tests/streamable_http_postgres_store.rs](../../crates/mcp/tests/streamable_http_postgres_store.rs) | Feature-gated, ignored container-backed PostgreSQL parity, migrations, concurrency, and safeguards. |
 | [../../crates/mcp/tests/oauth_authorization_server.rs](../../crates/mcp/tests/oauth_authorization_server.rs) | Hosted authorization metadata, JWKS, authorization code, PKCE, JWT, refresh rotation/replay, and revocation flow. |
