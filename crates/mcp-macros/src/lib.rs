@@ -24,11 +24,43 @@ pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Generate an opinionated progressive-workflow MCP server.
+/// Generate an opinionated progressive MCP server.
 ///
-/// Progressive servers expose one `exec` tool, generated help actions, workflow
-/// prompts/resources, optional action resources, and the same Streamable HTTP
-/// helper methods as `#[mcp_server]`.
+/// Declare one or more `tool(...)` entries in the server attribute. Each tool
+/// owns its action schema, namespaces, help, and runbooks. Methods register with
+/// `#[action(tool = "...", name = "...")]` or
+/// `#[runbook(tool = "...", name = "...")]`. Runbook prompts and all resources
+/// are server-global, while tool calls dispatch only to declarations owned by
+/// the selected tool. The macro also generates the same Streamable HTTP helper
+/// methods as `#[mcp_server]`.
+///
+/// ```ignore
+/// #[mcp::progressive_server(
+///     name = "example",
+///     version = "1",
+///     description = "Example server.",
+///     tool(
+///         name = "exec",
+///         description = "Configuration actions.",
+///         namespace(configuration, description = "Inspect configuration."),
+///         runbook_uri_template = "example://runbooks/{runbook}"
+///     ),
+///     tool(name = "sessions", description = "Session actions.")
+/// )]
+/// impl ExampleServer {
+///     /// Inspect configuration.
+///     #[action(tool = "exec", name = "configuration.inspect")]
+///     fn inspect(&self) -> mcp::server::ServerResult<serde_json::Value> {
+///         todo!()
+///     }
+///
+///     /// Configure the server.
+///     #[runbook(tool = "exec", name = "configuration")]
+///     fn configuration(&self) -> mcp::server::ServerResult<String> {
+///         todo!()
+///     }
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn progressive_server(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as progressive::ProgressiveArgs);

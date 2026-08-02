@@ -7,7 +7,7 @@ mod error;
 mod log;
 /// MCP OAuth protected-resource discovery and bearer-token validation helpers.
 pub mod oauth;
-/// Opinionated progressive-workflow MCP server helpers.
+/// Opinionated progressive MCP server helpers.
 #[cfg(feature = "progressive")]
 pub mod progressive;
 mod prompt;
