@@ -205,6 +205,16 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
   };
 
+  const dispatchWipeSessions = async () => {
+    return dispatchAndWaitForOperation({
+      command: { type: "wipeSessions" },
+      key: (snapshot) => snapshot.sessions.wipe.key,
+      kind: "sessionWipe",
+      missingKeyMessage: "session wipe command did not produce an operation key",
+      failureMessage: "session wipe failed",
+    });
+  };
+
   const dispatchUpdateSessionRuntimeConfig = async (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => {
     return dispatchAndWaitForOperation({
       command,
@@ -313,6 +323,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
         dispatchResetConfig,
         dispatchCreateSession,
         dispatchDeleteSession,
+        dispatchWipeSessions,
         dispatchUpdateSessionRuntimeConfig,
         dispatchSubmitUserMessage,
         dispatchRespondExternalRequest,

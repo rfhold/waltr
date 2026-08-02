@@ -29,6 +29,7 @@ export type AppState = {
   dispatchResetConfig: () => Promise<ClientSnapshot>;
   dispatchCreateSession: () => Promise<ClientSnapshot>;
   dispatchDeleteSession: (id: string) => Promise<ClientSnapshot>;
+  dispatchWipeSessions: () => Promise<ClientSnapshot>;
   dispatchUpdateSessionRuntimeConfig: (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => Promise<ClientSnapshot>;
   dispatchSubmitUserMessage: (sessionId: string, text: string) => Promise<ClientSnapshot>;
   dispatchRespondExternalRequest: (sessionId: string, requestId: string, responseJson: string) => Promise<ClientSnapshot>;

@@ -12,7 +12,7 @@ import {
   ConfigRoute,
 } from "./config/ConfigRoute";
 import { LandingRoute } from "./landing/LandingRoute";
-import { SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "./sessions/SessionsRoute";
+import { SessionsDataRoute, SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "./sessions/SessionsRoute";
 
 const fixtureRoutesEnabled = import.meta.env.DEV || import.meta.env.MODE === "test";
 
@@ -23,6 +23,7 @@ export function AppRouter() {
         <Route path="/" component={LandingRoute} />
         <Route path="/sessions" component={SessionsRoute}>
           <Route path="/" component={SessionsListRoute} />
+          <Route path="/data" component={SessionsDataRoute} />
           <Route path="/:sessionId" component={SessionsDetailRoute} />
         </Route>
         {fixtureRoutesEnabled && (

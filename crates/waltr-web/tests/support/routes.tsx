@@ -13,7 +13,7 @@ import {
 import { LandingRoute } from "../../src/routes/landing/LandingRoute";
 import { AppLayout } from "../../src/routes/layouts/AppLayout";
 import { ShellLayout } from "../../src/routes/layouts/ShellLayout";
-import { SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "../../src/routes/sessions/SessionsRoute";
+import { SessionsDataRoute, SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "../../src/routes/sessions/SessionsRoute";
 import { SplashRoute } from "../../src/routes/splash/SplashRoute";
 
 let currentHistory: MemoryHistory = createMemoryHistory();
@@ -55,6 +55,7 @@ export function ShellRouteWithChildren(props: { reload?: () => void } = {}) {
           <Route path="/" component={LandingRoute} />
           <Route path="/sessions" component={SessionsRoute}>
             <Route path="/" component={SessionsListRoute} />
+            <Route path="/data" component={SessionsDataRoute} />
             <Route path="/:sessionId" component={SessionsDetailRoute} />
           </Route>
           <Route path="/config" component={ConfigRoute}>
@@ -81,6 +82,7 @@ export function SessionsRouteWithRouter() {
     <MemoryRouter history={currentHistory}>
       <Route path="/sessions" component={SessionsRoute}>
         <Route path="/" component={SessionsListRoute} />
+        <Route path="/data" component={SessionsDataRoute} />
         <Route path="/:sessionId" component={SessionsDetailRoute} />
       </Route>
     </MemoryRouter>

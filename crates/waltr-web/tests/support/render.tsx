@@ -25,6 +25,7 @@ export function renderWithAppState(
     configPatchError?: string;
     sessionCreateError?: string;
     sessionDeleteError?: string;
+    sessionWipeError?: string;
     sessionRuntimeConfigUpdateError?: string;
     submitUserMessageError?: string;
     respondExternalRequestError?: string;
@@ -249,6 +250,18 @@ export function renderWithAppState(
       return ready;
     };
 
+    const dispatchWipeSessions = async () => {
+      return dispatchSessionOperation({
+        command: { type: "wipeSessions" },
+        operationName: "wipe",
+        kind: "sessionWipe",
+        error: options.sessionWipeError,
+        loadingOperation: { kind: "sessionWipe", status: "loading", error: null },
+        readyOperation: () => ({ kind: "sessionWipe", status: "ready", error: null }),
+        failedOperation: (error) => ({ kind: "sessionWipe", status: "failed", error }),
+      });
+    };
+
     const dispatchUpdateSessionRuntimeConfig = async (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => {
       return dispatchSessionOperation({
         command,
@@ -311,7 +324,7 @@ export function renderWithAppState(
 
     const dispatchSessionOperation = async (operation: {
       command: ClientCommand;
-      operationName: "runtimeConfigUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt" | "continueSession";
+      operationName: "wipe" | "runtimeConfigUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt" | "continueSession";
       kind: ClientOperationView["kind"];
       error?: string;
       loadingOperation: ClientOperationView;
@@ -399,6 +412,7 @@ export function renderWithAppState(
           dispatchResetConfig: () => dispatch({ type: "resetConfig" }),
           dispatchCreateSession,
           dispatchDeleteSession,
+          dispatchWipeSessions,
           dispatchUpdateSessionRuntimeConfig,
           dispatchSubmitUserMessage,
           dispatchRespondExternalRequest,
