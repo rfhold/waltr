@@ -41,6 +41,14 @@ Potential sidecar uses include:
 
 Sidecars should be explicit about their authority. A sidecar may recommend updates, produce summaries, or flag compliance issues, but the system needs clear rules for when a sidecar can mutate workspace state or influence the main prompt.
 
+### Context Management Direction
+
+A future context-management sidecar may select primary-session timeline material, apply different detail budgets to different ranges, identify semantic phases, and propose structured sections without forcing the primary session to perform that classification in its active context. The selection and projection contract remains future work.
+
+When context requires compaction, the intended flow is for the sidecar to signal the primary session, for the primary session to pause at a safe boundary, and for a shadow session to summarize explicitly selected timeline material. Durable markers must record the selected ranges, generated summary, and replacement boundary before the primary session adopts compacted context.
+
+The current agent contract does not include a reusable semantic timeline projection or an ephemeral rendering operation. Sidecar lifecycle, durable phase markers, compression signals, pausing, forks, shadow sessions, summary replacement, title or status policy, and cross-replica supervision also remain future work.
+
 ## Workspaces
 
 A workspace is a durable operating context tied to a filesystem directory. It should have its own local guidance, loaded capabilities, and read context so agents can work with project-specific assumptions without relying on global configuration alone.
