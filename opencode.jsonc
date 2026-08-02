@@ -4,9 +4,14 @@
     "grafana-query@git+ssh://git@git.holdenitdown.net/rfhold/grafana-query.git#opencode/v0.2.1"
   ],
   "mcp": {
-    "waltr": {
+    "waltr-local": {
       "type": "remote",
       "url": "http://127.0.0.1:14333/mcp",
+      "enabled": true
+    },
+    "waltr-preview": {
+      "type": "remote",
+      "url": "https://preview-waltr.holdenitdown.net/mcp",
       "enabled": true
     }
   }
