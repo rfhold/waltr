@@ -33,4 +33,5 @@ use support::app::*;
 
 include!("app/basic.rs");
 include!("app/sessions.rs");
+include!("app/session_data.rs");
 include!("app/config.rs");

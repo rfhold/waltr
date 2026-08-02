@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/session_data.rs
+expression: rendered
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"             Session data                                                       "
+"                                                                                "
+"            Delete all agent sessions                                           "
+"                                                                                "
+"            All agent sessions and their timeline data will be                  "
+"            deleted.                                                            "
+"            Configuration, authentication, OAuth credentials, and all           "
+"            non-session persistence remain untouched.                           "
+"                                                                                "
+"            All agent session data has been deleted. No sessions                "
+"            remain.                                                             "
+"                                                                                "
+"             Esc back to Sessions                                               "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

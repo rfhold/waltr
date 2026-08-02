@@ -113,6 +113,63 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     .await;
 }
 
+#[tokio::test]
+async fn session_data_screen_wipes_all_sessions_with_real_server() {
+    let server = setup_server();
+    let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
+    let mut app = App::new();
+
+    drive_app_to_landing(&mut stream, &mut app).await;
+    open_sessions_screen(&mut stream, &mut app).await;
+    next_snapshot_until(&mut stream, &mut app, |snapshot| {
+        snapshot.sessions.watch.status == "received"
+    })
+    .await;
+
+    let now = Instant::now();
+    for _ in 0..2 {
+        assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+        let create = app.handle_event(&char_press('s'), now);
+        drop(dispatch_app_command(&mut stream, &mut app, create).await);
+        let session_id = app
+            .sessions_section()
+            .detail_session_id()
+            .expect("created session detail should be open")
+            .to_owned();
+        let leave_detail = app.handle_event(&crate::support::input::escape_press(), now);
+        assert_eq!(
+            leave_detail,
+            AppAction::ClientCommand(
+                waltr_client::ClientCommand::ReleaseSessionTimelineWatchInterest { session_id }
+            )
+        );
+        drop(dispatch_app_command(&mut stream, &mut app, leave_detail).await);
+    }
+
+    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&char_press('w'), now), AppAction::Continue);
+    let wipe = app.handle_event(&enter_press(), now);
+    let wiped = dispatch_app_command(&mut stream, &mut app, wipe).await;
+    let key = wiped
+        .sessions
+        .wipe
+        .key
+        .as_ref()
+        .expect("wipe should expose operation key");
+    assert!(matches!(
+        wiped.operations.current.get(key),
+        Some(ClientOperationView::SessionWipe {
+            status: "ready",
+            error: None,
+        })
+    ));
+    assert!(wiped.sessions.current.is_empty());
+    assert_eq!(app.screen(), waltr_tui::app::AppScreen::SessionData);
+    let rendered = render_app(&app);
+    assert!(rendered.contains("No sessions"));
+    assert!(rendered.contains("remain."));
+}
+
 fn normalize_session_render(rendered: &str, session_id: &str) -> String {
     rendered
         .replace(session_id, "[session-id]")

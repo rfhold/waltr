@@ -17,8 +17,8 @@ use crate::{
     native_auth::NativeAuthAction,
     screens::{
         ConfigAuthState, ConfigResetState, ConfigTab, McpSection, ProviderSection,
-        RuntimeDefaultsSection, SectionAction, SessionsSection, register_timeline_watch_command,
-        targets_match,
+        RuntimeDefaultsSection, SectionAction, SessionDataAction, SessionDataState,
+        SessionsSection, register_timeline_watch_command, targets_match,
     },
     ui,
     ui::Notice,
@@ -75,6 +75,8 @@ pub enum AppScreen {
     Config,
     /// Server-side session list/detail view.
     Sessions,
+    /// Destructive whole-session-domain wipe view.
+    SessionData,
 }
 
 impl CloseIntent {
@@ -96,6 +98,7 @@ pub struct App {
     mcp_section: McpSection,
     runtime_defaults_section: RuntimeDefaultsSection,
     sessions_section: SessionsSection,
+    session_data: SessionDataState,
     leader_armed: bool,
     notice: Option<TransientNotice>,
     screen: AppScreen,
@@ -121,6 +124,7 @@ impl App {
             mcp_section: McpSection::new(),
             runtime_defaults_section: RuntimeDefaultsSection::new(),
             sessions_section: SessionsSection::new(),
+            session_data: SessionDataState::new(),
             leader_armed: false,
             notice: None,
             screen: AppScreen::Waiting,
@@ -175,6 +179,9 @@ impl App {
             }
             InputEvent::Key(key) if self.screen == AppScreen::Sessions => {
                 self.handle_sessions_key(key, now)
+            }
+            InputEvent::Key(key) if self.screen == AppScreen::SessionData => {
+                self.handle_session_data_key(key)
             }
             InputEvent::Scroll(delta) if self.screen == AppScreen::Sessions => {
                 self.handle_sessions_scroll(delta)
@@ -578,6 +585,10 @@ impl App {
         self.config_reset.error()
     }
 
+    pub(crate) const fn session_data_state(&self) -> &SessionDataState {
+        &self.session_data
+    }
+
     /// Whether a Config authentication action is pending for one target.
     #[must_use]
     pub fn config_auth_action_pending(&self, target: &ClientAuthTarget) -> bool {
@@ -700,8 +711,9 @@ impl App {
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.status.ready)
                 {
-                    let leaving_sessions = self.screen == AppScreen::Sessions;
-                    let detail_session_id = leaving_sessions
+                    let leaving_sessions =
+                        matches!(self.screen, AppScreen::Sessions | AppScreen::SessionData);
+                    let detail_session_id = (self.screen == AppScreen::Sessions)
                         .then(|| self.sessions_section.clear_detail_route())
                         .flatten();
                     self.screen = AppScreen::Config;
@@ -751,6 +763,11 @@ impl App {
                     };
                 }
 
+                if self.screen == AppScreen::SessionData {
+                    self.screen = AppScreen::Sessions;
+                    return AppAction::Continue;
+                }
+
                 if self
                     .client_snapshot
                     .as_ref()
@@ -769,6 +786,22 @@ impl App {
                 }
 
                 AppAction::Continue
+            }
+            KeyCommand::LeaderCommand(LeaderCommand::SessionData) => {
+                self.leader_armed = false;
+                if self.screen != AppScreen::Sessions {
+                    return AppAction::Continue;
+                }
+
+                let detail_session_id = self.sessions_section.clear_detail_route();
+                self.session_data.open();
+                self.screen = AppScreen::SessionData;
+
+                detail_session_id.map_or(AppAction::Continue, |session_id| {
+                    AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
+                        session_id,
+                    })
+                })
             }
             KeyCommand::LeaderCommand(LeaderCommand::Provider) => {
                 self.leader_armed = false;
@@ -916,9 +949,10 @@ impl App {
             }
             if self.screen != AppScreen::Access {
                 self.access_return_screen = match self.screen {
-                    AppScreen::Landing | AppScreen::Config | AppScreen::Sessions => {
-                        Some(self.screen)
-                    }
+                    AppScreen::Landing
+                    | AppScreen::Config
+                    | AppScreen::Sessions
+                    | AppScreen::SessionData => Some(self.screen),
                     AppScreen::Waiting | AppScreen::Access => None,
                 };
             }
@@ -959,6 +993,11 @@ impl App {
                     text: "configuration reset to server defaults".to_owned(),
                     expires_at: self.now.unwrap_or_else(Instant::now) + NOTICE_DURATION,
                 });
+            }
+            self.session_data.reconcile(&snapshot);
+            if snapshot.sessions.delete.status != "loading" {
+                self.sessions_section
+                    .reconcile_current_sessions(&snapshot.sessions.current);
             }
             self.sessions_section.reconcile_operations(&snapshot);
 
@@ -1004,6 +1043,7 @@ impl App {
         self.mcp_section = McpSection::new();
         self.runtime_defaults_section = RuntimeDefaultsSection::new();
         self.sessions_section = SessionsSection::new();
+        self.session_data = SessionDataState::new();
         self.leader_armed = false;
         self.notice = None;
         self.screen = AppScreen::Waiting;
@@ -1106,6 +1146,18 @@ impl App {
             SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
             SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
             SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+        }
+    }
+
+    fn handle_session_data_key(&mut self, key: KeyEvent) -> AppAction {
+        match self.session_data.handle_key(key) {
+            SessionDataAction::Continue => AppAction::Continue,
+            SessionDataAction::Cancel => {
+                self.screen = AppScreen::Sessions;
+                self.leader_armed = false;
+                AppAction::Continue
+            }
+            SessionDataAction::Confirm => AppAction::ClientCommand(ClientCommand::WipeSessions),
         }
     }
 

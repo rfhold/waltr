@@ -22,6 +22,8 @@ pub enum LeaderCommand {
     Config,
     /// Open the sessions screen.
     Sessions,
+    /// Open the destructive session-data screen.
+    SessionData,
     /// Open provider/model selection for the active session.
     Provider,
     /// Open MCP selection for the active session.
@@ -64,6 +66,10 @@ fn leader_command(key: KeyEvent) -> LeaderCommand {
 
     if matches!(key.code, KeyCode::Char('s')) {
         return LeaderCommand::Sessions;
+    }
+
+    if matches!(key.code, KeyCode::Char('w')) {
+        return LeaderCommand::SessionData;
     }
 
     if matches!(key.code, KeyCode::Char('p')) {

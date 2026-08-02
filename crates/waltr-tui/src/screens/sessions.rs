@@ -509,6 +509,18 @@ impl SessionsSection {
         }
     }
 
+    /// Drop detail-only state when the shared snapshot no longer contains its session.
+    pub fn reconcile_current_sessions(&mut self, sessions: &[SessionView]) {
+        let detail_exists = self
+            .detail_session_id
+            .as_ref()
+            .is_none_or(|detail_id| sessions.iter().any(|session| session.id == *detail_id));
+        if !detail_exists {
+            self.detail_session_id = None;
+            self.reset_detail_ui();
+        }
+    }
+
     /// Dismiss the active transient overlay. Returns true when handled.
     pub fn dismiss_overlay(&mut self) -> bool {
         if self.has_pending_operation() {
@@ -1476,7 +1488,7 @@ impl SessionsSection {
         render_sessions_modal_footer(
             frame,
             footer_area,
-            " Esc back  C-x s create  Right/Enter detail  C-x d delete ",
+            " C-x s create Enter open C-x d delete C-x w session data ",
         );
     }
 
