@@ -11,11 +11,12 @@ The agent timeline is the public, durable event stream produced by `crates/waltr
 | `AgentTimelineEvent` | Cursor-assigned event persisted in a session timeline. |
 | `PendingTimelineEvent` | Event before a store assigns its durable cursor. |
 | `TimelineCursor` | Monotonic per-session cursor assigned at append time. |
+| `TimelineItemId` | Opaque, session-local logical item identity assigned by the session store. |
 | `TimelineQuery` | Bounded timeline range query with direction, cursor, limit, and optional channel filtering. |
 | `TimelineItemText` | Reconstructed text-like content for one timeline item. |
 | `BoxAgentTimelineStream` | Host-facing live stream of cursor-assigned timeline events. |
 
-Host layers may expose, transform, or fan out timeline events, but transport shape and UI rendering are outside the agent crate.
+Transport shape, authorization, semantic projection, and UI rendering remain outside the agent crate.
 
 ## Channels
 
@@ -35,18 +36,25 @@ Some status events are channel-less. Channel-filtered queries include only event
 
 ## Event Semantics
 
+Every logical timeline item receives an identifier in the form `iN`, where `N` is the cursor assigned to the item's first durable event. The session store assigns both values in one append operation. Later events for the same item retain its original identifier while receiving new cursors, so item identifiers are monotonic by creation order but may contain gaps.
+
+Item identifiers are opaque and classify nothing. Consumers use event kind, channel, content, status, and parent relationships to interpret an item. Rollback and provider retry never reuse an identifier because allocation follows the complete physical timeline, including events hidden from the effective branch. Updates and child events may reference only items on the current effective branch.
+
+This identity format is a hard storage cutover. Session records containing legacy caller-generated identifiers are unsupported and receive no migration or compatibility translation; operators must clear persisted sessions and cached client timelines when deploying the change.
+
 | Area | Contract |
 | --- | --- |
 | Cursor assignment | Every appended timeline event receives a stable, monotonic `TimelineCursor` within its session. |
-| Assistant text | Provider text deltas emit `ContentDelta` events on `assistant_text`. Deltas for one assistant turn use a stable item id. |
-| Thinking | Provider thinking deltas emit `ContentDelta` events on `thinking`. Deltas for one thinking item use a stable item id. |
+| Item assignment | The first event for a logical item receives `i<cursor>`; subsequent events retain that item id. |
+| Assistant text | Provider text deltas emit `ContentDelta` events on `assistant_text`. Deltas and the final snapshot for one assistant response use one item id. |
+| Thinking | Provider thinking deltas emit `ContentDelta` events on `thinking`. Deltas for one thinking item use one item id. |
 | Tool call preview | A provider tool call emits an `ItemStarted` event on `tool_call` before local tool execution starts. |
 | Tool progress | Tool progress emits timeline events while the tool runs. Progress events set `parent_id` to the tool call item id. |
 | Tool result | Tool completion emits an `ItemFinished` event on `tool_result` with `parent_id` set to the tool call item id. |
 | External request | Host-required input emits opened and resolved external request events on `external_request`. |
 | Session status | Runtime status changes may emit channel-less status events. |
 
-The timeline is an immutable event log. Consumers that need rendered messages or item snapshots should derive them from events outside the agent crate.
+The timeline remains an immutable event log. Consumers may derive projections without replacing or mutating durable events.
 
 ## Querying
 
@@ -80,7 +88,7 @@ The method distinguishes a missing item from an existing item with no text-like 
 ## Boundaries
 
 - The agent crate owns durable event shape, cursor ordering, range queries, and item text reconstruction.
-- The agent crate does not own server subscriptions, multi-client fanout, transport backpressure, UI capping policy, scroll behavior, or rendered message projections.
+- The agent crate does not own semantic projection, server subscriptions, multi-client fanout, transport backpressure, authorization, UI scroll behavior, sidecar lifecycle, phase markers, forks, or compression policy.
 - Storage implementations may optimize query execution later without changing the public `SessionStore` contract.
 
 ## Tests
@@ -91,7 +99,7 @@ Focused coverage lives in:
 
 | Path | Covers |
 | --- | --- |
-| [../../crates/waltr-agent/src/agent/session/storage/memory.rs](../../crates/waltr-agent/src/agent/session/storage/memory.rs) | Store query, cursor ordering, channel filtering, and text reconstruction semantics. |
+| [../../crates/waltr-agent/src/agent/session/storage/memory.rs](../../crates/waltr-agent/src/agent/session/storage/memory.rs) | Store item allocation, rollback non-reuse, query, cursor ordering, channel filtering, and text reconstruction semantics. |
 | [../../crates/waltr-agent/tests/agent/loop.rs](../../crates/waltr-agent/tests/agent/loop.rs) | Live loop event ordering, assistant/thinking deltas, tool progress parenting, and durable text reconstruction. |
 
 ## References

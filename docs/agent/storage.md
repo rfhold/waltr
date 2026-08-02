@@ -36,8 +36,11 @@ Agent storage persists durable sessions for `crates/waltr-agent/`. A session is 
 - Appending timeline events with revision checks and store-assigned cursors.
 - Appending internal journal records with revision checks.
 - Reading timeline ranges after or before a cursor.
+- Wiping every raw session record in the store namespace without requiring records to deserialize.
 
 The agent loop depends on this trait rather than a concrete backend.
+
+A store wipe is idempotent and retry-safe. A successful result means no session records remain. Backends without multi-object transactions may delete some records before returning an error, and callers may safely retry. The operation deliberately does not inspect or coordinate running work; operators must ensure session activity is stopped before wiping or concurrent work may recreate records.
 
 ## Backends
 
