@@ -51,13 +51,13 @@ pub async fn server_endpoint_with_seeded_timeline(
             waltr_agent::PendingTimelineEvent::user_text_snapshot(
                 session_id.clone(),
                 1,
-                "user-1",
+                waltr_agent::PendingTimelineItemId::New,
                 "hello",
             ),
             waltr_agent::PendingTimelineEvent::assistant_text_snapshot(
                 session_id.clone(),
                 1,
-                "assistant-1",
+                waltr_agent::PendingTimelineItemId::New,
                 "hi there",
             ),
         ];
@@ -77,19 +77,19 @@ pub async fn server_endpoint_with_rollback_timeline()
         waltr_agent::PendingTimelineEvent::user_text_snapshot(
             session_id.clone(),
             1,
-            "user-1",
+            waltr_agent::PendingTimelineItemId::New,
             "first prompt",
         ),
         waltr_agent::PendingTimelineEvent::user_text_snapshot(
             session_id.clone(),
             2,
-            "user-2",
+            waltr_agent::PendingTimelineItemId::New,
             "second prompt",
         ),
         waltr_agent::PendingTimelineEvent::assistant_text_snapshot(
             session_id.clone(),
             2,
-            "assistant-2",
+            waltr_agent::PendingTimelineItemId::New,
             "second answer",
         ),
     ];
@@ -185,7 +185,7 @@ fn external_request_event(
     let mut event = PendingTimelineEvent::new(
         session_id.clone(),
         1,
-        "external-request:question-1",
+        waltr_agent::PendingTimelineItemId::New,
         kind,
         Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
         TimelineContent::ExternalRequest {

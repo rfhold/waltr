@@ -424,6 +424,20 @@ pub enum SessionEvent {
         /// Failure returned by the delete effect.
         error: ClientError,
     },
+    /// A caller requested deletion of all sessions.
+    WipeRequested(OperationKey),
+    /// All sessions were deleted successfully.
+    Wiped {
+        /// Operation key allocated when the wipe was requested.
+        operation_key: OperationKey,
+    },
+    /// Session wipe failed.
+    WipeFailed {
+        /// Operation key allocated when the wipe was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the wipe effect.
+        error: ClientError,
+    },
     /// A caller requested session runtime metadata replacement.
     RuntimeConfigUpdateRequested {
         /// Operation key allocated when the update was requested.
@@ -877,6 +891,11 @@ pub enum SessionEffect {
         operation_key: OperationKey,
         /// Session id to delete.
         id: String,
+    },
+    /// Delete every server-side session after shell-local confirmation.
+    Wipe {
+        /// Operation key allocated when the wipe was requested.
+        operation_key: OperationKey,
     },
     /// Replace server-side session runtime metadata.
     UpdateRuntimeConfig {

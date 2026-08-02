@@ -147,6 +147,9 @@ pub trait WaltrTransport {
     /// Delete a server-side session by id.
     fn delete_session(&self, id: String) -> impl Future<Output = Result<(), ClientError>>;
 
+    /// Delete every server-side session.
+    fn wipe_sessions(&self) -> impl Future<Output = Result<(), ClientError>>;
+
     /// Replace runtime config metadata for a server-side session.
     fn update_session_runtime_config(
         &self,
@@ -378,6 +381,10 @@ where
 
     async fn delete_session(&self, id: String) -> Result<(), ClientError> {
         session::delete_session(self, id).await
+    }
+
+    async fn wipe_sessions(&self) -> Result<(), ClientError> {
+        session::wipe_sessions(self).await
     }
 
     async fn update_session_runtime_config(

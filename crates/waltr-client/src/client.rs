@@ -786,6 +786,14 @@ impl Client {
         ))
     }
 
+    /// Request deletion of every server-side session after shell-local confirmation.
+    pub fn wipe_sessions(&mut self) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(SessionEvent::WipeRequested(
+            operation_key,
+        )))
+    }
+
     /// Return whether the provider has changed since the edit baseline.
     ///
     /// # Errors
@@ -1025,6 +1033,9 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             | SessionEvent::DeleteFailed { operation_key, .. },
         ) => operation_is_current(state.sessions.delete.key.as_ref(), operation_key),
         ClientEvent::Session(
+            SessionEvent::Wiped { operation_key } | SessionEvent::WipeFailed { operation_key, .. },
+        ) => operation_is_current(state.sessions.wipe.key.as_ref(), operation_key),
+        ClientEvent::Session(
             SessionEvent::RuntimeConfigUpdated { operation_key, .. }
             | SessionEvent::RuntimeConfigUpdateFailed { operation_key, .. },
         ) => operation_is_current(
@@ -1122,6 +1133,7 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
         | ClientEvent::Session(
             SessionEvent::CreateFailed { error, .. }
             | SessionEvent::DeleteFailed { error, .. }
+            | SessionEvent::WipeFailed { error, .. }
             | SessionEvent::RuntimeConfigUpdateFailed { error, .. }
             | SessionEvent::ListFailed(error)
             | SessionEvent::TimelineLoadFailed { error, .. }
@@ -2590,6 +2602,220 @@ mod tests {
             client.state().sessions.delete.status,
             OperationStatus::Ready
         );
+    }
+
+    #[test]
+    fn session_delete_completion_removes_template_search_cache() {
+        let mut client = Client::new();
+        client.search_session_templates(
+            "search-one",
+            "one",
+            "src",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+            None,
+        );
+
+        client.apply(ClientEvent::Session(SessionEvent::Deleted {
+            operation_key: "delete-session".to_owned(),
+            id: "one".to_owned(),
+        }));
+
+        assert!(
+            !client
+                .state()
+                .sessions
+                .template_searches
+                .contains_key("one")
+        );
+    }
+
+    #[test]
+    fn session_wipe_is_keyed_and_ignores_stale_success() {
+        let mut client = Client::new();
+        let first = client.wipe_sessions();
+        let [
+            ClientEffect::Session(SessionEffect::Wipe {
+                operation_key: first_key,
+            }),
+        ] = first.effects()
+        else {
+            panic!("session wipe effect");
+        };
+        let first_key = first_key.clone();
+        let second = client.wipe_sessions();
+        let [
+            ClientEffect::Session(SessionEffect::Wipe {
+                operation_key: second_key,
+            }),
+        ] = second.effects()
+        else {
+            panic!("second session wipe effect");
+        };
+        let second_key = second_key.clone();
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+
+        client.apply(ClientEvent::Session(SessionEvent::Wiped {
+            operation_key: first_key,
+        }));
+
+        assert!(client.state().sessions.current.contains_key("one"));
+        assert_eq!(
+            client.state().sessions.wipe.status,
+            OperationStatus::Loading
+        );
+        assert_eq!(client.state().sessions.wipe.key.as_ref(), Some(&second_key));
+    }
+
+    #[test]
+    fn matching_session_wipe_clears_all_session_caches_and_preserves_watch_interest() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
+            SystemStatus { ready: true },
+        )));
+        drop(client.register_session_watch_interest());
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
+            session_id: "one".to_owned(),
+            events: vec![timeline_event(1)],
+        }));
+        client.search_session_templates(
+            "search-one",
+            "one",
+            "src",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+            None,
+        );
+        drop(client.register_session_timeline_watch_interest("one", None, Vec::new(), None));
+        let wipe = client.wipe_sessions();
+        let [ClientEffect::Session(SessionEffect::Wipe { operation_key })] = wipe.effects() else {
+            panic!("session wipe effect");
+        };
+        let operation_key = operation_key.clone();
+
+        client.apply(ClientEvent::Session(SessionEvent::Wiped {
+            operation_key: operation_key.clone(),
+        }));
+
+        assert!(client.state().sessions.current.is_empty());
+        assert!(client.state().sessions.timelines.is_empty());
+        assert!(client.state().sessions.template_searches.is_empty());
+        assert_eq!(client.state().sessions.watch.interests, 1);
+        assert_eq!(client.state().sessions.wipe.status, OperationStatus::Ready);
+        assert!(matches!(
+            client.state().operations.get(&operation_key),
+            Some(crate::ClientOperationState::SessionWipe {
+                status: OperationStatus::Ready,
+                error: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn session_wipe_failure_retains_session_state() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
+            session_id: "one".to_owned(),
+            events: vec![timeline_event(1)],
+        }));
+        client.search_session_templates(
+            "search-one",
+            "one",
+            "src",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+            None,
+        );
+        let wipe = client.wipe_sessions();
+        let [ClientEffect::Session(SessionEffect::Wipe { operation_key })] = wipe.effects() else {
+            panic!("session wipe effect");
+        };
+        let operation_key = operation_key.clone();
+
+        client.apply(ClientEvent::Session(SessionEvent::WipeFailed {
+            operation_key: operation_key.clone(),
+            error: ClientError::new("wipe failed"),
+        }));
+
+        assert!(client.state().sessions.current.contains_key("one"));
+        assert!(client.state().sessions.timelines.contains_key("one"));
+        assert!(
+            client
+                .state()
+                .sessions
+                .template_searches
+                .contains_key("one")
+        );
+        assert_eq!(client.state().sessions.wipe.status, OperationStatus::Failed);
+        assert!(matches!(
+            client.state().operations.get(&operation_key),
+            Some(crate::ClientOperationState::SessionWipe {
+                status: OperationStatus::Failed,
+                error: Some(error),
+            }) if error == "wipe failed"
+        ));
+    }
+
+    #[test]
+    fn remote_session_clear_clears_all_session_caches_without_changing_wipe_result() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "one",
+        )])));
+        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
+            session_id: "one".to_owned(),
+            events: vec![timeline_event(1)],
+        }));
+        client.search_session_templates(
+            "search-one",
+            "one",
+            "src",
+            8,
+            vec![ClientSessionTemplateKind::File],
+            ClientSessionTemplateSearchTarget::Resources,
+            None,
+        );
+        drop(client.request_sessions());
+        assert_eq!(
+            client.state().sessions.list.status,
+            OperationStatus::Loading
+        );
+
+        client.apply(ClientEvent::Session(SessionEvent::WatchChanged(
+            SessionWatchUpdate {
+                sequence: 1,
+                event: SessionWatchEvent::Cleared,
+            },
+        )));
+
+        assert!(client.state().sessions.current.is_empty());
+        assert!(client.state().sessions.timelines.is_empty());
+        assert!(client.state().sessions.template_searches.is_empty());
+        assert_eq!(client.state().sessions.list.status, OperationStatus::Ready);
+        assert_eq!(client.state().sessions.wipe.status, OperationStatus::Idle);
+        assert_eq!(client.state().sessions.last_sequence, 1);
+
+        let future_list = client.request_sessions();
+        assert_eq!(
+            future_list.effects(),
+            &[ClientEffect::Session(SessionEffect::List)]
+        );
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
+            "future",
+        )])));
+        assert!(client.state().sessions.current.contains_key("future"));
+        assert_eq!(client.state().sessions.list.status, OperationStatus::Ready);
     }
 
     #[test]

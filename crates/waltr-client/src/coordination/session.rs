@@ -49,6 +49,21 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             state.set_session_delete_failed(operation_key, id, error.to_string());
             ClientUpdate::default()
         }
+        SessionEvent::WipeRequested(operation_key) => {
+            state.set_session_wipe_loading(operation_key.clone());
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Wipe { operation_key }))
+        }
+        SessionEvent::Wiped { operation_key } => {
+            state.set_session_wipe_ready(operation_key);
+            ClientUpdate::default()
+        }
+        SessionEvent::WipeFailed {
+            operation_key,
+            error,
+        } => {
+            state.set_session_wipe_failed(operation_key, error.to_string());
+            ClientUpdate::default()
+        }
         SessionEvent::RuntimeConfigUpdateRequested {
             operation_key,
             id,
@@ -518,6 +533,7 @@ fn apply_watch_event(state: &mut ClientState, update: SessionWatchUpdate) {
             state.set_session_watch_changed(update.sequence, session)
         }
         SessionWatchEvent::Deleted(id) => state.set_session_watch_deleted(update.sequence, &id),
+        SessionWatchEvent::Cleared => state.set_session_watch_cleared(update.sequence),
     }
 }
 

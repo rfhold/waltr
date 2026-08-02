@@ -16,3 +16,6 @@ mod watch;
 
 #[path = "session/template_search.rs"]
 mod template_search;
+
+#[path = "session/wipe.rs"]
+mod wipe;

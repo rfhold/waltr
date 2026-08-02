@@ -256,6 +256,8 @@ pub struct SessionClientState {
     pub list: OperationState,
     /// Session delete operation state.
     pub delete: OperationState,
+    /// Session wipe operation state.
+    pub wipe: OperationState,
     /// Session runtime metadata update operation state.
     pub runtime_config_update: OperationState,
     /// User message submit operation state.
@@ -414,6 +416,13 @@ pub enum ClientOperationState {
         /// Deleted session id.
         id: String,
     },
+    /// Session wipe command result.
+    SessionWipe {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+    },
     /// Session runtime metadata update command result.
     SessionRuntimeConfigUpdate {
         /// Current operation status.
@@ -511,6 +520,7 @@ impl ClientOperationState {
             } => fail_loading_operation(status, error, MESSAGE, || *auth_status = None),
             Self::AuthCancel { status, error }
             | Self::SessionDelete { status, error, .. }
+            | Self::SessionWipe { status, error }
             | Self::SessionSubmitUserMessage { status, error, .. }
             | Self::SessionRespondExternalRequest { status, error, .. }
             | Self::SessionInterrupt { status, error, .. }
@@ -576,6 +586,7 @@ impl ClientOperationState {
             | Self::ConfigPatch { .. }
             | Self::ConfigReset { .. }
             | Self::SessionCreate { .. }
+            | Self::SessionWipe { .. }
             | Self::SessionRuntimeConfigUpdate { .. } => {}
         }
     }
@@ -1604,6 +1615,46 @@ impl ClientState {
         );
     }
 
+    pub(crate) fn set_session_wipe_loading(&mut self, key: OperationKey) {
+        self.sessions.wipe.status = OperationStatus::Loading;
+        self.sessions.wipe.error = None;
+        self.sessions.wipe.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionWipe {
+                status: OperationStatus::Loading,
+                error: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_wipe_ready(&mut self, key: OperationKey) {
+        self.clear_session_derived_state();
+        self.sessions.wipe.status = OperationStatus::Ready;
+        self.sessions.wipe.error = None;
+        self.sessions.wipe.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionWipe {
+                status: OperationStatus::Ready,
+                error: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_wipe_failed(&mut self, key: OperationKey, message: String) {
+        self.sessions.wipe.status = OperationStatus::Failed;
+        self.sessions.wipe.error = Some(message.clone());
+        self.sessions.wipe.key = Some(key.clone());
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionWipe {
+                status: OperationStatus::Failed,
+                error: Some(message),
+            },
+        );
+    }
+
     pub(crate) fn set_session_runtime_config_update_loading(&mut self, key: OperationKey) {
         self.sessions.runtime_config_update.status = OperationStatus::Loading;
         self.sessions.runtime_config_update.error = None;
@@ -2287,6 +2338,14 @@ impl ClientState {
         self.sessions.watch.retry_attempt = 0;
     }
 
+    pub(crate) fn set_session_watch_cleared(&mut self, sequence: u64) {
+        self.clear_session_derived_state();
+        self.sessions.last_sequence = sequence;
+        self.sessions.watch.status = OperationStatus::Received;
+        self.sessions.watch.error = None;
+        self.sessions.watch.retry_attempt = 0;
+    }
+
     pub(crate) fn set_session_watch_failed(&mut self, message: String) -> u64 {
         self.sessions.watch.status = OperationStatus::Failed;
         self.sessions.watch.error = Some(message);
@@ -2304,6 +2363,17 @@ impl ClientState {
     fn remove_session(&mut self, id: &str) {
         self.sessions.current.remove(id);
         self.sessions.timelines.remove(id);
+        self.sessions.template_searches.remove(id);
+    }
+
+    fn clear_session_derived_state(&mut self) {
+        self.sessions.current.clear();
+        self.sessions.timelines.clear();
+        self.sessions.template_searches.clear();
+        if self.sessions.list.status == OperationStatus::Loading {
+            self.sessions.list.status = OperationStatus::Ready;
+            self.sessions.list.error = None;
+        }
     }
 
     fn session_timeline_mut(&mut self, session_id: &str) -> &mut SessionTimelineState {

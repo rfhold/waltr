@@ -49,9 +49,9 @@ async fn request_session_timeline_loads_seeded_events_through_client_state() {
         .expect("timeline should be present");
 
     assert_eq!(timeline.load.error, None);
-    assert_eq!(timeline.events[0].item_id, "user-1");
+    assert_eq!(timeline.events[0].item_id, "i1");
     assert_eq!(text_snapshot(&timeline.events[0].content), "hello");
-    assert_eq!(timeline.events[1].item_id, "assistant-1");
+    assert_eq!(timeline.events[1].item_id, "i2");
     assert_eq!(text_snapshot(&timeline.events[1].content), "hi there");
 }
 
@@ -82,10 +82,7 @@ async fn timeline_watch_replays_seeded_events_through_client_state() {
             .get(&session_id)
             .is_some_and(|timeline| {
                 timeline.watch.status == "received"
-                    && timeline
-                        .events
-                        .iter()
-                        .any(|event| event.item_id == "assistant-1")
+                    && timeline.events.iter().any(|event| event.item_id == "i2")
             })
     })
     .await;
@@ -97,7 +94,7 @@ async fn timeline_watch_replays_seeded_events_through_client_state() {
 
     assert_eq!(timeline.watch.error, None);
     assert_eq!(timeline.events.len(), 1);
-    assert_eq!(timeline.events[0].item_id, "assistant-1");
+    assert_eq!(timeline.events[0].item_id, "i2");
     assert_eq!(text_snapshot(&timeline.events[0].content), "hi there");
 
     let released = dispatch_stream_command(
@@ -139,12 +136,7 @@ async fn timeline_watch_keeps_distinct_request_params_active() {
             .sessions
             .timelines
             .get(&session_id)
-            .is_some_and(|timeline| {
-                timeline
-                    .events
-                    .iter()
-                    .any(|event| event.item_id == "assistant-1")
-            })
+            .is_some_and(|timeline| timeline.events.iter().any(|event| event.item_id == "i2"))
     })
     .await;
 
@@ -166,14 +158,8 @@ async fn timeline_watch_keeps_distinct_request_params_active() {
             .timelines
             .get(&session_id)
             .is_some_and(|timeline| {
-                timeline
-                    .events
-                    .iter()
-                    .any(|event| event.item_id == "assistant-1")
-                    && timeline
-                        .events
-                        .iter()
-                        .any(|event| event.item_id == "user-1")
+                timeline.events.iter().any(|event| event.item_id == "i2")
+                    && timeline.events.iter().any(|event| event.item_id == "i1")
             })
     })
     .await;
@@ -231,7 +217,7 @@ async fn rollback_before_cursor_truncates_timeline_through_client_state() {
             .timelines
             .get(&session_id)
             .is_some_and(|timeline| {
-                timeline.events.len() == 1 && timeline.events[0].item_id == "user-1"
+                timeline.events.len() == 1 && timeline.events[0].item_id == "i1"
             })
             && snapshot.operations.current.values().any(|operation| {
                 matches!(
