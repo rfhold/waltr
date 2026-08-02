@@ -284,7 +284,7 @@ pub(crate) fn timeline_text_event(
         cursor,
         session_id: session_id.to_owned(),
         turn: 1,
-        item_id: format!("item-{cursor}"),
+        item_id: format!("i{cursor}"),
         parent_id: None,
         kind: TimelineEventKindView::ItemFinished,
         channel: Some(channel.to_owned()),
@@ -574,6 +574,27 @@ pub(crate) fn session_delete_snapshot_with_error(
     snapshot
 }
 
+pub(crate) fn session_wipe_snapshot_from(
+    mut snapshot: ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) -> ClientSnapshot {
+    snapshot.sessions.wipe = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionWipe {
+            status,
+            error: error.map(str::to_owned),
+        },
+    );
+    snapshot
+}
+
 pub(crate) fn session_submit_snapshot(
     session: SessionView,
     key: &str,
@@ -753,6 +774,11 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 key: None,
             },
             delete: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            wipe: OperationSnapshot {
                 status: "idle",
                 error: None,
                 key: None,

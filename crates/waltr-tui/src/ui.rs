@@ -53,6 +53,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
                 screens::draw_sessions(frame, area, app.sessions_section(), app.client_snapshot());
             });
         }
+        AppScreen::SessionData => {
+            draw_app_shell(frame, area, app, true, |frame, area| {
+                frame.render_widget(Clear, area);
+            });
+            screens::draw_session_data(frame, area, app.session_data_state());
+        }
     });
 
     render_auth_modal(frame, app);

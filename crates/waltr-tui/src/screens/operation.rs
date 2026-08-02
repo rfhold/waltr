@@ -66,6 +66,12 @@ impl OperationTracker {
         self.pending
     }
 
+    /// Whether this tracker has captured the submitted operation's identity.
+    #[must_use]
+    pub const fn has_key(&self) -> bool {
+        self.key.is_some()
+    }
+
     /// Last terminal operation error, if any.
     #[must_use]
     pub fn error(&self) -> Option<&str> {

@@ -88,6 +88,10 @@ pub async fn open_sessions_screen(stream: &mut ClientStateStream, app: &mut App)
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "server-backed command driving handles each keyed operation explicitly"
+)]
 pub async fn dispatch_app_command(
     stream: &mut ClientStateStream,
     app: &mut App,
@@ -155,6 +159,21 @@ pub async fn dispatch_app_command(
             matches!(
                 snapshot.operations.current.get(&key),
                 Some(ClientOperationView::SessionDelete {
+                    status: "ready" | "failed",
+                    ..
+                })
+            )
+        })
+        .await;
+    }
+
+    if let Some(key) = snapshot.sessions.wipe.key.clone()
+        && snapshot.sessions.wipe.status == "loading"
+    {
+        return next_snapshot_until(stream, app, |snapshot| {
+            matches!(
+                snapshot.operations.current.get(&key),
+                Some(ClientOperationView::SessionWipe {
                     status: "ready" | "failed",
                     ..
                 })

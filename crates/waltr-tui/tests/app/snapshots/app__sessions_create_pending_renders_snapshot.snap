@@ -20,7 +20,7 @@ expression: render_app(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"             Esc back  C-x s create  Right/Enter detail  C-x d delete           "
+"             C-x s create Enter open C-x d delete C-x w session data            "
 "                                                                                "
 "                                                                                "
 "                                                                                "
