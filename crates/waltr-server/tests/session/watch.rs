@@ -1,9 +1,9 @@
 use crate::support::grpc::session_client;
 use waltr::grpc::waltr::session::v1::{
     CreateSessionRequest, DeleteSessionRequest, SessionPhase, WatchSessionsRequest,
-    watch_sessions_response,
+    WipeSessionsRequest, watch_sessions_response,
 };
-use waltr_agent::{PendingTimelineEvent, TimelineItemId};
+use waltr_agent::{PendingTimelineEvent, PendingTimelineItemId};
 use waltr_server::test_support::{setup_server, setup_server_with_sessions};
 
 #[tokio::test]
@@ -39,6 +39,7 @@ async fn session_service_watch_emits_created_sessions() -> Result<(), Box<dyn st
                 snapshot.sessions.len()
             )
         }
+        watch_sessions_response::Event::Cleared(_) => panic!("expected session event, got cleared"),
     };
 
     assert!(update.sequence > 0);
@@ -88,6 +89,7 @@ async fn receives_deleted_session_event() -> Result<(), Box<dyn std::error::Erro
                 snapshot.sessions.len()
             )
         }
+        watch_sessions_response::Event::Cleared(_) => panic!("expected session event, got cleared"),
     }
 
     mutation_client
@@ -112,6 +114,9 @@ async fn receives_deleted_session_event() -> Result<(), Box<dyn std::error::Erro
                 "expected deleted id event, got snapshot with {} sessions",
                 snapshot.sessions.len()
             )
+        }
+        watch_sessions_response::Event::Cleared(_) => {
+            panic!("expected deleted id event, got cleared")
         }
     }
 
@@ -214,7 +219,7 @@ async fn session_service_watch_emits_runtime_status_updates()
             vec![PendingTimelineEvent::assistant_text_delta(
                 session_id.clone(),
                 0,
-                TimelineItemId::new("assistant-1"),
+                PendingTimelineItemId::New,
                 "hello",
             )],
         )
@@ -227,6 +232,44 @@ async fn session_service_watch_emits_runtime_status_updates()
         SessionPhase::StreamingProvider as i32
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_service_watch_emits_one_cleared_event_for_wipe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = setup_server();
+    let mut watch_client = session_client(server).await?;
+    let mut mutation_client = session_client(server).await?;
+    mutation_client
+        .create_session(CreateSessionRequest::default())
+        .await?;
+    let mut watch = watch_client
+        .watch_sessions(WatchSessionsRequest::default())
+        .await?
+        .into_inner();
+    let snapshot = next_watch_message(&mut watch).await?;
+    assert!(matches!(
+        snapshot.event,
+        Some(watch_sessions_response::Event::Snapshot(_))
+    ));
+
+    mutation_client
+        .wipe_sessions(WipeSessionsRequest { confirm: true })
+        .await?;
+
+    let cleared = next_watch_message(&mut watch).await?;
+    assert!(cleared.sequence > snapshot.sequence);
+    assert!(matches!(
+        cleared.event,
+        Some(watch_sessions_response::Event::Cleared(_))
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), watch.message())
+            .await
+            .is_err(),
+        "wipe should publish exactly one cleared event"
+    );
     Ok(())
 }
 
@@ -259,6 +302,7 @@ fn assert_session_event(
                 snapshot.sessions.len()
             )
         }
+        watch_sessions_response::Event::Cleared(_) => panic!("expected session event, got cleared"),
     }
 }
 
@@ -280,6 +324,7 @@ fn session_event(
                 snapshot.sessions.len()
             )
         }
+        watch_sessions_response::Event::Cleared(_) => panic!("expected session event, got cleared"),
     }
 }
 
@@ -301,6 +346,9 @@ fn assert_deleted_event(
                 "expected deleted id event, got snapshot with {} sessions",
                 snapshot.sessions.len()
             )
+        }
+        watch_sessions_response::Event::Cleared(_) => {
+            panic!("expected deleted id event, got cleared")
         }
     }
 }
@@ -333,6 +381,9 @@ fn assert_snapshot_event(
         }
         watch_sessions_response::Event::DeletedId(id) => {
             panic!("expected snapshot event, got deleted id {id}")
+        }
+        watch_sessions_response::Event::Cleared(_) => {
+            panic!("expected snapshot event, got cleared")
         }
     }
 }

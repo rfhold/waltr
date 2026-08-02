@@ -22,11 +22,16 @@ async fn get_timeline_returns_persisted_events() -> Result<(), Box<dyn std::erro
         .append_timeline(
             &session_id,
             vec![
-                PendingTimelineEvent::user_text_snapshot(session_id.clone(), 1, "user-1", "hello"),
+                PendingTimelineEvent::user_text_snapshot(
+                    session_id.clone(),
+                    1,
+                    waltr_agent::PendingTimelineItemId::New,
+                    "hello",
+                ),
                 PendingTimelineEvent::assistant_text_snapshot(
                     session_id.clone(),
                     1,
-                    "assistant-1",
+                    waltr_agent::PendingTimelineItemId::New,
                     "hi there",
                 ),
             ],
@@ -49,9 +54,9 @@ async fn get_timeline_returns_persisted_events() -> Result<(), Box<dyn std::erro
 
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].session_id, session.id);
-    assert_eq!(events[0].item_id, "user-1");
+    assert_eq!(events[0].item_id, "i1");
     assert_eq!(text_snapshot(&events[0]), "hello");
-    assert_eq!(events[1].item_id, "assistant-1");
+    assert_eq!(events[1].item_id, "i2");
     assert_eq!(text_snapshot(&events[1]), "hi there");
 
     Ok(())
@@ -76,7 +81,7 @@ async fn watch_timeline_replays_history_then_live_events() -> Result<(), Box<dyn
             vec![PendingTimelineEvent::user_text_snapshot(
                 session_id.clone(),
                 1,
-                "user-1",
+                waltr_agent::PendingTimelineItemId::New,
                 "hello",
             )],
         )
@@ -98,7 +103,7 @@ async fn watch_timeline_replays_history_then_live_events() -> Result<(), Box<dyn
             vec![PendingTimelineEvent::assistant_text_snapshot(
                 session_id.clone(),
                 1,
-                "assistant-1",
+                waltr_agent::PendingTimelineItemId::New,
                 "hi there",
             )],
         )
@@ -118,7 +123,7 @@ async fn watch_timeline_replays_history_then_live_events() -> Result<(), Box<dyn
     .await??;
     let (sequence, event) = update;
     assert!(sequence > 0);
-    assert_eq!(event.item_id, "assistant-1");
+    assert_eq!(event.item_id, "i2");
     assert_eq!(text_snapshot(&event), "hi there");
 
     Ok(())
@@ -141,9 +146,24 @@ async fn watch_timeline_replays_after_cursor_before_initial_limit()
         .append_timeline(
             &session_id,
             vec![
-                PendingTimelineEvent::user_text_snapshot(session_id.clone(), 1, "user-1", "one"),
-                PendingTimelineEvent::user_text_snapshot(session_id.clone(), 1, "user-2", "two"),
-                PendingTimelineEvent::user_text_snapshot(session_id.clone(), 1, "user-3", "three"),
+                PendingTimelineEvent::user_text_snapshot(
+                    session_id.clone(),
+                    1,
+                    waltr_agent::PendingTimelineItemId::New,
+                    "one",
+                ),
+                PendingTimelineEvent::user_text_snapshot(
+                    session_id.clone(),
+                    1,
+                    waltr_agent::PendingTimelineItemId::New,
+                    "two",
+                ),
+                PendingTimelineEvent::user_text_snapshot(
+                    session_id.clone(),
+                    1,
+                    waltr_agent::PendingTimelineItemId::New,
+                    "three",
+                ),
             ],
         )
         .await?;
@@ -173,8 +193,8 @@ async fn watch_timeline_replays_after_cursor_before_initial_limit()
     })
     .await??;
 
-    assert_eq!(events[0].item_id, "user-2");
-    assert_eq!(events[1].item_id, "user-3");
+    assert_eq!(events[0].item_id, "i2");
+    assert_eq!(events[1].item_id, "i3");
 
     Ok(())
 }
@@ -200,7 +220,7 @@ async fn watch_timeline_pages_large_after_cursor_catchup_without_initial_gap()
                     PendingTimelineEvent::user_text_snapshot(
                         session_id.clone(),
                         1,
-                        format!("user-{index}"),
+                        waltr_agent::PendingTimelineItemId::New,
                         format!("message {index}"),
                     )
                 })
@@ -235,11 +255,11 @@ async fn watch_timeline_pages_large_after_cursor_catchup_without_initial_gap()
 
     assert_eq!(
         events.first().map(|event| event.item_id.as_str()),
-        Some("user-1")
+        Some("i2")
     );
     assert_eq!(
         events.last().map(|event| event.item_id.as_str()),
-        Some("user-1005")
+        Some("i1006")
     );
     assert!(
         events

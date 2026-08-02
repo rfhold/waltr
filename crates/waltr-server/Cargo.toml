@@ -20,6 +20,8 @@ waltr-agent = { path = "../waltr-agent", version = "0.1.0", default-features = f
 futures-util.workspace = true
 http-body.workspace = true
 jsonwebtoken.workspace = true
+jaq-interpret.workspace = true
+jaq-parse.workspace = true
 mcp = { workspace = true, features = ["oauth-authorization-server-postgres", "oauth-authorization-server-sqlite", "progressive", "streamable-http-postgres", "streamable-http-sqlite"] }
 oauth2.workspace = true
 notify.workspace = true

@@ -251,6 +251,7 @@ async fn update_runtime_config_publishes_session_upsert() -> Result<(), Box<dyn 
                 snapshot.sessions.len()
             )
         }
+        watch_sessions_response::Event::Cleared(_) => panic!("expected session, got cleared"),
     };
 
     assert_eq!(updated.id, created.id);
