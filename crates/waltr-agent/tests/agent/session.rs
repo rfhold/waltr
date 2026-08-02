@@ -160,9 +160,10 @@ mod completion {
     use futures_util::StreamExt;
     use waltr_agent::{
         AgentRuntime, AgentTimelineEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi,
-        ModelRef, PendingTimelineEvent, ProviderId, SessionCoordinator, SessionId,
-        SessionListEvent, SessionStatus, SessionStore, SessionTimelineEvent, TimelineContent,
-        TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall, ToolDefinition,
+        ModelRef, PendingTimelineEvent, PendingTimelineItemId, ProviderId, SessionCoordinator,
+        SessionId, SessionListEvent, SessionStatus, SessionStore, SessionTimelineEvent,
+        TimelineContent, TimelineCursor, TimelineEventKind, TimelineQuery, TimelineStatus,
+        ToolCall, ToolDefinition,
     };
     use serde_json::json;
     use tokio::time::{Duration, timeout};
@@ -290,13 +291,13 @@ mod completion {
                     PendingTimelineEvent::user_text_snapshot(
                         session_id.clone(),
                         1,
-                        "user-1",
+                        PendingTimelineItemId::New,
                         "first prompt",
                     ),
                     PendingTimelineEvent::user_text_snapshot(
                         session_id.clone(),
                         2,
-                        "user-2",
+                        PendingTimelineItemId::New,
                         "second prompt",
                     ),
                 ],
@@ -314,8 +315,8 @@ mod completion {
             .expect("timeline after rollback");
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].item_id.as_str(), "user-1");
-        assert_eq!(events[1].item_id.as_str(), "user-2");
+        assert_eq!(events[0].item_id.as_str(), "i1");
+        assert_eq!(events[1].item_id.as_str(), "i2");
     }
 
     #[tokio::test]
@@ -331,13 +332,13 @@ mod completion {
                     PendingTimelineEvent::user_text_snapshot(
                         session_id.clone(),
                         1,
-                        "user-1",
+                        PendingTimelineItemId::New,
                         "first prompt",
                     ),
                     PendingTimelineEvent::user_text_snapshot(
                         session_id.clone(),
                         2,
-                        "user-2",
+                        PendingTimelineItemId::New,
                         "second prompt",
                     ),
                 ],
@@ -360,7 +361,7 @@ mod completion {
             .expect("timeline after rollback");
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].item_id.as_str(), "user-1");
+        assert_eq!(events[0].item_id.as_str(), "i1");
         assert!(matches!(
             update.event,
             SessionTimelineEvent::Truncated {
@@ -368,6 +369,20 @@ mod completion {
                 ..
             } if cursor == seeded[0].cursor
         ));
+        let continued = sessions
+            .append_timeline(
+                &session_id,
+                vec![PendingTimelineEvent::user_text_snapshot(
+                    session_id.clone(),
+                    2,
+                    PendingTimelineItemId::New,
+                    "replacement prompt",
+                )],
+            )
+            .await
+            .expect("append after rollback");
+        assert_eq!(continued[0].cursor, TimelineCursor::new(3));
+        assert_eq!(continued[0].item_id.as_str(), "i3");
     }
 
     #[tokio::test]
@@ -382,7 +397,7 @@ mod completion {
                 vec![PendingTimelineEvent::user_text_snapshot(
                     session_id.clone(),
                     1,
-                    "user-1",
+                    PendingTimelineItemId::New,
                     "first prompt",
                 )],
             )

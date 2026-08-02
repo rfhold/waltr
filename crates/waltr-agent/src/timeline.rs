@@ -1,6 +1,8 @@
 //! Public agent timeline model.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
 
 use crate::{
@@ -65,14 +67,19 @@ impl From<u64> for TimelineCursor {
     }
 }
 
-/// Stable timeline item identity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct TimelineItemId(pub String);
+/// Opaque, persistence-assigned timeline item identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimelineItemId(String);
 
 impl TimelineItemId {
-    /// Create a timeline item identifier.
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    /// Create an item identity from the cursor of its first durable event.
+    #[must_use]
+    pub fn from_first_cursor(cursor: TimelineCursor) -> Self {
+        assert!(
+            cursor != TimelineCursor::ZERO,
+            "timeline item cursor must be non-zero"
+        );
+        Self(format!("i{}", cursor.get()))
     }
 
     /// Borrow the identifier string.
@@ -82,15 +89,49 @@ impl TimelineItemId {
     }
 }
 
-impl From<&str> for TimelineItemId {
-    fn from(value: &str) -> Self {
-        Self::new(value)
+impl fmt::Display for TimelineItemId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
-impl From<String> for TimelineItemId {
-    fn from(value: String) -> Self {
-        Self::new(value)
+impl Serialize for TimelineItemId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TimelineItemId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let sequence = value
+            .strip_prefix('i')
+            .filter(|sequence| !sequence.is_empty() && !sequence.starts_with('0'))
+            .and_then(|sequence| sequence.parse::<u64>().ok())
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| de::Error::custom("timeline item id must match i[1-9][0-9]*"))?;
+        Ok(Self(format!("i{sequence}")))
+    }
+}
+
+/// Allocation intent for a pending timeline event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingTimelineItemId {
+    /// Allocate an identity from this event's durable cursor.
+    New,
+    /// Append another event to an existing item.
+    Existing(TimelineItemId),
+}
+
+impl From<TimelineItemId> for PendingTimelineItemId {
+    fn from(value: TimelineItemId) -> Self {
+        Self::Existing(value)
     }
 }
 
@@ -381,8 +422,8 @@ pub struct PendingTimelineEvent {
     pub session_id: SessionId,
     /// Provider turn associated with this event.
     pub turn: u64,
-    /// Timeline item identity.
-    pub item_id: TimelineItemId,
+    /// Timeline item allocation intent.
+    pub item_id: PendingTimelineItemId,
     /// Parent item identity for child events.
     pub parent_id: Option<TimelineItemId>,
     /// Event lifecycle kind.
@@ -404,7 +445,7 @@ impl PendingTimelineEvent {
     pub fn new(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         kind: TimelineEventKind,
         channel: Option<TimelineChannel>,
         content: TimelineContent,
@@ -427,7 +468,7 @@ impl PendingTimelineEvent {
     pub fn assistant_text_delta(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         delta: impl Into<String>,
     ) -> Self {
         text_delta_event(session_id, turn, item_id, CHANNEL_ASSISTANT_TEXT, delta)
@@ -438,7 +479,7 @@ impl PendingTimelineEvent {
     pub fn user_text_snapshot(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         text: impl Into<String>,
     ) -> Self {
         text_snapshot_event(session_id, turn, item_id, CHANNEL_USER_TEXT, text)
@@ -449,7 +490,7 @@ impl PendingTimelineEvent {
     pub fn assistant_text_snapshot(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         text: impl Into<String>,
     ) -> Self {
         text_snapshot_event(session_id, turn, item_id, CHANNEL_ASSISTANT_TEXT, text)
@@ -460,7 +501,7 @@ impl PendingTimelineEvent {
     pub fn thinking_delta(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         delta: impl Into<String>,
     ) -> Self {
         text_delta_event(session_id, turn, item_id, CHANNEL_THINKING, delta)
@@ -471,7 +512,7 @@ impl PendingTimelineEvent {
     pub fn tool_progress_info(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         parent_id: impl Into<TimelineItemId>,
         delta: impl Into<String>,
     ) -> Self {
@@ -486,7 +527,7 @@ impl PendingTimelineEvent {
     pub fn tool_progress_error(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         parent_id: impl Into<TimelineItemId>,
         delta: impl Into<String>,
     ) -> Self {
@@ -506,7 +547,7 @@ impl PendingTimelineEvent {
     pub fn tool_call(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         call: ToolCall,
     ) -> Self {
         let mut event = Self::new(
@@ -526,7 +567,7 @@ impl PendingTimelineEvent {
     pub fn tool_result(
         session_id: SessionId,
         turn: u64,
-        item_id: impl Into<TimelineItemId>,
+        item_id: impl Into<PendingTimelineItemId>,
         parent_id: impl Into<TimelineItemId>,
         result: ToolResult,
     ) -> Self {
@@ -545,12 +586,16 @@ impl PendingTimelineEvent {
 
     /// Assign a durable session cursor to this pending event.
     #[must_use]
-    pub fn with_cursor(self, cursor: TimelineCursor) -> AgentTimelineEvent {
+    pub(crate) fn with_cursor(self, cursor: TimelineCursor) -> AgentTimelineEvent {
+        let item_id = match self.item_id {
+            PendingTimelineItemId::New => TimelineItemId::from_first_cursor(cursor),
+            PendingTimelineItemId::Existing(item_id) => item_id,
+        };
         AgentTimelineEvent {
             cursor,
             session_id: self.session_id,
             turn: self.turn,
-            item_id: self.item_id,
+            item_id,
             parent_id: self.parent_id,
             kind: self.kind,
             channel: self.channel,
@@ -586,18 +631,10 @@ pub struct AgentTimelineEvent {
     pub metadata: Value,
 }
 
-impl AgentTimelineEvent {
-    /// Create a cursor-assigned event from a pending event.
-    #[must_use]
-    pub fn from_pending(cursor: TimelineCursor, pending: PendingTimelineEvent) -> Self {
-        pending.with_cursor(cursor)
-    }
-}
-
 fn text_delta_event(
     session_id: SessionId,
     turn: u64,
-    item_id: impl Into<TimelineItemId>,
+    item_id: impl Into<PendingTimelineItemId>,
     channel: &'static str,
     delta: impl Into<String>,
 ) -> PendingTimelineEvent {
@@ -614,7 +651,7 @@ fn text_delta_event(
 fn text_snapshot_event(
     session_id: SessionId,
     turn: u64,
-    item_id: impl Into<TimelineItemId>,
+    item_id: impl Into<PendingTimelineItemId>,
     channel: &str,
     text: impl Into<String>,
 ) -> PendingTimelineEvent {
@@ -697,25 +734,30 @@ mod tests {
         let assistant = PendingTimelineEvent::assistant_text_delta(
             session_id.clone(),
             3,
-            "assistant-turn-3",
+            PendingTimelineItemId::New,
             "hello",
         );
+        let tool_call_id = TimelineItemId::from_first_cursor(TimelineCursor::new(1));
         let progress = PendingTimelineEvent::tool_progress_error(
             session_id.clone(),
             3,
-            "progress-1",
-            "tool-call-1",
+            PendingTimelineItemId::New,
+            tool_call_id.clone(),
             "stderr",
         );
         let call = ToolCall::new("call-1", "read", json!({ "path": "README.md" }));
-        let tool_call =
-            PendingTimelineEvent::tool_call(session_id.clone(), 3, "tool-call-1", call.clone());
+        let tool_call = PendingTimelineEvent::tool_call(
+            session_id.clone(),
+            3,
+            PendingTimelineItemId::New,
+            call.clone(),
+        );
         let result = ToolResult::new("call-1", "read", "contents");
         let tool_result = PendingTimelineEvent::tool_result(
             session_id,
             3,
-            "tool-result-1",
-            "tool-call-1",
+            PendingTimelineItemId::New,
+            tool_call_id.clone(),
             result.clone(),
         );
 
@@ -731,20 +773,14 @@ mod tests {
             progress.channel,
             Some(TimelineChannel::from(CHANNEL_TOOL_PROGRESS_ERROR))
         );
-        assert_eq!(
-            progress.parent_id,
-            Some(TimelineItemId::from("tool-call-1"))
-        );
+        assert_eq!(progress.parent_id, Some(tool_call_id.clone()));
 
         assert_eq!(tool_call.kind, TimelineEventKind::ItemStarted);
         assert_eq!(tool_call.status, Some(TimelineStatus::Pending));
         assert_eq!(tool_call.content, TimelineContent::ToolCall { call });
 
         assert_eq!(tool_result.kind, TimelineEventKind::ItemFinished);
-        assert_eq!(
-            tool_result.parent_id,
-            Some(TimelineItemId::from("tool-call-1"))
-        );
+        assert_eq!(tool_result.parent_id, Some(tool_call_id));
         assert_eq!(tool_result.status, Some(TimelineStatus::Finished));
         assert_eq!(tool_result.content, TimelineContent::ToolResult { result });
     }
@@ -754,7 +790,7 @@ mod tests {
         let pending = PendingTimelineEvent::thinking_delta(
             SessionId::new("session-1"),
             1,
-            "thinking-1",
+            PendingTimelineItemId::New,
             "considering",
         );
         let event = pending.clone().with_cursor(TimelineCursor::new(9));
@@ -762,7 +798,8 @@ mod tests {
         assert_eq!(event.cursor, TimelineCursor::new(9));
         assert_eq!(event.session_id, pending.session_id);
         assert_eq!(event.turn, pending.turn);
-        assert_eq!(event.item_id, pending.item_id);
+        assert_eq!(event.item_id.as_str(), "i9");
+        assert_eq!(pending.item_id, PendingTimelineItemId::New);
         assert_eq!(event.kind, pending.kind);
         assert_eq!(event.channel, pending.channel);
         assert_eq!(event.content, pending.content);
@@ -801,17 +838,23 @@ mod tests {
         let pending = PendingTimelineEvent::assistant_text_delta(
             SessionId::new("session-1"),
             0,
-            "assistant-turn-0",
+            PendingTimelineItemId::New,
             "hi",
         );
         let pending_value = serde_json::to_value(&pending).expect("serialize pending event");
-        let event_value = serde_json::to_value(AgentTimelineEvent::from_pending(
-            TimelineCursor::new(1),
-            pending,
-        ))
-        .expect("serialize assigned event");
+        let event_value = serde_json::to_value(pending.with_cursor(TimelineCursor::new(1)))
+            .expect("serialize assigned event");
 
         assert!(pending_value.get("cursor").is_none());
         assert_eq!(event_value.get("cursor"), Some(&json!(1)));
+        assert_eq!(event_value.get("item_id"), Some(&json!("i1")));
+    }
+
+    #[test]
+    fn timeline_item_id_rejects_legacy_values() {
+        let error = serde_json::from_value::<TimelineItemId>(json!("assistant-turn-1"))
+            .expect_err("legacy item id should fail");
+
+        assert!(error.to_string().contains("i[1-9][0-9]*"));
     }
 }

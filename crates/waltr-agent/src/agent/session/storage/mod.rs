@@ -9,7 +9,12 @@ mod postgresql;
 mod s3;
 mod scylla;
 
-use std::{collections::BTreeMap, error::Error, fmt, future::Future};
+use std::{
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt,
+    future::Future,
+};
 
 pub use filesystem::FilesystemSessionStore;
 pub use memory::MemorySessionStore;
@@ -19,8 +24,8 @@ pub use s3::S3SessionStore;
 pub use scylla::ScyllaSessionStore;
 
 use crate::timeline::{
-    AgentTimelineEvent, PendingTimelineEvent, TimelineContent, TimelineCursor, TimelineDirection,
-    TimelineItemId, TimelineItemText, TimelineQuery,
+    AgentTimelineEvent, PendingTimelineEvent, PendingTimelineItemId, TimelineContent,
+    TimelineCursor, TimelineDirection, TimelineItemId, TimelineItemText, TimelineQuery,
 };
 use serde_json::Value;
 
@@ -154,6 +159,9 @@ pub trait SessionStore: Send + Sync {
     /// Delete a session record if present.
     fn delete(&self, id: &SessionId) -> impl Future<Output = SessionStoreResult<()>> + Send;
 
+    /// Delete every session record without decoding stored data.
+    fn wipe(&self) -> impl Future<Output = SessionStoreResult<()>> + Send;
+
     /// List known sessions, newest activity first.
     fn list(&self) -> impl Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send;
 
@@ -238,6 +246,10 @@ pub(super) fn append_timeline_to_record(
     let mut cursor = record
         .last_timeline_cursor()
         .unwrap_or(TimelineCursor::ZERO);
+    let mut effective_item_ids = record
+        .timeline_events()
+        .map(|event| event.item_id.clone())
+        .collect::<HashSet<_>>();
     let mut assigned = Vec::with_capacity(events.len());
     for event in events {
         if event.session_id != *id {
@@ -247,7 +259,25 @@ pub(super) fn append_timeline_to_record(
             });
         }
         cursor = cursor.next();
-        assigned.push(event.with_cursor(cursor));
+        if let PendingTimelineItemId::Existing(item_id) = &event.item_id
+            && !effective_item_ids.contains(item_id)
+        {
+            return Err(SessionStoreError::TimelineItemNotFound {
+                id: id.clone(),
+                item_id: item_id.clone(),
+            });
+        }
+        if let Some(parent_id) = &event.parent_id
+            && !effective_item_ids.contains(parent_id)
+        {
+            return Err(SessionStoreError::TimelineItemNotFound {
+                id: id.clone(),
+                item_id: parent_id.clone(),
+            });
+        }
+        let event = event.with_cursor(cursor);
+        effective_item_ids.insert(event.item_id.clone());
+        assigned.push(event);
     }
     record.append_journal_events(assigned.iter().cloned().map(SessionJournalEvent::Timeline));
     record.touch_activity();

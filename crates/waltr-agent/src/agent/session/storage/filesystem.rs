@@ -106,6 +106,23 @@ impl FilesystemSessionStore {
         self.save_sync(&record)?;
         Ok(record)
     }
+
+    fn wipe_sync(&self) -> SessionStoreResult<()> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(backend_error(error)),
+        };
+        for entry in entries {
+            let path = entry.map_err(backend_error)?.path();
+            if path.is_dir() {
+                fs::remove_dir_all(path).map_err(backend_error)?;
+            } else {
+                fs::remove_file(path).map_err(backend_error)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SessionStore for FilesystemSessionStore {
@@ -185,6 +202,11 @@ impl SessionStore for FilesystemSessionStore {
                 }
             })
         }
+    }
+
+    fn wipe(&self) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        async move { store.wipe_sync() }
     }
 
     fn list(
@@ -331,6 +353,19 @@ mod tests {
 
         let error = store.load(&id).await.unwrap_err();
         assert_eq!(error, SessionStoreError::NotFound { id });
+    }
+
+    #[tokio::test]
+    async fn wipe_removes_valid_and_invalid_raw_records_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FilesystemSessionStore::new(temp.path());
+        store.create(SessionId::new("valid")).await.unwrap();
+        fs::write(temp.path().join("legacy.json"), b"not a session record").unwrap();
+
+        store.wipe().await.unwrap();
+        store.wipe().await.unwrap();
+
+        assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
     }
 
     #[tokio::test]

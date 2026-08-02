@@ -70,9 +70,9 @@ pub use stream::{
 pub use timeline::{
     AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS,
     CHANNEL_THINKING, CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO,
-    CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, PendingTimelineEvent, TimelineChannel, TimelineContent,
-    TimelineContentId, TimelineCursor, TimelineDirection, TimelineEventKind, TimelineItemId,
-    TimelineItemText, TimelineQuery, TimelineStatus,
+    CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, PendingTimelineEvent, PendingTimelineItemId,
+    TimelineChannel, TimelineContent, TimelineContentId, TimelineCursor, TimelineDirection,
+    TimelineEventKind, TimelineItemId, TimelineItemText, TimelineQuery, TimelineStatus,
 };
 pub use tools::filesystem;
 pub use tools::question;

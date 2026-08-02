@@ -253,6 +253,18 @@ impl SessionStore for ScyllaSessionStore {
         }
     }
 
+    fn wipe(&self) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+        let store = self.clone();
+        async move {
+            store
+                .session
+                .query_unpaged(format!("TRUNCATE {}", store.table_name()), ())
+                .await
+                .map_err(backend_error)?;
+            Ok(())
+        }
+    }
+
     fn list(
         &self,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {

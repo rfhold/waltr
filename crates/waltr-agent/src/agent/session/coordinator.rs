@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -40,7 +40,7 @@ where
     sessions: SessionListBroadcaster,
     timeline: SessionTimelineBroadcaster,
     runtime_factory: Option<AgentSessionRuntimeFactory>,
-    mcp_sessions: Arc<Mutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
+    mcp_sessions: Arc<StdMutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
     active_runs: Arc<Mutex<BTreeMap<SessionId, ActiveSessionRun>>>,
     next_run_id: Arc<AtomicU64>,
 }
@@ -84,7 +84,7 @@ where
             sessions: SessionListBroadcaster::new(),
             timeline: SessionTimelineBroadcaster::new(),
             runtime_factory: None,
-            mcp_sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            mcp_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
             next_run_id: Arc::new(AtomicU64::new(0)),
         }
@@ -224,13 +224,49 @@ where
         AgentSessionRuntime::new(&self.store)
             .delete_session(id)
             .await?;
-        let runtime = self.mcp_sessions.lock().await.remove(id);
+        let runtime = self
+            .mcp_sessions
+            .lock()
+            .expect("MCP runtime cache lock poisoned")
+            .remove(id);
         let shutdown = match runtime {
             Some(runtime) => runtime.runtime.shutdown().await,
             None => Ok(()),
         };
         self.sessions.publish(SessionListEvent::Deleted(id.clone()));
         shutdown?;
+        Ok(())
+    }
+
+    /// Delete every durable session and clear cached per-session MCP runtimes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store wipe fails.
+    #[tracing::instrument(
+        name = "session.store",
+        skip(self),
+        fields(operation = "wipe", db_system = "session_store")
+    )]
+    pub async fn wipe_sessions(&self) -> Result<()> {
+        self.store.wipe().await.map_err(session_store_error)?;
+        let runtimes = std::mem::take(
+            &mut *self
+                .mcp_sessions
+                .lock()
+                .expect("MCP runtime cache lock poisoned"),
+        );
+        self.sessions.publish(SessionListEvent::Cleared);
+        drop(tokio::spawn(async move {
+            for (session_id, cached) in runtimes {
+                if cached.runtime.shutdown().await.is_err() {
+                    tracing::warn!(
+                        session_id = %session_id.as_str(),
+                        "failed to shut down cached MCP runtime after session wipe"
+                    );
+                }
+            }
+        }));
         Ok(())
     }
 
@@ -430,7 +466,11 @@ where
         let record = AgentSessionRuntime::new(&self.store)
             .set_runtime_settings(id, runtime_settings)
             .await?;
-        let runtime = self.mcp_sessions.lock().await.remove(id);
+        let runtime = self
+            .mcp_sessions
+            .lock()
+            .expect("MCP runtime cache lock poisoned")
+            .remove(id);
         let shutdown = match runtime {
             Some(runtime) => runtime.runtime.shutdown().await,
             None => Ok(()),
@@ -937,7 +977,12 @@ where
         if settings.mcp_servers.is_empty() {
             return Ok(None);
         }
-        let runtime = self.mcp_sessions.lock().await.get(session_id).cloned();
+        let runtime = self
+            .mcp_sessions
+            .lock()
+            .expect("MCP runtime cache lock poisoned")
+            .get(session_id)
+            .cloned();
         if let Some(cached) = runtime {
             factory
                 .preflight_cached_mcp_authentication(settings, &cached.credentialed_servers)
@@ -992,13 +1037,16 @@ where
                     }
                     error => super::AgentSessionRuntimeError::from(error),
                 })?;
-        self.mcp_sessions.lock().await.insert(
-            session_id.clone(),
-            CachedMcpRuntime {
-                runtime: Arc::clone(&runtime),
-                credentialed_servers,
-            },
-        );
+        self.mcp_sessions
+            .lock()
+            .expect("MCP runtime cache lock poisoned")
+            .insert(
+                session_id.clone(),
+                CachedMcpRuntime {
+                    runtime: Arc::clone(&runtime),
+                    credentialed_servers,
+                },
+            );
         Ok(Some(runtime))
     }
 }
@@ -1170,7 +1218,7 @@ mod tests {
     use crate::{
         AgentSessionRuntimeError, BoxCompletionStream, BoxStreamFuture, CompletionEvent,
         CompletionReplayItem, CompletionRequest, LlmStream, ModelApi, ModelRef, ProviderId,
-        SessionStatus, TimelineItemId,
+        SessionStatus,
         agent::session::{
             FileCredentialStore, MemorySessionStore, SessionListEvent, SessionMcpServerRuntimeKind,
             SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
@@ -1321,6 +1369,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wipe_sessions_clears_records_cached_mcp_runtimes_and_publishes_once() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let first = sessions.create().await.unwrap();
+        let second = sessions.create().await.unwrap();
+        for session_id in [&first.record.id, &second.record.id] {
+            let runtime = McpClientRuntime::start(
+                crate::mcp::McpConfig::new(),
+                "file:///tmp".to_owned(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            sessions
+                .mcp_sessions
+                .lock()
+                .expect("MCP runtime cache lock poisoned")
+                .insert(
+                    session_id.clone(),
+                    CachedMcpRuntime {
+                        runtime,
+                        credentialed_servers: BTreeSet::new(),
+                    },
+                );
+        }
+        let mut watch = sessions.watch_sessions();
+
+        sessions.wipe_sessions().await.unwrap();
+
+        assert!(sessions.list().await.unwrap().is_empty());
+        assert!(
+            sessions
+                .mcp_sessions
+                .lock()
+                .expect("MCP runtime cache lock poisoned")
+                .is_empty()
+        );
+        let update = tokio::time::timeout(std::time::Duration::from_secs(1), watch.next())
+            .await
+            .unwrap()
+            .expect("wipe should publish");
+        assert_eq!(update.sequence, 3);
+        assert_eq!(update.event, SessionListEvent::Cleared);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), watch.next())
+                .await
+                .is_err(),
+            "wipe should publish exactly one event"
+        );
+    }
+
+    #[tokio::test]
     async fn metadata_update_publishes_session_upsert() {
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let session = sessions.create().await.unwrap();
@@ -1346,6 +1445,7 @@ mod tests {
                 );
             }
             SessionListEvent::Deleted(id) => panic!("expected upsert, got deleted {id:?}"),
+            SessionListEvent::Cleared => panic!("expected upsert, got cleared"),
         }
     }
 
@@ -1361,7 +1461,7 @@ mod tests {
                 vec![PendingTimelineEvent::assistant_text_delta(
                     session.record.id.clone(),
                     0,
-                    TimelineItemId::new("assistant-1"),
+                    crate::PendingTimelineItemId::New,
                     "hi",
                 )],
             )
@@ -1379,6 +1479,7 @@ mod tests {
                 assert!(matches!(summary.status, SessionStatus::StreamingProvider));
             }
             SessionListEvent::Deleted(id) => panic!("expected upsert, got deleted {id:?}"),
+            SessionListEvent::Cleared => panic!("expected upsert, got cleared"),
         }
     }
 
@@ -1512,13 +1613,17 @@ mod tests {
         )
         .await
         .expect("empty MCP runtime should start");
-        sessions.mcp_sessions.lock().await.insert(
-            session.record.id.clone(),
-            CachedMcpRuntime {
-                runtime,
-                credentialed_servers: BTreeSet::from(["protected".to_owned()]),
-            },
-        );
+        sessions
+            .mcp_sessions
+            .lock()
+            .expect("MCP runtime cache lock poisoned")
+            .insert(
+                session.record.id.clone(),
+                CachedMcpRuntime {
+                    runtime,
+                    credentialed_servers: BTreeSet::from(["protected".to_owned()]),
+                },
+            );
 
         let error = sessions
             .resolve_runtime(&session.record.id)
@@ -1630,7 +1735,7 @@ mod tests {
                 vec![PendingTimelineEvent::assistant_text_delta(
                     session_id.clone(),
                     0,
-                    TimelineItemId::new("assistant-1"),
+                    crate::PendingTimelineItemId::New,
                     "before",
                 )],
             )
