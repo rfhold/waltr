@@ -735,7 +735,7 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                         config,
                         credential_store,
                         None,
-                    );
+                    )
                 },
             )
             .await
@@ -900,7 +900,7 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
                 persistence,
                 catalog_loader,
                 |routes, config, credential_store| {
-                    session::add_sessions_service(routes, sessions, config, credential_store, None);
+                    session::add_sessions_service(routes, sessions, config, credential_store, None)
                 },
             )
             .await
@@ -1081,7 +1081,7 @@ END
                         config,
                         credential_store,
                         trusted_mcp_oauth_origin,
-                    );
+                    )
                 },
             )
             .await

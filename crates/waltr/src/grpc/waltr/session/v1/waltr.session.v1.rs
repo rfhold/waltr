@@ -26,6 +26,14 @@ pub struct DeleteSessionRequest {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteSessionResponse {
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WipeSessionsRequest {
+    #[prost(bool, tag="1")]
+    pub confirm: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WipeSessionsResponse {
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UpdateSessionRuntimeConfigRequest {
     #[prost(string, tag="1")]
@@ -45,7 +53,7 @@ pub struct WatchSessionsRequest {
 pub struct WatchSessionsResponse {
     #[prost(uint64, tag="1")]
     pub sequence: u64,
-    #[prost(oneof="watch_sessions_response::Event", tags="2, 3, 4")]
+    #[prost(oneof="watch_sessions_response::Event", tags="2, 3, 4, 5")]
     pub event: ::core::option::Option<watch_sessions_response::Event>,
 }
 /// Nested message and enum types in `WatchSessionsResponse`.
@@ -58,12 +66,17 @@ pub mod watch_sessions_response {
         Session(super::SessionSummary),
         #[prost(string, tag="4")]
         DeletedId(::prost::alloc::string::String),
+        #[prost(message, tag="5")]
+        Cleared(super::SessionListCleared),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionListSnapshot {
     #[prost(message, repeated, tag="1")]
     pub sessions: ::prost::alloc::vec::Vec<SessionSummary>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionListCleared {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetTimelineRequest {
@@ -265,8 +278,10 @@ pub struct TimelineEvent {
     pub session_id: ::prost::alloc::string::String,
     #[prost(uint64, tag="3")]
     pub turn: u64,
+    /// Opaque session-local identity assigned as i<first durable event cursor>.
     #[prost(string, tag="4")]
     pub item_id: ::prost::alloc::string::String,
+    /// Opaque session-local item identity for this event's parent.
     #[prost(string, optional, tag="5")]
     pub parent_id: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(enumeration="TimelineEventKind", tag="6")]

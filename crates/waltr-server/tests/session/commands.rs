@@ -173,13 +173,13 @@ async fn rollback_before_cursor_returns_truncation() -> Result<(), Box<dyn std::
                 PendingTimelineEvent::user_text_snapshot(
                     session_id.clone(),
                     1,
-                    "user-1",
+                    waltr_agent::PendingTimelineItemId::New,
                     "first prompt",
                 ),
                 PendingTimelineEvent::user_text_snapshot(
                     session_id.clone(),
                     2,
-                    "user-2",
+                    waltr_agent::PendingTimelineItemId::New,
                     "second prompt",
                 ),
             ],
@@ -222,13 +222,13 @@ async fn rollback_before_cursor_publishes_timeline_truncation()
                 PendingTimelineEvent::user_text_snapshot(
                     session_id.clone(),
                     1,
-                    "user-1",
+                    waltr_agent::PendingTimelineItemId::New,
                     "first prompt",
                 ),
                 PendingTimelineEvent::user_text_snapshot(
                     session_id.clone(),
                     2,
-                    "user-2",
+                    waltr_agent::PendingTimelineItemId::New,
                     "second prompt",
                 ),
             ],
@@ -333,7 +333,7 @@ fn external_request_event(
     let mut event = PendingTimelineEvent::new(
         session_id.clone(),
         1,
-        "external-request:question-1",
+        waltr_agent::PendingTimelineItemId::New,
         kind,
         Some(TimelineChannel::from(CHANNEL_EXTERNAL_REQUEST)),
         TimelineContent::ExternalRequest {

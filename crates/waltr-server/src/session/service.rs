@@ -20,24 +20,25 @@ use waltr::grpc::waltr::{
         GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
         ListSessionsRequest, ListSessionsResponse, RespondExternalRequestRequest,
         RespondExternalRequestResponse, RollbackSessionRequest, RollbackSessionResponse,
-        SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionListSnapshot,
-        SessionTemplateKind as ProtoSessionTemplateKind,
+        SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionListCleared,
+        SessionListSnapshot, SessionTemplateKind as ProtoSessionTemplateKind,
         SessionTemplateOption as ProtoSessionTemplateOption, SessionTemplateOptions,
         SessionTemplateSearchError,
         SessionTemplateSearchTarget as ProtoSessionTemplateSearchTarget, SubmitUserMessageRequest,
         SubmitUserMessageResponse, TimelineTruncation, UpdateSessionRuntimeConfigRequest,
         UpdateSessionRuntimeConfigResponse, WatchSessionsRequest, WatchSessionsResponse,
-        WatchTimelineRequest, WatchTimelineResponse, rollback_target,
-        search_session_templates_response,
+        WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest, WipeSessionsResponse,
+        rollback_target, search_session_templates_response,
         session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
         watch_timeline_response,
     },
 };
 use waltr_agent::{
+    AgentSession, AgentSessionActiveRunState, AgentSessionRunError, AgentSessionRunSubmission,
     AgentSessionRuntimeFactory, CredentialStore, ExternalRequestId, RunConflictPolicy,
-    SessionCoordinator, SessionId, SessionListEvent, SessionStore, SessionTemplateKind,
-    SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
-    SessionTimelineEvent, TimelineCursor,
+    SessionCoordinator, SessionId, SessionListEvent, SessionListUpdate, SessionStore,
+    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchRequest,
+    SessionTemplateSearchTarget, SessionTimelineEvent, TimelineCursor,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -118,6 +119,46 @@ where
 
     async fn load_config(&self) -> Configuration {
         self.config.load().await
+    }
+}
+
+#[tonic::async_trait]
+impl<S> super::SessionHost for SessionService<S>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    async fn list(&self) -> Result<Vec<SessionSummary>, waltr_agent::LlmError> {
+        self.sessions.list().await
+    }
+
+    async fn load(&self, id: &SessionId) -> Result<AgentSession, waltr_agent::LlmError> {
+        self.sessions.load(id).await
+    }
+
+    async fn wipe(&self) -> Result<(), waltr_agent::LlmError> {
+        self.sessions.wipe_sessions().await
+    }
+
+    async fn interrupt(&self, id: &SessionId) -> Result<AgentSession, waltr_agent::LlmError> {
+        self.sessions.interrupt(id).await
+    }
+
+    async fn active_state(&self, id: &SessionId) -> Option<AgentSessionActiveRunState> {
+        self.sessions.active_state(id).await
+    }
+
+    async fn submit_prompt(
+        &self,
+        id: SessionId,
+        prompt: String,
+    ) -> Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.sessions
+            .submit_prompt(id, prompt, RunConflictPolicy::QueueIfActive)
+            .await
+    }
+
+    fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>> {
+        Box::pin(self.sessions.watch_sessions())
     }
 }
 
@@ -203,6 +244,28 @@ where
     #[tracing::instrument(
         name = "server.write",
         skip(self, request),
+        fields(operation = "wipe_sessions")
+    )]
+    async fn wipe_sessions(
+        &self,
+        request: Request<WipeSessionsRequest>,
+    ) -> Result<Response<WipeSessionsResponse>, Status> {
+        if !request.into_inner().confirm {
+            return Err(Status::invalid_argument("confirm must be true"));
+        }
+
+        tracing::info!("session wipe accepted");
+        super::SessionHost::wipe(self)
+            .await
+            .map_err(agent_error_to_status)?;
+        tracing::info!("session wipe completed");
+
+        Ok(Response::new(WipeSessionsResponse {}))
+    }
+
+    #[tracing::instrument(
+        name = "server.write",
+        skip(self, request),
         fields(operation = "update_session_runtime_config", session_id)
     )]
     async fn update_session_runtime_config(
@@ -265,6 +328,9 @@ where
                     ),
                     SessionListEvent::Deleted(id) => {
                         watch_sessions_response::Event::DeletedId(id.as_str().to_owned())
+                    }
+                    SessionListEvent::Cleared => {
+                        watch_sessions_response::Event::Cleared(SessionListCleared {})
                     }
                 };
 

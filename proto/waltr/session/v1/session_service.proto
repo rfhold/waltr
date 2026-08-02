@@ -10,6 +10,7 @@ service SessionService {
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+  rpc WipeSessions(WipeSessionsRequest) returns (WipeSessionsResponse);
   rpc UpdateSessionRuntimeConfig(UpdateSessionRuntimeConfigRequest) returns (UpdateSessionRuntimeConfigResponse);
   rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
   rpc GetTimeline(GetTimelineRequest) returns (GetTimelineResponse);
@@ -42,6 +43,12 @@ message DeleteSessionRequest {
 
 message DeleteSessionResponse {}
 
+message WipeSessionsRequest {
+  bool confirm = 1;
+}
+
+message WipeSessionsResponse {}
+
 message UpdateSessionRuntimeConfigRequest {
   string id = 1;
   SessionRuntimeConfigRequest runtime_config = 2;
@@ -59,12 +66,15 @@ message WatchSessionsResponse {
     SessionListSnapshot snapshot = 2;
     SessionSummary session = 3;
     string deleted_id = 4;
+    SessionListCleared cleared = 5;
   }
 }
 
 message SessionListSnapshot {
   repeated SessionSummary sessions = 1;
 }
+
+message SessionListCleared {}
 
 message GetTimelineRequest {
   string session_id = 1;
@@ -219,7 +229,9 @@ message TimelineEvent {
   uint64 cursor = 1;
   string session_id = 2;
   uint64 turn = 3;
+  // Opaque session-local identity assigned as i<first durable event cursor>.
   string item_id = 4;
+  // Opaque session-local item identity for this event's parent.
   optional string parent_id = 5;
   TimelineEventKind kind = 6;
   optional string channel = 7;

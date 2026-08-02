@@ -440,7 +440,7 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         outbound_private_origins.clone(),
         automatic_self_mcp_resource.as_ref(),
     );
-    let mut session_storage = Ok(());
+    let mut session_storage = None;
     let router = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
         config_service,
         persistence,
@@ -450,17 +450,28 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         outbound_private_origins,
         automatic_self_mcp_resource,
         |grpc_routes, config, credential_store| {
-            session_storage = session::add_service_from_env_with_oauth_policy(
+            match session::add_service_from_env_with_oauth_policy(
                 grpc_routes,
-                config,
-                credential_store,
+                config.clone(),
+                credential_store.clone(),
                 session_private_origins,
-            );
+            ) {
+                Ok(host) => {
+                    session_storage = Some(Ok(Arc::clone(&host)));
+                    host
+                }
+                Err(error) => {
+                    session_storage = Some(Err(error));
+                    session::add_memory_service(grpc_routes, config, credential_store)
+                }
+            }
         },
     )
     .await
     .map_err(BuildAppError::Config)?;
-    session_storage.map_err(BuildAppError::SessionStorage)?;
+    session_storage
+        .expect("session service builder should run")
+        .map_err(BuildAppError::SessionStorage)?;
     Ok(router)
 }
 
@@ -496,7 +507,7 @@ pub async fn build_app_with_config_service(
         persistence,
         |grpc_routes, config, credential_store| {
             session::add_service_from_env(grpc_routes, config, credential_store, None)
-                .expect("session service should start");
+                .expect("session service should start")
         },
     )
     .await
@@ -513,7 +524,7 @@ pub async fn build_app_with_services<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator(
@@ -538,7 +549,7 @@ pub async fn build_app_with_access_authenticator<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
@@ -565,7 +576,7 @@ pub async fn build_app_with_access_authenticator_and_mcp_oauth<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
@@ -591,7 +602,7 @@ pub async fn build_app_with_catalog_loader<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
 {
     build_app_with_catalog_loader_and_access_authenticator(
         config_service,
@@ -625,7 +636,7 @@ pub async fn build_app_with_catalog_loader_and_access_authenticator<F>(
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
 {
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
@@ -662,7 +673,7 @@ pub async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oaut
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
 {
     let automatic_self_mcp_resource = mcp_oauth
         .as_ref()
@@ -696,7 +707,7 @@ async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_po
     add_session_service: F,
 ) -> Result<ServerApplication, ConfigError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore),
+    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
 {
     tracing::debug!("building app router");
     let config = ConfigHandle::watching(
@@ -738,21 +749,24 @@ where
             .with_required_scopes(required_scopes);
         mcp_options = mcp_options.with_authorization(authorization);
     }
+    let mut grpc_routes = Routes::builder();
+    let session_host = add_session_service(&mut grpc_routes, config, credential_store);
     let mcp_router = if access_authenticator.enabled() && mcp_oauth.is_none() {
         Router::new()
             .route("/mcp", any(service_unavailable))
             .route("/.well-known/oauth-protected-resource/mcp", get(not_found))
     } else {
         mcp::server::streamable_http_router_with_options(
-            Arc::new(WaltrMcpServer::new(Arc::clone(&config_service))),
+            Arc::new(WaltrMcpServer::new(
+                Arc::clone(&config_service),
+                session_host,
+            )),
             mcp_options,
         )
     };
-    let mut grpc_routes = Routes::builder();
     grpc_routes.add_service(ConfigServiceServer::from_arc(config_service));
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
     grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
-    add_session_service(&mut grpc_routes, config, credential_store);
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
     let grpc_routes = grpc_routes.routes();
     let grpc = ServiceBuilder::new()
