@@ -57,15 +57,24 @@ struct PolicyCheckInput {
     name = "release-desk",
     version = "1.0.0",
     description = "Release management for the example org.",
-    namespace(
-        releases,
-        description = "Query and inspect product releases. Use these to ground any statement about what shipped and when."
+    tool(
+        name = "releases",
+        description = "Release inventory actions.",
+        namespace(
+            releases,
+            description = "Query and inspect product releases. Use these to ground any statement about what shipped and when."
+        ),
+        runbook_uri_template = "playbooks://{runbook}"
     ),
-    namespace(
-        policy,
-        description = "Org release policies and compliance checks. Consult before recommending or performing any promotion."
+    tool(
+        name = "policy",
+        description = "Release policy actions.",
+        namespace(
+            policy,
+            description = "Org release policies and compliance checks. Consult before recommending or performing any promotion."
+        ),
+        runbook_uri_template = "playbooks://policy/{runbook}"
     ),
-    workflow_uri_template = "playbooks://{workflow}",
     auth(
         scopes = ["releases:read"],
         required_scopes = ["releases:read"],
@@ -79,7 +88,7 @@ impl ReleaseServer {
     /// Use this before summarizing release state or choosing a release for a
     /// follow-up action. Prefer a status filter when the user asks about a
     /// specific lifecycle state.
-    #[action(name = "releases.list")]
+    #[action(tool = "releases", name = "list")]
     fn list_releases(
         &self,
         input: ListReleasesInput,
@@ -108,7 +117,11 @@ impl ReleaseServer {
     ///
     /// Use this after `releases.list` or when a resource URI already contains
     /// the release id. This is the grounding action for release-specific facts.
-    #[action(name = "releases.get", resource_template = "releases://{id}")]
+    #[action(
+        tool = "releases",
+        name = "releases.get",
+        resource_template = "releases://{id}"
+    )]
     fn get_release(&self, input: GetReleaseInput, _context: ServerContext) -> ServerResult<Value> {
         Ok(json!({
             "id": input.id,
@@ -123,7 +136,7 @@ impl ReleaseServer {
     /// Use this whenever the user asks whether something can be promoted, or
     /// when you need the static promotion criteria without checking a specific
     /// release candidate.
-    #[action(name = "policy.promotion", resource = "policy://promotion")]
+    #[action(tool = "policy", name = "promotion", resource = "policy://promotion")]
     fn promotion_policy(&self, _context: ServerContext) -> ServerResult<Value> {
         Ok(json!({
             "requires_approval": true,
@@ -135,7 +148,7 @@ impl ReleaseServer {
     ///
     /// Use this before advising a deploy decision. The result is scoped to the
     /// requested release id and environment, unlike `policy.promotion`.
-    #[action(name = "policy.check")]
+    #[action(tool = "policy", name = "policy.check")]
     fn check_policy(
         &self,
         input: PolicyCheckInput,
@@ -151,19 +164,19 @@ impl ReleaseServer {
 
     /// Promote a release candidate to production with required pre-checks.
     ///
-    /// Load this workflow when the user wants an end-to-end production
+    /// Load this runbook when the user wants an end-to-end production
     /// promotion procedure rather than a single release fact.
-    #[workflow(name = "promote-to-production")]
-    fn promote_workflow(&self) -> ServerResult<String> {
+    #[runbook(tool = "policy", name = "promote-to-production")]
+    fn promote_runbook(&self) -> ServerResult<String> {
         Ok("## Promote to production\n1. Load release details.\n2. Check policy.\n3. Confirm rollback plan.\n".to_owned())
     }
 
     /// Roll back production to the previous known-good release.
     ///
-    /// Load this workflow when the user reports production impact or asks for a
+    /// Load this runbook when the user reports production impact or asks for a
     /// rollback playbook.
-    #[workflow(name = "rollback-release")]
-    fn rollback_workflow(&self) -> ServerResult<String> {
+    #[runbook(tool = "releases", name = "rollback-release")]
+    fn rollback_runbook(&self) -> ServerResult<String> {
         Ok("## Rollback release\n1. Identify the bad release.\n2. Select previous release.\n3. Announce rollback.\n".to_owned())
     }
 
@@ -195,8 +208,26 @@ impl ReleaseServer {
     }
 }
 
+#[test]
+fn progressive_tool_results_keep_text_exact_and_structure_non_objects() {
+    let result =
+        mcp::progressive::tool_result(json!("rendered text"), None).expect("string tool result");
+    assert_eq!(result.raw["content"][0]["text"], "rendered text");
+    assert_eq!(
+        result.raw["structuredContent"],
+        json!({ "result": "rendered text" })
+    );
+
+    let result = mcp::progressive::tool_result(json!(["v1.4.2", "v1.4.1"]), None)
+        .expect("array tool result");
+    assert_eq!(
+        result.raw["structuredContent"],
+        json!({ "result": ["v1.4.2", "v1.4.1"] })
+    );
+}
+
 #[tokio::test]
-async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp::Result<()> {
+async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp::Result<()> {
     let server = RunningServer::start_plain(ReleaseServer::default()).await?;
 
     let initialize = post_json(&server.endpoint, initialize_body("initialize")).await?;
@@ -215,7 +246,7 @@ async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp
         initialize.body["result"]["instructions"]
             .as_str()
             .is_some_and(
-                |instructions| instructions.contains("Use `exec` with action `help` first")
+                |instructions| instructions.contains("`releases`: Release inventory actions.")
             )
     );
 
@@ -229,104 +260,159 @@ async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp
             .as_array()
             .expect("tools")
             .len(),
-        1
+        2
     );
-    assert_eq!(tools.body["result"]["tools"][0]["name"], "exec");
+    let releases_tool = tool_named(&tools.body, "releases");
+    let policy_tool = tool_named(&tools.body, "policy");
     assert_array_contains(
-        &tools.body["result"]["tools"][0]["inputSchema"]["properties"]["action"]["enum"],
+        &releases_tool["inputSchema"]["properties"]["action"]["enum"],
         "help.releases",
     );
     assert_array_contains(
-        &tools.body["result"]["tools"][0]["inputSchema"]["properties"]["action"]["enum"],
-        "workflows.load",
+        &releases_tool["inputSchema"]["properties"]["action"]["enum"],
+        "runbooks.load",
     );
-    let input_options =
-        tools.body["result"]["tools"][0]["inputSchema"]["properties"]["input"]["oneOf"]
-            .as_array()
-            .expect("input oneOf");
+    assert_array_contains(
+        &policy_tool["inputSchema"]["properties"]["action"]["enum"],
+        "policy.check",
+    );
+    assert_array_excludes(
+        &releases_tool["inputSchema"]["properties"]["action"]["enum"],
+        "policy.check",
+    );
+    assert_array_excludes(
+        &policy_tool["inputSchema"]["properties"]["action"]["enum"],
+        "releases.get",
+    );
+    let input_options = releases_tool["inputSchema"]["properties"]["input"]["oneOf"]
+        .as_array()
+        .expect("input oneOf");
     assert!(
         input_options
             .iter()
             .any(|schema| schema.to_string().contains("Release id."))
     );
 
-    let root_help = call_exec(&server.endpoint, json!({ "action": "help" })).await?;
+    let root_help = call_tool(&server.endpoint, "releases", json!({ "action": "help" })).await?;
     assert_eq!(root_help["structuredContent"]["topic"], "help");
+    assert_eq!(
+        root_help["structuredContent"]["actions"][0]["action"],
+        "list"
+    );
     assert_eq!(
         root_help["structuredContent"]["namespaces"][0]["help_action"],
         "help.releases"
     );
+    assert_eq!(root_help["structuredContent"]["runbooks"]["count"], 1);
     assert_eq!(
-        root_help["structuredContent"]["namespaces"][1]["description"],
-        "Org release policies and compliance checks. Consult before recommending or performing any promotion."
+        root_help["structuredContent"]["description"],
+        "Release inventory actions."
     );
 
-    let policy_help = call_exec(&server.endpoint, json!({ "action": "help.policy" })).await?;
+    let policy_help = call_tool(
+        &server.endpoint,
+        "policy",
+        json!({ "action": "help.policy" }),
+    )
+    .await?;
     assert_eq!(policy_help["structuredContent"]["topic"], "help.policy");
     assert_eq!(
         policy_help["structuredContent"]["actions"][0]["action"],
-        "policy.promotion"
+        "policy.check"
     );
     assert_eq!(
         policy_help["structuredContent"]["actions"][0]["description"],
-        "Explain the promotion policy before recommending a production promotion."
+        "Check release policy against one release and target environment."
     );
     assert!(
         policy_help["structuredContent"]["actions"][0]["guidance"]
             .as_str()
-            .is_some_and(|guidance| guidance.contains("static promotion criteria"))
-    );
-    assert_eq!(
-        policy_help["structuredContent"]["actions"][0]["resource"],
-        "policy://promotion"
+            .is_some_and(|guidance| guidance.contains("deploy decision"))
     );
 
-    let workflows_help = call_exec(&server.endpoint, json!({ "action": "help.workflows" })).await?;
+    let runbooks_help = call_tool(
+        &server.endpoint,
+        "policy",
+        json!({ "action": "help.runbooks" }),
+    )
+    .await?;
     assert_eq!(
-        workflows_help["structuredContent"]["resource_template"],
-        "playbooks://{workflow}"
+        runbooks_help["structuredContent"]["resource_template"],
+        "playbooks://policy/{runbook}"
     );
     assert_eq!(
-        workflows_help["structuredContent"]["workflows"][0]["description"],
+        runbooks_help["structuredContent"]["runbooks"][0]["description"],
         "Promote a release candidate to production with required pre-checks."
     );
     assert_eq!(
-        workflows_help["structuredContent"]["workflows"][0]["resource"],
-        "playbooks://promote-to-production"
+        runbooks_help["structuredContent"]["runbooks"][0]["resource"],
+        "playbooks://policy/promote-to-production"
     );
 
-    let filtered = call_exec(
+    let filtered = call_tool(
         &server.endpoint,
+        "releases",
         json!({
-            "action": "releases.list",
+            "action": "list",
             "input": { "status": "released", "limit": 2 },
             "filter": ".[].id"
         }),
     )
     .await?;
-    assert_eq!(filtered["structuredContent"], json!(["v1.4.2", "v1.4.1"]));
+    assert_eq!(
+        filtered["structuredContent"],
+        json!({ "result": ["v1.4.2", "v1.4.1"] })
+    );
 
-    let workflow = call_exec(
+    let runbook = call_tool(
         &server.endpoint,
+        "policy",
         json!({
-            "action": "workflows.load",
-            "input": { "workflow": "promote-to-production" }
+            "action": "runbooks.load",
+            "input": { "runbook": "promote-to-production" }
         }),
     )
     .await?;
     assert!(
-        workflow["content"][0]["text"]
+        runbook["content"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("## Promote to production"))
     );
     assert!(
-        workflow["structuredContent"]["markdown"]
+        runbook["structuredContent"]["markdown"]
             .as_str()
             .is_some_and(|text| text.contains("Check policy"))
     );
     assert_eq!(
-        workflow["structuredContent"]["workflow"],
+        runbook["structuredContent"]["runbook"],
         "promote-to-production"
+    );
+
+    let isolated_runbook = call_tool_response(
+        &server.endpoint,
+        "releases",
+        json!({
+            "action": "runbooks.load",
+            "input": { "runbook": "promote-to-production" }
+        }),
+    )
+    .await?;
+    assert!(
+        isolated_runbook.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown runbook"))
+    );
+
+    let isolated_action = call_tool_response(
+        &server.endpoint,
+        "policy",
+        json!({ "action": "releases.get", "input": { "id": "v1.4.2" } }),
+    )
+    .await?;
+    assert!(
+        isolated_action.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown progressive action"))
     );
 
     let prompts = post_json(
@@ -384,7 +470,11 @@ async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp
     );
     assert_eq!(
         templates.body["result"]["resourceTemplates"][1]["uriTemplate"],
-        "playbooks://{workflow}"
+        "playbooks://{runbook}"
+    );
+    assert_eq!(
+        templates.body["result"]["resourceTemplates"][2]["uriTemplate"],
+        "playbooks://policy/{runbook}"
     );
 
     let policy_resource = post_json(
@@ -420,20 +510,36 @@ async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp
     )?;
     assert_eq!(release["id"], "v1.4.2");
 
-    let workflow_resource = post_json(
+    let runbook_resource = post_json(
         &server.endpoint,
         json!({
             "jsonrpc": "2.0",
-            "id": "workflow-resource",
+            "id": "runbook-resource",
             "method": "resources/read",
             "params": { "uri": "playbooks://rollback-release" }
         }),
     )
     .await?;
     assert!(
-        workflow_resource.body["result"]["contents"][0]["text"]
+        runbook_resource.body["result"]["contents"][0]["text"]
             .as_str()
             .is_some_and(|text| text.contains("## Rollback release"))
+    );
+
+    let overlapping_runbook_resource = post_json(
+        &server.endpoint,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "overlapping-runbook-resource",
+            "method": "resources/read",
+            "params": { "uri": "playbooks://policy/promote-to-production" }
+        }),
+    )
+    .await?;
+    assert!(
+        overlapping_runbook_resource.body["result"]["contents"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("## Promote to production"))
     );
 
     let missing_input = post_json(
@@ -442,7 +548,7 @@ async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp
             "jsonrpc": "2.0",
             "id": "missing-input",
             "method": "tools/call",
-            "params": { "name": "exec", "arguments": { "action": "releases.get" } }
+            "params": { "name": "releases", "arguments": { "action": "releases.get" } }
         }),
     )
     .await?;
@@ -458,7 +564,7 @@ async fn progressive_server_generates_exec_help_workflows_and_resources() -> mcp
             "jsonrpc": "2.0",
             "id": "unknown-action",
             "method": "tools/call",
-            "params": { "name": "exec", "arguments": { "action": "releases.delete" } }
+            "params": { "name": "releases", "arguments": { "action": "releases.delete" } }
         }),
     )
     .await?;
@@ -579,18 +685,27 @@ struct JsonResponse {
     body: Value,
 }
 
-async fn call_exec(endpoint: &str, arguments: Value) -> mcp::Result<Value> {
+async fn call_tool(endpoint: &str, name: &str, arguments: Value) -> mcp::Result<Value> {
+    let response = call_tool_response(endpoint, name, arguments).await?;
+    Ok(response.body["result"].clone())
+}
+
+async fn call_tool_response(
+    endpoint: &str,
+    name: &str,
+    arguments: Value,
+) -> mcp::Result<JsonResponse> {
     let response = post_json(
         endpoint,
         json!({
             "jsonrpc": "2.0",
-            "id": "exec",
+            "id": "progressive-tool",
             "method": "tools/call",
-            "params": { "name": "exec", "arguments": arguments }
+            "params": { "name": name, "arguments": arguments }
         }),
     )
     .await?;
-    Ok(response.body["result"].clone())
+    Ok(response)
 }
 
 async fn post_json(endpoint: &str, body: Value) -> mcp::Result<JsonResponse> {
@@ -678,4 +793,24 @@ fn assert_array_contains(values: &Value, expected: &str) {
             .any(|value| value.as_str() == Some(expected)),
         "expected array to contain {expected}, got {values}"
     );
+}
+
+fn assert_array_excludes(values: &Value, excluded: &str) {
+    assert!(
+        values
+            .as_array()
+            .expect("array")
+            .iter()
+            .all(|value| value.as_str() != Some(excluded)),
+        "expected array to exclude {excluded}, got {values}"
+    );
+}
+
+fn tool_named<'a>(body: &'a Value, name: &str) -> &'a Value {
+    body["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .unwrap_or_else(|| panic!("missing tool {name}"))
 }
