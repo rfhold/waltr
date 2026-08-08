@@ -632,7 +632,7 @@ async fn hosted_mcp_metadata_and_access_fail_closed_at_the_http_boundary()
         .bearer_auth(&access_token)
         .header(header::ORIGIN, "https://browser.example")
         .header("accept", "application/json, text/event-stream")
-        .json(&mcp_initialize_body())
+        .json(&mcp_discover_body())
         .send()
         .await?;
     assert_eq!(rejected_origin.status(), StatusCode::FORBIDDEN);
@@ -681,151 +681,30 @@ async fn hosted_mcp_metadata_and_access_fail_closed_at_the_http_boundary()
         mcp_post_raw(&client, &endpoint, None, Some(&browser_cookie), b"not json").await?;
     assert_eq!(cookie_only.status(), StatusCode::UNAUTHORIZED);
 
-    let initialized = mcp_initialize(&client, &endpoint, &access_token).await?;
-    assert_eq!(initialized.status(), StatusCode::OK);
-    let session_id = initialized.headers()["mcp-session-id"].to_str()?.to_owned();
-    drop(initialized.bytes().await?);
     assert_eq!(
-        mcp_post(
-            &client,
-            &endpoint,
-            &session_id,
-            &access_token,
-            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        )
-        .await?
-        .status(),
-        StatusCode::ACCEPTED
-    );
-
-    let rejected_delete = mcp_session_delete(&client, &endpoint, &session_id, "invalid").await?;
-    assert_eq!(rejected_delete.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        mcp_session_get(&client, &endpoint, &session_id, &access_token)
+        mcp_discover(&client, &endpoint, &access_token)
             .await?
             .status(),
         StatusCode::OK
     );
     assert_eq!(
-        mcp_session_delete(&client, &endpoint, &session_id, &access_token)
+        client
+            .get(&endpoint)
+            .bearer_auth(&access_token)
+            .send()
             .await?
             .status(),
-        StatusCode::ACCEPTED
-    );
-    server.stop();
-    Ok(())
-}
-
-#[tokio::test]
-async fn hosted_mcp_sessions_are_bound_to_the_oidc_subject()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = setup_access_auth_browser_fixture();
-    let server = fixture.start_server_with_mcp_oauth(Duration::from_hours(1));
-    let client = no_redirect_client()?;
-    let first_cookie = fixture.browser_session_for_subject("first-subject").await;
-    let second_cookie = fixture.browser_session_for_subject("second-subject").await;
-    let first_token = issue_mcp_access_token(&client, &server, &first_cookie, "mcp:use").await?;
-    let second_token = issue_mcp_access_token(&client, &server, &second_cookie, "mcp:use").await?;
-    let endpoint = server.url("/mcp");
-
-    let initialized = mcp_initialize(&client, &endpoint, &first_token).await?;
-    assert_eq!(initialized.status(), StatusCode::OK);
-    let session_id = initialized.headers()["mcp-session-id"].to_str()?.to_owned();
-    drop(initialized.bytes().await?);
-    assert_eq!(
-        mcp_post(
-            &client,
-            &endpoint,
-            &session_id,
-            &second_token,
-            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        )
-        .await?
-        .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::METHOD_NOT_ALLOWED
     );
     assert_eq!(
-        mcp_post(
-            &client,
-            &endpoint,
-            &session_id,
-            &first_token,
-            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        )
-        .await?
-        .status(),
-        StatusCode::ACCEPTED
-    );
-    assert_eq!(
-        mcp_post(
-            &client,
-            &endpoint,
-            &session_id,
-            &second_token,
-            json!({"jsonrpc": "2.0", "id": "inspect", "method": "ping"}),
-        )
-        .await?
-        .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        mcp_session_get(&client, &endpoint, &session_id, &second_token)
+        client
+            .delete(&endpoint)
+            .bearer_auth(&access_token)
+            .send()
             .await?
             .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::METHOD_NOT_ALLOWED
     );
-    assert_eq!(
-        mcp_session_delete(&client, &endpoint, &session_id, &second_token)
-            .await?
-            .status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        mcp_session_delete(&client, &endpoint, &session_id, &first_token)
-            .await?
-            .status(),
-        StatusCode::ACCEPTED
-    );
-    server.stop();
-    Ok(())
-}
-
-#[tokio::test]
-async fn hosted_mcp_get_stream_ends_at_access_token_expiry()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = setup_access_auth_browser_fixture();
-    let server = fixture.start_server_with_mcp_oauth(Duration::from_hours(1));
-    let client = no_redirect_client()?;
-    let browser_cookie = fixture
-        .browser_session_for_subject("expiring-subject")
-        .await;
-    let access_token = issue_mcp_access_token(&client, &server, &browser_cookie, "mcp:use").await?;
-    let access_token = fixture
-        .mcp_access_token_with_ttl(&access_token, Duration::from_secs(5))
-        .await;
-    let endpoint = server.url("/mcp");
-    let initialized = mcp_initialize(&client, &endpoint, &access_token).await?;
-    assert_eq!(initialized.status(), StatusCode::OK);
-    let session_id = initialized.headers()["mcp-session-id"].to_str()?.to_owned();
-    drop(initialized.bytes().await?);
-    assert_eq!(
-        mcp_post(
-            &client,
-            &endpoint,
-            &session_id,
-            &access_token,
-            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-        )
-        .await?
-        .status(),
-        StatusCode::ACCEPTED
-    );
-
-    let stream = mcp_session_get(&client, &endpoint, &session_id, &access_token).await?;
-    assert_eq!(stream.status(), StatusCode::OK);
-    tokio::time::timeout(Duration::from_secs(8), stream.bytes())
-        .await
-        .map_err(|_| "MCP GET stream survived hosted access-token expiry")??;
     server.stop();
     Ok(())
 }
@@ -904,7 +783,7 @@ async fn issue_mcp_access_token(
         .ok_or_else(|| "token response omitted access token".into())
 }
 
-async fn mcp_initialize(
+async fn mcp_discover(
     client: &reqwest::Client,
     endpoint: &str,
     access_token: &str,
@@ -913,20 +792,27 @@ async fn mcp_initialize(
         .post(endpoint)
         .bearer_auth(access_token)
         .header("accept", "application/json, text/event-stream")
-        .json(&mcp_initialize_body())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
+        .json(&mcp_discover_body())
         .send()
         .await
 }
 
-fn mcp_initialize_body() -> Value {
+fn mcp_discover_body() -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": "initialize",
-        "method": "initialize",
+        "id": "discover",
+        "method": "server/discover",
         "params": {
-            "protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "access-auth-test", "version": "1.0.0"}
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "access-auth-test", "version": "1.0.0"
+                }
+            }
         }
     })
 }
@@ -950,55 +836,6 @@ async fn mcp_post_raw(
         request = request.header(header::COOKIE, cookie);
     }
     request.send().await
-}
-
-async fn mcp_post(
-    client: &reqwest::Client,
-    endpoint: &str,
-    session_id: &str,
-    access_token: &str,
-    body: Value,
-) -> Result<reqwest::Response, reqwest::Error> {
-    client
-        .post(endpoint)
-        .bearer_auth(access_token)
-        .header("accept", "application/json, text/event-stream")
-        .header("mcp-session-id", session_id)
-        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
-        .json(&body)
-        .send()
-        .await
-}
-
-async fn mcp_session_get(
-    client: &reqwest::Client,
-    endpoint: &str,
-    session_id: &str,
-    access_token: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
-    client
-        .get(endpoint)
-        .bearer_auth(access_token)
-        .header("accept", "text/event-stream")
-        .header("mcp-session-id", session_id)
-        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
-        .send()
-        .await
-}
-
-async fn mcp_session_delete(
-    client: &reqwest::Client,
-    endpoint: &str,
-    session_id: &str,
-    access_token: &str,
-) -> Result<reqwest::Response, reqwest::Error> {
-    client
-        .delete(endpoint)
-        .bearer_auth(access_token)
-        .header("mcp-session-id", session_id)
-        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
-        .send()
-        .await
 }
 
 fn response_cookie_prefix(

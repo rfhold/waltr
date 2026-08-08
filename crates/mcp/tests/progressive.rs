@@ -230,20 +230,20 @@ fn progressive_tool_results_keep_text_exact_and_structure_non_objects() {
 async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp::Result<()> {
     let server = RunningServer::start_plain(ReleaseServer::default()).await?;
 
-    let initialize = post_json(&server.endpoint, initialize_body("initialize")).await?;
-    assert_eq!(initialize.status, StatusCode::OK);
+    let discover = post_json(&server.endpoint, discover_body("discover")).await?;
+    assert_eq!(discover.status, StatusCode::OK);
     assert_eq!(
-        initialize.body["result"]["serverInfo"]["name"],
+        discover.body["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "release-desk"
     );
     assert_eq!(
-        initialize.body["result"]["capabilities"]["tools"]["listChanged"],
+        discover.body["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
-    assert!(initialize.body["result"]["capabilities"]["prompts"].is_object());
-    assert!(initialize.body["result"]["capabilities"]["resources"].is_object());
+    assert!(discover.body["result"]["capabilities"]["prompts"].is_object());
+    assert!(discover.body["result"]["capabilities"]["resources"].is_object());
     assert!(
-        initialize.body["result"]["instructions"]
+        discover.body["result"]["instructions"]
             .as_str()
             .is_some_and(
                 |instructions| instructions.contains("`releases`: Release inventory actions.")
@@ -601,7 +601,10 @@ async fn progressive_server_generates_auth_helpers() -> mcp::Result<()> {
     let unauthorized = reqwest::Client::new()
         .post(&server.endpoint)
         .header("accept", "application/json, text/event-stream")
-        .json(&initialize_body("unauthorized"))
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
+        .json(&request_body(discover_body("unauthorized")))
         .send()
         .await?;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -618,13 +621,16 @@ async fn progressive_server_generates_auth_helpers() -> mcp::Result<()> {
     let authorized = reqwest::Client::new()
         .post(&server.endpoint)
         .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
         .bearer_auth("release-desk-secret")
-        .json(&initialize_body("authorized"))
+        .json(&request_body(discover_body("authorized")))
         .send()
         .await?;
     assert_eq!(authorized.status(), StatusCode::OK);
-    let body = authorized.json::<Value>().await?;
-    assert_eq!(body["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+    let body = sse_response(authorized).await?;
+    assert_eq!(body["result"]["supportedVersions"][0], MCP_PROTOCOL_VERSION);
     assert_eq!(
         validations.lock().expect("validations lock").as_slice(),
         [format!("{}:releases:read", server.endpoint)]
@@ -710,77 +716,59 @@ async fn call_tool_response(
 
 async fn post_json(endpoint: &str, body: Value) -> mcp::Result<JsonResponse> {
     let client = reqwest::Client::new();
-    let session_id = if should_initialize_before_post(&body) {
-        Some(initialized_session(endpoint).await?)
-    } else {
-        None
-    };
-
+    let body = request_body(body);
+    let method = body["method"].as_str().unwrap_or_default();
     let mut request = client
         .post(endpoint)
         .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-method", method)
         .json(&body);
-    if let Some(session_id) = &session_id {
-        request = request
-            .header("mcp-session-id", session_id)
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+    if let Some(name) = request_name(method, &body) {
+        request = request.header("mcp-name", name);
     }
     let response = request.send().await?;
     let status = response.status();
-    let body = response.json::<Value>().await?;
+    let body = sse_response(response).await?;
     Ok(JsonResponse { status, body })
 }
 
-async fn initialized_session(endpoint: &str) -> mcp::Result<String> {
-    let client = reqwest::Client::new();
-    let initialize = client
-        .post(endpoint)
-        .header("accept", "application/json, text/event-stream")
-        .json(&initialize_body("progressive-test-initialize"))
-        .send()
-        .await?;
-    let session_id = initialize
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| mcp::Error::protocol("missing MCP session id"))?
-        .to_owned();
-    drop(initialize.json::<Value>().await?);
-    drop(
-        client
-            .post(endpoint)
-            .header("accept", "application/json, text/event-stream")
-            .header("mcp-session-id", &session_id)
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-            }))
-            .send()
-            .await?
-            .bytes()
-            .await?,
-    );
-    Ok(session_id)
+fn request_body(mut body: Value) -> Value {
+    if body.get("params").is_none() {
+        body["params"] = json!({});
+    }
+    body["params"]["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "progressive-tests", "version": "1" }
+    });
+    body
 }
 
-fn should_initialize_before_post(body: &Value) -> bool {
-    let Some(method) = body.get("method").and_then(Value::as_str) else {
-        return false;
-    };
-    !matches!(method, "initialize" | "ping") && !method.starts_with("notifications/")
+fn request_name<'a>(method: &str, body: &'a Value) -> Option<&'a str> {
+    match method {
+        "tools/call" | "prompts/get" => body["params"]["name"].as_str(),
+        "resources/read" => body["params"]["uri"].as_str(),
+        _ => None,
+    }
 }
 
-fn initialize_body(id: &str) -> Value {
+async fn sse_response(response: reqwest::Response) -> mcp::Result<Value> {
+    let text = response.text().await?;
+    let data = text
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("data: "))
+        .ok_or_else(|| mcp::Error::protocol("MCP SSE response omitted data"))?;
+    Ok(serde_json::from_str(data)?)
+}
+
+fn discover_body(id: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "mcp-progressive-test-client", "version": "1.0.0" }
-        }
+        "method": "server/discover"
     })
 }
 

@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use futures_util::StreamExt;
 
 use crate::{
@@ -13,19 +11,13 @@ const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 /// One decoded SSE frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseFrame {
-    /// Optional SSE event id, including id-only frames.
-    pub id: Option<String>,
     /// Joined multiline data, when present.
     pub data: Option<String>,
-    /// Server-requested reconnection delay.
-    pub retry: Option<Duration>,
 }
 
 /// One SSE JSON-RPC event.
 #[derive(Debug)]
 pub struct SseJsonRpcEvent {
-    /// Optional SSE event id.
-    pub id: Option<String>,
     /// Parsed JSON-RPC message.
     pub message: JsonRpcInbound,
 }
@@ -36,8 +28,6 @@ pub struct SseDecoder {
     utf8_pending: Vec<u8>,
     lines: String,
     data_lines: Vec<String>,
-    event_id: Option<String>,
-    retry: Option<Duration>,
     event_bytes: usize,
     started: bool,
 }
@@ -135,34 +125,23 @@ impl SseDecoder {
         }
         let (field, value) = line.split_once(':').unwrap_or((line, ""));
         let value = value.strip_prefix(' ').unwrap_or(value);
-        match field {
-            "data" => {
-                self.event_bytes = self
-                    .event_bytes
-                    .checked_add(value.len() + usize::from(!self.data_lines.is_empty()))
-                    .filter(|bytes| *bytes <= MAX_SSE_EVENT_BYTES)
-                    .ok_or_else(|| Error::protocol("SSE event exceeds the configured limit"))?;
-                self.data_lines.push(value.to_owned());
-            }
-            "id" if !value.contains('\0') => self.event_id = Some(value.to_owned()),
-            "retry" if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
-                if let Ok(milliseconds) = value.parse::<u64>() {
-                    self.retry = Some(Duration::from_millis(milliseconds));
-                }
-            }
-            _ => {}
+        if field == "data" {
+            self.event_bytes = self
+                .event_bytes
+                .checked_add(value.len() + usize::from(!self.data_lines.is_empty()))
+                .filter(|bytes| *bytes <= MAX_SSE_EVENT_BYTES)
+                .ok_or_else(|| Error::protocol("SSE event exceeds the configured limit"))?;
+            self.data_lines.push(value.to_owned());
         }
         Ok(())
     }
 
     fn dispatch(&mut self, frames: &mut Vec<SseFrame>) {
-        if self.data_lines.is_empty() && self.event_id.is_none() && self.retry.is_none() {
+        if self.data_lines.is_empty() {
             return;
         }
         frames.push(SseFrame {
-            id: self.event_id.take(),
             data: (!self.data_lines.is_empty()).then(|| self.data_lines.join("\n")),
-            retry: self.retry.take(),
         });
         self.data_lines.clear();
         self.event_bytes = 0;
@@ -192,7 +171,6 @@ fn append_json_rpc_frames(
     for frame in frames {
         if let Some(data) = frame.data {
             messages.push(SseJsonRpcEvent {
-                id: frame.id,
                 message: parse_json_rpc_str(&data)?,
             });
         }
@@ -213,21 +191,17 @@ mod tests {
             frames.extend(decoder.push(std::slice::from_ref(byte)).unwrap());
         }
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].id.as_deref(), Some("stream:1"));
         assert_eq!(frames[0].data.as_deref(), Some("héello é\nworld"));
-        assert_eq!(frames[0].retry, Some(Duration::from_millis(1250)));
     }
 
     #[test]
-    fn surfaces_id_only_and_ignores_nul_ids() {
+    fn ignores_obsolete_event_ids() {
         let mut decoder = SseDecoder::default();
         let frames = decoder
             .push(b"id: prime:0\n\nid: bad\0id\ndata: {}\n\n")
             .unwrap();
-        assert_eq!(frames[0].id.as_deref(), Some("prime:0"));
-        assert!(frames[0].data.is_none());
-        assert!(frames[1].id.is_none());
-        assert_eq!(frames[1].data.as_deref(), Some("{}"));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data.as_deref(), Some("{}"));
     }
 
     #[test]

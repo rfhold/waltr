@@ -53,14 +53,6 @@ Run the ignored PostgreSQL OAuth store contract, which requires Docker:
 
 `cargo test -p mcp --features oauth-authorization-server-postgres --test oauth_postgres_store -- --ignored`
 
-The default MCP feature set does not compile either SQL store test. Run the feature-gated SQLite store contract:
-
-`cargo test -p mcp --features streamable-http-sqlite --test streamable_http_sqlite_store`
-
-Run the feature-gated PostgreSQL store contract, which starts `postgres:16-alpine` through testcontainers and therefore requires Docker:
-
-`cargo test -p mcp --features streamable-http-postgres --test streamable_http_postgres_store -- --ignored`
-
 Run server unit tests:
 
 `cargo test -p waltr-server --lib`

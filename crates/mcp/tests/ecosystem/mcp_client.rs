@@ -24,7 +24,8 @@ pub async fn assert_standard_surface(
         case_name.to_owned(),
         transport,
         handler.clone(),
-        McpClientOptions::new("mcp-ecosystem-test", "0", Duration::from_secs(5)),
+        McpClientOptions::new("mcp-ecosystem-test", "0", Duration::from_secs(5))
+            .with_log_level(mcp::McpLogLevel::Info),
         CancellationToken::new(),
     )
     .await?;
@@ -146,9 +147,6 @@ async fn assert_surface(client: &McpClient) -> mcp::Result<()> {
         .await?;
     assert_eq!(completion.values, vec!["42", "420", "4242"]);
 
-    client
-        .set_log_level(mcp::McpLogLevel::Warning, cancel)
-        .await?;
     Ok(())
 }
 

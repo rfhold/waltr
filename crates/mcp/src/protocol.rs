@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicI64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -9,16 +9,38 @@ use serde_json::{Value, json};
 use crate::{Error, Result};
 
 /// MCP protocol version used by this crate.
-pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Reserved request metadata key carrying the active protocol revision.
+pub const MCP_PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+/// Reserved request metadata key carrying per-request client capabilities.
+pub const MCP_CLIENT_CAPABILITIES_META_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+/// Reserved request metadata key carrying client implementation information.
+pub const MCP_CLIENT_INFO_META_KEY: &str = "io.modelcontextprotocol/clientInfo";
+/// Reserved request metadata key carrying the requested log level.
+pub const MCP_LOG_LEVEL_META_KEY: &str = "io.modelcontextprotocol/logLevel";
+/// Reserved result metadata key carrying server implementation information.
+pub const MCP_SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+/// Reserved notification metadata key carrying a subscription identifier.
+pub const MCP_SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
+
+/// HTTP/body metadata mismatch error code.
+pub const HEADER_MISMATCH: i64 = -32020;
+/// Missing required client capability error code.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+/// Unsupported protocol revision error code.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 
 /// JSON-RPC request identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum JsonRpcId {
     /// Numeric identifier.
-    Number(u64),
+    Number(i64),
     /// String identifier.
     String(String),
+    /// Null identifier used for errors without a usable request id.
+    Null,
 }
 
 impl fmt::Display for JsonRpcId {
@@ -26,6 +48,7 @@ impl fmt::Display for JsonRpcId {
         match self {
             Self::Number(id) => write!(formatter, "{id}"),
             Self::String(id) => formatter.write_str(id),
+            Self::Null => formatter.write_str("null"),
         }
     }
 }
@@ -165,6 +188,21 @@ pub fn json_rpc_success(id: JsonRpcId, result: Value) -> Value {
 /// Panics only if the internal JSON-RPC response representation cannot serialize.
 #[must_use]
 pub fn json_rpc_error(id: JsonRpcId, code: i64, message: impl Into<String>) -> Value {
+    json_rpc_error_with_data(id, code, message, None)
+}
+
+/// Build a JSON-RPC error response value with optional structured data.
+///
+/// # Panics
+///
+/// Panics only if the internal JSON-RPC response representation cannot serialize.
+#[must_use]
+pub fn json_rpc_error_with_data(
+    id: JsonRpcId,
+    code: i64,
+    message: impl Into<String>,
+    data: Option<Value>,
+) -> Value {
     serde_json::to_value(OutboundJsonRpcResponse {
         jsonrpc: "2.0",
         id,
@@ -172,7 +210,7 @@ pub fn json_rpc_error(id: JsonRpcId, code: i64, message: impl Into<String>) -> V
         error: Some(JsonRpcError {
             code,
             message: message.into(),
-            data: None,
+            data,
         }),
     })
     .expect("response serializes")
@@ -196,7 +234,19 @@ pub fn json_rpc_result(response: JsonRpcResponse) -> Result<Value> {
             error.code, error.message
         )));
     }
-    Ok(response.result.unwrap_or(Value::Null))
+    let result = response.result.unwrap_or(Value::Null);
+    if !result.is_object() {
+        return Err(Error::protocol("MCP result must be an object"));
+    }
+    if result
+        .get("resultType")
+        .is_some_and(|result_type| !result_type.is_string())
+    {
+        return Err(Error::protocol("MCP resultType must be a string"));
+    }
+    // The active revision requires senders to include resultType, but also requires
+    // receivers to treat omission as a complete result.
+    Ok(result)
 }
 
 /// Parse a JSON-RPC message from a value.
@@ -284,7 +334,7 @@ pub fn parse_json_rpc_str(message: &str) -> Result<JsonRpcInbound> {
 /// Return the next process-global JSON-RPC id.
 #[must_use]
 pub fn next_id() -> JsonRpcId {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    static NEXT_ID: AtomicI64 = AtomicI64::new(1);
     JsonRpcId::Number(NEXT_ID.fetch_add(1, Ordering::Relaxed))
 }
 

@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use crate::{Error, Result};
 
@@ -428,6 +429,8 @@ pub struct McpRevocationError {
 /// Public OAuth client registration metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpPublicClientRegistrationRequest {
+    /// RFC 7591 application type used to bind redirect URI policy.
+    pub application_type: McpOAuthApplicationType,
     /// Registered redirect URIs.
     pub redirect_uris: Vec<String>,
     /// Requested grant types.
@@ -462,6 +465,7 @@ impl McpPublicClientRegistrationRequest {
             || self.redirect_uris.iter().any(|redirect| {
                 redirect.len() > max_field_bytes
                     || validate_public_redirect_uri(redirect, allow_loopback_http).is_err()
+                    || !application_type_matches_redirect(self.application_type, redirect)
             });
         if invalid_redirect {
             return Err(McpClientRegistrationError {
@@ -518,6 +522,8 @@ pub struct McpClientRegistrationResponse {
     /// Client identifier issue time as Unix seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id_issued_at: Option<u64>,
+    /// Registered application type.
+    pub application_type: McpOAuthApplicationType,
     /// Registered redirect URIs.
     pub redirect_uris: Vec<String>,
     /// Registered grant types.
@@ -531,6 +537,16 @@ pub struct McpClientRegistrationResponse {
     pub client_name: Option<String>,
 }
 
+/// RFC 7591 OAuth client application type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpOAuthApplicationType {
+    /// Native application using loopback or private-use redirect URIs.
+    Native,
+    /// Web application using HTTPS redirect URIs.
+    Web,
+}
+
 impl fmt::Debug for McpClientRegistrationResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -541,6 +557,7 @@ impl fmt::Debug for McpClientRegistrationResponse {
             .field("registration_access_token", &self.registration_access_token)
             .field("registration_client_uri", &self.registration_client_uri)
             .field("client_id_issued_at", &self.client_id_issued_at)
+            .field("application_type", &self.application_type)
             .field("redirect_uris", &self.redirect_uris)
             .field("grant_types", &self.grant_types)
             .field("response_types", &self.response_types)
@@ -586,6 +603,7 @@ impl McpClientRegistrationResponse {
             || self.client_secret_expires_at.is_some()
             || self.registration_access_token.is_some()
             || self.registration_client_uri.is_some()
+            || self.application_type != request.application_type
             || canonical(&self.redirect_uris) != canonical(&request.redirect_uris)
             || response_grants != request_grants
             || self.response_types != request.response_types
@@ -597,6 +615,19 @@ impl McpClientRegistrationResponse {
             ));
         }
         Ok(())
+    }
+}
+
+fn application_type_matches_redirect(
+    application_type: McpOAuthApplicationType,
+    redirect: &str,
+) -> bool {
+    let Ok(redirect) = Url::parse(redirect) else {
+        return false;
+    };
+    match application_type {
+        McpOAuthApplicationType::Web => redirect.scheme() == "https",
+        McpOAuthApplicationType::Native => redirect.scheme() != "https",
     }
 }
 
@@ -674,7 +705,25 @@ impl McpClientMetadataDocument {
         allow_loopback_http: bool,
     ) -> std::result::Result<(), McpClientMetadataError> {
         self.validate_client_id(expected_client_id)?;
-        if self.client_id.len() > 2048
+        let client_id_url = Url::parse(&self.client_id)
+            .map_err(|_| McpClientMetadataError::UnsupportedClientMetadata)?;
+        let secure_client_id = client_id_url.scheme() == "https"
+            || (allow_loopback_http
+                && client_id_url.scheme() == "http"
+                && client_id_url.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|address| address.is_loopback())
+                }));
+        if !secure_client_id
+            || client_id_url.host_str().is_none()
+            || matches!(client_id_url.path(), "" | "/")
+            || self
+                .client_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+            || self.client_id.len() > 2048
             || self.redirect_uris.is_empty()
             || self.redirect_uris.len() > 16
             || self.grant_types.len() > 8

@@ -142,8 +142,8 @@ pub fn tool_definition(name: &str, description: &str, input_schema: Value) -> Mc
         icons: Vec::new(),
         input_schema,
         output_schema: None,
-        task_support: None,
         annotations: None,
+        meta: None,
     }
 }
 

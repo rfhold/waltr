@@ -128,7 +128,7 @@ impl McpProtectedResourceMetadata {
         let resource = Url::parse(&self.resource)
             .map_err(|_| Error::protocol("MCP protected resource identifier is invalid"))?;
         if resource.cannot_be_a_base()
-            || !matches!(resource.scheme(), "http" | "https")
+            || !secure_or_loopback(&resource)
             || resource.host_str().is_none()
             || !resource.username().is_empty()
             || resource.password().is_some()
@@ -143,7 +143,7 @@ impl McpProtectedResourceMetadata {
                 Error::protocol("MCP protected resource authorization server is invalid")
             })?;
             if issuer.cannot_be_a_base()
-                || !matches!(issuer.scheme(), "http" | "https")
+                || !secure_or_loopback(&issuer)
                 || issuer.host_str().is_none()
                 || !issuer.username().is_empty()
                 || issuer.password().is_some()
@@ -157,6 +157,17 @@ impl McpProtectedResourceMetadata {
         }
         Ok(())
     }
+}
+
+fn secure_or_loopback(url: &Url) -> bool {
+    url.scheme() == "https"
+        || (url.scheme() == "http"
+            && url.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }))
 }
 
 /// RFC 8414 OAuth authorization server metadata.

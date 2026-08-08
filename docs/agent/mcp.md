@@ -104,7 +104,7 @@ MCP resources are not exposed as provider tools.
 
 ## Server Instructions
 
-If an MCP server returns `instructions` in its initialize result, Waltr stores them with that session's MCP server runtime and adds them to the provider system prompt through MCP middleware.
+If an MCP server returns `instructions` from `server/discover`, Waltr stores them with that session's MCP server runtime and adds them to the provider system prompt through MCP middleware.
 
 Instructions are enabled by default on `AgentSessionRuntimeFactory`. Embedders can opt out with:
 
@@ -122,18 +122,18 @@ MCP server instructions from `foo`:
 
 The instructions middleware is registered with the other MCP session middleware, after the durable base system prompt and before AGENTS/skills middleware.
 
-## Notifications and Server Requests
+## Notifications and MRTR
 
-The generic MCP client routes inbound messages while a server is running. The agent-side handler converts relevant messages into registry refreshes, progress updates, logs, or roots responses.
+The generic MCP client opens `subscriptions/listen` for the list-change filters advertised by the server and reconnects after an unexpected closure. The agent-side handler converts subscription messages and request-scoped notifications into registry refreshes, progress updates, or logs. Roots are supplied through multi-round-trip request (MRTR) input rather than a server-initiated JSON-RPC request.
 
 | MCP message | Current behavior |
 | --- | --- |
 | `notifications/tools/list_changed` | Refreshes that server's tool registry in the background. Newly built agent runtimes see the refreshed tools. |
 | `notifications/prompts/list_changed` | Refreshes that server's prompt registry in the background. Newly built agent runtimes and template searches see the refreshed prompts. |
 | `notifications/resources/list_changed` | Refreshes that server's concrete resource and resource URI template registries in the background. Template searches see the refreshed resources. |
-| `notifications/message` | Publishes an internal MCP log event and writes a tracing event. |
+| `notifications/message` | Publishes an internal MCP log event and writes a tracing event when the originating request opted into a log level. |
 | `notifications/progress` | Publishes an internal MCP progress event. |
-| `roots/list` | Responds with the coordinator runtime root as a single `file://` root. |
+| MRTR `roots/list` input request | Retries the originating tool, prompt, or resource request with the coordinator runtime root as a single `file://` root response. |
 
 The internal MCP event stream is not yet exposed as a public client or UI contract.
 
@@ -164,24 +164,24 @@ A Streamable HTTP bearer challenge becomes an ordinary target-scoped session fai
 4. A still-valid persisted dynamic registration.
 5. Public DCR when the server advertises a registration endpoint.
 
-Configured preregistration is optional and target-scoped. Normalize the server key by uppercasing ASCII letters/digits and replacing every other character with `_`; `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_CLIENT_ID` supplies the public client ID and optional `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_REDIRECT_URI` overrides the default server callback. There is no global registration, registration-specific `self` branch, or deployment-owned `WALTR_MCP_SELF_OAUTH_*` contract. If no mechanism is available, authorization returns typed `CONFIGURATION_REQUIRED` in the outbound-MCP domain.
+Configured preregistration is optional, target-scoped, and issuer-bound. Normalize the server key by uppercasing ASCII letters/digits and replacing every other character with `_`; `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_CLIENT_ID` supplies the public client ID, required `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_ISSUER` must exactly match discovered authorization-server metadata, and optional `WALTR_MCP_<NORMALIZED_SERVER_KEY>_OAUTH_REDIRECT_URI` overrides the default server callback. There is no global registration, registration-specific `self` branch, or deployment-owned `WALTR_MCP_SELF_OAUTH_*` contract. If no mechanism is available, authorization returns typed `CONFIGURATION_REQUIRED` in the outbound-MCP domain.
 
 The default redirect is the server-owned `/outbound-oauth/callback`. Callback attempts, state, PKCE material, registration method, completion mode, and expiry are durable in Waltr SQL so another replica can claim completion. Completion requires the exact state for both callback and manual input. When the authorization server advertises RFC 9207, the response must also contain its exact issuer; a supplied issuer is always checked. Completion claims carry an opaque identity and expiry, use compare-and-swap for every terminal write, and can be reclaimed after a worker crashes. A configured nondefault redirect uses manual completion. Shared clients receive only the authorization URL and sanitized attempt lifecycle; web polls callback attempts and TUI can submit a final redirect URL for manual completion.
 
 Target-scoped durable credential state preserves the exact resource, issuer, selected registration, authorization/token/revocation endpoints, access and refresh tokens, granted scopes, expiry, and refresh generation. Expiry distinguishes a known deadline, a true non-expiring token, and a token whose successful response omitted `expires_in`; omitted expiry does not retain the replaced token's deadline. The Waltr SQL backend uses a 30-second identity-bound compare-and-swap refresh lease across sessions/replicas. A claimant commits only against its generation and claim identity. An indeterminate exchange or an expired refresh lease requires reauthorization rather than risking reuse of a rotated token family. Code-exchange and refresh responses must be JSON and fit within 64 KiB. Authorization, token, refresh, and revocation requests preserve the discovered resource. Debug output for attempts, claims, durable OAuth state, and token values is redacted.
 
-Agent transports use a bearer provider rather than copying one token into transport configuration. The provider reads current durable state before each POST, GET/reconnect, and DELETE, refreshes shortly before a known expiry, and returns the replacement token without reconstructing the session runtime. The same refresh coordinator supports an explicit target-scoped forced refresh while preserving generation/claim coordination and resource binding. A newly issued bearer with unknown expiry is reused until the MCP server rejects it rather than refreshing on every request. Config clients expose sanitized MCP credential status and authorize, force-refresh, and reset actions, while registration remains discovery- and environment-owned. Outbound logout attempts RFC 7009 revocation without redirects or a long-lived wait, then deletes local state unconditionally. External MCP expiration or rejection is an ordinary outbound-MCP failure carrying the exact server key and sanitized challenge context; it never starts OAuth, replays work, or clears Waltr access credentials.
+Agent transports use a bearer provider rather than copying one token into transport configuration. The provider reads current durable state before each stateless POST, refreshes shortly before a known expiry, and returns the replacement token without reconstructing the session runtime. The same refresh coordinator supports an explicit target-scoped forced refresh while preserving generation/claim coordination and resource binding. A newly issued bearer with unknown expiry is reused until the MCP server rejects it rather than refreshing on every request. Config clients expose sanitized MCP credential status and authorize, force-refresh, and reset actions, while registration remains discovery- and environment-owned. Outbound logout attempts RFC 7009 revocation without redirects or a long-lived wait, then deletes local state unconditionally. External MCP expiration or rejection is an ordinary outbound-MCP failure carrying the exact server key and sanitized challenge context; it never starts OAuth, replays work, or clears Waltr access credentials.
 
 ## Boundaries
 
 - MCP support is opt-in through session runtime settings.
 - Generic MCP protocol implementation belongs in `crates/mcp`; Waltr conversion into tools, templates, permissions, and session runtime belongs in `crates/waltr-agent/src/mcp/`.
 - MCP server instructions are injected into the provider system prompt by default for factory-built session runtimes; this is a factory policy, not generic MCP protocol behavior.
-- MCP resource subscriptions, sampling, elicitation, and extension negotiation are not implemented.
+- Resource URI subscriptions, sampling, elicitation, non-roots MRTR input, and task runtime extensions are not implemented. List-change subscriptions are implemented through `subscriptions/listen`.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - The shared server config names the HTTP MCP server type `SSE`; session runtime settings map that to the agent's Streamable HTTP transport.
-- Streamable HTTP GET delivery, `Last-Event-ID` acknowledgments, and DELETE session termination are implemented by the generic MCP transport; Waltr agent callers handle fallible async shutdown.
+- Streamable HTTP sends one POST per message and uses request-scoped JSON or SSE responses. Protocol sessions, GET delivery, resumability, and DELETE termination are absent.
 - Confidential downstream clients and registration-management credentials are not supported; outbound registration is public-client only.
 
 ## Tests

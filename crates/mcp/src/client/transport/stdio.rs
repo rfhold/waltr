@@ -18,7 +18,7 @@ use super::{InboundSender, TransportInbound};
 /// Stdio subprocess transport.
 pub struct StdioTransport {
     child: Arc<Mutex<Child>>,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
 
 impl std::fmt::Debug for StdioTransport {
@@ -113,7 +113,7 @@ impl StdioTransport {
         });
         Ok(Self {
             child: Arc::new(Mutex::new(child)),
-            stdin: Arc::new(Mutex::new(stdin)),
+            stdin: Arc::new(Mutex::new(Some(stdin))),
         })
     }
 
@@ -135,23 +135,32 @@ impl StdioTransport {
             "sending MCP stdio message"
         );
         let line = serde_json::to_string(&message)?;
-        let mut stdin = self.stdin.lock().await;
+        let mut stdin_guard = self.stdin.lock().await;
+        let stdin = stdin_guard
+            .as_mut()
+            .ok_or_else(|| Error::protocol("MCP stdio transport is shut down"))?;
         stdin.write_all(line.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
-        drop(stdin);
+        drop(stdin_guard);
         Ok(())
     }
 
-    /// Kill and wait for the subprocess.
+    /// Close stdin, then wait for or terminate the subprocess.
     ///
     /// # Errors
     ///
-    /// Returns an error when the subprocess cannot be killed or reaped.
+    /// Returns an error when the subprocess cannot be terminated or reaped.
     pub async fn shutdown(&self) -> Result<()> {
+        drop(self.stdin.lock().await.take());
         let mut child = self.child.lock().await;
-        child.start_kill()?;
-        child.wait().await?;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            child.start_kill()?;
+            child.wait().await?;
+        }
         drop(child);
         Ok(())
     }

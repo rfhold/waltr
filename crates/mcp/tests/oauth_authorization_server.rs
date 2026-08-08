@@ -378,6 +378,7 @@ async fn dcr_advertises_registers_and_completes_public_authorization_flow() {
     let registration = client
         .post(format!("{origin}/oauth/register"))
         .json(&McpPublicClientRegistrationRequest {
+            application_type: mcp::McpOAuthApplicationType::Web,
             redirect_uris: vec![REDIRECT.to_owned(), REDIRECT.to_owned()],
             grant_types: vec![
                 McpOAuthGrantType::RefreshToken,
@@ -468,6 +469,20 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let client_id = format!("{origin}/client.json");
+    let initial_document: mcp::McpClientMetadataDocument =
+        serde_json::from_value(serde_json::json!({
+            "client_id": client_id,
+            "client_name": "Snapshot client",
+            "redirect_uris": [REDIRECT],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "code_challenge_methods": ["S256"]
+        }))
+        .unwrap();
+    initial_document
+        .validate_public_client(&client_id, true)
+        .unwrap();
     let document_client_id = client_id.clone();
     let version_for_route = version.clone();
     let router = axum::Router::new().route(
@@ -488,6 +503,7 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
                     ],
                     serde_json::json!({
                         "client_id": client_id,
+                        "client_name": "Snapshot client",
                         "redirect_uris": [redirect],
                         "grant_types": ["authorization_code", "refresh_token"],
                         "response_types": ["code"],
@@ -523,8 +539,9 @@ async fn cimd_snapshot_survives_document_mutation_through_code_exchange() {
     .unwrap()
     .with_client_registration(OAuthClientRegistrationOptions {
         metadata_fetcher: Some(Arc::new(
-            HardenedOAuthClientMetadataFetcher::loopback_for_tests(),
+            HardenedOAuthClientMetadataFetcher::loopback_for_tests().with_loopback_redirects(true),
         )),
+        allow_loopback_redirects: true,
         ..OAuthClientRegistrationOptions::default()
     })
     .unwrap();
@@ -660,7 +677,11 @@ async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
 
 async fn authorize_client(client: &reqwest::Client, origin: &str, client_id: &str) -> String {
     let response = authorization_response(client, origin, client_id).await;
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    if response.status() != StatusCode::SEE_OTHER {
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        panic!("authorization failed with {status}: {body}");
+    }
     Url::parse(response.headers()["location"].to_str().unwrap())
         .unwrap()
         .query_pairs()

@@ -970,6 +970,9 @@ fn validate_progressive_parts(
     actions: &[ProgressiveAction],
     runbooks: &[ProgressiveRunbook],
 ) -> syn::Result<()> {
+    #[allow(clippy::literal_string_with_formatting_args)]
+    const RUNBOOK_BINDING: &str = "{runbook}";
+
     if args.tools.is_empty() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -1101,10 +1104,10 @@ fn validate_progressive_parts(
                 )
             })?;
             let template_value = template.value();
-            if !template_value.contains("{runbook}") {
+            if !template_value.contains(RUNBOOK_BINDING) {
                 return Err(syn::Error::new_spanned(
                     template,
-                    "runbook URI templates must contain a `{runbook}` binding",
+                    format!("runbook URI templates must contain a `{RUNBOOK_BINDING}` binding"),
                 ));
             }
             if !runbook_templates.insert(template_value) {

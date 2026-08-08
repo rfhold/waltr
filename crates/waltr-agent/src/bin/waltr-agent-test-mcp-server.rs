@@ -203,12 +203,6 @@ impl EchoMarkerServer {
         }
     }
 
-    #[log_level]
-    #[allow(clippy::needless_pass_by_value)]
-    fn set_log_level(level: String, _context: ServerContext) -> ServerResult<()> {
-        set_log_level(&level)
-    }
-
     #[prompt(name = "status_prompt", definition = status_prompt_definition())]
     #[allow(clippy::needless_pass_by_value)]
     fn status_prompt(
@@ -486,8 +480,8 @@ fn tool_definition(name: &str, description: &str, input_schema: Value) -> McpToo
         icons: Vec::new(),
         input_schema,
         output_schema: None,
-        task_support: None,
         annotations: None,
+        meta: None,
     }
 }
 
@@ -506,15 +500,6 @@ fn trace_marker(context: &ServerContext, label: &str) -> Option<String> {
         .map(|_| format!("trace:{label}:present"))
 }
 
-fn set_log_level(level: &str) -> ServerResult<()> {
-    if let Ok(path) = std::env::var("WALTR_TEST_MCP_LOG_LEVEL_FILE")
-        && let Err(error) = std::fs::write(path, level)
-    {
-        return Err(ServerError::internal(error.to_string()));
-    }
-    Ok(())
-}
-
 fn status_prompt_definition() -> McpPromptDefinition {
     prompt_definition(
         "status_prompt",
@@ -529,6 +514,7 @@ fn greet_prompt_definition() -> McpPromptDefinition {
         "Greet a named test subject.",
         vec![McpPromptArgument {
             name: "name".to_owned(),
+            title: None,
             description: Some("Name to greet".to_owned()),
             required: true,
         }],
@@ -630,7 +616,9 @@ fn complete(
     request: McpCompletionRequest,
     context: &ServerContext,
 ) -> ServerResult<mcp::McpCompletionResult> {
-    let mut values = if request.uri_template == "test://items/{id}" && request.argument_name == "id"
+    let mut values = if request.reference
+        == mcp::McpCompletionReference::Resource("test://items/{id}".to_owned())
+        && request.argument_name == "id"
     {
         ["42", "420", "4242"]
             .into_iter()

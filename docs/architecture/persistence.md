@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Waltr server persistence initializes separately owned Waltr and MCP database targets for server-owned durable state, all outbound provider and MCP OAuth credentials, MCP Streamable HTTP sessions, and the hosted MCP authorization server. Startup completes both standard SQLx migrators before the router, health endpoint, or gRPC readiness service becomes available.
+Waltr server persistence initializes separately owned Waltr and MCP database targets for server-owned durable state, outbound provider and MCP OAuth credentials, and the hosted MCP authorization server. Startup completes both standard SQLx migrators before the router, health endpoint, or gRPC readiness service becomes available.
 
 This database is separate from agent session storage selected by `WALTR_SESSION_STORE`.
 
@@ -28,7 +28,7 @@ Waltr and MCP use separate pools and retain separate schema and migration owners
 
 | Backend | Waltr objects | MCP objects |
 | --- | --- | --- |
-| SQLite | `waltr.sqlite3`: `_sqlx_migrations`, OIDC state, and durable outbound OAuth attempts/credentials | `mcp.sqlite3`: `_sqlx_migrations`, Streamable HTTP session/event tables, and hosted OAuth tables |
+| SQLite | `waltr.sqlite3`: `_sqlx_migrations`, OIDC state, and durable outbound OAuth attempts/credentials | `mcp.sqlite3`: `_sqlx_migrations`, hosted OAuth tables, and inert historical Streamable HTTP session/event tables |
 | PostgreSQL | `waltr` schema and `waltr._sqlx_migrations`, including outbound OAuth | `mcp` schema and `mcp._sqlx_migrations`, including hosted OAuth |
 
 Each owning crate embeds its forward-only migration files with `sqlx::migrate!()`. SQLx owns the standard `_sqlx_migrations` history format, version/checksum validation, and migration coordination; Waltr adds no migration-history layer. PostgreSQL migration connections set the owning `waltr` or `mcp` search path so the standard history and owned objects are created in that schema. Runtime queries remain owner-qualified where required.
@@ -56,7 +56,7 @@ Waltr migration V3 owns the hosted server's browser-correlation continuation rec
 
 V5 is a hard cutover for `outbound_oauth_credentials`: applying it removes existing credential rows, so every previously authorized provider and MCP target must authorize again. The recreated table stores a versioned Waltr-owned credential payload containing a shared OAuth token set and typed provider or MCP context. Access and refresh token values use `oauth2` secret-bearing primitives, while Waltr owns absolute expiry, context, and serialization. Credential revision, claim identity/deadline, reauthorization state, and update time remain envelope columns. Both provider and MCP refreshes use the same database lease and compare-and-swap contract. Callback completion and credential installation commit together for durable MCP callback attempts; provider authorization attempts remain process-local. An indeterminate refresh or expired refresh lease marks the credential for reauthorization rather than risking reuse.
 
-MCP migrations are likewise immutable: V1 owns Streamable HTTP sessions/events, V2 adds the hosted authorization server's transactions, consents, digest-only codes and refresh tokens, grants, refresh families, access-token authorization records, and ES256 signing keys, and V3 adds normalized client-registration, redirect-URI, CIMD snapshot, admission, and rate-limit state. Private signing material is encrypted with the deployment keyring; wrapping keys are never stored in SQL. SQLite transactions and PostgreSQL locking implement the same one-time redemption, refresh rotation/replay, admission, revocation, and signing-key activation contract.
+MCP migrations are likewise immutable. V1 created Streamable HTTP session/event tables for a removed protocol runtime; those tables remain inert so existing SQLx history and checksums stay valid. V2 adds the hosted authorization server's transactions, consents, digest-only codes and refresh tokens, grants, refresh families, access-token authorization records, and ES256 signing keys. V3 adds normalized client-registration, redirect-URI, CIMD snapshot, admission, and rate-limit state. Private signing material is encrypted with the deployment keyring; wrapping keys are never stored in SQL. SQLite transactions and PostgreSQL locking implement the same one-time redemption, refresh rotation/replay, admission, revocation, and signing-key activation contract.
 
 Never edit an applied migration. Schema corrections require a new forward-only migration in both backend directories; SQLx rejects changed checksums on reopen.
 
@@ -66,28 +66,27 @@ The MCP database and every wrapping-key version still referenced by an encrypted
 
 1. Parse `WALTR_DATABASE_URL` and optional `WALTR_MCP_DATABASE_URL`, or resolve and derive the durable defaults.
 2. Open the Waltr SQLx pool and run Waltr's standard embedded migrator.
-3. Open the independent MCP SQLx pool and construct the MCP session and OAuth stores, which run MCP's standard embedded migrator.
+3. Open the independent MCP SQLx pool and construct the hosted OAuth stores, which run MCP's standard embedded migrator.
 4. Validate access-auth and hosted-OAuth environment configuration and, in OIDC mode, perform upstream discovery, load the wrapping-key ring, and decrypt or bootstrap the active local signer.
 5. Build the router with initialized persistence, authentication, and hosted authorization.
 6. Bind the listener and expose health and readiness.
 
 Any failure before router construction prevents the server from binding or reporting readiness. Errors identify the failing subsystem without including credentials or database URLs.
 
-The environment-owned `build_app()` is therefore async and fallible. Explicit builders are synchronous composition APIs: they require initialized `Persistence`, and authenticated variants require an initialized `AccessAuthenticator`. All builders return a server-owned application lifecycle; its bounded MCP cleanup loop is cancelled and joined with server shutdown, independent of any external `Persistence` clones.
+The environment-owned `build_app()` is therefore async and fallible. Explicit builders are synchronous composition APIs: they require initialized `Persistence`, and authenticated variants require an initialized `AccessAuthenticator`. All builders return a server-owned application lifecycle whose hosted-OAuth maintenance is cancelled and joined with server shutdown, independent of any external `Persistence` clones. There is no MCP protocol-session store or cleanup loop.
 
 ## Boundaries
 
 - `crates/waltr-server/src/persistence/` owns database selection, Waltr migrations, and startup composition.
-- `crates/mcp/src/server/session/` owns MCP session tables and behavior.
+- `crates/mcp/src/oauth/server/` owns generic hosted-OAuth state transitions and runtime persistence; Waltr selects its MCP SQL pool and deployment policy.
 - `crates/waltr-server/src/session/` and `waltr-agent` continue to own agent session storage. `WALTR_SESSION_STORE` is not an alias for `WALTR_DATABASE_URL`.
 - Domain features should add purpose-specific stores and migrations rather than a generic key/value table.
 - `crates/waltr-server/src/access_auth/store.rs` owns the OIDC V2 domain store and admission rules; handlers do not issue SQL directly.
 - `crates/waltr-server/src/persistence/outbound_oauth.rs` owns durable callbacks, unified outbound credentials, and refresh claims.
-- `crates/mcp/src/oauth/server/` owns generic hosted-OAuth state transitions; Waltr only selects its MCP SQL pool and deployment policy.
 
 ## Tests
 
-Persistence tests cover SQLite and container-backed PostgreSQL migration startup, history isolation, SQLx checksum rejection, independent pools, SQLite target collision rejection, and foreign-key behavior. Server integration tests cover startup failure and MCP lifecycle/event reconstruction. See [Testing](../testing.md) for the server test commands.
+Persistence tests cover SQLite and container-backed PostgreSQL migration startup, history isolation, SQLx checksum rejection, independent pools, SQLite target collision rejection, foreign-key behavior, and hosted-OAuth store contracts. Historical V1 rows are migration history only; no test reconstructs protocol sessions. See [Testing](../testing.md) for the server test commands.
 
 ## References
 

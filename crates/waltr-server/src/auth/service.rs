@@ -519,9 +519,11 @@ where
         request: McpRegistrationRequest<'_>,
     ) -> Result<McpOAuthRegistration, Status> {
         let persisted = self.persisted_mcp_registration(&request).await?;
-        if let Some(registration) =
-            configured_mcp_registration(request.server_key, request.redirect_uri)?
-        {
+        if let Some(registration) = configured_mcp_registration(
+            request.server_key,
+            request.redirect_uri,
+            &request.authorization_server.issuer,
+        )? {
             return Ok(registration);
         }
         if let Some(registration) = persisted
@@ -595,6 +597,13 @@ where
             .as_deref()
         {
             let registration_request = McpPublicClientRegistrationRequest {
+                application_type: if url::Url::parse(request.redirect_uri)
+                    .is_ok_and(|redirect| redirect.scheme() == "https")
+                {
+                    mcp::McpOAuthApplicationType::Web
+                } else {
+                    mcp::McpOAuthApplicationType::Native
+                },
                 redirect_uris: vec![request.redirect_uri.to_owned()],
                 grant_types: vec![
                     McpOAuthGrantType::AuthorizationCode,
@@ -1368,6 +1377,7 @@ async fn revoke_mcp_credential_with_policy(
 fn configured_mcp_registration(
     server_key: &str,
     default_redirect_uri: &str,
+    discovered_issuer: &str,
 ) -> Result<Option<McpOAuthRegistration>, Status> {
     let key = server_key
         .chars()
@@ -1390,12 +1400,17 @@ fn configured_mcp_registration(
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_redirect_uri.to_owned());
-    if redirect_uri.trim().is_empty() {
+    let configured_issuer = std::env::var(format!("{prefix}_ISSUER"))
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if redirect_uri.trim().is_empty() || configured_issuer.as_deref() != Some(discovered_issuer) {
         return Err(outbound_failure_status(
             &AuthTarget::mcp_server(server_key),
             tonic::Code::FailedPrecondition,
             AuthenticationFailureReason::ConfigurationRequired,
-            format!("MCP OAuth public client registration is incomplete for '{server_key}'"),
+            format!(
+                "MCP OAuth public client registration is incomplete or issuer-mismatched for '{server_key}'"
+            ),
         ));
     }
     Ok(Some(McpOAuthRegistration {
@@ -1539,14 +1554,22 @@ async fn request_mcp_challenge(
     let response = client
         .post(endpoint)
         .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": "waltr-oauth-discovery",
-            "method": "initialize",
+            "method": "server/discover",
             "params": {
-                "protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "waltr", "version": env!("CARGO_PKG_VERSION") }
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "waltr",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
             }
         }))
         .send()
@@ -1792,8 +1815,12 @@ mod tests {
     #[test]
     fn missing_per_server_mcp_registration_allows_discovery_mechanisms() {
         let key = "registration-definitely-not-configured-7f4332";
-        let registration = configured_mcp_registration(key, "https://waltr.example/callback")
-            .expect("missing preregistration is not an error");
+        let registration = configured_mcp_registration(
+            key,
+            "https://waltr.example/callback",
+            "https://issuer.example",
+        )
+        .expect("missing preregistration is not an error");
         assert!(registration.is_none());
     }
 
@@ -2065,6 +2092,7 @@ mod tests {
                 post(|| async {
                     Json(serde_json::json!({
                         "client_id": "local-public-client",
+                        "application_type": "native",
                         "redirect_uris": ["http://127.0.0.1/callback"],
                         "grant_types": ["authorization_code", "refresh_token"],
                         "response_types": ["code"],
@@ -2609,6 +2637,7 @@ mod tests {
                 post(|| async {
                     Json(serde_json::json!({
                         "client_id": "registered-client",
+                        "application_type": "web",
                         "redirect_uris": ["https://waltr.example/outbound-oauth/callback"],
                         "grant_types": ["authorization_code", "refresh_token"],
                         "response_types": ["code"],
@@ -2630,6 +2659,7 @@ mod tests {
             policy,
             &registration_endpoint,
             &McpPublicClientRegistrationRequest {
+                application_type: mcp::McpOAuthApplicationType::Web,
                 redirect_uris: vec!["https://waltr.example/outbound-oauth/callback".to_owned()],
                 grant_types: vec![
                     McpOAuthGrantType::AuthorizationCode,

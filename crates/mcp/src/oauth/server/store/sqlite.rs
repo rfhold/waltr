@@ -79,10 +79,7 @@ impl SqliteOAuthAuthorizationStore {
         pool: SqlitePool,
         config: OAuthAuthorizationStoreConfig,
     ) -> OAuthAuthorizationStoreResult<Self> {
-        MIGRATOR
-            .run(&pool)
-            .await
-            .map_err(|error| migration_error(&error))?;
+        run_migrations(&pool).await?;
         Ok(Self { pool, config })
     }
 
@@ -105,6 +102,13 @@ impl SqliteOAuthAuthorizationStore {
         transaction.commit().await.map_err(unavailable)?;
         Ok(output)
     }
+}
+
+pub(super) async fn run_migrations(pool: &SqlitePool) -> OAuthAuthorizationStoreResult<()> {
+    MIGRATOR
+        .run(pool)
+        .await
+        .map_err(|error| migration_error(&error))
 }
 
 macro_rules! sqlite_method {

@@ -68,8 +68,8 @@ impl Readiness {
 /// Waltr router and server-owned background work.
 pub struct ServerApplication {
     router: Router,
-    mcp_cleanup: McpSessionCleanupTask,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
+    test_background: Option<TestBackgroundTask>,
 }
 
 impl fmt::Debug for ServerApplication {
@@ -81,15 +81,11 @@ impl fmt::Debug for ServerApplication {
 }
 
 impl ServerApplication {
-    fn new(
-        router: Router,
-        store: Arc<dyn mcp::server::StreamableHttpSessionStore>,
-        oauth: Option<McpOAuthServer>,
-    ) -> Self {
+    fn new(router: Router, oauth: Option<McpOAuthServer>) -> Self {
         Self {
             router,
-            mcp_cleanup: McpSessionCleanupTask::spawn(store, MCP_CLEANUP_INTERVAL),
             oauth_maintenance: oauth.map(McpOAuthMaintenanceTask::spawn),
+            test_background: None,
         }
     }
 
@@ -102,11 +98,23 @@ impl ServerApplication {
     pub async fn shutdown(self) {
         let Self {
             router,
-            mcp_cleanup,
             oauth_maintenance,
+            test_background,
         } = self;
-        shutdown_background_tasks(mcp_cleanup, oauth_maintenance).await;
+        shutdown_background_tasks(oauth_maintenance, test_background).await;
         drop(router);
+    }
+
+    #[cfg(any(debug_assertions, feature = "test"))]
+    pub(crate) fn with_background_task_for_test(
+        cancellation: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            router: Router::new(),
+            oauth_maintenance: None,
+            test_background: Some(TestBackgroundTask { cancellation, task }),
+        }
     }
 
     /// Bind the server listener, shutting down background work if startup fails.
@@ -135,21 +143,6 @@ impl ServerApplication {
         Ok((self, listener, bound_addr))
     }
 
-    #[cfg(any(debug_assertions, feature = "test"))]
-    pub(crate) fn with_cleanup_task_for_test(
-        cancellation: CancellationToken,
-        task: tokio::task::JoinHandle<()>,
-    ) -> Self {
-        Self {
-            router: Router::new(),
-            mcp_cleanup: McpSessionCleanupTask {
-                cancellation,
-                task: Some(task),
-            },
-            oauth_maintenance: None,
-        }
-    }
-
     /// Serve until the listener fails or the shutdown signal resolves, then join background work.
     ///
     /// # Errors
@@ -165,11 +158,13 @@ impl ServerApplication {
     {
         let Self {
             router,
-            mcp_cleanup,
             oauth_maintenance,
+            test_background,
         } = self;
-        let cancellation = mcp_cleanup.cancellation.clone();
         let oauth_cancellation = oauth_maintenance
+            .as_ref()
+            .map(|task| task.cancellation.clone());
+        let test_cancellation = test_background
             .as_ref()
             .map(|task| task.cancellation.clone());
         let result = axum::serve(
@@ -178,86 +173,45 @@ impl ServerApplication {
         )
         .with_graceful_shutdown(async move {
             shutdown.await;
-            cancellation.cancel();
             if let Some(cancellation) = oauth_cancellation {
+                cancellation.cancel();
+            }
+            if let Some(cancellation) = test_cancellation {
                 cancellation.cancel();
             }
         })
         .await;
-        shutdown_background_tasks(mcp_cleanup, oauth_maintenance).await;
+        shutdown_background_tasks(oauth_maintenance, test_background).await;
         result
     }
 }
 
 async fn shutdown_background_tasks(
-    mcp_cleanup: McpSessionCleanupTask,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
+    test_background: Option<TestBackgroundTask>,
 ) {
-    mcp_cleanup.cancellation.cancel();
     if let Some(task) = &oauth_maintenance {
         task.cancellation.cancel();
     }
     if let Some(oauth_maintenance) = oauth_maintenance {
-        tokio::join!(mcp_cleanup.shutdown(), oauth_maintenance.shutdown());
-    } else {
-        mcp_cleanup.shutdown().await;
+        oauth_maintenance.shutdown().await;
+    }
+    if let Some(test_background) = test_background {
+        test_background.shutdown().await;
     }
 }
 
-const MCP_CLEANUP_INTERVAL: Duration = Duration::from_mins(5);
-
-struct McpSessionCleanupTask {
+struct TestBackgroundTask {
     cancellation: CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-impl McpSessionCleanupTask {
-    fn spawn(
-        store: Arc<dyn mcp::server::StreamableHttpSessionStore>,
-        cleanup_interval: Duration,
-    ) -> Self {
-        let cancellation = CancellationToken::new();
-        let task_cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(cleanup_interval);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    biased;
-                    () = task_cancellation.cancelled() => return,
-                    _ = interval.tick() => {}
-                }
-                let limit = store.config().cleanup_batch_size;
-                tokio::select! {
-                    biased;
-                    () = task_cancellation.cancelled() => return,
-                    result = store.cleanup_expired(std::time::SystemTime::now(), limit) => {
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "failed to clean up expired MCP sessions");
-                        }
-                    }
-                }
-            }
-        });
-        Self {
-            cancellation,
-            task: Some(task),
-        }
-    }
-
-    async fn shutdown(mut self) {
+impl TestBackgroundTask {
+    async fn shutdown(self) {
         self.cancellation.cancel();
-        if let Some(task) = self.task.take()
-            && let Err(error) = task.await
-        {
-            tracing::warn!(%error, "MCP session cleanup task failed to join");
+        if let Err(error) = self.task.await {
+            tracing::warn!(%error, "test background task failed to join");
         }
-    }
-}
-
-impl Drop for McpSessionCleanupTask {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
     }
 }
 
@@ -726,15 +680,13 @@ where
     );
     let outbound_oauth_router = auth_service.router();
     let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
-    let mcp_session_store = persistence.mcp_session_store();
     let readiness = Readiness {
         persistence: persistence.clone(),
         oauth: mcp_oauth.clone(),
     };
     // Waltr has no browser MCP client, so the generic empty Origin allowlist stays in force.
-    let mut mcp_options = mcp::server::StreamableHttpOptions::default()
-        .with_session_store(Arc::clone(&mcp_session_store))
-        .without_root_protected_resource_metadata();
+    let mut mcp_options =
+        mcp::server::StreamableHttpOptions::default().without_root_protected_resource_metadata();
     if let Some(oauth) = &mcp_oauth {
         let required_scopes = oauth.required_scopes().to_vec();
         let metadata = mcp::McpProtectedResourceMetadata::new(oauth.resource(), [oauth.issuer()])
@@ -826,7 +778,7 @@ where
     let router = router
         .fallback_service(grpc)
         .layer(TraceLayer::new_for_http().make_span_with(request_span));
-    Ok(ServerApplication::new(router, mcp_session_store, mcp_oauth))
+    Ok(ServerApplication::new(router, mcp_oauth))
 }
 
 fn request_span<B>(request: &Request<B>) -> tracing::Span {
@@ -910,7 +862,7 @@ mod tests {
                 }
             })
         };
-        let app = ServerApplication::with_cleanup_task_for_test(cancellation, task);
+        let app = ServerApplication::with_background_task_for_test(cancellation, task);
         cleanup_started.notified().await;
         assert_eq!(activity.load(Ordering::SeqCst), 1);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -68,12 +68,6 @@ Run all MCP tests:
 
 `cargo test -p mcp --tests`
 
-Run feature-gated MCP SQL store tests:
-
-`cargo test -p mcp --features streamable-http-sqlite --test streamable_http_sqlite_store`
-
-`cargo test -p mcp --features streamable-http-postgres --test streamable_http_postgres_store -- --ignored`
-
 Run hosted MCP OAuth and SQL-store tests:
 
 `cargo test -p mcp --features oauth-authorization-server --test oauth_authorization_server --test oauth_store`

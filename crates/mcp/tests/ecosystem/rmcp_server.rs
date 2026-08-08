@@ -8,13 +8,14 @@ use mcp::client::McpTransportConfig;
 use rmcp::{
     ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, CompleteRequestParams, CompleteResult,
-        CompletionInfo, ContentBlock, ErrorData, GetPromptRequestParams, GetPromptResult,
-        Implementation, JsonObject, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListToolsResult, LoggingMessageNotificationParam, NumberOrString,
-        PaginatedRequestParams, ProgressNotificationParam, ProgressToken, Prompt, PromptArgument,
-        PromptMessage, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
-        ResourceTemplate, Role, ServerCapabilities, ServerInfo, SetLevelRequestParams, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CompleteRequestParams,
+        CompleteResult, CompletionInfo, ContentBlock, ErrorData, GetPromptRequestParams,
+        GetPromptResponse, GetPromptResult, Implementation, JsonObject, ListPromptsResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        LoggingMessageNotificationParam, NumberOrString, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, Prompt, PromptArgument, PromptMessage,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -46,9 +47,7 @@ impl RmcpStreamableHttpServer {
         let service = StreamableHttpService::new(
             || Ok(StandardRmcpServer),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default()
-                .with_stateful_mode(false)
-                .with_cancellation_token(CancellationToken::new()),
+            StreamableHttpServerConfig::default().with_cancellation_token(CancellationToken::new()),
         );
         let app = Router::new().route_service("/mcp", service);
         let task = tokio::spawn(async move {
@@ -103,16 +102,8 @@ impl ServerHandler for StandardRmcpServer {
         &self,
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        call_tool(params, context).await
-    }
-
-    async fn set_level(
-        &self,
-        _params: SetLevelRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<(), ErrorData> {
-        Ok(())
+    ) -> Result<CallToolResponse, ErrorData> {
+        call_tool(params, context).await.map(Into::into)
     }
 
     async fn list_prompts(
@@ -129,8 +120,8 @@ impl ServerHandler for StandardRmcpServer {
         &self,
         params: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, ErrorData> {
-        get_prompt(params)
+    ) -> Result<GetPromptResponse, ErrorData> {
+        get_prompt(params).map(Into::into)
     }
 
     async fn list_resources(
@@ -160,8 +151,8 @@ impl ServerHandler for StandardRmcpServer {
         &self,
         params: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        read_resource(&params.uri)
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        read_resource(&params.uri).map(Into::into)
     }
 
     async fn complete(

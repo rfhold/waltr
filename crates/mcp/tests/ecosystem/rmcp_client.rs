@@ -5,13 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use mcp::client::McpTransportConfig;
 use rmcp::{
-    ClientHandler,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt,
     model::{
         CallToolRequestParams, ClientInfo, ContentBlock, JsonObject, ListRootsResult, LoggingLevel,
-        LoggingMessageNotificationParam, Meta, NumberOrString, ProgressNotificationParam,
-        ProgressToken, ReadResourceRequestParams, Root, SetLevelRequestParams,
+        LoggingMessageNotificationParam, NumberOrString, ProgressNotificationParam, ProgressToken,
+        ProtocolVersion, ReadResourceRequestParams, RequestMetaObject, Root,
     },
-    serve_client,
     service::{NotificationContext, RequestContext, RoleClient},
     transport::StreamableHttpClientTransport,
 };
@@ -33,7 +32,13 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
     let logs = Arc::clone(&handler.logs);
     let progress = Arc::clone(&handler.progress);
     let transport = StreamableHttpClientTransport::from_uri(endpoint);
-    let peer = serve_client(handler, transport)
+    let peer = handler
+        .serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
         .await
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
 
@@ -54,11 +59,13 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
     assert_text_contains(&echo.content, "ecosystem-tool-marker-707")?;
 
+    let mut log_call =
+        call_tool_params(LOG_TOOL, &json!({ "message": "ecosystem-log-marker-818" }));
+    let mut log_meta = RequestMetaObject::default();
+    log_meta.set_log_level(LoggingLevel::Info);
+    log_call.meta = Some(log_meta);
     let log = peer
-        .call_tool(call_tool_params(
-            LOG_TOOL,
-            &json!({ "message": "ecosystem-log-marker-818" }),
-        ))
+        .call_tool(log_call)
         .await
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
     assert_text_contains(&log.content, "ecosystem-log-marker-818")?;
@@ -67,7 +74,7 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
         PROGRESS_TOOL,
         &json!({ "value": "ecosystem-progress-result-919" }),
     );
-    progress_call.meta = Some(Meta::with_progress_token(ProgressToken(
+    progress_call.meta = Some(RequestMetaObject::with_progress_token(ProgressToken(
         NumberOrString::String("ecosystem-progress-token".into()),
     )));
     let progress_result = peer
@@ -135,10 +142,6 @@ pub async fn assert_standard_surface(transport: McpTransportConfig) -> mcp::Resu
         .await
         .map_err(|error| mcp::Error::protocol(error.to_string()))?;
     assert_eq!(completion.values, vec!["42", "420", "4242"]);
-
-    peer.set_level(SetLevelRequestParams::new(LoggingLevel::Warning))
-        .await
-        .map_err(|error| mcp::Error::protocol(error.to_string()))?;
 
     assert!(
         logs.lock()

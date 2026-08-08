@@ -1,17 +1,6 @@
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::types::{McpIcon, parse_icons};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// MCP tool task support level.
-pub enum McpToolTaskSupport {
-    /// Tool calls must not be run as tasks.
-    Forbidden,
-    /// Tool calls may be run as tasks.
-    Optional,
-    /// Tool calls must be run as tasks.
-    Required,
-}
 
 /// MCP tool definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,10 +17,10 @@ pub struct McpToolDefinition {
     pub input_schema: Value,
     /// Optional JSON schema for output.
     pub output_schema: Option<Value>,
-    /// Optional task execution support metadata.
-    pub task_support: Option<McpToolTaskSupport>,
     /// Optional MCP annotations.
     pub annotations: Option<Value>,
+    /// Optional extension metadata.
+    pub meta: Option<Value>,
 }
 
 /// Parse a tool definition.
@@ -45,43 +34,25 @@ pub fn parse_tool_definition(value: &Value) -> Option<McpToolDefinition> {
         .get("description")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let input_schema = value
-        .get("inputSchema")
-        .cloned()
-        .unwrap_or_else(empty_object_schema);
+    let input_schema = value.get("inputSchema")?.clone();
+    let icons = parse_icons(value);
+    if value
+        .get("icons")
+        .and_then(Value::as_array)
+        .is_some_and(|raw| raw.len() != icons.len())
+    {
+        return None;
+    }
     Some(McpToolDefinition {
         name,
         title,
         description,
-        icons: parse_icons(value),
+        icons,
         input_schema,
         output_schema: value.get("outputSchema").cloned(),
-        task_support: value
-            .get("execution")
-            .and_then(|execution| execution.get("taskSupport"))
-            .and_then(Value::as_str)
-            .and_then(McpToolTaskSupport::parse),
         annotations: value.get("annotations").cloned(),
+        meta: value.get("_meta").cloned(),
     })
-}
-
-impl McpToolTaskSupport {
-    pub(crate) const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Forbidden => "forbidden",
-            Self::Optional => "optional",
-            Self::Required => "required",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "forbidden" => Some(Self::Forbidden),
-            "optional" => Some(Self::Optional),
-            "required" => Some(Self::Required),
-            _ => None,
-        }
-    }
 }
 
 impl McpToolDefinition {
@@ -132,8 +103,4 @@ pub fn format_tool_result(result: &Value) -> String {
     } else {
         content
     }
-}
-
-fn empty_object_schema() -> Value {
-    json!({ "type": "object", "properties": {} })
 }
