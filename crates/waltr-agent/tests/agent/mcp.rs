@@ -1,15 +1,6 @@
 //! MCP agent integration tests.
 
-use std::{
-    collections::HashMap,
-    fs,
-    process::Child,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, fs, process::Child, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use waltr_agent::{
@@ -28,10 +19,6 @@ use opentelemetry_sdk::{
     trace::{InMemorySpanExporter, SdkTracerProvider, SpanData},
 };
 use serde_json::json;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::{Notify, Semaphore},
-};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::{Registry, prelude::*};
 
@@ -39,67 +26,6 @@ use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
-const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
-
-#[tokio::test]
-async fn test_mcp_server_advertises_logging_and_accepts_set_level() -> waltr_agent::Result<()> {
-    let temp = tempfile::tempdir()?;
-    let level_file = temp.path().join("mcp-log-level.txt");
-    let mut child = tokio::process::Command::new(test_stdio_server_command())
-        .env("WALTR_TEST_MCP_LOG_LEVEL_FILE", &level_file)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut stdout = BufReader::new(stdout).lines();
-
-    write_json_rpc(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "waltr-agent-test", "version": "0" }
-            }
-        }),
-    )
-    .await?;
-    let initialize = read_json_rpc(&mut stdout).await?;
-    assert_eq!(initialize["id"], json!(1));
-    assert_eq!(initialize["result"]["capabilities"]["logging"], json!({}));
-
-    write_json_rpc(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        }),
-    )
-    .await?;
-    write_json_rpc(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "logging/setLevel",
-            "params": { "level": "warning" }
-        }),
-    )
-    .await?;
-    let set_level = read_json_rpc(&mut stdout).await?;
-    assert_eq!(set_level["id"], json!(2));
-    assert!(set_level.get("error").is_none(), "{set_level:#?}");
-    assert_eq!(fs::read_to_string(&level_file)?, "warning");
-
-    child.kill().await.ok();
-    child.wait().await.ok();
-    Ok(())
-}
 
 #[tokio::test]
 async fn mcp_agent_loop_discovers_and_calls_stdio_and_streamable_http_direct_tools()
@@ -254,143 +180,6 @@ async fn mcp_authentication_is_the_first_blocker_before_provider_authentication(
         }) if key == "http_test" && context.endpoint == expected_endpoint && context.http_status == 401
     ));
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn mcp_shutdown_releases_coordinator_lock_attempts_all_servers_and_propagates_failure()
--> waltr_agent::Result<()> {
-    let failing = Arc::new(ShutdownProbe::new(
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        true,
-    ));
-    let succeeding = Arc::new(ShutdownProbe::new(axum::http::StatusCode::ACCEPTED, false));
-    let (failing_endpoint, failing_task) = start_shutdown_probe(failing.clone()).await?;
-    let (succeeding_endpoint, succeeding_task) = start_shutdown_probe(succeeding.clone()).await?;
-    let provider = Arc::new(ScriptedProvider::from_turns(
-        "mcp_shutdown_provider",
-        vec![vec![CompletionEvent::Finished]],
-    ));
-    let sessions = mcp_sessions(provider);
-    let session_id = sessions.create().await?.id().clone();
-    sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![
-                http_runtime_endpoint("a_failing", failing_endpoint),
-                http_runtime_endpoint("b_succeeding", succeeding_endpoint),
-            ])),
-        )
-        .await?;
-    let submission = sessions
-        .submit_prompt(
-            session_id.clone(),
-            "start MCP runtimes",
-            waltr_agent::RunConflictPolicy::ReplaceActive,
-        )
-        .await?;
-    submission.handle.wait().await?;
-
-    let shutdown_sessions = sessions.clone();
-    let shutdown_session_id = session_id.clone();
-    let shutdown = tokio::spawn(async move {
-        shutdown_sessions
-            .set_runtime_settings(&shutdown_session_id, None)
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(1), failing.delete_started.notified())
-        .await
-        .expect("first MCP shutdown starts");
-
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        sessions.set_runtime_settings(&session_id, None),
-    )
-    .await
-    .expect("coordinator MCP runtime lock is released before shutdown")?;
-    failing.release_delete.add_permits(1);
-
-    let error = shutdown
-        .await
-        .expect("shutdown task completes")
-        .expect_err("failed MCP shutdown is propagated");
-    assert!(
-        error.to_string().contains("500"),
-        "unexpected error: {error}"
-    );
-    assert_eq!(failing.deletes.load(Ordering::SeqCst), 1);
-    assert_eq!(succeeding.deletes.load(Ordering::SeqCst), 1);
-
-    failing_task.abort();
-    succeeding_task.abort();
-    Ok(())
-}
-
-#[tokio::test]
-async fn session_wipe_clear_and_cleanup_survive_request_cancellation() -> waltr_agent::Result<()> {
-    let failing = Arc::new(ShutdownProbe::new(
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        true,
-    ));
-    let succeeding = Arc::new(ShutdownProbe::new(axum::http::StatusCode::ACCEPTED, false));
-    let (failing_endpoint, failing_task) = start_shutdown_probe(failing.clone()).await?;
-    let (succeeding_endpoint, succeeding_task) = start_shutdown_probe(succeeding.clone()).await?;
-    let provider = Arc::new(ScriptedProvider::from_turns(
-        "mcp_wipe_shutdown_provider",
-        vec![vec![CompletionEvent::Finished]],
-    ));
-    let sessions = mcp_sessions(provider);
-    let session_id = sessions.create().await?.id().clone();
-    sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![
-                http_runtime_endpoint("a_failing", failing_endpoint),
-                http_runtime_endpoint("b_succeeding", succeeding_endpoint),
-            ])),
-        )
-        .await?;
-    let submission = sessions
-        .submit_prompt(
-            session_id,
-            "start MCP runtimes",
-            waltr_agent::RunConflictPolicy::ReplaceActive,
-        )
-        .await?;
-    submission.handle.wait().await?;
-    let mut watch = sessions.watch_sessions();
-    let (wipe_tx, wipe_rx) = tokio::sync::oneshot::channel();
-    let wipe_sessions = sessions.clone();
-    let request = tokio::spawn(async move {
-        drop(wipe_tx.send(wipe_sessions.wipe_sessions().await));
-        futures_util::future::pending::<()>().await;
-    });
-
-    tokio::time::timeout(Duration::from_secs(1), failing.delete_started.notified())
-        .await
-        .expect("first MCP shutdown starts");
-    tokio::time::timeout(Duration::from_secs(1), wipe_rx)
-        .await
-        .expect("wipe result while shutdown is pending")
-        .expect("wipe result sender remains open")?;
-
-    assert!(sessions.list().await?.is_empty());
-    let update = tokio::time::timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("wipe clear update")
-        .expect("wipe clear update item");
-    assert_eq!(update.event, waltr_agent::SessionListEvent::Cleared);
-
-    request.abort();
-    failing.release_delete.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(1), succeeding.delete_started.notified())
-        .await
-        .expect("remaining MCP shutdown continues after request cancellation");
-    assert_eq!(failing.deletes.load(Ordering::SeqCst), 1);
-    assert_eq!(succeeding.deletes.load(Ordering::SeqCst), 1);
-
-    failing_task.abort();
-    succeeding_task.abort();
     Ok(())
 }
 
@@ -1242,15 +1031,6 @@ fn http_runtime_server_with_key(
     }
 }
 
-fn http_runtime_endpoint(key: &str, endpoint: String) -> SessionMcpServerRuntimeSettings {
-    SessionMcpServerRuntimeSettings {
-        key: key.to_owned(),
-        kind: SessionMcpServerRuntimeKind::StreamableHttp,
-        command: String::new(),
-        url: endpoint,
-    }
-}
-
 fn mcp_sessions(provider: Arc<impl LlmStream + 'static>) -> SessionCoordinator<MemorySessionStore> {
     mcp_sessions_with_instructions_enabled(provider, true)
 }
@@ -1454,25 +1234,6 @@ fn test_stdio_server_command() -> String {
     path.display().to_string()
 }
 
-async fn write_json_rpc(
-    stdin: &mut tokio::process::ChildStdin,
-    value: serde_json::Value,
-) -> waltr_agent::Result<()> {
-    stdin.write_all(value.to_string().as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
-    stdin.flush().await?;
-    Ok(())
-}
-
-async fn read_json_rpc(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-) -> waltr_agent::Result<serde_json::Value> {
-    let line = lines.next_line().await?.ok_or_else(|| {
-        waltr_agent::LlmError::api("mcp", "MCP test server closed stdout before response")
-    })?;
-    Ok(serde_json::from_str(&line)?)
-}
-
 #[derive(Debug)]
 struct HttpMcpTestServer {
     endpoint: String,
@@ -1557,102 +1318,6 @@ async fn wait_for_http_address(
         "mcp",
         "MCP HTTP test server did not report an address",
     ))
-}
-
-#[derive(Debug)]
-struct ShutdownProbe {
-    deletes: AtomicUsize,
-    delete_status: axum::http::StatusCode,
-    block_delete: bool,
-    delete_started: Notify,
-    release_delete: Semaphore,
-}
-
-impl ShutdownProbe {
-    fn new(delete_status: axum::http::StatusCode, block_delete: bool) -> Self {
-        Self {
-            deletes: AtomicUsize::new(0),
-            delete_status,
-            block_delete,
-            delete_started: Notify::new(),
-            release_delete: Semaphore::new(0),
-        }
-    }
-}
-
-async fn start_shutdown_probe(
-    probe: Arc<ShutdownProbe>,
-) -> waltr_agent::Result<(String, tokio::task::JoinHandle<()>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let router = axum::Router::new()
-        .route("/mcp", axum::routing::any(shutdown_probe))
-        .with_state(probe);
-    let task = tokio::spawn(async move {
-        drop(axum::serve(listener, router).await);
-    });
-    Ok((format!("http://{address}/mcp"), task))
-}
-
-async fn shutdown_probe(
-    axum::extract::State(probe): axum::extract::State<Arc<ShutdownProbe>>,
-    request: axum::http::Request<axum::body::Body>,
-) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-
-    match *request.method() {
-        axum::http::Method::DELETE => {
-            probe.deletes.fetch_add(1, Ordering::SeqCst);
-            probe.delete_started.notify_one();
-            if probe.block_delete {
-                let permit = probe
-                    .release_delete
-                    .acquire()
-                    .await
-                    .expect("shutdown probe semaphore remains open");
-                permit.forget();
-            }
-            probe.delete_status.into_response()
-        }
-        axum::http::Method::GET => {
-            let stream = futures_util::stream::pending::<Result<String, std::io::Error>>();
-            (
-                axum::http::StatusCode::OK,
-                [("content-type", "text/event-stream")],
-                axum::body::Body::from_stream(stream),
-            )
-                .into_response()
-        }
-        axum::http::Method::POST => {
-            let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-                .await
-                .expect("bounded probe request body");
-            let message: serde_json::Value =
-                serde_json::from_slice(&body).expect("probe JSON-RPC request");
-            if message["method"] == "initialize" {
-                return (
-                    axum::http::StatusCode::OK,
-                    [
-                        ("content-type", "application/json"),
-                        ("mcp-session-id", "shutdown-probe-session"),
-                        ("mcp-protocol-version", MCP_PROTOCOL_VERSION),
-                    ],
-                    axum::Json(json!({
-                        "jsonrpc": "2.0",
-                        "id": message["id"],
-                        "result": {
-                            "protocolVersion": MCP_PROTOCOL_VERSION,
-                            "capabilities": {},
-                            "serverInfo": { "name": "shutdown-probe", "version": "1" }
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-            axum::http::StatusCode::ACCEPTED.into_response()
-        }
-        _ => axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
-    }
 }
 
 fn tool_result_text(session: &AgentTestSession) -> String {

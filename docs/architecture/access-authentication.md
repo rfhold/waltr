@@ -55,11 +55,11 @@ HTTP callback URLs and insecure cookies are accepted only when both insecure fla
 | `GET /health` | Embedded web assets and SPA routes; unauthenticated navigation redirects to `/oidc/login`. |
 | `GET /oidc/login` | All native gRPC services via bearer token. |
 | `GET /oidc/callback` | All gRPC-web services via the Waltr browser session cookie. |
-| `POST /oidc/logout` | `/mcp` POST, GET, and DELETE via bearer token. |
+| `POST /oidc/logout` | `/mcp` POST via bearer token. |
 | `GET /oidc/session` | |
 | API-root RFC 9728 metadata, path-specific MCP metadata, local RFC 8414 metadata/JWKS, OAuth authorization/token/revocation/registration routes, and outbound callback/CIMD routes | |
 
-API, gRPC, and MCP failures are protocol responses, not HTML redirects. Authentication runs before protected service handlers and before MCP session-store access.
+API, gRPC, and MCP failures are protocol responses, not HTML redirects. Authentication runs before protected service handlers and before each stateless MCP request dispatch.
 
 ## Browser Flow
 
@@ -121,10 +121,9 @@ Waltr configures the generic MCP Streamable HTTP authorization hooks as follows:
 1. An unauthenticated `/mcp` request receives a bearer challenge that identifies Waltr's protected-resource metadata.
 2. Path-specific RFC 9728 metadata identifies the exact public `/mcp` resource, advertises only the local `/oauth` issuer, and publishes `WALTR_MCP_REQUIRED_SCOPES`. The root document remains the independent API/Authentik domain.
 3. The public client uses a preregistered client, a validated HTTPS CIMD client ID, or public DCR, then completes Authorization Code with PKCE S256 and Waltr consent.
-4. Waltr verifies the ES256 `at+jwt`, exact issuer/resource audience, lifetime, subject, client, scopes, and durable token/grant/family/client authorization state before touching MCP session persistence. Direct Authentik access tokens are rejected.
-5. Waltr derives the MCP session owner from a domain-separated SHA-256 of length-prefixed issuer and subject. Token bytes, scopes, expiry, and client secrets are excluded, so refresh and step-up tokens retain ownership while another subject receives HTTP `404` for the session.
+4. Waltr verifies the ES256 `at+jwt`, exact issuer/resource audience, lifetime, subject, client, scopes, and durable token/grant/family/client authorization state before dispatching every MCP POST. Direct Authentik access tokens are rejected.
 
-Missing, invalid, expired, or revoked credentials return `401`; insufficient scopes return `403` with `insufficient_scope`; authorization-store failures fail closed and end active GET delivery. Expiry and same-process revocation terminate streams immediately at their observed boundary. Other replicas authoritatively recheck durable revocation at most every five seconds, plus scheduling and database latency. Waltr has no browser MCP client, so its Origin allowlist is empty: absent Origin is accepted and every present Origin is denied.
+Missing, invalid, expired, or revoked credentials return `401`; insufficient scopes return `403` with `insufficient_scope`; authorization-store failures fail closed. Expiry and same-process revocation terminate active request-scoped response streams immediately at their observed boundary. Other replicas authoritatively recheck durable revocation at most every five seconds, plus scheduling and database latency. Waltr has no browser MCP client, so its Origin allowlist is empty: absent Origin is accepted and every present Origin is denied.
 
 The cutover is intentionally clean: there is no direct-Authentik MCP validator, dual-issuer period, `WALTR_MCP_OIDC_*` compatibility surface, or special `self` client configuration. With access auth disabled, Waltr exposes neither the hosted OAuth routes nor an MCP challenge and keeps local `/mcp` unauthenticated. OIDC mode without an initialized hosted server fails `/mcp` closed.
 

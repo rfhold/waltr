@@ -13,7 +13,7 @@ use syn::{
 /// Generate an `mcp::server::ServerHandler` implementation from an inherent impl block.
 ///
 /// Supported method helper attributes are `tool`, `prompt`, `resource`,
-/// `resource_template`, `complete`, `log_level`, `notification`, `instructions`, and
+/// `resource_template`, `complete`, `notification`, `instructions`, and
 /// `token_validator`.
 #[proc_macro_attribute]
 pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -80,7 +80,6 @@ fn expand_mcp_server(args: &ServerArgs, mut input: ItemImpl) -> syn::Result<Toke
     let mut resources = Vec::new();
     let mut resource_templates = Vec::new();
     let mut completion = None;
-    let mut log_level = None;
     let mut notifications = Vec::new();
     let mut instructions = None;
     let mut token_validator = None;
@@ -110,7 +109,6 @@ fn expand_mcp_server(args: &ServerArgs, mut input: ItemImpl) -> syn::Result<Toke
                     attr: MethodAttr::from_attr(attr, "resource_template")?,
                 }),
                 Some("complete") => completion = Some(method.clone()),
-                Some("log_level") => log_level = Some(method.clone()),
                 Some("notification") => notifications.push(NotificationMethod {
                     method: method.clone(),
                     attr: NotificationAttr::from_attr(attr)?,
@@ -129,7 +127,6 @@ fn expand_mcp_server(args: &ServerArgs, mut input: ItemImpl) -> syn::Result<Toke
         resources: &resources,
         resource_templates: &resource_templates,
         completion: completion.as_ref(),
-        log_level: log_level.as_ref(),
         notifications: &notifications,
         instructions: instructions.as_ref(),
     };
@@ -172,7 +169,6 @@ fn handler_impl(
     );
     let read_resource = read_resource_impl(parts.resources, parts.resource_templates);
     let complete = completion_impl(parts.completion);
-    let log_level = log_level_impl(parts.log_level);
     let notifications = notifications_impl(parts.notifications);
 
     quote! {
@@ -198,8 +194,6 @@ fn handler_impl(
             #read_resource
 
             #complete
-
-            #log_level
 
             #notifications
         }
@@ -231,7 +225,7 @@ fn capabilities_impl(args: &ServerArgs, parts: &HandlerParts<'_>) -> TokenStream
         || !parts.resources.is_empty()
         || !parts.resource_templates.is_empty();
     let completions = args.capabilities.completions || parts.completion.is_some();
-    let logging = args.capabilities.logging || parts.log_level.is_some();
+    let logging = args.capabilities.logging;
 
     let tools = tools.then(|| quote! { let capabilities = capabilities.tools(); });
     let prompts = prompts.then(|| quote! { let capabilities = capabilities.prompts(); });
@@ -484,22 +478,6 @@ fn completion_impl(method: Option<&ImplItemFn>) -> TokenStream2 {
     }
 }
 
-fn log_level_impl(method: Option<&ImplItemFn>) -> TokenStream2 {
-    let Some(method) = method else {
-        return TokenStream2::new();
-    };
-    let call = boxed_method_call(method, &quote! { level, context });
-    quote! {
-        fn set_log_level(
-            &self,
-            level: String,
-            context: ::mcp::server::ServerContext,
-        ) -> ::mcp::server::BoxFuture<::mcp::server::ServerResult<()>> {
-            #call
-        }
-    }
-}
-
 fn notifications_impl(notifications: &[NotificationMethod]) -> TokenStream2 {
     if notifications.is_empty() {
         return TokenStream2::new();
@@ -723,7 +701,6 @@ fn is_helper_attr(name: &str) -> bool {
             | "resource"
             | "resource_template"
             | "complete"
-            | "log_level"
             | "notification"
             | "instructions"
             | "token_validator"
@@ -736,7 +713,6 @@ struct HandlerParts<'a> {
     resources: &'a [RegisteredMethod],
     resource_templates: &'a [RegisteredMethod],
     completion: Option<&'a ImplItemFn>,
-    log_level: Option<&'a ImplItemFn>,
     notifications: &'a [NotificationMethod],
     instructions: Option<&'a ImplItemFn>,
 }

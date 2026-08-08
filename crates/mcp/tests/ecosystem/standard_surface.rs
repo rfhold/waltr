@@ -72,6 +72,7 @@ pub fn greet_prompt() -> McpPromptDefinition {
         icons: Vec::new(),
         arguments: vec![McpPromptArgument {
             name: "name".to_owned(),
+            title: None,
             description: Some("Name to greet".to_owned()),
             required: true,
         }],
@@ -130,7 +131,7 @@ fn tool(name: &str, description: &str, input_schema: Value) -> McpToolDefinition
         icons: Vec::new(),
         input_schema,
         output_schema: None,
-        task_support: None,
         annotations: None,
+        meta: None,
     }
 }

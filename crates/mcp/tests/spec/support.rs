@@ -45,72 +45,41 @@ pub struct JsonResponse {
     pub body: Value,
 }
 
-pub async fn initialized_session(endpoint: &str) -> mcp::Result<String> {
-    let client = reqwest::Client::new();
-    let initialize = client
-        .post(endpoint)
-        .header("accept", "application/json, text/event-stream")
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": "spec-initialize",
-            "method": "initialize",
-            "params": {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "mcp-spec-test-client",
-                    "version": "1.0.0",
-                },
-            },
-        }))
-        .send()
-        .await?;
-    let session_id = initialize
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| mcp::Error::protocol("missing MCP session id"))?
-        .to_owned();
-    drop(initialize.json::<Value>().await?);
-    drop(
-        client
-            .post(endpoint)
-            .header("accept", "application/json, text/event-stream")
-            .header("mcp-session-id", &session_id)
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-            }))
-            .send()
-            .await?
-            .bytes()
-            .await?,
-    );
-    Ok(session_id)
-}
-
 pub async fn post_json(endpoint: &str, body: Value) -> mcp::Result<JsonResponse> {
     let client = reqwest::Client::new();
-    let session_id = if should_initialize_before_post(&body) {
-        Some(initialized_session(endpoint).await?)
-    } else {
-        None
-    };
-
+    let method = body
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| mcp::Error::protocol("test request omitted method"))?;
     let mut request = client
         .post(endpoint)
         .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-method", method)
         .json(&body);
-    if let Some(session_id) = &session_id {
-        request = request
-            .header("mcp-session-id", session_id)
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+    if let Some(name) = request_name(method, &body) {
+        request = request.header("mcp-name", name);
     }
     let response = request.send().await?;
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response.json::<Value>().await?;
+    let bytes = response.bytes().await?;
+    let body = if headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/event-stream"))
+    {
+        let text =
+            std::str::from_utf8(&bytes).map_err(|error| mcp::Error::protocol(error.to_string()))?;
+        text.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .next_back()
+            .ok_or_else(|| mcp::Error::protocol("SSE response omitted data"))?
+    } else {
+        serde_json::from_slice(&bytes)?
+    };
     Ok(JsonResponse {
         status,
         headers,
@@ -118,6 +87,34 @@ pub async fn post_json(endpoint: &str, body: Value) -> mcp::Result<JsonResponse>
     })
 }
 
-fn should_initialize_before_post(body: &Value) -> bool {
-    body.get("method").and_then(Value::as_str) != Some("initialize")
+pub fn request_params(value: &Value) -> Value {
+    modern_params(json!({ "value": value.clone() }))
+}
+
+pub fn modern_params(mut params: Value) -> Value {
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "mcp-spec-test-client",
+            "version": "1.0.0"
+        }
+    });
+    params
+}
+
+pub fn sse_messages(body: &str) -> mcp::Result<Vec<Value>> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).map_err(Into::into))
+        .collect()
+}
+
+fn request_name<'a>(method: &str, body: &'a Value) -> Option<&'a str> {
+    let params = body.get("params")?;
+    match method {
+        "tools/call" | "prompts/get" => params.get("name")?.as_str(),
+        "resources/read" => params.get("uri")?.as_str(),
+        _ => None,
+    }
 }

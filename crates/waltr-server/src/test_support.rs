@@ -82,7 +82,7 @@ fn config_service_with_loader(loader: &CatalogLoader) -> Arc<ConfigService> {
 
 /// Observability and join controls for a server application with blocked cleanup.
 #[derive(Debug)]
-pub struct BlockedCleanupProbe {
+pub struct BlockedBackgroundTaskProbe {
     /// Notified after the blocked cleanup future starts.
     pub cleanup_started: Arc<Notify>,
     /// Set when cancellation drops the blocked cleanup future.
@@ -93,17 +93,17 @@ pub struct BlockedCleanupProbe {
     pub release_cleanup: Arc<Notify>,
 }
 
-struct CleanupDropGuard(Arc<AtomicBool>);
+struct BackgroundTaskDropGuard(Arc<AtomicBool>);
 
-impl Drop for CleanupDropGuard {
+impl Drop for BackgroundTaskDropGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
 }
 
-/// Construct an application whose cleanup remains blocked until explicitly released.
+/// Construct an application whose background task remains blocked until explicitly released.
 #[must_use]
-pub fn blocked_cleanup_application() -> (ServerApplication, BlockedCleanupProbe) {
+pub fn blocked_background_application() -> (ServerApplication, BlockedBackgroundTaskProbe) {
     let cancellation = CancellationToken::new();
     let cleanup_started = Arc::new(Notify::new());
     let cleanup_dropped = Arc::new(AtomicBool::new(false));
@@ -116,7 +116,7 @@ pub fn blocked_cleanup_application() -> (ServerApplication, BlockedCleanupProbe)
         let shutdown_observed = Arc::clone(&shutdown_observed);
         let release_cleanup = Arc::clone(&release_cleanup);
         tokio::spawn(async move {
-            let guard = CleanupDropGuard(cleanup_dropped);
+            let guard = BackgroundTaskDropGuard(cleanup_dropped);
             cleanup_started.notify_one();
             cancellation.cancelled().await;
             drop(guard);
@@ -124,10 +124,10 @@ pub fn blocked_cleanup_application() -> (ServerApplication, BlockedCleanupProbe)
             release_cleanup.notified().await;
         })
     };
-    let app = ServerApplication::with_cleanup_task_for_test(cancellation, task);
+    let app = ServerApplication::with_background_task_for_test(cancellation, task);
     (
         app,
-        BlockedCleanupProbe {
+        BlockedBackgroundTaskProbe {
             cleanup_started,
             cleanup_dropped,
             shutdown_observed,

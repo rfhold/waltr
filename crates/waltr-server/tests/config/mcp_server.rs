@@ -10,15 +10,13 @@ use waltr_server::{
     config_service::ConfigService,
     persistence::{DatabaseConfig, Persistence},
     session,
-    test_support::{blocked_cleanup_application, default_config_builder, setup_server, temp_root},
-};
-use mcp::server::{
-    StreamableHttpInspectSession, StreamableHttpSessionKey, StreamableHttpSessionOwner,
-    StreamableHttpSessionRequest,
+    test_support::{
+        blocked_background_application, default_config_builder, setup_server, temp_root,
+    },
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use std::{io, net::SocketAddr, sync::atomic::Ordering, time::SystemTime};
+use std::{io, net::SocketAddr, sync::atomic::Ordering};
 use tokio::sync::oneshot;
 
 #[tokio::test]
@@ -385,66 +383,6 @@ fn status_event(id: &SessionId, status: TimelineStatus) -> PendingTimelineEvent 
     event
 }
 
-#[tokio::test]
-async fn reconstructed_router_uses_persisted_mcp_sessions() -> Result<(), Box<dyn std::error::Error>>
-{
-    let root = temp_root();
-    let database =
-        DatabaseConfig::from_url(&format!("sqlite://{}", root.join("waltr.sqlite3").display()))?;
-    let first_persistence = Persistence::initialize(database.clone()).await?;
-    let first = start_router(root.clone(), first_persistence.clone()).await?;
-    let client = reqwest::Client::new();
-    let session_id = initialized_session(&client, &first.endpoint).await?;
-    assert!(matches!(
-        first_persistence
-            .mcp_session_store()
-            .inspect_session(session_request(&session_id))
-            .await?,
-        StreamableHttpInspectSession::Session(_)
-    ));
-    first.shutdown().await?;
-    drop(first_persistence);
-
-    let second_persistence = Persistence::initialize(database).await?;
-    let second = start_router(root.clone(), second_persistence.clone()).await?;
-    assert!(matches!(
-        second_persistence
-            .mcp_session_store()
-            .inspect_session(session_request(&session_id))
-            .await?,
-        StreamableHttpInspectSession::Session(_)
-    ));
-    second.shutdown().await?;
-    std::fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-fn session_request(session_id: &str) -> StreamableHttpSessionRequest {
-    StreamableHttpSessionRequest {
-        key: StreamableHttpSessionKey {
-            session_id: session_id.to_owned(),
-            owner: StreamableHttpSessionOwner::Anonymous,
-        },
-        presented_protocol_version: Some(mcp::protocol::MCP_PROTOCOL_VERSION.to_owned()),
-        now: SystemTime::now(),
-    }
-}
-
-async fn start_router(
-    root: std::path::PathBuf,
-    persistence: Persistence,
-) -> Result<TestRouter, Box<dyn std::error::Error>> {
-    let app = build_app_with_services(
-        ConfigService::new(root, default_config_builder())?,
-        persistence,
-        |routes, config, credential_store| {
-            session::add_memory_service(routes, config, credential_store)
-        },
-    )
-    .await?;
-    TestRouter::start(app).await.map_err(Into::into)
-}
-
 struct TestRouter {
     endpoint: String,
     shutdown: oneshot::Sender<()>,
@@ -481,7 +419,7 @@ impl TestRouter {
 async fn start_router_bind_failure_cancels_and_joins_cleanup() {
     let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = occupied.local_addr().unwrap();
-    let (app, probe) = blocked_cleanup_application();
+    let (app, probe) = blocked_background_application();
     probe.cleanup_started.notified().await;
 
     let startup = tokio::spawn(TestRouter::start_at(app, addr));
@@ -498,7 +436,7 @@ async fn start_router_bind_failure_cancels_and_joins_cleanup() {
 
 #[tokio::test]
 async fn test_router_shutdown_cancels_and_joins_cleanup() {
-    let (app, probe) = blocked_cleanup_application();
+    let (app, probe) = blocked_background_application();
     let router = TestRouter::start(app).await.unwrap();
     probe.cleanup_started.notified().await;
 
@@ -593,73 +531,75 @@ struct JsonResponse {
 
 async fn post_json(
     endpoint: &str,
-    body: Value,
+    mut body: Value,
 ) -> Result<JsonResponse, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let session_id = initialized_session(&client, endpoint).await?;
+    let method = body["method"]
+        .as_str()
+        .ok_or("missing MCP method")?
+        .to_owned();
+    let params = body
+        .as_object_mut()
+        .ok_or("MCP request must be an object")?
+        .entry("params")
+        .or_insert_with(|| json!({}));
+    let params = params
+        .as_object_mut()
+        .ok_or("MCP params must be an object")?;
+    let meta = params
+        .entry("_meta")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("MCP params._meta must be an object")?;
+    meta.insert(
+        "io.modelcontextprotocol/protocolVersion".to_owned(),
+        Value::String(::mcp::protocol::MCP_PROTOCOL_VERSION.to_owned()),
+    );
+    meta.insert(
+        "io.modelcontextprotocol/clientCapabilities".to_owned(),
+        json!({}),
+    );
+    meta.insert(
+        "io.modelcontextprotocol/clientInfo".to_owned(),
+        json!({ "name": "waltr-server-test", "version": "1.0.0" }),
+    );
+    let request_name = match method.as_str() {
+        "tools/call" | "prompts/get" => body["params"]["name"].as_str(),
+        "resources/read" => body["params"]["uri"].as_str(),
+        _ => None,
+    }
+    .map(ToOwned::to_owned);
 
-    let response = client
+    let mut request = client
         .post(endpoint)
         .header("accept", "application/json, text/event-stream")
-        .header("mcp-session-id", session_id)
+        .header("content-type", "application/json")
         .header(
             "mcp-protocol-version",
             ::mcp::protocol::MCP_PROTOCOL_VERSION,
         )
-        .json(&body)
-        .send()
-        .await?;
+        .header("mcp-method", &method);
+    if let Some(request_name) = request_name {
+        request = request.header("mcp-name", request_name);
+    }
+    let response = request.json(&body).send().await?;
     let status = response.status();
-    let body = response.json::<Value>().await?;
-    Ok(JsonResponse { status, body })
-}
-
-async fn initialized_session(
-    client: &reqwest::Client,
-    endpoint: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let initialize = client
-        .post(endpoint)
-        .header("accept", "application/json, text/event-stream")
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": "initialize",
-            "method": "initialize",
-            "params": {
-                "protocolVersion": ::mcp::protocol::MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "waltr-server-test", "version": "1.0.0" }
-            }
-        }))
-        .send()
-        .await?;
-    assert_eq!(initialize.status(), StatusCode::OK);
-    let session_id = initialize
+    let content_type = response
         .headers()
-        .get("mcp-session-id")
-        .ok_or("missing MCP session id")?
-        .to_str()?
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
         .to_owned();
-    drop(initialize.json::<Value>().await?);
-
-    drop(
-        client
-            .post(endpoint)
-            .header("accept", "application/json, text/event-stream")
-            .header("mcp-session-id", &session_id)
-            .header(
-                "mcp-protocol-version",
-                ::mcp::protocol::MCP_PROTOCOL_VERSION,
-            )
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-            }))
-            .send()
-            .await?
-            .bytes()
-            .await?,
-    );
-
-    Ok(session_id)
+    let text = response.text().await?;
+    let body = if content_type.starts_with("text/event-stream") {
+        serde_json::from_str(
+            text.lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .next_back()
+                .ok_or("missing MCP SSE data")?,
+        )?
+    } else {
+        serde_json::from_str(&text)?
+    };
+    Ok(JsonResponse { status, body })
 }

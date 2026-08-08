@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, fs, path::PathBuf, time::SystemTime};
+use std::{ffi::OsStr, fs, path::PathBuf};
 
 use sqlx::postgres::PgSslMode;
 use testcontainers::{
@@ -9,17 +9,6 @@ use testcontainers::{
 use uuid::Uuid;
 
 use super::*;
-
-fn missing_mcp_session_request() -> mcp::server::StreamableHttpSessionRequest {
-    mcp::server::StreamableHttpSessionRequest {
-        key: mcp::server::StreamableHttpSessionKey {
-            session_id: "missing".to_owned(),
-            owner: mcp::server::StreamableHttpSessionOwner::Anonymous,
-        },
-        presented_protocol_version: None,
-        now: SystemTime::now(),
-    }
-}
 
 #[test]
 fn derives_component_targets_for_supported_backends() {
@@ -503,14 +492,6 @@ async fn sqlite_files_keep_component_tables_and_histories_isolated() {
             "mcp_streamable_http_sessions"
         ]
     );
-    assert!(matches!(
-        persistence
-            .mcp_session_store()
-            .inspect_session(missing_mcp_session_request())
-            .await
-            .expect("read MCP store"),
-        mcp::server::StreamableHttpInspectSession::NotFound
-    ));
 }
 
 #[tokio::test]
@@ -797,15 +778,6 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .expect("find MCP table")
         .is_some()
     );
-    assert!(matches!(
-        second
-            .mcp_session_store()
-            .inspect_session(missing_mcp_session_request())
-            .await
-            .expect("read MCP store"),
-        mcp::server::StreamableHttpInspectSession::NotFound
-    ));
-
     sqlx::query(
         "UPDATE waltr._sqlx_migrations SET checksum = decode('00', 'hex') WHERE version = 1",
     )

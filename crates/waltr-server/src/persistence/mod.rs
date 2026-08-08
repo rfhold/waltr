@@ -17,10 +17,6 @@ use std::{
     time::Duration,
 };
 
-use mcp::server::{
-    PostgresStreamableHttpSessionStore, SqliteStreamableHttpSessionStore,
-    StreamableHttpSessionStore, StreamableHttpSessionStoreConfig,
-};
 use sqlx::{
     PgPool, SqlitePool,
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
@@ -236,7 +232,6 @@ impl DatabaseConfig {
 pub struct Persistence {
     pool: PersistencePool,
     mcp_pool: PersistencePool,
-    mcp_session_store: Arc<dyn StreamableHttpSessionStore>,
 }
 
 #[derive(Clone)]
@@ -292,11 +287,7 @@ impl Persistence {
 
         let pool = initialize_waltr_pool(config.waltr).await?;
         match initialize_mcp_pool(config.mcp).await {
-            Ok((mcp_pool, mcp_session_store)) => Ok(Self {
-                pool,
-                mcp_pool,
-                mcp_session_store,
-            }),
+            Ok(mcp_pool) => Ok(Self { pool, mcp_pool }),
             Err(error) => {
                 pool.close().await;
                 Err(error)
@@ -361,12 +352,6 @@ impl Persistence {
         }
     }
 
-    /// Clone the initialized MCP Streamable HTTP session store.
-    #[must_use]
-    pub fn mcp_session_store(&self) -> Arc<dyn StreamableHttpSessionStore> {
-        Arc::clone(&self.mcp_session_store)
-    }
-
     /// Check that both initialized database pools can serve queries.
     ///
     /// # Errors
@@ -408,8 +393,6 @@ pub enum PersistenceError {
     Connection(DatabaseBackend),
     /// A Waltr migration could not be validated or applied.
     Migration(DatabaseBackend),
-    /// The MCP session store could not initialize or migrate.
-    McpSessionStore(DatabaseBackend),
 }
 
 impl fmt::Display for PersistenceError {
@@ -423,10 +406,6 @@ impl fmt::Display for PersistenceError {
             Self::Migration(backend) => write!(
                 formatter,
                 "failed to validate or apply Waltr migrations to the {backend} database; check database permissions and migration compatibility"
-            ),
-            Self::McpSessionStore(backend) => write!(
-                formatter,
-                "failed to initialize MCP session persistence in the {backend} database; check database permissions and migration compatibility"
             ),
         }
     }
@@ -460,43 +439,28 @@ async fn initialize_waltr_pool(target: DatabaseTarget) -> Result<PersistencePool
     }
 }
 
-async fn initialize_mcp_pool(
-    target: DatabaseTarget,
-) -> Result<(PersistencePool, Arc<dyn StreamableHttpSessionStore>), PersistenceError> {
-    let backend = target.backend();
+async fn initialize_mcp_pool(target: DatabaseTarget) -> Result<PersistencePool, PersistenceError> {
     match target {
         DatabaseTarget::Sqlite {
             options, in_memory, ..
         } => {
             let pool = sqlite_pool(options, in_memory).await?;
-            if let Ok(store) = SqliteStreamableHttpSessionStore::from_pool_with_config(
-                pool.clone(),
-                StreamableHttpSessionStoreConfig::default(),
-            )
-            .await
-            {
-                Ok((PersistencePool::Sqlite(pool), Arc::new(store)))
-            } else {
+            if mcp::oauth::migrate_mcp_sqlite(&pool).await.is_err() {
                 pool.close().await;
-                Err(PersistenceError::McpSessionStore(backend))
+                return Err(PersistenceError::Migration(DatabaseBackend::Sqlite));
             }
+            Ok(PersistencePool::Sqlite(pool))
         }
         DatabaseTarget::PostgreSql { options } => {
             let pool = PgPoolOptions::new()
                 .connect_with(options)
                 .await
                 .map_err(|_| PersistenceError::Connection(DatabaseBackend::PostgreSql))?;
-            if let Ok(store) = PostgresStreamableHttpSessionStore::from_pool_with_config(
-                pool.clone(),
-                StreamableHttpSessionStoreConfig::default(),
-            )
-            .await
-            {
-                Ok((PersistencePool::PostgreSql(pool), Arc::new(store)))
-            } else {
+            if mcp::oauth::migrate_mcp_postgres(&pool).await.is_err() {
                 pool.close().await;
-                Err(PersistenceError::McpSessionStore(backend))
+                return Err(PersistenceError::Migration(DatabaseBackend::PostgreSql));
             }
+            Ok(PersistencePool::PostgreSql(pool))
         }
     }
 }

@@ -798,7 +798,7 @@ fn signing_state(value: &str) -> OAuthAuthorizationStoreResult<OAuthSigningKeySt
     }
 }
 
-async fn run_migrations(pool: &PgPool) -> OAuthAuthorizationStoreResult<()> {
+pub(super) async fn run_migrations(pool: &PgPool) -> OAuthAuthorizationStoreResult<()> {
     let mut connection = pool.acquire().await.map_err(unavailable)?;
     connection.close_on_drop();
     connection.lock().await.map_err(unavailable)?;

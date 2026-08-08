@@ -21,6 +21,7 @@ async fn dynamic_registration_requires_explicit_native_loopback_redirect_policy(
     let denied_server = fixture.start_server_with_mcp_oauth_dcr(Duration::from_hours(1), false);
     let client = reqwest::Client::new();
     let request = json!({
+        "application_type": "native",
         "redirect_uris": ["http://127.0.0.1:19876/mcp/oauth/callback"],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
@@ -273,7 +274,7 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
     let principal = jwt_subject(access)?;
 
     assert_eq!(
-        mcp_initialize(&client, &server.url("/mcp"), access)
+        mcp_discover(&client, &server.url("/mcp"), access)
             .await?
             .status(),
         StatusCode::OK
@@ -287,7 +288,7 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
         .await?;
     assert_eq!(rotated_jwks["keys"].as_array().map(Vec::len), Some(2));
     assert_eq!(
-        mcp_initialize(&client, &replica.url("/mcp"), access)
+        mcp_discover(&client, &replica.url("/mcp"), access)
             .await?
             .status(),
         StatusCode::OK,
@@ -295,7 +296,7 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
     );
     let upstream = fixture.access_token(Duration::from_hours(1));
     assert_eq!(
-        mcp_initialize(&client, &server.url("/mcp"), &upstream)
+        mcp_discover(&client, &server.url("/mcp"), &upstream)
             .await?
             .status(),
         StatusCode::UNAUTHORIZED
@@ -330,7 +331,7 @@ async fn browser_consent_issues_refreshes_and_revokes_local_mcp_tokens()
         .await?;
     assert_eq!(revoked.status(), StatusCode::OK);
     assert_eq!(
-        mcp_initialize(&client, &server.url("/mcp"), refreshed_access)
+        mcp_discover(&client, &server.url("/mcp"), refreshed_access)
             .await?
             .status(),
         StatusCode::UNAUTHORIZED
@@ -357,7 +358,10 @@ async fn disabled_auth_exposes_neither_oauth_routes_nor_mcp_challenges()
     let initialized = client
         .post(server.url("/mcp"))
         .header("accept", "application/json, text/event-stream")
-        .json(&initialize_body())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
+        .json(&discover_body())
         .send()
         .await?;
     assert_eq!(initialized.status(), StatusCode::OK);
@@ -374,7 +378,11 @@ async fn enabled_access_without_hosted_oauth_fails_closed_for_mcp()
     assert_eq!(
         client
             .post(server.url("/mcp"))
-            .json(&initialize_body())
+            .header("accept", "application/json, text/event-stream")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+            .header("mcp-method", "server/discover")
+            .json(&discover_body())
             .send()
             .await?
             .status(),
@@ -479,7 +487,7 @@ async fn readiness_fails_closed_when_active_signing_public_key_mismatches_privat
     Ok(())
 }
 
-async fn mcp_initialize(
+async fn mcp_discover(
     client: &reqwest::Client,
     endpoint: &str,
     token: &str,
@@ -488,20 +496,27 @@ async fn mcp_initialize(
         .post(endpoint)
         .bearer_auth(token)
         .header("accept", "application/json, text/event-stream")
-        .json(&initialize_body())
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
+        .json(&discover_body())
         .send()
         .await
 }
 
-fn initialize_body() -> Value {
+fn discover_body() -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": "initialize",
-        "method": "initialize",
+        "id": "discover",
+        "method": "server/discover",
         "params": {
-            "protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "oauth-server-test", "version": "1.0.0"}
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "oauth-server-test", "version": "1.0.0"
+                }
+            }
         }
     })
 }

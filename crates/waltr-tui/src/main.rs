@@ -315,7 +315,7 @@ mod tests {
 
     use tokio::sync::Notify;
 
-    use waltr_server::test_support::blocked_cleanup_application;
+    use waltr_server::test_support::blocked_background_application;
 
     use super::*;
 
@@ -457,7 +457,7 @@ mod tests {
     async fn occupied_port_cancels_and_joins_cleanup_before_startup_error() {
         let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = occupied.local_addr().unwrap();
-        let (app, probe) = blocked_cleanup_application();
+        let (app, probe) = blocked_background_application();
         probe.cleanup_started.notified().await;
 
         let startup = tokio::spawn(start_embedded_server_with_app(app, addr));

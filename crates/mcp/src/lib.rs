@@ -4,6 +4,7 @@ mod capabilities;
 /// MCP client connection and transport helpers.
 pub mod client;
 mod error;
+mod http_headers;
 mod log;
 /// MCP OAuth protected-resource discovery and bearer-token validation helpers.
 pub mod oauth;
@@ -21,8 +22,7 @@ mod trace;
 mod types;
 
 pub use capabilities::{
-    McpElicitationCapability, McpPromptsCapability, McpResourcesCapability, McpSamplingCapability,
-    McpServerCapabilities, McpTasksCapability, McpToolsCapability,
+    McpPromptsCapability, McpResourcesCapability, McpServerCapabilities, McpToolsCapability,
 };
 pub use error::{Error, Result};
 pub use log::McpLogLevel;
@@ -38,9 +38,9 @@ pub use oauth::{
     McpAuthorizationResponse, McpAuthorizationServerMetadata, McpAuthorizationSuccess,
     McpBearerChallenge, McpClientMetadataDocument, McpClientMetadataError,
     McpClientRegistrationError, McpClientRegistrationErrorCode, McpClientRegistrationResponse,
-    McpJwtAccessTokenClaims, McpJwtAccessTokenHeader, McpJwtAudience, McpOAuthClock,
-    McpOAuthDestinationPolicy, McpOAuthDiscoveryClient, McpOAuthEndpointPolicy, McpOAuthEntropy,
-    McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret, McpOAuthTokenType,
+    McpJwtAccessTokenClaims, McpJwtAccessTokenHeader, McpJwtAudience, McpOAuthApplicationType,
+    McpOAuthClock, McpOAuthDestinationPolicy, McpOAuthDiscoveryClient, McpOAuthEndpointPolicy,
+    McpOAuthEntropy, McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret, McpOAuthTokenType,
     McpPkceChallengeMethod, McpPrincipalId, McpProtectedResourceMetadata, McpPublicClientIdentity,
     McpPublicClientRegistrationRequest, McpRefreshTokenRequest, McpRevocationError,
     McpRevocationErrorCode, McpRevocationRequest, McpRevocationResponse,
@@ -57,10 +57,10 @@ pub use resource::{
     format_resource_result, parse_completion_result, parse_resource_definition,
     parse_resource_template_definition,
 };
-pub use tool::{McpToolDefinition, McpToolTaskSupport, format_tool_result, parse_tool_definition};
+pub use tool::{McpToolDefinition, format_tool_result, parse_tool_definition};
 pub use trace::McpTracePropagation;
 pub use types::{
-    McpCompletionRequest, McpIcon, McpProgressNotification, McpPromptList, McpPromptResult,
-    McpResourceList, McpResourceResult, McpResourceTemplateList, McpRoot, McpToolCall, McpToolList,
-    McpToolResult,
+    McpCompletionReference, McpCompletionRequest, McpIcon, McpIconTheme, McpProgressNotification,
+    McpPromptList, McpPromptResult, McpResourceList, McpResourceResult, McpResourceTemplateList,
+    McpRoot, McpToolCall, McpToolList, McpToolResult,
 };

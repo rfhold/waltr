@@ -63,11 +63,6 @@ impl StandardMcpServer {
         call_tool(call, context).await
     }
 
-    #[log_level]
-    fn set_log_level(_level: String, _context: ServerContext) -> ServerResult<()> {
-        Ok(())
-    }
-
     #[prompt(name = STATUS_PROMPT, definition = status_prompt())]
     fn get_status_prompt(
         _arguments: Option<Value>,
@@ -179,7 +174,10 @@ fn read_resource(uri: &str) -> ServerResult<McpResourceResult> {
 }
 
 fn complete(request: McpCompletionRequest) -> ServerResult<mcp::McpCompletionResult> {
-    let values = if request.uri_template == ITEM_TEMPLATE && request.argument_name == "id" {
+    let values = if request.reference
+        == mcp::McpCompletionReference::Resource(ITEM_TEMPLATE.to_owned())
+        && request.argument_name == "id"
+    {
         item_completions(&request.argument_value)
     } else {
         Vec::new()

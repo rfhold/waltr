@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    Result,
+    Error, Result,
     prompt::{McpPromptDefinition, format_prompt_result, parse_prompt_definition},
     resource::{
         McpCompletionResult, McpResourceDefinition, McpResourceTemplateDefinition,
@@ -19,9 +19,27 @@ pub struct McpIcon {
     /// Optional MIME type.
     pub mime_type: Option<String>,
     /// Optional icon size hint.
-    pub sizes: Option<String>,
+    pub sizes: Option<Vec<String>>,
     /// Optional theme hint.
-    pub theme: Option<String>,
+    pub theme: Option<McpIconTheme>,
+}
+
+/// Theme in which an MCP icon is intended to be displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpIconTheme {
+    /// Icon intended for a light visual theme.
+    Light,
+    /// Icon intended for a dark visual theme.
+    Dark,
+}
+
+impl McpIconTheme {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,14 +99,23 @@ pub struct McpResourceResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// MCP resource-template completion request.
 pub struct McpCompletionRequest {
-    /// Resource URI template.
-    pub uri_template: String,
+    /// Prompt or resource target being completed.
+    pub reference: McpCompletionReference,
     /// Argument name to complete.
     pub argument_name: String,
     /// Current argument value.
     pub argument_value: String,
     /// Optional context arguments.
     pub context_arguments: serde_json::Map<String, Value>,
+}
+
+/// Target of an MCP completion request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpCompletionReference {
+    /// Resource URI template reference.
+    Resource(String),
+    /// Prompt-name reference.
+    Prompt(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,14 +205,19 @@ fn parse_icon(value: &Value) -> Option<McpIcon> {
             .get("mimeType")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        sizes: value
-            .get("sizes")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        theme: value
-            .get("theme")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        sizes: value.get("sizes").and_then(Value::as_array).map(|sizes| {
+            sizes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        }),
+        theme: match value.get("theme").and_then(Value::as_str) {
+            Some("light") => Some(McpIconTheme::Light),
+            Some("dark") => Some(McpIconTheme::Dark),
+            Some(_) => return None,
+            None => None,
+        },
     })
 }
 
@@ -196,8 +228,12 @@ pub fn icons_to_value(icons: &[McpIcon]) -> Value {
 fn icon_to_value(icon: &McpIcon) -> Value {
     let mut value = json!({ "src": icon.src });
     optional_string(&mut value, "mimeType", icon.mime_type.as_ref());
-    optional_string(&mut value, "sizes", icon.sizes.as_ref());
-    optional_string(&mut value, "theme", icon.theme.as_ref());
+    if let Some(sizes) = &icon.sizes {
+        value["sizes"] = json!(sizes);
+    }
+    if let Some(theme) = icon.theme {
+        value["theme"] = Value::String(theme.as_str().to_owned());
+    }
     value
 }
 
@@ -245,12 +281,22 @@ impl McpToolCall {
             .get("_meta")
             .and_then(|meta| meta.get("progressToken"))
             .cloned();
+        if progress_token
+            .as_ref()
+            .is_some_and(|token| !valid_progress_token(token))
+        {
+            return Err("progress token must be a string or integer".to_owned());
+        }
         Ok(Self {
             name,
             arguments,
             progress_token,
         })
     }
+}
+
+pub fn valid_progress_token(token: &Value) -> bool {
+    token.as_str().is_some() || token.as_i64().is_some()
 }
 
 impl McpToolResult {
@@ -330,7 +376,22 @@ impl McpCompletionRequest {
         argument_value: impl Into<String>,
     ) -> Self {
         Self {
-            uri_template: uri_template.into(),
+            reference: McpCompletionReference::Resource(uri_template.into()),
+            argument_name: argument_name.into(),
+            argument_value: argument_value.into(),
+            context_arguments: serde_json::Map::new(),
+        }
+    }
+
+    /// Create a prompt completion request.
+    #[must_use]
+    pub fn for_prompt(
+        prompt_name: impl Into<String>,
+        argument_name: impl Into<String>,
+        argument_value: impl Into<String>,
+    ) -> Self {
+        Self {
+            reference: McpCompletionReference::Prompt(prompt_name.into()),
             argument_name: argument_name.into(),
             argument_value: argument_value.into(),
             context_arguments: serde_json::Map::new(),
@@ -340,8 +401,12 @@ impl McpCompletionRequest {
     /// Convert this request to MCP request params.
     #[must_use]
     pub fn to_params(&self) -> Value {
+        let reference = match &self.reference {
+            McpCompletionReference::Resource(uri) => json!({ "type": "ref/resource", "uri": uri }),
+            McpCompletionReference::Prompt(name) => json!({ "type": "ref/prompt", "name": name }),
+        };
         let mut params = json!({
-            "ref": { "type": "ref/resource", "uri": self.uri_template },
+            "ref": reference,
             "argument": { "name": self.argument_name, "value": self.argument_value },
         });
         if !self.context_arguments.is_empty() {
@@ -361,10 +426,13 @@ impl McpToolList {
         let tools = value
             .get("tools")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(parse_tool_definition)
-            .collect();
+            .ok_or_else(|| Error::protocol("MCP tools/list result omitted tools"))?
+            .iter()
+            .map(|tool| {
+                parse_tool_definition(tool)
+                    .ok_or_else(|| Error::protocol("invalid MCP tool definition"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             tools,
             next_cursor: next_cursor(value),
@@ -497,10 +565,8 @@ fn tool_to_value(tool: &McpToolDefinition) -> Value {
         value["icons"] = icons_to_value(&tool.icons);
     }
     optional_value(&mut value, "outputSchema", tool.output_schema.as_ref());
-    if let Some(task_support) = &tool.task_support {
-        value["execution"] = json!({ "taskSupport": task_support.as_str() });
-    }
     optional_value(&mut value, "annotations", tool.annotations.as_ref());
+    optional_value(&mut value, "_meta", tool.meta.as_ref());
     value
 }
 
@@ -518,6 +584,7 @@ fn prompt_to_value(prompt: &McpPromptDefinition) -> Value {
                 .iter()
                 .map(|argument| {
                     let mut value = json!({ "name": argument.name, "required": argument.required });
+                    optional_string(&mut value, "title", argument.title.as_ref());
                     optional_string(&mut value, "description", argument.description.as_ref());
                     value
                 })

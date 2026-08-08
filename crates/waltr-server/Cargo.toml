@@ -22,7 +22,7 @@ http-body.workspace = true
 jsonwebtoken.workspace = true
 jaq-interpret.workspace = true
 jaq-parse.workspace = true
-mcp = { workspace = true, features = ["oauth-authorization-server-postgres", "oauth-authorization-server-sqlite", "progressive", "streamable-http-postgres", "streamable-http-sqlite"] }
+mcp = { workspace = true, features = ["oauth-authorization-server-postgres", "oauth-authorization-server-sqlite", "progressive"] }
 oauth2.workspace = true
 notify.workspace = true
 p256.workspace = true

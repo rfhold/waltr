@@ -12,9 +12,9 @@ Use MCP protocol tests when changing the generic `mcp` crate, protocol types, JS
 
 # Expectations
 
-Start with spec tests for generic protocol behavior. Add ecosystem tests when the change affects compatibility with external MCP implementations. Add agent tests only when the generic behavior is adapted into Waltr session tools, prompt templates, resource templates, progress, roots, permissions, or runtime settings.
+Start with revision-scoped tests under `spec/v2026_07_28/` for generic protocol behavior. Add ecosystem tests when the change affects compatibility with external MCP implementations. Add agent tests only when the generic behavior is adapted into Waltr session tools, prompt templates, resource templates, progress, roots, permissions, or runtime settings.
 
-Keep unsupported protocol areas explicit. Current intentionally unsupported or partial areas include resource subscriptions, sampling, elicitation, Streamable HTTP long-lived GET SSE streams, `Last-Event-ID` resume requests, and DELETE session termination.
+Keep unsupported protocol areas explicit. List-change subscriptions use `subscriptions/listen`; resource URI subscriptions, sampling, elicitation, non-roots MRTR input, and task runtime extensions remain intentionally unsupported. Streamable HTTP is stateless and POST-only, so protocol sessions, GET delivery, resumability, and DELETE termination are removed behavior rather than partial support.
 
 Do not use `rmcp` outside MCP ecosystem tests.
 

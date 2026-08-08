@@ -22,6 +22,26 @@ pub use postgres::PostgresOAuthAuthorizationStore;
 #[cfg(feature = "oauth-authorization-server-sqlite")]
 pub use sqlite::SqliteOAuthAuthorizationStore;
 
+/// Run the complete MCP `SQLite` migration history on an existing pool.
+///
+/// # Errors
+///
+/// Returns an error when migration history is invalid or a database operation fails.
+#[cfg(feature = "oauth-authorization-server-sqlite")]
+pub async fn migrate_mcp_sqlite(pool: &sqlx::SqlitePool) -> OAuthAuthorizationStoreResult<()> {
+    sqlite::run_migrations(pool).await
+}
+
+/// Run the complete MCP `PostgreSQL` migration history on an existing pool.
+///
+/// # Errors
+///
+/// Returns an error when migration history is invalid or a database operation fails.
+#[cfg(feature = "oauth-authorization-server-postgres")]
+pub async fn migrate_mcp_postgres(pool: &sqlx::PgPool) -> OAuthAuthorizationStoreResult<()> {
+    postgres::run_migrations(pool).await
+}
+
 /// Quotas enforced atomically by an OAuth authorization store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OAuthAuthorizationStoreConfig {

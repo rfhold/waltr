@@ -24,6 +24,8 @@ pub struct McpPromptDefinition {
 pub struct McpPromptArgument {
     /// Argument name.
     pub name: String,
+    /// Optional display title.
+    pub title: Option<String>,
     /// Optional description.
     pub description: Option<String>,
     /// Whether the argument is required.
@@ -61,6 +63,10 @@ pub fn parse_prompt_definition(value: &Value) -> Option<McpPromptDefinition> {
 
 fn parse_prompt_argument(value: &Value) -> Option<McpPromptArgument> {
     let name = value.get("name")?.as_str()?.to_owned();
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let description = value
         .get("description")
         .and_then(Value::as_str)
@@ -71,6 +77,7 @@ fn parse_prompt_argument(value: &Value) -> Option<McpPromptArgument> {
         .unwrap_or(false);
     Some(McpPromptArgument {
         name,
+        title,
         description,
         required,
     })

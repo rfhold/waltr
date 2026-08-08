@@ -24,7 +24,6 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 #[derive(Clone, Default)]
 struct MacroServer {
-    log_level: Arc<Mutex<Option<String>>>,
     validations: Arc<Mutex<Vec<String>>>,
 }
 
@@ -93,12 +92,6 @@ impl MacroServer {
         })
     }
 
-    #[log_level]
-    fn set_log_level(&self, level: String, _context: ServerContext) -> ServerResult<()> {
-        *self.log_level.lock().expect("log level lock") = Some(level);
-        Ok(())
-    }
-
     #[token_validator]
     fn validate_token(
         &self,
@@ -129,37 +122,34 @@ impl MacroServer {
 #[tokio::test]
 async fn exported_server_macro_dispatches_registered_surface() -> mcp::Result<()> {
     let handler = MacroServer::default();
-    let log_level = Arc::clone(&handler.log_level);
     let server = RunningServer::start_plain(handler).await?;
 
-    let initialize = post_json(&server.endpoint, initialize_body("initialize-macro")).await?;
-    assert_eq!(initialize.status, StatusCode::OK);
+    let discover = post_json(&server.endpoint, discover_body("discover-macro")).await?;
+    assert_eq!(discover.status, StatusCode::OK);
     assert_eq!(
-        initialize.body["result"]["serverInfo"]["name"],
+        discover.body["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "mcp-macro-test-server"
     );
-    assert_eq!(initialize.body["result"]["serverInfo"]["version"], "1.2.3");
     assert_eq!(
-        initialize.body["result"]["instructions"],
+        discover.body["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
+        "1.2.3"
+    );
+    assert_eq!(
+        discover.body["result"]["instructions"],
         "Prefer macro-generated handlers."
     );
     assert_eq!(
-        initialize.body["result"]["capabilities"]["tools"]["listChanged"],
+        discover.body["result"]["capabilities"]["tools"]["listChanged"],
         false
     );
     assert_eq!(
-        initialize.body["result"]["capabilities"]["prompts"]["listChanged"],
+        discover.body["result"]["capabilities"]["prompts"]["listChanged"],
         false
     );
     assert_eq!(
-        initialize.body["result"]["capabilities"]["resources"]["listChanged"],
+        discover.body["result"]["capabilities"]["resources"]["listChanged"],
         false
     );
-    assert_eq!(
-        initialize.body["result"]["capabilities"]["logging"],
-        json!({})
-    );
-
     let tools = post_json(
         &server.endpoint,
         json!({ "jsonrpc": "2.0", "id": "tools-list", "method": "tools/list" }),
@@ -265,22 +255,6 @@ async fn exported_server_macro_dispatches_registered_surface() -> mcp::Result<()
         json!(["42", "420"])
     );
 
-    let log = post_json(
-        &server.endpoint,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "set-log-level",
-            "method": "logging/setLevel",
-            "params": { "level": "debug" }
-        }),
-    )
-    .await?;
-    assert_eq!(log.status, StatusCode::OK);
-    assert_eq!(
-        *log_level.lock().expect("log level lock"),
-        Some("debug".to_owned())
-    );
-
     Ok(())
 }
 
@@ -311,7 +285,10 @@ async fn exported_server_macro_generates_auth_helpers() -> mcp::Result<()> {
     let unauthorized = reqwest::Client::new()
         .post(&server.endpoint)
         .header("accept", "application/json, text/event-stream")
-        .json(&initialize_body("unauthorized"))
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
+        .json(&request_body(discover_body("unauthorized")))
         .send()
         .await?;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
@@ -329,12 +306,15 @@ async fn exported_server_macro_generates_auth_helpers() -> mcp::Result<()> {
         .post(&server.endpoint)
         .header("accept", "application/json, text/event-stream")
         .bearer_auth("valid-token")
-        .json(&initialize_body("authorized"))
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-method", "server/discover")
+        .json(&request_body(discover_body("authorized")))
         .send()
         .await?;
     assert_eq!(authorized.status(), StatusCode::OK);
-    let body = authorized.json::<Value>().await?;
-    assert_eq!(body["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+    let body = sse_response(authorized).await?;
+    assert_eq!(body["result"]["supportedVersions"][0], MCP_PROTOCOL_VERSION);
     assert_eq!(
         validations.lock().expect("validations lock").as_slice(),
         [format!("{}:macro:read", server.endpoint)]
@@ -397,77 +377,59 @@ struct JsonResponse {
 
 async fn post_json(endpoint: &str, body: Value) -> mcp::Result<JsonResponse> {
     let client = reqwest::Client::new();
-    let session_id = if should_initialize_before_post(&body) {
-        Some(initialized_session(endpoint).await?)
-    } else {
-        None
-    };
-
+    let body = request_body(body);
+    let method = body["method"].as_str().unwrap_or_default();
     let mut request = client
         .post(endpoint)
         .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-method", method)
         .json(&body);
-    if let Some(session_id) = &session_id {
-        request = request
-            .header("mcp-session-id", session_id)
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+    if let Some(name) = request_name(method, &body) {
+        request = request.header("mcp-name", name);
     }
     let response = request.send().await?;
     let status = response.status();
-    let body = response.json::<Value>().await?;
+    let body = sse_response(response).await?;
     Ok(JsonResponse { status, body })
 }
 
-async fn initialized_session(endpoint: &str) -> mcp::Result<String> {
-    let client = reqwest::Client::new();
-    let initialize = client
-        .post(endpoint)
-        .header("accept", "application/json, text/event-stream")
-        .json(&initialize_body("macro-test-initialize"))
-        .send()
-        .await?;
-    let session_id = initialize
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| mcp::Error::protocol("missing MCP session id"))?
-        .to_owned();
-    drop(initialize.json::<Value>().await?);
-    drop(
-        client
-            .post(endpoint)
-            .header("accept", "application/json, text/event-stream")
-            .header("mcp-session-id", &session_id)
-            .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-            }))
-            .send()
-            .await?
-            .bytes()
-            .await?,
-    );
-    Ok(session_id)
+fn request_body(mut body: Value) -> Value {
+    if body.get("params").is_none() {
+        body["params"] = json!({});
+    }
+    body["params"]["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "macro-tests", "version": "1" }
+    });
+    body
 }
 
-fn should_initialize_before_post(body: &Value) -> bool {
-    let Some(method) = body.get("method").and_then(Value::as_str) else {
-        return false;
-    };
-    !matches!(method, "initialize" | "ping") && !method.starts_with("notifications/")
+fn request_name<'a>(method: &str, body: &'a Value) -> Option<&'a str> {
+    match method {
+        "tools/call" | "prompts/get" => body["params"]["name"].as_str(),
+        "resources/read" => body["params"]["uri"].as_str(),
+        _ => None,
+    }
 }
 
-fn initialize_body(id: &str) -> Value {
+async fn sse_response(response: reqwest::Response) -> mcp::Result<Value> {
+    let text = response.text().await?;
+    let data = text
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("data: "))
+        .ok_or_else(|| mcp::Error::protocol("MCP SSE response omitted data"))?;
+    Ok(serde_json::from_str(data)?)
+}
+
+fn discover_body(id: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "mcp-macro-test-client", "version": "1.0.0" }
-        }
+        "method": "server/discover"
     })
 }
 
@@ -483,8 +445,8 @@ fn echo_tool_definition() -> McpToolDefinition {
             "required": ["value"]
         }),
         output_schema: None,
-        task_support: None,
         annotations: None,
+        meta: None,
     }
 }
 

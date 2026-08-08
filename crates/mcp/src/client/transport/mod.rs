@@ -8,7 +8,10 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{McpAuthorizationError, Result, protocol::JsonRpcInbound};
+use crate::{
+    McpAuthorizationError, Result,
+    protocol::{JsonRpcId, JsonRpcInbound},
+};
 use http::StreamableHttpTransport;
 use stdio::StdioTransport;
 
@@ -20,14 +23,14 @@ pub type InboundSender = mpsc::UnboundedSender<TransportInbound>;
 pub enum TransportInbound {
     /// Parsed JSON-RPC message.
     Message(JsonRpcInbound),
-    /// Streamable HTTP SSE event id.
-    SseEventId(String),
     /// Streamable HTTP authorization failure.
     AuthorizationFailed(McpAuthorizationError),
     /// Dynamic bearer provider failure.
     BearerProviderFailed(McpBearerProviderError),
     /// Recoverable or terminal transport-layer failure.
     TransportFailed(McpTransportError),
+    /// One request stream ended before its terminal response.
+    RequestFailed(JsonRpcId, String),
     /// Transport disconnection.
     Disconnected(String),
 }
@@ -216,8 +219,8 @@ impl McpTransport {
     pub async fn send(
         &self,
         message: Value,
-        initialized: bool,
         cancellation: Option<&CancellationToken>,
+        http_headers: &[(String, String)],
     ) -> Result<()> {
         match self {
             Self::Stdio(transport) => tokio::select! {
@@ -225,20 +228,8 @@ impl McpTransport {
                 result = transport.send(message) => result,
             },
             Self::StreamableHttp(transport) => {
-                transport.send(message, initialized, cancellation).await
+                transport.send(message, cancellation, http_headers).await
             }
-        }
-    }
-
-    /// Promote transport session state after initialize result validation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the initialized state cannot be committed.
-    pub async fn mark_initialized(&self, protocol_version: &str) -> Result<()> {
-        match self {
-            Self::Stdio(_) => Ok(()),
-            Self::StreamableHttp(transport) => transport.mark_initialized(protocol_version).await,
         }
     }
 

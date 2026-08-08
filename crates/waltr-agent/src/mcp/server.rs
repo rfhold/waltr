@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
@@ -38,7 +45,6 @@ pub(in crate::mcp) struct McpResourceRegistry {
 pub(in crate::mcp) struct McpServerRuntime {
     name: String,
     client: McpClient,
-    log_level: Option<McpLogLevel>,
     transport_kind: &'static str,
     #[allow(dead_code)]
     root_uri: String,
@@ -55,7 +61,6 @@ struct McpServerState {
     tools: McpToolRegistry,
     prompts: McpPromptRegistry,
     resources: McpResourceRegistry,
-    last_sse_event_id: Option<String>,
 }
 
 struct ServerHandler {
@@ -64,6 +69,10 @@ struct ServerHandler {
     events: broadcast::Sender<McpRuntimeEvent>,
     active_progress: Arc<std::sync::Mutex<BTreeMap<String, ToolProgressSink>>>,
     refresh: Mutex<Option<Arc<McpServerRuntime>>>,
+    cancellation: CancellationToken,
+    tools_epoch: Arc<AtomicU64>,
+    prompts_epoch: Arc<AtomicU64>,
+    resources_epoch: Arc<AtomicU64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -86,9 +95,16 @@ impl McpServerRuntime {
             events: events.clone(),
             active_progress: Arc::clone(&active_progress),
             refresh: Mutex::new(None),
+            cancellation: cancellation_token.clone(),
+            tools_epoch: Arc::new(AtomicU64::new(0)),
+            prompts_epoch: Arc::new(AtomicU64::new(0)),
+            resources_epoch: Arc::new(AtomicU64::new(0)),
         });
-        let options = McpClientOptions::new("waltr-agent", env!("CARGO_PKG_VERSION"), timeout)
+        let mut options = McpClientOptions::new("waltr-agent", env!("CARGO_PKG_VERSION"), timeout)
             .with_trace_propagation(trace_propagation);
+        if let Some(level) = log_level {
+            options = options.with_log_level(level);
+        }
         let client = if let Some(provider) = config.bearer_provider {
             McpClient::connect_with_bearer_provider(
                 name.clone(),
@@ -112,7 +128,6 @@ impl McpServerRuntime {
         let runtime = Arc::new(Self {
             name,
             client,
-            log_level,
             transport_kind,
             root_uri,
             events,
@@ -120,7 +135,44 @@ impl McpServerRuntime {
             state: Mutex::new(McpServerState::default()),
         });
         *handler.refresh.lock().await = Some(Arc::clone(&runtime));
-        runtime.finish_initialization(cancellation_token).await?;
+        runtime
+            .finish_initialization(cancellation_token.clone())
+            .await?;
+        let capabilities = runtime.client.capabilities();
+        let has_list_changes = capabilities
+            .tools
+            .as_ref()
+            .is_some_and(|capability| capability.list_changed)
+            || capabilities
+                .prompts
+                .as_ref()
+                .is_some_and(|capability| capability.list_changed)
+            || capabilities
+                .resources
+                .as_ref()
+                .is_some_and(|capability| capability.list_changed);
+        if has_list_changes {
+            let subscription_runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                while !cancellation_token.is_cancelled() {
+                    if let Err(error) = subscription_runtime
+                        .client
+                        .listen_for_list_changes(cancellation_token.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            server = %subscription_runtime.name,
+                            %error,
+                            "MCP list-change subscription ended"
+                        );
+                    }
+                    tokio::select! {
+                        () = cancellation_token.cancelled() => break,
+                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                }
+            });
+        }
         Ok(runtime)
     }
 
@@ -317,7 +369,6 @@ impl McpServerRuntime {
             state.instructions = instructions;
             state.initialized = true;
         }
-        self.configure_logging(cancellation_token.clone()).await?;
         self.refresh_tools(cancellation_token.clone()).await?;
         self.refresh_prompts(cancellation_token.clone()).await?;
         self.refresh_resources(cancellation_token).await?;
@@ -327,24 +378,27 @@ impl McpServerRuntime {
         Ok(())
     }
 
-    async fn configure_logging(&self, cancellation_token: CancellationToken) -> Result<()> {
-        let Some(level) = self.log_level else {
-            return Ok(());
-        };
-        if !self.state.lock().await.capabilities.logging {
-            return Ok(());
-        }
-        self.client.set_log_level(level, cancellation_token).await?;
-        Ok(())
+    async fn refresh_tools(&self, cancellation_token: CancellationToken) -> Result<()> {
+        self.refresh_tools_at(cancellation_token, None).await
     }
 
-    async fn refresh_tools(&self, cancellation_token: CancellationToken) -> Result<()> {
+    async fn refresh_tools_at(
+        &self,
+        cancellation_token: CancellationToken,
+        epoch: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<()> {
         if self.state.lock().await.capabilities.tools.is_none() {
             return Ok(());
         }
         let mut tools = BTreeMap::new();
         for tool in self.client.list_tools(cancellation_token).await? {
             tools.insert(tool.name.clone(), tool);
+        }
+        if epoch
+            .as_ref()
+            .is_some_and(|(current, expected)| current.load(Ordering::Acquire) != *expected)
+        {
+            return Ok(());
         }
         let generation = {
             let mut state = self.state.lock().await;
@@ -360,12 +414,26 @@ impl McpServerRuntime {
     }
 
     async fn refresh_prompts(&self, cancellation_token: CancellationToken) -> Result<()> {
+        self.refresh_prompts_at(cancellation_token, None).await
+    }
+
+    async fn refresh_prompts_at(
+        &self,
+        cancellation_token: CancellationToken,
+        epoch: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<()> {
         if self.state.lock().await.capabilities.prompts.is_none() {
             return Ok(());
         }
         let mut prompts = BTreeMap::new();
         for prompt in self.client.list_prompts(cancellation_token).await? {
             prompts.insert(prompt.name.clone(), prompt);
+        }
+        if epoch
+            .as_ref()
+            .is_some_and(|(current, expected)| current.load(Ordering::Acquire) != *expected)
+        {
+            return Ok(());
         }
         let mut state = self.state.lock().await;
         state.prompts.prompts = prompts;
@@ -375,6 +443,14 @@ impl McpServerRuntime {
     }
 
     async fn refresh_resources(&self, cancellation_token: CancellationToken) -> Result<()> {
+        self.refresh_resources_at(cancellation_token, None).await
+    }
+
+    async fn refresh_resources_at(
+        &self,
+        cancellation_token: CancellationToken,
+        epoch: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<()> {
         if self.state.lock().await.capabilities.resources.is_none() {
             return Ok(());
         }
@@ -386,21 +462,6 @@ impl McpServerRuntime {
         {
             resources.insert(resource.uri.clone(), resource);
         }
-        let mut state = self.state.lock().await;
-        state.resources.resources = resources;
-        state.resources.generation += 1;
-        drop(state);
-        self.refresh_resource_templates(cancellation_token).await?;
-        Ok(())
-    }
-
-    async fn refresh_resource_templates(
-        &self,
-        cancellation_token: CancellationToken,
-    ) -> Result<()> {
-        if self.state.lock().await.capabilities.resources.is_none() {
-            return Ok(());
-        }
         let mut resource_templates = BTreeMap::new();
         for resource_template in self
             .client
@@ -409,7 +470,14 @@ impl McpServerRuntime {
         {
             resource_templates.insert(resource_template.uri_template.clone(), resource_template);
         }
+        if epoch
+            .as_ref()
+            .is_some_and(|(current, expected)| current.load(Ordering::Acquire) != *expected)
+        {
+            return Ok(());
+        }
         let mut state = self.state.lock().await;
+        state.resources.resources = resources;
         state.resources.resource_templates = resource_templates;
         state.resources.generation += 1;
         drop(state);
@@ -439,8 +507,14 @@ impl McpClientHandler for ServerHandler {
             .ok()
             .and_then(|runtime| runtime.clone());
         if let Some(runtime) = refresh {
+            let epoch = self.tools_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            let current = Arc::clone(&self.tools_epoch);
+            let cancellation = self.cancellation.child_token();
             tokio::spawn(async move {
-                if let Err(error) = runtime.refresh_tools(CancellationToken::new()).await {
+                if let Err(error) = runtime
+                    .refresh_tools_at(cancellation, Some((current, epoch)))
+                    .await
+                {
                     tracing::warn!(server = %name, %error, "failed to refresh MCP tools");
                 }
             });
@@ -460,8 +534,14 @@ impl McpClientHandler for ServerHandler {
             .ok()
             .and_then(|runtime| runtime.clone());
         if let Some(runtime) = refresh {
+            let epoch = self.prompts_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            let current = Arc::clone(&self.prompts_epoch);
+            let cancellation = self.cancellation.child_token();
             tokio::spawn(async move {
-                if let Err(error) = runtime.refresh_prompts(CancellationToken::new()).await {
+                if let Err(error) = runtime
+                    .refresh_prompts_at(cancellation, Some((current, epoch)))
+                    .await
+                {
                     tracing::warn!(server = %name, %error, "failed to refresh MCP prompts");
                 }
             });
@@ -476,8 +556,14 @@ impl McpClientHandler for ServerHandler {
             .ok()
             .and_then(|runtime| runtime.clone());
         if let Some(runtime) = refresh {
+            let epoch = self.resources_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            let current = Arc::clone(&self.resources_epoch);
+            let cancellation = self.cancellation.child_token();
             tokio::spawn(async move {
-                if let Err(error) = runtime.refresh_resources(CancellationToken::new()).await {
+                if let Err(error) = runtime
+                    .refresh_resources_at(cancellation, Some((current, epoch)))
+                    .await
+                {
                     tracing::warn!(server = %name, %error, "failed to refresh MCP resources");
                 }
             });
@@ -518,19 +604,6 @@ impl McpClientHandler for ServerHandler {
             server_key: self.name.clone(),
             error,
         }));
-    }
-
-    fn sse_event_id(&self, id: String) {
-        let refresh = self
-            .refresh
-            .try_lock()
-            .ok()
-            .and_then(|runtime| runtime.clone());
-        if let Some(runtime) = refresh {
-            tokio::spawn(async move {
-                runtime.state.lock().await.last_sse_event_id = Some(id);
-            });
-        }
     }
 }
 

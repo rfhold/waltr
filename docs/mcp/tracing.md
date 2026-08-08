@@ -31,7 +31,7 @@ Each typed client request runs inside an `mcp.client.request` span from [../../c
 | `mcp.outcome` | `success`, `error`, `cancelled`, or `timeout`. |
 | `rpc.jsonrpc.error_code` | JSON-RPC error code when the response contains one. |
 
-Cancellation and timeout paths send `notifications/cancelled` for non-`initialize` requests before returning an error.
+Stdio cancellation and timeout paths send `notifications/cancelled`. Streamable HTTP cancellation closes only the affected request response stream.
 
 ## Server Span
 
@@ -45,12 +45,11 @@ Each inbound server request or notification runs inside an `mcp.server.request` 
 | `mcp.method` | MCP method name, currently the same value as `rpc.method`. |
 | `mcp.request_id` | Request id for requests, empty for notifications. |
 | `mcp.transport` | `stdio` or `streamable_http`. |
-| `mcp.session_id` | Streamable HTTP session id when available. |
-| `mcp.protocol_version` | Streamable HTTP protocol version header value when available. |
+| `mcp.protocol_version` | Protocol version from the request body's required `_meta` object. |
 | `mcp.outcome` | `success` or `error` when the handler completes. |
 | `rpc.jsonrpc.error_code` | JSON-RPC error code when the response contains one. |
 
-Stdio request spans are spawned per request. Streamable HTTP request spans cover the parsed inbound message, lifecycle validation, handler execution, response formatting, and any SSE POST response body creation.
+Stdio request spans are spawned per request. Streamable HTTP request spans cover stateless metadata and mirrored-header validation, handler execution, response formatting, and any request-scoped SSE response body creation.
 
 ## Waltr Agent Integration
 

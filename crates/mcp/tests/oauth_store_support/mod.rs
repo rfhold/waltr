@@ -367,6 +367,7 @@ async fn assert_registration_contract(
 
     let document = serde_json::json!({
         "client_id": "https://metadata.example/client.json",
+        "client_name": "Metadata test client",
         "redirect_uris": ["https://client.example/callback"],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
