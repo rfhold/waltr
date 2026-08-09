@@ -241,7 +241,7 @@ impl CredentialRefreshCoordinator {
         let claim = refresh_claim(record.revision);
         if let Some(current) = self.claim_refresh(&target, &credential_key, &claim).await? {
             validate_mcp_state(&target, server, &current)?;
-            if !mcp_refresh_result_is_usable(mode, &current.credential) {
+            if !mcp_refresh_result_is_usable(&current.credential) {
                 return Err(refresh_error(
                     target,
                     AuthenticationFailureReason::CredentialRequired,
@@ -291,7 +291,7 @@ impl CredentialRefreshCoordinator {
             .commit_refresh(&target, &credential_key, claim, refreshed)
             .await?;
         validate_mcp_state(&target, server, &current)?;
-        if !mcp_refresh_result_is_usable(mode, &current.credential) {
+        if !mcp_refresh_result_is_usable(&current.credential) {
             return Err(refresh_error(
                 target,
                 AuthenticationFailureReason::CredentialRequired,
@@ -475,11 +475,8 @@ fn should_refresh_provider(credential: &OAuthCredential) -> bool {
         .expires_by(now_ms().saturating_add(super::OAUTH_REFRESH_AHEAD_MS))
 }
 
-fn mcp_refresh_result_is_usable(mode: RefreshMode, credential: &OAuthCredential) -> bool {
-    match mode {
-        RefreshMode::Normal => !should_refresh_mcp_token(credential),
-        RefreshMode::Forced => !credential.token.expires_by(now_ms()),
-    }
+fn mcp_refresh_result_is_usable(credential: &OAuthCredential) -> bool {
+    !credential.token.expires_by(now_ms())
 }
 
 fn refresh_claim(revision: u64) -> OAuthRefreshClaim {
