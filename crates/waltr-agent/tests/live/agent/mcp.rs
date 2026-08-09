@@ -367,8 +367,8 @@ fn echo_marker_tool_definition() -> McpToolDefinition {
             "required": ["value"]
         }),
         output_schema: None,
-        task_support: None,
         annotations: None,
+        meta: None,
     }
 }
 

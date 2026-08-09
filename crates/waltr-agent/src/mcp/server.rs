@@ -774,6 +774,10 @@ mod tests {
             events,
             active_progress: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             refresh: Mutex::new(None),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            tools_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            prompts_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            resources_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         handler.log_message(json!({

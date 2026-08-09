@@ -1638,13 +1638,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_refresh_preserves_rotation_metadata() {
+    async fn mcp_refresh_accepts_five_minute_token_and_preserves_rotation_metadata() {
         let (token_url, server_state) = token_server(
             serde_json::json!({
                 "access_token": "new-access",
                 "refresh_token": "rotated-refresh",
                 "token_type": "Bearer",
-                "expires_in": 3600
+                "expires_in": 300
             }),
             Duration::ZERO,
         )
@@ -1957,7 +1957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_mcp_refresh_rejects_near_expiry_current_claim_result() {
+    async fn normal_mcp_refresh_accepts_unexpired_current_claim_result() {
         let mut initial = mcp_state("https://issuer.example/token".to_owned());
         initial.token.expires_at_ms = Some(now_ms() + 60_000);
         let mut current = initial.clone();
@@ -1977,20 +1977,20 @@ mod tests {
         });
         let coordinator = CredentialRefreshCoordinator::new(store);
 
-        let error = coordinator
+        let refreshed = coordinator
             .refresh_mcp(&mcp_server_settings(), RefreshMode::Normal)
             .await
-            .expect_err("near-expiry current result must require refresh");
+            .expect("near-expiry current result remains usable")
+            .expect("MCP credential");
 
         assert_eq!(
-            error.reason(),
-            crate::AuthenticationFailureReason::CredentialRequired
+            refreshed.token.access_token.secret(),
+            "concurrent-near-expiry-access"
         );
-        assert!(error.message().contains("usable credential"));
     }
 
     #[tokio::test]
-    async fn normal_mcp_refresh_rejects_near_expiry_current_after_failed_cas() {
+    async fn normal_mcp_refresh_accepts_unexpired_current_after_failed_cas() {
         let (token_url, server_state) = token_server(
             serde_json::json!({
                 "access_token": "stale-refreshed-access",
@@ -2031,16 +2031,16 @@ mod tests {
             .await
             .expect("store concurrent credential");
 
-        let error = task
+        let refreshed = task
             .await
             .expect("refresh task")
-            .expect_err("near-expiry failed-CAS current must require refresh");
+            .expect("near-expiry failed-CAS current remains usable")
+            .expect("MCP credential");
 
         assert_eq!(
-            error.reason(),
-            crate::AuthenticationFailureReason::CredentialRequired
+            refreshed.token.access_token.secret(),
+            "concurrent-near-expiry-access"
         );
-        assert!(error.message().contains("changed during refresh"));
         let stored = OAuthCredentialStore::read(&store, key)
             .await
             .expect("read state")
