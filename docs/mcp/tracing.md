@@ -1,6 +1,6 @@
 # MCP Tracing
 
-The generic `mcp` crate emits spans for MCP client and server requests and can propagate W3C trace context through MCP request metadata.
+The generic `mcp` crate emits spans and native metrics for MCP server dispatch, emits spans for MCP client requests, and can propagate W3C trace context through MCP request metadata. It does not install an OpenTelemetry SDK, exporter, meter provider, or tracing subscriber.
 
 ## Propagation
 
@@ -39,6 +39,7 @@ Each inbound server request or notification runs inside an `mcp.server.request` 
 
 | Field | Meaning |
 | --- | --- |
+| `otel.kind` | Always `server`. |
 | `rpc.system` | Always `jsonrpc`. |
 | `rpc.jsonrpc.version` | Always `2.0`. |
 | `rpc.method` | JSON-RPC method name. |
@@ -46,10 +47,27 @@ Each inbound server request or notification runs inside an `mcp.server.request` 
 | `mcp.request_id` | Request id for requests, empty for notifications. |
 | `mcp.transport` | `stdio` or `streamable_http`. |
 | `mcp.protocol_version` | Protocol version from the request body's required `_meta` object. |
-| `mcp.outcome` | `success` or `error` when the handler completes. |
+| `mcp.outcome` | `success`, `error`, or `cancelled`. Notifications record `success` after their handler completes. |
+| `otel.status_code` | `ERROR` for JSON-RPC errors and cancellation. |
 | `rpc.jsonrpc.error_code` | JSON-RPC error code when the response contains one. |
 
-Stdio request spans are spawned per request. Streamable HTTP request spans cover stateless metadata and mirrored-header validation, handler execution, response formatting, and any request-scoped SSE response body creation.
+Server spans begin only after transport parsing, JSON-RPC and required MCP metadata validation, and, for Streamable HTTP, origin, content negotiation, authorization, mirrored-header, method-availability, and tool-parameter-header checks succeed. Rejections before that accepted-dispatch boundary do not create server request spans or metrics. Stdio requests are dispatched in independent tasks; valid stdio notifications are handled inline. The stdio `notifications/cancelled` message is transport control handled before accepted handler dispatch, so it emits no `mcp.server.request` span or metrics. Metadata-valid HTTP notifications with that method can still dispatch through the generic handler and therefore retain the bounded metric-method allowlist entry. Streamable HTTP requests and notifications are dispatched in independent tasks.
+
+A tool result containing `isError: true` remains a `success` outcome because the JSON-RPC response itself succeeded.
+
+## Server Metrics
+
+The server creates instruments once per Streamable HTTP router or stdio/stream serve invocation. Instrument creation therefore occurs after a host has an opportunity to install its global meter provider. With no provider installed, the OpenTelemetry API remains a valid no-op.
+
+| Instrument | Type | Unit | Meaning |
+| --- | --- | --- | --- |
+| `mcp.server.request.count` | `u64` counter | `{request}` | Completed accepted requests and notifications. |
+| `mcp.server.request.duration` | `f64` histogram | `s` | Dispatch duration in seconds. |
+| `mcp.server.request.in_flight` | `i64` up/down counter | `{request}` | Accepted dispatches currently in flight. |
+
+All three instruments use bounded `rpc.method`, `mcp.transport`, and `mcp.protocol_version` attributes. Completed count and duration points also use `mcp.outcome`; JSON-RPC errors may add the integer `rpc.jsonrpc.error_code`. Unknown or extension methods are normalized to `other` for metrics while span fields retain exact protocol values. Unsupported protocol versions are rejected before telemetry. Version normalization to `other` is defensive for any accepted noncanonical value; it does not mean rejected versions emit spans or metrics.
+
+Metrics never include request IDs, tool names or arguments, URLs, credentials, user identity, arbitrary error text, or application-domain values. A drop-safe idempotent lifecycle guard balances in-flight and records count and duration exactly once for normal responses, notification completion, JSON-RPC errors, cancellation, authorization lease end, response-stream disconnect, and handler task abort.
 
 ## Waltr Agent Integration
 

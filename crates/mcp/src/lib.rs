@@ -17,6 +17,7 @@ pub mod protocol;
 mod resource;
 /// MCP server handler traits and stdio/HTTP serving helpers.
 pub mod server;
+mod server_telemetry;
 mod tool;
 mod trace;
 mod types;
