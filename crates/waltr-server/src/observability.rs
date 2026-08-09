@@ -10,6 +10,8 @@ use std::env;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 const SERVICE_NAME: &str = "waltr-server";
+const DEFAULT_FILTER: &str =
+    "waltr_server=info,waltr=info,mcp=info,tower_http=info,otel::tracing=info";
 
 /// Holds OpenTelemetry providers until process shutdown.
 #[derive(Debug)]
@@ -65,9 +67,8 @@ pub fn init() -> Result<ObservabilityGuard, Box<dyn std::error::Error + Send + S
     let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
     let fmt_layer = tracing_subscriber::fmt::layer().json();
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("waltr_server=info,waltr=info,tower_http=info,otel::tracing=info")
-    });
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -87,9 +88,8 @@ pub fn init() -> Result<ObservabilityGuard, Box<dyn std::error::Error + Send + S
 
 fn init_local() -> Result<ObservabilityGuard, Box<dyn std::error::Error + Send + Sync>> {
     let fmt_layer = tracing_subscriber::fmt::layer().json();
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("waltr_server=info,waltr=info,tower_http=info,otel::tracing=info")
-    });
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
     tracing_subscriber::registry()
         .with(filter)
@@ -138,4 +138,42 @@ fn meter_provider(
         .with_resource(resource)
         .with_periodic_exporter(exporter)
         .build())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::Context;
+
+    use super::*;
+
+    #[test]
+    fn default_filter_enables_generic_mcp_info_spans() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(DEFAULT_FILTER))
+            .with(TargetCapture(targets.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _mcp = tracing::info_span!(target: "mcp::client", "mcp.client.request");
+            let _dependency = tracing::info_span!(target: "reqwest", "dependency.request");
+        });
+
+        assert_eq!(*targets.lock().unwrap(), ["mcp::client"]);
+    }
+
+    struct TargetCapture(Arc<Mutex<Vec<&'static str>>>);
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for TargetCapture {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _context: Context<'_, S>,
+        ) {
+            self.0.lock().unwrap().push(attributes.metadata().target());
+        }
+    }
 }
