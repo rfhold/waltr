@@ -16,7 +16,7 @@ use std::{
 };
 
 use mcp::{
-    McpAccessToken, McpProtectedResourceMetadata, McpTokenValidation,
+    McpAccessToken, McpProtectedResourceMetadata, McpTokenValidation, McpToolResult,
     protocol::MCP_PROTOCOL_VERSION,
     server::{McpAuthorizationContext, ServerContext, ServerResult},
 };
@@ -60,6 +60,7 @@ struct PolicyCheckInput {
     tool(
         name = "releases",
         description = "Release inventory actions.",
+        annotations = release_tool_annotations(),
         namespace(
             releases,
             description = "Query and inspect product releases. Use these to ground any statement about what shipped and when."
@@ -162,6 +163,51 @@ impl ReleaseServer {
         }))
     }
 
+    /// Return a complete MCP result for consumers that need semantic content.
+    ///
+    /// This exercises non-text content, metadata, extensions, and request context.
+    #[action(tool = "releases", name = "semantic", resource = "releases://semantic")]
+    fn semantic_result(&self, context: ServerContext) -> ServerResult<McpToolResult> {
+        Ok(McpToolResult::new(json!({
+            "content": [
+                { "type": "text", "text": "semantic release result" },
+                { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }
+            ],
+            "structuredContent": {
+                "items": [{ "id": "v1.4.2" }, { "id": "v1.4.1" }],
+                "client": context
+                    .meta_value("io.modelcontextprotocol/clientInfo")
+                    .and_then(|value| value.get("name"))
+                    .cloned()
+            },
+            "isError": false,
+            "_meta": { "trace": "release-semantic" },
+            "x-release-extension": { "preserved": true }
+        })))
+    }
+
+    /// Return a semantic MCP action failure as a successful tool result.
+    #[action(tool = "releases", name = "semantic-error")]
+    fn semantic_error(&self) -> ServerResult<McpToolResult> {
+        Ok(McpToolResult::new(json!({
+            "content": [{ "type": "text", "text": "release not found" }],
+            "isError": true,
+            "_meta": { "kind": "not-found" }
+        })))
+    }
+
+    /// Return malformed semantic output to exercise protocol error conversion.
+    #[action(tool = "releases", name = "semantic-invalid")]
+    fn semantic_invalid(&self) -> ServerResult<McpToolResult> {
+        Ok(McpToolResult::new(json!({ "content": "invalid" })))
+    }
+
+    /// Return enough JSON values to exercise the jq fan-out bound.
+    #[action(tool = "releases", name = "fan-out")]
+    fn fan_out(&self) -> ServerResult<Value> {
+        Ok(json!((0..257).collect::<Vec<_>>()))
+    }
+
     /// Promote a release candidate to production with required pre-checks.
     ///
     /// Load this runbook when the user wants an end-to-end production
@@ -208,6 +254,13 @@ impl ReleaseServer {
     }
 }
 
+fn release_tool_annotations() -> Value {
+    json!({
+        "readOnlyHint": true,
+        "destructiveHint": false
+    })
+}
+
 #[test]
 fn progressive_tool_results_keep_text_exact_and_structure_non_objects() {
     let result =
@@ -224,6 +277,91 @@ fn progressive_tool_results_keep_text_exact_and_structure_non_objects() {
         result.raw["structuredContent"],
         json!({ "result": ["v1.4.2", "v1.4.1"] })
     );
+}
+
+#[test]
+fn progressive_semantic_results_preserve_envelopes_and_filter_only_structure() {
+    let raw = json!({
+        "content": [
+            { "type": "text", "text": "original text" },
+            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }
+        ],
+        "structuredContent": { "items": [{ "id": 1 }, { "id": 2 }] },
+        "isError": true,
+        "_meta": { "trace": "abc" },
+        "x-extension": [1, 2, 3]
+    });
+    let result = mcp::progressive::action_tool_result(McpToolResult::new(raw.clone()), None)
+        .expect("semantic tool result");
+    assert_eq!(result.raw, raw);
+
+    let result =
+        mcp::progressive::action_tool_result(McpToolResult::new(raw.clone()), Some(".items[].id"))
+            .expect("filtered semantic result");
+    assert_eq!(result.raw["structuredContent"], json!({ "result": [1, 2] }));
+    assert_eq!(result.raw["content"], raw["content"]);
+    assert_eq!(result.raw["isError"], true);
+    assert_eq!(result.raw["_meta"], raw["_meta"]);
+    assert_eq!(result.raw["x-extension"], raw["x-extension"]);
+
+    let result =
+        mcp::progressive::action_tool_result(McpToolResult::new(raw), Some(".items[0].id"))
+            .expect("scalar semantic filter");
+    assert_eq!(result.raw["structuredContent"], json!({ "result": 1 }));
+}
+
+#[test]
+fn progressive_semantic_results_reject_invalid_shapes_and_filter_fan_out() {
+    let invalid = [
+        json!([]),
+        json!({ "content": {} }),
+        json!({ "content": ["text"] }),
+        json!({ "content": [{}] }),
+        json!({ "content": [{ "type": 1 }] }),
+        json!({ "content": [], "isError": "yes" }),
+        json!({ "content": [], "structuredContent": [] }),
+    ];
+    for raw in invalid {
+        let error = mcp::progressive::action_tool_result(McpToolResult::new(raw), None)
+            .expect_err("invalid semantic shape");
+        assert!(format!("{error:?}").contains("MCP tool result"));
+    }
+
+    let missing_structure = mcp::progressive::action_tool_result(
+        McpToolResult::new(json!({ "content": [] })),
+        Some("."),
+    )
+    .expect_err("filter requires structured content");
+    assert!(format!("{missing_structure:?}").contains("without `structuredContent`"));
+
+    let outputs = (0..257).collect::<Vec<_>>();
+    let overflow = mcp::progressive::tool_result(json!(outputs), Some(".[]"))
+        .expect_err("fan-out must be bounded");
+    assert!(format!("{overflow:?}").contains("more than 256 results"));
+}
+
+#[test]
+fn progressive_semantic_resource_conversion_requires_non_error_structure() {
+    let result = mcp::progressive::action_resource_result(
+        "test://semantic".to_owned(),
+        McpToolResult::new(json!({
+            "content": [],
+            "structuredContent": { "ok": true }
+        })),
+    )
+    .expect("semantic resource result");
+    assert!(result.raw.to_string().contains("\\\"ok\\\": true"));
+
+    for raw in [
+        json!({ "content": [] }),
+        json!({ "content": [], "structuredContent": {}, "isError": true }),
+    ] {
+        mcp::progressive::action_resource_result(
+            "test://semantic".to_owned(),
+            McpToolResult::new(raw),
+        )
+        .expect_err("invalid semantic resource output");
+    }
 }
 
 #[tokio::test]
@@ -264,6 +402,9 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     );
     let releases_tool = tool_named(&tools.body, "releases");
     let policy_tool = tool_named(&tools.body, "policy");
+    assert_eq!(releases_tool["annotations"]["readOnlyHint"], true);
+    assert_eq!(releases_tool["annotations"]["destructiveHint"], false);
+    assert!(policy_tool.get("annotations").is_none());
     assert_array_contains(
         &releases_tool["inputSchema"]["properties"]["action"]["enum"],
         "help.releases",
@@ -363,6 +504,56 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
         filtered["structuredContent"],
         json!({ "result": ["v1.4.2", "v1.4.1"] })
     );
+
+    let semantic = call_tool(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "semantic" }),
+    )
+    .await?;
+    assert_eq!(semantic["isError"], false);
+    assert_eq!(semantic["content"][1]["type"], "image");
+    assert_eq!(semantic["_meta"]["trace"], "release-semantic");
+    assert_eq!(semantic["x-release-extension"]["preserved"], true);
+    assert_eq!(semantic["structuredContent"]["client"], "progressive-tests");
+
+    let semantic_filtered = call_tool(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "semantic", "filter": ".items[0].id" }),
+    )
+    .await?;
+    assert_eq!(
+        semantic_filtered["structuredContent"],
+        json!({ "result": "v1.4.2" })
+    );
+    assert_eq!(semantic_filtered["content"], semantic["content"]);
+    assert_eq!(semantic_filtered["_meta"], semantic["_meta"]);
+
+    let semantic_error = call_tool(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "semantic-error" }),
+    )
+    .await?;
+    assert_eq!(semantic_error["isError"], true);
+    assert!(semantic_error["content"][0]["text"] == "release not found");
+
+    let semantic_invalid = call_tool_response(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "semantic-invalid" }),
+    )
+    .await?;
+    assert_eq!(semantic_invalid.body["error"]["code"], -32602);
+
+    let fan_out = call_tool_response(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "fan-out", "filter": ".[]" }),
+    )
+    .await?;
+    assert_eq!(fan_out.body["error"]["code"], -32602);
 
     let runbook = call_tool(
         &server.endpoint,
@@ -510,6 +701,23 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     )?;
     assert_eq!(release["id"], "v1.4.2");
 
+    let semantic_resource = post_json(
+        &server.endpoint,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "semantic-resource",
+            "method": "resources/read",
+            "params": { "uri": "releases://semantic" }
+        }),
+    )
+    .await?;
+    let semantic_resource: Value = serde_json::from_str(
+        semantic_resource.body["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("semantic resource text"),
+    )?;
+    assert_eq!(semantic_resource["items"][0]["id"], "v1.4.2");
+
     let runbook_resource = post_json(
         &server.endpoint,
         json!({
@@ -557,6 +765,7 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
             .as_str()
             .is_some_and(|message| message.contains("help.releases"))
     );
+    assert_eq!(missing_input.body["error"]["code"], -32602);
 
     let unknown_action = post_json(
         &server.endpoint,
@@ -573,6 +782,42 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
             .as_str()
             .is_some_and(|message| message.contains("call `help`"))
     );
+    assert_eq!(unknown_action.body["error"]["code"], -32602);
+
+    let unknown_field = call_tool_response(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "help", "unexpected": true }),
+    )
+    .await?;
+    assert_eq!(unknown_field.body["error"]["code"], -32602);
+
+    let unknown_runbook_field = call_tool_response(
+        &server.endpoint,
+        "releases",
+        json!({
+            "action": "runbooks.load",
+            "input": { "runbook": "rollback-release", "unexpected": true }
+        }),
+    )
+    .await?;
+    assert_eq!(unknown_runbook_field.body["error"]["code"], -32602);
+
+    let null_filter = call_tool(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "help", "filter": null }),
+    )
+    .await?;
+    assert_eq!(null_filter["structuredContent"]["topic"], "help");
+
+    let invalid_filter = call_tool_response(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "help", "filter": ".]" }),
+    )
+    .await?;
+    assert_eq!(invalid_filter.body["error"]["code"], -32602);
 
     Ok(())
 }

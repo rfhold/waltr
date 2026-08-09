@@ -8,7 +8,7 @@ A progressive server declares one or more named MCP tools. Each tool accepts an 
 
 | Surface | Generated Behavior |
 | --- | --- |
-| Tools | Every nested `tool(...)` declaration produces an independently described MCP tool. |
+| Tools | Every nested `tool(...)` declaration produces an independently described MCP tool and can set MCP tool annotations. |
 | Help actions | Each tool provides `help`, `help.<namespace>`, and, when applicable, `help.runbooks`. |
 | Actions | `#[action(tool = "...", name = "...")]` methods dispatch only through their declared tool. |
 | Runbooks | `#[runbook(tool = "...", name = "...")]` methods are available through that tool's `runbooks.load`, prompts, and resource template. |
@@ -16,7 +16,7 @@ A progressive server declares one or more named MCP tools. Each tool accepts an 
 | Instructions | Initialize instructions list the progressive tools and direct clients to call the relevant tool with action `help` first. |
 | HTTP auth | A `#[token_validator]` method generates the same Streamable HTTP protected-resource helpers as `#[mcp::mcp_server]`. Authentication is server-wide; stdio remains unauthenticated. |
 
-Tool declarations are explicit. There is no implicit `exec` tool. Each declaration requires a unique, non-empty name and a description. Namespaces and `runbook_uri_template` belong to the tool declaration rather than the server.
+Tool declarations are explicit. There is no implicit `exec` tool. Each declaration requires a unique, non-empty name and a description. Namespaces, `runbook_uri_template`, and optional `annotations = <Rust expression>` belong to the tool declaration rather than the server. The annotation expression may produce either `serde_json::Value` or `Option<serde_json::Value>` and is preserved as the listed tool's `annotations` field. Duplicate `annotations` arguments are rejected during macro expansion.
 
 A tool that owns runbooks must declare a `runbook_uri_template` containing the `{runbook}` binding. Effective runbook templates must be unique across tools. `runbooks.load` returns Markdown as text content and object-shaped structured content containing `runbook` and `markdown`.
 
@@ -38,9 +38,15 @@ Every `#[action]` and `#[runbook]` method must have a doc comment. The first non
 
 ## Input Schemas And Filters
 
-Action input types should derive `serde::Deserialize` and `schemars::JsonSchema`. The macro uses those schemas to build the owning tool's `input.oneOf` schema.
+Action input types should derive `serde::Deserialize` and `schemars::JsonSchema`. The macro uses those schemas to build the owning tool's `input.oneOf` schema. Progressive request and generated runbook input parsing reject unknown fields to match their `additionalProperties: false` schemas. The optional filter may be omitted or explicitly set to `null`.
 
-The optional `filter` field uses a pure-Rust jaq evaluator. Tests cover common jq-style filters such as `.[].id`; invalid filters return MCP invalid-params errors. Action results keep their original text representation. Because MCP structured content must be an object, scalar, array, and null results are exposed as `structuredContent.result`.
+The optional `filter` field uses a pure-Rust jaq evaluator. Tests cover common jq-style filters such as `.[].id`; invalid filters and filters producing more than 256 values return MCP invalid-params errors. This is a result-count bound only; progressive servers do not impose a byte, message, or individual-result size limit.
+
+Actions may return either `ServerResult<serde_json::Value>` or `ServerResult<McpToolResult>`. JSON actions retain their existing behavior: the output supplies text content, object output is used directly as structured content, and scalar, array, or null output is exposed as `structuredContent.result`.
+
+An `McpToolResult` action supplies the complete semantic result envelope. Without a filter, Waltr preserves text and non-text `content`, `structuredContent`, `isError`, `_meta`, and extension fields exactly. With a filter, Waltr requires object-shaped `structuredContent`, evaluates jq only against that value, and replaces only `structuredContent`; scalar, array, and null filter output is wrapped as `{ "result": ... }`. The result must be an object with array-shaped `content`; every content entry must be an object with a string `type`; optional `isError` must be boolean; and optional `structuredContent` must be an object. Shape failures are invalid-params errors. A valid result with `isError: true` is still a successful JSON-RPC tool result.
+
+Resource-exposed semantic actions use their validated `structuredContent` as the JSON resource value. Resource conversion rejects semantic errors and results without `structuredContent`. JSON resource actions remain unchanged.
 
 ## Example
 
@@ -69,6 +75,10 @@ struct GetReleaseInput {
     tool(
         name = "releases",
         description = "Inspect product releases.",
+        annotations = json!({
+            "readOnlyHint": true,
+            "destructiveHint": false
+        }),
         namespace(releases, description = "Query and inspect product releases."),
         runbook_uri_template = "playbooks://{runbook}"
     ),
@@ -109,6 +119,16 @@ impl ReleaseServer {
     #[action(tool = "sessions", name = "list")]
     fn list_sessions(&self) -> ServerResult<Value> {
         Ok(json!([]))
+    }
+
+    /// Report a read failure with semantic MCP error content.
+    #[action(tool = "sessions", name = "read-error")]
+    fn read_error(&self) -> ServerResult<mcp::McpToolResult> {
+        Ok(mcp::McpToolResult::new(json!({
+            "content": [{ "type": "text", "text": "session not found" }],
+            "isError": true,
+            "_meta": { "kind": "not-found" }
+        })))
     }
 
     #[token_validator]

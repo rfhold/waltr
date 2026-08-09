@@ -14,6 +14,7 @@ use crate::{
 
 /// Parsed arguments for a progressive tool.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProgressiveRequest {
     /// Flat or dot-notated action name.
     pub action: String,
@@ -23,6 +24,27 @@ pub struct ProgressiveRequest {
     /// Optional jq-compatible filter applied to the JSON output.
     #[serde(default)]
     pub filter: Option<String>,
+}
+
+/// Output accepted from a generated progressive action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressiveActionOutput {
+    /// Legacy JSON output converted into text and structured content.
+    Json(Value),
+    /// Complete semantic MCP tool result.
+    Tool(McpToolResult),
+}
+
+impl From<Value> for ProgressiveActionOutput {
+    fn from(value: Value) -> Self {
+        Self::Json(value)
+    }
+}
+
+impl From<McpToolResult> for ProgressiveActionOutput {
+    fn from(result: McpToolResult) -> Self {
+        Self::Tool(result)
+    }
 }
 
 /// JSON schema for one configured action input.
@@ -208,7 +230,7 @@ pub fn input_schema(actions: &[&str], inputs: Vec<ActionInputSchema>, runbooks: 
                 "oneOf": input_options
             },
             "filter": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": "Optional jq-compatible filter applied to the action JSON output. Examples: `.id`, `.[].id`, `[.[] | .id]`."
             }
         }
@@ -322,6 +344,45 @@ pub fn tool_result(output: Value, filter: Option<&str>) -> ServerResult<McpToolR
     })))
 }
 
+/// Convert a typed progressive action output into an MCP tool result.
+///
+/// JSON output retains the behavior of [`tool_result`]. Semantic MCP output is validated and,
+/// when filtered, only its `structuredContent` is replaced.
+///
+/// # Errors
+///
+/// Returns invalid parameters for malformed semantic results or jq filter failures.
+pub fn action_tool_result(
+    output: impl Into<ProgressiveActionOutput>,
+    filter: Option<&str>,
+) -> ServerResult<McpToolResult> {
+    match output.into() {
+        ProgressiveActionOutput::Json(output) => tool_result(output, filter),
+        ProgressiveActionOutput::Tool(mut result) => {
+            validate_tool_result(&result.raw)?;
+            if let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) {
+                let structured = result
+                    .raw
+                    .get("structuredContent")
+                    .cloned()
+                    .ok_or_else(|| {
+                        ServerError::invalid_params(
+                            "cannot filter MCP tool result without `structuredContent`",
+                        )
+                    })?;
+                let filtered = apply_filter(structured, filter)?;
+                let filtered = match filtered {
+                    Value::Object(_) => filtered,
+                    filtered => json!({ "result": filtered }),
+                };
+                result.raw["structuredContent"] = filtered;
+                validate_tool_result(&result.raw)?;
+            }
+            Ok(result)
+        }
+    }
+}
+
 /// Convert runbook Markdown into an MCP tool result with object-shaped structured content.
 ///
 /// # Errors
@@ -368,6 +429,39 @@ pub fn runbook_resource_result(uri: String, markdown: String) -> McpResourceResu
 #[allow(clippy::needless_pass_by_value)]
 pub fn json_resource_result(uri: String, value: Value) -> McpResourceResult {
     McpResourceResult::text(uri, "application/json", text_for_value(&value))
+}
+
+/// Convert a typed progressive action output into an MCP JSON resource result.
+///
+/// # Errors
+///
+/// Returns invalid parameters when semantic output is malformed, represents an error, or omits
+/// `structuredContent`.
+pub fn action_resource_result(
+    uri: String,
+    output: impl Into<ProgressiveActionOutput>,
+) -> ServerResult<McpResourceResult> {
+    let value = match output.into() {
+        ProgressiveActionOutput::Json(value) => value,
+        ProgressiveActionOutput::Tool(result) => {
+            validate_tool_result(&result.raw)?;
+            if result.raw.get("isError").and_then(Value::as_bool) == Some(true) {
+                return Err(ServerError::invalid_params(
+                    "cannot expose an MCP semantic error as a resource",
+                ));
+            }
+            result
+                .raw
+                .get("structuredContent")
+                .cloned()
+                .ok_or_else(|| {
+                    ServerError::invalid_params(
+                        "cannot expose MCP tool result without `structuredContent` as a resource",
+                    )
+                })?
+        }
+    };
+    Ok(json_resource_result(uri, value))
 }
 
 /// Build a prompt definition for a runbook.
@@ -513,6 +607,7 @@ pub fn runbook_load_input_schema(runbooks: &[&str]) -> Value {
 /// Returns invalid parameters when input is absent or does not contain a runbook name.
 pub fn runbook_load_input(input: Option<Value>) -> ServerResult<String> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Input {
         runbook: String,
     }
@@ -545,6 +640,8 @@ pub fn unknown_runbook(runbook: &str) -> ServerError {
 }
 
 fn apply_filter(input: Value, filter: &str) -> ServerResult<Value> {
+    const MAX_FILTER_OUTPUTS: usize = 256;
+
     let mut defs = ParseCtx::new(Vec::new());
     let (filter, parse_errors) = jaq_parse::parse(filter, jaq_parse::main());
     if !parse_errors.is_empty() {
@@ -566,19 +663,62 @@ fn apply_filter(input: Value, filter: &str) -> ServerResult<Value> {
         )));
     }
     let inputs = RcIter::new(std::iter::empty());
-    let values = filter
-        .run((Ctx::new([], &inputs), Val::from(input)))
-        .map(|value| {
-            value
-                .map(Value::from)
-                .map_err(|error| ServerError::invalid_params(format!("jq filter failed: {error}")))
-        })
-        .collect::<ServerResult<Vec<_>>>()?;
+    let mut values = Vec::new();
+    for value in filter.run((Ctx::new([], &inputs), Val::from(input))) {
+        let value = value
+            .map(Value::from)
+            .map_err(|error| ServerError::invalid_params(format!("jq filter failed: {error}")))?;
+        if values.len() == MAX_FILTER_OUTPUTS {
+            return Err(ServerError::invalid_params(format!(
+                "jq filter produced more than {MAX_FILTER_OUTPUTS} results"
+            )));
+        }
+        values.push(value);
+    }
     Ok(match values.as_slice() {
         [] => Value::Null,
         [value] => value.clone(),
         _ => Value::Array(values),
     })
+}
+
+fn validate_tool_result(raw: &Value) -> ServerResult<()> {
+    let object = raw
+        .as_object()
+        .ok_or_else(|| ServerError::invalid_params("MCP tool result must be a JSON object"))?;
+    let content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ServerError::invalid_params("MCP tool result `content` must be an array"))?;
+    for (index, entry) in content.iter().enumerate() {
+        let entry = entry.as_object().ok_or_else(|| {
+            ServerError::invalid_params(format!(
+                "MCP tool result `content[{index}]` must be an object"
+            ))
+        })?;
+        if !entry.get("type").is_some_and(Value::is_string) {
+            return Err(ServerError::invalid_params(format!(
+                "MCP tool result `content[{index}].type` must be a string"
+            )));
+        }
+    }
+    if object
+        .get("isError")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(ServerError::invalid_params(
+            "MCP tool result `isError` must be a boolean",
+        ));
+    }
+    if object
+        .get("structuredContent")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(ServerError::invalid_params(
+            "MCP tool result `structuredContent` must be an object",
+        ));
+    }
+    Ok(())
 }
 
 fn action_help_value(action: &ProgressiveActionHelp) -> Value {
