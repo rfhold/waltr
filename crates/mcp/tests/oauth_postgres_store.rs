@@ -71,7 +71,7 @@ async fn postgres_store_passes_contract_across_reopen() {
             .fetch_one(&pool)
             .await
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         sqlx::query_as::<_, (String, String, i64)>(

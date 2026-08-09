@@ -10,17 +10,22 @@ macros = ["dep:mcp-macros"]
 oauth-authorization-server = ["dep:aes-gcm", "dep:p256", "dep:sha2", "dep:zeroize"]
 oauth-authorization-server-postgres = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/postgres", "sqlx/runtime-tokio-rustls"]
 oauth-authorization-server-sqlite = ["oauth-authorization-server", "dep:sqlx", "sqlx/macros", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite"]
+oauth-resource-owner-oidc = ["oauth-authorization-server", "dep:cookie", "dep:jsonwebtoken", "dep:sha2", "dep:zeroize"]
+oauth-resource-owner-oidc-postgres = ["oauth-resource-owner-oidc", "oauth-authorization-server-postgres"]
+oauth-resource-owner-oidc-sqlite = ["oauth-resource-owner-oidc", "oauth-authorization-server-sqlite"]
 progressive = ["macros", "dep:jaq-interpret", "dep:jaq-parse", "dep:schemars"]
 
 [dependencies]
 aes-gcm = { workspace = true, optional = true }
 axum.workspace = true
 base64.workspace = true
+cookie = { workspace = true, optional = true }
 futures-util.workspace = true
 jaq-interpret = { workspace = true, optional = true }
 jaq-parse = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
 mcp-macros = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
+reqwest = { workspace = true, features = ["form", "json", "rustls", "stream"] }
 opentelemetry.workspace = true
 p256 = { workspace = true, optional = true }
 schemars = { workspace = true, optional = true }
@@ -61,6 +66,11 @@ required-features = ["oauth-authorization-server-sqlite"]
 name = "oauth_postgres_store"
 path = "tests/oauth_postgres_store.rs"
 required-features = ["oauth-authorization-server-postgres"]
+
+[[test]]
+name = "oauth_resource_owner_oidc"
+path = "tests/oauth_resource_owner_oidc.rs"
+required-features = ["oauth-resource-owner-oidc"]
 
 [[test]]
 name = "progressive"

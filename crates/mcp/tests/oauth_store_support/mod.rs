@@ -30,6 +30,57 @@ pub async fn assert_store_contract(
         first.register_client(invalid_client).await,
         Err(OAuthAuthorizationStoreError::InvalidData)
     );
+    let resumed = OAuthAuthorizationTransaction {
+        transaction_id: "resumed-transaction".to_owned(),
+        client_id: "client".to_owned(),
+        client_metadata_snapshot_id: None,
+        redirect_uri: "https://client.example/callback".to_owned(),
+        resource: "https://resource.example/mcp".to_owned(),
+        scopes: vec!["read".to_owned()],
+        pkce_challenge: "challenge".to_owned(),
+        browser_correlation_digest: digest(10),
+        state_reference: "resumed-state".to_owned(),
+        principal_id: None,
+        decision: None,
+        created_at_ms: 1_000,
+        expires_at_ms: 10_000,
+    };
+    assert!(
+        first
+            .create_authorization_transaction(resumed)
+            .await
+            .unwrap()
+    );
+    let resume_request = |correlation| OAuthResumeAuthenticationRequest {
+        transaction_id: "resumed-transaction".to_owned(),
+        principal_id: McpPrincipalId::new("resumed-alice").unwrap(),
+        browser_correlation_digest: correlation,
+        now_ms: 2_000,
+    };
+    assert_eq!(
+        reopened
+            .resume_authorization_transaction(resume_request(vec![1]))
+            .await,
+        Err(OAuthAuthorizationStoreError::InvalidData)
+    );
+    assert!(
+        !reopened
+            .resume_authorization_transaction(resume_request(digest(11)))
+            .await
+            .unwrap()
+    );
+    assert!(
+        first
+            .resume_authorization_transaction(resume_request(digest(10)))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .consume_browser_correlation("resumed-transaction".to_owned(), digest(10), 2_001)
+            .await
+            .unwrap()
+    );
     let transaction = OAuthAuthorizationTransaction {
         transaction_id: "transaction".to_owned(),
         client_id: "client".to_owned(),
@@ -261,12 +312,15 @@ async fn assert_registration_contract(
     );
     assert_eq!(
         reopened
-            .authenticate_and_promote_client(OAuthDynamicClientPromotionRequest {
-                transaction_id: "dynamic-transaction".to_owned(),
-                principal_id: McpPrincipalId::new("alice").unwrap(),
-                now_ms: 7_200,
-                max_clients_per_principal: 1,
-                max_active_dynamic_clients: 2,
+            .resume_and_promote_client(OAuthResumeDynamicClientPromotionRequest {
+                promotion: OAuthDynamicClientPromotionRequest {
+                    transaction_id: "dynamic-transaction".to_owned(),
+                    principal_id: McpPrincipalId::new("alice").unwrap(),
+                    now_ms: 7_200,
+                    max_clients_per_principal: 1,
+                    max_active_dynamic_clients: 2,
+                },
+                browser_correlation_digest: digest(20),
             })
             .await
             .unwrap(),
@@ -343,16 +397,25 @@ async fn assert_registration_contract(
     );
     assert_eq!(
         reopened
-            .authenticate_and_promote_client(OAuthDynamicClientPromotionRequest {
-                transaction_id: "quota-transaction".to_owned(),
-                principal_id: McpPrincipalId::new("alice").unwrap(),
-                now_ms: 7_500,
-                max_clients_per_principal: 1,
-                max_active_dynamic_clients: 2,
+            .resume_and_promote_client(OAuthResumeDynamicClientPromotionRequest {
+                promotion: OAuthDynamicClientPromotionRequest {
+                    transaction_id: "quota-transaction".to_owned(),
+                    principal_id: McpPrincipalId::new("alice").unwrap(),
+                    now_ms: 7_500,
+                    max_clients_per_principal: 1,
+                    max_active_dynamic_clients: 2,
+                },
+                browser_correlation_digest: digest(22),
             })
             .await
             .unwrap(),
         OAuthClientPromotionResult::QuotaExceeded
+    );
+    assert!(
+        first
+            .consume_browser_correlation("quota-transaction".to_owned(), digest(22), 7_501)
+            .await
+            .unwrap()
     );
     assert!(first.register_client(client("reserved-a")).await.unwrap());
     assert!(first.register_client(client("reserved-b")).await.unwrap());

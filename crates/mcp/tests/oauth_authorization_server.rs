@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -242,6 +242,8 @@ async fn login_resume_and_consent_denial_use_opaque_transaction() {
     ]);
     let login = client.get(authorization_url).send().await.unwrap();
     assert_eq!(login.status(), StatusCode::SEE_OTHER);
+    let correlation_cookie = login.headers()["set-cookie"].to_str().unwrap();
+    assert_correlation_cookie(correlation_cookie);
     let continuation = Url::parse(login.headers()["location"].to_str().unwrap()).unwrap();
     assert_eq!(continuation.query_pairs().count(), 1);
     assert!(
@@ -297,6 +299,51 @@ async fn login_resume_and_consent_denial_use_opaque_transaction() {
         .await
         .unwrap();
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    task.abort();
+}
+
+#[tokio::test]
+async fn resumed_atomic_false_never_reaches_consent_or_clears_cookie() {
+    let store = Arc::new(InMemoryOAuthAuthorizationStore::default());
+    register_client(&store).await;
+    let consent = Arc::new(CountingConsent::default());
+    let server = server_with_hooks(
+        store,
+        Arc::new(MismatchedLoginAuthenticator::default()),
+        consent.clone(),
+    )
+    .await;
+    let (origin, task) = serve(server.router()).await;
+    let client = reqwest::Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .unwrap();
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+    let mut authorization_url = Url::parse(&format!("{origin}/oauth/authorize")).unwrap();
+    authorization_url.query_pairs_mut().extend_pairs([
+        ("response_type", "code"),
+        ("client_id", "client"),
+        ("redirect_uri", REDIRECT),
+        ("scope", "files:read"),
+        ("state", "atomic-false"),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+        ("resource", RESOURCE),
+    ]);
+    let login = client.get(authorization_url).send().await.unwrap();
+    let continuation = Url::parse(login.headers()["location"].to_str().unwrap()).unwrap();
+    let resumed = client
+        .get(format!(
+            "{origin}{}?{}",
+            continuation.path(),
+            continuation.query().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), StatusCode::BAD_REQUEST);
+    assert!(resumed.headers().get("set-cookie").is_none());
+    assert_eq!(consent.presentations.load(Ordering::SeqCst), 0);
     task.abort();
 }
 
@@ -811,6 +858,19 @@ fn unix_ms() -> i64 {
     .unwrap()
 }
 
+fn assert_correlation_cookie(cookie: &str) {
+    assert!(cookie.starts_with("__Host-mcp-oidc-"));
+    for attribute in [
+        "; Secure",
+        "; HttpOnly",
+        "; SameSite=Lax",
+        "; Path=/",
+        "; Max-Age=60",
+    ] {
+        assert!(cookie.contains(attribute), "missing {attribute}");
+    }
+}
+
 struct Authenticated;
 impl OAuthResourceOwnerAuthenticator for Authenticated {
     fn authenticate(
@@ -861,6 +921,21 @@ impl OAuthResourceOwnerAuthenticator for LoginAuthenticator {
             }
         })
     }
+
+    fn browser_correlation_cookie(
+        &self,
+        transaction_id: &str,
+        correlation: &McpOAuthSecret,
+    ) -> Option<OAuthBrowserCorrelationCookie> {
+        OAuthBrowserCorrelationCookie::new(
+            &format!(
+                "__Host-mcp-oidc-{transaction_id}={}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=60",
+                correlation.expose_secret()
+            ),
+            true,
+        )
+        .ok()
+    }
 }
 
 struct PresentConsent;
@@ -871,6 +946,43 @@ impl OAuthConsentHandler for PresentConsent {
     }
     fn validate_decision(&self, evidence: OAuthConsentDecisionEvidence) -> BoxFuture<bool> {
         Box::pin(async move { evidence.csrf.expose_secret() == "valid" })
+    }
+}
+
+#[derive(Default)]
+struct MismatchedLoginAuthenticator(AtomicU8);
+impl OAuthResourceOwnerAuthenticator for MismatchedLoginAuthenticator {
+    fn authenticate(
+        &self,
+        request: OAuthResourceOwnerAuthenticationRequest,
+    ) -> BoxFuture<OAuthResourceOwnerAuthentication> {
+        let initial = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if initial {
+                OAuthResourceOwnerAuthentication::LoginRequired {
+                    login_url: request.continuation_url,
+                }
+            } else {
+                OAuthResourceOwnerAuthentication::Authenticated {
+                    principal_id: McpPrincipalId::new("alice").unwrap(),
+                    browser_correlation: Some(McpOAuthSecret::new("wrong-correlation")),
+                }
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct CountingConsent {
+    presentations: AtomicUsize,
+}
+impl OAuthConsentHandler for CountingConsent {
+    fn present(&self, _: OAuthConsentModel) -> BoxFuture<OAuthConsentPresentation> {
+        self.presentations.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { OAuthConsentPresentation::Approved })
+    }
+    fn validate_decision(&self, _: OAuthConsentDecisionEvidence) -> BoxFuture<bool> {
+        Box::pin(async { false })
     }
 }
 

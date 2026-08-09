@@ -40,8 +40,10 @@ use super::{
     OAuthDynamicClientPromotionRequest, OAuthDynamicClientRegistrationRequest,
     OAuthDynamicClientRegistrationResult, OAuthIssueGrantRequest, OAuthIssueGrantResult,
     OAuthKeyEncryption, OAuthRefreshRotationRequest, OAuthRefreshRotationResult,
-    OAuthRegistrationOutcome, OAuthRevocationTarget, OAuthSigningKey, OAuthTokenMetadata,
-    OAuthValidateAccessTokenRequest, duration_ms, generate_es256_signing_key_candidate,
+    OAuthRegistrationOutcome, OAuthResumeAuthenticationRequest,
+    OAuthResumeDynamicClientPromotionRequest, OAuthRevocationTarget, OAuthSigningKey,
+    OAuthTokenMetadata, OAuthValidateAccessTokenRequest, duration_ms,
+    generate_es256_signing_key_candidate,
 };
 use crate::{
     Error, McpAuthorizationServerMetadata, McpClientRegistrationError,
@@ -169,6 +171,90 @@ pub trait OAuthResourceOwnerAuthenticator: Send + Sync + 'static {
         &self,
         request: OAuthResourceOwnerAuthenticationRequest,
     ) -> BoxFuture<OAuthResourceOwnerAuthentication>;
+
+    /// Build the correlation cookie set by the hosted server for an initial login redirect.
+    ///
+    /// Existing adapters need not implement this method. Implementations must return a
+    /// transaction-specific cookie and must not persist or place the correlation in a URL.
+    fn browser_correlation_cookie(
+        &self,
+        _transaction_id: &str,
+        _browser_correlation: &McpOAuthSecret,
+    ) -> Option<OAuthBrowserCorrelationCookie> {
+        None
+    }
+
+    /// Build a cookie expiration directive after successful resumed authentication.
+    fn clearing_browser_correlation_cookie(
+        &self,
+        _transaction_id: &str,
+    ) -> Option<OAuthBrowserCorrelationCookie> {
+        None
+    }
+
+    /// Best-effort finalization after hosted resumed authentication commits atomically.
+    fn finalize_authentication(&self, _transaction_id: String) -> BoxFuture<()> {
+        Box::pin(async {})
+    }
+}
+
+/// Validated browser-correlation cookie directive emitted by an authenticator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthBrowserCorrelationCookie {
+    header: HeaderValue,
+    max_age: Duration,
+}
+
+impl OAuthBrowserCorrelationCookie {
+    /// Validate a complete `Set-Cookie` value for a transaction correlation cookie.
+    ///
+    /// # Errors
+    ///
+    /// Rejects values that are not host-only, HTTP-only, Lax, root-path cookies.
+    pub fn new(value: &str, secure: bool) -> Result<Self> {
+        if value.chars().any(char::is_control) {
+            return Err(Error::protocol("invalid OAuth browser correlation cookie"));
+        }
+        let mut parts = value.split(';').map(str::trim);
+        let Some((name, cookie_value)) = parts.next().and_then(|part| part.split_once('=')) else {
+            return Err(Error::protocol("invalid OAuth browser correlation cookie"));
+        };
+        if !name.starts_with(if secure { "__Host-" } else { "mcp-oidc-" })
+            || cookie_value.is_empty()
+        {
+            return Err(Error::protocol("invalid OAuth browser correlation cookie"));
+        }
+        let (mut http_only, mut cookie_secure, mut lax, mut root_path) =
+            (false, false, false, false);
+        let mut cookie_max_age = None;
+        for part in parts {
+            let lower = part.to_ascii_lowercase();
+            match lower.as_str() {
+                "httponly" if !http_only => http_only = true,
+                "secure" if !cookie_secure => cookie_secure = true,
+                "samesite=lax" if !lax => lax = true,
+                "path=/" if !root_path => root_path = true,
+                _ if lower.starts_with("max-age=") && cookie_max_age.is_none() => {
+                    let Ok(seconds) = lower[8..].parse::<u64>() else {
+                        return Err(Error::protocol("invalid OAuth browser correlation cookie"));
+                    };
+                    cookie_max_age = Some(Duration::from_secs(seconds));
+                }
+                _ => {
+                    return Err(Error::protocol("invalid OAuth browser correlation cookie"));
+                }
+            }
+        }
+        if !http_only || !lax || !root_path || cookie_secure != secure {
+            return Err(Error::protocol("invalid OAuth browser correlation cookie"));
+        }
+        let Some(max_age) = cookie_max_age else {
+            return Err(Error::protocol("invalid OAuth browser correlation cookie"));
+        };
+        let header = HeaderValue::from_str(value)
+            .map_err(|_| Error::protocol("invalid OAuth browser correlation cookie"))?;
+        Ok(Self { header, max_age })
+    }
 }
 
 /// Sanitized consent presentation model.
@@ -962,13 +1048,21 @@ async fn authenticate_transaction(
         state.config.authorization_endpoint,
         encode(&transaction_id)
     );
+    let secret = McpOAuthSecret::new(correlation);
+    let cookie = (!resumed)
+        .then(|| {
+            state
+                .authenticator
+                .browser_correlation_cookie(&transaction_id, &secret)
+        })
+        .flatten();
     let outcome = state
         .authenticator
         .authenticate(OAuthResourceOwnerAuthenticationRequest {
             headers,
             transaction_id: transaction_id.clone(),
             continuation_url,
-            browser_correlation: McpOAuthSecret::new(correlation),
+            browser_correlation: secret,
         })
         .await;
     match outcome {
@@ -980,30 +1074,38 @@ async fn authenticate_transaction(
                 Ok(value) => value,
                 Err(_) => return unavailable(),
             };
-            if resumed {
+            let authentication = if resumed {
                 let Some(correlation) = browser_correlation else {
                     return local_authorization_error(StatusCode::BAD_REQUEST, "invalid_request");
                 };
-                match state
-                    .store
-                    .consume_browser_correlation(
-                        transaction_id.clone(),
-                        digest(correlation.expose_secret()),
-                        now,
-                    )
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return local_authorization_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request",
-                        );
-                    }
-                    Err(_) => return unavailable(),
+                let correlation_digest = digest(correlation.expose_secret());
+                if let Some(options) = &state.registration {
+                    state
+                        .store
+                        .resume_and_promote_client(OAuthResumeDynamicClientPromotionRequest {
+                            promotion: OAuthDynamicClientPromotionRequest {
+                                transaction_id: transaction_id.clone(),
+                                principal_id,
+                                now_ms: now,
+                                max_clients_per_principal: options.max_clients_per_principal,
+                                max_active_dynamic_clients: options.max_active_dynamic_clients,
+                            },
+                            browser_correlation_digest: correlation_digest,
+                        })
+                        .await
+                        .map(|result| result == OAuthClientPromotionResult::Authenticated)
+                } else {
+                    state
+                        .store
+                        .resume_authorization_transaction(OAuthResumeAuthenticationRequest {
+                            transaction_id: transaction_id.clone(),
+                            principal_id,
+                            browser_correlation_digest: correlation_digest,
+                            now_ms: now,
+                        })
+                        .await
                 }
-            }
-            let authentication = if let Some(options) = &state.registration {
+            } else if let Some(options) = &state.registration {
                 state
                     .store
                     .authenticate_and_promote_client(OAuthDynamicClientPromotionRequest {
@@ -1026,8 +1128,26 @@ async fn authenticate_transaction(
                     .await
             };
             match authentication {
+                Ok(true) if resumed => {
+                    state
+                        .authenticator
+                        .finalize_authentication(transaction_id.clone())
+                        .await;
+                    let clear = state
+                        .authenticator
+                        .clearing_browser_correlation_cookie(&transaction_id);
+                    let mut response = consent_or_issue(state, transaction_id).await;
+                    if let Some(cookie) = clear {
+                        response
+                            .headers_mut()
+                            .append(header::SET_COOKIE, cookie.header);
+                    }
+                    response
+                }
                 Ok(true) => consent_or_issue(state, transaction_id).await,
-                Ok(false) if resumed => consent_or_issue(state, transaction_id).await,
+                Ok(false) if resumed => {
+                    local_authorization_error(StatusCode::BAD_REQUEST, "invalid_request")
+                }
                 Ok(false) => {
                     local_authorization_error(StatusCode::BAD_REQUEST, "unauthorized_client")
                 }
@@ -1039,7 +1159,16 @@ async fn authenticate_transaction(
         }
         OAuthResourceOwnerAuthentication::LoginRequired { login_url } => {
             if safe_host_redirect(&state.config.issuer, &login_url) {
-                redirect_response(&login_url)
+                let mut response = redirect_response(&login_url);
+                if let Some(cookie) = cookie {
+                    if cookie.max_age > state.config.authorization_transaction_lifetime {
+                        return unavailable();
+                    }
+                    response
+                        .headers_mut()
+                        .append(header::SET_COOKIE, cookie.header);
+                }
+                response
             } else {
                 unavailable()
             }

@@ -208,6 +208,28 @@ pub struct OAuthDynamicClientPromotionRequest {
     pub max_active_dynamic_clients: usize,
 }
 
+/// Atomic resumed authentication and browser-correlation consumption request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthResumeAuthenticationRequest {
+    /// Authorization transaction receiving the principal.
+    pub transaction_id: String,
+    /// Authenticated principal.
+    pub principal_id: McpPrincipalId,
+    /// Digest of the transaction-specific browser correlation cookie.
+    pub browser_correlation_digest: Vec<u8>,
+    /// Operation time.
+    pub now_ms: i64,
+}
+
+/// Atomic resumed dynamic-client promotion and correlation consumption request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthResumeDynamicClientPromotionRequest {
+    /// Existing dynamic-client promotion request and quota policy.
+    pub promotion: OAuthDynamicClientPromotionRequest,
+    /// Digest of the transaction-specific browser correlation cookie.
+    pub browser_correlation_digest: Vec<u8>,
+}
+
 /// Authentication and dynamic promotion result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OAuthClientPromotionResult {
@@ -622,10 +644,24 @@ pub trait OAuthAuthorizationStore: Send + Sync + 'static {
         principal_id: McpPrincipalId,
         now_ms: i64,
     ) -> BoxFuture<OAuthAuthorizationStoreResult<bool>>;
+    /// Atomically consume browser correlation and attach one stable principal.
+    fn resume_authorization_transaction(
+        &self,
+        _request: OAuthResumeAuthenticationRequest,
+    ) -> BoxFuture<OAuthAuthorizationStoreResult<bool>> {
+        Box::pin(async { Ok(false) })
+    }
     /// Attach a principal and atomically promote a provisional dynamic client.
     fn authenticate_and_promote_client(
         &self,
         _request: OAuthDynamicClientPromotionRequest,
+    ) -> BoxFuture<OAuthAuthorizationStoreResult<OAuthClientPromotionResult>> {
+        Box::pin(async { Ok(OAuthClientPromotionResult::InvalidTransaction) })
+    }
+    /// Atomically promote a dynamic client, attach its principal, and consume correlation.
+    fn resume_and_promote_client(
+        &self,
+        _request: OAuthResumeDynamicClientPromotionRequest,
     ) -> BoxFuture<OAuthAuthorizationStoreResult<OAuthClientPromotionResult>> {
         Box::pin(async { Ok(OAuthClientPromotionResult::InvalidTransaction) })
     }
@@ -865,6 +901,67 @@ impl OAuthState {
         }
         self.consumed_browser_correlations.insert(id.to_owned());
         Ok(true)
+    }
+
+    fn resume_authenticate(
+        &mut self,
+        request: &OAuthResumeAuthenticationRequest,
+    ) -> OAuthAuthorizationStoreResult<bool> {
+        validate_time(request.now_ms)?;
+        drop(digest_key(&request.browser_correlation_digest)?);
+        let valid = self
+            .authorization_context(&request.transaction_id, request.now_ms)
+            .is_some_and(|context| {
+                context.transaction.principal_id.is_none()
+                    && constant_time_equal(
+                        &context.transaction.browser_correlation_digest,
+                        &request.browser_correlation_digest,
+                    )
+                    && !self
+                        .consumed_browser_correlations
+                        .contains(&request.transaction_id)
+            });
+        if !valid {
+            return Ok(false);
+        }
+        self.transactions
+            .get_mut(&request.transaction_id)
+            .ok_or(OAuthAuthorizationStoreError::InvalidData)?
+            .principal_id = Some(request.principal_id.as_str().to_owned());
+        self.consumed_browser_correlations
+            .insert(request.transaction_id.clone());
+        Ok(true)
+    }
+
+    fn resume_and_promote(
+        &mut self,
+        request: &OAuthResumeDynamicClientPromotionRequest,
+    ) -> OAuthAuthorizationStoreResult<OAuthClientPromotionResult> {
+        validate_time(request.promotion.now_ms)?;
+        drop(digest_key(&request.browser_correlation_digest)?);
+        let correlation_valid = self
+            .transactions
+            .get(&request.promotion.transaction_id)
+            .is_some_and(|transaction| {
+                transaction.created_at_ms <= request.promotion.now_ms
+                    && transaction.expires_at_ms > request.promotion.now_ms
+                    && constant_time_equal(
+                        &transaction.browser_correlation_digest,
+                        &request.browser_correlation_digest,
+                    )
+                    && !self
+                        .consumed_browser_correlations
+                        .contains(&request.promotion.transaction_id)
+            });
+        if !correlation_valid {
+            return Ok(OAuthClientPromotionResult::InvalidTransaction);
+        }
+        let result = self.authenticate_and_promote(&request.promotion);
+        if result == OAuthClientPromotionResult::Authenticated {
+            self.consumed_browser_correlations
+                .insert(request.promotion.transaction_id.clone());
+        }
+        Ok(result)
     }
 
     fn remember_consent(&mut self, id: &str, now: i64) -> bool {
@@ -1932,7 +2029,9 @@ impl OAuthAuthorizationStore for InMemoryOAuthAuthorizationStore {
     memory_method!(authorization_context(transaction_id: String, now_ms: i64) -> Option<OAuthAuthorizationContext>, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, now_ms| { validate_time(now_ms)?; Ok(state.authorization_context(&transaction_id, now_ms)) });
     memory_method!(consume_browser_correlation(transaction_id: String, correlation_digest: Vec<u8>, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, correlation_digest: Vec<u8>, now_ms| state.consume_correlation(&transaction_id, &correlation_digest, now_ms));
     memory_method!(authenticate_authorization_transaction(transaction_id: String, principal_id: McpPrincipalId, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, principal_id, now_ms| { validate_time(now_ms)?; Ok(state.authenticate(&transaction_id, &principal_id, now_ms)) });
+    memory_method!(resume_authorization_transaction(request: OAuthResumeAuthenticationRequest) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, request: OAuthResumeAuthenticationRequest| state.resume_authenticate(&request));
     memory_method!(authenticate_and_promote_client(request: OAuthDynamicClientPromotionRequest) -> OAuthClientPromotionResult, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, request: OAuthDynamicClientPromotionRequest| { validate_time(request.now_ms)?; Ok(state.authenticate_and_promote(&request)) });
+    memory_method!(resume_and_promote_client(request: OAuthResumeDynamicClientPromotionRequest) -> OAuthClientPromotionResult, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, request: OAuthResumeDynamicClientPromotionRequest| state.resume_and_promote(&request));
     memory_method!(decide_authorization_transaction(transaction_id: String, decision: OAuthAuthorizationDecision, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, decision, now_ms| { validate_time(now_ms)?; Ok(state.decide(&transaction_id, decision, now_ms)) });
     memory_method!(remember_authorization_consent(transaction_id: String, now_ms: i64) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, transaction_id: String, now_ms| { validate_time(now_ms)?; Ok(state.remember_consent(&transaction_id, now_ms)) });
     memory_method!(issue_authorization_code(code: OAuthAuthorizationCode) -> bool, |state: &mut OAuthState, _config: &OAuthAuthorizationStoreConfig, code| state.issue_code(code));
