@@ -43,9 +43,11 @@ url.workspace = true
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 rmcp = { version = "3.1.2", features = ["client", "reqwest", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 tempfile.workspace = true
 testcontainers.workspace = true
+tracing-subscriber.workspace = true
 
 [[test]]
 name = "oauth_store"

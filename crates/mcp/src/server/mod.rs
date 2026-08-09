@@ -42,6 +42,7 @@ use crate::{
         UNSUPPORTED_PROTOCOL_VERSION, json_rpc_error, json_rpc_error_with_data,
         json_rpc_method_not_found, json_rpc_notification, json_rpc_success, parse_json_rpc_message,
     },
+    server_telemetry::ServerTelemetry,
     trace::{request_meta, set_span_parent_from_meta},
     types::{
         McpCompletionRequest, McpIcon, McpPromptList, McpPromptResult, McpResourceList,
@@ -549,6 +550,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Send + Unpin + 'static,
 {
+    let telemetry = ServerTelemetry::new();
     let stdout: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
     let context = ServerContext {
         sender: NotificationSender::Stdio(Arc::clone(&stdout)),
@@ -604,7 +606,7 @@ where
                 let mut request_context = context.clone();
                 request_context.request_id = Some(request.id.clone());
                 request_context.request_meta = Some(meta.raw);
-                request_context.protocol_version = Some(meta.protocol_version);
+                request_context.protocol_version = Some(meta.protocol_version.clone());
                 request_context.client_capabilities = Some(meta.client_capabilities);
                 let cancellation = CancellationToken::new();
                 request_context.cancellation = cancellation.clone();
@@ -616,17 +618,24 @@ where
                     &request.method,
                     Some(&request.id.to_string()),
                     "stdio",
-                    None,
+                    Some(&meta.protocol_version),
                 );
                 set_span_parent_from_meta(&span, request_context.request_meta.as_ref());
+                let mut request_telemetry = telemetry.start(
+                    &request.method,
+                    "stdio",
+                    &meta.protocol_version,
+                    span.clone(),
+                );
                 tokio::spawn(
                     async move {
                         let request_id = request.id.clone();
                         tokio::select! {
                             response = handle_request(handler, request, request_context) => {
-                                record_response_outcome(&response);
-                                if let Err(error) = write_json_line(&stdout, &response).await {
-                                    tracing::debug!(%error, "failed to write MCP stdio response");
+                                let error_code = json_rpc_error_code(&response);
+                                match write_json_line(&stdout, &response).await {
+                                    Ok(()) => request_telemetry.response_error_code(error_code),
+                                    Err(error) => tracing::debug!(%error, "failed to write MCP stdio response"),
                                 }
                             }
                             () = cancellation.cancelled() => {}
@@ -655,8 +664,19 @@ where
                 };
                 let handler = Arc::clone(&handler);
                 let request_meta = Some(meta.raw);
-                let span = server_request_span(&notification.method, None, "stdio", None);
+                let span = server_request_span(
+                    &notification.method,
+                    None,
+                    "stdio",
+                    Some(&meta.protocol_version),
+                );
                 set_span_parent_from_meta(&span, request_meta.as_ref());
+                let mut request_telemetry = telemetry.start(
+                    &notification.method,
+                    "stdio",
+                    &meta.protocol_version,
+                    span.clone(),
+                );
                 let mut notification_context = context.clone();
                 notification_context.request_meta = request_meta;
                 notification_context.protocol_version = Some(meta.protocol_version);
@@ -665,7 +685,7 @@ where
                     handler
                         .handle_notification(notification, notification_context)
                         .await;
-                    tracing::Span::current().record("mcp.outcome", "success");
+                    request_telemetry.success();
                 }
                 .instrument(span)
                 .await;
@@ -960,6 +980,7 @@ pub fn streamable_http_router_with_options(
         handler,
         allowed_origins: options.allowed_origins,
         authorization: options.authorization,
+        telemetry: ServerTelemetry::new(),
     })
 }
 
@@ -984,6 +1005,7 @@ struct HttpState {
     handler: Arc<dyn ServerHandler>,
     allowed_origins: Arc<HashSet<CanonicalOrigin>>,
     authorization: Option<StreamableHttpAuthorization>,
+    telemetry: ServerTelemetry,
 }
 
 // Keeping validation and dispatch together makes the stateless boundary fail-closed.
@@ -1086,15 +1108,26 @@ async fn http_post(State(state): State<HttpState>, request: Request<Body>) -> Re
         );
     }
 
-    let span = http_server_request_span(&inbound, &meta.protocol_version);
-    set_span_parent_from_meta(&span, inbound_meta(&inbound));
     match inbound {
         JsonRpcInbound::Notification(notification) => {
+            let span = server_request_span(
+                &notification.method,
+                None,
+                "streamable_http",
+                Some(&meta.protocol_version),
+            );
+            set_span_parent_from_meta(&span, request_meta(notification.params.as_ref()));
+            let mut request_telemetry = state.telemetry.start(
+                &notification.method,
+                "streamable_http",
+                &meta.protocol_version,
+                span.clone(),
+            );
             let context = ServerContext {
                 sender: NotificationSender::Channel(mpsc::channel(1).0),
                 request_id: None,
                 request_meta: Some(meta.raw),
-                protocol_version: Some(meta.protocol_version),
+                protocol_version: Some(meta.protocol_version.clone()),
                 client_capabilities: Some(meta.client_capabilities),
                 subscription_id: None,
                 cancellation: CancellationToken::new(),
@@ -1108,6 +1141,7 @@ async fn http_post(State(state): State<HttpState>, request: Request<Body>) -> Re
                         .handler
                         .handle_notification(notification, context)
                         .await;
+                    request_telemetry.success();
                 }
                 .instrument(span),
             );
@@ -1120,7 +1154,7 @@ async fn http_post(State(state): State<HttpState>, request: Request<Body>) -> Re
                 sender: NotificationSender::Channel(sender.clone()),
                 request_id: Some(request.id.clone()),
                 request_meta: Some(meta.raw),
-                protocol_version: Some(meta.protocol_version),
+                protocol_version: Some(meta.protocol_version.clone()),
                 client_capabilities: Some(meta.client_capabilities),
                 subscription_id: None,
                 cancellation: cancellation.clone(),
@@ -1150,13 +1184,28 @@ async fn http_post(State(state): State<HttpState>, request: Request<Body>) -> Re
                     })),
                 );
             }
+            let span = server_request_span(
+                &request.method,
+                Some(&request.id.to_string()),
+                "streamable_http",
+                Some(&meta.protocol_version),
+            );
+            set_span_parent_from_meta(&span, request_meta(request.params.as_ref()));
+            let mut request_telemetry = state.telemetry.start(
+                &request.method,
+                "streamable_http",
+                &meta.protocol_version,
+                span.clone(),
+            );
             let handler_cancellation = cancellation.clone();
             tokio::spawn(
                 async move {
                     tokio::select! {
                         response = handle_request(Arc::clone(&state.handler), request, context) => {
-                            record_response_outcome(&response);
-                            drop(sender.send(response).await);
+                            let error_code = json_rpc_error_code(&response);
+                            if sender.send(response).await.is_ok() {
+                                request_telemetry.response_error_code(error_code);
+                            }
                         }
                         () = authorized_request_ended(authorization) => {}
                         () = handler_cancellation.cancelled() => {}
@@ -2097,29 +2146,6 @@ fn completion_request(params: Option<&Value>) -> std::result::Result<McpCompleti
     Ok(request)
 }
 
-fn http_server_request_span(inbound: &JsonRpcInbound, protocol_version: &str) -> tracing::Span {
-    match inbound {
-        JsonRpcInbound::Request(request) => server_request_span(
-            &request.method,
-            Some(&request.id.to_string()),
-            "streamable_http",
-            Some(protocol_version),
-        ),
-        JsonRpcInbound::Notification(notification) => server_request_span(
-            &notification.method,
-            None,
-            "streamable_http",
-            Some(protocol_version),
-        ),
-        JsonRpcInbound::Response(response) => server_request_span(
-            "",
-            Some(&response.id.to_string()),
-            "streamable_http",
-            Some(protocol_version),
-        ),
-    }
-}
-
 fn server_request_span(
     method: &str,
     id: Option<&str>,
@@ -2128,6 +2154,7 @@ fn server_request_span(
 ) -> tracing::Span {
     tracing::info_span!(
         "mcp.server.request",
+        otel.kind = "server",
         rpc.system = "jsonrpc",
         rpc.jsonrpc.version = "2.0",
         rpc.method = %method,
@@ -2136,33 +2163,16 @@ fn server_request_span(
         mcp.transport = transport,
         mcp.protocol_version = protocol_version.unwrap_or(""),
         mcp.outcome = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
         rpc.jsonrpc.error_code = tracing::field::Empty,
     )
 }
 
-fn inbound_meta(inbound: &JsonRpcInbound) -> Option<&serde_json::Map<String, Value>> {
-    match inbound {
-        JsonRpcInbound::Request(request) => request_meta(request.params.as_ref()),
-        JsonRpcInbound::Notification(notification) => request_meta(notification.params.as_ref()),
-        JsonRpcInbound::Response(_) => None,
-    }
-}
-
-fn record_response_outcome(response: &Value) {
-    if record_response_error(response).is_some() {
-        tracing::Span::current().record("mcp.outcome", "error");
-    } else {
-        tracing::Span::current().record("mcp.outcome", "success");
-    }
-}
-
-fn record_response_error(response: &Value) -> Option<i64> {
-    let code = response
+fn json_rpc_error_code(response: &Value) -> Option<i64> {
+    response
         .get("error")
         .and_then(|error| error.get("code"))
-        .and_then(Value::as_i64)?;
-    tracing::Span::current().record("rpc.jsonrpc.error_code", code);
-    Some(code)
+        .and_then(Value::as_i64)
 }
 
 type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
