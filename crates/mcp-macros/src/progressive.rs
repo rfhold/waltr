@@ -166,12 +166,23 @@ fn list_tools_impl(
     actions: &[ProgressiveAction],
     runbooks: &[ProgressiveRunbook],
 ) -> TokenStream2 {
-    let definitions = args.tools.iter().map(|tool| {
-        let name = &tool.name;
-        let description = &tool.description;
-        let input_schema = input_schema_expr(tool, actions, runbooks);
-        quote! { ::mcp::progressive::tool_definition(#name, #description, #input_schema) }
-    });
+    let definitions =
+        args.tools.iter().map(|tool| {
+            let name = &tool.name;
+            let description = &tool.description;
+            let input_schema = input_schema_expr(tool, actions, runbooks);
+            tool.annotations.as_ref().map_or_else(
+            || quote! { ::mcp::progressive::tool_definition(#name, #description, #input_schema) },
+            |annotations| quote! {
+                {
+                    let mut definition =
+                        ::mcp::progressive::tool_definition(#name, #description, #input_schema);
+                    definition.annotations = (#annotations).into();
+                    definition
+                }
+            },
+        )
+        });
     quote! {
         fn list_tools(
             &self,
@@ -717,7 +728,7 @@ fn action_tool_call(action: &ProgressiveAction) -> TokenStream2 {
             let future = #invocation;
             Box::pin(async move {
                 let output = future.await?;
-                ::mcp::progressive::tool_result(output, request.filter.as_deref())
+                ::mcp::progressive::action_tool_result(output, request.filter.as_deref())
             }) as ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpToolResult>>
         }
     }
@@ -732,7 +743,7 @@ fn action_resource_call(action: &ProgressiveAction, uri: &TokenStream2) -> Token
             let future = #invocation;
             Box::pin(async move {
                 let output = future.await?;
-                Ok(::mcp::progressive::json_resource_result(#uri, output))
+                ::mcp::progressive::action_resource_result(#uri, output)
             }) as ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpResourceResult>>
         }
     }
@@ -768,7 +779,7 @@ fn action_template_resource_call(
             let future = #invocation;
             Box::pin(async move {
                 let output = future.await?;
-                Ok(::mcp::progressive::json_resource_result(#uri, output))
+                ::mcp::progressive::action_resource_result(#uri, output)
             }) as ::mcp::server::BoxFuture<::mcp::server::ServerResult<::mcp::McpResourceResult>>
         }
     }
@@ -1438,6 +1449,7 @@ impl syn::parse::Parse for ProgressiveArgs {
 struct ProgressiveToolArg {
     name: LitStr,
     description: LitStr,
+    annotations: Option<Expr>,
     namespaces: Vec<ProgressiveNamespaceArg>,
     runbook_uri_template: Option<LitStr>,
 }
@@ -1448,6 +1460,7 @@ impl ProgressiveToolArg {
         let metas = parser.parse2(tokens)?;
         let mut name = None;
         let mut description = None;
+        let mut annotations = None;
         let mut namespaces = Vec::new();
         let mut runbook_uri_template = None;
         for meta in metas {
@@ -1457,6 +1470,15 @@ impl ProgressiveToolArg {
                 }
                 Meta::NameValue(value) if path_is(&value.path, "description") => {
                     description = Some(lit_str(value.value, "tool description")?);
+                }
+                Meta::NameValue(value) if path_is(&value.path, "annotations") => {
+                    if annotations.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            "duplicate progressive tool `annotations`",
+                        ));
+                    }
+                    annotations = Some(value.value);
                 }
                 Meta::NameValue(value) if path_is(&value.path, "runbook_uri_template") => {
                     runbook_uri_template = Some(lit_str(value.value, "runbook_uri_template")?);
@@ -1485,6 +1507,7 @@ impl ProgressiveToolArg {
                     "progressive tool requires `description = ...`",
                 )
             })?,
+            annotations,
             namespaces,
             runbook_uri_template,
         })
@@ -1591,6 +1614,39 @@ mod tests {
             .err()
             .expect("missing description must fail");
         assert!(error.to_string().contains("requires `description"));
+    }
+
+    #[test]
+    fn accepts_annotation_expressions_and_rejects_duplicates() {
+        let args = syn::parse_str::<ProgressiveArgs>(
+            r#"tool(
+                name = "exec",
+                description = "Exec",
+                annotations = annotations_for("exec")
+            )"#,
+        )
+        .expect("annotation expression");
+        let input = syn::parse_str::<ItemImpl>("impl Server {}").expect("impl");
+        let expanded = expand_progressive_server(&args, input)
+            .expect("expansion")
+            .to_string();
+        assert!(expanded.contains("annotations_for (\"exec\")"));
+
+        let error = syn::parse_str::<ProgressiveArgs>(
+            r#"tool(
+                name = "exec",
+                description = "Exec",
+                annotations = first(),
+                annotations = second()
+            )"#,
+        )
+        .err()
+        .expect("duplicate annotations must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate progressive tool `annotations`")
+        );
     }
 
     #[test]
