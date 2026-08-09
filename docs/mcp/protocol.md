@@ -105,6 +105,51 @@ Hosted OAuth persistence remains in the MCP-owned database. Historical migration
 `0001_streamable_http_sessions.sql` is immutable migration history, but its session table
 is inert because the modern protocol has no session runtime.
 
+### Resource-Owner OIDC
+
+The optional `oauth-resource-owner-oidc` feature provides a provider-neutral, one-shot
+implementation of `OAuthResourceOwnerAuthenticator`. It authenticates exactly one hosted
+authorization transaction and creates no reusable application session. The SQL variants
+are `oauth-resource-owner-oidc-sqlite` and `oauth-resource-owner-oidc-postgres`; each also
+enables the corresponding hosted authorization-store backend.
+
+`OidcResourceOwnerAuthenticator::discover` validates exact issuer and local endpoint
+configuration, discovers a redirect-free Authorization Code provider, loads bounded
+JWKS, and selects `client_secret_basic`, `client_secret_post`, or `none` according to the
+registered client and advertised metadata. HTTPS is required by default. The explicit
+`OidcEndpointPolicy::LoopbackTest` exception permits HTTP and non-Secure cookies only on
+loopback hosts. Every discovery, JWKS, and token request has a validated total timeout;
+the default is ten seconds and callers may select a nonzero override no greater than one
+minute. The authenticator applies that bound itself rather than trusting the supplied
+Reqwest builder.
+
+The hosted server generates its normal browser correlation and sets it through the
+authenticator's additive cookie directive. OIDC uses one transaction-specific host-only,
+HTTP-only, Lax, root-path cookie, so concurrent authorization tabs cannot overwrite one
+another. Only SHA-256 state and correlation digests enter persistence. Login sends the
+upstream provider state, nonce, and S256 challenge; callback atomically claims the attempt
+before exchanging the code with the exact callback and verifier. ID-token mapping occurs
+only after asymmetric signature, `kid`, issuer, audience/`azp`, time, nonce, subject, and
+optional `at_hash` verification.
+
+`OidcPrincipalMapper` receives only the verified provider-neutral identity and claims.
+Its principal, denial, or unavailability result maps directly into hosted authenticator
+semantics. A successful callback reconstructs the configured local continuation from the
+parent transaction ID. Resume reads the completed OIDC principal without consuming it and
+returns the cookie correlation. The hosted authorization store then atomically validates
+and consumes that correlation while attaching the principal or promoting the dynamic
+client. False outcomes never proceed to consent and leave no partially committed hosted
+authentication. Only after that transaction commits does the server invoke an additive
+best-effort authenticator finalization hook and clear the cookie. OIDC finalization marks
+its completed attempt consumed; if it fails, the already-consumed hosted correlation
+still makes the flow one-shot and normal cleanup removes the residual OIDC row.
+
+`OidcResourceOwnerStore` is a separate object-safe persistence seam with a process-local
+reference store. `SqliteOidcResourceOwnerStore` and `PostgresOidcResourceOwnerStore` accept
+the caller's existing MCP pool and run the same embedded MCP migrator. Migration `0004`
+adds the digest-only attempt table with a cascading parent transaction foreign key;
+expired attempts support bounded cleanup.
+
 ## Unsupported Areas
 
 The crate explicitly does not implement:
@@ -125,6 +170,7 @@ Run the revision suite and all generic integration tests:
 
 ```bash
 cargo test -p mcp --test spec
+cargo test -p mcp --test oauth_resource_owner_oidc --all-features
 cargo test -p mcp --tests --all-features
 ```
 
