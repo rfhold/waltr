@@ -53,6 +53,9 @@ capability maps.
 Tool results retain their raw wire value and also expose ordered borrowed text, image, and
 unknown extension blocks. Parsing rejects malformed known blocks while leaving image decoding,
 MIME policy, and payload validation to the consuming application.
+Under MCP `2026-07-28`, `structuredContent` may be any JSON value. The protocol recommends also
+providing serialized structured JSON in a text content block for compatibility; progressive
+servers apply the synchronization policy documented in [progressive.md](progressive.md).
 
 Roots are retained as a deprecated client feature. A server requests roots through an
 `input_required` result; the client retries the originating `tools/call`, `prompts/get`,

@@ -347,7 +347,7 @@ pub fn tool_result(output: Value, filter: Option<&str>) -> ServerResult<McpToolR
 /// Convert a typed progressive action output into an MCP tool result.
 ///
 /// JSON output retains the behavior of [`tool_result`]. Semantic MCP output is validated and,
-/// when filtered, only its `structuredContent` is replaced.
+/// when successfully filtered, its structured and text content are synchronized.
 ///
 /// # Errors
 ///
@@ -360,6 +360,9 @@ pub fn action_tool_result(
         ProgressiveActionOutput::Json(output) => tool_result(output, filter),
         ProgressiveActionOutput::Tool(mut result) => {
             validate_tool_result(&result.raw)?;
+            if result.raw.get("isError").and_then(Value::as_bool) == Some(true) {
+                return Ok(result);
+            }
             if let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) {
                 let structured = result
                     .raw
@@ -371,10 +374,41 @@ pub fn action_tool_result(
                         )
                     })?;
                 let filtered = apply_filter(structured, filter)?;
-                let filtered = match filtered {
-                    Value::Object(_) => filtered,
-                    filtered => json!({ "result": filtered }),
-                };
+                let text = serde_json::to_string(&filtered).map_err(|error| {
+                    ServerError::invalid_params(format!(
+                        "cannot serialize filtered MCP tool result: {error}"
+                    ))
+                })?;
+                let content = result
+                    .raw
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| {
+                        ServerError::invalid_params("MCP tool result `content` must be an array")
+                    })?;
+                let mut synchronized = Vec::with_capacity(content.len().max(1));
+                let mut kept_text = false;
+                for mut block in std::mem::take(content) {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        if kept_text {
+                            continue;
+                        }
+                        block
+                            .as_object_mut()
+                            .ok_or_else(|| {
+                                ServerError::invalid_params(
+                                    "MCP tool result content block must be an object",
+                                )
+                            })?
+                            .insert("text".to_owned(), Value::String(text.clone()));
+                        kept_text = true;
+                    }
+                    synchronized.push(block);
+                }
+                if !kept_text {
+                    synchronized.insert(0, json!({ "type": "text", "text": text }));
+                }
+                *content = synchronized;
                 result.raw["structuredContent"] = filtered;
                 validate_tool_result(&result.raw)?;
             }
@@ -428,7 +462,7 @@ pub fn runbook_resource_result(uri: String, markdown: String) -> McpResourceResu
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn json_resource_result(uri: String, value: Value) -> McpResourceResult {
-    McpResourceResult::text(uri, "application/json", text_for_value(&value))
+    McpResourceResult::text(uri, "application/json", value.to_string())
 }
 
 /// Convert a typed progressive action output into an MCP JSON resource result.
@@ -708,14 +742,6 @@ fn validate_tool_result(raw: &Value) -> ServerResult<()> {
     {
         return Err(ServerError::invalid_params(
             "MCP tool result `isError` must be a boolean",
-        ));
-    }
-    if object
-        .get("structuredContent")
-        .is_some_and(|value| !value.is_object())
-    {
-        return Err(ServerError::invalid_params(
-            "MCP tool result `structuredContent` must be an object",
         ));
     }
     Ok(())

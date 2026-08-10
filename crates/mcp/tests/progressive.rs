@@ -290,34 +290,130 @@ fn progressive_tool_results_keep_text_exact_and_structure_non_objects() {
 }
 
 #[test]
-fn progressive_semantic_results_preserve_envelopes_and_filter_only_structure() {
+fn progressive_semantic_results_preserve_unfiltered_envelopes_and_json_values() {
+    for structured_content in [
+        json!({ "ok": true }),
+        json!([1, 2]),
+        json!("value"),
+        json!(42),
+        json!(true),
+        json!(null),
+    ] {
+        let raw = json!({
+            "content": [{ "type": "text", "text": "original" }],
+            "structuredContent": structured_content,
+            "_meta": { "trace": "abc" },
+            "x-extension": true
+        });
+        let result = mcp::progressive::action_tool_result(McpToolResult::new(raw.clone()), None)
+            .expect("semantic tool result");
+        assert_eq!(result.raw, raw);
+    }
+}
+
+#[test]
+fn progressive_semantic_filters_synchronize_text_and_preserve_extensions() {
     let raw = json!({
         "content": [
-            { "type": "text", "text": "original text" },
-            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }
+            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png", "x-image": 1 },
+            { "type": "text", "text": "original text", "x-text": { "preserved": true } },
+            { "type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav", "x-audio": 2 },
+            { "type": "text", "text": "stale text", "x-stale": true },
+            { "type": "resource", "resource": { "uri": "test://item", "text": "body" } }
         ],
         "structuredContent": { "items": [{ "id": 1 }, { "id": 2 }] },
-        "isError": true,
+        "isError": false,
         "_meta": { "trace": "abc" },
         "x-extension": [1, 2, 3]
     });
-    let result = mcp::progressive::action_tool_result(McpToolResult::new(raw.clone()), None)
-        .expect("semantic tool result");
-    assert_eq!(result.raw, raw);
-
     let result =
         mcp::progressive::action_tool_result(McpToolResult::new(raw.clone()), Some(".items[].id"))
             .expect("filtered semantic result");
-    assert_eq!(result.raw["structuredContent"], json!({ "result": [1, 2] }));
-    assert_eq!(result.raw["content"], raw["content"]);
-    assert_eq!(result.raw["isError"], true);
+    assert_eq!(result.raw["structuredContent"], json!([1, 2]));
+    assert_eq!(
+        result.raw["content"],
+        json!([
+            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png", "x-image": 1 },
+            { "type": "text", "text": "[1,2]", "x-text": { "preserved": true } },
+            { "type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav", "x-audio": 2 },
+            { "type": "resource", "resource": { "uri": "test://item", "text": "body" } }
+        ])
+    );
+    assert_eq!(result.raw["isError"], false);
     assert_eq!(result.raw["_meta"], raw["_meta"]);
     assert_eq!(result.raw["x-extension"], raw["x-extension"]);
 
+    let no_text = json!({
+        "content": [
+            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" },
+            { "type": "audio", "data": "YXVkaW8=", "mimeType": "audio/wav" }
+        ],
+        "structuredContent": { "value": "quoted" }
+    });
     let result =
-        mcp::progressive::action_tool_result(McpToolResult::new(raw), Some(".items[0].id"))
-            .expect("scalar semantic filter");
-    assert_eq!(result.raw["structuredContent"], json!({ "result": 1 }));
+        mcp::progressive::action_tool_result(McpToolResult::new(no_text.clone()), Some(".value"))
+            .expect("filtered semantic result without text");
+    assert_eq!(result.raw["structuredContent"], "quoted");
+    assert_eq!(result.raw["content"][0]["text"], "\"quoted\"");
+    assert_eq!(result.raw["content"][1], no_text["content"][0]);
+    assert_eq!(result.raw["content"][2], no_text["content"][1]);
+}
+
+#[test]
+fn progressive_semantic_filters_store_every_exact_json_result_shape() {
+    for filtered in [
+        json!({ "ok": true }),
+        json!([1, 2]),
+        json!("value"),
+        json!(42),
+        json!(true),
+        json!(null),
+    ] {
+        let result = mcp::progressive::action_tool_result(
+            McpToolResult::new(json!({
+                "content": [{ "type": "text", "text": "stale" }],
+                "structuredContent": { "value": filtered }
+            })),
+            Some(".value"),
+        )
+        .expect("filtered semantic value");
+        assert_eq!(result.raw["structuredContent"], filtered);
+        assert_eq!(
+            result.raw["content"][0]["text"],
+            serde_json::to_string(&filtered).expect("JSON value")
+        );
+    }
+
+    let zero = mcp::progressive::action_tool_result(
+        McpToolResult::new(json!({
+            "content": [],
+            "structuredContent": []
+        })),
+        Some(".[]"),
+    )
+    .expect("zero filter outputs");
+    assert_eq!(zero.raw["structuredContent"], Value::Null);
+    assert_eq!(zero.raw["content"][0]["text"], "null");
+}
+
+#[test]
+fn progressive_semantic_errors_skip_filters_and_preserve_exact_envelopes() {
+    let raw = json!({
+        "content": [
+            { "type": "text", "text": "release not found", "x-text": true },
+            { "type": "text", "text": "detail" },
+            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }
+        ],
+        "isError": true,
+        "_meta": { "kind": "not-found" },
+        "x-error": { "preserved": true }
+    });
+    let result = mcp::progressive::action_tool_result(
+        McpToolResult::new(raw.clone()),
+        Some("invalid[filter"),
+    )
+    .expect("semantic errors skip filters");
+    assert_eq!(result.raw, raw);
 }
 
 #[test]
@@ -329,7 +425,6 @@ fn progressive_semantic_results_reject_invalid_shapes_and_filter_fan_out() {
         json!({ "content": [{}] }),
         json!({ "content": [{ "type": 1 }] }),
         json!({ "content": [], "isError": "yes" }),
-        json!({ "content": [], "structuredContent": [] }),
     ];
     for raw in invalid {
         let error = mcp::progressive::action_tool_result(McpToolResult::new(raw), None)
@@ -344,6 +439,16 @@ fn progressive_semantic_results_reject_invalid_shapes_and_filter_fan_out() {
     .expect_err("filter requires structured content");
     assert!(format!("{missing_structure:?}").contains("without `structuredContent`"));
 
+    let maximum = mcp::progressive::tool_result(json!((0..256).collect::<Vec<_>>()), Some(".[]"))
+        .expect("256 filter outputs are allowed");
+    assert_eq!(
+        maximum.raw["structuredContent"]["result"]
+            .as_array()
+            .expect("legacy wrapped outputs")
+            .len(),
+        256
+    );
+
     let outputs = (0..257).collect::<Vec<_>>();
     let overflow = mcp::progressive::tool_result(json!(outputs), Some(".[]"))
         .expect_err("fan-out must be bounded");
@@ -352,6 +457,12 @@ fn progressive_semantic_results_reject_invalid_shapes_and_filter_fan_out() {
 
 #[test]
 fn progressive_semantic_resource_conversion_requires_non_error_structure() {
+    let scalar = mcp::progressive::json_resource_result(
+        "test://legacy".to_owned(),
+        json!("quoted legacy JSON"),
+    );
+    assert_eq!(scalar.raw["contents"][0]["text"], "\"quoted legacy JSON\"");
+
     let result = mcp::progressive::action_resource_result(
         "test://semantic".to_owned(),
         McpToolResult::new(json!({
@@ -360,7 +471,31 @@ fn progressive_semantic_resource_conversion_requires_non_error_structure() {
         })),
     )
     .expect("semantic resource result");
-    assert!(result.raw.to_string().contains("\\\"ok\\\": true"));
+    assert_eq!(result.raw["contents"][0]["text"], "{\"ok\":true}");
+
+    for value in [
+        json!([1, 2]),
+        json!("quoted"),
+        json!(42),
+        json!(true),
+        json!(null),
+    ] {
+        let result = mcp::progressive::action_resource_result(
+            "test://semantic".to_owned(),
+            McpToolResult::new(json!({
+                "content": [],
+                "structuredContent": value
+            })),
+        )
+        .expect("semantic scalar resource result");
+        let text = result.raw["contents"][0]["text"]
+            .as_str()
+            .expect("resource text");
+        assert_eq!(
+            serde_json::from_str::<Value>(text).expect("valid JSON"),
+            value
+        );
+    }
 
     for raw in [
         json!({ "content": [] }),
@@ -412,6 +547,8 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     );
     let releases_tool = tool_named(&tools.body, "releases");
     let policy_tool = tool_named(&tools.body, "policy");
+    assert!(releases_tool.get("outputSchema").is_none());
+    assert!(policy_tool.get("outputSchema").is_none());
     assert_eq!(releases_tool["annotations"]["readOnlyHint"], true);
     assert_eq!(releases_tool["annotations"]["destructiveHint"], false);
     assert!(policy_tool.get("annotations").is_none());
@@ -567,11 +704,9 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
         json!({ "action": "semantic", "filter": ".items[0].id" }),
     )
     .await?;
-    assert_eq!(
-        semantic_filtered["structuredContent"],
-        json!({ "result": "v1.4.2" })
-    );
-    assert_eq!(semantic_filtered["content"], semantic["content"]);
+    assert_eq!(semantic_filtered["structuredContent"], json!("v1.4.2"));
+    assert_eq!(semantic_filtered["content"][0]["text"], "\"v1.4.2\"");
+    assert_eq!(semantic_filtered["content"][1], semantic["content"][1]);
     assert_eq!(semantic_filtered["_meta"], semantic["_meta"]);
 
     let semantic_error = call_tool(
@@ -582,6 +717,14 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     .await?;
     assert_eq!(semantic_error["isError"], true);
     assert!(semantic_error["content"][0]["text"] == "release not found");
+
+    let filtered_semantic_error = call_tool(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "semantic-error", "filter": "invalid[filter" }),
+    )
+    .await?;
+    assert_eq!(filtered_semantic_error, semantic_error);
 
     let semantic_invalid = call_tool_response(
         &server.endpoint,

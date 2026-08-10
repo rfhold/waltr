@@ -15,7 +15,7 @@
 | `subscriptions.rs` | Acknowledgment ordering, supported filter subsets, subscription IDs, graceful completion, and required filters. |
 | `server/` | Complete tools, prompts, resources, and resource-template payloads, errors, annotations, metadata, and cursors. |
 | `server_utilities/` | Typed completion, pagination propagation/errors, exact request logging, progress, and request metadata. |
-| `common/` | Active content block wire shapes, annotations, metadata, and formatting helpers. |
+| `common/` | Active content block wire shapes, arbitrary JSON structured content, annotations, metadata, and formatting helpers. |
 | `schema.rs` | Capabilities, extension preservation, JSON Schemas, icons, annotations, tool metadata, and prompt argument titles. |
 | `oauth_protocol.rs` | Metadata policy, redirect parsing, CIMD/DCR normalization, secret redaction, bearer challenges, and discovery URL construction. |
 | `unsupported.rs` | Capability omission and explicit rejection of unsupported methods and non-roots MRTR. |
