@@ -18,7 +18,7 @@ use crate::{
     Error, McpAuthorizationError, McpTracePropagation, Result,
     client::transport::{
         McpBearerProvider, McpBearerProviderError, McpTransport, McpTransportConfig,
-        McpTransportError, TransportInbound,
+        McpTransportError, McpTransportLimits, TransportInbound,
     },
     protocol::{
         JsonRpcId, JsonRpcInbound, JsonRpcNotification, cancellation_params, json_rpc_notification,
@@ -67,23 +67,27 @@ impl McpConnection {
         transport: McpTransportConfig,
         handler: Arc<dyn McpConnectionHandler>,
         active_subscriptions: Arc<RwLock<HashSet<JsonRpcId>>>,
+        limits: McpTransportLimits,
     ) -> Result<Arc<Self>> {
         Self::start_with_optional_bearer_provider(
             server_name,
             transport,
             handler,
             active_subscriptions,
+            limits,
             None,
         )
         .await
     }
 
     /// Start a connection with a dynamic Streamable HTTP bearer provider.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_bearer_provider(
         server_name: String,
         transport: McpTransportConfig,
         handler: Arc<dyn McpConnectionHandler>,
         active_subscriptions: Arc<RwLock<HashSet<JsonRpcId>>>,
+        limits: McpTransportLimits,
         bearer_provider: Arc<dyn McpBearerProvider>,
     ) -> Result<Arc<Self>> {
         Self::start_with_optional_bearer_provider(
@@ -91,30 +95,36 @@ impl McpConnection {
             transport,
             handler,
             active_subscriptions,
+            limits,
             Some(bearer_provider),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_with_optional_bearer_provider(
         server_name: String,
         transport: McpTransportConfig,
         handler: Arc<dyn McpConnectionHandler>,
         active_subscriptions: Arc<RwLock<HashSet<JsonRpcId>>>,
+        limits: McpTransportLimits,
         bearer_provider: Option<Arc<dyn McpBearerProvider>>,
     ) -> Result<Arc<Self>> {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let transport = match bearer_provider {
             Some(provider) => {
-                McpTransport::start_with_bearer_provider(
+                McpTransport::start_with_bearer_provider_and_limits(
                     server_name,
                     transport,
                     inbound_tx,
                     provider,
+                    limits,
                 )
                 .await?
             }
-            None => McpTransport::start(server_name, transport, inbound_tx).await?,
+            None => {
+                McpTransport::start_with_limits(server_name, transport, inbound_tx, limits).await?
+            }
         };
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
         let dispatch_cancellation = CancellationToken::new();

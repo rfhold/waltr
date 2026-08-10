@@ -2,7 +2,7 @@ use std::{process::Stdio, sync::Arc};
 
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
     sync::Mutex,
 };
@@ -42,6 +42,7 @@ impl StdioTransport {
         command: String,
         args: Vec<String>,
         inbound: InboundSender,
+        max_message_bytes: usize,
     ) -> Result<Self> {
         let mut child = Command::new(&command)
             .args(&args)
@@ -86,31 +87,7 @@ impl StdioTransport {
                 }
             });
         }
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => match parse_json_rpc_str(&line) {
-                        Ok(message) => drop(inbound.send(TransportInbound::Message(message))),
-                        Err(error) => drop(inbound.send(TransportInbound::Disconnected(format!(
-                            "invalid MCP stdio JSON-RPC message: {error}"
-                        )))),
-                    },
-                    Ok(None) => {
-                        drop(inbound.send(TransportInbound::Disconnected(
-                            "MCP stdio server closed stdout".to_owned(),
-                        )));
-                        break;
-                    }
-                    Err(error) => {
-                        drop(inbound.send(TransportInbound::Disconnected(format!(
-                            "failed to read MCP stdio stdout: {error}"
-                        ))));
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(read_stdout(stdout, inbound, max_message_bytes));
         Ok(Self {
             child: Arc::new(Mutex::new(child)),
             stdin: Arc::new(Mutex::new(Some(stdin))),
@@ -163,5 +140,103 @@ impl StdioTransport {
         }
         drop(child);
         Ok(())
+    }
+}
+
+async fn read_stdout(
+    stdout: tokio::process::ChildStdout,
+    inbound: InboundSender,
+    max_message_bytes: usize,
+) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        match read_line_bounded(&mut reader, max_message_bytes).await {
+            Ok(None) => {
+                drop(inbound.send(TransportInbound::Disconnected(
+                    "MCP stdio server closed stdout".to_owned(),
+                )));
+                break;
+            }
+            Ok(Some(line)) => {
+                let line = match std::str::from_utf8(&line) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        drop(inbound.send(TransportInbound::Disconnected(format!(
+                            "invalid UTF-8 in MCP stdio message: {error}"
+                        ))));
+                        break;
+                    }
+                };
+                match parse_json_rpc_str(line) {
+                    Ok(message) => drop(inbound.send(TransportInbound::Message(message))),
+                    Err(error) => drop(inbound.send(TransportInbound::Disconnected(format!(
+                        "invalid MCP stdio JSON-RPC message: {error}"
+                    )))),
+                }
+            }
+            Err(error) => {
+                drop(inbound.send(TransportInbound::Disconnected(format!(
+                    "failed to read MCP stdio stdout: {error}"
+                ))));
+                break;
+            }
+        }
+    }
+}
+
+async fn read_line_bounded<R>(
+    reader: &mut R,
+    max_message_bytes: usize,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if line.len().saturating_add(newline) > max_message_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "MCP stdio message exceeds the configured limit",
+                ));
+            }
+            line.extend_from_slice(&available[..newline]);
+            reader.consume(newline + 1);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+        if line.len().saturating_add(available.len()) > max_message_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MCP stdio message exceeds the configured limit",
+            ));
+        }
+        let consumed = available.len();
+        line.extend_from_slice(available);
+        reader.consume(consumed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_line_reader_accepts_limit_and_rejects_overflow() {
+        let mut accepted = BufReader::new(&b"1234\nrest"[..]);
+        assert_eq!(
+            read_line_bounded(&mut accepted, 4).await.unwrap(),
+            Some(b"1234".to_vec())
+        );
+
+        let mut rejected = BufReader::with_capacity(2, &b"12345\n"[..]);
+        let error = read_line_bounded(&mut rejected, 4).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

@@ -58,7 +58,10 @@ pub use resource::{
     format_resource_result, parse_completion_result, parse_resource_definition,
     parse_resource_template_definition,
 };
-pub use tool::{McpToolDefinition, format_tool_result, parse_tool_definition};
+pub use tool::{
+    McpToolContent, McpToolDefinition, McpToolResultContent, McpToolResultContentError,
+    format_tool_result, parse_tool_definition, parse_tool_result_content,
+};
 pub use trace::McpTracePropagation;
 pub use types::{
     McpCompletionReference, McpCompletionRequest, McpIcon, McpIconTheme, McpProgressNotification,

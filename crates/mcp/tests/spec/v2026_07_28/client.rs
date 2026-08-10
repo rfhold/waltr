@@ -15,7 +15,9 @@ use axum::{
 };
 use mcp::{
     McpRoot, McpToolCall, McpToolDefinition, McpToolList, McpToolResult,
-    client::{McpClient, McpClientHandler, McpClientOptions, McpTransportConfig},
+    client::{
+        McpClient, McpClientHandler, McpClientOptions, McpTransportConfig, McpTransportLimits,
+    },
     protocol::{MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION_META_KEY},
     server::{
         BoxFuture, ServerCapabilities, ServerContext, ServerError, ServerHandler, ServerInfo,
@@ -154,6 +156,56 @@ struct InteropMrtrServer {
     calls: AtomicUsize,
 }
 
+struct LargeImageServer;
+
+impl ServerHandler for LargeImageServer {
+    fn server_info(&self) -> ServerInfo {
+        ServerInfo::new("large-image-spec", "1.0.0")
+    }
+
+    fn capabilities(&self) -> ServerCapabilities {
+        ServerCapabilities::new().tools()
+    }
+
+    fn list_tools(
+        &self,
+        _cursor: Option<String>,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<McpToolList>> {
+        Box::pin(async {
+            Ok(McpToolList {
+                tools: vec![McpToolDefinition {
+                    name: "image".to_owned(),
+                    title: None,
+                    description: None,
+                    icons: Vec::new(),
+                    input_schema: json!({ "type": "object" }),
+                    output_schema: None,
+                    annotations: None,
+                    meta: None,
+                }],
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn call_tool(
+        &self,
+        _call: McpToolCall,
+        _context: ServerContext,
+    ) -> BoxFuture<ServerResult<McpToolResult>> {
+        Box::pin(async {
+            Ok(McpToolResult::new(json!({
+                "content": [{
+                    "type": "image",
+                    "data": "a".repeat(96 * 1024),
+                    "mimeType": "image/png"
+                }]
+            })))
+        })
+    }
+}
+
 impl ServerHandler for InteropMrtrServer {
     fn server_info(&self) -> ServerInfo {
         ServerInfo::new("mrtr-interop-spec", "1.0.0")
@@ -237,6 +289,33 @@ async fn client_and_server_interoperate_across_roots_mrtr_retry() -> mcp::Result
         .call_tool(McpToolCall::new("needs-roots", json!({})), cancellation)
         .await?;
     assert_eq!(result.format_text(), "interoperable");
+    client.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_transport_receives_large_sse_tool_result() -> mcp::Result<()> {
+    let server = crate::spec::support::SpecServer::start(Arc::new(LargeImageServer)).await?;
+    let cancellation = CancellationToken::new();
+    let client = McpClient::connect_with_transport_limits(
+        "large-image-spec",
+        McpTransportConfig::StreamableHttp {
+            endpoint: server.endpoint(),
+            bearer_token: None,
+        },
+        Arc::new(RootsHandler),
+        McpClientOptions::new("spec-client", "1.0.0", Duration::from_secs(2)),
+        McpTransportLimits::new(256 * 1024, 256 * 1024),
+        cancellation.clone(),
+    )
+    .await?;
+    let result = client
+        .call_tool(McpToolCall::new("image", json!({})), cancellation)
+        .await?;
+    assert_eq!(
+        result.raw["content"][0]["data"].as_str().unwrap().len(),
+        96 * 1024
+    );
     client.shutdown().await?;
     Ok(())
 }

@@ -8,7 +8,10 @@ use crate::{
         format_resource_result, parse_completion_result, parse_resource_definition,
         parse_resource_template_definition,
     },
-    tool::{McpToolDefinition, format_tool_result, parse_tool_definition},
+    tool::{
+        McpToolDefinition, McpToolResultContent, McpToolResultContentError, format_tool_result,
+        parse_tool_definition, parse_tool_result_content,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +319,17 @@ impl McpToolResult {
     #[must_use]
     pub fn format_text(&self) -> String {
         format_tool_result(&self.raw)
+    }
+
+    /// Parse ordered tool-result content without copying its payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the result or a recognized content block is malformed.
+    pub fn content(
+        &self,
+    ) -> std::result::Result<McpToolResultContent<'_>, McpToolResultContentError> {
+        parse_tool_result_content(&self.raw)
     }
 }
 

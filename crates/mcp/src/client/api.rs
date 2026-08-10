@@ -25,7 +25,10 @@ use crate::{
 
 use super::{
     connection::McpConnection,
-    transport::{McpBearerProvider, McpBearerProviderError, McpTransportConfig, McpTransportError},
+    transport::{
+        McpBearerProvider, McpBearerProviderError, McpTransportConfig, McpTransportError,
+        McpTransportLimits,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -146,14 +149,44 @@ impl McpClient {
         options: McpClientOptions,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
+        Self::connect_with_transport_limits(
+            server_name,
+            transport,
+            handler,
+            options,
+            McpTransportLimits::default(),
+            cancellation_token,
+        )
+        .await
+    }
+
+    /// Connect with explicit receive limits, discover capabilities, and return a typed client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when transport startup or MCP discovery fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_transport_limits(
+        server_name: impl Into<String>,
+        transport: McpTransportConfig,
+        handler: Arc<dyn McpClientHandler>,
+        options: McpClientOptions,
+        transport_limits: McpTransportLimits,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
         let active_subscriptions = Arc::new(StdRwLock::new(HashSet::new()));
         let adapter = Arc::new(ClientHandlerAdapter {
             inner: Arc::clone(&handler),
             active_subscriptions: Arc::clone(&active_subscriptions),
         });
-        let connection =
-            McpConnection::start(server_name.into(), transport, adapter, active_subscriptions)
-                .await?;
+        let connection = McpConnection::start(
+            server_name.into(),
+            transport,
+            adapter,
+            active_subscriptions,
+            transport_limits,
+        )
+        .await?;
         Self::discover(connection, handler, options, cancellation_token).await
     }
 
@@ -173,6 +206,35 @@ impl McpClient {
         options: McpClientOptions,
         cancellation_token: CancellationToken,
     ) -> Result<Self> {
+        Self::connect_with_bearer_provider_and_transport_limits(
+            server_name,
+            transport,
+            bearer_provider,
+            handler,
+            options,
+            McpTransportLimits::default(),
+            cancellation_token,
+        )
+        .await
+    }
+
+    /// Connect using a dynamic bearer provider and explicit receive limits.
+    ///
+    /// The provider supersedes the static token in Streamable HTTP configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when token resolution, transport startup, or discovery fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_bearer_provider_and_transport_limits(
+        server_name: impl Into<String>,
+        transport: McpTransportConfig,
+        bearer_provider: Arc<dyn McpBearerProvider>,
+        handler: Arc<dyn McpClientHandler>,
+        options: McpClientOptions,
+        transport_limits: McpTransportLimits,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self> {
         let active_subscriptions = Arc::new(StdRwLock::new(HashSet::new()));
         let adapter = Arc::new(ClientHandlerAdapter {
             inner: Arc::clone(&handler),
@@ -183,6 +245,7 @@ impl McpClient {
             transport,
             adapter,
             active_subscriptions,
+            transport_limits,
             bearer_provider,
         )
         .await?;
