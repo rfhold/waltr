@@ -108,8 +108,8 @@ fn timeline_content_to_proto(content: TimelineContent) -> Result<ProtoTimelineCo
             timeline_content::Content::ToolResult(ToolResultTimelineContent {
                 id: result.call_id,
                 name: result.name,
-                content: result.content,
-                error: false,
+                content: result.content.to_string(),
+                error: result.is_error,
             })
         }
         TimelineContent::ExternalRequest { request } => {
@@ -190,4 +190,40 @@ fn with_channel_filter(mut query: TimelineQuery, channels: Vec<TimelineChannel>)
         query.channels = Some(channels);
     }
     query
+}
+
+#[cfg(test)]
+mod tests {
+    use waltr::grpc::waltr::session::v1::timeline_content;
+    use waltr_agent::{
+        TimelineContent, ToolResult, ToolResultContent, ToolResultContentBlock, ToolResultImage,
+    };
+
+    use super::timeline_content_to_proto;
+
+    #[test]
+    fn tool_result_projection_omits_image_data_and_preserves_error_state() {
+        let result = ToolResult::from_content(
+            "call-image",
+            "camera",
+            ToolResultContent::from_blocks(vec![ToolResultContentBlock::Image(
+                ToolResultImage::new("iVBORw0KGgo=", "image/png").expect("valid image"),
+            )])
+            .expect("bounded content"),
+            true,
+        );
+
+        let projected = timeline_content_to_proto(TimelineContent::ToolResult { result })
+            .expect("projected tool result")
+            .content
+            .expect("timeline content");
+        let timeline_content::Content::ToolResult(projected) = projected else {
+            panic!("expected tool result projection");
+        };
+
+        assert!(projected.error);
+        assert!(projected.content.contains("image/png"));
+        assert!(projected.content.contains("8 bytes"));
+        assert!(!projected.content.contains("iVBOR"));
+    }
 }

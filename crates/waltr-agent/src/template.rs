@@ -355,11 +355,9 @@ pub(crate) async fn render_tool_template_reference(
     match before_outcome {
         Ok(HookOutcome::Continue) => {}
         Ok(HookOutcome::ReplaceToolResult(result)) => {
-            return Ok(TemplateReferenceRender::Rendered(template_tool_result(
-                &result.name,
-                &arguments,
-                &result.content,
-            )));
+            return Ok(TemplateReferenceRender::Rendered(
+                render_template_tool_result(&result, &arguments),
+            ));
         }
         Ok(HookOutcome::Suspend(suspension)) => {
             return Ok(TemplateReferenceRender::Suspend(suspension));
@@ -400,9 +398,9 @@ pub(crate) async fn render_tool_template_reference(
             .with_session_context(ctx.session_id.into(), ctx.turn),
         )
         .await;
-    let (mut result, result_error) = match result {
-        Ok(result) => (result, false),
-        Err(error) => (error_tool_result(&call, &error), true),
+    let mut result = match result {
+        Ok(result) => result,
+        Err(error) => error_tool_result(&call, &error),
     };
     let after_outcome = {
         let middleware_chain = ctx.middleware_chain;
@@ -419,21 +417,24 @@ pub(crate) async fn render_tool_template_reference(
         middleware_chain.after_tool_call(&mut result_ctx).await
     };
     match after_outcome {
-        Ok(HookOutcome::Continue) => {
-            let rendered = if result_error {
-                template_tool_error_result(name, &arguments, &result.content)
-            } else {
-                template_tool_result(name, &arguments, &result.content)
-            };
-            Ok(TemplateReferenceRender::Rendered(rendered))
-        }
+        Ok(HookOutcome::Continue) => Ok(TemplateReferenceRender::Rendered(
+            render_template_tool_result(&result, &arguments),
+        )),
         Ok(HookOutcome::ReplaceToolResult(result)) => Ok(TemplateReferenceRender::Rendered(
-            template_tool_result(&result.name, &arguments, &result.content),
+            render_template_tool_result(&result, &arguments),
         )),
         Ok(HookOutcome::Suspend(suspension)) => Ok(TemplateReferenceRender::Suspend(suspension)),
         Err(error) => Ok(TemplateReferenceRender::Rendered(
             template_tool_error_result(name, &arguments, error),
         )),
+    }
+}
+
+fn render_template_tool_result(result: &ToolResult, arguments: &Value) -> String {
+    if result.is_error {
+        template_tool_error_result(&result.name, arguments, &result.content)
+    } else {
+        template_tool_result(&result.name, arguments, &result.content)
     }
 }
 
@@ -811,6 +812,7 @@ fn error_tool_result(call: &ToolCall, error: &LlmError) -> ToolResult {
         call.name.clone(),
         format!("Tool error: {error}\nArguments: {}", call.arguments),
     )
+    .with_error()
 }
 
 fn template_runtime_error(error: impl std::fmt::Display) -> LlmError {
@@ -833,4 +835,24 @@ fn escape_xml_text(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::ToolResult;
+
+    use super::render_template_tool_result;
+
+    #[test]
+    fn structured_tool_error_uses_the_error_template() {
+        let result = ToolResult::new("call-1", "camera", "bad <snapshot>").with_error();
+
+        let rendered = render_template_tool_result(&result, &json!({ "entity": "camera.front" }));
+
+        assert!(rendered.contains("status=\"error\""));
+        assert!(rendered.contains("bad &lt;snapshot&gt;"));
+        assert!(!rendered.contains("bad <snapshot>"));
+    }
 }

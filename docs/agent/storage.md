@@ -24,7 +24,7 @@ Agent storage persists durable sessions for `crates/waltr-agent/`. A session is 
 | `SessionJournalEvent` | Internal journal entry for prompts, provider requests, provider metadata, middleware state, suspensions, turn finishes, and lifecycle records. |
 | `SessionSnapshot` | Reconstructed turn state derived from the journal for resume decisions and provider replay. |
 | `ExternalRequest` | Pending host interaction such as a permission decision or question answer. |
-| `RequestRecord` | Canonical and projected provider request data recorded before dispatch. |
+| `RequestRecord` | Canonical and projected provider request data recorded before dispatch. Inline tool-result images are redacted to safe metadata in these audit records. |
 | `MiddlewareState` | Namespaced durable middleware state. |
 
 ## Store Contract
@@ -67,6 +67,8 @@ Durable runs journal data before external side effects where possible:
 6. Loaded records derive snapshots from the journal before making resume decisions.
 
 Crash recovery is retry-the-turn. The provider request is durable before dispatch, but parser progress inside an in-flight provider stream is not a durable checkpoint.
+
+Provider-neutral tool results may contain bounded inline images so a resumed session can replay them to the model. Request audit records do not duplicate that Base64: canonical records retain media type, decoded size, and SHA-256 digest, while projected provider requests replace native Base64 and data URLs with redacted metadata. Public server timeline conversion uses the same safe text projection and never returns inline image data.
 
 ## Resume Inputs
 

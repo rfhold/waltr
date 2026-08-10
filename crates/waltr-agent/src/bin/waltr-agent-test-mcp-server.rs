@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use mcp::{
     McpAccessToken, McpCompletionRequest, McpPrincipalId, McpPromptArgument, McpPromptDefinition,
@@ -121,6 +122,8 @@ impl EchoMarkerServer {
     )]
     #[tool(name = "emit_log_marker", definition = emit_log_marker_tool_definition())]
     #[tool(name = "progress_marker", definition = progress_marker_tool_definition())]
+    #[tool(name = "large_image", definition = large_image_tool_definition())]
+    #[allow(clippy::too_many_lines)]
     async fn call_tool(
         &self,
         call: McpToolCall,
@@ -198,6 +201,21 @@ impl EchoMarkerServer {
                     }
                     Err(error) => Err(ServerError::invalid_params(error.to_string())),
                 }
+            }
+            "large_image" => {
+                let mut bytes = vec![0_u8; 96 * 1024];
+                bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+                Ok(McpToolResult::new(json!({
+                    "content": [
+                        { "type": "text", "text": "large image marker" },
+                        {
+                            "type": "image",
+                            "data": STANDARD.encode(bytes),
+                            "mimeType": "image/png"
+                        }
+                    ],
+                    "structuredContent": { "source": "test" }
+                })))
             }
             _ => Err(ServerError::invalid_params("unknown test tool")),
         }
@@ -469,6 +487,18 @@ fn progress_marker_tool_definition() -> McpToolDefinition {
         "progress_marker",
         "Emit progress and echo a deterministic marker.",
         string_schema("value"),
+    )
+}
+
+fn large_image_tool_definition() -> McpToolDefinition {
+    tool_definition(
+        "large_image",
+        "Return a deterministic image larger than the default SSE line limit.",
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
     )
 }
 

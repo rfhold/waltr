@@ -38,24 +38,34 @@ pub(super) fn chat_messages(request: &CompletionRequest<'_>) -> Vec<Value> {
     }
     let mut pending_text = String::new();
     let mut pending_calls: Vec<Value> = Vec::new();
+    let mut pending_images: Vec<Value> = Vec::new();
     for item in request.replay_items() {
         match item {
             CompletionReplayItem::Prompt(prompt) => {
                 flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
+                flush_tool_images(&mut messages, &mut pending_images);
                 messages.push(json!({ "role": "user", "content": prompt }));
             }
             CompletionReplayItem::Turn(item) => match item {
-                TurnItem::AssistantText(text) => pending_text.push_str(text),
-                TurnItem::Thinking(_) => {}
-                TurnItem::ToolCall(call) => pending_calls.push(chat_tool_call(call)),
+                TurnItem::AssistantText(text) => {
+                    flush_tool_images(&mut messages, &mut pending_images);
+                    pending_text.push_str(text);
+                }
+                TurnItem::Thinking(_) => flush_tool_images(&mut messages, &mut pending_images),
+                TurnItem::ToolCall(call) => {
+                    flush_tool_images(&mut messages, &mut pending_images);
+                    pending_calls.push(chat_tool_call(call));
+                }
                 TurnItem::ToolResult(result) => {
                     flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
                     messages.push(chat_tool_result(result));
+                    append_chat_tool_images(&mut pending_images, result);
                 }
             },
         }
     }
     flush_assistant_message(&mut messages, &mut pending_text, &mut pending_calls);
+    flush_tool_images(&mut messages, &mut pending_images);
     messages
 }
 
@@ -89,8 +99,36 @@ fn chat_tool_result(result: &ToolResult) -> Value {
     json!({
         "role": "tool",
         "tool_call_id": result.call_id,
-        "content": result.content,
+        "content": result.text_projection(),
     })
+}
+
+fn append_chat_tool_images(content: &mut Vec<Value>, result: &ToolResult) {
+    let mut labeled = false;
+    for image in result.content.images() {
+        if !labeled {
+            content.push(json!({
+                "type": "text",
+                "text": format!(
+                    "Images returned by tool `{}` for call `{}`:",
+                    result.name, result.call_id
+                ),
+            }));
+            labeled = true;
+        }
+        content.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{};base64,{}", image.media_type(), image.data()),
+            }
+        }));
+    }
+}
+
+fn flush_tool_images(messages: &mut Vec<Value>, content: &mut Vec<Value>) {
+    if !content.is_empty() {
+        messages.push(json!({ "role": "user", "content": std::mem::take(content) }));
+    }
 }
 
 pub(super) fn chat_tools(tools: &[ToolDefinition]) -> Vec<Value> {
@@ -113,7 +151,10 @@ pub(super) fn chat_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 mod tests {
     use serde_json::json;
 
-    use crate::{CompletionRequest, CompletionTurn, PromptTurn, ToolCall, ToolResult, TurnItem};
+    use crate::{
+        CompletionRequest, CompletionTurn, PromptTurn, ToolCall, ToolResult, ToolResultContent,
+        ToolResultContentBlock, ToolResultImage, TurnItem,
+    };
 
     use super::{chat_body, chat_messages};
 
@@ -205,5 +246,79 @@ mod tests {
         assert_eq!(messages[4]["tool_call_id"], "call-1");
         assert_eq!(messages[5]["role"], "user");
         assert_eq!(messages[5]["content"], "follow up");
+    }
+
+    #[test]
+    fn chat_messages_emit_tool_results_before_labeled_image_messages() {
+        let mut request = CompletionRequest::new("look");
+        request.turns = vec![CompletionTurn {
+            turn: 0,
+            metadata: None,
+            items: vec![
+                TurnItem::ToolCall(ToolCall::new("call-image", "camera", json!({}))),
+                TurnItem::ToolResult(image_result("call-image")),
+            ],
+        }];
+
+        let messages = chat_messages(&request);
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-image");
+        assert!(!messages[2]["content"].as_str().unwrap().contains("iVBOR"));
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"][0]["type"], "text");
+        assert!(
+            messages[3]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("call-image")
+        );
+        assert_eq!(messages[3]["content"][1]["type"], "image_url");
+        assert_eq!(
+            messages[3]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    #[test]
+    fn chat_messages_complete_all_tool_results_before_batched_images() {
+        let mut request = CompletionRequest::new("look");
+        request.turns = vec![CompletionTurn {
+            turn: 0,
+            metadata: None,
+            items: vec![
+                TurnItem::ToolCall(ToolCall::new("call-a", "camera", json!({}))),
+                TurnItem::ToolCall(ToolCall::new("call-b", "camera", json!({}))),
+                TurnItem::ToolResult(image_result("call-a")),
+                TurnItem::ToolResult(image_result("call-b")),
+            ],
+        }];
+
+        let messages = chat_messages(&request);
+
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call-a");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call-b");
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(messages[4]["content"].as_array().unwrap().len(), 4);
+    }
+
+    fn image_result(call_id: &str) -> ToolResult {
+        ToolResult::from_content(
+            call_id,
+            "camera",
+            ToolResultContent::from_blocks(vec![
+                ToolResultContentBlock::Text {
+                    text: "snapshot".to_owned(),
+                },
+                ToolResultContentBlock::Image(
+                    ToolResultImage::new("iVBORw0KGgo=", "image/png").expect("valid image"),
+                ),
+            ])
+            .expect("bounded content"),
+            false,
+        )
     }
 }

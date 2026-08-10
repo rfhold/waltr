@@ -3064,6 +3064,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
+ "base64 0.22.1",
  "futures-util",
  "globset",
  "http 1.4.1",

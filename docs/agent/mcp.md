@@ -46,9 +46,21 @@ When a provider calls an MCP-backed tool, the agent uses the normal tool executi
 - The MCP runtime sends `tools/call` to the server.
 - The MCP request includes a progress token.
 - If the Waltr tool call is canceled or times out, the MCP runtime sends `notifications/cancelled` for the in-flight JSON-RPC request.
-- The response is converted into provider-neutral `ToolResult` text.
+- The response is converted into ordered provider-neutral `ToolResult` text and image blocks.
 
-MCP result formatting includes text content, unsupported-content markers, `structuredContent`, and MCP `isError` status.
+MCP result conversion preserves text order, represents unknown content with explicit unsupported-content markers, appends `structuredContent` as text, and preserves MCP `isError` as structured tool-result state. Image blocks must use canonical standard Base64, declare `image/png`, `image/jpeg`, or `image/webp`, and match that type's file signature. Waltr accepts at most four images and 4 MiB of decoded image data in one result. Invalid encoding, unsupported media, signature mismatches, and excess data become bounded MCP protocol errors; image data is never included in the error.
+
+Waltr opts into an 8 MiB MCP message and SSE-line limit so one bounded 4 MiB decoded image plus Base64 and JSON framing fits over Streamable HTTP. Generic MCP client defaults remain smaller. Tool results persist their ordered blocks for session replay, while text-only consumers receive a projection containing text plus image media type, decoded size, and SHA-256 digest, never Base64.
+
+Provider adapters deliver validated images as follows:
+
+| Provider API | Image mapping |
+| --- | --- |
+| Anthropic Messages | Native image blocks inside the `tool_result`; MCP error state maps to `is_error`. |
+| OpenAI Responses HTTP and WebSocket | `input_image` items inside `function_call_output.output`. |
+| OpenAI Chat Completions | The required text tool message is emitted first, followed by a labeled user multimodal message for images from the completed tool-call batch. |
+
+The selected model must support image input. Waltr does not silently omit images or automatically switch models when a configured model rejects multimodal input.
 
 `outputSchema` is preserved in the tool registry for future validation and presentation work. Waltr does not yet validate `structuredContent` against `outputSchema`.
 
@@ -180,6 +192,7 @@ Agent transports use a bearer provider rather than copying one token into transp
 - Resource URI subscriptions, sampling, elicitation, non-roots MRTR input, and task runtime extensions are not implemented. List-change subscriptions are implemented through `subscriptions/listen`.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
+- Session RPC and UI timeline results expose the safe text projection rather than inline image data; direct model delivery and durable agent replay retain validated image blocks.
 - The shared server config names the HTTP MCP server type `SSE`; session runtime settings map that to the agent's Streamable HTTP transport.
 - Streamable HTTP sends one POST per message and uses request-scoped JSON or SSE responses. Protocol sessions, GET delivery, resumability, and DELETE termination are absent.
 - Confidential downstream clients and registration-management credentials are not supported; outbound registration is public-client only.

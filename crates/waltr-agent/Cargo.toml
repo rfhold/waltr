@@ -11,6 +11,7 @@ shell = ["dep:tree-sitter", "dep:tree-sitter-bash"]
 [dependencies]
 aws-sdk-s3.workspace = true
 axum.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 globset.workspace = true
 http.workspace = true

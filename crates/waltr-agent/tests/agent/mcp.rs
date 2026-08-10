@@ -1,6 +1,15 @@
 //! MCP agent integration tests.
 
-use std::{collections::HashMap, fs, process::Child, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    process::Child,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use waltr_agent::{
@@ -11,7 +20,7 @@ use waltr_agent::{
     SessionCoordinator, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
     SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStore, SessionTemplateKind,
     SessionTemplateSearchRequest, SessionTemplateSearchTarget, Suspension, TimelineContent,
-    TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall,
+    TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall, ToolResultContentBlock,
 };
 use opentelemetry::{global, trace::TracerProvider as _};
 use opentelemetry_sdk::{
@@ -83,6 +92,54 @@ async fn mcp_agent_loop_discovers_and_calls_stdio_and_streamable_http_direct_too
         "{context}"
     );
     assert!(session.text.contains("mcp-flow-complete"), "{context}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_streamable_http_delivers_large_images_to_the_provider() -> waltr_agent::Result<()> {
+    let http_server = HttpMcpTestServer::start().await?;
+    let saw_image = Arc::new(AtomicBool::new(false));
+    let provider_saw_image = saw_image.clone();
+    let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
+        "scripted_mcp_image_provider",
+        move |request| {
+            let Some(result) = request.tool_results().next() else {
+                return vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                    "call-large-image",
+                    "mcp_http_test_large_image",
+                    json!({}),
+                )))];
+            };
+            assert!(matches!(
+                &result.content.blocks()[1],
+                ToolResultContentBlock::Image(image)
+                    if image.data().len() > 64 * 1024
+                        && image.media_type() == "image/png"
+                        && image.decoded_bytes() == 96 * 1024
+            ));
+            assert!(!result.text_projection().contains("iVBOR"));
+            provider_saw_image.store(true, Ordering::SeqCst);
+            vec![
+                Ok(CompletionEvent::Delta("image-flow-complete".to_owned())),
+                Ok(CompletionEvent::Finished),
+            ]
+        },
+    )));
+
+    let sessions = mcp_sessions(provider.clone());
+    let session = run_session_prompt(
+        &sessions,
+        "render image",
+        vec![http_runtime_server(&http_server)],
+    )
+    .await?;
+
+    assert_tool_was_surfaced(&provider, "mcp_http_test_large_image");
+    assert!(saw_image.load(Ordering::SeqCst));
+    assert!(session.text.contains("image-flow-complete"));
+    assert!(tool_result_text(&session).contains("image/png"));
+    assert!(!tool_result_text(&session).contains("iVBOR"));
 
     Ok(())
 }

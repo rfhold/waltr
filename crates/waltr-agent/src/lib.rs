@@ -63,9 +63,10 @@ pub use resource::{
 };
 pub use stream::{
     BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionReplayItem, CompletionRequest,
-    CompletionRequestBuilder, CompletionTurn, LlmStream, ModelCost, PromptTurn,
-    ProviderTurnMetadata, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TokenCost, TokenUsage,
-    ToolCall, ToolDefinition, ToolResult, TurnItem,
+    CompletionRequestBuilder, CompletionTurn, LlmStream, MAX_TOOL_RESULT_IMAGE_BYTES,
+    MAX_TOOL_RESULT_IMAGES, ModelCost, PromptTurn, ProviderTurnMetadata, ThinkingBlock,
+    ThinkingBlockKind, ThinkingDelta, TokenCost, TokenUsage, ToolCall, ToolDefinition, ToolResult,
+    ToolResultContent, ToolResultContentBlock, ToolResultContentError, ToolResultImage, TurnItem,
 };
 pub use timeline::{
     AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS,
