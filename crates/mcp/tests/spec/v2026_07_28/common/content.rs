@@ -79,6 +79,29 @@ fn tool_result_exposes_ordered_typed_and_extension_content() {
 }
 
 #[test]
+fn tool_result_accepts_every_json_value_as_structured_content() {
+    for structured_content in [
+        json!({ "ok": true }),
+        json!([1, 2]),
+        json!("value"),
+        json!(42),
+        json!(true),
+        json!(null),
+    ] {
+        let tool = McpToolResult::new(json!({
+            "content": [],
+            "structuredContent": structured_content
+        }));
+        assert_eq!(
+            tool.content()
+                .expect("valid tool result")
+                .structured_content,
+            Some(&structured_content)
+        );
+    }
+}
+
+#[test]
 fn tool_result_rejects_malformed_known_content() {
     let malformed = McpToolResult::new(json!({
         "content": [{ "type": "image", "data": "aW1hZ2U=" }]
