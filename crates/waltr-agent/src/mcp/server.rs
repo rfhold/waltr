@@ -12,16 +12,26 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use mcp::client::{McpClient, McpClientHandler, McpClientOptions};
+use mcp::client::{McpClient, McpClientHandler, McpClientOptions, McpTransportLimits};
 use mcp::{
     McpCompletionRequest, McpCompletionResult, McpLogLevel, McpProgressNotification,
     McpPromptDefinition, McpResourceDefinition, McpResourceTemplateDefinition, McpRoot,
-    McpServerCapabilities, McpToolCall, McpToolDefinition, McpTracePropagation,
+    McpServerCapabilities, McpToolCall, McpToolContent, McpToolDefinition, McpTracePropagation,
 };
 
-use crate::{LlmError, Result, ToolProgressSink};
+use crate::{
+    LlmError, Result, ToolProgressSink, ToolResultContent, ToolResultContentBlock, ToolResultImage,
+};
 
 use super::{config::McpServerConfig, event::McpRuntimeEvent};
+
+const WALTR_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(in crate::mcp) struct McpAgentToolResult {
+    pub(in crate::mcp) content: ToolResultContent,
+    pub(in crate::mcp) is_error: bool,
+}
 
 #[derive(Debug, Clone, Default)]
 pub(in crate::mcp) struct McpToolRegistry {
@@ -77,6 +87,7 @@ struct ServerHandler {
 
 #[allow(clippy::too_many_arguments)]
 impl McpServerRuntime {
+    #[allow(clippy::too_many_lines)]
     pub(in crate::mcp) async fn start(
         config: McpServerConfig,
         timeout: Duration,
@@ -106,21 +117,23 @@ impl McpServerRuntime {
             options = options.with_log_level(level);
         }
         let client = if let Some(provider) = config.bearer_provider {
-            McpClient::connect_with_bearer_provider(
+            McpClient::connect_with_bearer_provider_and_transport_limits(
                 name.clone(),
                 config.transport,
                 provider,
                 handler.clone(),
                 options,
+                McpTransportLimits::new(WALTR_MCP_MESSAGE_BYTES, WALTR_MCP_MESSAGE_BYTES),
                 cancellation_token.clone(),
             )
             .await?
         } else {
-            McpClient::connect(
+            McpClient::connect_with_transport_limits(
                 name.clone(),
                 config.transport,
                 handler.clone(),
                 options,
+                McpTransportLimits::new(WALTR_MCP_MESSAGE_BYTES, WALTR_MCP_MESSAGE_BYTES),
                 cancellation_token.clone(),
             )
             .await?
@@ -235,7 +248,7 @@ impl McpServerRuntime {
         call_id: &str,
         progress: ToolProgressSink,
         cancellation_token: CancellationToken,
-    ) -> Result<String> {
+    ) -> Result<McpAgentToolResult> {
         let span = tracing::info_span!(
             "mcp.agent.operation",
             mcp.server = %self.name,
@@ -263,7 +276,7 @@ impl McpServerRuntime {
                     .map(|mut active| active.remove(&progress_token)),
             );
             let response = response?;
-            Ok(response.format_text())
+            mcp_tool_result(&response)
         }
         .instrument(span)
         .await
@@ -488,6 +501,59 @@ impl McpServerRuntime {
         self.client.shutdown().await?;
         Ok(())
     }
+}
+
+fn mcp_tool_result(response: &mcp::McpToolResult) -> Result<McpAgentToolResult> {
+    let parsed = response
+        .content()
+        .map_err(|error| protocol_error(error.to_string()))?;
+    let mut blocks = Vec::with_capacity(parsed.content.len() + 1);
+    for block in parsed.content {
+        match block {
+            McpToolContent::Text { text } => blocks.push(ToolResultContentBlock::Text {
+                text: text.to_owned(),
+            }),
+            McpToolContent::Image { data, mime_type } => {
+                let image = ToolResultImage::new(data, mime_type)
+                    .map_err(|error| protocol_error(error.to_string()))?;
+                blocks.push(ToolResultContentBlock::Image(image));
+            }
+            McpToolContent::Unsupported { kind, .. } => {
+                blocks.push(ToolResultContentBlock::Text {
+                    text: format!("[unsupported MCP content type: {kind}]"),
+                });
+            }
+        }
+    }
+    if let Some(structured) = parsed.structured_content {
+        blocks.push(ToolResultContentBlock::Text {
+            text: format!("structuredContent: {structured}"),
+        });
+    }
+    if blocks.is_empty() {
+        blocks.push(ToolResultContentBlock::Text {
+            text: response.raw.to_string(),
+        });
+    }
+    if parsed.is_error {
+        match blocks.first_mut() {
+            Some(ToolResultContentBlock::Text { text }) => {
+                text.insert_str(0, "MCP tool error: ");
+            }
+            _ => blocks.insert(
+                0,
+                ToolResultContentBlock::Text {
+                    text: "MCP tool error".to_owned(),
+                },
+            ),
+        }
+    }
+    let content = ToolResultContent::from_blocks(blocks)
+        .map_err(|error| protocol_error(error.to_string()))?;
+    Ok(McpAgentToolResult {
+        content,
+        is_error: parsed.is_error,
+    })
 }
 
 impl McpClientHandler for ServerHandler {
@@ -761,9 +827,11 @@ mod tests {
     use serde_json::json;
     use tokio::sync::{Mutex, broadcast};
 
-    use mcp::McpLogLevel;
+    use mcp::{McpLogLevel, McpToolResult};
 
-    use super::{McpRuntimeEvent, ServerHandler};
+    use crate::{MAX_TOOL_RESULT_IMAGE_BYTES, ToolResultContentBlock};
+
+    use super::{McpRuntimeEvent, ServerHandler, mcp_tool_result};
 
     #[test]
     fn normalizes_mcp_log_notification_events() {
@@ -798,5 +866,68 @@ mod tests {
                 && logger.as_deref() == Some("test.logger")
                 && data == json!({ "message": "hello" })
         ));
+    }
+
+    #[test]
+    fn converts_validated_mcp_images_and_error_metadata() {
+        let result = mcp_tool_result(&McpToolResult::new(json!({
+            "content": [
+                { "type": "text", "text": "snapshot" },
+                {
+                    "type": "image",
+                    "data": "iVBORw0KGgo=",
+                    "mimeType": "image/png"
+                }
+            ],
+            "structuredContent": { "camera": "front" },
+            "isError": true
+        })))
+        .expect("valid image result");
+
+        assert!(result.is_error);
+        assert_eq!(result.content.blocks().len(), 3);
+        assert!(matches!(
+            &result.content.blocks()[0],
+            ToolResultContentBlock::Text { text } if text == "MCP tool error: snapshot"
+        ));
+        assert!(matches!(
+            &result.content.blocks()[1],
+            ToolResultContentBlock::Image(image)
+                if image.media_type() == "image/png"
+                    && image.decoded_bytes() == 8
+                    && image.sha256().len() == 64
+        ));
+        assert!(result.content.as_str().contains("structuredContent"));
+        assert!(!result.content.as_str().contains("iVBOR"));
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_image_encoding_media_and_magic() {
+        for image in [
+            json!({ "type": "image", "data": "not-base64", "mimeType": "image/png" }),
+            json!({ "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/gif" }),
+            json!({ "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }),
+        ] {
+            let error = mcp_tool_result(&McpToolResult::new(json!({ "content": [image] })))
+                .expect_err("invalid image must fail");
+            assert!(error.to_string().contains("mcp protocol error"));
+            assert!(!error.to_string().contains("not-base64"));
+            assert!(!error.to_string().contains("iVBOR"));
+        }
+    }
+
+    #[test]
+    fn rejects_mcp_images_before_decoding_excessive_input() {
+        let oversized = "A".repeat(MAX_TOOL_RESULT_IMAGE_BYTES.div_ceil(3) * 4 + 1);
+        let error = mcp_tool_result(&McpToolResult::new(json!({
+            "content": [{
+                "type": "image",
+                "data": oversized,
+                "mimeType": "image/png"
+            }]
+        })))
+        .expect_err("oversized image must fail");
+
+        assert!(error.to_string().contains("size limit"));
     }
 }

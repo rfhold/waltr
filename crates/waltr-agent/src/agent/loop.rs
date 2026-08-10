@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    fmt::Write as _,
     hash::{Hash, Hasher},
     path::PathBuf,
     pin::Pin,
@@ -9,17 +10,19 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use crate::permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState};
 use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
-    ModelRef, PendingTimelineEvent, PendingTimelineItemId, PermissionClaim, PermissionLevel,
-    PermissionOperation, PermissionPattern, PermissionPolicy, PermissionResource,
-    PermissionResourcePattern, PermissionResponse, PromptTurn, Result, TimelineChannel,
-    TimelineContent, TimelineEventKind, TimelineItemId, ToolCall, ToolDefinition,
-    ToolExecutionContext, ToolProgressSink, ToolResult, TurnItem,
+    MAX_TOOL_RESULT_IMAGE_BYTES, ModelRef, PendingTimelineEvent, PendingTimelineItemId,
+    PermissionClaim, PermissionLevel, PermissionOperation, PermissionPattern, PermissionPolicy,
+    PermissionResource, PermissionResourcePattern, PermissionResponse, PromptTurn, Result,
+    TimelineChannel, TimelineContent, TimelineEventKind, TimelineItemId, ToolCall, ToolDefinition,
+    ToolExecutionContext, ToolProgressSink, ToolResult, ToolResultContentBlock, TurnItem,
     middleware::{
         self as middleware, HookOutcome,
         chain::MiddlewareChain,
@@ -1478,6 +1481,8 @@ where
         projected: Option<Value>,
     ) -> Result<()> {
         let canonical_request = canonical_request_json(draft);
+        let mut projected_request = projected.unwrap_or_else(|| canonical_request.clone());
+        redact_provider_images(&mut projected_request);
         let request = RequestRecord {
             id: RequestId::new(format!(
                 "{}-request-{}",
@@ -1487,7 +1492,7 @@ where
             turn: self.turn as u64,
             model: self.model.clone(),
             canonical_request_hash: stable_request_hash(&canonical_request),
-            projected_request: projected.unwrap_or_else(|| canonical_request.clone()),
+            projected_request,
             canonical_request,
         };
 
@@ -1734,8 +1739,107 @@ fn tool_result_json(result: &ToolResult) -> Value {
     json!({
         "call_id": result.call_id,
         "name": result.name,
-        "content": result.content,
+        "content": result.content.blocks().iter().map(|block| match block {
+            ToolResultContentBlock::Text { text } => json!({
+                "type": "text",
+                "text": text,
+            }),
+            ToolResultContentBlock::Image(image) => json!({
+                "type": "image",
+                "media_type": image.media_type(),
+                "decoded_bytes": image.decoded_bytes(),
+                "sha256": image.sha256(),
+            }),
+        }).collect::<Vec<_>>(),
+        "is_error": result.is_error,
     })
+}
+
+fn redact_provider_images(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                redact_provider_images(value);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("image")
+                && object
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .and_then(|source| source.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("base64")
+            {
+                if let Some(source) = object.get_mut("source").and_then(Value::as_object_mut) {
+                    redact_base64_field(source, "data");
+                }
+            } else if object.get("type").and_then(Value::as_str) == Some("input_image") {
+                redact_data_url_field(object, "image_url");
+            } else if object.get("type").and_then(Value::as_str) == Some("image_url")
+                && let Some(image_url) = object.get_mut("image_url").and_then(Value::as_object_mut)
+            {
+                redact_data_url_field(image_url, "url");
+            }
+            for value in object.values_mut() {
+                redact_provider_images(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_base64_field(object: &mut serde_json::Map<String, Value>, field: &str) {
+    let Some(data) = object.remove(field) else {
+        return;
+    };
+    object.insert(field.to_owned(), json!("[redacted inline image]"));
+    if let Some((decoded_bytes, sha256)) = data.as_str().and_then(image_metadata) {
+        object.insert("decoded_bytes".to_owned(), json!(decoded_bytes));
+        object.insert("sha256".to_owned(), json!(sha256));
+        object.insert("image_metadata_valid".to_owned(), json!(true));
+    } else {
+        object.insert("image_metadata_valid".to_owned(), json!(false));
+    }
+}
+
+fn redact_data_url_field(object: &mut serde_json::Map<String, Value>, field: &str) {
+    let Some(data_url) = object.remove(field) else {
+        return;
+    };
+    object.insert(field.to_owned(), json!("[redacted inline image]"));
+    let metadata = data_url
+        .as_str()
+        .and_then(|data_url| data_url.split_once(','))
+        .and_then(|(header, data)| {
+            let media_type = header.strip_prefix("data:")?.strip_suffix(";base64")?;
+            let (decoded_bytes, sha256) = image_metadata(data)?;
+            Some((media_type.to_owned(), decoded_bytes, sha256))
+        });
+    if let Some((media_type, decoded_bytes, sha256)) = metadata {
+        object.insert("media_type".to_owned(), json!(media_type));
+        object.insert("decoded_bytes".to_owned(), json!(decoded_bytes));
+        object.insert("sha256".to_owned(), json!(sha256));
+        object.insert("image_metadata_valid".to_owned(), json!(true));
+    } else {
+        object.insert("image_metadata_valid".to_owned(), json!(false));
+    }
+}
+
+fn image_metadata(data: &str) -> Option<(usize, String)> {
+    if data.len() > MAX_TOOL_RESULT_IMAGE_BYTES.div_ceil(3) * 4 {
+        return None;
+    }
+    let decoded = STANDARD.decode(data).ok()?;
+    if decoded.len() > MAX_TOOL_RESULT_IMAGE_BYTES {
+        return None;
+    }
+    let digest = Sha256::digest(&decoded);
+    let mut sha256 = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(sha256, "{byte:02x}");
+    }
+    Some((decoded.len(), sha256))
 }
 
 fn stable_request_hash(canonical_request: &Value) -> String {
@@ -1974,4 +2078,98 @@ fn error_tool_result(call: &ToolCall, error: &LlmError) -> ToolResult {
         call.name.clone(),
         format!("Tool error: {error}\nArguments: {}", call.arguments),
     )
+    .with_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::{ToolResult, ToolResultContent, ToolResultContentBlock, ToolResultImage};
+
+    use super::{redact_provider_images, tool_result_json};
+
+    #[test]
+    fn provider_request_audit_redacts_native_and_data_url_images() {
+        let mut request = json!({
+            "anthropic": {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo="
+                }
+            },
+            "openai": {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,iVBORw0KGgo="
+            }
+        });
+
+        redact_provider_images(&mut request);
+        let encoded = request.to_string();
+
+        assert!(!encoded.contains("iVBOR"));
+        assert_eq!(request["anthropic"]["source"]["decoded_bytes"], 8);
+        assert_eq!(request["openai"]["decoded_bytes"], 8);
+        assert_eq!(
+            request["anthropic"]["source"]["sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn provider_request_audit_fails_closed_for_malformed_images() {
+        let mut request = json!({
+            "invalid_base64": {
+                "type": "image",
+                "source": { "type": "base64", "data": "secret-not-base64" }
+            },
+            "non_string": {
+                "type": "image",
+                "source": { "type": "base64", "data": { "secret": true } }
+            },
+            "invalid_data_url": {
+                "type": "input_image",
+                "image_url": "secret-malformed-data-url"
+            }
+        });
+
+        redact_provider_images(&mut request);
+        let encoded = request.to_string();
+
+        assert!(!encoded.contains("secret"));
+        assert_eq!(
+            request["invalid_base64"]["source"]["data"],
+            "[redacted inline image]"
+        );
+        assert_eq!(
+            request["non_string"]["source"]["image_metadata_valid"],
+            false
+        );
+        assert_eq!(request["invalid_data_url"]["image_metadata_valid"], false);
+    }
+
+    #[test]
+    fn canonical_request_audit_keeps_image_metadata_without_data() {
+        let result = ToolResult::from_content(
+            "call-image",
+            "camera",
+            ToolResultContent::from_blocks(vec![ToolResultContentBlock::Image(
+                ToolResultImage::new("iVBORw0KGgo=", "image/png").expect("valid image"),
+            )])
+            .expect("bounded content"),
+            false,
+        );
+
+        let audit = tool_result_json(&result);
+
+        assert!(!audit.to_string().contains("iVBOR"));
+        assert_eq!(audit["content"][0]["media_type"], "image/png");
+        assert_eq!(audit["content"][0]["decoded_bytes"], 8);
+        assert_eq!(audit["content"][0]["sha256"].as_str().unwrap().len(), 64);
+    }
 }

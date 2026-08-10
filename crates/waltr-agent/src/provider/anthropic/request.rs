@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 
-use crate::{CompletionReplayItem, CompletionRequest, ThinkingBlockKind, ToolDefinition, TurnItem};
+use crate::{
+    CompletionReplayItem, CompletionRequest, ThinkingBlockKind, ToolDefinition, ToolResult,
+    ToolResultContentBlock, TurnItem,
+};
 
 use super::thinking::{AnthropicThinkingConfig, anthropic_thinking};
 
@@ -69,11 +72,15 @@ fn anthropic_messages(
                 }
                 TurnItem::ToolResult(result) => {
                     flush_assistant_content(&mut messages, &mut assistant_content);
-                    tool_results.push(json!({
+                    let mut tool_result = json!({
                         "type": "tool_result",
                         "tool_use_id": result.call_id,
-                        "content": result.content,
-                    }));
+                        "content": anthropic_tool_result_content(result),
+                    });
+                    if result.is_error {
+                        tool_result["is_error"] = json!(true);
+                    }
+                    tool_results.push(tool_result);
                 }
             },
         }
@@ -84,6 +91,32 @@ fn anthropic_messages(
         add_rolling_cache_control(&mut messages, usize::from(static_breakpoint));
     }
     messages
+}
+
+fn anthropic_tool_result_content(result: &ToolResult) -> Value {
+    if let [ToolResultContentBlock::Text { text }] = result.content.blocks() {
+        return json!(text);
+    }
+    Value::Array(
+        result
+            .content
+            .blocks()
+            .iter()
+            .map(|block| match block {
+                ToolResultContentBlock::Text { text } => {
+                    json!({ "type": "text", "text": text })
+                }
+                ToolResultContentBlock::Image(image) => json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.media_type(),
+                        "data": image.data(),
+                    }
+                }),
+            })
+            .collect(),
+    )
 }
 
 fn anthropic_system(system_prompt: &str, prompt_cache: bool) -> Value {
@@ -185,7 +218,7 @@ mod tests {
 
     use crate::{
         CompletionRequest, CompletionTurn, PromptTurn, ThinkingBlock, ThinkingBlockKind, ToolCall,
-        ToolResult, TurnItem,
+        ToolResult, ToolResultContent, ToolResultContentBlock, ToolResultImage, TurnItem,
     };
 
     use super::{AnthropicThinkingConfig, messages_request};
@@ -360,5 +393,49 @@ mod tests {
                 .get("cache_control")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn request_encodes_image_tool_results_as_native_anthropic_blocks() {
+        let mut request = CompletionRequest::new("look");
+        request.turns = vec![CompletionTurn {
+            turn: 0,
+            metadata: None,
+            items: vec![
+                TurnItem::ToolCall(ToolCall::new("call-image", "camera", json!({}))),
+                TurnItem::ToolResult(image_result(true)),
+            ],
+        }];
+
+        let body = messages_request("claude-test", 256, None, false, &request);
+        let tool_result = &body["messages"][2]["content"][0];
+
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["is_error"], true);
+        assert_eq!(tool_result["content"][0]["type"], "text");
+        assert_eq!(tool_result["content"][1]["type"], "image");
+        assert_eq!(tool_result["content"][1]["source"]["type"], "base64");
+        assert_eq!(
+            tool_result["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(tool_result["content"][1]["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    fn image_result(is_error: bool) -> ToolResult {
+        ToolResult::from_content(
+            "call-image",
+            "camera",
+            ToolResultContent::from_blocks(vec![
+                ToolResultContentBlock::Text {
+                    text: "snapshot".to_owned(),
+                },
+                ToolResultContentBlock::Image(
+                    ToolResultImage::new("iVBORw0KGgo=", "image/png").expect("valid image"),
+                ),
+            ])
+            .expect("bounded content"),
+            is_error,
+        )
     }
 }

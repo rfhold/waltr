@@ -8,7 +8,7 @@ use mcp::{
     McpCompletionResult, McpPromptDefinition, McpResourceDefinition, McpResourceTemplateDefinition,
 };
 
-use crate::{AgentTool, LlmError, Result, ToolDefinition, ToolProgressSink};
+use crate::{AgentTool, LlmError, Result, ToolDefinition, ToolProgressSink, ToolResult};
 
 use super::{
     config::McpConfig, event::McpRuntimeEvent, name::direct_tool_name, server::McpServerRuntime,
@@ -150,7 +150,7 @@ impl McpClientRuntime {
                     let progress = context.progress().clone();
                     let cancellation_token = context.cancellation_token().clone();
                     Box::pin(async move {
-                        let content = runtime
+                        let result = runtime
                             .call_tool(
                                 &server_name,
                                 &tool_name,
@@ -160,7 +160,12 @@ impl McpClientRuntime {
                                 cancellation_token,
                             )
                             .await?;
-                        Ok(context.result(content))
+                        Ok(ToolResult::from_content(
+                            context.call().id.clone(),
+                            context.call().name.clone(),
+                            result.content,
+                            result.is_error,
+                        ))
                     })
                 }));
             }
@@ -268,7 +273,7 @@ impl McpClientRuntime {
         call_id: &str,
         progress: ToolProgressSink,
         cancellation_token: CancellationToken,
-    ) -> Result<String> {
+    ) -> Result<super::server::McpAgentToolResult> {
         self.servers
             .get(server_name)
             .ok_or_else(|| protocol_error(format!("unknown MCP server `{server_name}`")))?

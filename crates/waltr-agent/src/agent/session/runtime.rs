@@ -572,7 +572,8 @@ where
                         tool_call_id.to_owned(),
                         "permission",
                         message.unwrap_or_else(|| "permission denied".to_owned()),
-                    );
+                    )
+                    .with_error();
                     let session_id = record.id.clone();
                     let parent_id = tool_call_item_id(&record, &result.call_id)?;
                     let record = self
@@ -758,11 +759,7 @@ fn pending_work(snapshot: &SessionSnapshot) -> Vec<&PendingWork> {
 
 fn interrupted_tool_result(work: &PendingWork) -> Option<ToolResult> {
     let call = work.tool_call.as_ref()?;
-    Some(ToolResult::new(
-        call.id.clone(),
-        call.name.clone(),
-        "interrupted",
-    ))
+    Some(ToolResult::new(call.id.clone(), call.name.clone(), "interrupted").with_error())
 }
 
 fn permission_state(snapshot: &SessionSnapshot) -> Result<PermissionRuntimeState> {

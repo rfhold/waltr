@@ -957,7 +957,9 @@ mod system_prompt_state {
         };
         while let Some(event) = stream.next().await {
             match event.expect("agent event").content {
-                TimelineContent::ToolResult { result } => output.tool_results.push(result.content),
+                TimelineContent::ToolResult { result } => {
+                    output.tool_results.push(result.content.to_string());
+                }
                 TimelineContent::ExternalRequest { request } => {
                     output.external_request_id = Some(request.id.as_str().to_owned());
                 }
@@ -1342,7 +1344,9 @@ mod agents_skills_state {
         };
         while let Some(event) = stream.next().await {
             match event.expect("agent event").content {
-                TimelineContent::ToolResult { result } => output.tool_results.push(result.content),
+                TimelineContent::ToolResult { result } => {
+                    output.tool_results.push(result.content.to_string());
+                }
                 TimelineContent::ExternalRequest { request } => {
                     output.external_request_id = Some(request.id.as_str().to_owned());
                 }

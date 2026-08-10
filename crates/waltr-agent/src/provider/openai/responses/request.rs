@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::provider::openai::reasoning::{OpenAiReasoningConfig, openai_reasoning};
 use crate::stream::{
     CompletionReplayItem, CompletionRequest, ThinkingBlockKind, ToolCall, ToolDefinition,
-    ToolResult, TurnItem,
+    ToolResult, ToolResultContentBlock, TurnItem,
 };
 
 use super::super::cache::prompt_cache_key;
@@ -99,8 +99,30 @@ fn responses_tool_result(result: &ToolResult) -> Value {
     json!({
         "type": "function_call_output",
         "call_id": result.call_id,
-        "output": result.content,
+        "output": responses_tool_result_content(result),
     })
+}
+
+fn responses_tool_result_content(result: &ToolResult) -> Value {
+    if let [ToolResultContentBlock::Text { text }] = result.content.blocks() {
+        return json!(text);
+    }
+    Value::Array(
+        result
+            .content
+            .blocks()
+            .iter()
+            .map(|block| match block {
+                ToolResultContentBlock::Text { text } => {
+                    json!({ "type": "input_text", "text": text })
+                }
+                ToolResultContentBlock::Image(image) => json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{}", image.media_type(), image.data()),
+                }),
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn responses_tools(tools: &[ToolDefinition]) -> Vec<Value> {
@@ -125,7 +147,7 @@ mod tests {
 
     use crate::{
         CompletionTurn, PromptTurn, ThinkingBlock, ThinkingBlockKind, ToolCall, ToolResult,
-        TurnItem,
+        ToolResultContent, ToolResultContentBlock, ToolResultImage, TurnItem,
     };
 
     use super::{responses_body, responses_input};
@@ -321,5 +343,45 @@ mod tests {
         assert_eq!(input[7]["role"], "user");
         assert_eq!(input[7]["content"][0]["text"], "follow up");
         assert_eq!(input.as_array().expect("input array").len(), 8);
+    }
+
+    #[test]
+    fn responses_input_encodes_image_tool_results_as_input_content() {
+        let mut request = CompletionRequest::new("look");
+        request.turns = vec![CompletionTurn {
+            turn: 0,
+            metadata: None,
+            items: vec![
+                TurnItem::ToolCall(ToolCall::new("call-image", "camera", json!({}))),
+                TurnItem::ToolResult(image_result()),
+            ],
+        }];
+
+        let input = responses_input(&request);
+        let output = &input[2]["output"];
+
+        assert_eq!(
+            output[0],
+            json!({ "type": "input_text", "text": "snapshot" })
+        );
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    fn image_result() -> ToolResult {
+        ToolResult::from_content(
+            "call-image",
+            "camera",
+            ToolResultContent::from_blocks(vec![
+                ToolResultContentBlock::Text {
+                    text: "snapshot".to_owned(),
+                },
+                ToolResultContentBlock::Image(
+                    ToolResultImage::new("iVBORw0KGgo=", "image/png").expect("valid image"),
+                ),
+            ])
+            .expect("bounded content"),
+            false,
+        )
     }
 }

@@ -123,7 +123,7 @@ impl AgentMiddleware for AgentsInstructionsMiddleware {
         let Some(call) = ctx.call else {
             return Ok(HookOutcome::Continue);
         };
-        if call.name != "read" || ctx.result.content.starts_with("Tool error:") {
+        if call.name != "read" || ctx.result.is_error {
             return Ok(HookOutcome::Continue);
         }
         let Ok(input) = serde_json::from_value::<ReadInput>(call.arguments.clone()) else {

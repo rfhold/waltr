@@ -2059,7 +2059,7 @@ where
         if let TimelineContent::ToolResult { result } = &event.content
             && crate::session::channel_is(&event, CHANNEL_TOOL_RESULT)
         {
-            results.push(result.content.clone());
+            results.push(result.content.to_string());
         }
     }
     results

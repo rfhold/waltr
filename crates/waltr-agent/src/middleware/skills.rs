@@ -243,7 +243,7 @@ impl AgentMiddleware for SkillsMiddleware {
         let Some(call) = ctx.call else {
             return Ok(HookOutcome::Continue);
         };
-        if ctx.result.content.starts_with("Tool error:") {
+        if ctx.result.is_error {
             return Ok(HookOutcome::Continue);
         }
         let (target_path, walk_children) = match call.name.as_str() {
