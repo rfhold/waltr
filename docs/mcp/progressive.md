@@ -24,7 +24,9 @@ A tool that owns runbooks must declare a `runbook_uri_template` containing the `
 
 Each listed tool has an independent action enum and action-specific `input.oneOf` schema. A call first selects the MCP tool and can then dispatch only an action owned by that tool. The same flat action name may exist in different tools.
 
-Actions may use flat names such as `list` or dot-namespaced names such as `releases.get`. Namespaced actions must use a namespace declared by their tool. Root `help` lists flat actions and declared namespaces; `help.<namespace>` lists that namespace's actions with descriptions, guidance, schemas, and resource bindings.
+Actions may use flat names such as `list` or dot-namespaced names such as `releases.get` and `alert-rule.list`. Namespaced actions must use a namespace declared by their tool. Root `help` lists flat actions and declared namespaces; `help.<namespace>` lists that namespace's actions with descriptions, guidance, schemas, and resource bindings.
+
+Namespace declarations support two forms. `namespace(releases, description = "...")` preserves the original Rust-identifier form. `namespace(name = "alert-rule", description = "...")` declares a string-valued public name for namespaces that are not Rust identifiers. Explicit public names must match `[a-z0-9]+(?:-[a-z0-9]+)*`: non-empty ASCII lowercase letters or digits separated by single hyphens. This rejects dots, whitespace, uppercase letters, underscores, leading or trailing hyphens, and repeated hyphens. `help` and `runbooks` remain reserved in either form, namespace names must be unique within a tool, and action namespace matching uses the complete declared name exactly.
 
 Runbooks are tool-owned for loading and help, while MCP prompts are server-global. Runbook names must therefore be unique across the complete server and remain unprefixed in prompt listings.
 
@@ -80,6 +82,7 @@ struct GetReleaseInput {
             "destructiveHint": false
         }),
         namespace(releases, description = "Query and inspect product releases."),
+        namespace(name = "alert-rule", description = "Inspect release alert rules."),
         runbook_uri_template = "playbooks://{runbook}"
     ),
     tool(
@@ -105,6 +108,12 @@ impl ReleaseServer {
         _context: ServerContext,
     ) -> ServerResult<Value> {
         Ok(json!({ "id": input.id, "status": "released" }))
+    }
+
+    /// List alert rules associated with releases.
+    #[action(tool = "releases", name = "alert-rule.list")]
+    fn list_alert_rules(&self) -> ServerResult<Value> {
+        Ok(json!([]))
     }
 
     /// Promote a release candidate to production with required pre-checks.

@@ -43,6 +43,7 @@ pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
 ///         name = "exec",
 ///         description = "Configuration actions.",
 ///         namespace(configuration, description = "Inspect configuration."),
+///         namespace(name = "alert-rule", description = "Inspect alert rules."),
 ///         runbook_uri_template = "example://runbooks/{runbook}"
 ///     ),
 ///     tool(name = "sessions", description = "Session actions.")
@@ -51,6 +52,12 @@ pub fn mcp_server(args: TokenStream, input: TokenStream) -> TokenStream {
 ///     /// Inspect configuration.
 ///     #[action(tool = "exec", name = "configuration.inspect")]
 ///     fn inspect(&self) -> mcp::server::ServerResult<serde_json::Value> {
+///         todo!()
+///     }
+///
+///     /// List alert rules.
+///     #[action(tool = "exec", name = "alert-rule.list")]
+///     fn list_alert_rules(&self) -> mcp::server::ServerResult<serde_json::Value> {
 ///         todo!()
 ///     }
 ///
