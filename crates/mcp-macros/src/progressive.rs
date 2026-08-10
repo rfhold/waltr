@@ -217,7 +217,7 @@ fn call_tool_impl(
             .filter(|runbook| runbook.tool == tool.name.value())
             .collect::<Vec<_>>();
         let namespace_branches = tool.namespaces.iter().map(|namespace| {
-            let help_action = format!("help.{}", namespace.name);
+            let help_action = format!("help.{}", namespace.name.value());
             let help = namespace_help_expr(tool, namespace, actions);
             quote! {
                 #help_action => {
@@ -632,7 +632,9 @@ fn namespace_help_expr(
     let namespace_value = namespace_expr(namespace);
     let action_values = actions
         .iter()
-        .filter(|action| action.tool == tool.name.value() && namespace.name == action.namespace)
+        .filter(|action| {
+            action.tool == tool.name.value() && namespace.name.value() == action.namespace
+        })
         .map(action_help_expr);
     quote! {
         {
@@ -667,7 +669,7 @@ fn namespaces_expr(tool: &ProgressiveToolArg) -> TokenStream2 {
 }
 
 fn namespace_expr(namespace: &ProgressiveNamespaceArg) -> TokenStream2 {
-    let name = namespace.name.to_string();
+    let name = &namespace.name;
     let description = &namespace.description;
     quote! {
         ::mcp::progressive::ProgressiveNamespace {
@@ -1007,7 +1009,13 @@ fn validate_progressive_parts(
         }
         let mut namespaces = BTreeSet::new();
         for namespace in &tool.namespaces {
-            let name = namespace.name.to_string();
+            let name = namespace.name.value();
+            if namespace.explicit_name && !is_public_namespace_name(&name) {
+                return Err(syn::Error::new_spanned(
+                    &namespace.name,
+                    "explicit progressive namespace names must use lowercase kebab-case (`[a-z0-9]+(?:-[a-z0-9]+)*`)",
+                ));
+            }
             if matches!(name.as_str(), "help" | "runbooks") {
                 return Err(syn::Error::new_spanned(
                     &namespace.name,
@@ -1069,7 +1077,7 @@ fn validate_progressive_parts(
             if !tool
                 .namespaces
                 .iter()
-                .any(|declared| declared.name == namespace)
+                .any(|declared| declared.name.value() == namespace)
             {
                 return Err(syn::Error::new_spanned(
                     &action.name,
@@ -1515,7 +1523,8 @@ impl ProgressiveToolArg {
 }
 
 struct ProgressiveNamespaceArg {
-    name: syn::Ident,
+    name: LitStr,
+    explicit_name: bool,
     description: Expr,
 }
 
@@ -1538,7 +1547,14 @@ fn lit_str(expr: Expr, field: &str) -> syn::Result<LitStr> {
 impl ProgressiveNamespaceArg {
     fn from_tokens(tokens: TokenStream2) -> syn::Result<Self> {
         let parser = |input: syn::parse::ParseStream<'_>| {
-            let name = input.parse::<syn::Ident>()?;
+            let first = input.parse::<syn::Ident>()?;
+            let (name, explicit_name) = if first == "name" && input.peek(Token![=]) {
+                input.parse::<Token![=]>()?;
+                let name = lit_str(input.parse::<Expr>()?, "namespace name")?;
+                (name, true)
+            } else {
+                (LitStr::new(&first.to_string(), first.span()), false)
+            };
             input.parse::<Token![,]>()?;
             let description_ident = input.parse::<syn::Ident>()?;
             if description_ident != "description" {
@@ -1549,10 +1565,24 @@ impl ProgressiveNamespaceArg {
             }
             input.parse::<Token![=]>()?;
             let description = input.parse::<Expr>()?;
-            Ok(Self { name, description })
+            Ok(Self {
+                name,
+                explicit_name,
+                description,
+            })
         };
         parser.parse2(tokens)
     }
+}
+
+fn is_public_namespace_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 fn path_is(path: &Path, ident: &str) -> bool {
@@ -1692,6 +1722,10 @@ mod tests {
             r#"tool(name = "exec", description = "Exec", namespace(runbooks, description = "Reserved"))"#,
             "reserved progressive namespaces",
         );
+        assert_error_contains(
+            r#"tool(name = "exec", description = "Exec", namespace(name = "help", description = "Reserved"))"#,
+            "reserved progressive namespaces",
+        );
         assert_impl_error_contains(
             one_tool_args(),
             r#"
@@ -1702,6 +1736,97 @@ mod tests {
                 }
             "#,
             "reserved progressive action names",
+        );
+    }
+
+    #[test]
+    fn accepts_explicit_kebab_case_namespaces_and_preserves_identifier_namespaces() {
+        let args = syn::parse_str::<ProgressiveArgs>(
+            r#"tool(
+                name = "exec",
+                description = "Exec",
+                namespace(releases, description = "Releases"),
+                namespace(name = "alert-rule", description = "Alert rules"),
+                namespace(name = "alert-instance", description = "Alert instances")
+            )"#,
+        )
+        .expect("namespace declarations");
+        let input = syn::parse_str::<ItemImpl>(
+            r#"
+                impl Server {
+                    /// List alert rules.
+                    #[action(tool = "exec", name = "alert-rule.list")]
+                    fn list_alert_rules() {}
+                }
+            "#,
+        )
+        .expect("impl");
+
+        expand_progressive_server(&args, input).expect("kebab-case namespace must expand");
+    }
+
+    #[test]
+    fn rejects_invalid_explicit_namespace_names() {
+        for name in [
+            "",
+            "alert.rule",
+            "alert rule",
+            "Alert-rule",
+            "alert_rule",
+            "-alert-rule",
+            "alert-rule-",
+            "alert--rule",
+        ] {
+            assert_error_contains(
+                &format!(
+                    r#"tool(name = "exec", description = "Exec", namespace(name = "{name}", description = "Invalid"))"#
+                ),
+                "must use lowercase kebab-case",
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_and_identifier_namespace_names_share_duplicate_checks() {
+        assert_error_contains(
+            r#"tool(
+                name = "exec",
+                description = "Exec",
+                namespace(releases, description = "Identifier"),
+                namespace(name = "releases", description = "Explicit")
+            )"#,
+            "duplicate progressive namespace within tool",
+        );
+    }
+
+    #[test]
+    fn explicit_namespaces_require_exact_roots_and_one_action_separator() {
+        let args = r#"tool(
+            name = "exec",
+            description = "Exec",
+            namespace(name = "alert-rule", description = "Alert rules")
+        )"#;
+        assert_impl_error_contains(
+            args,
+            r#"
+                impl Server {
+                    /// List alerts.
+                    #[action(tool = "exec", name = "alert.list")]
+                    fn list() {}
+                }
+            "#,
+            "uses undeclared namespace `alert`",
+        );
+        assert_impl_error_contains(
+            args,
+            r#"
+                impl Server {
+                    /// List alerts.
+                    #[action(tool = "exec", name = "alert-rule.list.all")]
+                    fn list() {}
+                }
+            "#,
+            "must use `namespace.action`",
         );
     }
 
@@ -1814,9 +1939,7 @@ mod tests {
     fn assert_impl_error_contains(args: &str, input: &str, expected: &str) {
         let args = syn::parse_str::<ProgressiveArgs>(args).expect("valid test args");
         let input = syn::parse_str::<ItemImpl>(input).expect("valid test impl");
-        let error = expand_progressive_server(&args, input)
-            .err()
-            .expect("expansion must fail");
+        let error = expand_progressive_server(&args, input).expect_err("expansion must fail");
         assert!(
             error.to_string().contains(expected),
             "expected `{expected}` in `{error}`"

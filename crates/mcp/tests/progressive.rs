@@ -65,6 +65,10 @@ struct PolicyCheckInput {
             releases,
             description = "Query and inspect product releases. Use these to ground any statement about what shipped and when."
         ),
+        namespace(
+            name = "alert-rule",
+            description = "Query alert rules associated with releases."
+        ),
         runbook_uri_template = "playbooks://{runbook}"
     ),
     tool(
@@ -130,6 +134,12 @@ impl ReleaseServer {
             "owner": "platform",
             "notes": ["fix login redirect", "improve deploy telemetry"]
         }))
+    }
+
+    /// List alert rules associated with releases.
+    #[action(tool = "releases", name = "alert-rule.list")]
+    fn list_alert_rules(&self) -> ServerResult<Value> {
+        Ok(json!([{ "name": "release-health" }]))
     }
 
     /// Explain the promotion policy before recommending a production promotion.
@@ -411,6 +421,14 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     );
     assert_array_contains(
         &releases_tool["inputSchema"]["properties"]["action"]["enum"],
+        "help.alert-rule",
+    );
+    assert_array_contains(
+        &releases_tool["inputSchema"]["properties"]["action"]["enum"],
+        "alert-rule.list",
+    );
+    assert_array_contains(
+        &releases_tool["inputSchema"]["properties"]["action"]["enum"],
         "runbooks.load",
     );
     assert_array_contains(
@@ -448,6 +466,32 @@ async fn progressive_server_isolates_tools_help_runbooks_and_resources() -> mcp:
     assert_eq!(
         root_help["structuredContent"]["description"],
         "Release inventory actions."
+    );
+
+    let alert_rule_help = call_tool(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "help.alert-rule" }),
+    )
+    .await?;
+    assert_eq!(
+        alert_rule_help["structuredContent"]["topic"],
+        "help.alert-rule"
+    );
+    assert_eq!(
+        alert_rule_help["structuredContent"]["actions"][0]["action"],
+        "alert-rule.list"
+    );
+
+    let alert_rules = call_tool(
+        &server.endpoint,
+        "releases",
+        json!({ "action": "alert-rule.list" }),
+    )
+    .await?;
+    assert_eq!(
+        alert_rules["structuredContent"],
+        json!({ "result": [{ "name": "release-health" }] })
     );
 
     let policy_help = call_tool(
