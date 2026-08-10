@@ -21,11 +21,9 @@ use crate::{
 };
 
 use super::{
-    InboundSender, McpBearerProvider, McpTransportError, McpTransportErrorKind, TransportInbound,
-    sse::SseDecoder,
+    InboundSender, McpBearerProvider, McpTransportError, McpTransportErrorKind, McpTransportLimits,
+    TransportInbound, sse::SseDecoder,
 };
-
-const HTTP_BODY_LIMIT: usize = 1024 * 1024;
 
 /// Stateless Streamable HTTP client transport.
 pub struct StreamableHttpTransport {
@@ -37,6 +35,7 @@ pub struct StreamableHttpTransport {
     cancellation: CancellationToken,
     readers: Mutex<JoinSet<()>>,
     shutting_down: AtomicBool,
+    limits: McpTransportLimits,
 }
 
 impl std::fmt::Debug for StreamableHttpTransport {
@@ -56,6 +55,7 @@ impl StreamableHttpTransport {
         bearer_token: Option<String>,
         bearer_provider: Option<Arc<dyn McpBearerProvider>>,
         inbound: InboundSender,
+        limits: McpTransportLimits,
     ) -> Self {
         Self {
             endpoint,
@@ -66,6 +66,7 @@ impl StreamableHttpTransport {
             cancellation: CancellationToken::new(),
             readers: Mutex::new(JoinSet::new()),
             shutting_down: AtomicBool::new(false),
+            limits,
         }
     }
 
@@ -186,6 +187,7 @@ impl StreamableHttpTransport {
             let inbound = self.inbound.clone();
             let shutdown = self.cancellation.clone();
             let request_cancel = request_cancellation.cloned();
+            let limits = self.limits;
             {
                 let mut readers = self.readers.lock().await;
                 while readers.try_join_next().is_some() {}
@@ -199,13 +201,14 @@ impl StreamableHttpTransport {
                         shutdown,
                         request_cancel,
                         request_json_rpc_id,
+                        limits,
                     )
                     .await;
                 });
             }
             return Ok(());
         }
-        let body = collect_body_bounded(response).await?;
+        let body = collect_body_bounded(response, self.limits.max_message_bytes).await?;
         let inbound = parse_json_rpc_message(serde_json::from_slice(&body)?)?;
         self.inbound
             .send(TransportInbound::Message(inbound))
@@ -242,15 +245,17 @@ fn mirrored_name(method: &str, message: &Value) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_sse(
     response: reqwest::Response,
     inbound: InboundSender,
     shutdown: CancellationToken,
     request_cancel: Option<CancellationToken>,
     request_id: Option<JsonRpcId>,
+    limits: McpTransportLimits,
 ) {
     let mut body = response.bytes_stream();
-    let mut decoder = SseDecoder::default();
+    let mut decoder = SseDecoder::with_limits(limits.max_sse_line_bytes, limits.max_message_bytes);
     let mut terminal = false;
     loop {
         let chunk = tokio::select! {
@@ -336,7 +341,10 @@ fn report_stream_error(inbound: &InboundSender, error: &Error) {
     );
 }
 
-async fn collect_body_bounded(response: reqwest::Response) -> Result<Vec<u8>> {
+async fn collect_body_bounded(
+    response: reqwest::Response,
+    max_message_bytes: usize,
+) -> Result<Vec<u8>> {
     let mut body = response.bytes_stream();
     let mut collected = Vec::new();
     while let Some(chunk) = body.next().await {
@@ -344,7 +352,7 @@ async fn collect_body_bounded(response: reqwest::Response) -> Result<Vec<u8>> {
         let next = collected
             .len()
             .checked_add(chunk.len())
-            .filter(|size| *size <= HTTP_BODY_LIMIT)
+            .filter(|size| *size <= max_message_bytes)
             .ok_or_else(|| Error::protocol("MCP HTTP response body exceeds limit"))?;
         collected.reserve(next - collected.len());
         collected.extend_from_slice(&chunk);

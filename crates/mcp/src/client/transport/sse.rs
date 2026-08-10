@@ -5,8 +5,8 @@ use crate::{
     protocol::{JsonRpcInbound, parse_json_rpc_str},
 };
 
-const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
-const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+pub(super) const DEFAULT_MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+pub(super) const DEFAULT_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// One decoded SSE frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,16 +23,38 @@ pub struct SseJsonRpcEvent {
 }
 
 /// Bounded incremental SSE decoder.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseDecoder {
     utf8_pending: Vec<u8>,
     lines: String,
     data_lines: Vec<String>,
     event_bytes: usize,
     started: bool,
+    max_line_bytes: usize,
+    max_event_bytes: usize,
 }
 
 impl SseDecoder {
+    /// Create a decoder with explicit positive line and event limits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either limit is zero.
+    #[must_use]
+    pub fn with_limits(max_line_bytes: usize, max_event_bytes: usize) -> Self {
+        assert!(max_line_bytes > 0, "SSE line limit must be positive");
+        assert!(max_event_bytes > 0, "SSE event limit must be positive");
+        Self {
+            utf8_pending: Vec::new(),
+            lines: String::new(),
+            data_lines: Vec::new(),
+            event_bytes: 0,
+            started: false,
+            max_line_bytes,
+            max_event_bytes,
+        }
+    }
+
     /// Feed one response-body chunk and return every complete frame.
     ///
     /// # Errors
@@ -96,7 +118,7 @@ impl SseDecoder {
             self.lines.drain(..consumed);
             self.process_line(&line, &mut frames)?;
         }
-        if self.lines.len() > MAX_SSE_LINE_BYTES {
+        if self.lines.len() > self.max_line_bytes {
             return Err(Error::protocol("SSE line exceeds the configured limit"));
         }
         if finish {
@@ -113,7 +135,7 @@ impl SseDecoder {
     }
 
     fn process_line(&mut self, line: &str, frames: &mut Vec<SseFrame>) -> Result<()> {
-        if line.len() > MAX_SSE_LINE_BYTES {
+        if line.len() > self.max_line_bytes {
             return Err(Error::protocol("SSE line exceeds the configured limit"));
         }
         if line.is_empty() {
@@ -129,7 +151,7 @@ impl SseDecoder {
             self.event_bytes = self
                 .event_bytes
                 .checked_add(value.len() + usize::from(!self.data_lines.is_empty()))
-                .filter(|bytes| *bytes <= MAX_SSE_EVENT_BYTES)
+                .filter(|bytes| *bytes <= self.max_event_bytes)
                 .ok_or_else(|| Error::protocol("SSE event exceeds the configured limit"))?;
             self.data_lines.push(value.to_owned());
         }
@@ -145,6 +167,12 @@ impl SseDecoder {
         });
         self.data_lines.clear();
         self.event_bytes = 0;
+    }
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::with_limits(DEFAULT_MAX_SSE_LINE_BYTES, DEFAULT_MAX_MESSAGE_BYTES)
     }
 }
 
@@ -214,11 +242,25 @@ mod tests {
 
     #[test]
     fn rejects_oversized_lines_and_events() {
-        let line = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        let line = vec![b'x'; DEFAULT_MAX_SSE_LINE_BYTES + 1];
         assert!(SseDecoder::default().push(&line).is_err());
         let mut event = b"data: ".to_vec();
-        event.extend(vec![b'x'; MAX_SSE_EVENT_BYTES + 1]);
+        event.extend(vec![b'x'; DEFAULT_MAX_MESSAGE_BYTES + 1]);
         event.extend_from_slice(b"\n\n");
         assert!(SseDecoder::default().push(&event).is_err());
+    }
+
+    #[test]
+    fn explicit_limits_accept_larger_single_line_events() {
+        let mut event = b"data: ".to_vec();
+        event.extend(vec![b'x'; DEFAULT_MAX_SSE_LINE_BYTES + 1]);
+        event.extend_from_slice(b"\n\n");
+        let mut decoder = SseDecoder::with_limits(event.len(), event.len());
+        let frames = decoder.push(&event).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].data.as_ref().map(String::len),
+            Some(DEFAULT_MAX_SSE_LINE_BYTES + 1)
+        );
     }
 }

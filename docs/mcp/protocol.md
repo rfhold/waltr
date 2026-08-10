@@ -50,6 +50,10 @@ The typed surface supports tools, prompts, resources, resource templates, comple
 pagination, progress, cancellation, annotations, icons, opaque metadata, and extension
 capability maps.
 
+Tool results retain their raw wire value and also expose ordered borrowed text, image, and
+unknown extension blocks. Parsing rejects malformed known blocks while leaving image decoding,
+MIME policy, and payload validation to the consuming application.
+
 Roots are retained as a deprecated client feature. A server requests roots through an
 `input_required` result; the client retries the originating `tools/call`, `prompts/get`,
 or `resources/read` request with a new JSON-RPC ID, exact `requestState`, and keyed
@@ -73,6 +77,8 @@ stdio uses one UTF-8 JSON-RPC message per line. Requests and notifications are v
 for required per-request metadata. Parse errors (`-32700`) and invalid requests
 (`-32600`) are returned without terminating the stream. `notifications/cancelled`
 cancels the matching active request; servers never initiate JSON-RPC requests.
+Client reads use the default bounded message size unless the caller selects explicit limits through
+the with-limits connection APIs described below.
 
 ### Streamable HTTP
 
@@ -91,6 +97,13 @@ compare recognized headers against the request body before executing the tool.
 Origin validation is default-deny when an `Origin` header is present. Bearer tokens are
 resolved independently for every POST. Token expiry or revocation terminates the active
 response stream.
+
+Clients bound JSON responses, SSE lines and events, and stdio messages. Default connections accept
+at most 64 KiB in one SSE line and 1 MiB in one complete message, SSE event, JSON response body, or
+stdio line. Applications expecting larger bounded content such as Base64 image blocks opt in with
+`McpClient::connect_with_transport_limits` or
+`McpClient::connect_with_bearer_provider_and_transport_limits`; the original connection and public
+transport entry points retain the conservative defaults.
 
 ## Authorization
 

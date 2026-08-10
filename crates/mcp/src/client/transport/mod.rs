@@ -15,6 +15,40 @@ use crate::{
 use http::StreamableHttpTransport;
 use stdio::StdioTransport;
 
+use self::sse::{DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_SSE_LINE_BYTES};
+
+/// Bounds applied while receiving MCP transport messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpTransportLimits {
+    /// Maximum bytes accepted in one SSE line.
+    pub max_sse_line_bytes: usize,
+    /// Maximum bytes accepted in one JSON-RPC message or SSE event.
+    pub max_message_bytes: usize,
+}
+
+impl McpTransportLimits {
+    /// Create explicit positive transport limits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either limit is zero.
+    #[must_use]
+    pub const fn new(max_sse_line_bytes: usize, max_message_bytes: usize) -> Self {
+        assert!(max_sse_line_bytes > 0, "SSE line limit must be positive");
+        assert!(max_message_bytes > 0, "MCP message limit must be positive");
+        Self {
+            max_sse_line_bytes,
+            max_message_bytes,
+        }
+    }
+}
+
+impl Default for McpTransportLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_SSE_LINE_BYTES, DEFAULT_MAX_MESSAGE_BYTES)
+    }
+}
+
 /// Transport inbound channel sender.
 pub type InboundSender = mpsc::UnboundedSender<TransportInbound>;
 
@@ -164,7 +198,21 @@ impl McpTransport {
         config: McpTransportConfig,
         inbound: InboundSender,
     ) -> Result<Self> {
-        Self::start_with_optional_bearer_provider(server_name, config, inbound, None).await
+        Self::start_with_limits(server_name, config, inbound, McpTransportLimits::default()).await
+    }
+
+    /// Start a transport from config with explicit receive limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured transport cannot start.
+    pub async fn start_with_limits(
+        server_name: String,
+        config: McpTransportConfig,
+        inbound: InboundSender,
+        limits: McpTransportLimits,
+    ) -> Result<Self> {
+        Self::start_with_optional_bearer_provider(server_name, config, inbound, limits, None).await
     }
 
     /// Start a transport with a dynamic Streamable HTTP bearer provider.
@@ -180,10 +228,33 @@ impl McpTransport {
         inbound: InboundSender,
         bearer_provider: Arc<dyn McpBearerProvider>,
     ) -> Result<Self> {
+        Self::start_with_bearer_provider_and_limits(
+            server_name,
+            config,
+            inbound,
+            bearer_provider,
+            McpTransportLimits::default(),
+        )
+        .await
+    }
+
+    /// Start a transport with a dynamic bearer provider and explicit receive limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured transport cannot start.
+    pub async fn start_with_bearer_provider_and_limits(
+        server_name: String,
+        config: McpTransportConfig,
+        inbound: InboundSender,
+        bearer_provider: Arc<dyn McpBearerProvider>,
+        limits: McpTransportLimits,
+    ) -> Result<Self> {
         Self::start_with_optional_bearer_provider(
             server_name,
             config,
             inbound,
+            limits,
             Some(bearer_provider),
         )
         .await
@@ -193,11 +264,19 @@ impl McpTransport {
         server_name: String,
         config: McpTransportConfig,
         inbound: InboundSender,
+        limits: McpTransportLimits,
         bearer_provider: Option<Arc<dyn McpBearerProvider>>,
     ) -> Result<Self> {
         match config {
             McpTransportConfig::Stdio { command, args } => Ok(Self::Stdio(Box::new(
-                StdioTransport::start(server_name, command, args, inbound).await?,
+                StdioTransport::start(
+                    server_name,
+                    command,
+                    args,
+                    inbound,
+                    limits.max_message_bytes,
+                )
+                .await?,
             ))),
             McpTransportConfig::StreamableHttp {
                 endpoint,
@@ -207,6 +286,7 @@ impl McpTransport {
                 bearer_token,
                 bearer_provider,
                 inbound,
+                limits,
             ))),
         }
     }
