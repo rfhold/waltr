@@ -3,14 +3,14 @@ use std::pin::Pin;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use waltr::grpc::waltr::session::v1::{
-    ContinueSessionRequest, CreateSessionRequest, DeleteSessionRequest, GetTimelineRequest,
-    InterruptSessionRequest, ListSessionsRequest, RespondExternalRequestRequest,
-    RollbackSessionRequest, RollbackTarget, SearchSessionTemplatesRequest,
-    SearchSessionTemplatesResponse, SessionRuntimeConfigRequest, SessionSummary,
+    AgentSelectionRequest, ContinueSessionRequest, CreateSessionRequest, DeleteSessionRequest,
+    GetTimelineRequest, InferenceSettingsRequest, InterruptSessionRequest, ListAgentsRequest,
+    ListAgentsResponse, ListSessionsRequest, RespondExternalRequestRequest, RollbackSessionRequest,
+    RollbackTarget, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary,
     SubmitUserMessageRequest, TimelineEvent, TimelineQuery, TimelineTruncation,
-    UpdateSessionRuntimeConfigRequest, WatchSessionsRequest, WatchSessionsResponse,
-    WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest, watch_sessions_response,
-    watch_timeline_response,
+    UpdateSessionAgentRequest, UpdateSessionInferenceSettingsRequest, WatchSessionsRequest,
+    WatchSessionsResponse, WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest,
+    watch_sessions_response, watch_timeline_response,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
@@ -70,7 +70,10 @@ pub enum SessionTimelineWatchEvent {
     clippy::future_not_send,
     reason = "browser RPC futures are locally polled"
 )]
-pub(super) async fn create_session<T>(transport: &T) -> Result<SessionSummary, ClientError>
+pub(super) async fn create_session<T>(
+    transport: &T,
+    agent_name: String,
+) -> Result<SessionSummary, ClientError>
 where
     T: RemoteTransport,
     T::Inner: tonic::client::GrpcService<tonic::body::Body>,
@@ -84,7 +87,10 @@ where
     let response = transport
         .session_client(&credentials)
         .await?
-        .create_session(CreateSessionRequest::default())
+        .create_session(CreateSessionRequest {
+            agent_selection: Some(AgentSelectionRequest { agent_name }),
+            ..CreateSessionRequest::default()
+        })
         .await
         .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
@@ -95,6 +101,30 @@ where
             &credentials,
         )
     })
+}
+
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
+pub(super) async fn list_agents<T>(transport: &T) -> Result<ListAgentsResponse, ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    let credentials = transport.request_credentials();
+    transport
+        .session_client(&credentials)
+        .await?
+        .list_agents(ListAgentsRequest {})
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|error| status_error(&error, &credentials))
 }
 
 #[allow(
@@ -177,10 +207,10 @@ where
     clippy::future_not_send,
     reason = "browser RPC futures are locally polled"
 )]
-pub(super) async fn update_session_runtime_config<T>(
+pub(super) async fn update_session_inference_settings<T>(
     transport: &T,
     id: String,
-    runtime_config: SessionRuntimeConfigRequest,
+    inference_settings: InferenceSettingsRequest,
 ) -> Result<SessionSummary, ClientError>
 where
     T: RemoteTransport,
@@ -195,9 +225,9 @@ where
     let response = transport
         .session_client(&credentials)
         .await?
-        .update_session_runtime_config(UpdateSessionRuntimeConfigRequest {
+        .update_session_inference_settings(UpdateSessionInferenceSettingsRequest {
             id,
-            runtime_config: Some(runtime_config),
+            inference_settings: Some(inference_settings),
         })
         .await
         .map_err(|error| status_error(&error, &credentials))?
@@ -205,7 +235,45 @@ where
 
     response.session.ok_or_else(|| {
         status_error(
-            &tonic::Status::data_loss("update session runtime config response missing session"),
+            &tonic::Status::data_loss("update session inference settings response missing session"),
+            &credentials,
+        )
+    })
+}
+
+#[allow(
+    clippy::future_not_send,
+    reason = "browser RPC futures are locally polled"
+)]
+pub(super) async fn update_session_agent<T>(
+    transport: &T,
+    id: String,
+    agent_name: String,
+) -> Result<SessionSummary, ClientError>
+where
+    T: RemoteTransport,
+    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
+    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
+        Body<Data = Bytes> + Send + 'static,
+    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
+        Into<StdError> + Send,
+{
+    let credentials = transport.request_credentials();
+    let response = transport
+        .session_client(&credentials)
+        .await?
+        .update_session_agent(UpdateSessionAgentRequest {
+            id,
+            agent_selection: Some(AgentSelectionRequest { agent_name }),
+        })
+        .await
+        .map_err(|error| status_error(&error, &credentials))?
+        .into_inner();
+
+    response.session.ok_or_else(|| {
+        status_error(
+            &tonic::Status::data_loss("update session agent response missing session"),
             &credentials,
         )
     })

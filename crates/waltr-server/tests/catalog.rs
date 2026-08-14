@@ -447,7 +447,7 @@ async fn patch_provider(
                 providers: HashMap::from([(provider_key.to_owned(), provider)]),
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await?
         .into_inner()

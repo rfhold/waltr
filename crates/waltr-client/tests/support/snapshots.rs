@@ -51,7 +51,7 @@ pub fn config_with_provider(name: &str) -> ConfigView {
         providers: BTreeMap::from([(name.to_owned(), provider_view(name))]),
         mcp_servers: BTreeMap::new(),
         etag: String::new(),
-        runtime_defaults: None,
+        inference_defaults: None,
     }
 }
 

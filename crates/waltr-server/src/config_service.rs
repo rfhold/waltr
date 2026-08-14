@@ -117,7 +117,7 @@ where
         let patch = ConfigPatch {
             providers: request.providers.map(|patch| patch.providers),
             mcp_servers: request.mcp_servers.map(|patch| patch.mcp_servers),
-            runtime_defaults: request.runtime_defaults,
+            inference_defaults: request.inference_defaults,
         };
         let config = self
             .store

@@ -5,8 +5,8 @@ use crate::{
     config::{ConfigError, ConfigPatch, ConfigStore, DefaultConfigBuilder},
 };
 use waltr::grpc::waltr::config::v1::{
-    Configuration, McpServer, McpServerType, Model, ModelType, OAuthProvider, OauthTokenField,
-    OauthTokenRequestStyle, Provider, RuntimeDefaults,
+    Configuration, InferenceDefaults, McpServer, McpServerType, Model, ModelType, OAuthProvider,
+    OauthTokenField, OauthTokenRequestStyle, Provider,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -102,8 +102,8 @@ impl ConfigStore for FilesystemConfigStore {
         if let Some(mcp_servers) = patch.mcp_servers {
             next.mcp_servers = mcp_servers;
         }
-        if let Some(runtime_defaults) = patch.runtime_defaults {
-            next.runtime_defaults = Some(runtime_defaults);
+        if let Some(inference_defaults) = patch.inference_defaults {
+            next.inference_defaults = Some(inference_defaults);
         }
         validate_config(&next)?;
         self.save_unlocked(next).await
@@ -142,6 +142,16 @@ impl FilesystemConfigStore {
             }
         };
 
+        let document = toml::from_str::<toml::Table>(&data).map_err(|error| {
+            tracing::warn!(path = %path.display(), %error, "failed to parse config file");
+            ConfigError::parse(path.clone(), error)
+        })?;
+        // TODO: Remove this check (and others like it)
+        if document.contains_key("runtime_defaults") {
+            return Err(ConfigError::invalid(
+                "runtime_defaults is unsupported; use inference_defaults",
+            ));
+        }
         let mut config = toml::from_str::<Configuration>(&data).map_err(|error| {
             tracing::warn!(path = %path.display(), %error, "failed to parse config file");
             ConfigError::parse(path.clone(), error)
@@ -196,7 +206,7 @@ struct CanonicalConfiguration<'a> {
     providers: BTreeMap<&'a str, CanonicalProvider<'a>>,
     etag: &'a str,
     mcp_servers: BTreeMap<&'a str, &'a McpServer>,
-    runtime_defaults: &'a Option<RuntimeDefaults>,
+    inference_defaults: &'a Option<InferenceDefaults>,
 }
 
 impl<'a> From<&'a Configuration> for CanonicalConfiguration<'a> {
@@ -213,7 +223,7 @@ impl<'a> From<&'a Configuration> for CanonicalConfiguration<'a> {
                 .iter()
                 .map(|(key, server)| (key.as_str(), server))
                 .collect(),
-            runtime_defaults: &config.runtime_defaults,
+            inference_defaults: &config.inference_defaults,
         }
     }
 }
@@ -265,7 +275,7 @@ fn validate_config(config: &Configuration) -> Result<(), ConfigError> {
     }
 
     validate_mcp_servers(config)?;
-    validate_runtime_defaults(config)?;
+    validate_inference_defaults(config)?;
 
     Ok(())
 }
@@ -344,13 +354,12 @@ fn validate_oauth_provider(key: &str, provider: &OAuthProvider) -> Result<(), Co
     Ok(())
 }
 
-fn validate_runtime_defaults(config: &Configuration) -> Result<(), ConfigError> {
-    let Some(defaults) = &config.runtime_defaults else {
+fn validate_inference_defaults(config: &Configuration) -> Result<(), ConfigError> {
+    let Some(defaults) = &config.inference_defaults else {
         return Ok(());
     };
 
     if defaults.provider_key.trim().is_empty() && defaults.model_key.trim().is_empty() {
-        validate_default_mcp_keys(defaults, config)?;
         return Ok(());
     }
 
@@ -359,20 +368,20 @@ fn validate_runtime_defaults(config: &Configuration) -> Result<(), ConfigError> 
         .get(&defaults.provider_key)
         .ok_or_else(|| {
             ConfigError::invalid(format!(
-                "runtime default provider '{}' does not exist",
+                "inference default provider '{}' does not exist",
                 defaults.provider_key
             ))
         })?;
 
     if defaults.model_key.trim().is_empty() {
         return Err(ConfigError::invalid(
-            "runtime default model key must not be empty when provider key is set",
+            "inference default model key must not be empty when provider key is set",
         ));
     }
 
     let model = provider.models.get(&defaults.model_key).ok_or_else(|| {
         ConfigError::invalid(format!(
-            "runtime default model '{}' does not exist in provider '{}'",
+            "inference default model '{}' does not exist in provider '{}'",
             defaults.model_key, defaults.provider_key
         ))
     })?;
@@ -391,23 +400,8 @@ fn validate_runtime_defaults(config: &Configuration) -> Result<(), ConfigError> 
         });
         if !supported {
             return Err(ConfigError::invalid(format!(
-                "runtime default reasoning effort '{effort}' does not exist in model '{}' for provider '{}'",
+                "inference default reasoning effort '{effort}' does not exist in model '{}' for provider '{}'",
                 defaults.model_key, defaults.provider_key
-            )));
-        }
-    }
-
-    validate_default_mcp_keys(defaults, config)
-}
-
-fn validate_default_mcp_keys(
-    defaults: &RuntimeDefaults,
-    config: &Configuration,
-) -> Result<(), ConfigError> {
-    for key in &defaults.enabled_mcp_server_keys {
-        if !config.mcp_servers.contains_key(key) {
-            return Err(ConfigError::invalid(format!(
-                "runtime default mcp server '{key}' does not exist"
             )));
         }
     }
@@ -581,6 +575,61 @@ image = false
     }
 
     #[tokio::test]
+    async fn load_rejects_legacy_runtime_defaults_table() {
+        let root = temp_root();
+        let config_dir = root.join(CONFIG_DIR);
+        tokio::fs::create_dir_all(&config_dir)
+            .await
+            .expect("config dir should be created");
+        tokio::fs::write(
+            config_dir.join(CONFIG_FILE),
+            "etag = \"\"\n\n[runtime_defaults]\nprovider_key = \"codex\"\nmodel_key = \"gpt-5.6-sol\"\n",
+        )
+        .await
+        .expect("config file should be written");
+
+        let error = FilesystemConfigStore::new(root, test_builder())
+            .load()
+            .await
+            .expect_err("legacy defaults should be rejected");
+
+        assert!(error.is_invalid());
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_defaults is unsupported")
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_defaults_round_trip() {
+        let root = temp_root();
+        let store = FilesystemConfigStore::new(root.clone(), test_builder());
+        let mut config = store.load().await.expect("defaults should load");
+        config.inference_defaults = Some(InferenceDefaults {
+            provider_key: "codex".to_owned(),
+            model_key: "gpt-5.3".to_owned(),
+            reasoning_effort: Some("high".to_owned()),
+        });
+
+        let saved = store.save(config).await.expect("defaults should save");
+        let loaded = FilesystemConfigStore::new(root, test_builder())
+            .load()
+            .await
+            .expect("defaults should load");
+
+        assert_eq!(loaded, saved);
+        assert_eq!(
+            loaded.inference_defaults,
+            Some(InferenceDefaults {
+                provider_key: "codex".to_owned(),
+                model_key: "gpt-5.3".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn patch_rejects_stale_etag() {
         let store = FilesystemConfigStore::new(temp_root(), test_builder());
         let current = store.load().await.expect("config should load");
@@ -590,7 +639,7 @@ image = false
                 ConfigPatch {
                     providers: Some(config_with_provider("anthropic").providers),
                     mcp_servers: None,
-                    runtime_defaults: None,
+                    inference_defaults: None,
                 },
                 "stale",
             )
@@ -664,10 +713,7 @@ image = false
                         ..McpServer::default()
                     },
                 )]),
-                runtime_defaults: Some(RuntimeDefaults {
-                    enabled_mcp_server_keys: vec!["custom".to_owned()],
-                    ..RuntimeDefaults::default()
-                }),
+                inference_defaults: Some(InferenceDefaults::default()),
                 ..Configuration::default()
             })
             .await
@@ -680,7 +726,7 @@ image = false
 
         assert_eq!(reset.providers, initial.providers);
         assert_eq!(reset.mcp_servers, initial.mcp_servers);
-        assert!(reset.runtime_defaults.is_none());
+        assert!(reset.inference_defaults.is_none());
         assert_ne!(reset.etag, current.etag);
         let reconstructed = FilesystemConfigStore::new(root, test_builder())
             .load()

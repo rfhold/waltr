@@ -27,7 +27,8 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use waltr_agent::{MemorySessionStore, SessionCoordinator};
+use waltr_agent::definition::AgentDefinitionBundle;
+use waltr_agent::{AgentDefinitionCatalog, MemorySessionStore, ResolvedAgent, SessionCoordinator};
 use mcp::oauth::{
     McpJwtAccessTokenHeader, OAuthEncryptedPrivateKey, OAuthKeyEncryption,
     VersionedOAuthWrappingKeyring,
@@ -70,6 +71,22 @@ pub fn default_catalog_loader() -> CatalogLoader {
 #[must_use]
 pub fn default_config_builder() -> DefaultConfigBuilder {
     DefaultConfigBuilder::new(default_catalog_loader(), "http://127.0.0.1:14333/mcp")
+}
+
+/// Resolve the bundled coding agent used by server tests.
+#[must_use]
+pub fn default_agent_definition() -> (ResolvedAgent, AgentDefinitionBundle) {
+    let loaded = crate::agent_definition::load_default_agent(&[], "coding")
+        .expect("bundled coding agent definition should resolve");
+    (loaded.resolved, loaded.bundle)
+}
+
+/// Return the deterministic startup agent catalog used by server tests.
+#[must_use]
+pub fn default_agent_catalog() -> AgentDefinitionCatalog {
+    crate::agent_definition::load_default_agent(&[], "coding")
+        .expect("bundled coding agent definition should resolve")
+        .catalog
 }
 
 fn config_service_with_loader(loader: &CatalogLoader) -> Arc<ConfigService> {
@@ -735,6 +752,7 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                         config,
                         credential_store,
                         None,
+                        default_agent_catalog(),
                     )
                 },
             )
@@ -900,7 +918,14 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
                 persistence,
                 catalog_loader,
                 |routes, config, credential_store| {
-                    session::add_sessions_service(routes, sessions, config, credential_store, None)
+                    session::add_sessions_service(
+                        routes,
+                        sessions,
+                        config,
+                        credential_store,
+                        None,
+                        default_agent_catalog(),
+                    )
                 },
             )
             .await
@@ -925,6 +950,7 @@ async fn test_persistence() -> Persistence {
 }
 
 #[allow(
+    clippy::fn_params_excessive_bools,
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the fixture exposes independent authentication server settings"
@@ -1081,6 +1107,7 @@ END
                         config,
                         credential_store,
                         trusted_mcp_oauth_origin,
+                        default_agent_catalog(),
                     )
                 },
             )

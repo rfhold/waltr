@@ -1,10 +1,12 @@
 //! HTTP and gRPC router construction.
 
 use crate::{
+    AgentDefinitionLoadError,
     access_auth::{
         AccessAuthConfig, AccessAuthConfigError, AccessAuthError, AccessAuthHttpClient,
         AccessAuthenticator, GrpcAccessAuthLayer, GrpcTransportLayer,
     },
+    agent_definition::load_default_agent_from_env,
     auth::{
         AuthService, CredentialStore, TrustedPrivateOriginsError, trusted_private_origins_from_env,
     },
@@ -275,6 +277,8 @@ impl Drop for McpOAuthMaintenanceTask {
 
 /// Failure to construct the environment-owned application.
 pub enum BuildAppError {
+    /// Agent definitions could not be loaded or resolved.
+    AgentDefinition(AgentDefinitionLoadError),
     /// Filesystem-backed configuration could not start.
     Config(ConfigError),
     /// Server persistence could not initialize.
@@ -306,6 +310,9 @@ impl fmt::Debug for BuildAppError {
 impl fmt::Display for BuildAppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AgentDefinition(error) => {
+                write!(formatter, "failed to initialize agent definitions: {error}")
+            }
             Self::Config(error) => write!(formatter, "failed to initialize server config: {error}"),
             Self::Persistence(error) => error.fmt(formatter),
             Self::SessionStorage(error) => error.fmt(formatter),
@@ -333,6 +340,7 @@ impl fmt::Display for BuildAppError {
 impl Error for BuildAppError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::AgentDefinition(error) => Some(error),
             Self::Config(error) => Some(error),
             Self::Persistence(error) => Some(error),
             Self::SessionStorage(error) => Some(error),
@@ -351,8 +359,13 @@ impl Error for BuildAppError {
 /// # Errors
 ///
 /// Returns an error when persistence, config, authentication, or agent session storage cannot initialize.
+///
+/// # Panics
+///
+/// Panics if the application builder does not invoke the session-service callback.
 pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
     tracing::debug!("building app with config service from current directory");
+    let default_agent = load_default_agent_from_env().map_err(BuildAppError::AgentDefinition)?;
     let persistence = Persistence::from_env()
         .await
         .map_err(BuildAppError::Persistence)?;
@@ -366,12 +379,7 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         McpOAuthConfig::from_env(&access_auth_config).map_err(BuildAppError::McpOAuthConfig)?;
     let outbound_private_origins =
         trusted_private_origins_from_env().map_err(BuildAppError::OutboundOAuthConfig)?;
-    let access_auth_client = AccessAuthHttpClient::build(
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10)),
-    )
-    .map_err(BuildAppError::AccessAuthClient)?;
+    let access_auth_client = build_access_auth_client()?;
     let access_authenticator =
         AccessAuthenticator::initialize(access_auth_config, &persistence, access_auth_client)
             .await
@@ -409,6 +417,7 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
                 config.clone(),
                 credential_store.clone(),
                 session_private_origins,
+                default_agent.catalog.clone(),
             ) {
                 Ok(host) => {
                     session_storage = Some(Ok(Arc::clone(&host)));
@@ -416,7 +425,12 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
                 }
                 Err(error) => {
                     session_storage = Some(Err(error));
-                    session::add_memory_service(grpc_routes, config, credential_store)
+                    session::add_memory_service(
+                        grpc_routes,
+                        config,
+                        credential_store,
+                        default_agent.catalog,
+                    )
                 }
             }
         },
@@ -427,6 +441,15 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         .expect("session service builder should run")
         .map_err(BuildAppError::SessionStorage)?;
     Ok(router)
+}
+
+fn build_access_auth_client() -> Result<AccessAuthHttpClient, BuildAppError> {
+    AccessAuthHttpClient::build(
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10)),
+    )
+    .map_err(BuildAppError::AccessAuthClient)
 }
 
 fn agent_trusted_origins(
@@ -441,30 +464,6 @@ fn agent_trusted_origins(
         configured.push(server_resource.clone());
     }
     configured
-}
-
-/// Build the Axum application using an explicit config service.
-///
-/// # Errors
-///
-/// Returns an error when persisted config cannot be loaded before router construction.
-///
-/// # Panics
-///
-/// Panics when session storage environment configuration is invalid.
-pub async fn build_app_with_config_service(
-    config_service: Arc<ConfigService>,
-    persistence: Persistence,
-) -> Result<ServerApplication, ConfigError> {
-    build_app_with_services(
-        config_service,
-        persistence,
-        |grpc_routes, config, credential_store| {
-            session::add_service_from_env(grpc_routes, config, credential_store, None)
-                .expect("session service should start")
-        },
-    )
-    .await
 }
 
 /// Build the Axum application using explicit services.
@@ -836,6 +835,19 @@ mod tests {
         let same_origin = reqwest::Url::parse("https://preview-waltr.example/oauth").unwrap();
         let origins = agent_trusted_origins(vec![same_origin.clone()], Some(&server));
         assert_eq!(origins, [same_origin]);
+    }
+
+    #[test]
+    fn build_error_preserves_agent_definition_context_and_source() {
+        let load_error = crate::agent_definition::load_default_agent(&[], "missing").unwrap_err();
+        let error = BuildAppError::AgentDefinition(load_error);
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to resolve default agent `missing`")
+        );
+        assert!(error.source().is_some());
     }
 
     #[tokio::test]

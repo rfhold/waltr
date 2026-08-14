@@ -4,9 +4,9 @@ use crate::coordination::{access, auth, catalog, config, session, status, stream
 use crate::{
     AccessAttemptId, AccessEvent, AuthEvent, AuthTarget, CatalogEvent, ClientEffect, ClientError,
     ClientEvent, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientState,
-    ConfigEffect, ConfigEvent, ConfigPatch, Configuration, McpServer, OperationKey, Provider,
-    ProviderEditBaseline, RuntimeDefaults, SessionEvent, SessionRuntimeConfigRequest, StatusEvent,
-    TimelineQuery,
+    ConfigEffect, ConfigEvent, ConfigPatch, Configuration, InferenceDefaults,
+    InferenceSettingsRequest, McpServer, OperationKey, Provider, ProviderEditBaseline,
+    SessionEvent, StatusEvent, TimelineQuery,
 };
 
 /// Single headless client reducer used by shells.
@@ -237,11 +237,12 @@ impl Client {
     }
 
     /// Request that a new server-side session be created.
-    pub fn create_session(&mut self) -> ClientUpdate {
+    pub fn create_session(&mut self, agent_name: impl Into<String>) -> ClientUpdate {
         let operation_key = self.state.next_operation_key();
-        self.apply(ClientEvent::Session(SessionEvent::CreateRequested(
+        self.apply(ClientEvent::Session(SessionEvent::CreateRequested {
             operation_key,
-        )))
+            agent_name: agent_name.into(),
+        }))
     }
 
     /// Request that a server-side session be deleted.
@@ -253,20 +254,41 @@ impl Client {
         }))
     }
 
-    /// Request that a server-side session runtime config metadata snapshot be replaced.
-    pub fn update_session_runtime_config(
+    /// Request that a server-side session inference settings snapshot be replaced.
+    pub fn update_session_inference_settings(
         &mut self,
         id: impl Into<String>,
-        runtime_config: SessionRuntimeConfigRequest,
+        inference_settings: InferenceSettingsRequest,
     ) -> ClientUpdate {
         let operation_key = self.state.next_operation_key();
         self.apply(ClientEvent::Session(
-            SessionEvent::RuntimeConfigUpdateRequested {
+            SessionEvent::InferenceSettingsUpdateRequested {
                 operation_key,
                 id: id.into(),
-                runtime_config: Box::new(runtime_config),
+                inference_settings: Box::new(inference_settings),
             },
         ))
+    }
+
+    /// Request that a server-side session switch to an exact selectable agent.
+    pub fn update_session_agent(
+        &mut self,
+        id: impl Into<String>,
+        agent_name: impl Into<String>,
+    ) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
+        self.apply(ClientEvent::Session(
+            SessionEvent::SessionAgentUpdateRequested {
+                operation_key,
+                id: id.into(),
+                agent_name: agent_name.into(),
+            },
+        ))
+    }
+
+    /// Retry loading selectable session agents.
+    pub fn request_session_agents(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Session(SessionEvent::AgentsLoadRequested))
     }
 
     /// Request that the current server-side sessions be loaded.
@@ -689,22 +711,22 @@ impl Client {
         Ok(self.request_config_patch(mcp_servers_patch(config.mcp_servers), expected_etag))
     }
 
-    /// Request a patch that replaces runtime defaults in the latest configuration.
+    /// Request a patch that replaces inference defaults in the latest configuration.
     ///
     /// # Errors
     ///
     /// Returns an error when no configuration has loaded or defaults reference missing config.
-    pub fn set_runtime_defaults(
+    pub fn set_inference_defaults(
         &mut self,
-        defaults: Option<RuntimeDefaults>,
+        defaults: Option<InferenceDefaults>,
     ) -> Result<ClientUpdate, ClientError> {
         let config = self.current_config()?;
         let expected_etag = config.etag.clone();
         if let Some(defaults) = defaults.as_ref() {
-            Self::validate_runtime_defaults(defaults, &config)?;
+            Self::validate_inference_defaults(defaults, &config)?;
         }
 
-        Ok(self.request_config_patch(runtime_defaults_patch(defaults), expected_etag))
+        Ok(self.request_config_patch(inference_defaults_patch(defaults), expected_etag))
     }
 
     /// Request a patch that renames a provider in the latest configuration.
@@ -892,18 +914,11 @@ impl Client {
         Ok(())
     }
 
-    fn validate_runtime_defaults(
-        defaults: &RuntimeDefaults,
+    fn validate_inference_defaults(
+        defaults: &InferenceDefaults,
         config: &Configuration,
     ) -> Result<(), ClientError> {
         if defaults.provider_key.trim().is_empty() && defaults.model_key.trim().is_empty() {
-            for key in &defaults.enabled_mcp_server_keys {
-                if !config.mcp_servers.contains_key(key) {
-                    return Err(ClientError::new(format!(
-                        "runtime default MCP server '{key}' not found"
-                    )));
-                }
-            }
             return Ok(());
         }
 
@@ -912,18 +927,18 @@ impl Client {
             .get(&defaults.provider_key)
             .ok_or_else(|| {
                 ClientError::new(format!(
-                    "runtime default provider '{}' not found",
+                    "inference default provider '{}' not found",
                     defaults.provider_key
                 ))
             })?;
         if defaults.model_key.trim().is_empty() {
             return Err(ClientError::new(
-                "runtime default model id cannot be empty when provider is set",
+                "inference default model id cannot be empty when provider is set",
             ));
         }
         let model = provider.models.get(&defaults.model_key).ok_or_else(|| {
             ClientError::new(format!(
-                "runtime default model '{}' not found in provider '{}'",
+                "inference default model '{}' not found in provider '{}'",
                 defaults.model_key, defaults.provider_key
             ))
         })?;
@@ -941,19 +956,11 @@ impl Client {
             });
             if !supported {
                 return Err(ClientError::new(format!(
-                    "runtime default reasoning effort '{effort}' not found in model '{}' for provider '{}'",
+                    "inference default reasoning effort '{effort}' not found in model '{}' for provider '{}'",
                     defaults.model_key, defaults.provider_key
                 )));
             }
         }
-        for key in &defaults.enabled_mcp_server_keys {
-            if !config.mcp_servers.contains_key(key) {
-                return Err(ClientError::new(format!(
-                    "runtime default MCP server '{key}' not found"
-                )));
-            }
-        }
-
         Ok(())
     }
 }
@@ -1036,10 +1043,10 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             SessionEvent::Wiped { operation_key } | SessionEvent::WipeFailed { operation_key, .. },
         ) => operation_is_current(state.sessions.wipe.key.as_ref(), operation_key),
         ClientEvent::Session(
-            SessionEvent::RuntimeConfigUpdated { operation_key, .. }
-            | SessionEvent::RuntimeConfigUpdateFailed { operation_key, .. },
+            SessionEvent::InferenceSettingsUpdated { operation_key, .. }
+            | SessionEvent::InferenceSettingsUpdateFailed { operation_key, .. },
         ) => operation_is_current(
-            state.sessions.runtime_config_update.key.as_ref(),
+            state.sessions.inference_settings_update.key.as_ref(),
             operation_key,
         ),
         ClientEvent::Session(
@@ -1134,7 +1141,7 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
             SessionEvent::CreateFailed { error, .. }
             | SessionEvent::DeleteFailed { error, .. }
             | SessionEvent::WipeFailed { error, .. }
-            | SessionEvent::RuntimeConfigUpdateFailed { error, .. }
+            | SessionEvent::InferenceSettingsUpdateFailed { error, .. }
             | SessionEvent::ListFailed(error)
             | SessionEvent::TimelineLoadFailed { error, .. }
             | SessionEvent::TemplatesSearchFailed { error, .. }
@@ -1162,7 +1169,7 @@ const fn providers_patch(
     crate::ConfigPatch {
         providers: Some(providers),
         mcp_servers: None,
-        runtime_defaults: None,
+        inference_defaults: None,
     }
 }
 
@@ -1172,15 +1179,15 @@ const fn mcp_servers_patch(
     crate::ConfigPatch {
         providers: None,
         mcp_servers: Some(mcp_servers),
-        runtime_defaults: None,
+        inference_defaults: None,
     }
 }
 
-const fn runtime_defaults_patch(defaults: Option<RuntimeDefaults>) -> crate::ConfigPatch {
+const fn inference_defaults_patch(defaults: Option<InferenceDefaults>) -> crate::ConfigPatch {
     crate::ConfigPatch {
         providers: None,
         mcp_servers: None,
-        runtime_defaults: defaults,
+        inference_defaults: defaults,
     }
 }
 
@@ -1361,6 +1368,7 @@ mod tests {
             [
                 ClientEffect::Config(ConfigEffect::Watch { .. }),
                 ClientEffect::Session(SessionEffect::Watch { .. }),
+                ClientEffect::Session(SessionEffect::ListAgents { .. }),
                 ClientEffect::Config(ConfigEffect::Load),
                 ClientEffect::Session(SessionEffect::List),
             ]
@@ -1411,6 +1419,7 @@ mod tests {
             [
                 ClientEffect::Config(ConfigEffect::Watch { .. }),
                 ClientEffect::Session(SessionEffect::Watch { .. }),
+                ClientEffect::Session(SessionEffect::ListAgents { .. }),
             ]
         ));
         let timeline_update = client.maintain_watches();
@@ -1537,19 +1546,21 @@ mod tests {
     #[test]
     fn stale_operation_401_does_not_expire_current_access() {
         let mut client = Client::new();
-        let first = client.create_session();
+        let first = client.create_session("default");
         let [
             ClientEffect::Session(SessionEffect::Create {
                 operation_key: first_key,
+                ..
             }),
         ] = first.effects()
         else {
             panic!("first create should emit an effect");
         };
-        let second = client.create_session();
+        let second = client.create_session("default");
         let [
             ClientEffect::Session(SessionEffect::Create {
                 operation_key: second_key,
+                ..
             }),
         ] = second.effects()
         else {
@@ -1611,7 +1622,7 @@ mod tests {
         let mut client = Client::new();
         drop(client.register_config_watch_interest());
         drop(client.register_session_watch_interest());
-        client.create_session();
+        client.create_session("default");
         let operation_key = client.state().sessions.create.key.clone().unwrap();
         let update = client.expire_waltr_access("native token expired");
 
@@ -1643,7 +1654,7 @@ mod tests {
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
         )])));
-        let started = client.create_session();
+        let started = client.create_session("default");
         let operation_key = client.state().sessions.create.key.clone().unwrap();
         assert!(!started.is_empty());
 
@@ -1889,16 +1900,16 @@ mod tests {
         assert!(client.state().config.watch.open_id.is_none());
 
         let sessions = client.register_session_watch_interest();
-        let [
-            ClientEffect::Session(SessionEffect::Watch {
-                open_id: session_open_id,
-            }),
-        ] = sessions.effects()
-        else {
-            panic!("session watch should open");
-        };
+        let session_open_id = sessions
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                ClientEffect::Session(SessionEffect::Watch { open_id }) => Some(*open_id),
+                _ => None,
+            })
+            .expect("session watch should open");
         let session_failure = ClientEvent::Session(SessionEvent::WatchOpenFailed {
-            open_id: *session_open_id,
+            open_id: session_open_id,
             error: ClientError::new("session open failed"),
         });
         assert_eq!(client.apply(session_failure.clone()).effects().len(), 1);
@@ -1952,7 +1963,10 @@ mod tests {
             client.state().config.watch.error.as_deref(),
             Some("watch open identity exhausted")
         );
-        assert!(client.register_session_watch_interest().is_empty());
+        assert!(matches!(
+            client.register_session_watch_interest().effects(),
+            [ClientEffect::Session(SessionEffect::ListAgents { .. })]
+        ));
         assert_eq!(
             client.state().sessions.watch.status,
             OperationStatus::Failed
@@ -1978,7 +1992,7 @@ mod tests {
             etag: "etag-1".to_owned(),
             providers: providers([provider("anthropic")]),
             mcp_servers: mcp_servers([mcp_server("filesystem")]),
-            runtime_defaults: None,
+            inference_defaults: None,
         });
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
@@ -2568,16 +2582,18 @@ mod tests {
     }
 
     #[test]
-    fn session_create_completion_upserts_current_session() {
+    fn session_create_completion_only_updates_operation_result() {
         let mut client = Client::new();
         let operation_key = OperationKey::from("create-session");
+
+        client.state.sessions.create.key = Some(operation_key.clone());
 
         client.apply(ClientEvent::Session(SessionEvent::Created {
             operation_key,
             session: session("one"),
         }));
 
-        assert!(client.state().sessions.current.contains_key("one"));
+        assert!(client.state().sessions.current.is_empty());
         assert_eq!(
             client.state().sessions.create.status,
             OperationStatus::Ready
@@ -2585,7 +2601,7 @@ mod tests {
     }
 
     #[test]
-    fn session_delete_completion_removes_current_session() {
+    fn session_delete_completion_only_updates_operation_result() {
         let mut client = Client::new();
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
@@ -2597,7 +2613,7 @@ mod tests {
             id: "one".to_owned(),
         }));
 
-        assert!(!client.state().sessions.current.contains_key("one"));
+        assert!(client.state().sessions.current.contains_key("one"));
         assert_eq!(
             client.state().sessions.delete.status,
             OperationStatus::Ready
@@ -2605,7 +2621,7 @@ mod tests {
     }
 
     #[test]
-    fn session_delete_completion_removes_template_search_cache() {
+    fn session_delete_completion_preserves_authoritative_session_caches() {
         let mut client = Client::new();
         client.search_session_templates(
             "search-one",
@@ -2623,7 +2639,7 @@ mod tests {
         }));
 
         assert!(
-            !client
+            client
                 .state()
                 .sessions
                 .template_searches
@@ -2671,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_session_wipe_clears_all_session_caches_and_preserves_watch_interest() {
+    fn matching_session_wipe_waits_for_authoritative_watch_clear() {
         let mut client = Client::new();
         client.apply(ClientEvent::Status(StatusEvent::WatchChanged(
             SystemStatus { ready: true },
@@ -2704,9 +2720,15 @@ mod tests {
             operation_key: operation_key.clone(),
         }));
 
-        assert!(client.state().sessions.current.is_empty());
-        assert!(client.state().sessions.timelines.is_empty());
-        assert!(client.state().sessions.template_searches.is_empty());
+        assert!(client.state().sessions.current.contains_key("one"));
+        assert!(client.state().sessions.timelines.contains_key("one"));
+        assert!(
+            client
+                .state()
+                .sessions
+                .template_searches
+                .contains_key("one")
+        );
         assert_eq!(client.state().sessions.watch.interests, 1);
         assert_eq!(client.state().sessions.wipe.status, OperationStatus::Ready);
         assert!(matches!(
@@ -2882,7 +2904,10 @@ mod tests {
         );
         assert!(matches!(
             recovery_update.effects(),
-            [ClientEffect::Session(SessionEffect::Watch { .. })]
+            [
+                ClientEffect::Session(SessionEffect::Watch { .. }),
+                ClientEffect::Session(SessionEffect::ListAgents { .. })
+            ]
         ));
     }
 

@@ -373,7 +373,7 @@ async fn patch_config(addr: std::net::SocketAddr) -> Result<(), Box<dyn std::err
                 providers: config_with_provider("anthropic").providers,
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         }),
     )
     .await??

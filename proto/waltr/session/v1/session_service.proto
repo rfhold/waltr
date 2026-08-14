@@ -7,11 +7,13 @@ import "waltr/auth/v1/auth_service.proto";
 import "waltr/config/v1/config_service.proto";
 
 service SessionService {
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
   rpc WipeSessions(WipeSessionsRequest) returns (WipeSessionsResponse);
-  rpc UpdateSessionRuntimeConfig(UpdateSessionRuntimeConfigRequest) returns (UpdateSessionRuntimeConfigResponse);
+  rpc UpdateSessionInferenceSettings(UpdateSessionInferenceSettingsRequest) returns (UpdateSessionInferenceSettingsResponse);
+  rpc UpdateSessionAgent(UpdateSessionAgentRequest) returns (UpdateSessionAgentResponse);
   rpc WatchSessions(WatchSessionsRequest) returns (stream WatchSessionsResponse);
   rpc GetTimeline(GetTimelineRequest) returns (GetTimelineResponse);
   rpc WatchTimeline(WatchTimelineRequest) returns (stream WatchTimelineResponse);
@@ -24,7 +26,28 @@ service SessionService {
 }
 
 message CreateSessionRequest {
-  SessionRuntimeConfigRequest runtime_config = 1;
+  reserved "runtime_config";
+
+  InferenceSettingsRequest inference_settings = 1;
+  // Optional startup-catalog agent selection. Absence selects the server default.
+  AgentSelectionRequest agent_selection = 2;
+}
+
+message AgentSelectionRequest {
+  // Exact selectable startup-catalog agent name.
+  string agent_name = 1;
+}
+
+message ListAgentsRequest {}
+
+message ListAgentsResponse {
+  repeated SelectableAgent agents = 1;
+  string default_agent_name = 2;
+}
+
+message SelectableAgent {
+  string name = 1;
+  optional string description = 2;
 }
 
 message CreateSessionResponse {
@@ -49,12 +72,21 @@ message WipeSessionsRequest {
 
 message WipeSessionsResponse {}
 
-message UpdateSessionRuntimeConfigRequest {
+message UpdateSessionInferenceSettingsRequest {
   string id = 1;
-  SessionRuntimeConfigRequest runtime_config = 2;
+  InferenceSettingsRequest inference_settings = 2;
 }
 
-message UpdateSessionRuntimeConfigResponse {
+message UpdateSessionInferenceSettingsResponse {
+  SessionSummary session = 1;
+}
+
+message UpdateSessionAgentRequest {
+  string id = 1;
+  AgentSelectionRequest agent_selection = 2;
+}
+
+message UpdateSessionAgentResponse {
   SessionSummary session = 1;
 }
 
@@ -321,6 +353,8 @@ message JsonTimelineContent {
 }
 
 message SessionSummary {
+  reserved "runtime_config";
+
   string id = 1;
   uint64 revision = 2;
   SessionStatus status = 3;
@@ -328,8 +362,10 @@ message SessionSummary {
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
   google.protobuf.Timestamp last_activity_at = 7;
-  SessionRuntimeConfig runtime_config = 8;
+  InferenceSettings inference_settings = 8;
   SessionMetrics metrics = 9;
+  // Effective selected agent name. Legacy records use the current server default.
+  string agent_name = 10;
 }
 
 message SessionMetrics {
@@ -347,40 +383,36 @@ message SessionMetrics {
   uint64 context_tokens = 11;
 }
 
-message SessionRuntimeConfig {
-  SessionProviderRuntime provider = 1;
-  repeated SessionMcpServerRuntime mcp_servers = 2;
+message InferenceSettings {
+  reserved 2;
+  reserved "mcp_servers";
+
+  InferenceProviderSettings provider = 1;
 }
 
-message SessionRuntimeConfigRequest {
+message InferenceSettingsRequest {
+  reserved 3;
+  reserved "enabled_mcp_server_keys";
+
   string provider_key = 1;
   string model_id = 2;
-  repeated string enabled_mcp_server_keys = 3;
   optional string reasoning_effort = 4;
 }
 
-message SessionProviderRuntime {
+message InferenceProviderSettings {
   string key = 1;
   waltr.config.v1.ProviderType type = 2;
   string url = 3;
   string model_id = 4;
-  RuntimeConfigMatch match = 5;
+  InferenceSettingsMatch match = 5;
   optional string reasoning_effort = 6;
 }
 
-message SessionMcpServerRuntime {
-  string key = 1;
-  waltr.config.v1.McpServerType type = 2;
-  string command = 3;
-  string url = 4;
-  RuntimeConfigMatch match = 5;
-}
-
-enum RuntimeConfigMatch {
-  RUNTIME_CONFIG_MATCH_UNSPECIFIED = 0;
-  RUNTIME_CONFIG_MATCH_CONFIGURED = 1;
-  RUNTIME_CONFIG_MATCH_MISSING = 2;
-  RUNTIME_CONFIG_MATCH_CHANGED = 3;
+enum InferenceSettingsMatch {
+  INFERENCE_SETTINGS_MATCH_UNSPECIFIED = 0;
+  INFERENCE_SETTINGS_MATCH_CONFIGURED = 1;
+  INFERENCE_SETTINGS_MATCH_MISSING = 2;
+  INFERENCE_SETTINGS_MATCH_CHANGED = 3;
 }
 
 message SessionStatus {

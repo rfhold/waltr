@@ -8,7 +8,8 @@ use ts_rs::TS;
 use crate::transport::SessionTimelineWatchEvent;
 use crate::{
     AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, Configuration, GenericAuthAttempt,
-    RollbackTarget, SessionSummary, SessionTemplateOption, StreamId, SystemStatus, TimelineEvent,
+    RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateOption, StreamId, SystemStatus,
+    TimelineEvent,
 };
 
 /// Runtime-local operation identifier used by shells to track command results.
@@ -148,6 +149,7 @@ pub struct AccessClientState {
     pub active_attempt_id: Option<AccessAttemptId>,
     pub(crate) reload_config: bool,
     pub(crate) reload_sessions: bool,
+    pub(crate) reload_agents: bool,
 }
 
 /// Current Waltr access authentication status.
@@ -248,6 +250,8 @@ pub struct StatusClientState {
 /// Session coordination state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SessionClientState {
+    /// Selectable session agent catalog.
+    pub agents: SessionAgentCatalogState,
     /// Last known sessions by id.
     pub current: BTreeMap<String, SessionSummary>,
     /// Session create operation state.
@@ -258,8 +262,10 @@ pub struct SessionClientState {
     pub delete: OperationState,
     /// Session wipe operation state.
     pub wipe: OperationState,
-    /// Session runtime metadata update operation state.
-    pub runtime_config_update: OperationState,
+    /// Session inference settings update operation state.
+    pub inference_settings_update: OperationState,
+    /// Session agent update operation state.
+    pub agent_update: OperationState,
     /// User message submit operation state.
     pub submit_user_message: OperationState,
     /// External request response operation state.
@@ -277,6 +283,18 @@ pub struct SessionClientState {
     /// Latest resource search state by session id.
     pub template_searches: BTreeMap<String, SessionTemplateSearchState>,
     pub(crate) last_sequence: u64,
+}
+
+/// Selectable session agent catalog state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionAgentCatalogState {
+    /// Deterministically ordered selectable agents.
+    pub entries: Vec<SelectableAgent>,
+    /// Server-selected default agent name.
+    pub default_agent_name: String,
+    /// Current load operation state.
+    pub load: OperationState,
+    pub(crate) request_id: u64,
 }
 
 /// Resource search coordination state for one session.
@@ -423,8 +441,17 @@ pub enum ClientOperationState {
         /// Last operation error, when present.
         error: Option<String>,
     },
-    /// Session runtime metadata update command result.
-    SessionRuntimeConfigUpdate {
+    /// Session inference settings update command result.
+    SessionInferenceSettingsUpdate {
+        /// Current operation status.
+        status: OperationStatus,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Updated session, when the operation completed successfully.
+        session: Option<SessionSummary>,
+    },
+    /// Session agent update command result.
+    SessionAgentUpdate {
         /// Current operation status.
         status: OperationStatus,
         /// Last operation error, when present.
@@ -542,7 +569,12 @@ impl ClientOperationState {
                 error,
                 session,
             }
-            | Self::SessionRuntimeConfigUpdate {
+            | Self::SessionInferenceSettingsUpdate {
+                status,
+                error,
+                session,
+            }
+            | Self::SessionAgentUpdate {
                 status,
                 error,
                 session,
@@ -587,7 +619,8 @@ impl ClientOperationState {
             | Self::ConfigReset { .. }
             | Self::SessionCreate { .. }
             | Self::SessionWipe { .. }
-            | Self::SessionRuntimeConfigUpdate { .. } => {}
+            | Self::SessionInferenceSettingsUpdate { .. }
+            | Self::SessionAgentUpdate { .. } => {}
         }
     }
 }
@@ -737,9 +770,11 @@ impl ClientState {
                 self.config.current.is_some() || self.config.load.status != OperationStatus::Idle;
             self.access.reload_sessions |= !self.sessions.current.is_empty()
                 || self.sessions.list.status != OperationStatus::Idle;
+            self.access.reload_agents |= self.sessions.agents.load.status != OperationStatus::Idle;
         } else {
             self.access.reload_config = false;
             self.access.reload_sessions = false;
+            self.access.reload_agents = false;
         }
 
         self.config = ConfigClientState::default();
@@ -1539,10 +1574,10 @@ impl ClientState {
     }
 
     pub(crate) fn set_session_create_ready(&mut self, key: OperationKey, session: SessionSummary) {
-        self.sessions.create.status = OperationStatus::Ready;
-        self.sessions.create.error = None;
-        self.sessions.create.key = Some(key.clone());
-        self.upsert_session(session.clone());
+        if self.sessions.create.key.as_ref() == Some(&key) {
+            self.sessions.create.status = OperationStatus::Ready;
+            self.sessions.create.error = None;
+        }
         self.operations.insert(
             key,
             ClientOperationState::SessionCreate {
@@ -1554,9 +1589,10 @@ impl ClientState {
     }
 
     pub(crate) fn set_session_create_failed(&mut self, key: OperationKey, message: String) {
-        self.sessions.create.status = OperationStatus::Failed;
-        self.sessions.create.error = Some(message.clone());
-        self.sessions.create.key = Some(key.clone());
+        if self.sessions.create.key.as_ref() == Some(&key) {
+            self.sessions.create.status = OperationStatus::Failed;
+            self.sessions.create.error = Some(message.clone());
+        }
         self.operations.insert(
             key,
             ClientOperationState::SessionCreate {
@@ -1585,7 +1621,6 @@ impl ClientState {
         self.sessions.delete.status = OperationStatus::Ready;
         self.sessions.delete.error = None;
         self.sessions.delete.key = Some(key.clone());
-        self.remove_session(&id);
         self.operations.insert(
             key,
             ClientOperationState::SessionDelete {
@@ -1629,7 +1664,6 @@ impl ClientState {
     }
 
     pub(crate) fn set_session_wipe_ready(&mut self, key: OperationKey) {
-        self.clear_session_derived_state();
         self.sessions.wipe.status = OperationStatus::Ready;
         self.sessions.wipe.error = None;
         self.sessions.wipe.key = Some(key.clone());
@@ -1655,13 +1689,13 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_session_runtime_config_update_loading(&mut self, key: OperationKey) {
-        self.sessions.runtime_config_update.status = OperationStatus::Loading;
-        self.sessions.runtime_config_update.error = None;
-        self.sessions.runtime_config_update.key = Some(key.clone());
+    pub(crate) fn set_session_inference_settings_update_loading(&mut self, key: OperationKey) {
+        self.sessions.inference_settings_update.status = OperationStatus::Loading;
+        self.sessions.inference_settings_update.error = None;
+        self.sessions.inference_settings_update.key = Some(key.clone());
         self.operations.insert(
             key,
-            ClientOperationState::SessionRuntimeConfigUpdate {
+            ClientOperationState::SessionInferenceSettingsUpdate {
                 status: OperationStatus::Loading,
                 error: None,
                 session: None,
@@ -1669,18 +1703,18 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_session_runtime_config_update_ready(
+    pub(crate) fn set_session_inference_settings_update_ready(
         &mut self,
         key: OperationKey,
         session: SessionSummary,
     ) {
-        self.sessions.runtime_config_update.status = OperationStatus::Ready;
-        self.sessions.runtime_config_update.error = None;
-        self.sessions.runtime_config_update.key = Some(key.clone());
-        self.upsert_session(session.clone());
+        if self.sessions.inference_settings_update.key.as_ref() == Some(&key) {
+            self.sessions.inference_settings_update.status = OperationStatus::Ready;
+            self.sessions.inference_settings_update.error = None;
+        }
         self.operations.insert(
             key,
-            ClientOperationState::SessionRuntimeConfigUpdate {
+            ClientOperationState::SessionInferenceSettingsUpdate {
                 status: OperationStatus::Ready,
                 error: None,
                 session: Some(session),
@@ -1688,22 +1722,104 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_session_runtime_config_update_failed(
+    pub(crate) fn set_session_inference_settings_update_failed(
         &mut self,
         key: OperationKey,
         message: String,
     ) {
-        self.sessions.runtime_config_update.status = OperationStatus::Failed;
-        self.sessions.runtime_config_update.error = Some(message.clone());
-        self.sessions.runtime_config_update.key = Some(key.clone());
+        if self.sessions.inference_settings_update.key.as_ref() == Some(&key) {
+            self.sessions.inference_settings_update.status = OperationStatus::Failed;
+            self.sessions.inference_settings_update.error = Some(message.clone());
+        }
         self.operations.insert(
             key,
-            ClientOperationState::SessionRuntimeConfigUpdate {
+            ClientOperationState::SessionInferenceSettingsUpdate {
                 status: OperationStatus::Failed,
                 error: Some(message),
                 session: None,
             },
         );
+    }
+
+    pub(crate) fn set_session_agent_update_loading(&mut self, key: OperationKey) {
+        self.sessions.agent_update = OperationState {
+            status: OperationStatus::Loading,
+            error: None,
+            key: Some(key.clone()),
+        };
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionAgentUpdate {
+                status: OperationStatus::Loading,
+                error: None,
+                session: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_agent_update_ready(
+        &mut self,
+        key: OperationKey,
+        session: SessionSummary,
+    ) {
+        if self.sessions.agent_update.key.as_ref() == Some(&key) {
+            self.sessions.agent_update.status = OperationStatus::Ready;
+            self.sessions.agent_update.error = None;
+        }
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionAgentUpdate {
+                status: OperationStatus::Ready,
+                error: None,
+                session: Some(session),
+            },
+        );
+    }
+
+    pub(crate) fn set_session_agent_update_failed(&mut self, key: OperationKey, message: String) {
+        if self.sessions.agent_update.key.as_ref() == Some(&key) {
+            self.sessions.agent_update.status = OperationStatus::Failed;
+            self.sessions.agent_update.error = Some(message.clone());
+        }
+        self.operations.insert(
+            key,
+            ClientOperationState::SessionAgentUpdate {
+                status: OperationStatus::Failed,
+                error: Some(message),
+                session: None,
+            },
+        );
+    }
+
+    pub(crate) fn set_session_agents_loading(&mut self) -> u64 {
+        self.sessions.agents.request_id = self.sessions.agents.request_id.saturating_add(1);
+        self.sessions.agents.load.status = OperationStatus::Loading;
+        self.sessions.agents.load.error = None;
+        self.sessions.agents.request_id
+    }
+
+    pub(crate) fn set_session_agents_ready(
+        &mut self,
+        request_id: u64,
+        mut entries: Vec<SelectableAgent>,
+        default_agent_name: String,
+    ) {
+        if self.sessions.agents.request_id != request_id {
+            return;
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        self.sessions.agents.entries = entries;
+        self.sessions.agents.default_agent_name = default_agent_name;
+        self.sessions.agents.load.status = OperationStatus::Ready;
+        self.sessions.agents.load.error = None;
+    }
+
+    pub(crate) fn set_session_agents_failed(&mut self, request_id: u64, message: String) {
+        if self.sessions.agents.request_id != request_id {
+            return;
+        }
+        self.sessions.agents.load.status = OperationStatus::Failed;
+        self.sessions.agents.load.error = Some(message);
     }
 
     pub(crate) fn set_session_list_loading(&mut self) {

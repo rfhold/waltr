@@ -26,7 +26,7 @@ export default async function () {
 
     await page.locator('.shell__nav a[href="/sessions"]').click();
     await waitForText(page, "#sessions-title", "Sessions");
-    await page.locator(".sessions__header button").click();
+    await createSession(page);
     await waitForText(page, '[aria-label="Session status summary"]', `Provider gateway-openai/${GATEWAY_MODEL}`);
 
     await typeAndKeepFocus(page, '[aria-label="Session message"]', LIVE_PROMPT);
@@ -55,19 +55,26 @@ export default async function () {
   });
 }
 
+async function createSession(page) {
+  await page.locator('.sessions__header button').click();
+  const dialog = page.locator('[role="dialog"][aria-label="Create session dialog"]');
+  await dialog.waitFor();
+  await dialog.locator('button[type="submit"]').click();
+}
+
 async function seedGatewayProvider(page) {
   await page.locator('a[href="/config/provider"]').click();
   await waitForText(page, "#config-title", "Settings");
   await createProvider(page, "gateway-openai", GATEWAY_MODEL);
 
   await page.locator('a[href="/config/defaults"]').click();
-  await waitForText(page, "#runtime-defaults-title", "New session defaults");
-  await waitForSelectOption(page, "#runtime-default-provider", "gateway-openai");
-  await setSelectValue(page, "#runtime-default-provider", "gateway-openai");
-  await waitForSelectOption(page, "#runtime-default-model", GATEWAY_MODEL);
-  await setSelectValue(page, "#runtime-default-model", GATEWAY_MODEL);
-  await submitForm(page, 'section[aria-labelledby="runtime-defaults-title"] form');
-  await waitForText(page, 'section[aria-labelledby="runtime-defaults-title"]', "Clear defaults");
+  await waitForText(page, "#inference-defaults-title", "New session inference");
+  await waitForSelectOption(page, "#inference-default-provider", "gateway-openai");
+  await setSelectValue(page, "#inference-default-provider", "gateway-openai");
+  await waitForSelectOption(page, "#inference-default-model", GATEWAY_MODEL);
+  await setSelectValue(page, "#inference-default-model", GATEWAY_MODEL);
+  await submitForm(page, 'section[aria-labelledby="inference-defaults-title"] form');
+  await waitForText(page, 'section[aria-labelledby="inference-defaults-title"]', "Clear defaults");
 }
 
 async function createProvider(page, name, model) {

@@ -16,7 +16,7 @@ async fn config_service_rejects_stale_etag() -> Result<(), Box<dyn std::error::E
                 providers: config_with_provider("anthropic").providers,
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await?;
 
@@ -27,7 +27,7 @@ async fn config_service_rejects_stale_etag() -> Result<(), Box<dyn std::error::E
                 providers: config_with_provider("openai").providers,
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect_err("stale etag should be rejected");

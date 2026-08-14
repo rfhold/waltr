@@ -27,8 +27,6 @@ type = 2
 command = ""
 url = "https://waltr.test/mcp"
 
-[runtime_defaults]
+[inference_defaults]
 provider_key = "k6-openai"
 model_key = "gpt-5-nano"
-mcp_default_enabled = false
-enabled_mcp_server_keys = ["protected"]

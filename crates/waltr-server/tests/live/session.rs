@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::support::grpc::session_client;
 use waltr::grpc::waltr::{
-    config::v1::{Configuration, Model, ModelType, Provider, ProviderType, RuntimeDefaults},
+    config::v1::{Configuration, InferenceDefaults, Model, ModelType, Provider, ProviderType},
     session::v1::{
         CreateSessionRequest, GetTimelineRequest, SubmitUserMessageRequest, TimelineDirection,
         TimelineQuery, timeline_content, watch_timeline_response,
@@ -170,11 +170,9 @@ fn live_config(provider: LiveServerProvider) -> Configuration {
                 provider.model_key,
             ),
         )]),
-        runtime_defaults: Some(RuntimeDefaults {
+        inference_defaults: Some(InferenceDefaults {
             provider_key,
             model_key,
-            mcp_default_enabled: Some(false),
-            enabled_mcp_server_keys: Vec::new(),
             reasoning_effort: None,
         }),
         ..Configuration::default()

@@ -11,8 +11,7 @@ export default async function () {
     const visibleSnapshots = [];
     await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
     await waitForPathname(page, "/sessions");
-    await page.locator(".sessions__header button").click();
-    await waitForText(page, '[aria-label="Session status summary"]', "MCP protected");
+    await createSession(page);
     const sessionUrl = page.url();
     const sessionPath = await page.evaluate(() => window.location.pathname);
 
@@ -118,7 +117,6 @@ export default async function () {
     await waitForMissingElement(page, '.oauth-dialog', 20_000);
     await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
     await waitForPathname(page, sessionPath);
-    await waitForText(page, '[aria-label="Session status summary"]', "MCP protected");
     await typeAndKeepFocus(page, '[aria-label="Session message"]', protectedPrompt);
     await page.locator('[aria-label="Send session message"] button[type="submit"]').click();
     await waitForTextareaValue(page, '[aria-label="Session message"]', "");
@@ -126,9 +124,7 @@ export default async function () {
 
     await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
     await waitForPathname(page, "/sessions");
-    await page.locator(".sessions__header button").click();
-    await waitForText(page, '[aria-label="Session status summary"]', "MCP protected");
-
+    await createSession(page);
     await clearTextarea(page, '[aria-label="Session message"]');
     await typeAndKeepFocus(page, '[aria-label="Session message"]', "@configuration");
     const suggestions = await waitForText(
@@ -150,9 +146,9 @@ export default async function () {
     const clientSecret = __ENV.WALTR_OAUTH_CLIENT_SECRET || "waltr-access-test-secret";
 
     check(null, {
-      "runtime MCP failure is inline and target scoped": () =>
+      "MCP failure is inline and target scoped": () =>
         includesText(authenticationFailure, "Authentication failed for MCP server protected"),
-      "runtime failure retains the draft without opening OAuth": () =>
+      "MCP failure retains the draft without opening OAuth": () =>
         retainedDraft === protectedPrompt && noRuntimeDialog,
       "server callback lifecycle reaches shared-client terminal state": () =>
         includesText(pendingDialog, "Waiting for the server callback") && noReauthorization,
@@ -190,6 +186,13 @@ export default async function () {
       ].every((label) => !combinedSnapshots.includes(label)),
     });
   });
+}
+
+async function createSession(page) {
+  await page.locator('.sessions__header button').click();
+  const dialog = page.locator('[role="dialog"][aria-label="Create session dialog"]');
+  await dialog.waitFor();
+  await dialog.locator('button[type="submit"]').click();
 }
 
 async function waitForTextareaValueChange(page, selector, previousValue) {

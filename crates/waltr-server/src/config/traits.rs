@@ -1,7 +1,7 @@
 //! Configuration backend traits.
 
 use crate::config::{ConfigError, ConfigWatchEvent};
-use waltr::grpc::waltr::config::v1::{Configuration, McpServer, Provider, RuntimeDefaults};
+use waltr::grpc::waltr::config::v1::{Configuration, InferenceDefaults, McpServer, Provider};
 use std::{collections::HashMap, future::Future};
 use tokio_stream::{Stream, wrappers::errors::BroadcastStreamRecvError};
 
@@ -37,8 +37,8 @@ pub struct ConfigPatch {
     pub providers: Option<HashMap<String, Provider>>,
     /// Replacement MCP servers map. `None` leaves MCP servers unchanged.
     pub mcp_servers: Option<HashMap<String, McpServer>>,
-    /// Replacement runtime defaults. `None` leaves runtime defaults unchanged.
-    pub runtime_defaults: Option<RuntimeDefaults>,
+    /// Replacement inference defaults. `None` leaves inference defaults unchanged.
+    pub inference_defaults: Option<InferenceDefaults>,
 }
 
 /// Configuration pubsub abstraction.

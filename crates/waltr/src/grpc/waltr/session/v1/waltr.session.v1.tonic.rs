@@ -79,6 +79,30 @@ pub mod session_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
+        pub async fn list_agents(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListAgentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListAgentsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/ListAgents",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("waltr.session.v1.SessionService", "ListAgents"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn create_session(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateSessionRequest>,
@@ -183,11 +207,13 @@ pub mod session_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        pub async fn update_session_runtime_config(
+        pub async fn update_session_inference_settings(
             &mut self,
-            request: impl tonic::IntoRequest<super::UpdateSessionRuntimeConfigRequest>,
+            request: impl tonic::IntoRequest<
+                super::UpdateSessionInferenceSettingsRequest,
+            >,
         ) -> std::result::Result<
-            tonic::Response<super::UpdateSessionRuntimeConfigResponse>,
+            tonic::Response<super::UpdateSessionInferenceSettingsResponse>,
             tonic::Status,
         > {
             self.inner
@@ -200,14 +226,43 @@ pub mod session_service_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waltr.session.v1.SessionService/UpdateSessionRuntimeConfig",
+                "/waltr.session.v1.SessionService/UpdateSessionInferenceSettings",
             );
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(
                     GrpcMethod::new(
                         "waltr.session.v1.SessionService",
-                        "UpdateSessionRuntimeConfig",
+                        "UpdateSessionInferenceSettings",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn update_session_agent(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateSessionAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateSessionAgentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.session.v1.SessionService/UpdateSessionAgent",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.session.v1.SessionService",
+                        "UpdateSessionAgent",
                     ),
                 );
             self.inner.unary(req, path, codec).await
@@ -470,6 +525,13 @@ pub mod session_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with SessionServiceServer.
     #[async_trait]
     pub trait SessionService: std::marker::Send + std::marker::Sync + 'static {
+        async fn list_agents(
+            &self,
+            request: tonic::Request<super::ListAgentsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListAgentsResponse>,
+            tonic::Status,
+        >;
         async fn create_session(
             &self,
             request: tonic::Request<super::CreateSessionRequest>,
@@ -498,11 +560,18 @@ pub mod session_service_server {
             tonic::Response<super::WipeSessionsResponse>,
             tonic::Status,
         >;
-        async fn update_session_runtime_config(
+        async fn update_session_inference_settings(
             &self,
-            request: tonic::Request<super::UpdateSessionRuntimeConfigRequest>,
+            request: tonic::Request<super::UpdateSessionInferenceSettingsRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::UpdateSessionRuntimeConfigResponse>,
+            tonic::Response<super::UpdateSessionInferenceSettingsResponse>,
+            tonic::Status,
+        >;
+        async fn update_session_agent(
+            &self,
+            request: tonic::Request<super::UpdateSessionAgentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateSessionAgentResponse>,
             tonic::Status,
         >;
         /// Server streaming response type for the WatchSessions method.
@@ -657,6 +726,51 @@ pub mod session_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
+                "/waltr.session.v1.SessionService/ListAgents" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListAgentsSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::ListAgentsRequest>
+                    for ListAgentsSvc<T> {
+                        type Response = super::ListAgentsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListAgentsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::list_agents(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListAgentsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/waltr.session.v1.SessionService/CreateSession" => {
                     #[allow(non_camel_case_types)]
                     struct CreateSessionSvc<T: SessionService>(pub Arc<T>);
@@ -837,15 +951,17 @@ pub mod session_service_server {
                     };
                     Box::pin(fut)
                 }
-                "/waltr.session.v1.SessionService/UpdateSessionRuntimeConfig" => {
+                "/waltr.session.v1.SessionService/UpdateSessionInferenceSettings" => {
                     #[allow(non_camel_case_types)]
-                    struct UpdateSessionRuntimeConfigSvc<T: SessionService>(pub Arc<T>);
+                    struct UpdateSessionInferenceSettingsSvc<T: SessionService>(
+                        pub Arc<T>,
+                    );
                     impl<
                         T: SessionService,
                     > tonic::server::UnaryService<
-                        super::UpdateSessionRuntimeConfigRequest,
-                    > for UpdateSessionRuntimeConfigSvc<T> {
-                        type Response = super::UpdateSessionRuntimeConfigResponse;
+                        super::UpdateSessionInferenceSettingsRequest,
+                    > for UpdateSessionInferenceSettingsSvc<T> {
+                        type Response = super::UpdateSessionInferenceSettingsResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
@@ -853,12 +969,12 @@ pub mod session_service_server {
                         fn call(
                             &mut self,
                             request: tonic::Request<
-                                super::UpdateSessionRuntimeConfigRequest,
+                                super::UpdateSessionInferenceSettingsRequest,
                             >,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as SessionService>::update_session_runtime_config(
+                                <T as SessionService>::update_session_inference_settings(
                                         &inner,
                                         request,
                                     )
@@ -873,7 +989,53 @@ pub mod session_service_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
-                        let method = UpdateSessionRuntimeConfigSvc(inner);
+                        let method = UpdateSessionInferenceSettingsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.session.v1.SessionService/UpdateSessionAgent" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateSessionAgentSvc<T: SessionService>(pub Arc<T>);
+                    impl<
+                        T: SessionService,
+                    > tonic::server::UnaryService<super::UpdateSessionAgentRequest>
+                    for UpdateSessionAgentSvc<T> {
+                        type Response = super::UpdateSessionAgentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateSessionAgentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SessionService>::update_session_agent(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpdateSessionAgentSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

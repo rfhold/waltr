@@ -2,8 +2,8 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::support::grpc::{config_client, config_with_provider, get_config};
 use waltr::grpc::waltr::config::v1::{
-    McpServer, McpServerMapPatch, McpServerType, PatchConfigRequest, ProviderMapPatch,
-    ResetConfigRequest, RuntimeDefaults, WatchConfigRequest,
+    InferenceDefaults, McpServer, McpServerMapPatch, McpServerType, PatchConfigRequest,
+    ProviderMapPatch, ResetConfigRequest, WatchConfigRequest,
 };
 use waltr_server::test_support::setup_server;
 use tonic::Code;
@@ -34,10 +34,7 @@ async fn reset_replaces_all_sections_and_publishes_changed_keys()
             mcp_servers: Some(McpServerMapPatch {
                 mcp_servers: HashMap::from([("custom".to_owned(), custom_mcp)]),
             }),
-            runtime_defaults: Some(RuntimeDefaults {
-                enabled_mcp_server_keys: vec!["custom".to_owned()],
-                ..RuntimeDefaults::default()
-            }),
+            inference_defaults: Some(InferenceDefaults::default()),
         })
         .await?
         .into_inner()
@@ -58,7 +55,7 @@ async fn reset_replaces_all_sections_and_publishes_changed_keys()
 
     assert_eq!(reset.providers, initial.providers);
     assert_eq!(reset.mcp_servers, initial.mcp_servers);
-    assert!(reset.runtime_defaults.is_none());
+    assert!(reset.inference_defaults.is_none());
     assert_ne!(reset.etag, custom.etag);
     assert_eq!(get_config(&mut client).await?, reset);
 
@@ -69,7 +66,7 @@ async fn reset_replaces_all_sections_and_publishes_changed_keys()
     assert_eq!(event.etag, reset.etag);
     assert_eq!(
         event.changed_keys,
-        vec!["mcp_servers", "providers", "runtime_defaults"]
+        vec!["inference_defaults", "mcp_servers", "providers"]
     );
 
     Ok(())

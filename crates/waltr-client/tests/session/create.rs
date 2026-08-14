@@ -11,9 +11,14 @@ async fn client_surface_creates_session_and_updates_snapshot() {
 
     next_snapshot_until(&mut stream, |snapshot| snapshot.status.ready).await;
 
-    let started = dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
-        .await
-        .expect("session create should succeed");
+    let started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("session create should succeed");
     assert_eq!(started.sessions.create.status, "loading");
     let operation_key = started
         .sessions
@@ -54,12 +59,12 @@ async fn client_surface_creates_session_and_updates_snapshot() {
         panic!("session create operation should include created session result");
     };
     assert!(!operation_session.id.is_empty());
+    assert_eq!(operation_session.agent_name, "coding");
     assert_eq!(operation_session.revision, 0);
     assert_eq!(operation_session.status.phase, SessionPhaseView::Idle);
     assert_eq!(operation_session.current_prompt, None);
     assert!(operation_session.created_at.is_some());
     assert!(operation_session.updated_at.is_some());
     assert!(operation_session.last_activity_at.is_some());
-    assert_eq!(snapshot.sessions.current.len(), 1);
-    assert_eq!(snapshot.sessions.current[0].id, operation_session.id);
+    assert!(snapshot.sessions.current.is_empty());
 }

@@ -168,7 +168,8 @@ impl CatalogLoader {
             .providers
             .get_mut("anthropic")
             .expect("anthropic provider template")
-            .models = claude_models.clone();
+            .models
+            .clone_from(&claude_models);
         config
             .providers
             .get_mut("claude-code")
@@ -178,7 +179,8 @@ impl CatalogLoader {
             .providers
             .get_mut("openai")
             .expect("openai provider template")
-            .models = openai_models.clone();
+            .models
+            .clone_from(&openai_models);
         config
             .providers
             .get_mut("codex")
@@ -193,7 +195,7 @@ impl CatalogLoader {
                 url: mcp_url.to_owned(),
             },
         );
-        config.runtime_defaults = None;
+        config.inference_defaults = None;
         Ok(config)
     }
 
@@ -1037,7 +1039,7 @@ mod default_tests {
             Some(("openai", "gpt-5.3"))
         );
         assert_eq!(config.mcp_servers["waltr"].url, "http://127.0.0.1:14333/mcp");
-        assert!(config.runtime_defaults.is_none());
+        assert!(config.inference_defaults.is_none());
     }
 
     #[tokio::test]
@@ -1496,7 +1498,7 @@ where
                 ConfigPatch {
                     providers: Some(config.providers),
                     mcp_servers: None,
-                    runtime_defaults: None,
+                    inference_defaults: None,
                 },
                 expected_etag,
             )

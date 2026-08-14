@@ -67,15 +67,31 @@ fn main() {
     assert!(status.success(), "pnpm web build failed with {status}");
 
     let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR should be set");
-    let generated = Path::new(&out_dir).join("web_assets.rs");
+    write_assets(&dist, Path::new(&out_dir));
+}
+
+fn write_assets(dist: &Path, out_dir: &Path) {
+    let generated = out_dir.join("web_assets.rs");
+    let bundled_assets = out_dir.join("web-assets");
+    if bundled_assets.exists() {
+        fs::remove_dir_all(&bundled_assets).expect("stale bundled web assets should be removable");
+    }
     let mut assets = Vec::new();
-    collect_assets(&dist, &dist, &mut assets).expect("web dist assets should be readable");
+    collect_assets(dist, dist, &mut assets).expect("web dist assets should be readable");
     assets.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut source = String::new();
     source.push_str("static WEB_ASSETS: &[WebAsset] = &[\n");
     for (path, file) in assets {
-        let include_path = file.to_string_lossy();
+        let bundled_file = bundled_assets.join(path.trim_start_matches('/'));
+        fs::create_dir_all(
+            bundled_file
+                .parent()
+                .expect("bundled asset should have a parent directory"),
+        )
+        .expect("bundled web asset directory should be creatable");
+        fs::copy(&file, &bundled_file).expect("bundled web asset should be copyable");
+        let include_path = bundled_file.to_string_lossy();
         writeln!(
             source,
             "    WebAsset {{ path: {path:?}, content_type: {:?}, bytes: include_bytes!({include_path:?}) }},",

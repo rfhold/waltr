@@ -3,7 +3,7 @@
 use waltr_client::{ClientCommand, ClientOperationView, ClientRuntime, SessionPhaseView};
 
 use crate::support::{
-    server::{server_endpoint, server_endpoint_with_runtime_config},
+    server::{server_endpoint, server_endpoint_with_inference_config},
     snapshots::{dispatch_stream_command, next_snapshot_until, no_sleep},
 };
 
@@ -32,9 +32,14 @@ async fn session_watch_interest_receives_initial_snapshot_and_created_sessions()
     assert_eq!(watched.sessions.watch.status, "received");
     assert!(watched.sessions.current.is_empty());
 
-    dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
-        .await
-        .expect("session create should succeed");
+    dispatch_stream_command(
+        &mut stream,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("session create should succeed");
 
     let watched = next_snapshot_until(&mut stream, |snapshot| {
         snapshot.sessions.watch.status == "received" && snapshot.sessions.current.len() == 1
@@ -75,9 +80,14 @@ async fn two_session_watch_streams_stay_in_sync_across_create_and_delete() {
     open_session_watch(&mut first).await;
     open_session_watch(&mut second).await;
 
-    dispatch_stream_command(&mut first, ClientCommand::CreateSession)
-        .await
-        .expect("first tab should create session");
+    dispatch_stream_command(
+        &mut first,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("first tab should create session");
     let first_seen = next_snapshot_until(&mut first, |snapshot| {
         snapshot.sessions.watch.status == "received" && snapshot.sessions.current.len() == 1
     })
@@ -117,8 +127,8 @@ async fn two_session_watch_streams_stay_in_sync_across_create_and_delete() {
 }
 
 #[tokio::test]
-async fn session_runtime_update_preserves_reasoning_effort_in_client_state() {
-    let endpoint = server_endpoint_with_runtime_config()
+async fn session_inference_update_preserves_reasoning_effort_in_client_state() {
+    let endpoint = server_endpoint_with_inference_config()
         .await
         .expect("runtime-configured server should start");
     let mut stream = ClientRuntime::for_endpoint(endpoint).into_state_stream(no_sleep);
@@ -126,9 +136,14 @@ async fn session_runtime_update_preserves_reasoning_effort_in_client_state() {
     wait_for_system_ready(&mut stream).await;
     open_session_watch(&mut stream).await;
 
-    dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
-        .await
-        .expect("session create should succeed");
+    dispatch_stream_command(
+        &mut stream,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("session create should succeed");
     let created = next_snapshot_until(&mut stream, |snapshot| {
         snapshot.sessions.watch.status == "received" && snapshot.sessions.current.len() == 1
     })
@@ -137,11 +152,10 @@ async fn session_runtime_update_preserves_reasoning_effort_in_client_state() {
 
     let started = dispatch_stream_command(
         &mut stream,
-        ClientCommand::UpdateSessionRuntimeConfig {
+        ClientCommand::UpdateSessionInferenceSettings {
             id: session_id.clone(),
             provider_key: "openai".to_owned(),
             model_id: "gpt".to_owned(),
-            enabled_mcp_server_keys: Vec::new(),
             reasoning_effort: Some("high".to_owned()),
         },
     )
@@ -149,7 +163,7 @@ async fn session_runtime_update_preserves_reasoning_effort_in_client_state() {
     .expect("runtime update should succeed");
     let operation_key = started
         .sessions
-        .runtime_config_update
+        .inference_settings_update
         .key
         .clone()
         .expect("runtime update should expose operation key");
@@ -157,21 +171,32 @@ async fn session_runtime_update_preserves_reasoning_effort_in_client_state() {
     let updated = next_snapshot_until(&mut stream, |snapshot| {
         matches!(
             snapshot.operations.current.get(&operation_key),
-            Some(ClientOperationView::SessionRuntimeConfigUpdate {
+            Some(ClientOperationView::SessionInferenceSettingsUpdate {
                 status: "ready",
                 ..
             })
-        )
+        ) && snapshot
+            .sessions
+            .current
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.inference_settings.as_ref())
+            .and_then(|settings| settings.provider.as_ref())
+            .and_then(|provider| provider.reasoning_effort.as_deref())
+            == Some("high")
     })
     .await;
-    let runtime = updated
+    let inference_settings = updated
         .sessions
         .current
         .iter()
         .find(|session| session.id == session_id)
-        .and_then(|session| session.runtime_config.as_ref())
-        .expect("updated session should retain runtime config");
-    let provider = runtime.provider.as_ref().expect("provider should be set");
+        .and_then(|session| session.inference_settings.as_ref())
+        .expect("updated session should retain inference settings");
+    let provider = inference_settings
+        .provider
+        .as_ref()
+        .expect("provider should be set");
 
     assert_eq!(provider.key, "openai");
     assert_eq!(provider.model_id, "gpt");

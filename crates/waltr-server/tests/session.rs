@@ -5,6 +5,9 @@ mod support;
 #[path = "session/create.rs"]
 mod create;
 
+#[path = "session/agents.rs"]
+mod agents;
+
 #[path = "session/list.rs"]
 mod list;
 
@@ -14,8 +17,8 @@ mod delete;
 #[path = "session/watch.rs"]
 mod watch;
 
-#[path = "session/runtime_config.rs"]
-mod runtime_config;
+#[path = "session/inference_settings.rs"]
+mod inference_settings;
 
 #[path = "session/timeline.rs"]
 mod timeline;

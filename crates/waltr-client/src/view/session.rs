@@ -4,11 +4,30 @@ use ts_rs::TS;
 use waltr::grpc::waltr::session::v1::timeline_content;
 
 use crate::{
-    AuthenticationFailureSnapshot, McpServerTypeView, OutboundAuthenticationFailure,
-    ProviderKindView, RuntimeConfigMatch, SessionMcpServerRuntime, SessionMetrics, SessionPhase,
-    SessionProviderRuntime, SessionRuntimeConfig, SessionStatus, SessionSummary, TimelineContent,
-    TimelineEvent, TimelineEventKind, TimelineStatus,
+    AuthenticationFailureSnapshot, InferenceProviderSettings, InferenceSettings,
+    InferenceSettingsMatch, OutboundAuthenticationFailure, ProviderKindView, SessionMetrics,
+    SessionPhase, SessionStatus, SessionSummary, TimelineContent, TimelineEvent, TimelineEventKind,
+    TimelineStatus,
 };
+
+/// Stable selectable session agent view shared by Waltr shells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectableAgentView {
+    /// Exact selectable agent name.
+    pub name: String,
+    /// Optional human-readable description.
+    pub description: Option<String>,
+}
+
+impl From<crate::SelectableAgent> for SelectableAgentView {
+    fn from(agent: crate::SelectableAgent) -> Self {
+        Self {
+            name: agent.name,
+            description: agent.description,
+        }
+    }
+}
 
 /// Stable session summary view shared by Waltr shells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
@@ -16,6 +35,8 @@ use crate::{
 pub struct SessionView {
     /// Server-assigned session id.
     pub id: String,
+    /// Exact selectable agent currently assigned to the session.
+    pub agent_name: String,
     /// Session revision.
     pub revision: u64,
     /// Current session status.
@@ -28,8 +49,8 @@ pub struct SessionView {
     pub updated_at: Option<TimestampView>,
     /// Last activity timestamp, when supplied by the server.
     pub last_activity_at: Option<TimestampView>,
-    /// Runtime configuration snapshot stored with the session.
-    pub runtime_config: Option<SessionRuntimeConfigView>,
+    /// Inference settings snapshot stored with the session.
+    pub inference_settings: Option<InferenceSettingsView>,
     /// Aggregate usage and cost derived from journaled provider turns.
     pub metrics: SessionMetricsView,
 }
@@ -62,61 +83,43 @@ pub struct SessionMetricsView {
     pub total_cost_micros: u64,
 }
 
-/// Stable session runtime config snapshot view shared by Waltr shells.
+/// Stable session inference settings view shared by Waltr shells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionRuntimeConfigView {
-    /// Stored provider runtime snapshot.
-    pub provider: Option<SessionProviderRuntimeView>,
-    /// Stored MCP server runtime snapshots.
-    pub mcp_servers: Vec<SessionMcpServerRuntimeView>,
+pub struct InferenceSettingsView {
+    /// Stored provider inference settings.
+    pub provider: Option<InferenceProviderSettingsView>,
 }
 
-/// Stable provider runtime snapshot view shared by Waltr shells.
+/// Stable provider inference settings view shared by Waltr shells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionProviderRuntimeView {
-    /// Provider key selected when runtime config was stored.
+pub struct InferenceProviderSettingsView {
+    /// Provider key selected when inference settings were stored.
     pub key: String,
-    /// Provider type selected when runtime config was stored.
+    /// Provider type selected when inference settings were stored.
     pub kind: ProviderKindView,
-    /// Provider URL selected when runtime config was stored.
+    /// Provider URL selected when inference settings were stored.
     pub url: String,
-    /// Exact provider model id selected when runtime config was stored.
+    /// Exact provider model id selected when inference settings were stored.
     pub model_id: String,
     /// Per-session reasoning effort, when configured.
     pub reasoning_effort: Option<String>,
     /// Whether the stored provider/model still matches current config.
-    pub match_status: RuntimeConfigMatchView,
+    pub match_status: InferenceSettingsMatchView,
 }
 
-/// Stable MCP server runtime snapshot view shared by Waltr shells.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionMcpServerRuntimeView {
-    /// MCP server key selected when runtime config was stored.
-    pub key: String,
-    /// MCP server type selected when runtime config was stored.
-    pub kind: McpServerTypeView,
-    /// MCP command selected when runtime config was stored.
-    pub command: String,
-    /// MCP URL selected when runtime config was stored.
-    pub url: String,
-    /// Whether the stored MCP server still matches current config.
-    pub match_status: RuntimeConfigMatchView,
-}
-
-/// Stable runtime snapshot match status shared by Waltr shells.
+/// Stable inference settings match status shared by Waltr shells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub enum RuntimeConfigMatchView {
+pub enum InferenceSettingsMatchView {
     /// Match status was omitted or intentionally unspecified.
     Unspecified,
-    /// Stored runtime config still matches current server config.
+    /// Stored inference settings still match current server config.
     Configured,
-    /// Stored runtime config references a missing provider/model/MCP entry.
+    /// Stored inference settings reference a missing provider or model.
     Missing,
-    /// Stored runtime config differs from current server config.
+    /// Stored inference settings differ from current server config.
     Changed,
     /// Match status is unknown to this client version.
     Unknown,
@@ -299,6 +302,7 @@ impl From<SessionSummary> for SessionView {
     fn from(session: SessionSummary) -> Self {
         Self {
             id: session.id,
+            agent_name: session.agent_name,
             revision: session.revision,
             status: session
                 .status
@@ -307,7 +311,7 @@ impl From<SessionSummary> for SessionView {
             created_at: session.created_at.map(Into::into),
             updated_at: session.updated_at.map(Into::into),
             last_activity_at: session.last_activity_at.map(Into::into),
-            runtime_config: session.runtime_config.map(Into::into),
+            inference_settings: session.inference_settings.map(Into::into),
             metrics: session
                 .metrics
                 .map_or_else(SessionMetricsView::default, Into::into),
@@ -382,17 +386,16 @@ impl From<i32> for SessionPhaseView {
     }
 }
 
-impl From<SessionRuntimeConfig> for SessionRuntimeConfigView {
-    fn from(config: SessionRuntimeConfig) -> Self {
+impl From<InferenceSettings> for InferenceSettingsView {
+    fn from(settings: InferenceSettings) -> Self {
         Self {
-            provider: config.provider.map(Into::into),
-            mcp_servers: config.mcp_servers.into_iter().map(Into::into).collect(),
+            provider: settings.provider.map(Into::into),
         }
     }
 }
 
-impl From<SessionProviderRuntime> for SessionProviderRuntimeView {
-    fn from(provider: SessionProviderRuntime) -> Self {
+impl From<InferenceProviderSettings> for InferenceProviderSettingsView {
+    fn from(provider: InferenceProviderSettings) -> Self {
         Self {
             key: provider.key,
             kind: provider.r#type.into(),
@@ -404,25 +407,13 @@ impl From<SessionProviderRuntime> for SessionProviderRuntimeView {
     }
 }
 
-impl From<SessionMcpServerRuntime> for SessionMcpServerRuntimeView {
-    fn from(server: SessionMcpServerRuntime) -> Self {
-        Self {
-            key: server.key,
-            kind: server.r#type.into(),
-            command: server.command,
-            url: server.url,
-            match_status: server.r#match.into(),
-        }
-    }
-}
-
-impl From<i32> for RuntimeConfigMatchView {
+impl From<i32> for InferenceSettingsMatchView {
     fn from(value: i32) -> Self {
-        match RuntimeConfigMatch::try_from(value) {
-            Ok(RuntimeConfigMatch::Unspecified) => Self::Unspecified,
-            Ok(RuntimeConfigMatch::Configured) => Self::Configured,
-            Ok(RuntimeConfigMatch::Missing) => Self::Missing,
-            Ok(RuntimeConfigMatch::Changed) => Self::Changed,
+        match InferenceSettingsMatch::try_from(value) {
+            Ok(InferenceSettingsMatch::Unspecified) => Self::Unspecified,
+            Ok(InferenceSettingsMatch::Configured) => Self::Configured,
+            Ok(InferenceSettingsMatch::Missing) => Self::Missing,
+            Ok(InferenceSettingsMatch::Changed) => Self::Changed,
             Err(_) => Self::Unknown,
         }
     }

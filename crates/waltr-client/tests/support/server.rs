@@ -8,8 +8,8 @@ use waltr_agent::{
     TimelineContent, TimelineEventKind, TimelineStatus,
 };
 use waltr_client::{
-    Configuration, McpServer, McpServerType, Model, ModelOptions, ModelType, Provider,
-    ProviderType, RuntimeDefaults,
+    Configuration, InferenceDefaults, McpServer, McpServerType, Model, ModelOptions, ModelType,
+    Provider, ProviderType,
 };
 use waltr_server::config::ConfigStore as _;
 
@@ -23,7 +23,7 @@ pub async fn server_endpoint_with_unavailable_config_reset()
             "http://127.0.0.1:14333/mcp",
         ),
     )?;
-    service.store().save(runtime_config()).await?;
+    service.store().save(inference_config()).await?;
     Ok(waltr_server::test_support::setup_server_with_services(service).base_url())
 }
 
@@ -31,12 +31,12 @@ pub fn server_endpoint() -> String {
     waltr_server::test_support::setup_server().base_url()
 }
 
-pub async fn server_endpoint_with_runtime_config() -> Result<String, Box<dyn std::error::Error>> {
+pub async fn server_endpoint_with_inference_config() -> Result<String, Box<dyn std::error::Error>> {
     let config_service = waltr_server::config_service::ConfigService::new(
         waltr_server::test_support::temp_root(),
         waltr_server::test_support::default_config_builder(),
     )?;
-    config_service.store().save(runtime_config()).await?;
+    config_service.store().save(inference_config()).await?;
     Ok(waltr_server::test_support::setup_server_with_services(config_service).base_url())
 }
 
@@ -123,7 +123,7 @@ pub async fn server_endpoint_with_resolved_external_request()
     Ok((server.base_url(), session_id.as_str().to_owned()))
 }
 
-fn runtime_config() -> Configuration {
+fn inference_config() -> Configuration {
     Configuration {
         providers: HashMap::from([("openai".to_owned(), provider("openai", "gpt"))]),
         mcp_servers: HashMap::from([(
@@ -135,11 +135,9 @@ fn runtime_config() -> Configuration {
                 ..McpServer::default()
             },
         )]),
-        runtime_defaults: Some(RuntimeDefaults {
+        inference_defaults: Some(InferenceDefaults {
             provider_key: "openai".to_owned(),
             model_key: "gpt".to_owned(),
-            mcp_default_enabled: Some(false),
-            enabled_mcp_server_keys: vec!["git".to_owned()],
             reasoning_effort: None,
         }),
         ..Configuration::default()

@@ -1,6 +1,6 @@
 #![allow(clippy::default_trait_access)]
 
-use waltr_agent::{ModelApi, SessionProviderRuntimeSettings, SessionRuntimeSettings};
+use waltr_agent::{InferenceProviderSettings, InferenceSettings, ModelApi};
 use waltr_client::{
     ClientCommand, ClientRuntime, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget,
 };
@@ -12,7 +12,7 @@ async fn client_runtime_returns_session_template_search_results()
 -> Result<(), Box<dyn std::error::Error>> {
     let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
     let session_id = sessions
-        .create_with_runtime_settings(Some(test_runtime_settings()), Default::default())
+        .create_with_inference_settings(Some(test_inference_settings()), None, Default::default())
         .await?
         .id()
         .as_str()
@@ -62,9 +62,9 @@ async fn client_runtime_returns_session_template_search_results()
     Ok(())
 }
 
-fn test_runtime_settings() -> SessionRuntimeSettings {
-    SessionRuntimeSettings {
-        provider: SessionProviderRuntimeSettings {
+fn test_inference_settings() -> InferenceSettings {
+    InferenceSettings {
+        provider: InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -74,7 +74,5 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             oauth: None,
             reasoning_effort: None,
         },
-        mcp_servers: Vec::new(),
-        mcp_trace_propagation: false,
     }
 }

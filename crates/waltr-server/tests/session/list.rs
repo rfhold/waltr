@@ -33,6 +33,7 @@ async fn session_service_list_returns_created_sessions() -> Result<(), Box<dyn s
             .find(|session| &session.id == id)
             .expect("created session should be listed");
         assert_eq!(session.revision, 0);
+        assert_eq!(session.agent_name, "coding");
         assert_eq!(
             session
                 .status

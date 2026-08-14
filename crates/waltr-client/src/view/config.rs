@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::{
-    CatalogMatchSource, Configuration, McpServer, McpServerType, Model, ModelCapabilities,
-    ModelCatalogMatch, ModelCost, ModelLimits, ModelOptions, ModelType, OAuthProvider,
-    OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider,
-    ProviderType, RuntimeDefaults,
+    CatalogMatchSource, Configuration, InferenceDefaults, McpServer, McpServerType, Model,
+    ModelCapabilities, ModelCatalogMatch, ModelCost, ModelLimits, ModelOptions, ModelType,
+    OAuthProvider, OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, OauthUrlParam,
+    Provider, ProviderType,
 };
 
 /// Stable configuration view shared by Waltr shells.
@@ -20,22 +20,18 @@ pub struct ConfigView {
     pub providers: BTreeMap<String, ProviderView>,
     /// Configured MCP servers.
     pub mcp_servers: BTreeMap<String, McpServerView>,
-    /// Default runtime selection for newly created sessions.
-    pub runtime_defaults: Option<RuntimeDefaultsView>,
+    /// Default inference selection for newly created sessions.
+    pub inference_defaults: Option<InferenceDefaultsView>,
 }
 
-/// Stable runtime defaults view shared by Waltr shells.
+/// Stable inference defaults view shared by Waltr shells.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
-pub struct RuntimeDefaultsView {
+pub struct InferenceDefaultsView {
     /// Default provider key.
     pub provider_key: String,
     /// Default model id within the selected provider.
     pub model_id: String,
-    /// Whether all configured MCP servers are enabled by default.
-    pub mcp_default_enabled: bool,
-    /// Explicit MCP server keys enabled by default.
-    pub enabled_mcp_server_keys: Vec<String>,
     /// Default reasoning effort for newly created sessions.
     pub reasoning_effort: Option<String>,
 }
@@ -328,7 +324,7 @@ impl From<Configuration> for ConfigView {
                 .into_iter()
                 .map(|(name, server)| (name, McpServerView::from(server)))
                 .collect(),
-            runtime_defaults: config.runtime_defaults.map(RuntimeDefaultsView::from),
+            inference_defaults: config.inference_defaults.map(InferenceDefaultsView::from),
         }
     }
 }
@@ -353,30 +349,26 @@ impl From<ConfigView> for Configuration {
                 .into_iter()
                 .map(|(name, server)| (name, McpServer::from(server)))
                 .collect(),
-            runtime_defaults: view.runtime_defaults.map(RuntimeDefaults::from),
+            inference_defaults: view.inference_defaults.map(InferenceDefaults::from),
         }
     }
 }
 
-impl From<RuntimeDefaults> for RuntimeDefaultsView {
-    fn from(defaults: RuntimeDefaults) -> Self {
+impl From<InferenceDefaults> for InferenceDefaultsView {
+    fn from(defaults: InferenceDefaults) -> Self {
         Self {
             provider_key: defaults.provider_key,
             model_id: defaults.model_key,
-            mcp_default_enabled: defaults.mcp_default_enabled.unwrap_or(false),
-            enabled_mcp_server_keys: defaults.enabled_mcp_server_keys,
             reasoning_effort: defaults.reasoning_effort,
         }
     }
 }
 
-impl From<RuntimeDefaultsView> for RuntimeDefaults {
-    fn from(view: RuntimeDefaultsView) -> Self {
+impl From<InferenceDefaultsView> for InferenceDefaults {
+    fn from(view: InferenceDefaultsView) -> Self {
         Self {
             provider_key: view.provider_key,
             model_key: view.model_id,
-            mcp_default_enabled: Some(view.mcp_default_enabled),
-            enabled_mcp_server_keys: view.enabled_mcp_server_keys,
             reasoning_effort: view.reasoning_effort,
         }
     }
