@@ -13,12 +13,13 @@ use mcp::{
 use oauth2::{AccessToken, RefreshToken, Scope};
 use reqwest::{Client, Response, Url, header::CONTENT_TYPE};
 
+use super::McpResolvedConnection;
 use super::{should_refresh_mcp_token, validate_mcp_access_token, validate_mcp_credential};
 use crate::{
     AuthTarget, AuthenticationFailureReason, CredentialStore, OAuthCredential,
     OAuthCredentialContext, OAuthCredentialRecord, OAuthRefreshClaim, OAuthRefreshClaimResult,
-    SessionMcpServerRuntimeSettings, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
-    SessionOAuthProviderSettings, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
+    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
 };
 
 const TOKEN_RESPONSE_LIMIT: usize = 64 * 1024;
@@ -204,7 +205,7 @@ impl CredentialRefreshCoordinator {
     #[allow(clippy::too_many_lines)]
     pub async fn refresh_mcp(
         &self,
-        server: &SessionMcpServerRuntimeSettings,
+        server: &McpResolvedConnection,
         mode: RefreshMode,
     ) -> Result<Option<OAuthCredential>, CredentialRefreshError> {
         let target = AuthTarget::mcp_server(&server.key);
@@ -420,7 +421,7 @@ const fn oauth_target_label(target: &AuthTarget) -> &'static str {
 
 fn validate_mcp_state(
     target: &AuthTarget,
-    server: &SessionMcpServerRuntimeSettings,
+    server: &McpResolvedConnection,
     record: &OAuthCredentialRecord,
 ) -> Result<(), CredentialRefreshError> {
     let credential = &record.credential;

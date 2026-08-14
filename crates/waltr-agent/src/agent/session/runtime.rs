@@ -4,7 +4,11 @@
 
 use crate::{
     AuthenticationFailure, LlmError, PermissionDenyMode, PermissionResponse, Result, ToolResult,
-    permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
+    definition::AgentDefinitionBundle,
+    permission::{
+        PERMISSION_STATE_NAMESPACE, PermissionApprovalStage, PermissionClaimIdentity,
+        PermissionRuntimeState,
+    },
     timeline::{
         CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, PendingTimelineItemId, TimelineChannel,
         TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
@@ -17,9 +21,9 @@ use serde_json::Value;
 
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, PendingWork, PendingWorkStatus, ResumeInput, SessionId, SessionJournalEvent,
-    SessionListBroadcaster, SessionListEvent, SessionRecord, SessionRollbackTarget,
-    SessionRuntimeSettings, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
+    ExternalResponse, InferenceSettings, PendingWork, PendingWorkStatus, ResumeInput, SessionId,
+    SessionJournalEvent, SessionListBroadcaster, SessionListEvent, SessionRecord,
+    SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
     SessionTimelineBroadcaster, Suspension,
 };
 
@@ -85,19 +89,25 @@ where
             .map_err(session_store_error)
     }
 
-    /// Create a new durable session record with runtime settings and metadata values.
+    /// Create a new durable session record with inference settings and metadata values.
     ///
     /// # Errors
     ///
     /// Returns an error when the store rejects the new record.
-    pub async fn create_session_with_runtime_settings(
+    pub async fn create_session_with_inference_settings(
         &self,
         id: SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
         metadata_values: BTreeMap<String, Value>,
     ) -> Result<SessionRecord> {
         self.store
-            .create_with_runtime_settings(id, runtime_settings, metadata_values)
+            .create_with_inference_settings(
+                id,
+                inference_settings,
+                agent_definition,
+                metadata_values,
+            )
             .await
             .map_err(session_store_error)
     }
@@ -256,18 +266,34 @@ where
             .map_err(session_store_error)
     }
 
-    /// Set the first-class runtime settings for a durable session.
+    /// Set the first-class inference settings for a durable session.
     ///
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the store fails.
-    pub async fn set_runtime_settings(
+    pub async fn set_inference_settings(
         &self,
         id: &SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
     ) -> Result<SessionRecord> {
         self.store
-            .set_runtime_settings(id, runtime_settings)
+            .set_inference_settings(id, inference_settings)
+            .await
+            .map_err(session_store_error)
+    }
+
+    /// Set the first-class agent-definition bundle for a durable session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
+    pub async fn set_agent_definition(
+        &self,
+        id: &SessionId,
+        agent_definition: Option<AgentDefinitionBundle>,
+    ) -> Result<SessionRecord> {
+        self.store
+            .set_agent_definition(id, agent_definition)
             .await
             .map_err(session_store_error)
     }
@@ -468,6 +494,12 @@ where
     ) -> Result<RuntimeResumeOutput> {
         let snapshot = record.snapshot();
         let request = validate_pending_external_response(&snapshot, &request_id)?;
+        if request.kind == ExternalRequestKind::Permission
+            && let PermissionResponse::AllowAlways { patterns } =
+                PermissionResponse::from_value(response.payload.clone())?
+        {
+            validate_permission_patterns(&request, &patterns)?;
+        }
         let request_item_id = external_request_item_id(&record, &request_id)?;
         let turn = snapshot.turn;
         let mut record = self
@@ -551,18 +583,30 @@ where
             return Err(runtime_error("permission request missing tool call id"));
         };
         let turn = snapshot.turn;
+        let approval_stage = if request
+            .payload
+            .get("claims")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            PermissionApprovalStage::WholeTool
+        } else {
+            PermissionApprovalStage::Contextual
+        };
+        let claims = permission_request_claims(request)?;
 
         match response {
             PermissionResponse::AllowOnce => {
                 let mut state = permission_state(snapshot)?;
-                state.allow_once(request_id, tool_call_id);
+                state.allow_once(request_id, tool_call_id, approval_stage, claims);
                 self.append_journal_and_reload(record, vec![permission_state_event(&state)])
                     .await
             }
             PermissionResponse::AllowAlways { patterns } => {
+                validate_permission_patterns(request, &patterns)?;
                 let mut state = permission_state(snapshot)?;
                 state.allow_patterns(patterns);
-                state.allow_once(request_id, tool_call_id);
+                state.allow_once(request_id, tool_call_id, approval_stage, claims);
                 self.append_journal_and_reload(record, vec![permission_state_event(&state)])
                     .await
             }
@@ -673,6 +717,28 @@ where
     }
 }
 
+fn validate_permission_patterns(
+    request: &ExternalRequest,
+    patterns: &[crate::PermissionPattern],
+) -> Result<()> {
+    let suggested = request
+        .payload
+        .get("patterns")
+        .cloned()
+        .ok_or_else(|| runtime_error("permission request missing suggested patterns"))?;
+    let suggested: Vec<crate::PermissionPattern> =
+        serde_json::from_value(suggested).map_err(|error| {
+            runtime_error(format!("invalid suggested permission patterns: {error}"))
+        })?;
+    if patterns.iter().all(|pattern| suggested.contains(pattern)) {
+        Ok(())
+    } else {
+        Err(runtime_error(
+            "allow_always patterns must be a subset of the pending suggested patterns",
+        ))
+    }
+}
+
 /// Result of applying a runtime resume operation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeResumeOutput {
@@ -769,6 +835,17 @@ fn permission_state(snapshot: &SessionSnapshot) -> Result<PermissionRuntimeState
         .map(|state| serde_json::from_value(state.clone()))
         .transpose()
         .map_err(|error| runtime_error(error.to_string()))
+        .map(Option::unwrap_or_default)
+}
+
+fn permission_request_claims(request: &ExternalRequest) -> Result<Vec<PermissionClaimIdentity>> {
+    request
+        .payload
+        .get("claim_identities")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| runtime_error(format!("invalid permission claim identities: {error}")))
         .map(Option::unwrap_or_default)
 }
 

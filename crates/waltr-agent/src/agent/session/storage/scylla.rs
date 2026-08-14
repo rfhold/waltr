@@ -3,6 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use scylla::client::session::Session;
+use scylla::value::CqlValue;
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
@@ -10,9 +11,9 @@ use super::{
 };
 use crate::{
     agent::session::{
-        Revision, SessionId, SessionJournalEvent, SessionRecord, SessionRuntimeSettings,
-        SessionSummary,
+        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
+    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -134,32 +135,56 @@ impl ScyllaSessionStore {
         &self,
         id: &SessionId,
         expected_revision: Revision,
-        update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
+        update: impl Fn(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
     ) -> SessionStoreResult<(Revision, T)> {
-        let mut record = self.load_record(id).await?;
-        if record.revision != expected_revision {
-            return Err(SessionStoreError::StaleRevision {
-                id: id.clone(),
-                expected: expected_revision,
-                actual: record.revision,
-            });
+        loop {
+            let mut record = self.load_record(id).await?;
+            if record.revision != expected_revision {
+                return Err(SessionStoreError::StaleRevision {
+                    id: id.clone(),
+                    expected: expected_revision,
+                    actual: record.revision,
+                });
+            }
+            let original_json = serde_json::to_string(&record).map_err(backend_error)?;
+            let revision = record.revision.next();
+            record.revision = revision;
+            let value = update(&mut record, revision)?;
+            let json = serde_json::to_string(&record).map_err(backend_error)?;
+            let expected = i64::try_from(expected_revision.get()).map_err(backend_error)?;
+            let next = i64::try_from(revision.get()).map_err(backend_error)?;
+            let applied: (bool, Option<CqlValue>, Option<CqlValue>) = self.session.query_unpaged(
+                format!("UPDATE {} SET revision = ?, record_json = ? WHERE session_id = ? IF revision = ? AND record_json = ?", self.table_name()),
+                (next, json, id.as_str(), expected, original_json),
+            ).await.map_err(backend_error)?.into_rows_result().map_err(backend_error)?
+                .single_row().map_err(backend_error)?;
+            if applied.0 {
+                return Ok((revision, value));
+            }
         }
-        let revision = record.revision.next();
-        record.revision = revision;
-        let value = update(&mut record, revision)?;
-        self.save_record(&record).await?;
-        Ok((revision, value))
     }
 
     async fn update_metadata_record(
         &self,
         id: &SessionId,
-        update: impl FnOnce(&mut SessionRecord) + Send,
+        update: impl Fn(&mut SessionRecord) + Send,
     ) -> SessionStoreResult<SessionRecord> {
-        let mut record = self.load_record(id).await?;
-        update(&mut record);
-        self.save_record(&record).await?;
-        Ok(record)
+        loop {
+            let mut record = self.load_record(id).await?;
+            let revision = record.revision;
+            let original_json = serde_json::to_string(&record).map_err(backend_error)?;
+            update(&mut record);
+            let json = serde_json::to_string(&record).map_err(backend_error)?;
+            let revision_i64 = i64::try_from(revision.get()).map_err(backend_error)?;
+            let applied: (bool, Option<CqlValue>, Option<CqlValue>) = self.session.query_unpaged(
+                format!("UPDATE {} SET record_json = ? WHERE session_id = ? IF revision = ? AND record_json = ?", self.table_name()),
+                (json, id.as_str(), revision_i64, original_json),
+            ).await.map_err(backend_error)?.into_rows_result().map_err(backend_error)?
+                .single_row().map_err(backend_error)?;
+            if applied.0 {
+                return Ok(record);
+            }
+        }
     }
 }
 
@@ -201,17 +226,19 @@ impl SessionStore for ScyllaSessionStore {
         }
     }
 
-    fn create_with_runtime_settings(
+    fn create_with_inference_settings(
         &self,
         id: SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
         metadata_values: BTreeMap<String, Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::with_runtime_settings_and_metadata_values(
+            let record = SessionRecord::with_inference_settings_and_metadata_values(
                 id,
-                runtime_settings,
+                inference_settings,
+                agent_definition,
                 metadata_values,
             );
             match store.load_record(&record.id).await {
@@ -283,7 +310,7 @@ impl SessionStore for ScyllaSessionStore {
         async move {
             let (_, assigned) = store
                 .update_record(&id, expected_revision, |record, _| {
-                    append_timeline_to_record(record, &id, events)
+                    append_timeline_to_record(record, &id, events.clone())
                 })
                 .await?;
             Ok(assigned)
@@ -301,7 +328,7 @@ impl SessionStore for ScyllaSessionStore {
         async move {
             let (revision, ()) = store
                 .update_record(&id, expected_revision, |record, _| {
-                    record.append_journal_events(events);
+                    record.append_journal_events(events.clone());
                     record.touch_activity();
                     Ok(())
                 })
@@ -320,7 +347,9 @@ impl SessionStore for ScyllaSessionStore {
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| record.set_metadata_value(key, value))
+                .update_metadata_record(&id, |record| {
+                    record.set_metadata_value(key.clone(), value.clone());
+                })
                 .await
         }
     }
@@ -341,16 +370,34 @@ impl SessionStore for ScyllaSessionStore {
         }
     }
 
-    fn set_runtime_settings(
+    fn set_inference_settings(
         &self,
         id: &SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| record.set_runtime_settings(runtime_settings))
+                .update_metadata_record(&id, |record| {
+                    record.set_inference_settings(inference_settings.clone());
+                })
+                .await
+        }
+    }
+
+    fn set_agent_definition(
+        &self,
+        id: &SessionId,
+        agent_definition: Option<AgentDefinitionBundle>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            store
+                .update_metadata_record(&id, |record| {
+                    record.set_agent_definition(agent_definition.clone());
+                })
                 .await
         }
     }

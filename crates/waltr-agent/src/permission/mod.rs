@@ -2,6 +2,7 @@
 
 mod claim;
 mod engine;
+mod input;
 mod level;
 mod pattern;
 mod policy;
@@ -12,13 +13,20 @@ mod selector;
 
 pub use claim::{PermissionClaim, PermissionOperation, PermissionResource};
 pub use engine::PermissionEngine;
+pub use input::{
+    PermissionInputCondition, PermissionInputRule, PermissionInputScalar,
+    PermissionInputValueMatcher, PermissionJsonPointer,
+};
 pub use level::{PermissionEffect, PermissionLevel};
 pub use pattern::{
     PermissionCommandPattern, PermissionPathPattern, PermissionPattern, PermissionResourcePattern,
 };
 pub use policy::PermissionPolicy;
 #[allow(clippy::redundant_pub_crate)]
-pub(crate) use response::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState};
+pub(crate) use response::{
+    PERMISSION_STATE_NAMESPACE, PermissionApprovalStage, PermissionClaimIdentity,
+    PermissionRuntimeState, permission_claim_identities,
+};
 pub use response::{PermissionDenyMode, PermissionResponse};
 pub use rule::{
     PermissionClassRule, PermissionCommandRule, PermissionDirectoryRule, PermissionToolRule,

@@ -3,11 +3,11 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use waltr_agent::{
-    AgentRuntime, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
-    CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, FileCredentialStore, LlmError, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, RunConflictPolicy, SessionCoordinator,
-    SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings, SessionProviderRuntimeSettings,
-    SessionRuntimeSettings, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
+    AgentRuntimeProvider, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, FileCredentialStore, InferenceProviderSettings,
+    InferenceSettings, LlmError, LlmStream, McpConnectionKind, McpResolvedConnection,
+    MemorySessionStore, ModelApi, ModelRef, RunConflictPolicy, SessionCoordinator, TimelineContent,
+    TimelineEventKind, TimelineQuery, TimelineStatus,
 };
 use mcp::{
     McpToolCall, McpToolDefinition, McpToolResult,
@@ -50,15 +50,7 @@ async fn run_live_mcp(
             http_runtime_server(&http_server),
         ],
     );
-    let session = run_session_prompt(
-        &sessions,
-        prompt,
-        vec![
-            stdio_runtime_server(&stdio_command),
-            http_runtime_server(&http_server),
-        ],
-    )
-    .await?;
+    let session = run_session_prompt(&sessions, prompt).await?;
     crate::session::report_tool_errors(&provider, &session, "mcp live test");
     let context = format!(
         "{}\n{}",
@@ -127,19 +119,19 @@ fn test_stdio_server_command() -> String {
     path.display().to_string()
 }
 
-fn stdio_runtime_server(command: &str) -> SessionMcpServerRuntimeSettings {
-    SessionMcpServerRuntimeSettings {
+fn stdio_runtime_server(command: &str) -> McpResolvedConnection {
+    McpResolvedConnection {
         key: "stdio_test".to_owned(),
-        kind: SessionMcpServerRuntimeKind::Stdio,
+        kind: McpConnectionKind::Stdio,
         command: command.to_owned(),
         url: String::new(),
     }
 }
 
-fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSettings {
-    SessionMcpServerRuntimeSettings {
+fn http_runtime_server(server: &HttpMcpTestServer) -> McpResolvedConnection {
+    McpResolvedConnection {
         key: "http_test".to_owned(),
-        kind: SessionMcpServerRuntimeKind::StreamableHttp,
+        kind: McpConnectionKind::StreamableHttp,
         command: String::new(),
         url: format!("http://{}/mcp", server.address),
     }
@@ -148,23 +140,30 @@ fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSet
 fn mcp_sessions(
     provider: Arc<impl LlmStream + 'static>,
     model: ModelRef,
-    _mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+    connections: Vec<McpResolvedConnection>,
 ) -> SessionCoordinator<MemorySessionStore> {
     let root = tempfile::tempdir().expect("tempdir").keep();
     let credentials = FileCredentialStore::new(root.join("credentials.json"));
-    let factory = AgentSessionRuntimeFactory::new(root, credentials)
-        .with_runtime_builder(move |_| Ok(AgentRuntime::builder(model.clone(), provider.clone())));
+    let factory = AgentSessionRuntimeFactory::new(
+        root,
+        credentials,
+        crate::agent_definitions::mcp_agent(true),
+    )
+    .with_runtime_provider(move |_| Ok(AgentRuntimeProvider::new(model.clone(), provider.clone())))
+    .with_mcp_connection_resolver(move |_| {
+        let connections = connections.clone();
+        Box::pin(async move { Ok(connections) })
+    });
     SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory)
 }
 
 async fn run_session_prompt(
     sessions: &SessionCoordinator<MemorySessionStore>,
     prompt: &str,
-    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
 ) -> waltr_agent::Result<AgentTestSession> {
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(&session_id, Some(test_runtime_settings(mcp_servers)))
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
     let submission = sessions
         .submit_prompt(session_id.clone(), prompt, RunConflictPolicy::ReplaceActive)
@@ -176,11 +175,9 @@ async fn run_session_prompt(
     Ok(test_session_from_timeline(events))
 }
 
-fn test_runtime_settings(
-    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
-) -> SessionRuntimeSettings {
-    SessionRuntimeSettings {
-        provider: SessionProviderRuntimeSettings {
+fn test_inference_settings() -> InferenceSettings {
+    InferenceSettings {
+        provider: InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -190,8 +187,6 @@ fn test_runtime_settings(
             oauth: None,
             reasoning_effort: None,
         },
-        mcp_servers,
-        mcp_trace_propagation: false,
     }
 }
 

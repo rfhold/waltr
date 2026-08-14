@@ -15,7 +15,10 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-use crate::permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState};
+use crate::permission::{
+    PERMISSION_STATE_NAMESPACE, PermissionApprovalStage, PermissionClaimIdentity,
+    PermissionRuntimeState, permission_claim_identities,
+};
 use crate::{
     BoxCompletionStream, CompletionEvent, CompletionRequest, CompletionTurn, LlmError, LlmStream,
     MAX_TOOL_RESULT_IMAGE_BYTES, ModelRef, PendingTimelineEvent, PendingTimelineItemId,
@@ -30,7 +33,6 @@ use crate::{
             MiddlewareStateLog, ModelRequestDraft, RequestContext, RunContext, SystemPromptParts,
             ToolCallContext, ToolDraft, ToolResultContext,
         },
-        tools::tool_is_visible,
     },
     template::{TemplateRender, TemplateRuntime, TemplateSource},
     timeline::{AgentTimelineEvent, CHANNEL_EXTERNAL_REQUEST, CHANNEL_METRICS, TimelineStatus},
@@ -120,7 +122,7 @@ struct RunningTool {
     progress_rx: Option<mpsc::UnboundedReceiver<PendingTimelineEvent>>,
 }
 
-type ResolvedToolCall = std::result::Result<(usize, ToolDefinition), ToolResult>;
+type ResolvedToolCall = (usize, ToolDefinition);
 
 enum PermissionOutcome {
     Allow,
@@ -587,27 +589,52 @@ where
             .tools
             .iter()
             .position(|tool| tool.definition().name == call.name)?;
-        let tool_definition = self.tools[tool_index].definition().clone();
-
-        if !tool_is_visible(&self.permission_policy, &tool_definition, true) {
-            return Some(Err(error_tool_result(
-                call,
-                &LlmError::Protocol {
-                    provider: "permission",
-                    message: format!("tool is not permitted: {}", call.name),
-                },
-            )));
-        }
-
-        Some(Ok((tool_index, tool_definition)))
+        Some((tool_index, self.tools[tool_index].definition().clone()))
     }
 
     #[allow(clippy::too_many_lines)]
     async fn start_tool(&mut self, mut call: ToolCall) -> Result<ToolExecution> {
-        let resolved = match self.resolve_tool_call(&call) {
-            Some(Ok(resolved)) => Some(resolved),
-            Some(Err(result)) => return Ok(ToolExecution::Finished(Some(result))),
-            None => None,
+        let whole_tool_level = self.permission_policy.evaluate_tool(&call.name);
+        let resolved = self.resolve_tool_call(&call);
+        let whole_tool_request = PermissionRequestContext {
+            session_id: self.session_id.as_str(),
+            turn: self.turn as u64,
+            stage: PermissionApprovalStage::WholeTool,
+            policy: &self.permission_policy,
+        };
+        let whole_tool_request_id = permission_request_id(&whole_tool_request, &call, &[]);
+        let whole_tool_approved = match whole_tool_level {
+            PermissionLevel::Allow => false,
+            PermissionLevel::Ask => {
+                let state = self.permission_runtime_state()?;
+                if state.has_one_shot(
+                    &whole_tool_request_id,
+                    &call.id,
+                    PermissionApprovalStage::WholeTool,
+                    &[],
+                ) {
+                    true
+                } else {
+                    let outcome = HookOutcome::Suspend(permission_suspension(
+                        &whole_tool_request,
+                        &call,
+                        &[],
+                    ));
+                    return self
+                        .tool_result_from_hook_outcome(&call, outcome)
+                        .await
+                        .map(ToolExecution::Finished);
+                }
+            }
+            PermissionLevel::Deny => {
+                return Ok(ToolExecution::Finished(Some(error_tool_result(
+                    &call,
+                    &LlmError::Protocol {
+                        provider: "permission",
+                        message: format!("tool is not permitted: {}", call.name),
+                    },
+                ))));
+            }
         };
 
         // Claims-producing middleware fills this during before_tool_call; permission
@@ -626,6 +653,32 @@ where
         match before_outcome {
             Ok(HookOutcome::Continue) => {}
             Ok(outcome) => {
+                match self.permission_outcome(&call, &claims, whole_tool_approved)? {
+                    PermissionOutcome::Allow => {}
+                    PermissionOutcome::Deny(message) => {
+                        return Ok(ToolExecution::Finished(Some(error_tool_result(
+                            &call,
+                            &LlmError::Protocol {
+                                provider: "permission",
+                                message,
+                            },
+                        ))));
+                    }
+                    PermissionOutcome::Ask(claims) => {
+                        let request = PermissionRequestContext {
+                            session_id: self.session_id.as_str(),
+                            turn: self.turn as u64,
+                            stage: PermissionApprovalStage::Contextual,
+                            policy: &self.permission_policy,
+                        };
+                        let outcome =
+                            HookOutcome::Suspend(permission_suspension(&request, &call, &claims));
+                        return self
+                            .tool_result_from_hook_outcome(&call, outcome)
+                            .await
+                            .map(ToolExecution::Finished);
+                    }
+                }
                 return self
                     .tool_result_from_hook_outcome(&call, outcome)
                     .await
@@ -648,8 +701,19 @@ where
             ))));
         };
 
-        match self.permission_outcome(&call, &claims) {
+        match self.permission_outcome(&call, &claims, whole_tool_approved) {
             Ok(PermissionOutcome::Allow) => {
+                if whole_tool_approved {
+                    let mut state = self.permission_runtime_state()?;
+                    if state.consume_one_shot(
+                        &whole_tool_request_id,
+                        &call.id,
+                        PermissionApprovalStage::WholeTool,
+                        &[],
+                    ) {
+                        self.set_permission_runtime_state(&state)?;
+                    }
+                }
                 self.in_turn_span(|| tracing::debug!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission allowed"));
                 self.flush_middleware_state().await?;
             }
@@ -665,12 +729,13 @@ where
             }
             Ok(PermissionOutcome::Ask(claims)) => {
                 self.in_turn_span(|| tracing::info!(tool_name = %call.name, tool_call_id = %call.id, claim_count = claims.len(), "tool permission requested"));
-                let outcome = HookOutcome::Suspend(permission_suspension(
-                    &self.session_id,
-                    self.turn as u64,
-                    &call,
-                    &claims,
-                ));
+                let request = PermissionRequestContext {
+                    session_id: self.session_id.as_str(),
+                    turn: self.turn as u64,
+                    stage: PermissionApprovalStage::Contextual,
+                    policy: &self.permission_policy,
+                };
+                let outcome = HookOutcome::Suspend(permission_suspension(&request, &call, &claims));
                 return self
                     .tool_result_from_hook_outcome(&call, outcome)
                     .await
@@ -840,6 +905,7 @@ where
         &mut self,
         tool_call: &ToolCall,
         claims: &[PermissionClaim],
+        _whole_tool_approved: bool,
     ) -> Result<PermissionOutcome> {
         let denied = claims
             .iter()
@@ -858,36 +924,58 @@ where
             )));
         }
 
+        let input = self
+            .permission_policy
+            .evaluate_input(&tool_call.name, &tool_call.arguments);
+        if input
+            .as_ref()
+            .is_some_and(|evaluation| evaluation.effect.level == PermissionLevel::Deny)
+        {
+            return Ok(PermissionOutcome::Deny(
+                "permission denied: tool input does not satisfy policy".to_owned(),
+            ));
+        }
+
         let mut state = self.permission_runtime_state()?;
+        let input_claims = input
+            .as_ref()
+            .filter(|input| input.effect.level == PermissionLevel::Ask)
+            .map_or(&[][..], |input| input.claims.as_slice());
         let unmatched = claims
-            .iter()
-            .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
-            .cloned()
-            .collect::<Vec<_>>();
-        if unmatched.is_empty() {
-            return Ok(PermissionOutcome::Allow);
-        }
-
-        if state.consume_one_shot(&tool_call.id) {
-            self.set_permission_runtime_state(&state)?;
-            return Ok(PermissionOutcome::Allow);
-        }
-
-        let ask = unmatched
             .iter()
             .filter(|claim| {
                 self.permission_policy
-                    .evaluate_claim_effect(&tool_call.name, claim)
-                    .level
-                    == PermissionLevel::Ask
+                    .evaluate_claim_refinement_effect(&tool_call.name, claim)
+                    .is_some_and(|effect| effect.level == PermissionLevel::Ask)
             })
             .cloned()
+            .chain(input_claims.iter().cloned())
+            .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
             .collect::<Vec<_>>();
-        if ask.is_empty() {
-            Ok(PermissionOutcome::Allow)
-        } else {
-            Ok(PermissionOutcome::Ask(ask))
+        let identities = permission_claim_identities(&unmatched);
+        let request_id = permission_request_id(
+            &PermissionRequestContext {
+                session_id: self.session_id.as_str(),
+                turn: self.turn as u64,
+                stage: PermissionApprovalStage::Contextual,
+                policy: &self.permission_policy,
+            },
+            tool_call,
+            &identities,
+        );
+        if state.consume_one_shot(
+            &request_id,
+            &tool_call.id,
+            PermissionApprovalStage::Contextual,
+            &identities,
+        ) {
+            self.set_permission_runtime_state(&state)?;
+            return Ok(PermissionOutcome::Allow);
         }
+        if unmatched.is_empty() {
+            return Ok(PermissionOutcome::Allow);
+        }
+        Ok(PermissionOutcome::Ask(unmatched))
     }
 
     fn permission_runtime_state(&self) -> Result<PermissionRuntimeState> {
@@ -1874,9 +1962,15 @@ fn session_external_request_status(
     }
 }
 
-fn permission_suspension(
-    session_id: &SessionId,
+struct PermissionRequestContext<'a> {
+    session_id: &'a str,
     turn: u64,
+    stage: PermissionApprovalStage,
+    policy: &'a PermissionPolicy,
+}
+
+fn permission_suspension(
+    request: &PermissionRequestContext<'_>,
     call: &ToolCall,
     claims: &[PermissionClaim],
 ) -> middleware::Suspension {
@@ -1892,23 +1986,42 @@ fn permission_suspension(
             .map(|claim| {
                 json!({
                     "operation": format!("{:?}", claim.operation),
-                    "resource": format!("{:?}", claim.resource),
+                    "resource": permission_claim_resource(&claim.resource),
                     "summary": claim.summary,
                 })
             })
             .collect::<Vec<_>>(),
         "patterns": permission_patterns(claims),
+        "claim_identities": permission_claim_identities(claims),
     });
     middleware::Suspension::external(
         "permission",
         middleware::ExternalRequestDraft {
-            id: format!("permission:{}:{}:{}", session_id.as_str(), turn, call.id),
+            id: permission_request_id(request, call, &permission_claim_identities(claims)),
             kind: middleware::ExternalRequestKind::Permission,
             tool_call_id: Some(call.id.clone()),
             prompt: summary,
             payload,
             status: middleware::ExternalRequestStatus::Pending,
         },
+    )
+}
+
+fn permission_request_id(
+    request: &PermissionRequestContext<'_>,
+    call: &ToolCall,
+    claims: &[PermissionClaimIdentity],
+) -> String {
+    let identity = serde_json::to_string(&(request.stage, request.policy.identity(), claims))
+        .expect("permission request identity serializes");
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in identity.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!(
+        "permission:{}:{}:{}:{hash:016x}",
+        request.session_id, request.turn, call.id
     )
 }
 
@@ -1941,6 +2054,15 @@ fn permission_pattern(claim: &PermissionClaim) -> PermissionPattern {
                 resource: PermissionResourcePattern::ShellCommand(command.clone()),
             };
         }
+        PermissionResource::ToolInput {
+            tool,
+            pointer,
+            value,
+        } => PermissionResourcePattern::ToolInput {
+            tool: tool.clone(),
+            pointer: pointer.clone(),
+            value: value.clone(),
+        },
     };
     PermissionPattern {
         operation: Some(claim.operation),
@@ -2026,6 +2148,15 @@ fn permission_claim_message(prefix: &str, claims: &[PermissionClaim]) -> String 
         prefix.to_owned()
     } else {
         format!("{prefix}: {summaries}")
+    }
+}
+
+fn permission_claim_resource(resource: &PermissionResource) -> String {
+    match resource {
+        PermissionResource::ToolInput { tool, pointer, .. } => {
+            format!("ToolInput {{ tool: {tool:?}, pointer: {pointer:?} }}")
+        }
+        resource => format!("{resource:?}"),
     }
 }
 

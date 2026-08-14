@@ -2,6 +2,7 @@
 
 mod agent;
 mod auth;
+pub mod definition;
 mod error;
 pub mod mcp;
 pub mod middleware;
@@ -16,40 +17,49 @@ pub mod timeline;
 pub mod tools;
 
 pub use agent::{
-    AgentRunBuilder, AgentRuntime, AgentRuntimeBuilder, AgentSession, AgentSessionActiveRunState,
-    AgentSessionRunDisposition, AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput,
-    AgentSessionRunOutcome, AgentSessionRunSubmission, AgentSessionRuntime,
-    AgentSessionRuntimeError, AgentSessionRuntimeFactory, AgentTool, BoxAgentTimelineStream,
-    CancelReason, CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore,
-    ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, FileCredentialStore, FilesystemSessionStore, McpOAuthContext,
-    McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod, MemorySessionStore,
+    AgentRunBuilder, AgentRuntime, AgentRuntimeBuilder, AgentRuntimeProvider, AgentSession,
+    AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
+    AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
+    AgentSessionRuntime, AgentSessionRuntimeError, AgentSessionRuntimeFactory, AgentTool,
+    BoxAgentTimelineStream, CancelReason, CredentialRefreshCoordinator, CredentialRefreshError,
+    CredentialStore, ExternalRequest, ExternalRequestId, ExternalRequestKind,
+    ExternalRequestStatus, ExternalResponse, FileCredentialStore, FilesystemSessionStore,
+    InferenceProviderSettings, InferenceSettings, McpConnectionKind, McpConnectionResolveFuture,
+    McpConnectionResolveRequest, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration,
+    McpOAuthRegistrationMethod, McpResolvedConnection, MemorySessionStore,
     OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext, OAuthCredentialRecord,
     OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult,
     OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus, ProviderRetryConfig,
     RefreshMode, RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy,
     RuntimeResumeOutput, S3SessionStore, ScyllaSessionStore, SessionCoordinator, SessionId,
     SessionJournalEvent, SessionListEvent, SessionListSubscription, SessionListUpdate,
-    SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings, SessionMetrics,
-    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionMetrics, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
-    SessionProviderRuntimeSettings, SessionRecord, SessionRuntimeSettings, SessionSnapshot,
-    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential,
-    Suspension, ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
-    run_postgresql_migrations,
+    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionStoreError,
+    SessionStoreResult, SessionSummary, SessionTimelineEvent, SessionTimelineSubscription,
+    SessionTimelineUpdate, StoredCredential, Suspension, ToolExecutionContext, ToolProgressSink,
+    opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use auth::{
     AuthTarget, AuthenticationFailure, AuthenticationFailureReason, McpAuthorizationContext,
+};
+pub use definition::{
+    AGENT_DEFINITION_API_VERSION, AgentCatalogEntry, AgentDefinitionBundle, AgentDefinitionCatalog,
+    AgentDefinitionError, AgentDefinitionRegistry, AgentDefinitionResourceKind, AgentFeature,
+    AgentPermissionSelector, AgentSwitchAudit, AgentsFeatureConfig, FilesystemFeatureConfig,
+    FilesystemFeatureProfile, McpFeatureConfig, ResolvedAgent, ResolvedAgentFeatures,
+    ResolvedPermission, ResolvedPermissionEntry, ResolvedPermissionResources,
+    SESSION_WORKSPACE_ROOT, ShellFeatureConfig, SkillsFeatureConfig, TaskFeatureConfig,
 };
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};
 pub use permission::{
     PermissionClaim, PermissionClassRule, PermissionCommandPattern, PermissionCommandRule,
     PermissionDenyMode, PermissionDirectoryRule, PermissionEffect, PermissionEngine,
-    PermissionLevel, PermissionOperation, PermissionPathPattern, PermissionPattern,
-    PermissionPolicy, PermissionResource, PermissionResourcePattern, PermissionResponse,
-    PermissionToolRule, PermissionToolSelector,
+    PermissionInputCondition, PermissionInputRule, PermissionInputScalar,
+    PermissionInputValueMatcher, PermissionJsonPointer, PermissionLevel, PermissionOperation,
+    PermissionPathPattern, PermissionPattern, PermissionPolicy, PermissionResource,
+    PermissionResourcePattern, PermissionResponse, PermissionToolRule, PermissionToolSelector,
 };
 #[cfg(feature = "shell")]
 pub use prompt::ShellPromptConfig;

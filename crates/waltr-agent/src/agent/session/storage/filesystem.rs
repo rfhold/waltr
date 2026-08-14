@@ -1,6 +1,11 @@
 //! Filesystem-backed session storage.
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
@@ -8,14 +13,17 @@ use super::{
 };
 use crate::{
     agent::session::{
-        Revision, SessionId, SessionJournalEvent, SessionRecord, SessionRuntimeSettings,
-        SessionSummary,
+        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
+    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
 };
 use serde_json::Value;
+
+type MutationKey = (PathBuf, SessionId);
+type MutationGuards = OnceLock<Mutex<HashMap<MutationKey, Arc<Mutex<()>>>>>;
 
 /// Local JSON-file implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
@@ -81,6 +89,8 @@ impl FilesystemSessionStore {
         expected_revision: Revision,
         update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T>,
     ) -> SessionStoreResult<(Revision, T)> {
+        let guard = self.mutation_guard(id)?;
+        let _mutation = guard.lock().map_err(|_| SessionStoreError::LockPoisoned)?;
         let mut record = self.load_sync(id)?;
         if record.revision != expected_revision {
             return Err(SessionStoreError::StaleRevision {
@@ -101,10 +111,23 @@ impl FilesystemSessionStore {
         id: &SessionId,
         update: impl FnOnce(&mut SessionRecord),
     ) -> SessionStoreResult<SessionRecord> {
+        let guard = self.mutation_guard(id)?;
+        let _mutation = guard.lock().map_err(|_| SessionStoreError::LockPoisoned)?;
         let mut record = self.load_sync(id)?;
         update(&mut record);
         self.save_sync(&record)?;
         Ok(record)
+    }
+
+    fn mutation_guard(&self, id: &SessionId) -> SessionStoreResult<Arc<Mutex<()>>> {
+        static MUTATION_GUARDS: MutationGuards = OnceLock::new();
+        Ok(MUTATION_GUARDS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| SessionStoreError::LockPoisoned)?
+            .entry((self.root.clone(), id.clone()))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
     }
 
     fn wipe_sync(&self) -> SessionStoreResult<()> {
@@ -157,17 +180,19 @@ impl SessionStore for FilesystemSessionStore {
         }
     }
 
-    fn create_with_runtime_settings(
+    fn create_with_inference_settings(
         &self,
         id: SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
         metadata_values: BTreeMap<String, Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::with_runtime_settings_and_metadata_values(
+            let record = SessionRecord::with_inference_settings_and_metadata_values(
                 id,
-                runtime_settings,
+                inference_settings,
+                agent_definition,
                 metadata_values,
             );
             if store.path(&record.id).exists() {
@@ -275,16 +300,30 @@ impl SessionStore for FilesystemSessionStore {
         }
     }
 
-    fn set_runtime_settings(
+    fn set_inference_settings(
         &self,
         id: &SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             store.update_metadata_sync(&id, |record| {
-                record.set_runtime_settings(runtime_settings);
+                record.set_inference_settings(inference_settings);
+            })
+        }
+    }
+
+    fn set_agent_definition(
+        &self,
+        id: &SessionId,
+        agent_definition: Option<AgentDefinitionBundle>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            store.update_metadata_sync(&id, |record| {
+                record.set_agent_definition(agent_definition);
             })
         }
     }
@@ -335,6 +374,36 @@ mod tests {
         let summaries = store.list().await.unwrap();
 
         assert!(summaries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn independently_constructed_stores_serialize_append_and_metadata_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = FilesystemSessionStore::new(temp.path());
+        let second = FilesystemSessionStore::new(temp.path());
+        let id = SessionId::new("race");
+        first.create(id.clone()).await.unwrap();
+
+        let (append, metadata) = tokio::join!(
+            first.append_journal(
+                &id,
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "preserved".to_owned(),
+                }],
+            ),
+            second.set_metadata_value(&id, "key".to_owned(), serde_json::json!("value")),
+        );
+
+        assert_eq!(append.unwrap(), Revision::new(1));
+        metadata.unwrap();
+        let record = first.load(&id).await.unwrap();
+        assert_eq!(record.revision, Revision::new(1));
+        assert_eq!(record.journal.len(), 1);
+        assert_eq!(
+            record.metadata_value("key"),
+            Some(&serde_json::json!("value"))
+        );
     }
 
     #[tokio::test]

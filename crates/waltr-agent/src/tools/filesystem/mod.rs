@@ -120,12 +120,13 @@ mod tests {
             config.resolve_profile(&model),
             ResolvedFilesystemToolProfile::StructuredPatch
         );
+        let tools = config.exposed_tools(&model);
         assert_eq!(
-            config.exposed_tools(&model).edit_tools,
+            tools.all(),
             vec![
-                FilesystemToolKind::Edit,
-                FilesystemToolKind::Write,
-                FilesystemToolKind::Delete,
+                FilesystemToolKind::Read,
+                FilesystemToolKind::Glob,
+                FilesystemToolKind::Grep,
                 FilesystemToolKind::ApplyPatch,
             ]
         );
@@ -149,6 +150,17 @@ mod tests {
             config.resolve_profile(&claude),
             ResolvedFilesystemToolProfile::ExactEdit
         );
+        assert_eq!(
+            config.exposed_tools(&claude).all(),
+            vec![
+                FilesystemToolKind::Read,
+                FilesystemToolKind::Glob,
+                FilesystemToolKind::Grep,
+                FilesystemToolKind::Edit,
+                FilesystemToolKind::Write,
+                FilesystemToolKind::Delete,
+            ]
+        );
     }
 
     #[test]
@@ -159,6 +171,16 @@ mod tests {
         assert_eq!(
             config.resolve_profile(&model),
             ResolvedFilesystemToolProfile::WholeFileWrite
+        );
+        assert_eq!(
+            config.exposed_tools(&model).all(),
+            vec![
+                FilesystemToolKind::Read,
+                FilesystemToolKind::Glob,
+                FilesystemToolKind::Grep,
+                FilesystemToolKind::Write,
+                FilesystemToolKind::Delete,
+            ]
         );
     }
 

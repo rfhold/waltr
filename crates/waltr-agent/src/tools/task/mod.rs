@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use crate::{
     AgentSessionRunDisposition, AgentSessionRunHandle, AgentTool, CHANNEL_METRICS,
     CHANNEL_TOOL_PROGRESS_INFO, LlmError, RunConflictPolicy, SessionCoordinator, SessionId,
-    SessionRuntimeSettings, SessionStore, SessionTimelineEvent, TimelineChannel, TimelineContent,
-    TimelineStatus, ToolExecutionContext, ToolResult,
+    SessionRecord, SessionStore, SessionTimelineEvent, TimelineChannel, TimelineContent,
+    TimelineStatus, ToolExecutionContext, ToolResult, definition::AgentDefinitionBundle,
 };
 
 /// Provider-facing tool name for spawning subagent tasks.
@@ -46,6 +46,7 @@ where
 {
     sessions: SessionCoordinator<S>,
     max_subagent_depth: usize,
+    agent_definition: Option<AgentDefinitionBundle>,
 }
 
 impl<S> TaskConfig<S>
@@ -58,7 +59,18 @@ where
         Self {
             sessions,
             max_subagent_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+            agent_definition: None,
         }
+    }
+
+    /// Capture the parent cycle's selected bundle for deterministic child inheritance.
+    #[must_use]
+    pub fn with_agent_definition(
+        mut self,
+        agent_definition: Option<AgentDefinitionBundle>,
+    ) -> Self {
+        self.agent_definition = agent_definition;
+        self
     }
 
     /// Set how many subagent levels this task tool may create.
@@ -108,13 +120,18 @@ where
         let prompt = required_non_empty(input.prompt.as_deref(), "prompt")?.to_owned();
         let mode = input.mode.unwrap_or(TaskMode::Sync);
         let task_id = Self::resolve_task_id(&context);
-        let child_depth = self.child_depth(&context).await;
+        let parent_record = if let Some(parent_session_id) = context.session_id() {
+            Some(self.sessions.load(parent_session_id).await?.record)
+        } else {
+            None
+        };
+        let child_depth = Self::child_depth(parent_record.as_ref());
         self.ensure_depth_allowed(child_depth)?;
         self.ensure_child_session(
             &task_id,
             &context,
             input.description.as_deref(),
-            child_depth,
+            parent_record.as_ref(),
         )
         .await?;
 
@@ -299,17 +316,28 @@ where
         task_id: &SessionId,
         context: &ToolExecutionContext,
         description: Option<&str>,
-        child_depth: usize,
+        parent_record: Option<&SessionRecord>,
     ) -> crate::Result<()> {
         if self.sessions.load(task_id).await.is_ok() {
             return Ok(());
         }
 
-        let metadata = self.child_metadata(context, description, child_depth).await;
-        let runtime_settings = self.child_runtime_settings(context).await;
+        let metadata = Self::child_metadata(
+            context,
+            description,
+            Self::child_depth(parent_record),
+            parent_record,
+        );
+        let inference_settings = parent_record.and_then(|record| record.inference_settings.clone());
+        let agent_definition = self.agent_definition.clone();
         match self
             .sessions
-            .create_with_id_and_runtime_settings(task_id.clone(), runtime_settings, metadata)
+            .create_with_id_and_inference_settings(
+                task_id.clone(),
+                inference_settings,
+                agent_definition,
+                metadata,
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -323,21 +351,15 @@ where
         }
     }
 
-    async fn child_metadata(
-        &self,
+    fn child_metadata(
         context: &ToolExecutionContext,
         description: Option<&str>,
         child_depth: usize,
+        parent_record: Option<&SessionRecord>,
     ) -> BTreeMap<String, Value> {
-        let mut values = if let Some(parent_session_id) = context.session_id() {
-            self.sessions
-                .load(parent_session_id)
-                .await
-                .map(|session| session.record.metadata.values)
-                .unwrap_or_default()
-        } else {
-            BTreeMap::new()
-        };
+        let mut values = parent_record
+            .map(|record| record.metadata.values.clone())
+            .unwrap_or_default();
         if let Some(parent_session_id) = context.session_id() {
             values.insert(
                 TASK_PARENT_SESSION_ID_KEY.to_owned(),
@@ -358,17 +380,10 @@ where
         values
     }
 
-    async fn child_depth(&self, context: &ToolExecutionContext) -> usize {
-        let parent_depth = if let Some(parent_session_id) = context.session_id() {
-            self.sessions
-                .load(parent_session_id)
-                .await
-                .ok()
-                .and_then(|session| metadata_depth(&session.record.metadata.values))
-                .unwrap_or_default()
-        } else {
-            0
-        };
+    fn child_depth(parent_record: Option<&SessionRecord>) -> usize {
+        let parent_depth = parent_record
+            .and_then(|record| metadata_depth(&record.metadata.values))
+            .unwrap_or_default();
         parent_depth.saturating_add(1)
     }
 
@@ -380,18 +395,6 @@ where
             "subagent depth limit exceeded: requested depth {child_depth}, max depth {}",
             self.max_subagent_depth
         )))
-    }
-
-    async fn child_runtime_settings(
-        &self,
-        context: &ToolExecutionContext,
-    ) -> Option<SessionRuntimeSettings> {
-        let parent_session_id = context.session_id()?;
-        self.sessions
-            .load(parent_session_id)
-            .await
-            .ok()
-            .and_then(|session| session.record.runtime_settings)
     }
 }
 

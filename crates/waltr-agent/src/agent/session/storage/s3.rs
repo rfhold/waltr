@@ -10,9 +10,9 @@ use super::{
 };
 use crate::{
     agent::session::{
-        Revision, SessionId, SessionJournalEvent, SessionRecord, SessionRuntimeSettings,
-        SessionSummary,
+        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
+    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -46,7 +46,10 @@ impl S3SessionStore {
         format!("{}{}.json", self.prefix, id.as_str())
     }
 
-    async fn load_record(&self, id: &SessionId) -> SessionStoreResult<SessionRecord> {
+    async fn load_record_with_etag(
+        &self,
+        id: &SessionId,
+    ) -> SessionStoreResult<(SessionRecord, String)> {
         let key = self.key(id);
         let output = self
             .client
@@ -56,13 +59,26 @@ impl S3SessionStore {
             .send()
             .await
             .map_err(|error| map_s3_error(id, error))?;
+        let etag = output
+            .e_tag()
+            .ok_or_else(|| SessionStoreError::Backend {
+                message: format!("S3 object for {} has no ETag", id.as_str()),
+            })?
+            .to_owned();
         let bytes = output
             .body
             .collect()
             .await
             .map_err(backend_error)?
             .into_bytes();
-        serde_json::from_slice(bytes.as_ref()).map_err(backend_error)
+        let record = serde_json::from_slice(bytes.as_ref()).map_err(backend_error)?;
+        Ok((record, etag))
+    }
+
+    async fn load_record(&self, id: &SessionId) -> SessionStoreResult<SessionRecord> {
+        self.load_record_with_etag(id)
+            .await
+            .map(|(record, _)| record)
     }
 
     async fn save_record(&self, record: &SessionRecord) -> SessionStoreResult<()> {
@@ -129,32 +145,68 @@ impl S3SessionStore {
         &self,
         id: &SessionId,
         expected_revision: Revision,
-        update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
+        update: impl Fn(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
     ) -> SessionStoreResult<(Revision, T)> {
-        let mut record = self.load_record(id).await?;
-        if record.revision != expected_revision {
-            return Err(SessionStoreError::StaleRevision {
-                id: id.clone(),
-                expected: expected_revision,
-                actual: record.revision,
-            });
+        loop {
+            let (mut record, etag) = self.load_record_with_etag(id).await?;
+            if record.revision != expected_revision {
+                return Err(SessionStoreError::StaleRevision {
+                    id: id.clone(),
+                    expected: expected_revision,
+                    actual: record.revision,
+                });
+            }
+            let revision = record.revision.next();
+            record.revision = revision;
+            let value = update(&mut record, revision)?;
+            let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
+            let result = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(self.key(id))
+                .if_match(etag)
+                .body(ByteStream::from(bytes))
+                .send()
+                .await;
+            match result {
+                Ok(_) => return Ok((revision, value)),
+                Err(error)
+                    if error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 412) => {}
+                Err(error) => return Err(backend_error(error)),
+            }
         }
-        let revision = record.revision.next();
-        record.revision = revision;
-        let value = update(&mut record, revision)?;
-        self.save_record(&record).await?;
-        Ok((revision, value))
     }
 
     async fn update_metadata_record(
         &self,
         id: &SessionId,
-        update: impl FnOnce(&mut SessionRecord) + Send,
+        update: impl Fn(&mut SessionRecord) + Send,
     ) -> SessionStoreResult<SessionRecord> {
-        let mut record = self.load_record(id).await?;
-        update(&mut record);
-        self.save_record(&record).await?;
-        Ok(record)
+        loop {
+            let (mut record, etag) = self.load_record_with_etag(id).await?;
+            update(&mut record);
+            let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
+            let result = self
+                .client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(self.key(id))
+                .if_match(etag)
+                .body(ByteStream::from(bytes))
+                .send()
+                .await;
+            match result {
+                Ok(_) => return Ok(record),
+                Err(error)
+                    if error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 412) => {}
+                Err(error) => return Err(backend_error(error)),
+            }
+        }
     }
 
     async fn wipe_records(&self) -> SessionStoreResult<()> {
@@ -233,17 +285,19 @@ impl SessionStore for S3SessionStore {
         }
     }
 
-    fn create_with_runtime_settings(
+    fn create_with_inference_settings(
         &self,
         id: SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
         metadata_values: BTreeMap<String, Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::with_runtime_settings_and_metadata_values(
+            let record = SessionRecord::with_inference_settings_and_metadata_values(
                 id,
-                runtime_settings,
+                inference_settings,
+                agent_definition,
                 metadata_values,
             );
             match store.load_record(&record.id).await {
@@ -308,7 +362,7 @@ impl SessionStore for S3SessionStore {
         async move {
             let (_, assigned) = store
                 .update_record(&id, expected_revision, |record, _| {
-                    append_timeline_to_record(record, &id, events)
+                    append_timeline_to_record(record, &id, events.clone())
                 })
                 .await?;
             Ok(assigned)
@@ -326,7 +380,7 @@ impl SessionStore for S3SessionStore {
         async move {
             let (revision, ()) = store
                 .update_record(&id, expected_revision, |record, _| {
-                    record.append_journal_events(events);
+                    record.append_journal_events(events.clone());
                     record.touch_activity();
                     Ok(())
                 })
@@ -345,7 +399,9 @@ impl SessionStore for S3SessionStore {
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| record.set_metadata_value(key, value))
+                .update_metadata_record(&id, |record| {
+                    record.set_metadata_value(key.clone(), value.clone());
+                })
                 .await
         }
     }
@@ -366,16 +422,34 @@ impl SessionStore for S3SessionStore {
         }
     }
 
-    fn set_runtime_settings(
+    fn set_inference_settings(
         &self,
         id: &SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
             store
-                .update_metadata_record(&id, |record| record.set_runtime_settings(runtime_settings))
+                .update_metadata_record(&id, |record| {
+                    record.set_inference_settings(inference_settings.clone());
+                })
+                .await
+        }
+    }
+
+    fn set_agent_definition(
+        &self,
+        id: &SessionId,
+        agent_definition: Option<AgentDefinitionBundle>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            store
+                .update_metadata_record(&id, |record| {
+                    record.set_agent_definition(agent_definition.clone());
+                })
                 .await
         }
     }

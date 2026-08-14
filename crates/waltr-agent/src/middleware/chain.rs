@@ -217,6 +217,9 @@ impl MiddlewareChain {
         for middleware in &self.middleware {
             middleware.list_tools(ctx, tools).await?;
         }
+        tools
+            .tools
+            .retain(|tool| super::tools::tool_is_visible(&ctx.permission_policy, tool, true));
 
         Ok(())
     }
@@ -357,6 +360,23 @@ mod tests {
         outcome: ProviderRequestOutcome,
     }
 
+    struct ToolProducerMiddleware;
+
+    impl AgentMiddleware for ToolProducerMiddleware {
+        async fn list_tools(
+            &self,
+            _ctx: &mut RequestContext<'_>,
+            tools: &mut ToolDraft,
+        ) -> Result<()> {
+            tools.push(crate::ToolDefinition::new(
+                "load_skill",
+                "middleware-owned tool",
+                serde_json::json!({ "type": "object" }),
+            ));
+            Ok(())
+        }
+    }
+
     enum ProviderRequestOutcome {
         Continue,
         Replace,
@@ -464,5 +484,23 @@ mod tests {
             *calls.lock().expect("call log poisoned"),
             vec!["first", "second"]
         );
+    }
+
+    #[tokio::test]
+    async fn tool_listing_filters_middleware_owned_tools() {
+        let mut chain = MiddlewareChain::new();
+        chain.push(ToolProducerMiddleware);
+        let mut middleware_state = crate::middleware::context::MiddlewareStateLog::default();
+        let mut system_prompt_override = None;
+        let mut ctx = request_context(&mut middleware_state, &mut system_prompt_override);
+        ctx.permission_policy = crate::PermissionPolicy::new(crate::PermissionLevel::Deny);
+        let mut tools = ToolDraft::default();
+
+        chain
+            .list_tools(&mut ctx, &mut tools)
+            .await
+            .expect("tool listing should run");
+
+        assert!(tools.tools.is_empty());
     }
 }

@@ -4,22 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ModelApi, ModelCost};
 
-/// First-class runtime settings stored on a session.
+/// Durable inference settings stored on a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionRuntimeSettings {
-    /// Provider settings snapshot.
-    pub provider: SessionProviderRuntimeSettings,
-    /// Enabled MCP server snapshots.
-    #[serde(default)]
-    pub mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
-    /// Whether MCP requests propagate the current trace context.
-    #[serde(default)]
-    pub mcp_trace_propagation: bool,
+pub struct InferenceSettings {
+    /// Provider settings used for inference.
+    pub provider: InferenceProviderSettings,
 }
 
-/// Provider settings needed to build a runtime without consulting server config.
+/// Provider settings needed to perform inference without consulting server config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionProviderRuntimeSettings {
+pub struct InferenceProviderSettings {
     /// User/config provider key.
     pub key: String,
     /// Provider API surface.
@@ -37,28 +31,6 @@ pub struct SessionProviderRuntimeSettings {
     pub oauth: Option<SessionOAuthProviderSettings>,
     /// Optional `OpenAI` reasoning effort.
     pub reasoning_effort: Option<String>,
-}
-
-/// MCP server settings snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionMcpServerRuntimeSettings {
-    /// MCP server key.
-    pub key: String,
-    /// Server kind.
-    pub kind: SessionMcpServerRuntimeKind,
-    /// Stdio command.
-    pub command: String,
-    /// Streamable HTTP/SSE URL.
-    pub url: String,
-}
-
-/// MCP server kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionMcpServerRuntimeKind {
-    /// Stdio transport.
-    Stdio,
-    /// HTTP transport.
-    StreamableHttp,
 }
 
 /// OAuth provider settings needed for token refresh.
@@ -153,8 +125,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_settings_default_mcp_trace_propagation_is_false() {
-        let settings: SessionRuntimeSettings = serde_json::from_value(json!({
+    fn inference_settings_contain_only_provider_settings() {
+        let settings: InferenceSettings = serde_json::from_value(json!({
             "provider": {
                 "key": "test",
                 "api": "OpenAiResponses",
@@ -164,12 +136,26 @@ mod tests {
                 "headers": {},
                 "oauth": null,
                 "reasoning_effort": null
-            },
-            "mcp_servers": []
+            }
         }))
         .expect("settings deserialize");
 
-        assert!(!settings.mcp_trace_propagation);
+        assert_eq!(settings.provider.key, "test");
+        assert_eq!(
+            serde_json::to_value(settings).expect("settings serialize"),
+            json!({
+                "provider": {
+                    "key": "test",
+                    "api": "OpenAiResponses",
+                    "url": "",
+                    "model_id": "test-model",
+                    "model_cost": null,
+                    "headers": {},
+                    "oauth": null,
+                    "reasoning_effort": null
+                }
+            })
+        );
     }
 
     #[test]

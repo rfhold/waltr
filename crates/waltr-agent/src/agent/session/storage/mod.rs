@@ -23,14 +23,17 @@ pub use postgresql::{opendal_postgresql_session_store, run_postgresql_migrations
 pub use s3::S3SessionStore;
 pub use scylla::ScyllaSessionStore;
 
-use crate::timeline::{
-    AgentTimelineEvent, PendingTimelineEvent, PendingTimelineItemId, TimelineContent,
-    TimelineCursor, TimelineDirection, TimelineItemId, TimelineItemText, TimelineQuery,
+use crate::{
+    definition::AgentDefinitionBundle,
+    timeline::{
+        AgentTimelineEvent, PendingTimelineEvent, PendingTimelineItemId, TimelineContent,
+        TimelineCursor, TimelineDirection, TimelineItemId, TimelineItemText, TimelineQuery,
+    },
 };
 use serde_json::Value;
 
 use super::{
-    SessionRuntimeSettings,
+    InferenceSettings,
     types::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
 };
 
@@ -142,11 +145,12 @@ pub trait SessionStore: Send + Sync {
         metadata_values: BTreeMap<String, Value>,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
-    /// Create a new session record with initial runtime settings and metadata values.
-    fn create_with_runtime_settings(
+    /// Create a new session record with initial inference settings and metadata values.
+    fn create_with_inference_settings(
         &self,
         id: SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
         metadata_values: BTreeMap<String, Value>,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
@@ -196,11 +200,18 @@ pub trait SessionStore: Send + Sync {
         key: String,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
-    /// Set runtime settings and return the updated record.
-    fn set_runtime_settings(
+    /// Set inference settings and return the updated record.
+    fn set_inference_settings(
         &self,
         id: &SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
+
+    /// Set the agent-definition bundle on the latest complete record without changing revision.
+    fn set_agent_definition(
+        &self,
+        id: &SessionId,
+        agent_definition: Option<AgentDefinitionBundle>,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
     /// Read timeline events using a bounded store-neutral query.

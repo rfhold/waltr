@@ -97,10 +97,10 @@ impl McpClientRuntime {
     ) -> std::result::Result<Arc<Self>, McpRuntimeStartError> {
         let (servers, timeout, log_level, trace_propagation) = config.into_parts();
         let (events, _) = broadcast::channel(128);
-        let mut active = BTreeMap::new();
+        let mut active: BTreeMap<String, Arc<McpServerRuntime>> = BTreeMap::new();
         for server in servers {
             let server_key = server.name.clone();
-            let runtime = McpServerRuntime::start(
+            let runtime = match McpServerRuntime::start(
                 server,
                 timeout,
                 log_level,
@@ -110,7 +110,21 @@ impl McpClientRuntime {
                 cancellation_token.clone(),
             )
             .await
-            .map_err(|error| McpRuntimeStartError { server_key, error })?;
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    for started in active.values() {
+                        if let Err(shutdown_error) = started.shutdown().await {
+                            tracing::warn!(
+                                server = %started.name(),
+                                error = %shutdown_error,
+                                "failed to shut down MCP server after startup failure"
+                            );
+                        }
+                    }
+                    return Err(McpRuntimeStartError { server_key, error });
+                }
+            };
             active.insert(runtime.name().to_owned(), runtime);
         }
         Ok(Arc::new(Self {

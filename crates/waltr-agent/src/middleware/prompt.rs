@@ -16,6 +16,8 @@ const SYSTEM_PROMPT_STATE_NAMESPACE: &str = "system_prompt";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct SystemPromptState {
     prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
 }
 
 /// Per-run system prompt override consumed at the next provider request.
@@ -71,12 +73,23 @@ impl SystemPromptOverride {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SystemPromptMiddleware {
     configured: Option<String>,
+    identity: Option<String>,
 }
 
 impl SystemPromptMiddleware {
     /// Create middleware from an optional configured system prompt.
     pub const fn new(configured: Option<String>) -> Self {
-        Self { configured }
+        Self {
+            configured,
+            identity: None,
+        }
+    }
+
+    /// Attach the durable identity of the configured base prompt.
+    #[must_use]
+    pub fn with_identity(mut self, identity: impl Into<String>) -> Self {
+        self.identity = Some(identity.into());
+        self
     }
 }
 
@@ -87,16 +100,33 @@ impl AgentMiddleware for SystemPromptMiddleware {
         prompt: &mut SystemPromptParts,
     ) -> Result<HookOutcome> {
         let run_override = ctx.take_system_prompt_override();
-        let state = if let Some(stored) =
+        let state = if let Some(mut stored) =
             ctx.state_as::<SystemPromptState>(SYSTEM_PROMPT_STATE_NAMESPACE)?
         {
+            let identity_changed = stored.identity.is_some() && stored.identity != self.identity;
+            let identity_initialized = stored.identity.is_none() && self.identity.is_some();
+            if identity_changed {
+                stored = SystemPromptState {
+                    prompt: self.configured.clone(),
+                    identity: self.identity.clone(),
+                };
+            } else if identity_initialized {
+                stored.identity.clone_from(&self.identity);
+            }
             let effective =
                 run_override.map(|run_override| run_override.apply(stored.prompt.clone()));
             match effective {
                 Some(effective) if effective != stored.prompt => {
-                    let state = SystemPromptState { prompt: effective };
+                    let state = SystemPromptState {
+                        prompt: effective,
+                        identity: stored.identity,
+                    };
                     ctx.set_state_as(SYSTEM_PROMPT_STATE_NAMESPACE, &state)?;
                     state
+                }
+                _ if identity_changed || identity_initialized => {
+                    ctx.set_state_as(SYSTEM_PROMPT_STATE_NAMESPACE, &stored)?;
+                    stored
                 }
                 _ => stored,
             }
@@ -105,6 +135,7 @@ impl AgentMiddleware for SystemPromptMiddleware {
                 prompt: run_override
                     .unwrap_or_default()
                     .apply(self.configured.clone()),
+                identity: self.identity.clone(),
             };
             ctx.set_state_as(SYSTEM_PROMPT_STATE_NAMESPACE, &state)?;
             state
@@ -278,5 +309,60 @@ mod tests {
             middleware_state.get("system_prompt"),
             Some(&json!({ "prompt": null }))
         );
+    }
+
+    #[tokio::test]
+    async fn changed_identity_replaces_only_the_materialized_base_prompt() {
+        let middleware = SystemPromptMiddleware::new(Some("new prompt".to_owned()))
+            .with_identity("definition-b");
+        let mut middleware_state = MiddlewareStateLog::default();
+        middleware_state.set(
+            "system_prompt",
+            json!({ "prompt": "old prompt", "identity": "definition-a" }),
+        );
+        middleware_state.set("other", json!({ "history": true }));
+        drop(middleware_state.drain_pending());
+        let mut run_override = None;
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
+        let mut prompt = SystemPromptParts::default();
+
+        middleware
+            .build_system_prompt(&mut ctx, &mut prompt)
+            .await
+            .unwrap();
+
+        assert_eq!(prompt.parts, vec!["new prompt"]);
+        assert_eq!(
+            middleware_state.get("system_prompt"),
+            Some(&json!({ "prompt": "new prompt", "identity": "definition-b" }))
+        );
+        assert_eq!(
+            middleware_state.get("other"),
+            Some(&json!({ "history": true }))
+        );
+        assert_eq!(middleware_state.drain_pending().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_identity_retains_materialized_prompt_after_restart() {
+        let middleware = SystemPromptMiddleware::new(Some("startup prompt changed".to_owned()))
+            .with_identity("definition-a");
+        let mut middleware_state = MiddlewareStateLog::default();
+        middleware_state.set(
+            "system_prompt",
+            json!({ "prompt": "materialized prompt", "identity": "definition-a" }),
+        );
+        drop(middleware_state.drain_pending());
+        let mut run_override = None;
+        let mut ctx = request_context(&mut middleware_state, &mut run_override);
+        let mut prompt = SystemPromptParts::default();
+
+        middleware
+            .build_system_prompt(&mut ctx, &mut prompt)
+            .await
+            .unwrap();
+
+        assert_eq!(prompt.parts, vec!["materialized prompt"]);
+        assert!(middleware_state.drain_pending().is_empty());
     }
 }

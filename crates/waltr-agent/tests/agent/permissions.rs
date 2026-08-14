@@ -4,14 +4,15 @@ use std::{env, fs, path::PathBuf, sync::Arc};
 
 use futures_util::{Stream, StreamExt, stream};
 use waltr_agent::{
-    AgentRuntime, AgentSessionRuntime, AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture,
-    CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT, CancelReason,
-    CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
+    AgentRuntime, AgentSessionRuntime, AgentTimelineEvent, AgentTool, BoxCompletionStream,
+    BoxStreamFuture, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_RESULT,
+    CancelReason, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, LlmStream, MemorySessionStore, ModelApi, ModelRef,
-    PendingWorkStatus, PermissionEffect, PermissionOperation, PermissionPattern, PermissionPolicy,
-    PermissionResourcePattern, PermissionResponse, PermissionToolSelector, ProviderId, ResumeInput,
-    RuntimeResumeOutput, SessionCoordinator, SessionStatus, SessionStore, TimelineContent,
-    ToolCall,
+    PendingWorkStatus, PermissionEffect, PermissionInputCondition, PermissionInputRule,
+    PermissionInputScalar, PermissionInputValueMatcher, PermissionJsonPointer, PermissionOperation,
+    PermissionPattern, PermissionPolicy, PermissionResourcePattern, PermissionResponse,
+    PermissionToolSelector, ProviderId, ResumeInput, RuntimeResumeOutput, SessionCoordinator,
+    SessionStatus, SessionStore, TimelineContent, ToolCall, ToolDefinition,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -22,6 +23,420 @@ use tokio_util::sync::CancellationToken;
 use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn nested_input_ask_persists_only_exact_tool_bound_approval() -> waltr_agent::Result<()> {
+    let provider = Arc::new(ScriptedProvider::new("nested_input", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "input-call",
+                "generic",
+                json!({ "action": "sessions.read" }),
+            )))]
+        }
+    }));
+    let tool = AgentTool::new(
+        ToolDefinition::new("generic", "generic", json!({ "type": "object" })),
+        |call| Ok(call.result("invoked")),
+    );
+    let rule = PermissionInputRule::new(
+        vec![PermissionInputCondition {
+            pointer: PermissionJsonPointer::parse("/action").unwrap(),
+            value: PermissionInputValueMatcher::WildcardPrefix("sessions.".to_owned()),
+        }],
+        PermissionEffect::ask(),
+    )
+    .unwrap();
+    let policy =
+        PermissionPolicy::default().with_input_rule(PermissionToolSelector::exact("generic"), rule);
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_tool(tool)
+        .with_permission_policy(policy)
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let session_id = sessions.create().await?.id().clone();
+    let events = sessions
+        .prompt(&agent, session_id.clone(), "run")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    let request = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("input ask should suspend");
+    assert_eq!(
+        request.prompt,
+        "permission required: input approval for tool `generic`"
+    );
+    let patterns: Vec<PermissionPattern> =
+        serde_json::from_value(request.payload["patterns"].clone()).unwrap();
+    assert!(matches!(
+        &patterns[0].resource,
+        PermissionResourcePattern::ToolInput { tool, pointer, value }
+            if tool == "generic"
+                && pointer.as_str() == "/action"
+                && value == &PermissionInputScalar::String("sessions.read".to_owned())
+    ));
+
+    let error = AgentSessionRuntime::new(&store)
+        .resume(
+            &session_id,
+            ResumeInput::ExternalResponse {
+                request_id: request.id.clone(),
+                response: ExternalResponse::new(json!(PermissionResponse::AllowAlways {
+                    patterns: vec![PermissionPattern {
+                        operation: Some(PermissionOperation::Execute),
+                        resource: PermissionResourcePattern::ToolInput {
+                            tool: "other".to_owned(),
+                            pointer: PermissionJsonPointer::parse("/action").unwrap(),
+                            value: PermissionInputScalar::String("sessions.read".to_owned()),
+                        },
+                    }],
+                })),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must be a subset"));
+
+    AgentSessionRuntime::new(&store)
+        .resume(
+            &session_id,
+            ResumeInput::ExternalResponse {
+                request_id: request.id.clone(),
+                response: ExternalResponse::new(json!(PermissionResponse::AllowAlways {
+                    patterns,
+                })),
+            },
+        )
+        .await?;
+    let snapshot = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    assert_eq!(snapshot.middleware_state["permissions"]["version"], 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_input_deny_prevents_ordinary_tool_invocation() -> waltr_agent::Result<()> {
+    let invoked = Arc::new(std::sync::Mutex::new(false));
+    let observed = Arc::clone(&invoked);
+    let provider = Arc::new(ScriptedProvider::new("nested_input_deny", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "denied-input",
+                "generic",
+                json!({ "action": "sessions.delete" }),
+            )))]
+        }
+    }));
+    let tool = AgentTool::new(
+        ToolDefinition::new("generic", "generic", json!({ "type": "object" })),
+        move |call| {
+            *observed.lock().unwrap() = true;
+            Ok(call.result("should not run"))
+        },
+    );
+    let policy = PermissionPolicy::default().with_input_rule(
+        PermissionToolSelector::exact("generic"),
+        PermissionInputRule::new(
+            vec![PermissionInputCondition {
+                pointer: PermissionJsonPointer::parse("/action").unwrap(),
+                value: PermissionInputValueMatcher::WildcardPrefix("sessions.".to_owned()),
+            }],
+            PermissionEffect::deny(),
+        )
+        .unwrap(),
+    );
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_tool(tool)
+        .with_permission_policy(policy)
+        .build();
+    let events = agent
+        .prompt("run")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    assert!(!*invoked.lock().unwrap());
+    assert!(events.iter().any(|event| matches!(
+        &event.content,
+        TimelineContent::ToolResult { result }
+            if result.is_error && result.content.contains("tool input does not satisfy policy")
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn approved_whole_tool_ask_does_not_bypass_post_middleware_resource_deny()
+-> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let provider = Arc::new(ScriptedProvider::new(
+        "whole_ask_resource_deny",
+        |request| {
+            if request.tool_results().next().is_some() {
+                vec![Ok(CompletionEvent::Finished)]
+            } else {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "whole-ask-denied-resource",
+                    "../outside/external.txt",
+                )))]
+            }
+        },
+    ));
+    let policy = PermissionPolicy::filesystem_default(fixture.root.path()).with_tool_rule(
+        PermissionToolSelector::exact("read"),
+        PermissionEffect::ask(),
+    );
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_permission_policy(policy)
+        .with_filesystem_tools(FilesystemConfig::new(fixture.root.path()))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store);
+    let session_id = sessions.create().await?.id().clone();
+    let initial = sessions
+        .prompt(&agent, session_id.clone(), "read outside")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    let request = initial
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("whole-tool ask should suspend before claims middleware");
+    assert_eq!(request.payload["claims"], json!([]));
+
+    let resumed = sessions
+        .resume(
+            &agent,
+            session_id,
+            ResumeInput::ExternalResponse {
+                request_id: request.id.clone(),
+                response: ExternalResponse::new(json!(PermissionResponse::AllowOnce)),
+            },
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    assert!(resumed.iter().any(|event| matches!(
+        &event.content,
+        TimelineContent::ToolResult { result }
+            if result.call_id == "whole-ask-denied-resource"
+                && result.is_error
+                && result.content.contains("permission denied")
+    )));
+    assert!(
+        resumed
+            .iter()
+            .all(|event| !matches!(event.content, TimelineContent::ExternalRequest { .. }))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn whole_tool_and_contextual_ask_require_exactly_two_approvals() -> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let provider = Arc::new(ScriptedProvider::new("two_stage_ask", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(read_call(
+                "two-stage-call",
+                "../outside/external.txt",
+            )))]
+        }
+    }));
+    let policy =
+        PermissionPolicy::filesystem_external(fixture.root.path(), PermissionEffect::ask())
+            .with_tool_rule(
+                PermissionToolSelector::exact("read"),
+                PermissionEffect::ask(),
+            );
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_permission_policy(policy)
+        .with_filesystem_tools(FilesystemConfig::new(fixture.root.path()))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store);
+    let session_id = sessions.create().await?.id().clone();
+
+    let first = sessions
+        .prompt(&agent, session_id.clone(), "read outside")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    let first_request = first
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("whole-tool request");
+    let second = sessions
+        .resume(
+            &agent,
+            session_id.clone(),
+            ResumeInput::ExternalResponse {
+                request_id: first_request,
+                response: ExternalResponse::new(json!(PermissionResponse::AllowOnce)),
+            },
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    let second_request = second
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("contextual request");
+    let third = sessions
+        .resume(
+            &agent,
+            session_id,
+            ResumeInput::ExternalResponse {
+                request_id: second_request,
+                response: ExternalResponse::new(json!(PermissionResponse::AllowOnce)),
+            },
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    assert!(third.iter().any(|event| matches!(
+        &event.content,
+        TimelineContent::ToolResult { result } if result.call_id == "two-stage-call" && !result.is_error
+    )));
+    assert!(
+        third
+            .iter()
+            .all(|event| !matches!(event.content, TimelineContent::ExternalRequest { .. }))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn contextual_approval_does_not_cross_policy_switch_for_same_call() -> waltr_agent::Result<()>
+{
+    let provider = Arc::new(ScriptedProvider::new("policy_switch_claim", |request| {
+        if request.tool_results().next().is_some() {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "stable-call",
+                "generic",
+                json!({ "a": "old", "b": "new" }),
+            )))]
+        }
+    }));
+    let tool = || {
+        AgentTool::new(
+            ToolDefinition::new("generic", "generic", json!({ "type": "object" })),
+            |call| Ok(call.result("invoked")),
+        )
+    };
+    let ask_rule = |pointer: &str, value: &str| {
+        PermissionInputRule::new(
+            vec![PermissionInputCondition {
+                pointer: PermissionJsonPointer::parse(pointer).unwrap(),
+                value: PermissionInputValueMatcher::Exact(PermissionInputScalar::String(
+                    value.to_owned(),
+                )),
+            }],
+            PermissionEffect::ask(),
+        )
+        .unwrap()
+    };
+    let old_agent =
+        AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), Arc::clone(&provider))
+            .with_tool(tool())
+            .with_permission_policy(PermissionPolicy::default().with_input_rule(
+                PermissionToolSelector::exact("generic"),
+                ask_rule("/a", "old"),
+            ))
+            .build();
+    let new_agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_tool(tool())
+        .with_permission_policy(PermissionPolicy::default().with_input_rule(
+            PermissionToolSelector::exact("generic"),
+            ask_rule("/b", "new"),
+        ))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store);
+    let session_id = sessions.create().await?.id().clone();
+    let initial = sessions
+        .prompt(&old_agent, session_id.clone(), "run")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    let old_request = initial
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request.id.clone()),
+            _ => None,
+        })
+        .expect("old claim request");
+
+    let switched = sessions
+        .resume(
+            &new_agent,
+            session_id,
+            ResumeInput::ExternalResponse {
+                request_id: old_request,
+                response: ExternalResponse::new(json!(PermissionResponse::AllowOnce)),
+            },
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    let request = switched
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("new claim must request approval");
+    assert_eq!(request.payload["tool_call"]["id"], "stable-call");
+    assert!(switched.iter().all(|event| !matches!(
+        &event.content,
+        TimelineContent::ToolResult { result } if result.call_id == "stable-call"
+    )));
+    Ok(())
+}
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn filesystem_permissions_allow_root_and_suspend_for_external_access()
@@ -966,6 +1381,80 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn whole_tool_ask_allow_once_executes_claim_producing_tool_without_reasking()
+-> waltr_agent::Result<()> {
+    let fixture = PermissionFixture::new()?;
+    let provider = Arc::new(ScriptedProvider::new(
+        "whole_tool_ask_provider",
+        |request| {
+            if request
+                .tool_results()
+                .any(|result| result.call_id == "read_once")
+            {
+                vec![Ok(CompletionEvent::Finished)]
+            } else {
+                vec![Ok(CompletionEvent::ToolCall(read_call(
+                    "read_once",
+                    "allowed.txt",
+                )))]
+            }
+        },
+    ));
+    let agent = AgentRuntime::builder(test_model(ModelApi::OpenAiResponses), provider)
+        .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("read"),
+            PermissionEffect::ask(),
+        ))
+        .with_filesystem_tools(FilesystemConfig::new(fixture.root.path()))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store);
+    let session_id = sessions.create().await?.id().clone();
+
+    let initial = sessions
+        .prompt(&agent, session_id.clone(), "read once")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+    let request = initial
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("whole-tool Ask should suspend");
+
+    let resumed = sessions
+        .resume(
+            &agent,
+            session_id,
+            ResumeInput::ExternalResponse {
+                request_id: request.id.clone(),
+                response: ExternalResponse::new(json!(PermissionResponse::AllowOnce)),
+            },
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<waltr_agent::Result<Vec<_>>>()?;
+
+    assert!(resumed.iter().any(|event| matches!(
+        &event.content,
+        TimelineContent::ToolResult { result }
+            if result.call_id == "read_once" && result.content.contains("root-allowed-101")
+    )));
+    assert!(
+        resumed
+            .iter()
+            .all(|event| !matches!(event.content, TimelineContent::ExternalRequest { .. }))
+    );
+    Ok(())
+}
+
 struct ScriptedPermissionProvider;
 
 impl LlmStream for ScriptedPermissionProvider {
@@ -1013,6 +1502,8 @@ impl LlmStream for ScriptedPermissionProvider {
 }
 
 fn scripted_shell_or_finished(completed: &[&str]) -> Vec<waltr_agent::Result<CompletionEvent>> {
+    #[cfg(not(feature = "shell"))]
+    let _ = completed;
     #[cfg(feature = "shell")]
     {
         if !completed.contains(&"call_6") {
