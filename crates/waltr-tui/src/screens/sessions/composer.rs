@@ -1,7 +1,7 @@
 //! Detail composer rendering and cursor helpers.
 
 use waltr_client::{
-    ClientSnapshot, SessionRuntimeConfigView, SessionTemplateSearchSnapshot, SessionView,
+    ClientSnapshot, InferenceSettingsView, SessionTemplateSearchSnapshot, SessionView,
 };
 use ratatui::{
     Frame,
@@ -344,10 +344,10 @@ fn render_composer_metadata(
     context_tokens: u64,
 ) {
     let [left, right] =
-        Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)]).areas(area);
+        Layout::horizontal([Constraint::Percentage(80), Constraint::Percentage(20)]).areas(area);
 
     frame.render_widget(
-        Paragraph::new(composer_runtime_line(session.runtime_config.as_ref())).style(panel_style()),
+        Paragraph::new(composer_inference_line(session)).style(panel_style()),
         left,
     );
     frame.render_widget(
@@ -358,15 +358,22 @@ fn render_composer_metadata(
     );
 }
 
-fn composer_runtime_line(runtime: Option<&SessionRuntimeConfigView>) -> Line<'static> {
+fn composer_inference_line(session: &SessionView) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
+        Span::styled("agent ", panel_muted_style()),
+        Span::raw(session.agent_name.clone()),
+        Span::raw(" "),
+        Span::styled("(C-x a)", THEME.focus_style()),
+        Span::raw("  "),
         Span::styled("provider ", panel_muted_style()),
-        Span::raw(provider_model_status_text(runtime)),
+        Span::raw(provider_model_status_text(
+            session.inference_settings.as_ref(),
+        )),
         Span::raw(" "),
         Span::styled("(C-x p)", THEME.focus_style()),
     ];
-    if let Some(thinking) = provider_thinking_status_text(runtime) {
+    if let Some(thinking) = provider_thinking_status_text(session.inference_settings.as_ref()) {
         spans.extend([
             Span::raw("  "),
             Span::styled("t ", panel_muted_style()),
@@ -380,13 +387,6 @@ fn composer_runtime_line(runtime: Option<&SessionRuntimeConfigView>) -> Line<'st
             Span::styled("(Ctrl-T)", THEME.focus_style()),
         ]);
     }
-    spans.extend([
-        Span::raw(" "),
-        Span::styled("mcp ", panel_muted_style()),
-        Span::raw(mcp_status_text(runtime)),
-        Span::raw(" "),
-        Span::styled("(C-x m)", THEME.focus_style()),
-    ]);
     Line::from(spans)
 }
 
@@ -422,16 +422,16 @@ fn detail_metrics_line(session: &SessionView, context_tokens: u64) -> Line<'stat
     ])
 }
 
-fn provider_model_status_text(runtime: Option<&SessionRuntimeConfigView>) -> String {
-    let Some(provider) = runtime.and_then(|runtime| runtime.provider.as_ref()) else {
+fn provider_model_status_text(settings: Option<&InferenceSettingsView>) -> String {
+    let Some(provider) = settings.and_then(|settings| settings.provider.as_ref()) else {
         return "none".to_owned();
     };
 
     format!("{}/{}", provider.key, provider.model_id)
 }
 
-fn provider_thinking_status_text(runtime: Option<&SessionRuntimeConfigView>) -> Option<String> {
-    let provider = runtime.and_then(|runtime| runtime.provider.as_ref())?;
+fn provider_thinking_status_text(settings: Option<&InferenceSettingsView>) -> Option<String> {
+    let provider = settings.and_then(|settings| settings.provider.as_ref())?;
     Some(
         provider
             .reasoning_effort
@@ -439,21 +439,4 @@ fn provider_thinking_status_text(runtime: Option<&SessionRuntimeConfigView>) -> 
             .unwrap_or("none")
             .to_owned(),
     )
-}
-
-fn mcp_status_text(runtime: Option<&SessionRuntimeConfigView>) -> String {
-    let Some(runtime) = runtime else {
-        return "none".to_owned();
-    };
-
-    if runtime.mcp_servers.is_empty() {
-        return "none".to_owned();
-    }
-
-    runtime
-        .mcp_servers
-        .iter()
-        .map(|server| server.key.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }

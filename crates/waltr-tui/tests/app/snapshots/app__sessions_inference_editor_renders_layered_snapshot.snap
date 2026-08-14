@@ -1,9 +1,10 @@
 ---
 source: crates/waltr-tui/tests/app/sessions.rs
+assertion_line: 98
 expression: rendered
 ---
 "                                                                                                    "
-"              Provider/model                                                                        "
+"              Inference settings                                                                    "
 "                                                                                                    "
 "              Select provider/model for the next prompt.                                            "
 "                                                                                                    "

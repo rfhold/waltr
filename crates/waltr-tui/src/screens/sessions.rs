@@ -1,8 +1,9 @@
 //! Session list/detail surface: state, input, and rendering.
 
+mod agent_selector;
 mod composer;
+mod inference_editor;
 mod prompts;
-mod runtime_editor;
 mod template_style;
 mod timeline;
 
@@ -11,8 +12,8 @@ use std::collections::BTreeSet;
 use waltr_client::{
     AuthenticationFailureSnapshot, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
     ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection,
-    RuntimeConfigMatchView, SessionPhaseView, SessionTemplateSearchSnapshot, SessionTimelineView,
-    SessionView,
+    InferenceSettingsMatchView, SessionPhaseView, SessionTemplateSearchSnapshot,
+    SessionTimelineView, SessionView,
 };
 use ratatui::{
     Frame,
@@ -31,14 +32,15 @@ use crate::{
 };
 
 use self::{
+    agent_selector::{AgentSelector, AgentSelectorPurpose, render_agent_selector},
     composer::{
         composer_cursor_at_line_column, composer_cursor_line_column, composer_line_count,
         composer_line_end, composer_line_start, composer_visible_input_line_count, render_composer,
     },
+    inference_editor::{InferenceEditor, render_inference_editor},
     prompts::{
         ExternalPromptModel, PromptDraft, current_external_prompt, prompt_height, render_prompt,
     },
-    runtime_editor::{RuntimeEditor, RuntimeEditorKind, render_runtime_editor},
     timeline::{
         TimelineClickTarget, latest_context_tokens, shell_tool_at_row, timeline_channels,
         timeline_click_target_at_row, timeline_lines, timeline_rendered_line_count,
@@ -82,8 +84,9 @@ pub struct SessionsSection {
     selected_session: usize,
     detail_session_id: Option<String>,
     delete_session_id: Option<String>,
-    runtime_editor: Option<RuntimeEditor>,
-    pending_runtime_editor: Option<RuntimeEditorKind>,
+    agent_selector: Option<AgentSelector>,
+    inference_editor: Option<InferenceEditor>,
+    pending_inference_editor: bool,
     composer_draft: String,
     composer_cursor: usize,
     resource_autocomplete: ResourceAutocompleteState,
@@ -92,7 +95,8 @@ pub struct SessionsSection {
     prompt_draft: PromptDraft,
     create: OperationTracker,
     delete: OperationTracker,
-    runtime_update: OperationTracker,
+    inference_settings_update: OperationTracker,
+    agent_update: OperationTracker,
     submit: OperationTracker,
     respond: OperationTracker,
     interrupt: OperationTracker,
@@ -203,8 +207,9 @@ impl SessionsSection {
             selected_session: 0,
             detail_session_id: None,
             delete_session_id: None,
-            runtime_editor: None,
-            pending_runtime_editor: None,
+            agent_selector: None,
+            inference_editor: None,
+            pending_inference_editor: false,
             composer_draft: String::new(),
             composer_cursor: 0,
             resource_autocomplete: ResourceAutocompleteState {
@@ -224,7 +229,8 @@ impl SessionsSection {
             prompt_draft: PromptDraft::new(),
             create: OperationTracker::new(),
             delete: OperationTracker::new(),
-            runtime_update: OperationTracker::new(),
+            inference_settings_update: OperationTracker::new(),
+            agent_update: OperationTracker::new(),
             submit: OperationTracker::new(),
             respond: OperationTracker::new(),
             interrupt: OperationTracker::new(),
@@ -304,6 +310,7 @@ impl SessionsSection {
                 _ => None,
             },
         ) {
+            self.agent_selector = None;
             self.reset_detail_ui();
             self.detail_session_id = Some(session.id.clone());
             self.select_session_by_id(&snapshot.sessions.current, &session.id);
@@ -333,11 +340,11 @@ impl SessionsSection {
             }
         }
 
-        if let Some(Ok(_session)) = self.runtime_update.reconcile(
-            &snapshot.sessions.runtime_config_update,
+        if let Some(Ok(_session)) = self.inference_settings_update.reconcile(
+            &snapshot.sessions.inference_settings_update,
             snapshot,
             |operation| match operation {
-                ClientOperationView::SessionRuntimeConfigUpdate {
+                ClientOperationView::SessionInferenceSettingsUpdate {
                     status,
                     error,
                     session,
@@ -346,7 +353,7 @@ impl SessionsSection {
                     "failed" => OperationResult::Failed(
                         error
                             .as_deref()
-                            .unwrap_or("session runtime update failed")
+                            .unwrap_or("session inference settings update failed")
                             .to_owned(),
                     ),
                     _ => OperationResult::Pending,
@@ -354,7 +361,38 @@ impl SessionsSection {
                 _ => None,
             },
         ) {
-            self.runtime_editor = None;
+            self.inference_editor = None;
+        }
+
+        if let Some(Ok(_session)) =
+            self.agent_update
+                .reconcile(
+                    &snapshot.sessions.agent_update,
+                    snapshot,
+                    |operation| match operation {
+                        ClientOperationView::SessionAgentUpdate {
+                            status,
+                            error,
+                            session,
+                        } => Some(match *status {
+                            "ready" => OperationResult::Ready(session.clone()),
+                            "failed" => OperationResult::Failed(
+                                error
+                                    .as_deref()
+                                    .unwrap_or("session agent update failed")
+                                    .to_owned(),
+                            ),
+                            _ => OperationResult::Pending,
+                        }),
+                        _ => None,
+                    },
+                )
+        {
+            self.agent_selector = None;
+        }
+
+        if let Some(selector) = &mut self.agent_selector {
+            selector.clamp(snapshot.sessions.agents.entries.len());
         }
 
         if let Some(Ok(_session_id)) = self.submit.reconcile(
@@ -488,14 +526,11 @@ impl SessionsSection {
             self.rollback_modal = None;
         }
 
-        if let Some(kind) = self.pending_runtime_editor.take() {
-            match kind {
-                RuntimeEditorKind::Provider => self.open_provider_editor(Some(snapshot)),
-                RuntimeEditorKind::Mcp => self.open_mcp_editor(Some(snapshot)),
-            }
-
-            if self.runtime_editor.is_none() {
-                self.pending_runtime_editor = Some(kind);
+        if self.pending_inference_editor {
+            self.pending_inference_editor = false;
+            self.open_provider_editor(Some(snapshot));
+            if self.inference_editor.is_none() {
+                self.pending_inference_editor = true;
             }
         }
     }
@@ -527,8 +562,14 @@ impl SessionsSection {
             return true;
         }
 
-        if self.runtime_editor.take().is_some() {
-            self.runtime_update.clear_error();
+        if self.inference_editor.take().is_some() {
+            self.inference_settings_update.clear_error();
+            return true;
+        }
+
+        if self.agent_selector.take().is_some() {
+            self.create.clear_error();
+            self.agent_update.clear_error();
             return true;
         }
 
@@ -538,7 +579,7 @@ impl SessionsSection {
             return true;
         }
 
-        if self.pending_runtime_editor.take().is_some() {
+        if std::mem::take(&mut self.pending_inference_editor) {
             return true;
         }
 
@@ -565,8 +606,9 @@ impl SessionsSection {
 
     /// Clear the active detail route when a top-level route change leaves sessions.
     pub fn clear_detail_route(&mut self) -> Option<String> {
-        self.runtime_editor = None;
-        self.pending_runtime_editor = None;
+        self.inference_editor = None;
+        self.agent_selector = None;
+        self.pending_inference_editor = false;
         self.delete_session_id = None;
         let detail_session_id = self.detail_session_id.take();
         self.reset_detail_ui();
@@ -574,13 +616,34 @@ impl SessionsSection {
     }
 
     /// Start creating a session.
-    pub fn create_session(&mut self) -> SectionAction {
+    pub fn open_create_session(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
         if self.has_pending_operation() {
             return SectionAction::Continue;
         }
 
-        self.create.begin();
-        SectionAction::ClientCommand(ClientCommand::CreateSession)
+        self.create.clear_error();
+        self.agent_selector = Some(AgentSelector::create(snapshot));
+        request_agents_if_needed(snapshot)
+    }
+
+    /// Open agent selection for the active session.
+    pub fn open_agent_selector(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        if self.has_pending_operation() || self.agent_selector.is_some() {
+            return SectionAction::Continue;
+        }
+        let Some(snapshot) = snapshot else {
+            return SectionAction::Continue;
+        };
+        let Some(session) = self.current_detail_session(Some(snapshot)) else {
+            return SectionAction::Continue;
+        };
+        self.agent_update.clear_error();
+        self.agent_selector = Some(AgentSelector::switch(
+            session.id,
+            &session.agent_name,
+            snapshot,
+        ));
+        request_agents_if_needed(Some(snapshot))
     }
 
     /// Route a key event into the sessions section.
@@ -594,8 +657,12 @@ impl SessionsSection {
             return SectionAction::Continue;
         }
 
-        if self.runtime_editor.is_some() {
-            return self.handle_runtime_editor_key(key, snapshot);
+        if self.inference_editor.is_some() {
+            return self.handle_inference_editor_key(key, snapshot);
+        }
+
+        if self.agent_selector.is_some() {
+            return self.handle_agent_selector_key(key, snapshot);
         }
 
         if self.rollback_modal.is_some() {
@@ -646,6 +713,62 @@ impl SessionsSection {
         }
     }
 
+    fn handle_agent_selector_key(
+        &mut self,
+        key: KeyEvent,
+        snapshot: Option<&ClientSnapshot>,
+    ) -> SectionAction {
+        let Some(selector) = &mut self.agent_selector else {
+            return SectionAction::Continue;
+        };
+        match key.code {
+            KeyCode::Up => {
+                selector.select_previous();
+                SectionAction::Continue
+            }
+            KeyCode::Down => {
+                selector.select_next(
+                    snapshot.map_or(0, |snapshot| snapshot.sessions.agents.entries.len()),
+                );
+                SectionAction::Continue
+            }
+            KeyCode::Char('r') => SectionAction::ClientCommand(ClientCommand::RequestSessionAgents),
+            KeyCode::Esc => {
+                self.agent_selector = None;
+                self.create.clear_error();
+                self.agent_update.clear_error();
+                SectionAction::Continue
+            }
+            KeyCode::Enter => self.confirm_agent_selection(snapshot),
+            _ => SectionAction::Continue,
+        }
+    }
+
+    fn confirm_agent_selection(&mut self, snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        let Some(selector) = &self.agent_selector else {
+            return SectionAction::Continue;
+        };
+        let Some(agent_name) = selector
+            .selected_agent(snapshot)
+            .map(|agent| agent.name.clone())
+        else {
+            return SectionAction::Continue;
+        };
+        match &selector.purpose {
+            AgentSelectorPurpose::Create => {
+                self.create.begin();
+                SectionAction::ClientCommand(ClientCommand::CreateSession { agent_name })
+            }
+            AgentSelectorPurpose::Switch { session_id } => {
+                self.agent_update.begin();
+                SectionAction::ClientCommand(ClientCommand::UpdateSessionAgent {
+                    id: session_id.clone(),
+                    agent_name,
+                })
+            }
+        }
+    }
+
     fn handle_detail_key(
         &mut self,
         key: KeyEvent,
@@ -678,7 +801,7 @@ impl SessionsSection {
     ) -> SectionAction {
         match key.code {
             KeyCode::Char('t' | 'T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cycle_runtime_reasoning(snapshot)
+                self.cycle_inference_reasoning(snapshot)
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.insert_composer_char('\n');
@@ -1305,7 +1428,8 @@ impl SessionsSection {
     const fn has_pending_operation(&self) -> bool {
         self.create.is_pending()
             || self.delete.is_pending()
-            || self.runtime_update.is_pending()
+            || self.inference_settings_update.is_pending()
+            || self.agent_update.is_pending()
             || self.submit.is_pending()
             || self.respond.is_pending()
             || self.interrupt.is_pending()
@@ -1314,8 +1438,9 @@ impl SessionsSection {
     }
 
     fn reset_detail_ui(&mut self) {
-        self.runtime_editor = None;
-        self.pending_runtime_editor = None;
+        self.inference_editor = None;
+        self.agent_selector = None;
+        self.pending_inference_editor = false;
         self.delete_session_id = None;
         self.composer_draft.clear();
         self.composer_cursor = 0;
@@ -1328,6 +1453,7 @@ impl SessionsSection {
         self.interrupt.clear();
         self.rollback.clear();
         self.continue_session.clear();
+        self.agent_update.clear();
         self.rollback_modal = None;
     }
 
@@ -1404,6 +1530,23 @@ impl SessionsSection {
         sorted_sessions_from_slice(&snapshot?.sessions.current)
             .into_iter()
             .find(|session| session.id == id)
+    }
+
+    pub(crate) fn detail_is_immediate_create_result(&self, snapshot: &ClientSnapshot) -> bool {
+        let Some(detail_id) = self.detail_session_id() else {
+            return false;
+        };
+        let Some(key) = snapshot.sessions.create.key.as_deref() else {
+            return false;
+        };
+        matches!(
+            snapshot.operations.current.get(key),
+            Some(ClientOperationView::SessionCreate {
+                status: "ready",
+                session: Some(session),
+                ..
+            }) if session.id == detail_id
+        )
     }
 
     /// Arm deletion for the selected session or active detail session.
@@ -1490,6 +1633,10 @@ impl SessionsSection {
             footer_area,
             " C-x s create Enter open C-x d delete C-x w session data ",
         );
+
+        if self.agent_selector.is_some() {
+            render_agent_selector(frame, area, self, snapshot);
+        }
     }
 
     fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, snapshot: Option<&ClientSnapshot>) {
@@ -1566,12 +1713,16 @@ impl SessionsSection {
             frame.render_widget(status_widget(snapshot, self), error_area);
         }
 
-        if self.runtime_editor.is_some() {
-            render_runtime_editor(frame, area, self, snapshot);
+        if self.inference_editor.is_some() {
+            render_inference_editor(frame, area, self, snapshot);
         }
 
         if self.rollback_modal.is_some() {
             render_rollback_modal(frame, area, self);
+        }
+
+        if self.agent_selector.is_some() {
+            render_agent_selector(frame, area, self, snapshot);
         }
     }
 
@@ -1607,6 +1758,18 @@ pub fn draw_sessions(
 
 fn sorted_sessions(snapshot: &ClientSnapshot) -> Vec<SessionView> {
     sorted_sessions_from_slice(&snapshot.sessions.current)
+}
+
+fn request_agents_if_needed(snapshot: Option<&ClientSnapshot>) -> SectionAction {
+    if snapshot.is_none_or(|snapshot| {
+        snapshot.sessions.agents.load.status == "idle"
+            || (snapshot.sessions.agents.entries.is_empty()
+                && snapshot.sessions.agents.load.status != "loading")
+    }) {
+        SectionAction::ClientCommand(ClientCommand::RequestSessionAgents)
+    } else {
+        SectionAction::Continue
+    }
 }
 
 fn sorted_sessions_from_slice(sessions: &[SessionView]) -> Vec<SessionView> {
@@ -1919,7 +2082,7 @@ fn session_line(section: &SessionsSection, session: &SessionView, selected: bool
             format_timestamp(session),
             session_option_muted_style(selected),
         ),
-        runtime_warning_span(session, selected),
+        inference_warning_span(session, selected),
     ])
     .style(session_option_style(selected))
 }
@@ -2099,25 +2262,19 @@ const fn session_option_bg(selected: bool) -> ratatui::style::Color {
     }
 }
 
-fn runtime_warning_span(session: &SessionView, selected: bool) -> Span<'static> {
-    let Some(runtime) = &session.runtime_config else {
+fn inference_warning_span(session: &SessionView, selected: bool) -> Span<'static> {
+    let Some(settings) = &session.inference_settings else {
         return Span::raw("");
     };
-    let provider_mismatch = runtime.provider.as_ref().is_some_and(|provider| {
+    let provider_mismatch = settings.provider.as_ref().is_some_and(|provider| {
         matches!(
             provider.match_status,
-            RuntimeConfigMatchView::Missing | RuntimeConfigMatchView::Changed
+            InferenceSettingsMatchView::Missing | InferenceSettingsMatchView::Changed
         )
     });
-    let mcp_mismatch = runtime.mcp_servers.iter().any(|server| {
-        matches!(
-            server.match_status,
-            RuntimeConfigMatchView::Missing | RuntimeConfigMatchView::Changed
-        )
-    });
-    if provider_mismatch || mcp_mismatch {
+    if provider_mismatch {
         Span::styled(
-            "  runtime drift",
+            "  inference mismatch",
             THEME
                 .status_style(StatusRole::Saving)
                 .bg(session_option_bg(selected)),
@@ -2143,7 +2300,8 @@ fn status_messages(snapshot: Option<&ClientSnapshot>, section: &SessionsSection)
         .create
         .error()
         .or_else(|| section.delete.error())
-        .or_else(|| section.runtime_update.error())
+        .or_else(|| section.inference_settings_update.error())
+        .or_else(|| section.agent_update.error())
         .or_else(|| section.submit.error())
         .or_else(|| section.respond.error())
         .or_else(|| section.interrupt.error())

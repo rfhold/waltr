@@ -1,5 +1,6 @@
 ---
-source: crates/waltr-tui/tests/server-backed/config/defaults.rs
+source: crates/waltr-tui/tests/server-backed/config/inference_defaults.rs
+assertion_line: 55
 expression: render_app(&app)
 ---
 "                                                                                "
@@ -7,12 +8,11 @@ expression: render_app(&app)
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
 "         Default model anthropic/sonnet                                         "
 "         Reasoning not supported                                                "
-"         MCP default files                                                      "
-"         m selects model, Space selects MCP, Enter saves for new                "
+"         m selects model, r changes reasoning, Enter saves for new              "
 "        sessions.                                                               "
 "                                                                                "
 "                                                                                "
@@ -22,7 +22,8 @@ expression: render_app(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"         Esc back  Tab switch  m model  Space MCP  r reason  Enter save         "
+"                                                                                "
+"         Esc back  Tab switch  m model  r reason  Enter save  Del clear         "
 "                                                                                "
 " Esc  back    Ctrl-X q  quit                                        Waltr  ready "
 "                                                                                "

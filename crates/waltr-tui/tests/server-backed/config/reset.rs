@@ -4,9 +4,9 @@ use std::{
 };
 
 use waltr_client::{
-    ClientRuntime, Configuration, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
-    RuntimeDefaultsView,
+    ClientRuntime, Configuration, InferenceDefaultsView, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
+    ProviderKindView, ProviderView,
 };
 use waltr_server::{
     config::ConfigStore as _,
@@ -75,7 +75,7 @@ async fn reset_replaces_all_config_sections_with_real_server_defaults() {
     assert_eq!(waltr.name, "waltr");
     assert!(waltr.url.ends_with("/mcp"));
     assert!(!config.mcp_servers.contains_key("custom"));
-    assert!(config.runtime_defaults.is_none());
+    assert!(config.inference_defaults.is_none());
     assert!(render_app(&app).contains("configuration reset to server defaults"));
 }
 
@@ -130,13 +130,11 @@ fn custom_configuration() -> Configuration {
             }
             .into(),
         )]),
-        runtime_defaults: Some(
-            RuntimeDefaultsView {
+        inference_defaults: Some(
+            InferenceDefaultsView {
                 provider_key: "custom".to_owned(),
                 model_id: "custom-model".to_owned(),
                 reasoning_effort: None,
-                mcp_default_enabled: false,
-                enabled_mcp_server_keys: vec!["custom".to_owned()],
             }
             .into(),
         ),

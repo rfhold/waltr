@@ -15,9 +15,10 @@ use waltr_client::{
     ConfigSnapshot, ConfigView, ExternalRequestView, McpAuthorizationContextSnapshot,
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
-    OperationSnapshot, ProviderKindView, ProviderView, SessionPhaseView, SessionSnapshot,
-    SessionStatusView, SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView,
-    TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
+    OperationSnapshot, ProviderKindView, ProviderView, SelectableAgentView,
+    SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot, SessionStatusView,
+    SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelineStatusView, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction},
@@ -31,7 +32,7 @@ pub(crate) use super::input::{
     back_tab_press, backspace_press, char_press, ctrl_t_press, ctrl_x_press, delete_press,
     down_press, end_press, enter_press, escape_press, home_press, left_click, left_press,
     page_down_press, page_up_press, right_press, scroll_down, scroll_up, shift_enter_press,
-    tab_press,
+    tab_press, up_press,
 };
 
 pub(crate) fn render_app(app: &App) -> String {
@@ -224,6 +225,29 @@ pub(crate) fn watched_sessions_snapshot(sessions: Vec<SessionView>) -> ClientSna
     snapshot.sessions.current = sessions;
     snapshot.sessions.list.status = "ready";
     snapshot.sessions.watch.status = "received";
+    snapshot
+}
+
+pub(crate) fn with_agents(
+    mut snapshot: ClientSnapshot,
+    default_agent_name: &str,
+    agents: &[(&str, Option<&str>)],
+) -> ClientSnapshot {
+    snapshot.sessions.agents = SessionAgentCatalogSnapshot {
+        entries: agents
+            .iter()
+            .map(|(name, description)| SelectableAgentView {
+                name: (*name).to_owned(),
+                description: description.map(str::to_owned),
+            })
+            .collect(),
+        default_agent_name: default_agent_name.to_owned(),
+        load: OperationSnapshot {
+            status: "ready",
+            error: None,
+            key: None,
+        },
+    };
     snapshot
 }
 
@@ -494,7 +518,11 @@ pub(crate) fn session_create_snapshot(
     status: &'static str,
     session: Option<SessionView>,
 ) -> ClientSnapshot {
-    let mut snapshot = watched_sessions_snapshot(session.iter().cloned().collect());
+    let mut snapshot = with_agents(
+        watched_sessions_snapshot(session.iter().cloned().collect()),
+        "default",
+        &[("default", None)],
+    );
     snapshot.sessions.create = OperationSnapshot {
         status,
         error: None,
@@ -516,7 +544,11 @@ pub(crate) fn session_create_snapshot_with_error(
     status: &'static str,
     error: &str,
 ) -> ClientSnapshot {
-    let mut snapshot = watched_sessions_snapshot(Vec::new());
+    let mut snapshot = with_agents(
+        watched_sessions_snapshot(Vec::new()),
+        "default",
+        &[("default", None)],
+    );
     snapshot.sessions.create = OperationSnapshot {
         status,
         error: Some(error.to_owned()),
@@ -546,6 +578,29 @@ pub(crate) fn session_delete_snapshot(key: &str, status: &'static str, id: &str)
             status,
             error: None,
             id: id.to_owned(),
+        },
+    );
+    snapshot
+}
+
+pub(crate) fn session_agent_update_snapshot(
+    mut snapshot: ClientSnapshot,
+    key: &str,
+    status: &'static str,
+    error: Option<&str>,
+) -> ClientSnapshot {
+    snapshot.sessions.agent_update = OperationSnapshot {
+        status,
+        error: error.map(str::to_owned),
+        key: Some(key.to_owned()),
+    };
+    let session = snapshot.sessions.current.first().cloned();
+    snapshot.operations.current.insert(
+        key.to_owned(),
+        ClientOperationView::SessionAgentUpdate {
+            status,
+            error: error.map(str::to_owned),
+            session: (status == "ready").then_some(session).flatten(),
         },
     );
     snapshot
@@ -654,6 +709,7 @@ pub(crate) fn session_with_phase(
 ) -> SessionView {
     SessionView {
         id: id.to_owned(),
+        agent_name: "default".to_owned(),
         revision: 1,
         status: SessionStatusView {
             phase,
@@ -664,7 +720,7 @@ pub(crate) fn session_with_phase(
         created_at: Some(TimestampView { seconds, nanos: 0 }),
         updated_at: Some(TimestampView { seconds, nanos: 0 }),
         last_activity_at: None,
-        runtime_config: None,
+        inference_settings: None,
         metrics: Default::default(),
     }
 }
@@ -762,6 +818,15 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
             },
         },
         sessions: SessionSnapshot {
+            agents: SessionAgentCatalogSnapshot {
+                entries: Vec::new(),
+                default_agent_name: String::new(),
+                load: OperationSnapshot {
+                    status: "idle",
+                    error: None,
+                    key: None,
+                },
+            },
             current: Vec::new(),
             create: OperationSnapshot {
                 status: "idle",
@@ -783,7 +848,12 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
                 error: None,
                 key: None,
             },
-            runtime_config_update: OperationSnapshot {
+            inference_settings_update: OperationSnapshot {
+                status: "idle",
+                error: None,
+                key: None,
+            },
+            agent_update: OperationSnapshot {
                 status: "idle",
                 error: None,
                 key: None,
@@ -850,7 +920,7 @@ pub(crate) fn loaded_config_snapshot() -> ClientSnapshot {
             },
         )]),
         mcp_servers: BTreeMap::new(),
-        runtime_defaults: None,
+        inference_defaults: None,
     });
     snapshot.config.load.status = "ready";
     snapshot

@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/app/config.rs
+assertion_line: 1377
 expression: render_app(&app)
 ---
 "                                                                                "
@@ -7,7 +8,7 @@ expression: render_app(&app)
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
 "        > anthropic  anthropic-messages  oauth  no-url                          "
 "            status: connected (OAuth)                                           "

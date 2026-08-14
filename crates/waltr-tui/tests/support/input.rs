@@ -123,6 +123,14 @@ pub const fn down_press() -> AppEvent {
     )))
 }
 
+pub const fn up_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Up,
+        KeyModifiers::NONE,
+        KeyEventKind::Press,
+    )))
+}
+
 pub const fn page_up_press() -> AppEvent {
     AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
         KeyCode::PageUp,

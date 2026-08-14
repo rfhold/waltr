@@ -34,13 +34,26 @@ fn sessions_escape_releases_watch_interest() {
 
 #[test]
 fn sessions_create_dispatches_and_completion_opens_detail() {
-    let mut app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+    let mut app = open_sessions_app_with(with_agents(
+        watched_sessions_snapshot(Vec::new()),
+        "reviewer",
+        &[("builder", None), ("reviewer", Some("Reviews changes"))],
+    ));
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('s'), now),
-        AppAction::ClientCommand(ClientCommand::CreateSession)
+        AppAction::Continue
+    );
+    let rendered = render_app_with_size(&app, 100, 24);
+    assert!(rendered.contains("Create session"));
+    assert!(rendered.contains("reviewer  default"));
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::CreateSession {
+            agent_name: "reviewer".to_owned(),
+        })
     );
 
     assert_eq!(
@@ -68,14 +81,139 @@ fn sessions_create_dispatches_and_completion_opens_detail() {
 
     assert_eq!(app.sessions_section().detail_session_id(), Some("created"));
     let rendered = render_app_with_size(&app, 120, 24);
+    assert!(rendered.contains("agent default (C-x a)"));
     assert!(rendered.contains("provider none (C-x p)"));
-    assert!(rendered.contains("mcp none (C-x m)"));
     assert!(rendered.contains("ctx 0"));
 }
 
 #[test]
-fn sessions_provider_runtime_editor_renders_layered_snapshot() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
+fn sessions_create_selects_alternate_and_escape_cancels() {
+    let snapshot = with_agents(
+        watched_sessions_snapshot(Vec::new()),
+        "builder",
+        &[("builder", None), ("reviewer", None)],
+    );
+    let mut app = open_sessions_app_with(snapshot);
+    let now = Instant::now();
+    drop(app.handle_event(&ctrl_x_press(), now));
+    assert_eq!(app.handle_event(&char_press('s'), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::CreateSession {
+            agent_name: "reviewer".to_owned(),
+        })
+    );
+
+    let mut app = open_sessions_app_with(with_agents(
+        watched_sessions_snapshot(Vec::new()),
+        "builder",
+        &[("builder", None)],
+    ));
+    drop(app.handle_event(&ctrl_x_press(), now));
+    drop(app.handle_event(&char_press('s'), now));
+    assert_eq!(app.handle_event(&escape_press(), now), AppAction::Continue);
+    assert!(!render_app(&app).contains("Choose the exact agent"));
+}
+
+#[test]
+fn sessions_agent_catalog_loading_error_empty_and_retry_are_actionable() {
+    let now = Instant::now();
+    let mut app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+    drop(app.handle_event(&ctrl_x_press(), now));
+    assert_eq!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::RequestSessionAgents)
+    );
+    let rendered = render_app(&app);
+    assert!(rendered.contains("Loading agents"), "{rendered}");
+
+    let mut failed = watched_sessions_snapshot(Vec::new());
+    failed.sessions.agents.load.status = "failed";
+    failed.sessions.agents.load.error = Some("catalog unavailable".to_owned());
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed)), now));
+    let rendered = render_app(&app);
+    assert!(rendered.contains("catalog unavailable"));
+    assert_eq!(
+        app.handle_event(&char_press('r'), now),
+        AppAction::ClientCommand(ClientCommand::RequestSessionAgents)
+    );
+
+    let empty = with_agents(watched_sessions_snapshot(Vec::new()), "", &[]);
+    drop(app.handle_event(&AppEvent::Client(Box::new(empty)), now));
+    assert!(render_app(&app).contains("No agents are available"));
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+}
+
+#[test]
+fn sessions_switch_agent_success_failure_and_stale_operation() {
+    let mut session = session_view("chat", 1);
+    session.agent_name = "builder".to_owned();
+    let base = with_agents(
+        watched_session_with_timeline(session, Vec::new()),
+        "builder",
+        &[("builder", None), ("reviewer", None)],
+    );
+    let mut app = open_sessions_app_with(base.clone());
+    let now = Instant::now();
+    drop(app.handle_event(&right_press(), now));
+    drop(app.handle_event(&ctrl_x_press(), now));
+    assert_eq!(app.handle_event(&char_press('a'), now), AppAction::Continue);
+    drop(app.handle_event(&down_press(), now));
+    assert_eq!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::UpdateSessionAgent {
+            id: "chat".to_owned(),
+            agent_name: "reviewer".to_owned(),
+        })
+    );
+
+    let stale = session_agent_update_snapshot(base.clone(), "stale", "ready", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(stale)), now));
+    assert!(render_app(&app).contains("Switch agent"));
+    let loading = session_agent_update_snapshot(base.clone(), "switch", "loading", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(loading)), now));
+    assert!(render_app(&app).contains("Saving"));
+    let failed = session_agent_update_snapshot(base.clone(), "switch", "failed", Some("denied"));
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed)), now));
+    assert!(render_app(&app).contains("denied"));
+    assert!(render_app(&app).contains("Switch agent"));
+
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::UpdateSessionAgent { .. })
+    ));
+    let loading = session_agent_update_snapshot(base.clone(), "switch-2", "loading", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(loading)), now));
+    let ready = session_agent_update_snapshot(base, "switch-2", "ready", None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(ready)), now));
+    assert!(!render_app(&app).contains("Switch agent"));
+}
+
+#[test]
+fn sessions_active_agent_switch_explains_next_cycle_and_escape_focus() {
+    let mut session = session_with_phase("chat", 1, SessionPhaseView::StreamingProvider, "");
+    session.agent_name = "builder".to_owned();
+    let snapshot = with_agents(
+        watched_session_with_timeline(session, Vec::new()),
+        "builder",
+        &[("builder", None), ("reviewer", None)],
+    );
+    let mut app = open_sessions_app_with(snapshot);
+    let now = Instant::now();
+    drop(app.handle_event(&right_press(), now));
+    drop(app.handle_event(&ctrl_x_press(), now));
+    drop(app.handle_event(&char_press('a'), now));
+    let rendered = render_app_with_size(&app, 70, 18);
+    assert!(rendered.contains("Active work continues"), "{rendered}");
+    assert!(rendered.contains("applies next cycle"), "{rendered}");
+    assert_eq!(app.handle_event(&escape_press(), now), AppAction::Continue);
+    assert!(!app.session_interrupt_armed());
+}
+
+#[test]
+fn sessions_inference_editor_renders_layered_snapshot() {
+    let mut app = open_sessions_app_with(inference_editor_snapshot());
     let now = Instant::now();
 
     assert_eq!(
@@ -100,8 +238,8 @@ fn sessions_provider_runtime_editor_renders_layered_snapshot() {
 }
 
 #[test]
-fn explicit_logout_clears_runtime_editor_and_session_confirmation_state() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
+fn explicit_logout_clears_inference_editor_and_session_confirmation_state() {
+    let mut app = open_sessions_app_with(inference_editor_snapshot());
     let now = Instant::now();
     assert_eq!(
         app.handle_event(&right_press(), now),
@@ -130,8 +268,8 @@ fn explicit_logout_clears_runtime_editor_and_session_confirmation_state() {
 }
 
 #[test]
-fn sessions_runtime_search_supports_middle_editing() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
+fn sessions_inference_search_supports_middle_editing() {
+    let mut app = open_sessions_app_with(inference_editor_snapshot());
     let now = Instant::now();
 
     assert_eq!(
@@ -152,8 +290,8 @@ fn sessions_runtime_search_supports_middle_editing() {
 }
 
 #[test]
-fn sessions_detail_ctrl_t_cycles_runtime_thinking() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
+fn sessions_detail_ctrl_t_cycles_inference_reasoning() {
+    let mut app = open_sessions_app_with(inference_editor_snapshot());
     let now = Instant::now();
 
     assert_eq!(
@@ -162,12 +300,11 @@ fn sessions_detail_ctrl_t_cycles_runtime_thinking() {
     );
     assert_eq!(
         app.handle_event(&ctrl_t_press(), now),
-        AppAction::ClientCommand(ClientCommand::UpdateSessionRuntimeConfig {
+        AppAction::ClientCommand(ClientCommand::UpdateSessionInferenceSettings {
             id: "chat".to_owned(),
             provider_key: "openai".to_owned(),
             model_id: "gpt4o".to_owned(),
             reasoning_effort: Some("high".to_owned()),
-            enabled_mcp_server_keys: vec!["files".to_owned(), "ghost".to_owned()],
         })
     );
 
@@ -176,30 +313,8 @@ fn sessions_detail_ctrl_t_cycles_runtime_thinking() {
 }
 
 #[test]
-fn sessions_mcp_runtime_editor_renders_layered_snapshot() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
-    let now = Instant::now();
-
-    assert_eq!(
-        app.handle_event(&right_press(), now),
-        expected_register_timeline_command("chat")
-    );
-    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    assert_eq!(app.handle_event(&char_press('m'), now), AppAction::Continue);
-
-    let rendered = render_app_with_size(&app, 100, 30);
-    assert!(rendered.contains("Search"));
-    assert!(rendered.contains("MCP Servers"));
-    assert!(rendered.contains("[enabled]"));
-    assert!(rendered.contains("[available]"));
-    assert!(rendered.contains("[missing]"));
-    assert!(rendered.contains("[selected]"));
-    insta::assert_snapshot!(rendered);
-}
-
-#[test]
-fn sessions_provider_runtime_editor_enter_saves_selected_model() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
+fn sessions_inference_editor_enter_saves_selected_model() {
+    let mut app = open_sessions_app_with(inference_editor_snapshot());
     let now = Instant::now();
 
     assert_eq!(
@@ -210,43 +325,18 @@ fn sessions_provider_runtime_editor_enter_saves_selected_model() {
     assert_eq!(app.handle_event(&char_press('p'), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&enter_press(), now),
-        AppAction::ClientCommand(ClientCommand::UpdateSessionRuntimeConfig {
+        AppAction::ClientCommand(ClientCommand::UpdateSessionInferenceSettings {
             id: "chat".to_owned(),
             provider_key: "anthropic".to_owned(),
             model_id: "claude".to_owned(),
             reasoning_effort: Some("medium".to_owned()),
-            enabled_mcp_server_keys: vec!["files".to_owned(), "ghost".to_owned()],
         })
     );
 }
 
 #[test]
-fn sessions_mcp_runtime_editor_toggles_and_saves_enabled_servers() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
-    let now = Instant::now();
-
-    assert_eq!(
-        app.handle_event(&right_press(), now),
-        expected_register_timeline_command("chat")
-    );
-    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    assert_eq!(app.handle_event(&char_press('m'), now), AppAction::Continue);
-    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
-    assert_eq!(
-        app.handle_event(&enter_press(), now),
-        AppAction::ClientCommand(ClientCommand::UpdateSessionRuntimeConfig {
-            id: "chat".to_owned(),
-            provider_key: "openai".to_owned(),
-            model_id: "gpt4o".to_owned(),
-            reasoning_effort: Some("medium".to_owned()),
-            enabled_mcp_server_keys: vec!["ghost".to_owned()],
-        })
-    );
-}
-
-#[test]
-fn sessions_runtime_editor_requests_config_then_opens_when_config_arrives() {
-    let mut snapshot = runtime_editor_snapshot();
+fn sessions_inference_editor_requests_config_then_opens_when_config_arrives() {
+    let mut snapshot = inference_editor_snapshot();
     snapshot.config.current = None;
     let mut app = open_sessions_app_with(snapshot);
     let now = Instant::now();
@@ -261,7 +351,7 @@ fn sessions_runtime_editor_requests_config_then_opens_when_config_arrives() {
         AppAction::ClientCommand(ClientCommand::RequestConfig)
     );
     assert_eq!(
-        app.handle_event(&AppEvent::Client(Box::new(runtime_editor_snapshot())), now),
+        app.handle_event(&AppEvent::Client(Box::new(inference_editor_snapshot())), now),
         AppAction::Continue
     );
 
@@ -270,8 +360,8 @@ fn sessions_runtime_editor_requests_config_then_opens_when_config_arrives() {
 }
 
 #[test]
-fn sessions_runtime_editor_escape_closes_overlay_before_interrupting_active_session() {
-    let mut app = open_sessions_app_with(active_runtime_editor_snapshot());
+fn sessions_inference_editor_escape_closes_overlay_before_interrupting_active_session() {
+    let mut app = open_sessions_app_with(active_inference_editor_snapshot());
     let now = Instant::now();
 
     assert_eq!(
@@ -297,8 +387,8 @@ fn sessions_runtime_editor_escape_closes_overlay_before_interrupting_active_sess
 }
 
 #[test]
-fn sessions_runtime_editor_update_failure_preserves_editor() {
-    let mut app = open_sessions_app_with(runtime_editor_snapshot());
+fn sessions_inference_editor_update_failure_preserves_editor() {
+    let mut app = open_sessions_app_with(inference_editor_snapshot());
     let now = Instant::now();
 
     assert_eq!(
@@ -309,18 +399,18 @@ fn sessions_runtime_editor_update_failure_preserves_editor() {
     assert_eq!(app.handle_event(&char_press('p'), now), AppAction::Continue);
     assert!(matches!(
         app.handle_event(&enter_press(), now),
-        AppAction::ClientCommand(ClientCommand::UpdateSessionRuntimeConfig { .. })
+        AppAction::ClientCommand(ClientCommand::UpdateSessionInferenceSettings { .. })
     ));
     assert_eq!(
         app.handle_event(
-            &AppEvent::Client(Box::new(runtime_update_snapshot("loading", None))),
+            &AppEvent::Client(Box::new(inference_update_snapshot("loading", None))),
             now,
         ),
         AppAction::Continue
     );
     assert_eq!(
         app.handle_event(
-            &AppEvent::Client(Box::new(runtime_update_snapshot(
+            &AppEvent::Client(Box::new(inference_update_snapshot(
                 "failed",
                 Some("runtime save failed"),
             ))),
@@ -1578,33 +1668,17 @@ fn sessions_detail_timeline_pins_to_bottom_until_manually_scrolled() {
     assert!(rendered.contains("message 9"), "{rendered}");
 }
 
-fn runtime_editor_snapshot() -> ClientSnapshot {
+fn inference_editor_snapshot() -> ClientSnapshot {
     let mut session = session_view("chat", 1);
-    session.runtime_config = Some(SessionRuntimeConfigView {
-        provider: Some(SessionProviderRuntimeView {
+    session.inference_settings = Some(InferenceSettingsView {
+        provider: Some(InferenceProviderSettingsView {
             key: "openai".to_owned(),
             kind: ProviderKindView::OpenAiChatCompletions,
             url: "https://api.openai.com/v1".to_owned(),
             model_id: "gpt4o".to_owned(),
             reasoning_effort: Some("medium".to_owned()),
-            match_status: RuntimeConfigMatchView::Configured,
+            match_status: InferenceSettingsMatchView::Configured,
         }),
-        mcp_servers: vec![
-            SessionMcpServerRuntimeView {
-                key: "files".to_owned(),
-                kind: McpServerTypeView::Stdio,
-                command: "files-mcp".to_owned(),
-                url: String::new(),
-                match_status: RuntimeConfigMatchView::Configured,
-            },
-            SessionMcpServerRuntimeView {
-                key: "ghost".to_owned(),
-                kind: McpServerTypeView::Stdio,
-                command: "ghost-mcp".to_owned(),
-                url: String::new(),
-                match_status: RuntimeConfigMatchView::Missing,
-            },
-        ],
     });
     let mut snapshot = watched_session_with_timeline(session, Vec::new());
     snapshot.config.current = Some(ConfigView {
@@ -1633,30 +1707,30 @@ fn runtime_editor_snapshot() -> ClientSnapshot {
             ("files".to_owned(), runtime_mcp_server("files")),
             ("git".to_owned(), runtime_mcp_server("git")),
         ]),
-        runtime_defaults: None,
+        inference_defaults: None,
     });
     snapshot.config.load.status = "idle";
     snapshot.config.watch.status = "received";
     snapshot
 }
 
-fn active_runtime_editor_snapshot() -> ClientSnapshot {
-    let mut snapshot = runtime_editor_snapshot();
+fn active_inference_editor_snapshot() -> ClientSnapshot {
+    let mut snapshot = inference_editor_snapshot();
     snapshot.sessions.current[0].status.phase = SessionPhaseView::RunningTool;
     snapshot
 }
 
-fn runtime_update_snapshot(status: &'static str, error: Option<&str>) -> ClientSnapshot {
-    let mut snapshot = runtime_editor_snapshot();
+fn inference_update_snapshot(status: &'static str, error: Option<&str>) -> ClientSnapshot {
+    let mut snapshot = inference_editor_snapshot();
     let session = snapshot.sessions.current[0].clone();
-    snapshot.sessions.runtime_config_update = OperationSnapshot {
+    snapshot.sessions.inference_settings_update = OperationSnapshot {
         status,
         error: error.map(str::to_owned),
         key: Some("op-runtime".to_owned()),
     };
     snapshot.operations.current.insert(
         "op-runtime".to_owned(),
-        ClientOperationView::SessionRuntimeConfigUpdate {
+        ClientOperationView::SessionInferenceSettingsUpdate {
             status,
             error: error.map(str::to_owned),
             session: Some(session),
@@ -2097,28 +2171,44 @@ fn sessions_delete_confirmation_renders_snapshot() {
 
 #[test]
 fn sessions_create_pending_renders_snapshot() {
-    let mut app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+    let mut app = open_sessions_app_with(with_agents(
+        watched_sessions_snapshot(Vec::new()),
+        "default",
+        &[("default", None)],
+    ));
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('s'), now),
-        AppAction::ClientCommand(ClientCommand::CreateSession)
+        AppAction::Continue
     );
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::CreateSession { .. })
+    ));
 
     insta::assert_snapshot!(render_app(&app));
 }
 
 #[test]
 fn sessions_create_error_renders_snapshot() {
-    let mut app = open_sessions_app_with(watched_sessions_snapshot(Vec::new()));
+    let mut app = open_sessions_app_with(with_agents(
+        watched_sessions_snapshot(Vec::new()),
+        "default",
+        &[("default", None)],
+    ));
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(
         app.handle_event(&char_press('s'), now),
-        AppAction::ClientCommand(ClientCommand::CreateSession)
+        AppAction::Continue
     );
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::CreateSession { .. })
+    ));
     assert_eq!(
         app.handle_event(
             &AppEvent::Client(Box::new(session_create_snapshot(

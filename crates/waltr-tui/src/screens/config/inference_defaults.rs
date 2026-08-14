@@ -1,10 +1,7 @@
-//! Runtime defaults config section.
-
-use std::collections::BTreeSet;
+//! Inference defaults config section.
 
 use waltr_client::{
-    ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, RuntimeConfigMatchView,
-    RuntimeDefaultsView,
+    ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, InferenceDefaultsView,
 };
 use ratatui::{
     Frame,
@@ -17,7 +14,7 @@ use ratatui::{
 use crate::{
     screens::{
         OperationResult, OperationTracker,
-        runtime_selector::{self, McpSelectorEntry, ModelSelectorEntry},
+        inference_selector::{self, ModelSelectorEntry},
     },
     theme::THEME,
     ui,
@@ -25,40 +22,35 @@ use crate::{
 
 use crate::screens::SectionAction;
 
-/// Runtime defaults section state.
+/// Inference defaults section state.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeDefaultsSection {
+pub struct InferenceDefaultsSection {
     selected_provider: usize,
     selected_model: usize,
-    selected_mcp: usize,
-    overlay: Option<RuntimeDefaultsOverlay>,
-    draft: Option<RuntimeDefaultsDraft>,
+    overlay: Option<InferenceDefaultsOverlay>,
+    draft: Option<InferenceDefaultsDraft>,
     patch: OperationTracker,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RuntimeDefaultsOverlay {
+enum InferenceDefaultsOverlay {
     Model,
-    Mcp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeDefaultsDraft {
+struct InferenceDefaultsDraft {
     provider_key: String,
     model_id: String,
     reasoning_effort: Option<String>,
-    mcp_default_enabled: bool,
-    enabled_mcp_server_keys: BTreeSet<String>,
 }
 
-impl RuntimeDefaultsSection {
-    /// Create an empty runtime defaults section.
+impl InferenceDefaultsSection {
+    /// Create an empty inference defaults section.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             selected_provider: 0,
             selected_model: 0,
-            selected_mcp: 0,
             overlay: None,
             draft: None,
             patch: OperationTracker::new(),
@@ -91,7 +83,7 @@ impl RuntimeDefaultsSection {
     /// Clamp selections to available config entries.
     pub fn sync_selection(&mut self, config: Option<&ConfigView>) {
         if self.draft.is_none()
-            && let Some(defaults) = config.and_then(|config| config.runtime_defaults.as_ref())
+            && let Some(defaults) = config.and_then(|config| config.inference_defaults.as_ref())
             && let Some((provider_index, model_index)) = model_indices(
                 config,
                 defaults.provider_key.as_str(),
@@ -108,8 +100,6 @@ impl RuntimeDefaultsSection {
             .and_then(|key| config?.providers.get(key))
             .map_or(0, |provider| provider.models.len());
         self.selected_model = clamp_index(self.selected_model, model_count);
-        let mcp_count = config.map_or(0, |config| config.mcp_servers.len());
-        self.selected_mcp = clamp_index(self.selected_mcp, mcp_count);
     }
 
     /// Whether the section has an active overlay.
@@ -130,7 +120,7 @@ impl RuntimeDefaultsSection {
     /// Open the default model selector from the config shell leader command.
     pub const fn open_create_form(&mut self) {
         if !self.patch.is_pending() {
-            self.overlay = Some(RuntimeDefaultsOverlay::Model);
+            self.overlay = Some(InferenceDefaultsOverlay::Model);
         }
     }
 
@@ -146,11 +136,7 @@ impl RuntimeDefaultsSection {
 
         match key.code {
             KeyCode::Char('m') => {
-                self.overlay = Some(RuntimeDefaultsOverlay::Model);
-                SectionAction::Continue
-            }
-            KeyCode::Char(' ') => {
-                self.overlay = Some(RuntimeDefaultsOverlay::Mcp);
+                self.overlay = Some(InferenceDefaultsOverlay::Model);
                 SectionAction::Continue
             }
             KeyCode::Char('r') => {
@@ -165,42 +151,18 @@ impl RuntimeDefaultsSection {
 
     fn handle_overlay_key(
         &mut self,
-        overlay: RuntimeDefaultsOverlay,
+        overlay: InferenceDefaultsOverlay,
         key: KeyEvent,
         config: Option<&ConfigView>,
     ) -> SectionAction {
         match overlay {
-            RuntimeDefaultsOverlay::Model => match key.code {
+            InferenceDefaultsOverlay::Model => match key.code {
                 KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
                     self.move_selected_model(config, -1);
                     SectionAction::Continue
                 }
                 KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => {
                     self.move_selected_model(config, 1);
-                    SectionAction::Continue
-                }
-                KeyCode::Enter => {
-                    self.overlay = None;
-                    SectionAction::Continue
-                }
-                _ => SectionAction::Unhandled,
-            },
-            RuntimeDefaultsOverlay::Mcp => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected_mcp = self.selected_mcp.saturating_sub(1);
-                    SectionAction::Continue
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let max = mcp_count(config).saturating_sub(1);
-                    self.selected_mcp = (self.selected_mcp + 1).min(max);
-                    SectionAction::Continue
-                }
-                KeyCode::Char(' ' | 'm') => {
-                    self.toggle_selected_mcp(config);
-                    SectionAction::Continue
-                }
-                KeyCode::Char('a') => {
-                    self.toggle_all_mcp(config);
                     SectionAction::Continue
                 }
                 KeyCode::Enter => {
@@ -237,47 +199,20 @@ impl RuntimeDefaultsSection {
         }
     }
 
-    fn draft(&self, config: Option<&ConfigView>) -> RuntimeDefaultsDraft {
-        self.draft.clone().unwrap_or_else(|| RuntimeDefaultsDraft {
-            provider_key: config
-                .and_then(|config| config.runtime_defaults.as_ref())
-                .map_or_else(String::new, |defaults| defaults.provider_key.clone()),
-            model_id: config
-                .and_then(|config| config.runtime_defaults.as_ref())
-                .map_or_else(String::new, |defaults| defaults.model_id.clone()),
-            reasoning_effort: config
-                .and_then(|config| config.runtime_defaults.as_ref())
-                .and_then(|defaults| defaults.reasoning_effort.clone()),
-            mcp_default_enabled: config
-                .and_then(|config| config.runtime_defaults.as_ref())
-                .is_some_and(|defaults| defaults.mcp_default_enabled),
-            enabled_mcp_server_keys: config
-                .and_then(|config| config.runtime_defaults.as_ref())
-                .map_or_else(BTreeSet::new, |defaults| {
-                    defaults.enabled_mcp_server_keys.iter().cloned().collect()
-                }),
-        })
-    }
-
-    fn toggle_all_mcp(&mut self, config: Option<&ConfigView>) {
-        let mut draft = self.draft(config);
-        draft.mcp_default_enabled = !draft.mcp_default_enabled;
-        if draft.mcp_default_enabled {
-            draft.enabled_mcp_server_keys.clear();
-        }
-        self.draft = Some(draft);
-    }
-
-    fn toggle_selected_mcp(&mut self, config: Option<&ConfigView>) {
-        let Some(key) = selected_mcp_key(config, self.selected_mcp) else {
-            return;
-        };
-        let mut draft = self.draft(config);
-        draft.mcp_default_enabled = false;
-        if !draft.enabled_mcp_server_keys.insert(key.to_owned()) {
-            draft.enabled_mcp_server_keys.remove(key);
-        }
-        self.draft = Some(draft);
+    fn draft(&self, config: Option<&ConfigView>) -> InferenceDefaultsDraft {
+        self.draft
+            .clone()
+            .unwrap_or_else(|| InferenceDefaultsDraft {
+                provider_key: config
+                    .and_then(|config| config.inference_defaults.as_ref())
+                    .map_or_else(String::new, |defaults| defaults.provider_key.clone()),
+                model_id: config
+                    .and_then(|config| config.inference_defaults.as_ref())
+                    .map_or_else(String::new, |defaults| defaults.model_id.clone()),
+                reasoning_effort: config
+                    .and_then(|config| config.inference_defaults.as_ref())
+                    .and_then(|defaults| defaults.reasoning_effort.clone()),
+            })
     }
 
     fn cycle_reasoning_effort(&mut self, config: Option<&ConfigView>) {
@@ -319,26 +254,22 @@ impl RuntimeDefaultsSection {
         }
 
         self.patch.begin();
-        SectionAction::ClientCommand(ClientCommand::SetRuntimeDefaults {
-            defaults: Some(RuntimeDefaultsView {
+        SectionAction::ClientCommand(ClientCommand::SetInferenceDefaults {
+            defaults: Some(InferenceDefaultsView {
                 provider_key: draft.provider_key,
                 model_id: draft.model_id,
                 reasoning_effort: draft.reasoning_effort,
-                mcp_default_enabled: draft.mcp_default_enabled,
-                enabled_mcp_server_keys: draft.enabled_mcp_server_keys.into_iter().collect(),
             }),
         })
     }
 
     fn clear(&mut self) -> SectionAction {
         self.patch.begin();
-        SectionAction::ClientCommand(ClientCommand::SetRuntimeDefaults {
-            defaults: Some(RuntimeDefaultsView {
+        SectionAction::ClientCommand(ClientCommand::SetInferenceDefaults {
+            defaults: Some(InferenceDefaultsView {
                 provider_key: String::new(),
                 model_id: String::new(),
                 reasoning_effort: None,
-                mcp_default_enabled: false,
-                enabled_mcp_server_keys: Vec::new(),
             }),
         })
     }
@@ -365,7 +296,7 @@ impl RuntimeDefaultsSection {
     }
 
     fn render_loaded_content(&self, frame: &mut Frame<'_>, area: Rect, config: &ConfigView) {
-        runtime_selector::fill_panel(frame, area);
+        inference_selector::fill_panel(frame, area);
 
         let status_lines = self.status_lines(config);
         let status_height = status_lines.len().try_into().unwrap_or(u16::MAX);
@@ -396,14 +327,9 @@ impl RuntimeDefaultsSection {
         };
 
         let (title, footer, height) = match overlay {
-            RuntimeDefaultsOverlay::Model => (
+            InferenceDefaultsOverlay::Model => (
                 "Select default model",
                 "Up/Down choose  Enter done  Esc cancel",
-                16,
-            ),
-            RuntimeDefaultsOverlay::Mcp => (
-                "Select default MCP",
-                "Up/Down choose  Space toggle  a all  Enter done  Esc cancel",
                 16,
             ),
         };
@@ -413,24 +339,12 @@ impl RuntimeDefaultsSection {
         let body_area = super::render_modal_frame(frame, selector_area, title, footer);
 
         match (overlay, config) {
-            (RuntimeDefaultsOverlay::Model, Some(config)) => {
+            (InferenceDefaultsOverlay::Model, Some(config)) => {
                 let models = self.model_selector_entries(config);
-                runtime_selector::render_model_selector(frame, body_area, "Models", &models);
+                inference_selector::render_model_selector(frame, body_area, "Models", &models);
             }
-            (RuntimeDefaultsOverlay::Mcp, Some(config)) => {
-                let mcp_servers = self.mcp_selector_entries(config);
-                runtime_selector::render_mcp_selector(
-                    frame,
-                    body_area,
-                    "MCP Servers",
-                    &mcp_servers,
-                );
-            }
-            (RuntimeDefaultsOverlay::Model, None) => {
-                runtime_selector::render_model_selector(frame, body_area, "Models", &[]);
-            }
-            (RuntimeDefaultsOverlay::Mcp, None) => {
-                runtime_selector::render_mcp_selector(frame, body_area, "MCP Servers", &[]);
+            (InferenceDefaultsOverlay::Model, None) => {
+                inference_selector::render_model_selector(frame, body_area, "Models", &[]);
             }
         }
     }
@@ -439,19 +353,7 @@ impl RuntimeDefaultsSection {
         let draft = self.draft(Some(config));
         let selected_model =
             selected_model_entry(Some(config), self.selected_provider, self.selected_model)
-                .map_or_else(|| "none".to_owned(), RuntimeModelEntry::display_key);
-        let mcp_mode = if draft.mcp_default_enabled {
-            "all MCP servers".to_owned()
-        } else if draft.enabled_mcp_server_keys.is_empty() {
-            "no MCP servers".to_owned()
-        } else {
-            draft
-                .enabled_mcp_server_keys
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+                .map_or_else(|| "none".to_owned(), InferenceModelEntry::display_key);
         let reasoning = if selected_reasoning_efforts(
             Some(config),
             self.selected_provider,
@@ -473,12 +375,8 @@ impl RuntimeDefaultsSection {
                 Span::styled("Reasoning ", THEME.panel_muted_style()),
                 Span::styled(reasoning, THEME.focus_style().bg(THEME.panel())),
             ]),
-            panel_line(vec![
-                Span::styled("MCP default ", THEME.panel_muted_style()),
-                Span::styled(mcp_mode, THEME.focus_style().bg(THEME.panel())),
-            ]),
             panel_line(vec![Span::styled(
-                "m selects model, Space selects MCP, Enter saves for new sessions.",
+                "m selects model, r changes reasoning, Enter saves for new sessions.",
                 THEME.panel_muted_style(),
             )]),
         ]
@@ -487,7 +385,7 @@ impl RuntimeDefaultsSection {
     fn status_lines(&self, config: &ConfigView) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if self.patch.is_pending() {
-            lines.push(ui::loading_line("Saving runtime defaults..."));
+            lines.push(ui::loading_line("Saving inference defaults..."));
         }
         if let Some(error) = self.patch.error() {
             lines.push(Line::from(Span::styled(
@@ -505,7 +403,7 @@ impl RuntimeDefaultsSection {
     fn model_selector_entries(&self, config: &ConfigView) -> Vec<ModelSelectorEntry> {
         let selected =
             selected_model_entry(Some(config), self.selected_provider, self.selected_model);
-        let persisted = config.runtime_defaults.as_ref();
+        let persisted = config.inference_defaults.as_ref();
 
         model_entries(Some(config))
             .into_iter()
@@ -528,25 +426,9 @@ impl RuntimeDefaultsSection {
             })
             .collect()
     }
-
-    fn mcp_selector_entries(&self, config: &ConfigView) -> Vec<McpSelectorEntry> {
-        let draft = self.draft(Some(config));
-        config
-            .mcp_servers
-            .keys()
-            .enumerate()
-            .map(|(index, key)| McpSelectorEntry {
-                key: key.clone(),
-                focused: index == self.selected_mcp,
-                checked: draft.mcp_default_enabled || draft.enabled_mcp_server_keys.contains(key),
-                configured: true,
-                state: RuntimeConfigMatchView::Configured,
-            })
-            .collect()
-    }
 }
 
-impl Default for RuntimeDefaultsSection {
+impl Default for InferenceDefaultsSection {
     fn default() -> Self {
         Self::new()
     }
@@ -563,24 +445,24 @@ fn panel_line(mut spans: Vec<Span<'static>>) -> Line<'static> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeModelEntry {
+struct InferenceModelEntry {
     provider_key: String,
     model_id: String,
     model_name: String,
 }
 
-impl RuntimeModelEntry {
+impl InferenceModelEntry {
     fn display_key(self) -> String {
         format!("{}/{}", self.provider_key, self.model_id)
     }
 }
 
-fn model_entries(config: Option<&ConfigView>) -> Vec<RuntimeModelEntry> {
+fn model_entries(config: Option<&ConfigView>) -> Vec<InferenceModelEntry> {
     let mut entries = Vec::new();
     if let Some(config) = config {
         for (provider_key, provider) in &config.providers {
             for (model_id, model) in &provider.models {
-                entries.push(RuntimeModelEntry {
+                entries.push(InferenceModelEntry {
                     provider_key: provider_key.clone(),
                     model_id: model_id.clone(),
                     model_name: model.name.clone(),
@@ -600,12 +482,12 @@ fn selected_model_entry(
     config: Option<&ConfigView>,
     provider_index: usize,
     model_index: usize,
-) -> Option<RuntimeModelEntry> {
+) -> Option<InferenceModelEntry> {
     let config = config?;
     let provider_key = selected_provider_key(Some(config), provider_index)?;
     let provider = config.providers.get(provider_key)?;
     let (model_id, model) = provider.models.iter().nth(model_index)?;
-    Some(RuntimeModelEntry {
+    Some(InferenceModelEntry {
         provider_key: provider_key.to_owned(),
         model_id: model_id.clone(),
         model_name: model.name.clone(),
@@ -616,7 +498,7 @@ fn selected_model_entry_index(
     config: Option<&ConfigView>,
     provider_index: usize,
     model_index: usize,
-    entries: &[RuntimeModelEntry],
+    entries: &[InferenceModelEntry],
 ) -> usize {
     selected_model_entry(config, provider_index, model_index)
         .and_then(|selected| {
@@ -644,10 +526,6 @@ fn model_indices(
         .keys()
         .position(|key| key == model_id)?;
     Some((provider_index, model_index))
-}
-
-fn mcp_count(config: Option<&ConfigView>) -> usize {
-    config.map_or(0, |config| config.mcp_servers.len())
 }
 
 fn selected_provider_key(config: Option<&ConfigView>, index: usize) -> Option<&str> {
@@ -690,11 +568,7 @@ fn selected_reasoning_efforts(
         .map_or_else(Vec::new, |model| model.options.reasoning_efforts.clone())
 }
 
-fn selected_mcp_key(config: Option<&ConfigView>, index: usize) -> Option<&str> {
-    config?.mcp_servers.keys().nth(index).map(String::as_str)
-}
-
 fn loading_widget() -> Paragraph<'static> {
-    Paragraph::new(vec![ui::loading_line("Waiting for runtime defaults...")])
+    Paragraph::new(vec![ui::loading_line("Waiting for inference defaults...")])
         .style(THEME.panel_style())
 }

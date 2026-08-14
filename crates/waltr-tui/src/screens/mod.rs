@@ -2,9 +2,9 @@
 
 mod access;
 mod config;
+mod inference_selector;
 mod landing;
 mod operation;
-mod runtime_selector;
 mod session_data;
 mod sessions;
 mod splash;
@@ -12,8 +12,8 @@ mod splash;
 pub use access::draw_access;
 pub(crate) use config::{ConfigAuthState, ConfigResetState, targets_match};
 pub use config::{
-    ConfigTab, McpForm, McpFormMode, McpSection, ModelForm, ModelFormMode, ProviderForm,
-    ProviderFormMode, ProviderSection, RuntimeDefaultsSection, draw_config,
+    ConfigTab, InferenceDefaultsSection, McpForm, McpFormMode, McpSection, ModelForm,
+    ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection, draw_config,
 };
 pub use landing::draw_landing;
 pub use operation::{OperationResult, OperationTracker, SectionAction};

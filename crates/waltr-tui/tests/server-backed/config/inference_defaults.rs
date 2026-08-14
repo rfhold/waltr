@@ -4,9 +4,9 @@ use std::{
 };
 
 use waltr_client::{
-    ClientRuntime, Configuration, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, ProviderKindView, ProviderView,
-    RuntimeDefaultsView,
+    ClientRuntime, Configuration, InferenceDefaultsView, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
+    ProviderKindView, ProviderView,
 };
 use waltr_server::{
     config::ConfigStore as _,
@@ -16,7 +16,7 @@ use waltr_server::{
 use waltr_tui::app::{App, AppAction};
 
 use crate::support::{
-    input::{char_press, enter_press, tab_press},
+    input::{enter_press, tab_press},
     render::render_app,
     server::{
         dispatch_app_command, drive_app_to_landing, next_snapshot_until, no_sleep,
@@ -25,8 +25,8 @@ use crate::support::{
 };
 
 #[tokio::test]
-async fn runtime_defaults_snapshot_and_save_use_real_server() {
-    let server = setup_runtime_defaults_server().await;
+async fn inference_defaults_snapshot_and_save_use_real_server() {
+    let server = setup_inference_defaults_server().await;
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
 
@@ -42,25 +42,20 @@ async fn runtime_defaults_snapshot_and_save_use_real_server() {
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     insta::assert_snapshot!("config_defaults_seeded_real_server", render_app(&app));
 
-    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
-    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
-    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
     let action = app.handle_event(&enter_press(), now);
     let saved = dispatch_app_command(&mut stream, &mut app, action).await;
     let defaults = saved
         .config
         .current
         .as_ref()
-        .and_then(|config| config.runtime_defaults.as_ref())
-        .expect("runtime defaults should be persisted");
+        .and_then(|config| config.inference_defaults.as_ref())
+        .expect("inference defaults should be persisted");
     assert_eq!(defaults.provider_key, "anthropic");
     assert_eq!(defaults.model_id, "sonnet");
-    assert!(!defaults.mcp_default_enabled);
-    assert_eq!(defaults.enabled_mcp_server_keys, vec!["files"]);
     insta::assert_snapshot!("config_defaults_saved_real_server", render_app(&app));
 }
 
-async fn setup_runtime_defaults_server() -> &'static TestServer {
+async fn setup_inference_defaults_server() -> &'static TestServer {
     let config_service = ConfigService::new(temp_root(), default_config_builder())
         .expect("config service should start");
     config_service
@@ -90,19 +85,17 @@ async fn setup_runtime_defaults_server() -> &'static TestServer {
                 }
                 .into(),
             )]),
-            runtime_defaults: Some(
-                RuntimeDefaultsView {
+            inference_defaults: Some(
+                InferenceDefaultsView {
                     provider_key: "anthropic".to_owned(),
                     model_id: "sonnet".to_owned(),
                     reasoning_effort: None,
-                    mcp_default_enabled: false,
-                    enabled_mcp_server_keys: Vec::new(),
                 }
                 .into(),
             ),
         })
         .await
-        .expect("runtime defaults seed should save");
+        .expect("inference defaults seed should save");
 
     setup_server_with_services(config_service)
 }

@@ -16,9 +16,9 @@ use crate::{
     keys::{KeyCommand, LeaderCommand, key_command},
     native_auth::NativeAuthAction,
     screens::{
-        ConfigAuthState, ConfigResetState, ConfigTab, McpSection, ProviderSection,
-        RuntimeDefaultsSection, SectionAction, SessionDataAction, SessionDataState,
-        SessionsSection, register_timeline_watch_command, targets_match,
+        ConfigAuthState, ConfigResetState, ConfigTab, InferenceDefaultsSection, McpSection,
+        ProviderSection, SectionAction, SessionDataAction, SessionDataState, SessionsSection,
+        register_timeline_watch_command, targets_match,
     },
     ui,
     ui::Notice,
@@ -96,7 +96,7 @@ pub struct App {
     active_config_tab: ConfigTab,
     provider_section: ProviderSection,
     mcp_section: McpSection,
-    runtime_defaults_section: RuntimeDefaultsSection,
+    inference_defaults_section: InferenceDefaultsSection,
     sessions_section: SessionsSection,
     session_data: SessionDataState,
     leader_armed: bool,
@@ -122,7 +122,7 @@ impl App {
             active_config_tab: ConfigTab::Providers,
             provider_section: ProviderSection::new(),
             mcp_section: McpSection::new(),
-            runtime_defaults_section: RuntimeDefaultsSection::new(),
+            inference_defaults_section: InferenceDefaultsSection::new(),
             sessions_section: SessionsSection::new(),
             session_data: SessionDataState::new(),
             leader_armed: false,
@@ -344,10 +344,10 @@ impl App {
         &self.mcp_section
     }
 
-    /// Return the runtime defaults config section.
+    /// Return the inference defaults config section.
     #[must_use]
-    pub const fn runtime_defaults_section(&self) -> &RuntimeDefaultsSection {
-        &self.runtime_defaults_section
+    pub const fn inference_defaults_section(&self) -> &InferenceDefaultsSection {
+        &self.inference_defaults_section
     }
 
     /// Return the sessions screen state.
@@ -701,7 +701,9 @@ impl App {
                     match self.active_config_tab {
                         ConfigTab::Providers => self.provider_section.open_create_form(),
                         ConfigTab::Mcp => self.mcp_section.open_create_form(),
-                        ConfigTab::Defaults => self.runtime_defaults_section.open_create_form(),
+                        ConfigTab::InferenceDefaults => {
+                            self.inference_defaults_section.open_create_form();
+                        }
                     }
                     return AppAction::Continue;
                 }
@@ -754,7 +756,10 @@ impl App {
                         };
                     }
 
-                    return match self.sessions_section.create_session() {
+                    return match self
+                        .sessions_section
+                        .open_create_session(self.client_snapshot.as_ref())
+                    {
                         SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
                         SectionAction::ClientCommands(commands) => {
                             AppAction::ClientCommands(commands)
@@ -803,12 +808,12 @@ impl App {
                     })
                 })
             }
-            KeyCommand::LeaderCommand(LeaderCommand::Provider) => {
+            KeyCommand::LeaderCommand(LeaderCommand::Inference) => {
                 self.leader_armed = false;
                 if self.screen == AppScreen::Sessions {
                     return match self
                         .sessions_section
-                        .open_provider_runtime_editor(self.client_snapshot.as_ref())
+                        .open_inference_settings_editor(self.client_snapshot.as_ref())
                     {
                         SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
                         SectionAction::ClientCommands(commands) => {
@@ -819,12 +824,12 @@ impl App {
                 }
                 AppAction::Continue
             }
-            KeyCommand::LeaderCommand(LeaderCommand::Mcp) => {
+            KeyCommand::LeaderCommand(LeaderCommand::Agent) => {
                 self.leader_armed = false;
                 if self.screen == AppScreen::Sessions {
                     return match self
                         .sessions_section
-                        .open_mcp_runtime_editor(self.client_snapshot.as_ref())
+                        .open_agent_selector(self.client_snapshot.as_ref())
                     {
                         SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
                         SectionAction::ClientCommands(commands) => {
@@ -987,7 +992,7 @@ impl App {
             if auth_status_stale {
                 commands.push(ClientCommand::RequestAuthStatuses);
             }
-            self.runtime_defaults_section.reconcile_patch(&snapshot);
+            self.inference_defaults_section.reconcile_patch(&snapshot);
             if self.config_reset.reconcile(&snapshot) {
                 self.notice = Some(TransientNotice {
                     text: "configuration reset to server defaults".to_owned(),
@@ -995,7 +1000,11 @@ impl App {
                 });
             }
             self.session_data.reconcile(&snapshot);
-            if snapshot.sessions.delete.status != "loading" {
+            if snapshot.sessions.delete.status != "loading"
+                && !self
+                    .sessions_section
+                    .detail_is_immediate_create_result(&snapshot)
+            {
                 self.sessions_section
                     .reconcile_current_sessions(&snapshot.sessions.current);
             }
@@ -1004,7 +1013,7 @@ impl App {
             if let Some(config) = snapshot.config.current.as_ref() {
                 self.provider_section.sync_selection(config.providers.len());
                 self.mcp_section.sync_selection(config.mcp_servers.len());
-                self.runtime_defaults_section.sync_selection(Some(config));
+                self.inference_defaults_section.sync_selection(Some(config));
             }
 
             if snapshot.sessions.watch.status == "received" {
@@ -1041,7 +1050,7 @@ impl App {
         self.active_config_tab = ConfigTab::Providers;
         self.provider_section = ProviderSection::new();
         self.mcp_section = McpSection::new();
-        self.runtime_defaults_section = RuntimeDefaultsSection::new();
+        self.inference_defaults_section = InferenceDefaultsSection::new();
         self.sessions_section = SessionsSection::new();
         self.session_data = SessionDataState::new();
         self.leader_armed = false;
@@ -1065,7 +1074,7 @@ impl App {
         match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.has_overlay(),
             ConfigTab::Mcp => self.mcp_section.has_overlay(),
-            ConfigTab::Defaults => self.runtime_defaults_section.has_overlay(),
+            ConfigTab::InferenceDefaults => self.inference_defaults_section.has_overlay(),
         }
     }
 
@@ -1079,7 +1088,7 @@ impl App {
         match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.dismiss_overlay(),
             ConfigTab::Mcp => self.mcp_section.dismiss_overlay(),
-            ConfigTab::Defaults => self.runtime_defaults_section.dismiss_overlay(),
+            ConfigTab::InferenceDefaults => self.inference_defaults_section.dismiss_overlay(),
         }
     }
 
@@ -1121,7 +1130,7 @@ impl App {
         let auth_target = match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.selected_auth_target(config.as_ref()),
             ConfigTab::Mcp => self.mcp_section.selected_auth_target(config.as_ref()),
-            ConfigTab::Defaults => None,
+            ConfigTab::InferenceDefaults => None,
         };
         if !self.active_section_has_content_overlay() {
             match self.config_auth.handle_key(key, auth_target, &statuses) {
@@ -1138,8 +1147,8 @@ impl App {
         let action = match self.active_config_tab {
             ConfigTab::Providers => self.provider_section.handle_key(key, config.as_ref()),
             ConfigTab::Mcp => self.mcp_section.handle_key(key, config.as_ref()),
-            ConfigTab::Defaults => self
-                .runtime_defaults_section
+            ConfigTab::InferenceDefaults => self
+                .inference_defaults_section
                 .handle_key(key, config.as_ref()),
         };
         match action {

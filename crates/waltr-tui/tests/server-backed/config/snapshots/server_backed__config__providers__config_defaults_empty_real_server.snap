@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/server-backed/config/providers.rs
+assertion_line: 51
 expression: defaults
 ---
 "                                                                                "
@@ -7,12 +8,11 @@ expression: defaults
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
 "         Default model anthropic/claude-fable-5                                 "
 "         Reasoning not supported                                                "
-"         MCP default no MCP servers                                             "
-"         m selects model, Space selects MCP, Enter saves for new                "
+"         m selects model, r changes reasoning, Enter saves for new              "
 "        sessions.                                                               "
 "                                                                                "
 "                                                                                "
@@ -22,7 +22,8 @@ expression: defaults
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"         Esc back  Tab switch  m model  Space MCP  r reason  Enter save         "
+"                                                                                "
+"         Esc back  Tab switch  m model  r reason  Enter save  Del clear         "
 "                                                                                "
 " Esc  back    Ctrl-X q  quit                                        Waltr  ready "
 "                                                                                "

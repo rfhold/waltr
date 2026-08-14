@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/app/config.rs
+assertion_line: 1872
 expression: rendered
 ---
 "                                                                                "
@@ -7,7 +8,7 @@ expression: rendered
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
 "        > remote  sse  https://mcp.example/sse                                  "
 "            status: authorization required                                      "

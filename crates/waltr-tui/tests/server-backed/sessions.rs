@@ -4,9 +4,9 @@ use std::{
 };
 
 use waltr_client::{
-    ClientOperationView, ClientRuntime, Configuration, McpServerTypeView, McpServerView,
-    ModelCapabilitiesView, ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView,
-    ProviderKindView, ProviderView, RuntimeDefaultsView,
+    ClientOperationView, ClientRuntime, Configuration, InferenceDefaultsView, McpServerTypeView,
+    McpServerView, ModelCapabilitiesView, ModelLimitsView, ModelOptionsView, ModelTypeView,
+    ModelView, ProviderKindView, ProviderView,
 };
 use waltr_server::{
     config::ConfigStore as _,
@@ -18,7 +18,7 @@ use waltr_server::{
 use waltr_tui::app::{App, AppAction};
 
 use crate::support::{
-    input::{char_press, ctrl_t_press, ctrl_x_press, enter_press},
+    input::{char_press, ctrl_t_press, ctrl_x_press, enter_press, right_press},
     render::render_app,
     server::{
         dispatch_app_command, drive_app_to_landing, next_snapshot_until, no_sleep,
@@ -27,6 +27,10 @@ use crate::support::{
 };
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the test covers one complete session lifecycle against a real server"
+)]
 async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     let server = setup_server();
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
@@ -46,7 +50,19 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
 
     let now = Instant::now();
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    let create_action = app.handle_event(&char_press('s'), now);
+    let load_agents = app.handle_event(&char_press('s'), now);
+    if !matches!(load_agents, AppAction::Continue) {
+        drop(dispatch_app_command(&mut stream, &mut app, load_agents).await);
+        next_snapshot_until(&mut stream, &mut app, |snapshot| {
+            (snapshot.sessions.agents.load.status == "ready"
+                && !snapshot.sessions.agents.entries.is_empty())
+                || snapshot.sessions.agents.load.status == "failed"
+        })
+        .await;
+    }
+    let selector = render_app(&app);
+    assert!(selector.contains("Create session"));
+    let create_action = app.handle_event(&enter_press(), now);
     let created = dispatch_app_command(&mut stream, &mut app, create_action).await;
     let create_key = created
         .sessions
@@ -76,6 +92,8 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     })
     .await;
     let rendered = render_app(&app);
+    assert!(rendered.contains("agent "));
+    assert!(rendered.contains("(C-x a)"));
     assert!(rendered.contains("provider none (C-x p)"));
     assert!(rendered.contains("ctx 0"));
     insta::assert_snapshot!(
@@ -129,7 +147,11 @@ async fn session_data_screen_wipes_all_sessions_with_real_server() {
     let now = Instant::now();
     for _ in 0..2 {
         assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-        let create = app.handle_event(&char_press('s'), now);
+        let load_agents = app.handle_event(&char_press('s'), now);
+        if !matches!(load_agents, AppAction::Continue) {
+            drop(dispatch_app_command(&mut stream, &mut app, load_agents).await);
+        }
+        let create = app.handle_event(&enter_press(), now);
         drop(dispatch_app_command(&mut stream, &mut app, create).await);
         let session_id = app
             .sessions_section()
@@ -190,8 +212,8 @@ fn normalize_session_render(rendered: &str, session_id: &str) -> String {
 }
 
 #[tokio::test]
-async fn session_detail_updates_runtime_config_with_real_server() {
-    let server = setup_runtime_configured_server().await;
+async fn session_detail_updates_inference_settings_with_real_server() {
+    let server = setup_inference_configured_server().await;
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);
     let mut app = App::new();
 
@@ -199,8 +221,9 @@ async fn session_detail_updates_runtime_config_with_real_server() {
     open_sessions_screen(&mut stream, &mut app).await;
 
     let now = Instant::now();
-    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    let create_action = app.handle_event(&char_press('s'), now);
+    let create_action = AppAction::ClientCommand(waltr_client::ClientCommand::CreateSession {
+        agent_name: "coding".to_owned(),
+    });
     let created = dispatch_app_command(&mut stream, &mut app, create_action).await;
     let create_key = created
         .sessions
@@ -217,13 +240,24 @@ async fn session_detail_updates_runtime_config_with_real_server() {
         operation => panic!("expected ready session create operation, saw {operation:?}"),
     };
 
-    assert_runtime_provider(&created, &session_id, "openai", "gpt4o", None);
+    let created = next_snapshot_until(&mut stream, &mut app, |snapshot| {
+        snapshot
+            .sessions
+            .current
+            .iter()
+            .any(|session| session.id == session_id)
+    })
+    .await;
+
+    assert_inference_provider(&created, &session_id, "openai", "gpt4o", None);
+    let open_detail = app.handle_event(&right_press(), now);
+    drop(dispatch_app_command(&mut stream, &mut app, open_detail).await);
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     let open_provider = app.handle_event(&char_press('p'), now);
     dispatch_app_command(&mut stream, &mut app, open_provider).await;
     let provider_editor = render_app(&app);
-    assert!(provider_editor.contains("Provider/model"));
+    assert!(provider_editor.contains("Inference settings"));
     assert!(provider_editor.contains("Search"));
     assert!(provider_editor.contains("anthropic/claude"));
     assert!(provider_editor.contains("openai/gpt4o"));
@@ -232,54 +266,38 @@ async fn session_detail_updates_runtime_config_with_real_server() {
 
     let provider_update = app.handle_event(&enter_press(), now);
     let updated_provider = dispatch_app_command(&mut stream, &mut app, provider_update).await;
-    assert_runtime_provider(&updated_provider, &session_id, "anthropic", "claude", None);
+    assert_inference_provider(&updated_provider, &session_id, "openai", "gpt4o", None);
 
     for expected_effort in ["low", "medium", "high"] {
         let thinking_update = app.handle_event(&ctrl_t_press(), now);
-        let updated_thinking = dispatch_app_command(&mut stream, &mut app, thinking_update).await;
-        assert_runtime_provider(
+        drop(dispatch_app_command(&mut stream, &mut app, thinking_update).await);
+        let updated_thinking = next_snapshot_until(&mut stream, &mut app, |snapshot| {
+            snapshot
+                .sessions
+                .current
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.inference_settings.as_ref())
+                .and_then(|settings| settings.provider.as_ref())
+                .and_then(|provider| provider.reasoning_effort.as_deref())
+                == Some(expected_effort)
+        })
+        .await;
+        assert_inference_provider(
             &updated_thinking,
             &session_id,
-            "anthropic",
-            "claude",
+            "openai",
+            "gpt4o",
             Some(expected_effort),
         );
     }
 
     let rendered = render_app(&app);
-    assert!(rendered.contains("(Ctrl-T)"));
-    assert_runtime_provider(&updated_provider, &session_id, "anthropic", "claude", None);
-
-    assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    assert_eq!(app.handle_event(&char_press('m'), now), AppAction::Continue);
-    assert!(render_app(&app).contains("MCP servers"));
-    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
-    let mcp_update = app.handle_event(&enter_press(), now);
-    let updated_mcp = dispatch_app_command(&mut stream, &mut app, mcp_update).await;
-    let runtime = updated_mcp
-        .sessions
-        .current
-        .iter()
-        .find(|session| session.id == session_id)
-        .and_then(|session| session.runtime_config.as_ref())
-        .expect("updated session should expose runtime config");
-    assert!(
-        runtime
-            .mcp_servers
-            .iter()
-            .any(|server| server.key == "files")
-    );
-    assert!(runtime.mcp_servers.iter().any(|server| server.key == "git"));
-    assert_eq!(
-        runtime
-            .provider
-            .as_ref()
-            .and_then(|provider| provider.reasoning_effort.as_deref()),
-        Some("high")
-    );
+    assert!(rendered.contains("agent coding (C-x a)"));
+    assert_inference_provider(&updated_provider, &session_id, "openai", "gpt4o", None);
 }
 
-async fn setup_runtime_configured_server() -> &'static TestServer {
+async fn setup_inference_configured_server() -> &'static TestServer {
     let config_service = ConfigService::new(temp_root(), default_config_builder())
         .expect("config service should start");
     config_service
@@ -297,24 +315,22 @@ async fn setup_runtime_configured_server() -> &'static TestServer {
                 ("files".to_owned(), mcp_server("files").into()),
                 ("git".to_owned(), mcp_server("git").into()),
             ]),
-            runtime_defaults: Some(
-                RuntimeDefaultsView {
+            inference_defaults: Some(
+                InferenceDefaultsView {
                     provider_key: "openai".to_owned(),
                     model_id: "gpt4o".to_owned(),
                     reasoning_effort: None,
-                    mcp_default_enabled: false,
-                    enabled_mcp_server_keys: vec!["git".to_owned()],
                 }
                 .into(),
             ),
         })
         .await
-        .expect("runtime config seed should save");
+        .expect("inference settings seed should save");
 
     setup_server_with_services(config_service)
 }
 
-fn assert_runtime_provider(
+fn assert_inference_provider(
     snapshot: &waltr_client::ClientSnapshot,
     session_id: &str,
     provider_key: &str,
@@ -326,11 +342,11 @@ fn assert_runtime_provider(
         .current
         .iter()
         .find(|session| session.id == session_id)
-        .and_then(|session| session.runtime_config.as_ref())
-        .and_then(|runtime| runtime.provider.as_ref())
+        .and_then(|session| session.inference_settings.as_ref())
+        .and_then(|settings| settings.provider.as_ref())
         .unwrap_or_else(|| {
             panic!(
-                "updated session should expose provider runtime; sessions={:?}; operations={:?}",
+                "updated session should expose inference provider; sessions={:?}; operations={:?}",
                 snapshot.sessions.current, snapshot.operations.current
             )
         });
