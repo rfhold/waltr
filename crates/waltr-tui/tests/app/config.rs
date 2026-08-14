@@ -114,7 +114,11 @@ fn config_reset_is_discoverable_from_every_loaded_tab() {
     let mut app = open_config_app();
     let now = Instant::now();
 
-    for expected_tab in [ConfigTab::Providers, ConfigTab::Mcp, ConfigTab::Defaults] {
+    for expected_tab in [
+        ConfigTab::Providers,
+        ConfigTab::Mcp,
+        ConfigTab::InferenceDefaults,
+    ] {
         assert_eq!(app.active_config_tab(), expected_tab);
         assert!(render_app(&app).contains("R Reset configuration"));
         drop(app.handle_event(&tab_press(), now));
@@ -288,14 +292,14 @@ fn config_tab_switch_cycles_between_providers_mcp_and_defaults() {
     assert_eq!(app.active_config_tab(), ConfigTab::Providers);
     assert!(app.provider_section().config_form().is_none());
 
-    // Tab cycles Providers -> MCP -> Defaults -> Providers.
+    // Tab cycles Providers -> MCP -> Inference Defaults -> Providers.
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.active_config_tab(), ConfigTab::Mcp);
     assert!(render_app(&app).contains("No MCP servers configured."));
 
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
-    assert_eq!(app.active_config_tab(), ConfigTab::Defaults);
-    assert!(render_app(&app).contains("Space MCP"));
+    assert_eq!(app.active_config_tab(), ConfigTab::InferenceDefaults);
+    assert!(render_app(&app).contains("r reason"));
 
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.active_config_tab(), ConfigTab::Providers);
@@ -314,7 +318,7 @@ fn config_defaults_renders_model_selector_and_saves_selected_model() {
 
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
-    assert_eq!(app.active_config_tab(), ConfigTab::Defaults);
+    assert_eq!(app.active_config_tab(), ConfigTab::InferenceDefaults);
 
     let rendered = render_app(&app);
     assert!(rendered.contains("Default model"));
@@ -331,45 +335,14 @@ fn config_defaults_renders_model_selector_and_saves_selected_model() {
     assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
     assert!(!render_app(&app).contains("Select default model"));
 
-    let AppAction::ClientCommand(ClientCommand::SetRuntimeDefaults {
+    let AppAction::ClientCommand(ClientCommand::SetInferenceDefaults {
         defaults: Some(defaults),
     }) = app.handle_event(&enter_press(), now)
     else {
-        panic!("expected SetRuntimeDefaults command");
+        panic!("expected SetInferenceDefaults command");
     };
     assert_eq!(defaults.provider_key, "anthropic");
     assert_eq!(defaults.model_id, "sonnet");
-}
-
-#[test]
-fn config_defaults_opens_mcp_selector_modal_and_stages_toggle() {
-    let mut app = open_config_app_with_mcp();
-    let now = Instant::now();
-
-    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
-    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
-    assert_eq!(app.active_config_tab(), ConfigTab::Defaults);
-
-    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
-    let rendered = render_app(&app);
-    assert!(rendered.contains("Select default MCP"));
-    assert!(rendered.contains("MCP Servers"));
-    assert!(rendered.contains("> [ ] files"));
-
-    assert_eq!(app.handle_event(&char_press(' '), now), AppAction::Continue);
-    assert!(render_app(&app).contains("> [x] files"));
-
-    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
-    assert!(!render_app(&app).contains("Select default MCP"));
-
-    let AppAction::ClientCommand(ClientCommand::SetRuntimeDefaults {
-        defaults: Some(defaults),
-    }) = app.handle_event(&enter_press(), now)
-    else {
-        panic!("expected SetRuntimeDefaults command");
-    };
-    assert!(!defaults.mcp_default_enabled);
-    assert_eq!(defaults.enabled_mcp_server_keys, vec!["files"]);
 }
 
 #[test]
@@ -1578,7 +1551,7 @@ fn config_reset_confirmation_clears_when_its_target_is_removed() {
     drop(app.handle_event(&AppEvent::Client(Box::new(snapshot)), now));
     assert!(!render_app(&app).contains("Reset credential?"));
     drop(app.handle_event(&tab_press(), now));
-    assert_eq!(app.active_config_tab(), ConfigTab::Defaults);
+    assert_eq!(app.active_config_tab(), ConfigTab::InferenceDefaults);
 }
 
 #[test]

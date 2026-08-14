@@ -182,13 +182,13 @@ pub async fn dispatch_app_command(
         .await;
     }
 
-    if let Some(key) = snapshot.sessions.runtime_config_update.key.clone()
-        && snapshot.sessions.runtime_config_update.status == "loading"
+    if let Some(key) = snapshot.sessions.inference_settings_update.key.clone()
+        && snapshot.sessions.inference_settings_update.status == "loading"
     {
         return next_snapshot_until(stream, app, |snapshot| {
             matches!(
                 snapshot.operations.current.get(&key),
-                Some(ClientOperationView::SessionRuntimeConfigUpdate {
+                Some(ClientOperationView::SessionInferenceSettingsUpdate {
                     status: "ready" | "failed",
                     ..
                 })

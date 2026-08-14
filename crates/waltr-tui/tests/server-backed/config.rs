@@ -12,8 +12,8 @@ mod providers;
 #[path = "config/mcp.rs"]
 mod mcp;
 
-#[path = "config/defaults.rs"]
-mod defaults;
+#[path = "config/inference_defaults.rs"]
+mod inference_defaults;
 
 #[path = "config/reset.rs"]
 mod reset;

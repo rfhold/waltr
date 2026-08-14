@@ -576,8 +576,8 @@ fn explicit_logout_clears_protected_forms_and_composer_draft() {
     );
     assert_eq!(app.mcp_section(), &waltr_tui::screens::McpSection::new());
     assert_eq!(
-        app.runtime_defaults_section(),
-        &waltr_tui::screens::RuntimeDefaultsSection::new()
+        app.inference_defaults_section(),
+        &waltr_tui::screens::InferenceDefaultsSection::new()
     );
     assert_eq!(app.sessions_section(), &SessionsSection::new());
     assert!(app.auth_input().is_empty());
@@ -623,7 +623,7 @@ fn explicit_logout_rejects_buffered_authenticated_snapshot_until_reducer_barrier
 }
 
 #[test]
-fn explicit_logout_clears_mcp_defaults_auth_and_notices() {
+fn explicit_logout_clears_mcp_inference_defaults_auth_and_notices() {
     let now = Instant::now();
 
     let mut mcp_app = open_config_app_with_mcp();
@@ -639,15 +639,15 @@ fn explicit_logout_clears_mcp_defaults_auth_and_notices() {
     let mut defaults_app = open_config_app_with_mcp();
     assert_eq!(defaults_app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(defaults_app.handle_event(&tab_press(), now), AppAction::Continue);
-    assert_eq!(defaults_app.handle_event(&char_press(' '), now), AppAction::Continue);
-    assert!(defaults_app.runtime_defaults_section().has_overlay());
+    assert_eq!(defaults_app.handle_event(&char_press('m'), now), AppAction::Continue);
+    assert!(defaults_app.inference_defaults_section().has_overlay());
     drop(defaults_app.handle_event(
         &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::LoggedOut),
         now,
     ));
     assert_eq!(
-        defaults_app.runtime_defaults_section(),
-        &waltr_tui::screens::RuntimeDefaultsSection::new()
+        defaults_app.inference_defaults_section(),
+        &waltr_tui::screens::InferenceDefaultsSection::new()
     );
 
     let mut notice_app = App::new();

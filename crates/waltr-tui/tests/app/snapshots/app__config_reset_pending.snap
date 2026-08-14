@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/app/config.rs
+assertion_line: 165
 expression: render_app(&app)
 ---
 "                                                                                "
@@ -7,11 +8,11 @@ expression: render_app(&app)
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
 "        > an    Reset configuration                                             "
 "        http                                                                    "
-"               Providers, MCP servers, and runtime defaults will                "
+"               Providers, MCP servers, and inference defaults will              "
 "               return                                                           "
 "               to server defaults. Credentials remain untouched.                "
 "                                                                                "

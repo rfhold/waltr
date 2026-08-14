@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/server-backed/config/mcp.rs
+assertion_line: 76
 expression: render_app(&app)
 ---
 "                                                                                "
@@ -7,7 +8,7 @@ expression: render_app(&app)
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
 "        > waltr  sse  http://127.0.0.1:14333/mcp                                 "
 "            status: not connected                                               "

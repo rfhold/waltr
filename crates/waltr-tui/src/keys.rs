@@ -24,10 +24,10 @@ pub enum LeaderCommand {
     Sessions,
     /// Open the destructive session-data screen.
     SessionData,
-    /// Open provider/model selection for the active session.
-    Provider,
-    /// Open MCP selection for the active session.
-    Mcp,
+    /// Open inference settings for the active session.
+    Inference,
+    /// Switch the agent for the active session.
+    Agent,
     /// Quit the app immediately.
     Quit,
     /// Clear in-memory Waltr credentials.
@@ -73,11 +73,11 @@ fn leader_command(key: KeyEvent) -> LeaderCommand {
     }
 
     if matches!(key.code, KeyCode::Char('p')) {
-        return LeaderCommand::Provider;
+        return LeaderCommand::Inference;
     }
 
-    if matches!(key.code, KeyCode::Char('m')) {
-        return LeaderCommand::Mcp;
+    if matches!(key.code, KeyCode::Char('a')) {
+        return LeaderCommand::Agent;
     }
 
     if matches!(key.code, KeyCode::Char('q')) {

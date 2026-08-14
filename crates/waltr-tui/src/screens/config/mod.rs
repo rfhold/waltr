@@ -6,12 +6,12 @@
 //! provider list, selection, form, and delete interactions.
 
 mod auth;
-mod defaults;
+mod inference_defaults;
 mod mcp;
 mod providers;
 
 pub use auth::{ConfigAuthState, targets_match};
-pub use defaults::RuntimeDefaultsSection;
+pub use inference_defaults::InferenceDefaultsSection;
 pub use mcp::{McpForm, McpFormMode, McpSection};
 pub use providers::{ModelForm, ModelFormMode, ProviderForm, ProviderFormMode, ProviderSection};
 
@@ -33,7 +33,7 @@ use crate::{
 
 /// Config-shell state for resetting every configuration section.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ConfigResetState {
+pub struct ConfigResetState {
     open: bool,
     operation: OperationTracker,
 }
@@ -97,7 +97,6 @@ impl ConfigResetState {
                     return None;
                 };
                 Some(match *status {
-                    "loading" => OperationResult::Pending,
                     "ready" => OperationResult::Ready(()),
                     "failed" => OperationResult::Failed(
                         error
@@ -127,13 +126,13 @@ pub enum ConfigTab {
     Providers,
     /// MCP server configuration section.
     Mcp,
-    /// Runtime defaults configuration section.
-    Defaults,
+    /// Inference defaults configuration section.
+    InferenceDefaults,
 }
 
 impl ConfigTab {
     /// The ordered set of tabs presented in the strip.
-    pub const ALL: [Self; 3] = [Self::Providers, Self::Mcp, Self::Defaults];
+    pub const ALL: [Self; 3] = [Self::Providers, Self::Mcp, Self::InferenceDefaults];
 
     /// The tab's display label.
     #[must_use]
@@ -141,7 +140,7 @@ impl ConfigTab {
         match self {
             Self::Providers => "Providers",
             Self::Mcp => "MCP Servers",
-            Self::Defaults => "Defaults",
+            Self::InferenceDefaults => "Inference",
         }
     }
 
@@ -150,8 +149,8 @@ impl ConfigTab {
     pub const fn next(self) -> Self {
         match self {
             Self::Providers => Self::Mcp,
-            Self::Mcp => Self::Defaults,
-            Self::Defaults => Self::Providers,
+            Self::Mcp => Self::InferenceDefaults,
+            Self::InferenceDefaults => Self::Providers,
         }
     }
 }
@@ -228,8 +227,8 @@ pub fn draw_config(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             section.render_overlay(frame, modal_area);
         }
-        ConfigTab::Defaults => {
-            let section = app.runtime_defaults_section();
+        ConfigTab::InferenceDefaults => {
+            let section = app.inference_defaults_section();
             if !pending {
                 section.render_content(frame, content_area, config, loaded);
             }
@@ -245,8 +244,8 @@ const fn config_footer_hint(active_tab: ConfigTab) -> &'static str {
         ConfigTab::Providers | ConfigTab::Mcp => {
             "Esc back Tab switch C-x c create Enter edit Del delete a/f/r"
         }
-        ConfigTab::Defaults => {
-            "Esc back  Tab switch  m model  Space MCP  r reason  Enter save  Del clear"
+        ConfigTab::InferenceDefaults => {
+            "Esc back  Tab switch  m model  r reason  Enter save  Del clear"
         }
     }
 }
@@ -345,7 +344,7 @@ fn render_reset_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let body = render_modal_frame(frame, reset_area, "Reset configuration", footer);
     let mut lines = vec![
-        Line::from("Providers, MCP servers, and runtime defaults will return"),
+        Line::from("Providers, MCP servers, and inference defaults will return"),
         Line::from("to server defaults. Credentials remain untouched."),
         Line::from(""),
     ];

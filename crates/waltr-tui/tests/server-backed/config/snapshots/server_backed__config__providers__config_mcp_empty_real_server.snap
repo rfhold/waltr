@@ -1,5 +1,6 @@
 ---
 source: crates/waltr-tui/tests/server-backed/config/providers.rs
+assertion_line: 47
 expression: switched
 ---
 "                                                                                "
@@ -7,7 +8,7 @@ expression: switched
 "                                                                                "
 "         Configuration                                                          "
 "                                                                                "
-"          Providers   MCP Servers   Defaults  R Reset configuration             "
+"          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
 "        > waltr  sse  http://127.0.0.1:14333/mcp                                 "
 "            status: not connected                                               "
