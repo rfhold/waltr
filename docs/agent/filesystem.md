@@ -15,14 +15,14 @@ Filesystem tools give an agent controlled access to workspace files. They are im
 
 ## Tool Profiles
 
-The filesystem tool set can expose different write/edit surfaces depending on the configured profile.
+Every profile includes the shared `read`, `glob`, and `grep` discovery tools. Mutation surfaces are mutually exclusive by profile: structured patch models do not also receive standalone edit, write, or delete tools.
 
-| Profile | Behavior |
+| Profile | Mutation tools |
 | --- | --- |
-| `ExactEdit` | Exposes exact string replacement tools. |
-| `WholeFileWrite` | Exposes whole-file writes. |
-| `StructuredPatch` | Exposes the simplified `apply_patch` patch envelope. |
-| `Auto` | Selects a profile from the model/provider shape. |
+| `ExactEdit` | `edit`, `write`, and `delete` |
+| `WholeFileWrite` | `write` and `delete` |
+| `StructuredPatch` | `apply_patch` only |
+| `Auto` | Selects one of the concrete mutation surfaces from the model/provider shape. |
 
 `Auto` currently favors structured patches for newer OpenAI `gpt-*` models except older `gpt-4*` and `oss` model names. Other models default toward exact edits.
 

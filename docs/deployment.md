@@ -63,6 +63,50 @@ The Pulumi workload definition uses S3 session storage. It intentionally specifi
 
 The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not modify either Waltr or MCP SQL data, authentication sessions, OAuth credentials, or configuration. The operation is a blind delete without active-run or cross-replica coordination; stop session activity before invoking it or concurrent work may recreate records.
 
+## Agent Definitions
+
+The server always loads the definitions bundled at compile time in `crates/waltr-server/agent-definitions.yaml`. Two environment variables control startup additions and selection:
+
+| Variable | Contract |
+| --- | --- |
+| `WALTR_AGENT_DEFINITION_PATHS` | Optional platform-native path list, such as colon-separated paths on Unix or semicolon-separated paths on Windows. Each entry must be a regular file or directory. A directory contributes its direct regular files with `.yaml` or `.yml` extensions in lexical path order; nested directories and other extensions are ignored. |
+| `WALTR_DEFAULT_AGENT` | Default catalog agent after all sources load. It defaults to `coding`; an explicitly empty, whitespace-only, or non-Unicode value fails startup. |
+
+Sources load in this order: the bundled source, then path-list entries in their declared order, with each directory's files in lexical order. A source may contain multiple YAML documents. Duplicate `(kind, metadata.name)` resources within one source fail atomically, while a resource in a later separately loaded source replaces an earlier resource of the same kind and name. External definitions can therefore override bundled `Agent`, `FeatureSet`, or `PermissionSet` resources without replacing the whole bundle.
+
+Definition files are read only during startup. Missing or unsupported paths, unreadable files or directories, invalid YAML or schema, duplicate resources within one source, unresolved references or inheritance cycles in any final agent, failure to resolve `WALTR_DEFAULT_AGENT`, and an unsupported feature on the default prevent startup. Nondefault agents with features omitted from the server build are not selectable. All compiled-valid agents are retained in deterministic name order; the default is one catalog entry. There is no file watcher or configuration RPC for definitions; restart the server to apply source changes.
+
+`ListAgents` publishes names, descriptions, and the default. New clients require a selected catalog name when creating a session; omission in the older RPC request shape uses the default. Each top-level session stores an `AgentDefinitionBundle` with that name and the exact ordered YAML source texts. Task children inherit the cycle-captured bundle and inference settings. Session summaries project the effective agent name.
+
+`UpdateSessionAgent` persists any exact catalog name for the next capture boundary. Active work finishes on its captured definition. Queued and resumed cycles and later template searches use the new one, preserving history and policy-constrained approvals. The next cycle materializes the new base prompt; MCP replacement waits until reconstruction and fingerprint comparison. Multiple pre-boundary switches coalesce into one old-to-final `session_info` audit event.
+
+When Waltr reconstructs a session with a bundle, that bundle supplies the prompt, features, permissions, and MCP definition behavior. A malformed present bundle fails reconstruction.
+
+Durable middleware state preserves first-execution behavior for one definition identity. The stored prompt takes precedence until an agent switch changes that identity. Captured `AGENTS.md` content and the stored skill catalog remain stable. Skill content becomes durable when the session loads that skill, not when the catalog first appears.
+
+Legacy records without a bundle use the configured default and remain unchanged on disk. A restart can change their definition-derived behavior. Definition files still load only at startup; reconstruction reads stored source texts from the session record rather than from the original files.
+
+Agent-definition syntax is also a hard cut. `spec.features` and `spec.permissions` are ordered inline/reference lists. The old `featureSetRefs` and `permissionSetRefs` fields are rejected with no alias or migration. Replace them in every external definition and clear or rewrite stored bundles that contain them before upgrade. Routine/routine tools, deferred tools, harness tools, and definition watching/editing remain unsupported.
+
+## Inference Cutover
+
+This release uses a hard session-data and workspace-config cutover. Durable session JSON uses `inference_settings`, whose only member is the provider settings snapshot. The snapshot contains provider key, API, URL, model ID and cost, headers, OAuth refresh settings, and reasoning effort. The old `runtime_settings` field has no alias or backfill.
+
+Workspace TOML uses only `[inference_defaults]` for `provider_key`, `model_key`, and optional `reasoning_effort`. `[runtime_defaults]` is unsupported. MCP defaults do not exist because the current agent definition owns MCP selection.
+
+Before the new binary starts:
+
+1. Stop session activity and every process that can write the configured session store.
+2. Clear old durable session records, or rewrite them to the exact `inference_settings` schema.
+3. Replace `[runtime_defaults]` with `[inference_defaults]` in the workspace configuration.
+4. Remove old MCP-default fields from that table.
+5. Validate the selected agent definitions and current MCP server keys.
+6. Start the new binary only after the store and configuration updates finish.
+
+Waltr performs no session-store migration, alias, or backfill for this cutover. Keep a rollback backup until the new process and session flows pass operator checks. This procedure describes preparation only; it does not deploy a server.
+
+See [Agent Architecture](architecture/agent.md#agent-definitions) and [Agent Definition Examples](examples/agents/README.md) for the implemented schema and examples.
+
 ## OIDC Access Domains
 
 Production OIDC deployment requires:
@@ -173,7 +217,7 @@ Pipelines as Code definitions under `.tekton/` are configured to build the Docke
 
 ## Startup And Operation
 
-The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets, completes both standard migrators, validates access-auth and hosted-OAuth configuration, performs upstream OIDC discovery and initial JWKS loading, loads the wrapping ring, decrypts or creates the local active signer, and initializes agent session storage before returning `ServerApplication`. That server-owned lifecycle contains the router, five-minute bounded cleanup, and daily signing rotation/rewrap; graceful shutdown cancels and joins that work. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds. `/health` is process liveness. `/ready` fails closed when either database is unavailable, the hosted OAuth store or active signer is unusable, signer PKCS#8 and public JWK disagree, maintenance is unhealthy, or revocation termination exceeds its bounded durable-check policy. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
+The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets, completes both standard migrators, validates access-auth and hosted-OAuth configuration, performs upstream OIDC discovery and initial JWKS loading, loads the wrapping ring, decrypts or creates the local active signer, loads and resolves the startup agent definition, and initializes agent session storage before returning `ServerApplication`. That server-owned lifecycle contains the router, five-minute bounded cleanup, and daily signing rotation/rewrap; graceful shutdown cancels and joins that work. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds. `/health` is process liveness. `/ready` fails closed when either database is unavailable, the hosted OAuth store or active signer is unusable, signer PKCS#8 and public JWK disagree, maintenance is unhealthy, or revocation termination exceeds its bounded durable-check policy. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
 
 When `.waltr/waltr.toml` is absent, startup also loads the models.dev catalog to construct the initial provider inventory. Explicit configuration reset repeats that catalog load. The loader uses `WALTR_MODELS_DEV_PATH` or `WALTR_MODELS_DEV_URL` when configured, otherwise `https://models.dev/api.json`, and may fall back to its disk cache. If neither the source nor cache is available, missing-file startup fails and reset preserves the current configuration. Existing configuration files do not require a catalog load during startup.
 

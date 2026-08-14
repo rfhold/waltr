@@ -13,11 +13,57 @@ MCP servers are owned by the durable session coordinator so they can remain init
 | `McpClientRuntime` | Session-scoped runtime that starts configured servers and adapts their registries. |
 | `McpServerRuntime` | Per-server runtime that owns the typed generic `McpClient`, registries, progress routing, and refresh behavior. |
 | `McpInstructionsMiddleware` | Middleware that adds initialized MCP server instructions to the system prompt. |
-| `SessionRuntimeSettings::mcp_servers` | Per-session MCP server snapshots used by `SessionCoordinator`. |
-| `SessionRuntimeSettings::mcp_trace_propagation` | Session setting that enables MCP request trace context propagation. |
-| `SessionCoordinator` | Starts and caches a session-scoped MCP runtime when resolving a session runtime. |
+| `McpFeatureConfig::servers` | Definition-owned include or exclude selector for current configured servers. |
+| `McpFeatureConfig::trace_propagation` | Definition-owned Waltr switch for MCP request trace context propagation. |
+| `SessionCoordinator` | Resolves current MCP configuration and caches a session-scoped MCP runtime. |
 
 The agent integration depends on the generic `mcp` crate. The generic crate must not depend back on `waltr-agent`.
+
+## Definition Selection
+
+`FeatureSet.spec.mcp.servers` is omitted or contains exactly one of `include` and `exclude`:
+
+```yaml
+mcp:
+  servers:
+    include: [filesystem, issue-tracker]
+```
+
+```yaml
+mcp:
+  servers:
+    exclude: [production-admin]
+```
+
+Selection uses these exact rules:
+
+| Definition value | Selected current servers |
+| --- | --- |
+| `servers` omitted | All configured servers. |
+| `exclude: []` | All configured servers. |
+| `include: []` | No servers. |
+| `include: [a, b]` | Only current keys `a` and `b`. |
+| `exclude: [a, b]` | All current keys except `a` and `b`. |
+
+Include names match current configuration keys exactly. If any include is absent, reconstruction fails and names every missing key in deterministic order. Missing exclude names have no effect. Blank or whitespace-only names, duplicate names, both selectors, an empty selector mapping, `null`, and unknown fields fail strict definition parsing.
+
+The bundled `coding` feature uses `servers: { exclude: [] }`. This explicit selector selects every server in the current configuration.
+
+MCP server selection is part of the selected agent definition stored with the session, not an independent MCP setting. Session RPCs and clients can create or switch the session's agent definition, but expose no separate MCP selector, endpoint snapshot, drift status, or trace switch.
+
+## Current Configuration Authority
+
+Every normal run and template search reconstruction uses the cycle's selected agent definition and resolves its MCP feature against the current server `ConfigHandle`. The current stdio command or remote URL is authoritative. Provider configuration changes do not affect MCP resolution.
+
+A new reconstruction, including one after an agent switch, sees selected server additions, removals, command changes, URL changes, transport changes, and definition trace changes. An active captured runtime continues with its old MCP runtime. Unselected server changes have no effect. An absent required include fails that reconstruction instead of exposing a stale cached runtime.
+
+Template search uses the same current resolution. It treats MCP preparation failures as best effort and continues without MCP templates. It never returns templates from a stale mismatched runtime.
+
+## Cache Lifecycle
+
+The coordinator caches one MCP runtime per durable session. Its structural fingerprint contains the sorted selected keys, transport kinds, stdio commands, remote URLs, and trace-propagation value. Provider settings, credentials, and unselected MCP entries do not belong to this fingerprint.
+
+An equal fingerprint reuses the cached runtime after credential preflight. Provider-only and unselected-server changes therefore reuse it. A changed fingerprint starts the replacement before the cache swap. Startup failure keeps the old cached runtime for a later attempt, but the failed reconstruction receives the error and cannot use the stale runtime. After a successful swap, current `Arc` users finish with the old runtime. Waltr shuts it down after those users release it.
 
 ## Tool Discovery
 
@@ -118,12 +164,9 @@ MCP resources are not exposed as provider tools.
 
 If an MCP server returns `instructions` from `server/discover`, Waltr stores them with that session's MCP server runtime and adds them to the provider system prompt through MCP middleware.
 
-Instructions are enabled by default on `AgentSessionRuntimeFactory`. Embedders can opt out with:
-
-```rust
-AgentSessionRuntimeFactory::new(root, credentials)
-    .with_mcp_server_instructions_enabled(false);
-```
+Agent definitions control instruction exposure through
+`FeatureSet.spec.mcp.instructions`. The runtime factory requires a resolved agent
+definition and does not provide a second MCP-instructions override.
 
 Prompt fragments are emitted in server-key order and include the source server key:
 
@@ -151,7 +194,7 @@ The internal MCP event stream is not yet exposed as a public client or UI contra
 
 ## Trace Propagation and Spans
 
-Agent MCP trace propagation is disabled by default at the agent config boundary. When `SessionRuntimeSettings::mcp_trace_propagation` is true, runtime construction maps it to `McpTracePropagation::TraceContext` before connecting to servers. Server-resolved session runtime configs enable this setting for managed sessions.
+`FeatureSet.spec.mcp.tracePropagation` is the only Waltr switch. Omission defaults to `true`; explicit `false` disables propagation. When enabled, runtime construction maps it to `McpTracePropagation::TraceContext` before connection startup. The generic `mcp` crate default remains `McpTracePropagation::Disabled`.
 
 Trace context is propagated through MCP request `_meta.traceparent` and `_meta.tracestate`, not only through HTTP headers. See [../mcp/tracing.md](../mcp/tracing.md) for generic client/server span and propagation details.
 
@@ -186,14 +229,14 @@ Agent transports use a bearer provider rather than copying one token into transp
 
 ## Boundaries
 
-- MCP support is opt-in through session runtime settings.
+- MCP support is opt-in through the current resolved agent definition.
 - Generic MCP protocol implementation belongs in `crates/mcp`; Waltr conversion into tools, templates, permissions, and session runtime belongs in `crates/waltr-agent/src/mcp/`.
 - MCP server instructions are injected into the provider system prompt by default for factory-built session runtimes; this is a factory policy, not generic MCP protocol behavior.
 - Resource URI subscriptions, sampling, elicitation, non-roots MRTR input, and task runtime extensions are not implemented. List-change subscriptions are implemented through `subscriptions/listen`.
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - Session RPC and UI timeline results expose the safe text projection rather than inline image data; direct model delivery and durable agent replay retain validated image blocks.
-- The shared server config names the HTTP MCP server type `SSE`; session runtime settings map that to the agent's Streamable HTTP transport.
+- The shared server config names the HTTP MCP server type `SSE`; current host resolution maps that to the agent's Streamable HTTP transport.
 - Streamable HTTP sends one POST per message and uses request-scoped JSON or SSE responses. Protocol sessions, GET delivery, resumability, and DELETE termination are absent.
 - Confidential downstream clients and registration-management credentials are not supported; outbound registration is public-client only.
 

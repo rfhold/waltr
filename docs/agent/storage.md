@@ -40,6 +40,10 @@ Agent storage persists durable sessions for `crates/waltr-agent/`. A session is 
 
 The agent loop depends on this trait rather than a concrete backend.
 
+Metadata mutations, including inference settings and selected agent bundles, must not overwrite concurrent journal or timeline appends. Memory, filesystem, and OpenDAL backends without usable ETags provide this guarantee only among stores in the same process through shared per-session ownership locks. Independently constructed OpenDAL operators that alias the same endpoint but do not expose the same operator identity must use the same explicit mutation namespace. This is not distributed atomicity. OpenDAL uses conditional ETag writes when its service supplies an ETag. The dedicated S3 backend uses object ETag compare-and-swap across writers, and Scylla uses lightweight transactions over revision and record content.
+
+The coordinator also serializes inference and agent mutations with runtime record capture. A successful agent switch is therefore immediately authoritative for cycles captured after that mutation boundary, while an already captured runtime remains unchanged.
+
 A store wipe is idempotent and retry-safe. A successful result means no session records remain. Backends without multi-object transactions may delete some records before returning an error, and callers may safely retry. The operation deliberately does not inspect or coordinate running work; operators must ensure session activity is stopped before wiping or concurrent work may recreate records.
 
 ## Backends
@@ -109,7 +113,7 @@ Focused coverage:
 | Path | Purpose |
 | --- | --- |
 | [../../crates/waltr-agent/src/agent/session/mod.rs](../../crates/waltr-agent/src/agent/session/mod.rs) | Public durable session module boundary. |
-| [../../crates/waltr-agent/src/agent/session/factory.rs](../../crates/waltr-agent/src/agent/session/factory.rs) | `AgentSessions` factory. |
+| [../../crates/waltr-agent/src/agent/session/runtime_factory.rs](../../crates/waltr-agent/src/agent/session/runtime_factory.rs) | Session runtime factory. |
 | [../../crates/waltr-agent/src/agent/session/runtime.rs](../../crates/waltr-agent/src/agent/session/runtime.rs) | Durable runtime and resume handling. |
 | [../../crates/waltr-agent/src/agent/session/types.rs](../../crates/waltr-agent/src/agent/session/types.rs) | Session journal, snapshots, records, and external requests. |
 | [../../crates/waltr-agent/src/timeline.rs](../../crates/waltr-agent/src/timeline.rs) | Public timeline event, cursor, channel, content, and status types. |
