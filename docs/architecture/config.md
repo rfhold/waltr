@@ -44,7 +44,7 @@ The config RPC model is `waltr.config.v1.Configuration`:
 | --- | --- |
 | `providers` | Configured model providers keyed by provider name. |
 | `mcp_servers` | Configured MCP servers keyed by server name. |
-| `runtime_defaults` | Optional default provider, model, MCP servers, and provider parameters resolved for new agent sessions. |
+| `inference_defaults` | Optional provider, model, and reasoning effort defaults for new agent sessions. |
 | `etag` | Server-generated version hash used for optimistic concurrency. |
 
 The filesystem store persists `.waltr/waltr.toml`. ETags are not persisted as authoritative data. On load or save, the store clears `etag`, serializes the config, hashes the serialized content with SHA-256, and returns an `etag` prefixed with `sha256:`.
@@ -61,7 +61,7 @@ The default inventory uses these selection rules:
 - `openai` and `codex` contain every non-deprecated catalog model whose ID represents GPT major version 5 and minor version 3 or later.
 - Catalog metadata supplies model names, limits, costs, capabilities, reasoning metadata, and catalog matches.
 - `mcp_servers.waltr` is an ordinary Streamable HTTP server entry for Waltr's own `/mcp` endpoint.
-- `runtime_defaults` is absent.
+- `inference_defaults` is absent.
 
 Default construction is strict. If the catalog cannot load or a required canonical Claude model is absent, first-time initialization fails rather than persisting a partial default. See [Deployment](../deployment.md) for catalog and self-MCP URL requirements.
 
@@ -75,10 +75,12 @@ Default construction is strict. If the catalog cannot load or a required canonic
 | `providers` present | Replace the entire providers map. |
 | `mcp_servers` absent | Leave existing MCP servers unchanged. |
 | `mcp_servers` present | Replace the entire MCP servers map. |
-| `runtime_defaults` absent | Leave existing runtime defaults unchanged. |
-| `runtime_defaults` present | Replace the complete runtime-defaults message. |
+| `inference_defaults` absent | Leave current inference defaults unchanged. |
+| `inference_defaults` present | Replace the complete inference-defaults message. |
 
-Patches are partial at the top-level section boundary only. They do not patch individual providers, provider fields, individual MCP servers, runtime-default fields, or nested model data in place. Shared client helpers build full replacement sections from the latest loaded config for operations like add, update, delete, rename, and setting runtime defaults.
+Patches are partial at the top-level section boundary only. They do not patch individual providers, provider fields, individual MCP servers, inference-default fields, or nested model data in place. Shared client helpers build full replacement sections from the latest loaded config for operations like add, update, delete, rename, and setting inference defaults.
+
+The workspace TOML table is `[inference_defaults]`. It accepts only `provider_key`, `model_key`, and optional `reasoning_effort`. MCP selection does not belong in workspace defaults. `[runtime_defaults]` is unsupported and fails configuration loading. Waltr provides no alias, migration, or fallback for that table.
 
 The server validates the resulting full config before saving. Invalid provider names, provider key/name mismatches, unspecified model types, invalid MCP server types, and missing required MCP command or URL values are rejected.
 
@@ -86,7 +88,7 @@ The server validates the resulting full config before saving. Invalid provider n
 
 `PatchConfigRequest.expected_etag` must match the current server config `etag`.
 
-`ResetConfigRequest.expected_etag` has the same optimistic-concurrency requirement. A reset builds the complete current server default before taking the configuration write lock, then compares the ETag and atomically replaces providers, MCP servers, and runtime defaults. Catalog or validation failure leaves the existing file unchanged. A successful reset returns the complete saved configuration and is published through the normal filesystem watch path.
+`ResetConfigRequest.expected_etag` has the same optimistic-concurrency requirement. A reset builds the complete current server default before taking the configuration write lock, then compares the ETag and atomically replaces providers, MCP servers, and inference defaults. Catalog or validation failure leaves the existing file unchanged. A successful reset returns the complete saved configuration and is published through the normal filesystem watch path.
 
 Reset changes configuration only. Provider API keys, provider OAuth credentials, and outbound MCP OAuth credentials remain in their target-scoped credential stores.
 
@@ -142,7 +144,7 @@ Watch change responses include:
 | --- | --- |
 | `previous_etag` | ETag observed before the change. Empty on initial snapshots. |
 | `etag` | ETag after the change. |
-| `changed_keys` | Top-level sections that changed: `providers`, `mcp_servers`, and/or `runtime_defaults`. |
+| `changed_keys` | Top-level sections that changed: `providers`, `mcp_servers`, and/or `inference_defaults`. |
 | `config` | Full initial snapshot, or a sparse config containing only changed sections plus the new ETag for later changes. |
 | `error` | Server-reported watch/load error when a change could not be loaded. |
 

@@ -16,7 +16,7 @@ The generic crate owns:
 - trace-context propagation
 - revision-scoped conformance and ecosystem tests
 
-Waltr-specific tool adaptation, runtime settings, identity policy, and UI behavior stay in
+Waltr-specific tool adaptation, inference settings, identity policy, and UI behavior stay in
 their owning Waltr crates.
 
 ## Per-Request Protocol

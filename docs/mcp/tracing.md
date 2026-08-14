@@ -71,6 +71,6 @@ Metrics never include request IDs, tool names or arguments, URLs, credentials, u
 
 ## Waltr Agent Integration
 
-The generic crate does not decide whether Waltr sessions propagate MCP trace context. The agent integration maps `SessionRuntimeSettings::mcp_trace_propagation` to `McpTracePropagation::TraceContext`; server-resolved session runtime configs enable that setting for managed sessions.
+The generic crate does not decide whether Waltr sessions propagate MCP trace context. Its default remains `McpTracePropagation::Disabled`. Waltr owns a separate definition switch at `FeatureSet.spec.mcp.tracePropagation`. Waltr defaults that switch to `true`; explicit `false` preserves the generic disabled mode.
 
 Agent-specific MCP spans are documented in [../agent/otel.md](../agent/otel.md).

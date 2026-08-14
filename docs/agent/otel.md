@@ -74,4 +74,4 @@ The generic MCP crate also emits `mcp.client.request` and `mcp.server.request` s
 
 - The agent crate emits spans but does not own process-level OpenTelemetry exporter configuration.
 - Provider request bodies are not recorded as span fields; durable request projections are persisted through session storage instead.
-- MCP trace propagation is opt-in at the agent config boundary and enabled for server-resolved session runtime configs.
+- Waltr's definition-owned MCP trace switch defaults to enabled. Explicit `tracePropagation: false` disables it. The generic MCP client default remains disabled.
