@@ -392,7 +392,7 @@ function accessSnapshot(
   error: string | null = null,
 ) {
   const snapshot = snapshotWithConfig(
-    { etag: status === "authenticated" ? "v1" : "", providers: {}, mcpServers: {}, runtimeDefaults: null },
+    { etag: status === "authenticated" ? "v1" : "", providers: {}, mcpServers: {}, inferenceDefaults: null },
     { ready: status === "authenticated" },
   );
   snapshot.access = { status, error, activeAttemptId };

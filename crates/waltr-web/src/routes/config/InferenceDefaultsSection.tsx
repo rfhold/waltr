@@ -2,45 +2,42 @@ import { For, Show, createMemo, createSignal } from "solid-js";
 import type { Accessor } from "solid-js";
 
 import { useAppState } from "../../app/context";
-import { ActionList, ActionRow, Field, InlineAlert } from "../../components/ui";
-import type { ClientCommand, ConfigView, RuntimeDefaultsView } from "../../generated/waltr-client";
+import { Field, InlineAlert } from "../../components/ui";
+import type { ClientCommand, ConfigView, InferenceDefaultsView } from "../../generated/waltr-client";
 
-type RuntimeDefaultsForm = {
+type InferenceDefaultsForm = {
   providerKey: string;
   modelId: string;
   reasoningEffort: string;
-  mcpDefaultEnabled: boolean;
-  enabledMcpServerKeys: string[];
 };
 
-export function RuntimeDefaultsSection(props: {
+export function InferenceDefaultsSection(props: {
   watchedConfig: Accessor<ConfigView | undefined>;
 }) {
   const app = useAppState();
   const [operationPending, setOperationPending] = createSignal(false);
   const [operationError, setOperationError] = createSignal<string>();
-  const [draft, setDraft] = createSignal<RuntimeDefaultsForm>();
+  const [draft, setDraft] = createSignal<InferenceDefaultsForm>();
   const config = props.watchedConfig;
-  const form = createMemo(() => draft() ?? defaultsToForm(config()?.runtimeDefaults));
+  const form = createMemo(() => draft() ?? defaultsToForm(config()?.inferenceDefaults));
   const providers = createMemo(() => providerKeys(config()));
   const models = createMemo(() => modelKeys(config(), form().providerKey));
   const reasoningEfforts = createMemo(() => modelReasoningEfforts(config(), form().providerKey, form().modelId));
-  const mcpServers = createMemo(() => mcpKeys(config()));
   const providerMissing = createMemo(() => form().providerKey !== "" && !providers().includes(form().providerKey));
   const modelMissing = createMemo(() => form().modelId !== "" && !models().includes(form().modelId));
   const reasoningMissing = createMemo(() => form().reasoningEffort !== "" && !reasoningEfforts().includes(form().reasoningEffort));
   const saveDisabled = createMemo(() => operationPending() || providerMissing() || modelMissing() || reasoningMissing());
 
-  const update = (patch: Partial<RuntimeDefaultsForm>) => {
+  const update = (patch: Partial<InferenceDefaultsForm>) => {
     setDraft((current) => ({ ...form(), ...current, ...patch }));
   };
 
   return (
-    <section class="config__section" aria-labelledby="runtime-defaults-title">
+    <section class="config__section" aria-labelledby="inference-defaults-title">
       <div class="config__section-header">
         <div>
-          <p class="eyebrow">Runtime Defaults</p>
-          <h2 id="runtime-defaults-title">New session defaults</h2>
+          <p class="eyebrow">Inference Defaults</p>
+          <h2 id="inference-defaults-title">New session inference</h2>
         </div>
       </div>
 
@@ -52,10 +49,10 @@ export function RuntimeDefaultsSection(props: {
         class="config__form"
         onSubmit={(event) => {
           event.preventDefault();
-          void saveDefaults(app.dispatchConfigPatch, form(), setOperationPending, setOperationError, setDraft);
+          void saveDefaults(app.dispatchConfigPatch, formToDefaults(form()), setOperationPending, setOperationError, setDraft);
         }}
       >
-        <Field id="runtime-default-provider" label="Provider">
+        <Field id="inference-default-provider" label="Provider" error={providerMissing() ? "Selected provider is no longer configured." : undefined}>
           {(field) => (
             <select
               id={field.id}
@@ -70,7 +67,7 @@ export function RuntimeDefaultsSection(props: {
           )}
         </Field>
 
-        <Field id="runtime-default-model" label="Model" error={modelMissing() ? "Selected model is no longer configured." : undefined}>
+        <Field id="inference-default-model" label="Model" error={modelMissing() ? "Selected model is no longer configured." : undefined}>
           {(field) => (
             <select
               id={field.id}
@@ -86,7 +83,7 @@ export function RuntimeDefaultsSection(props: {
           )}
         </Field>
 
-        <Field id="runtime-default-reasoning" label="Reasoning effort" error={reasoningMissing() ? "Selected reasoning effort is no longer configured." : undefined}>
+        <Field id="inference-default-reasoning" label="Reasoning effort" error={reasoningMissing() ? "Selected reasoning effort is no longer configured." : undefined}>
           {(field) => (
             <select
               id={field.id}
@@ -102,58 +99,12 @@ export function RuntimeDefaultsSection(props: {
           )}
         </Field>
 
-        <label class="config__form-checkbox runtime-defaults__all-mcp">
-          <input
-            type="checkbox"
-            checked={form().mcpDefaultEnabled}
-            onChange={(event) => update({ mcpDefaultEnabled: event.currentTarget.checked })}
-          />
-          <span>Enable all configured MCP servers by default</span>
-        </label>
-
-        <div class="config__models" aria-labelledby="runtime-defaults-mcp-title">
-          <div class="config__models-header">
-            <div>
-              <p class="eyebrow">MCP Servers</p>
-              <h3 id="runtime-defaults-mcp-title">Explicit MCP defaults</h3>
-            </div>
-          </div>
-          <ActionList class="config__list" label="Explicit MCP defaults">
-            <Show when={mcpServers().length > 0} fallback={<p class="panel">No MCP servers configured yet.</p>}>
-              <For each={mcpServers()}>
-                {(server) => {
-                  const enabled = createMemo(() => form().enabledMcpServerKeys.includes(server));
-                  const active = createMemo(() => form().mcpDefaultEnabled || enabled());
-
-                  return (
-                    <ActionRow class="provider-row provider-row--model" selected={active()}>
-                      <label class="provider-row__summary runtime-defaults__mcp-row">
-                        <input
-                          type="checkbox"
-                          disabled={form().mcpDefaultEnabled}
-                          checked={enabled()}
-                          onChange={(event) => update({
-                            enabledMcpServerKeys: toggleKey(form().enabledMcpServerKeys, server, event.currentTarget.checked),
-                          })}
-                        />
-                        <strong>{server}</strong>
-                        <span>{active() ? "enabled" : "disabled"}</span>
-                        <code>{form().mcpDefaultEnabled ? "All MCP servers" : "Explicit default"}</code>
-                      </label>
-                    </ActionRow>
-                  );
-                }}
-              </For>
-            </Show>
-          </ActionList>
-        </div>
-
         <div class="config__form-actions">
-          <button type="submit" disabled={saveDisabled()}>Save defaults</button>
+          <button type="submit" disabled={saveDisabled()}>{operationPending() ? "Saving..." : "Save defaults"}</button>
           <button
             type="button"
             disabled={operationPending()}
-            onClick={() => void saveDefaults(app.dispatchConfigPatch, emptyDefaults(), setOperationPending, setOperationError, setDraft)}
+            onClick={() => void saveDefaults(app.dispatchConfigPatch, null, setOperationPending, setOperationError, setDraft)}
           >
             Clear defaults
           </button>
@@ -163,39 +114,31 @@ export function RuntimeDefaultsSection(props: {
   );
 }
 
-function defaultsToForm(defaults: RuntimeDefaultsView | null | undefined): RuntimeDefaultsForm {
+function defaultsToForm(defaults: InferenceDefaultsView | null | undefined): InferenceDefaultsForm {
   return defaults
     ? {
         providerKey: defaults.providerKey,
         modelId: defaults.modelId,
         reasoningEffort: defaults.reasoningEffort ?? "",
-        mcpDefaultEnabled: defaults.mcpDefaultEnabled,
-        enabledMcpServerKeys: defaults.enabledMcpServerKeys ?? [],
       }
     : emptyDefaults();
 }
 
-function emptyDefaults(): RuntimeDefaultsForm {
-  return {
-    providerKey: "",
-    modelId: "",
-    reasoningEffort: "",
-    mcpDefaultEnabled: false,
-    enabledMcpServerKeys: [],
-  };
+function emptyDefaults(): InferenceDefaultsForm {
+  return { providerKey: "", modelId: "", reasoningEffort: "" };
 }
 
 async function saveDefaults(
   dispatch: (command: ClientCommand) => Promise<unknown>,
-  form: RuntimeDefaultsForm,
+  defaults: InferenceDefaultsView | null,
   setOperationPending: (pending: boolean) => void,
   setOperationError: (message?: string) => void,
-  setDraft: (form?: RuntimeDefaultsForm) => void,
+  setDraft: (form?: InferenceDefaultsForm) => void,
 ) {
   setOperationPending(true);
   setOperationError(undefined);
   try {
-    await dispatch({ type: "setRuntimeDefaults", defaults: formToDefaults(form) });
+    await dispatch({ type: "setInferenceDefaults", defaults });
     setDraft(undefined);
   } catch (error) {
     setOperationError(errorMessage(error));
@@ -204,13 +147,11 @@ async function saveDefaults(
   }
 }
 
-function formToDefaults(form: RuntimeDefaultsForm): RuntimeDefaultsView {
+function formToDefaults(form: InferenceDefaultsForm): InferenceDefaultsView {
   return {
     providerKey: form.providerKey,
     modelId: form.modelId,
     reasoningEffort: form.reasoningEffort || null,
-    mcpDefaultEnabled: form.mcpDefaultEnabled,
-    enabledMcpServerKeys: form.mcpDefaultEnabled ? [] : form.enabledMcpServerKeys,
   };
 }
 
@@ -224,20 +165,6 @@ function modelKeys(config: ConfigView | undefined, providerKey: string) {
 
 function modelReasoningEfforts(config: ConfigView | undefined, providerKey: string, modelId: string) {
   return [...(config?.providers?.[providerKey]?.models?.[modelId]?.options.reasoningEfforts ?? [])].sort((left, right) => left.localeCompare(right));
-}
-
-function mcpKeys(config: ConfigView | undefined) {
-  return Object.keys(config?.mcpServers ?? {}).sort((left, right) => left.localeCompare(right));
-}
-
-function toggleKey(keys: readonly string[], key: string, enabled: boolean) {
-  const set = new Set(keys);
-  if (enabled) {
-    set.add(key);
-  } else {
-    set.delete(key);
-  }
-  return [...set].sort((left, right) => left.localeCompare(right));
 }
 
 function errorMessage(error: unknown) {

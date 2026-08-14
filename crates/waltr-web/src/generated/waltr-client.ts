@@ -232,7 +232,7 @@ command: string,
  */
 url: string, };
 
-export type RuntimeDefaultsView = {
+export type InferenceDefaultsView = {
 /**
  * Default provider key.
  */
@@ -241,14 +241,6 @@ providerKey: string,
  * Default model id within the selected provider.
  */
 modelId: string,
-/**
- * Whether all configured MCP servers are enabled by default.
- */
-mcpDefaultEnabled: boolean,
-/**
- * Explicit MCP server keys enabled by default.
- */
-enabledMcpServerKeys: Array<string>,
 /**
  * Default reasoning effort for newly created sessions.
  */
@@ -298,9 +290,9 @@ providers: { [key in string]?: ProviderView },
  */
 mcpServers: { [key in string]?: McpServerView },
 /**
- * Default runtime selection for newly created sessions.
+ * Default inference selection for newly created sessions.
  */
-runtimeDefaults: RuntimeDefaultsView | null, };
+inferenceDefaults: InferenceDefaultsView | null, };
 
 export type CatalogModelRefView = {
 /**
@@ -530,23 +522,23 @@ failedMessage: string,
  */
 authenticationFailure: AuthenticationFailureSnapshot | null, };
 
-export type RuntimeConfigMatchView = "unspecified" | "configured" | "missing" | "changed" | "unknown";
+export type InferenceSettingsMatchView = "unspecified" | "configured" | "missing" | "changed" | "unknown";
 
-export type SessionProviderRuntimeView = {
+export type InferenceProviderSettingsView = {
 /**
- * Provider key selected when runtime config was stored.
+ * Provider key selected when inference settings were stored.
  */
 key: string,
 /**
- * Provider type selected when runtime config was stored.
+ * Provider type selected when inference settings were stored.
  */
 kind: ProviderKindView,
 /**
- * Provider URL selected when runtime config was stored.
+ * Provider URL selected when inference settings were stored.
  */
 url: string,
 /**
- * Exact provider model id selected when runtime config was stored.
+ * Exact provider model id selected when inference settings were stored.
  */
 modelId: string,
 /**
@@ -556,39 +548,13 @@ reasoningEffort: string | null,
 /**
  * Whether the stored provider/model still matches current config.
  */
-matchStatus: RuntimeConfigMatchView, };
+matchStatus: InferenceSettingsMatchView, };
 
-export type SessionMcpServerRuntimeView = {
+export type InferenceSettingsView = {
 /**
- * MCP server key selected when runtime config was stored.
+ * Stored provider inference settings.
  */
-key: string,
-/**
- * MCP server type selected when runtime config was stored.
- */
-kind: McpServerTypeView,
-/**
- * MCP command selected when runtime config was stored.
- */
-command: string,
-/**
- * MCP URL selected when runtime config was stored.
- */
-url: string,
-/**
- * Whether the stored MCP server still matches current config.
- */
-matchStatus: RuntimeConfigMatchView, };
-
-export type SessionRuntimeConfigView = {
-/**
- * Stored provider runtime snapshot.
- */
-provider: SessionProviderRuntimeView | null,
-/**
- * Stored MCP server runtime snapshots.
- */
-mcpServers: Array<SessionMcpServerRuntimeView>, };
+provider: InferenceProviderSettingsView | null, };
 
 export type SessionMetricsView = {
 /**
@@ -636,11 +602,25 @@ costCurrency: string | null,
  */
 totalCostMicros: bigint, };
 
+export type SelectableAgentView = {
+/**
+ * Exact selectable agent name.
+ */
+name: string,
+/**
+ * Optional human-readable description.
+ */
+description: string | null, };
+
 export type SessionView = {
 /**
  * Server-assigned session id.
  */
 id: string,
+/**
+ * Exact selectable agent currently assigned to the session.
+ */
+agentName: string,
 /**
  * Session revision.
  */
@@ -666,9 +646,9 @@ updatedAt: TimestampView | null,
  */
 lastActivityAt: TimestampView | null,
 /**
- * Runtime configuration snapshot stored with the session.
+ * Inference settings snapshot stored with the session.
  */
-runtimeConfig: SessionRuntimeConfigView | null,
+inferenceSettings: InferenceSettingsView | null,
 /**
  * Aggregate usage and cost derived from journaled provider turns.
  */
@@ -1104,7 +1084,19 @@ status: string,
 /**
  * Last operation error, when present.
  */
-error: string | null, } | { "kind": "sessionRuntimeConfigUpdate",
+error: string | null, } | { "kind": "sessionInferenceSettingsUpdate",
+/**
+ * Stable operation status name.
+ */
+status: string,
+/**
+ * Last operation error, when present.
+ */
+error: string | null,
+/**
+ * Updated session, when the operation completed successfully.
+ */
+session: SessionView | null, } | { "kind": "sessionAgentUpdate",
 /**
  * Stable operation status name.
  */
@@ -1254,7 +1246,25 @@ ready: boolean,
  */
 watch: OperationSnapshot, };
 
+export type SessionAgentCatalogSnapshot = {
+/**
+ * Deterministically ordered selectable agents.
+ */
+entries: Array<SelectableAgentView>,
+/**
+ * Server-selected default agent name.
+ */
+defaultAgentName: string,
+/**
+ * Catalog load operation snapshot.
+ */
+load: OperationSnapshot, };
+
 export type SessionSnapshot = {
+/**
+ * Selectable session agent catalog.
+ */
+agents: SessionAgentCatalogSnapshot,
 /**
  * Last known sessions.
  */
@@ -1276,9 +1286,13 @@ delete: OperationSnapshot,
  */
 wipe: OperationSnapshot,
 /**
- * Session runtime metadata update operation snapshot.
+ * Session inference settings update operation snapshot.
  */
-runtimeConfigUpdate: OperationSnapshot,
+inferenceSettingsUpdate: OperationSnapshot,
+/**
+ * Session agent update operation snapshot.
+ */
+agentUpdate: OperationSnapshot,
 /**
  * User message submit operation snapshot.
  */
@@ -1460,15 +1474,19 @@ server: McpServerView, } | { "type": "deleteMcpServer",
 /**
  * MCP server key to delete.
  */
-name: string, } | { "type": "setRuntimeDefaults",
+name: string, } | { "type": "setInferenceDefaults",
 /**
- * Runtime defaults to store, or null to clear defaults.
+ * Inference defaults to store, or null to clear defaults.
  */
-defaults: RuntimeDefaultsView | null, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession" } | { "type": "deleteSession",
+defaults: InferenceDefaultsView | null, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession",
+/**
+ * Exact selectable agent name.
+ */
+agentName: string, } | { "type": "requestSessionAgents" } | { "type": "deleteSession",
 /**
  * Session id to delete.
  */
-id: string, } | { "type": "wipeSessions" } | { "type": "updateSessionRuntimeConfig",
+id: string, } | { "type": "wipeSessions" } | { "type": "updateSessionInferenceSettings",
 /**
  * Session id to update.
  */
@@ -1482,13 +1500,17 @@ providerKey: string,
  */
 modelId: string,
 /**
- * MCP server keys enabled for subsequent prompts.
- */
-enabledMcpServerKeys: Array<string>,
-/**
  * Optional per-session reasoning effort.
  */
-reasoningEffort: string | null, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "requestSessionTimeline",
+reasoningEffort: string | null, } | { "type": "updateSessionAgent",
+/**
+ * Session id to update.
+ */
+id: string,
+/**
+ * Exact selectable agent name.
+ */
+agentName: string, } | { "type": "registerSessionWatchInterest" } | { "type": "releaseSessionWatchInterest" } | { "type": "requestSessionTimeline",
 /**
  * Session id whose timeline should load.
  */

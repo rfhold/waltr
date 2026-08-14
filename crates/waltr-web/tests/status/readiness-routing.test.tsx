@@ -9,7 +9,7 @@ describe("readiness routing", () => {
   test("keeps shell routes in place while the splash is visible", async () => {
     renderWithAppState(() => <ShellRouteWithChildren />, {
       routePath: "/config/provider",
-      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }, { ready: false }),
+      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }, { ready: false }),
     });
 
     await waitFor(() => expect(testHistory().get()).toBe("/config/provider"));

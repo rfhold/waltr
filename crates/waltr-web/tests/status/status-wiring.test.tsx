@@ -9,9 +9,9 @@ describe("status wiring", () => {
   test("loaded config surface shows no persistent watch footer", () => {
     renderWithAppState(() => <ConfigRouteWithChildren />, {
       snapshot: {
-        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }),
+        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
         config: {
-          current: { etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null },
+          current: { etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null },
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),
@@ -31,7 +31,7 @@ describe("status wiring", () => {
   test("pending config surface shows the watch status in the loading panel", () => {
     renderWithAppState(() => <ConfigRouteWithChildren />, {
       snapshot: {
-        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }),
+        ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
         config: {
           current: null,
           load: operationSnapshot("idle"),
