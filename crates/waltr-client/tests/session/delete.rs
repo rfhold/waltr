@@ -6,14 +6,26 @@ use crate::support::{
 };
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the test covers one complete create-delete-watch interaction"
+)]
 async fn client_surface_deletes_session_and_updates_snapshot() {
     let mut stream = ClientRuntime::for_endpoint(server_endpoint()).into_state_stream(no_sleep);
 
     next_snapshot_until(&mut stream, |snapshot| snapshot.status.ready).await;
-
-    let create_started = dispatch_stream_command(&mut stream, ClientCommand::CreateSession)
+    dispatch_stream_command(&mut stream, ClientCommand::RegisterSessionWatchInterest)
         .await
-        .expect("session create should succeed");
+        .expect("session watch interest should register");
+
+    let create_started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("session create should succeed");
     let create_key = create_started
         .sessions
         .create
@@ -27,7 +39,7 @@ async fn client_surface_deletes_session_and_updates_snapshot() {
                 status: "ready",
                 ..
             })
-        )
+        ) && snapshot.sessions.current.len() == 1
     })
     .await;
     let Some(ClientOperationView::SessionCreate {
@@ -68,7 +80,7 @@ async fn client_surface_deletes_session_and_updates_snapshot() {
                 status: "ready",
                 ..
             })
-        )
+        ) && snapshot.sessions.current.is_empty()
     })
     .await;
 

@@ -63,8 +63,8 @@ async fn stream_resets_config_and_exposes_returned_snapshot() {
     assert_eq!(reset_config.providers, initial_config.providers);
     assert_eq!(reset_config.mcp_servers, initial_config.mcp_servers);
     assert_eq!(
-        reset_config.runtime_defaults,
-        initial_config.runtime_defaults
+        reset_config.inference_defaults,
+        initial_config.inference_defaults
     );
     assert_ne!(reset_config.etag, custom.etag);
     let Some(ClientOperationView::ConfigReset {
@@ -164,6 +164,10 @@ async fn reset_rejects_stale_loaded_etag_and_preserves_snapshot() {
     );
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "the client state stream intentionally runs on a local task set"
+)]
 async fn load_config(stream: &mut waltr_client::ClientStateStream) -> waltr_client::ClientSnapshot {
     dispatch_stream_command(stream, ClientCommand::RequestConfig)
         .await

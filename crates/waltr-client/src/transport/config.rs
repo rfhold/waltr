@@ -71,7 +71,7 @@ where
             mcp_servers: patch
                 .mcp_servers
                 .map(|mcp_servers| McpServerMapPatch { mcp_servers }),
-            runtime_defaults: patch.runtime_defaults,
+            inference_defaults: patch.inference_defaults,
         })
         .await
         .map_err(|error| status_error(&error, &credentials))?

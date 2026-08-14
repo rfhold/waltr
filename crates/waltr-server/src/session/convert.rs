@@ -1,6 +1,8 @@
 use std::time::SystemTime;
 
-use super::{error::authentication_failure_to_proto, runtime_config::runtime_config_to_proto};
+use super::{
+    error::authentication_failure_to_proto, inference_settings::inference_settings_to_proto,
+};
 use waltr::grpc::waltr::{
     config::v1::Configuration,
     session::v1::{
@@ -19,10 +21,11 @@ use waltr_agent::{
 pub(super) fn session_summary_to_proto(
     summary: SessionSummary,
     config: &Configuration,
+    default_agent_name: &str,
 ) -> ProtoSessionSummary {
-    let runtime_config = summary
-        .runtime_settings
-        .map(|runtime_config| runtime_config_to_proto(runtime_config, config));
+    let inference_settings = summary
+        .inference_settings
+        .map(|settings| inference_settings_to_proto(settings, config));
     ProtoSessionSummary {
         id: summary.id.as_str().to_owned(),
         revision: summary.revision.get(),
@@ -31,8 +34,11 @@ pub(super) fn session_summary_to_proto(
         created_at: Some(timestamp_to_proto(summary.created_at)),
         updated_at: Some(timestamp_to_proto(summary.updated_at)),
         last_activity_at: Some(timestamp_to_proto(summary.last_activity_at)),
-        runtime_config,
+        inference_settings,
         metrics: Some(session_metrics_to_proto(summary.metrics)),
+        agent_name: summary
+            .agent_name
+            .unwrap_or_else(|| default_agent_name.to_owned()),
     }
 }
 

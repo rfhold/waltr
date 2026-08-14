@@ -19,8 +19,8 @@ use waltr::grpc::waltr::auth::v1::{
 };
 use waltr_agent::{
     AuthenticationFailureReason as AgentAuthenticationFailureReason, CredentialRefreshCoordinator,
-    CredentialRefreshError, CredentialStore, McpOAuthRegistration, McpOAuthRegistrationMethod,
-    OAuthCredential, RefreshMode, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
+    CredentialRefreshError, CredentialStore, McpConnectionKind, McpOAuthRegistration,
+    McpOAuthRegistrationMethod, McpResolvedConnection, OAuthCredential, RefreshMode,
 };
 use mcp::oauth::{
     McpBearerChallenge, McpOAuthGrantType, McpOAuthResponseType, McpOAuthSecret,
@@ -463,9 +463,9 @@ where
                     .with_trusted_mcp_oauth_origins(policy.trusted_private_origins().to_vec());
                 coordinator
                     .refresh_mcp(
-                        &SessionMcpServerRuntimeSettings {
+                        &McpResolvedConnection {
                             key: key.clone(),
-                            kind: SessionMcpServerRuntimeKind::StreamableHttp,
+                            kind: McpConnectionKind::StreamableHttp,
                             command: server.command.clone(),
                             url: server.url.clone(),
                         },

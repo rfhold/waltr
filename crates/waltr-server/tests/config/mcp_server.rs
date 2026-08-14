@@ -1,12 +1,13 @@
 use crate::support::grpc::{config_client, get_config};
 use waltr::grpc::waltr::config::v1::McpServerType;
 use waltr_agent::{
-    MemorySessionStore, ModelApi, PendingTimelineEvent, SessionCoordinator, SessionId,
-    SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStore, TimelineContent,
+    InferenceProviderSettings, InferenceSettings, MemorySessionStore, ModelApi,
+    PendingTimelineEvent, SessionCoordinator, SessionId, SessionStore, TimelineContent,
     TimelineEventKind, TimelineStatus,
 };
 use waltr_server::{
     ServerApplication, build_app_with_services,
+    config::ConfigStore as _,
     config_service::ConfigService,
     persistence::{DatabaseConfig, Persistence},
     session,
@@ -16,7 +17,7 @@ use waltr_server::{
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use std::{io, net::SocketAddr, sync::atomic::Ordering};
+use std::{collections::BTreeMap, io, net::SocketAddr, sync::atomic::Ordering};
 use tokio::sync::oneshot;
 
 #[tokio::test]
@@ -69,6 +70,10 @@ async fn mcp_configuration_actions_call_config_rpc_contract()
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the integration test exercises one shared coordinator across the complete MCP lifecycle"
+)]
 async fn mcp_sessions_share_the_registered_grpc_coordinator()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = temp_root();
@@ -81,40 +86,46 @@ async fn mcp_sessions_share_the_registered_grpc_coordinator()
     let coordinator = SessionCoordinator::new(store.clone());
     let id = SessionId::new("mcp-shared-session");
     coordinator
-        .create_with_id_and_metadata_values(id.clone(), Default::default())
+        .create_with_id_and_metadata_values(id.clone(), BTreeMap::default())
         .await?;
     append_status(&store, &id, TimelineStatus::Finished).await?;
     let runnable_id = SessionId::new("mcp-runnable-session");
     coordinator
-        .create_with_id_and_runtime_settings(
+        .create_with_id_and_inference_settings(
             runnable_id.clone(),
-            Some(SessionRuntimeSettings {
-                provider: SessionProviderRuntimeSettings {
+            Some(InferenceSettings {
+                provider: InferenceProviderSettings {
                     key: "test".to_owned(),
                     api: ModelApi::OpenAiResponses,
                     url: "http://127.0.0.1:9".to_owned(),
                     model_id: "test-model".to_owned(),
                     model_cost: None,
-                    headers: Default::default(),
+                    headers: BTreeMap::default(),
                     oauth: None,
                     reasoning_effort: None,
                 },
-                mcp_servers: Vec::new(),
-                mcp_trace_propagation: false,
             }),
-            Default::default(),
+            None,
+            BTreeMap::default(),
         )
         .await?;
-    let app = build_app_with_services(
-        ConfigService::new(root.clone(), default_config_builder())?,
-        persistence,
-        {
-            let coordinator = coordinator.clone();
-            move |routes, config, credential_store| {
-                session::add_sessions_service(routes, coordinator, config, credential_store, None)
-            }
-        },
-    )
+    let config_service = ConfigService::new(root.clone(), default_config_builder())?;
+    let mut config = config_service.store().load().await?;
+    config.mcp_servers.clear();
+    config_service.store().save(config).await?;
+    let app = build_app_with_services(config_service, persistence, {
+        let coordinator = coordinator.clone();
+        move |routes, config, credential_store| {
+            session::add_sessions_service(
+                routes,
+                coordinator,
+                config,
+                credential_store,
+                None,
+                waltr_server::test_support::default_agent_catalog(),
+            )
+        }
+    })
     .await?;
     let router = TestRouter::start(app).await?;
 
@@ -175,6 +186,13 @@ async fn mcp_sessions_share_the_registered_grpc_coordinator()
     assert_eq!(fetched["structuredContent"]["running"], false);
     assert!(fetched["structuredContent"]["pending_work"].is_array());
     assert!(fetched["structuredContent"]["active_external_requests"].is_array());
+    assert!(fetched["structuredContent"].get("runtime").is_none());
+    assert!(fetched["structuredContent"].get("mcp_servers").is_none());
+    assert!(
+        fetched["structuredContent"]
+            .get("mcp_trace_propagation")
+            .is_none()
+    );
 
     let waited = call_tool(
         &router.endpoint,
@@ -225,7 +243,7 @@ async fn mcp_sessions_share_the_registered_grpc_coordinator()
     ));
 
     assert_mcp_error(
-        call_tool_response(
+        &call_tool_response(
             &router.endpoint,
             "sessions",
             json!({ "action": "wipe", "input": { "confirm": false } }),
@@ -292,7 +310,7 @@ async fn mcp_session_wait_reconciles_durable_state_and_reports_fallbacks()
     let coordinator = SessionCoordinator::new(store.clone());
     let id = SessionId::new("mcp-wait-session");
     coordinator
-        .create_with_id_and_metadata_values(id.clone(), Default::default())
+        .create_with_id_and_metadata_values(id.clone(), BTreeMap::default())
         .await?;
     append_status(&store, &id, TimelineStatus::StreamingProvider).await?;
 
@@ -302,7 +320,14 @@ async fn mcp_session_wait_reconciles_durable_state_and_reports_fallbacks()
         {
             let coordinator = coordinator.clone();
             move |routes, config, credential_store| {
-                session::add_sessions_service(routes, coordinator, config, credential_store, None)
+                session::add_sessions_service(
+                    routes,
+                    coordinator,
+                    config,
+                    credential_store,
+                    None,
+                    waltr_server::test_support::default_agent_catalog(),
+                )
             }
         },
     )
@@ -514,7 +539,7 @@ async fn call_method(
     Ok(response.body)
 }
 
-fn assert_mcp_error(response: Value, code: i64, message: &str) {
+fn assert_mcp_error(response: &Value, code: i64, message: &str) {
     assert_eq!(response["error"]["code"], code, "{response}");
     assert!(
         response["error"]["message"]

@@ -3,7 +3,33 @@
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateSessionRequest {
     #[prost(message, optional, tag="1")]
-    pub runtime_config: ::core::option::Option<SessionRuntimeConfigRequest>,
+    pub inference_settings: ::core::option::Option<InferenceSettingsRequest>,
+    /// Optional startup-catalog agent selection. Absence selects the server default.
+    #[prost(message, optional, tag="2")]
+    pub agent_selection: ::core::option::Option<AgentSelectionRequest>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AgentSelectionRequest {
+    /// Exact selectable startup-catalog agent name.
+    #[prost(string, tag="1")]
+    pub agent_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ListAgentsRequest {
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListAgentsResponse {
+    #[prost(message, repeated, tag="1")]
+    pub agents: ::prost::alloc::vec::Vec<SelectableAgent>,
+    #[prost(string, tag="2")]
+    pub default_agent_name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SelectableAgent {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="2")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateSessionResponse {
@@ -35,14 +61,26 @@ pub struct WipeSessionsRequest {
 pub struct WipeSessionsResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct UpdateSessionRuntimeConfigRequest {
+pub struct UpdateSessionInferenceSettingsRequest {
     #[prost(string, tag="1")]
     pub id: ::prost::alloc::string::String,
     #[prost(message, optional, tag="2")]
-    pub runtime_config: ::core::option::Option<SessionRuntimeConfigRequest>,
+    pub inference_settings: ::core::option::Option<InferenceSettingsRequest>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct UpdateSessionRuntimeConfigResponse {
+pub struct UpdateSessionInferenceSettingsResponse {
+    #[prost(message, optional, tag="1")]
+    pub session: ::core::option::Option<SessionSummary>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UpdateSessionAgentRequest {
+    #[prost(string, tag="1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub agent_selection: ::core::option::Option<AgentSelectionRequest>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateSessionAgentResponse {
     #[prost(message, optional, tag="1")]
     pub session: ::core::option::Option<SessionSummary>,
 }
@@ -390,9 +428,12 @@ pub struct SessionSummary {
     #[prost(message, optional, tag="7")]
     pub last_activity_at: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(message, optional, tag="8")]
-    pub runtime_config: ::core::option::Option<SessionRuntimeConfig>,
+    pub inference_settings: ::core::option::Option<InferenceSettings>,
     #[prost(message, optional, tag="9")]
     pub metrics: ::core::option::Option<SessionMetrics>,
+    /// Effective selected agent name. Legacy records use the current server default.
+    #[prost(string, tag="10")]
+    pub agent_name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionMetrics {
@@ -420,26 +461,22 @@ pub struct SessionMetrics {
     #[prost(uint64, tag="11")]
     pub context_tokens: u64,
 }
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SessionRuntimeConfig {
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InferenceSettings {
     #[prost(message, optional, tag="1")]
-    pub provider: ::core::option::Option<SessionProviderRuntime>,
-    #[prost(message, repeated, tag="2")]
-    pub mcp_servers: ::prost::alloc::vec::Vec<SessionMcpServerRuntime>,
+    pub provider: ::core::option::Option<InferenceProviderSettings>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SessionRuntimeConfigRequest {
+pub struct InferenceSettingsRequest {
     #[prost(string, tag="1")]
     pub provider_key: ::prost::alloc::string::String,
     #[prost(string, tag="2")]
     pub model_id: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag="3")]
-    pub enabled_mcp_server_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, optional, tag="4")]
     pub reasoning_effort: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SessionProviderRuntime {
+pub struct InferenceProviderSettings {
     #[prost(string, tag="1")]
     pub key: ::prost::alloc::string::String,
     #[prost(enumeration="super::super::config::v1::ProviderType", tag="2")]
@@ -448,23 +485,10 @@ pub struct SessionProviderRuntime {
     pub url: ::prost::alloc::string::String,
     #[prost(string, tag="4")]
     pub model_id: ::prost::alloc::string::String,
-    #[prost(enumeration="RuntimeConfigMatch", tag="5")]
+    #[prost(enumeration="InferenceSettingsMatch", tag="5")]
     pub r#match: i32,
     #[prost(string, optional, tag="6")]
     pub reasoning_effort: ::core::option::Option<::prost::alloc::string::String>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SessionMcpServerRuntime {
-    #[prost(string, tag="1")]
-    pub key: ::prost::alloc::string::String,
-    #[prost(enumeration="super::super::config::v1::McpServerType", tag="2")]
-    pub r#type: i32,
-    #[prost(string, tag="3")]
-    pub command: ::prost::alloc::string::String,
-    #[prost(string, tag="4")]
-    pub url: ::prost::alloc::string::String,
-    #[prost(enumeration="RuntimeConfigMatch", tag="5")]
-    pub r#match: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionStatus {
@@ -716,32 +740,32 @@ impl TimelineStatus {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
-pub enum RuntimeConfigMatch {
+pub enum InferenceSettingsMatch {
     Unspecified = 0,
     Configured = 1,
     Missing = 2,
     Changed = 3,
 }
-impl RuntimeConfigMatch {
+impl InferenceSettingsMatch {
     /// String value of the enum field names used in the ProtoBuf definition.
     ///
     /// The values are not transformed in any way and thus are considered stable
     /// (if the ProtoBuf definition does not change) and safe for programmatic use.
     pub fn as_str_name(&self) -> &'static str {
         match self {
-            Self::Unspecified => "RUNTIME_CONFIG_MATCH_UNSPECIFIED",
-            Self::Configured => "RUNTIME_CONFIG_MATCH_CONFIGURED",
-            Self::Missing => "RUNTIME_CONFIG_MATCH_MISSING",
-            Self::Changed => "RUNTIME_CONFIG_MATCH_CHANGED",
+            Self::Unspecified => "INFERENCE_SETTINGS_MATCH_UNSPECIFIED",
+            Self::Configured => "INFERENCE_SETTINGS_MATCH_CONFIGURED",
+            Self::Missing => "INFERENCE_SETTINGS_MATCH_MISSING",
+            Self::Changed => "INFERENCE_SETTINGS_MATCH_CHANGED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "RUNTIME_CONFIG_MATCH_UNSPECIFIED" => Some(Self::Unspecified),
-            "RUNTIME_CONFIG_MATCH_CONFIGURED" => Some(Self::Configured),
-            "RUNTIME_CONFIG_MATCH_MISSING" => Some(Self::Missing),
-            "RUNTIME_CONFIG_MATCH_CHANGED" => Some(Self::Changed),
+            "INFERENCE_SETTINGS_MATCH_UNSPECIFIED" => Some(Self::Unspecified),
+            "INFERENCE_SETTINGS_MATCH_CONFIGURED" => Some(Self::Configured),
+            "INFERENCE_SETTINGS_MATCH_MISSING" => Some(Self::Missing),
+            "INFERENCE_SETTINGS_MATCH_CHANGED" => Some(Self::Changed),
             _ => None,
         }
     }

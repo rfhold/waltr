@@ -134,7 +134,10 @@ test("all Waltr services have exact static environments", () => {
 
 test("hosted MCP OAuth fixture uses the OIDC/TLS Waltr resource contract", () => {
   assert.match(hostedOauthFixture, /^url = "https:\/\/waltr\.test\/mcp"$/m);
-  assert.match(hostedOauthFixture, /^enabled_mcp_server_keys = \["protected"\]$/m);
+  assert.match(hostedOauthFixture, /^\[inference_defaults\]$/m);
+  assert.match(hostedOauthFixture, /^provider_key = "k6-openai"$/m);
+  assert.match(hostedOauthFixture, /^model_key = "gpt-5-nano"$/m);
+  assert.doesNotMatch(hostedOauthFixture, /runtime_defaults|mcp_default_enabled|enabled_mcp_server_keys/);
   assert.match(hostedOauthScript, /\.well-known\/oauth-client\/waltr/);
   assert.match(hostedOauthScript, /outbound-oauth\/callback/);
   assert.match(hostedOauthScript, /configuration\.inspect/);

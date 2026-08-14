@@ -32,27 +32,15 @@ export default async function () {
     await submitForm(page, 'form[aria-label="Create provider"]');
     await waitForText(page, '[aria-label="Provider list"]', PROVIDER);
 
-    await page.locator('a[href="/config/mcp"]').click();
-    await waitForPathname(page, "/config/mcp");
-    await page.locator('[aria-label="MCP server actions"] button').click();
-    await typeAndKeepFocus(page, 'form[aria-label="Create MCP server"] input[name="name"]', "localstdio");
-    await setInputValue(page, 'form[aria-label="Create MCP server"] input[name="command"]', "npx local-mcp");
-    await submitForm(page, 'form[aria-label="Create MCP server"]');
-    await waitForText(page, ".config__list", "localstdio");
-
     await page.locator('a[href="/config/defaults"]').click();
     const defaultsRoute = await waitForPathname(page, "/config/defaults");
-    await waitForText(page, "#runtime-defaults-title", "New session defaults");
-    await waitForSelectOption(page, "#runtime-default-provider", PROVIDER);
-    await setSelectValue(page, "#runtime-default-provider", PROVIDER);
-    await waitForSelectOption(page, "#runtime-default-model", MODEL);
-    await setSelectValue(page, "#runtime-default-model", MODEL);
-    await waitForText(page, '[aria-label="Explicit MCP defaults"]', "localstdio");
-    await setExplicitMcpDefault(page, "localstdio", true);
-    const explicitDefaults = await waitForText(page, '[aria-label="Explicit MCP defaults"]', "localstdio");
-    await screenshot(page, "config-defaults-explicit-mcp");
-    await submitForm(page, 'section[aria-labelledby="runtime-defaults-title"] form');
-    await waitForText(page, 'section[aria-labelledby="runtime-defaults-title"]', "Clear defaults");
+    await waitForText(page, "#inference-defaults-title", "New session inference");
+    await waitForSelectOption(page, "#inference-default-provider", PROVIDER);
+    await setSelectValue(page, "#inference-default-provider", PROVIDER);
+    await waitForSelectOption(page, "#inference-default-model", MODEL);
+    await setSelectValue(page, "#inference-default-model", MODEL);
+    await submitForm(page, 'section[aria-labelledby="inference-defaults-title"] form');
+    await waitForText(page, 'section[aria-labelledby="inference-defaults-title"]', "Clear defaults");
     await screenshot(page, "config-defaults-saved");
 
     await page.locator(".config__header button").click();
@@ -73,33 +61,27 @@ export default async function () {
 
     await page.locator('a[href="/config/mcp"]').click();
     const resetMcpServers = await waitForText(page, ".config__list", "waltr");
-    const customMcpRemoved = await waitForMissingText(page, ".config__list", "localstdio");
-
     await page.locator('a[href="/config/defaults"]').click();
-    const resetProviderDefault = await waitForSelectValue(page, "#runtime-default-provider", "");
-    const resetModelDefault = await waitForSelectValue(page, "#runtime-default-model", "");
+    const resetProviderDefault = await waitForSelectValue(page, "#inference-default-provider", "");
+    const resetModelDefault = await waitForSelectValue(page, "#inference-default-model", "");
 
     check({
       defaultsRoute,
-      explicitDefaults,
       resetConfirmation,
       resetSuccess,
       resetProviders,
       customProviderRemoved,
       resetMcpServers,
-      customMcpRemoved,
       resetProviderDefault,
       resetModelDefault,
     }, {
-      "runtime defaults screen saves explicit MCP default": ({ defaultsRoute, explicitDefaults }) =>
-        defaultsRoute && includesText(explicitDefaults, "localstdio"),
+      "inference defaults screen saves provider and model": ({ defaultsRoute }) => defaultsRoute,
       "configuration reset restores stable server defaults": ({
         resetConfirmation,
         resetSuccess,
         resetProviders,
         customProviderRemoved,
         resetMcpServers,
-        customMcpRemoved,
         resetProviderDefault,
         resetModelDefault,
       }) =>
@@ -108,7 +90,6 @@ export default async function () {
         ["anthropic", "claude-code", "openai", "codex"].every((provider) => includesText(resetProviders, provider)) &&
         !includesText(customProviderRemoved, PROVIDER) &&
         includesText(resetMcpServers, "waltr") &&
-        !includesText(customMcpRemoved, "localstdio") &&
         resetProviderDefault === "" &&
         resetModelDefault === "",
     });
@@ -164,21 +145,6 @@ async function waitForSelectValue(page, selector, expectedValue) {
   }
 
   throw new Error(`Timed out waiting for ${selector} to equal ${expectedValue}; saw ${value}`);
-}
-
-async function setExplicitMcpDefault(page, server, checked) {
-  await page.evaluate(({ server, checked }) => {
-    const labels = Array.from(document.querySelectorAll('[aria-label="Explicit MCP defaults"] label'));
-    const label = labels.find((candidate) => candidate.textContent?.includes(server));
-    const input = label?.querySelector('input[type="checkbox"]');
-
-    if (!(input instanceof HTMLInputElement)) {
-      throw new Error(`MCP default checkbox not found: ${server}`);
-    }
-
-    input.checked = checked;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  }, { server, checked });
 }
 
 async function submitForm(page, selector) {

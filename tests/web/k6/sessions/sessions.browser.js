@@ -22,10 +22,9 @@ export default async function () {
     await waitForText(page, "#sessions-list-title", "Recent sessions");
     await screenshot(page, "sessions-list-empty");
 
-    await page.locator(".sessions__header button").click();
+    await createSession(page);
     await waitForText(page, '[aria-label="Session detail"]', "");
     await waitForText(page, '[aria-label="Session status summary"]', `Provider ${PRIMARY_PROVIDER}/${PRIMARY_MODEL}`);
-    await waitForText(page, '[aria-label="Session status summary"]', "MCP git");
     const thinkingSelectEnabled = await waitForSelectEnabled(page, '[aria-label="Session thinking level"]');
 
     const createdPathname = await page.evaluate(() => window.location.pathname);
@@ -50,14 +49,8 @@ export default async function () {
     const providerDialogThinking = await waitForLabeledSelectValue(page, "Thinking level", "high");
     await screenshot(page, "sessions-provider-runtime-thinking-dialog");
     await clickRuntimeProviderOption(page, SECONDARY_PROVIDER);
-    await clickButtonByText(page, "Save runtime");
+    await clickButtonByText(page, "Save inference settings");
     const providerRuntime = await waitForText(page, '[aria-label="Session status summary"]', `Provider ${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`);
-
-    await clickButtonByLabel(page, "Edit MCP");
-    await waitForText(page, '[role="dialog"]', "Edit MCP servers");
-    await toggleMcpRuntime(page, "files");
-    await clickButtonByText(page, "Save MCP");
-    const mcpRuntime = await waitForText(page, '[aria-label="Session status summary"]', "files");
     await screenshot(page, "sessions-detail-created");
 
     await page.locator('.shell__nav a[href="/sessions"]').click();
@@ -75,7 +68,7 @@ export default async function () {
     await waitForPathname(page, "/sessions");
     const listAfterDelete = await waitForMissingText(page, ".sessions__list-panel", sessionId);
 
-    await page.locator(".sessions__header button").click();
+    await createSession(page);
     await waitForText(page, '[aria-label="Session detail"]', "");
     const wipeSessionPathname = await page.evaluate(() => window.location.pathname);
     const wipeSessionId = decodeURIComponent(wipeSessionPathname.replace(/^\/sessions\//, ""));
@@ -102,8 +95,7 @@ export default async function () {
       "session thinking runtime updates": () => includesText(thinkingRuntime, `${PRIMARY_PROVIDER}/${PRIMARY_MODEL} (high)`),
       "session thinking select persists update": () => thinkingSelectValue === "high",
       "provider dialog shows selected thinking": () => providerDialogThinking === "high",
-      "session detail edits provider runtime": () => includesText(providerRuntime, `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`),
-      "session detail edits mcp runtime": () => includesText(mcpRuntime, "files") && includesText(mcpRuntime, "git"),
+      "session detail edits inference settings": () => includesText(providerRuntime, `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`),
       "session list contains created session": () => includesText(listedSession, sessionId),
       "session selection reopens detail": () => includesText(reopenedDetail, `${SECONDARY_PROVIDER}/${SECONDARY_MODEL}`),
       "session list omits deleted session": () => !includesText(listAfterDelete, sessionId),
@@ -113,6 +105,13 @@ export default async function () {
       "session list omits wiped session": () => !includesText(listAfterWipe, wipeSessionId),
     });
   });
+}
+
+async function createSession(page) {
+  await page.locator('.sessions__header button').click();
+  const dialog = page.locator('[role="dialog"][aria-label="Create session dialog"]');
+  await dialog.waitFor();
+  await dialog.locator('button[type="submit"]').click();
 }
 
 async function waitForTextareaValueChange(page, selector, previousValue) {
@@ -224,20 +223,6 @@ async function waitForLabeledSelectValue(page, labelText, expectedValue) {
   }
 
   throw new Error(`Timed out waiting for ${labelText} to equal ${expectedValue}; saw ${value}`);
-}
-
-async function toggleMcpRuntime(page, server) {
-  await page.evaluate((serverName) => {
-    const labels = Array.from(document.querySelectorAll(".sessions__runtime-option"));
-    const label = labels.find((candidate) => candidate.textContent?.includes(serverName));
-    const input = label?.querySelector('input[type="checkbox"]');
-
-    if (!(input instanceof HTMLInputElement)) {
-      throw new Error(`Runtime MCP checkbox not found: ${serverName}`);
-    }
-
-    input.click();
-  }, server);
 }
 
 async function setSelectValue(page, selector, value) {

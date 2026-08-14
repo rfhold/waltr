@@ -62,8 +62,10 @@ pub fn apply_config_watch_update(
     if changed(&update.changed_keys, "mcp_servers") {
         config.mcp_servers.clone_from(&patch.mcp_servers);
     }
-    if changed(&update.changed_keys, "runtime_defaults") {
-        config.runtime_defaults.clone_from(&patch.runtime_defaults);
+    if changed(&update.changed_keys, "inference_defaults") {
+        config
+            .inference_defaults
+            .clone_from(&patch.inference_defaults);
     }
     if update.etag.is_empty() {
         patch.etag.clone_into(&mut config.etag);
@@ -82,7 +84,7 @@ fn changed(keys: &[String], key: &str) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::grpc::waltr::config::v1::{Configuration, Provider, RuntimeDefaults};
+    use crate::grpc::waltr::config::v1::{Configuration, InferenceDefaults, Provider};
 
     use super::{ConfigWatchApplyOutcome, ConfigWatchUpdate, apply_config_watch_update};
 
@@ -106,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn merges_sparse_runtime_defaults_change() {
+    fn merges_sparse_inference_defaults_change() {
         let current = Configuration {
             etag: "v1".to_owned(),
             providers: HashMap::from([("anthropic".to_owned(), Provider::default())]),
@@ -114,11 +116,9 @@ mod tests {
         };
         let patch = Configuration {
             etag: "v2".to_owned(),
-            runtime_defaults: Some(RuntimeDefaults {
+            inference_defaults: Some(InferenceDefaults {
                 provider_key: "anthropic".to_owned(),
                 model_key: "sonnet".to_owned(),
-                mcp_default_enabled: None,
-                enabled_mcp_server_keys: Vec::new(),
                 reasoning_effort: None,
             }),
             ..Configuration::default()
@@ -129,7 +129,7 @@ mod tests {
             &ConfigWatchUpdate {
                 previous_etag: "v1".to_owned(),
                 etag: "v2".to_owned(),
-                changed_keys: vec!["runtime_defaults".to_owned()],
+                changed_keys: vec!["inference_defaults".to_owned()],
                 config: Some(patch.clone()),
                 ..ConfigWatchUpdate::default()
             },
@@ -139,7 +139,7 @@ mod tests {
 
         assert_eq!(config.etag, "v2");
         assert_eq!(config.providers, current.providers);
-        assert_eq!(config.runtime_defaults, patch.runtime_defaults);
+        assert_eq!(config.inference_defaults, patch.inference_defaults);
     }
 
     #[test]

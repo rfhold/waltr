@@ -1,0 +1,112 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata:
+  name: default
+spec:
+  description: Provide the shared base behavior for Waltr agents.
+  systemPrompt: >-
+    You are Waltr Agent, a careful coding and operations assistant. Follow the
+    user's instructions, use available tools when they are helpful, and report
+    results clearly. Treat tool errors as recoverable information and continue
+    when possible.
+  permissions:
+    - permissionSetRef:
+        name: default
+---
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata:
+  name: coding
+spec:
+  description: Provide the complete coding behavior currently assembled by the server.
+  inheritsFrom:
+    name: default
+  features:
+    - featureSetRef:
+        name: coding
+  permissions:
+    - permissionSetRef:
+        name: coding
+---
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata:
+  name: coding
+spec:
+  filesystem:
+    root: $(session.workspace.root)
+    profile: auto
+    systemPrompt: true
+    agentsReadContext: true
+    skillsContext: true
+    defaultPermissions: true
+  agents:
+    root: $(session.workspace.root)
+    filename: AGENTS.md
+    systemPrompt: true
+  skills:
+    root: $(session.workspace.root)
+    defaultPermissions: true
+  shell:
+    root: $(session.workspace.root)
+    systemPrompt: true
+    defaultPermissions: true
+  task:
+    maxSubagentDepth: 1
+    defaultPermissions: true
+  mcp:
+    servers:
+      exclude: []
+    exposeTools: true
+    instructions: true
+    resources: true
+    prompts: true
+    tracePropagation: true
+    defaultPermissions: true
+---
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata:
+  name: default
+spec:
+  tools:
+    - name: question
+      permission: allow
+---
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata:
+  name: coding
+spec:
+  tools:
+    - feature: filesystem
+      permission:
+        resources:
+          paths:
+            - match:
+                outsideRoot: $(session.workspace.root)
+              effect: ask
+
+    - name: shell
+      permission:
+        resources:
+          paths:
+            - match:
+                outsideRoot: $(session.workspace.root)
+              effect: ask
+          commands:
+            - match:
+                names:
+                  - git
+                  - pulumi
+                  - kubectl
+                  - terraform
+                  - gcloud
+                  - aws
+                  - gh
+                  - help
+                  - pyinfra
+                  - ansible
+                  - sudo
+                  - ssh
+              effect: ask

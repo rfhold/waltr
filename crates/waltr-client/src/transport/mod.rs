@@ -34,9 +34,9 @@ use tonic::metadata::AsciiMetadataValue;
 use tonic::service::{Interceptor, interceptor::InterceptedService};
 
 use crate::{
-    ClientError, ConfigPatch, Configuration, RollbackTarget, SearchSessionTemplatesRequest,
-    SearchSessionTemplatesResponse, SessionRuntimeConfigRequest, SessionSummary, TimelineEvent,
-    TimelineQuery,
+    ClientError, ConfigPatch, Configuration, InferenceSettingsRequest, ListAgentsResponse,
+    RollbackTarget, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary,
+    TimelineEvent, TimelineQuery,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -139,7 +139,13 @@ pub trait WaltrTransport {
     ) -> impl Future<Output = Result<AuthStatus, ClientError>>;
 
     /// Create a new server-side session.
-    fn create_session(&self) -> impl Future<Output = Result<SessionSummary, ClientError>>;
+    fn create_session(
+        &self,
+        agent_name: String,
+    ) -> impl Future<Output = Result<SessionSummary, ClientError>>;
+
+    /// List selectable session agents.
+    fn list_agents(&self) -> impl Future<Output = Result<ListAgentsResponse, ClientError>>;
 
     /// List current server-side sessions.
     fn list_sessions(&self) -> impl Future<Output = Result<Vec<SessionSummary>, ClientError>>;
@@ -150,11 +156,18 @@ pub trait WaltrTransport {
     /// Delete every server-side session.
     fn wipe_sessions(&self) -> impl Future<Output = Result<(), ClientError>>;
 
-    /// Replace runtime config metadata for a server-side session.
-    fn update_session_runtime_config(
+    /// Replace inference settings for a server-side session.
+    fn update_session_inference_settings(
         &self,
         id: String,
-        runtime_config: SessionRuntimeConfigRequest,
+        inference_settings: InferenceSettingsRequest,
+    ) -> impl Future<Output = Result<SessionSummary, ClientError>>;
+
+    /// Switch a server-side session to an exact selectable agent.
+    fn update_session_agent(
+        &self,
+        id: String,
+        agent_name: String,
     ) -> impl Future<Output = Result<SessionSummary, ClientError>>;
 
     /// Subscribe to future session changes.
@@ -371,8 +384,12 @@ where
         auth::refresh_auth(self, target).await
     }
 
-    async fn create_session(&self) -> Result<SessionSummary, ClientError> {
-        session::create_session(self).await
+    async fn create_session(&self, agent_name: String) -> Result<SessionSummary, ClientError> {
+        session::create_session(self, agent_name).await
+    }
+
+    async fn list_agents(&self) -> Result<ListAgentsResponse, ClientError> {
+        session::list_agents(self).await
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ClientError> {
@@ -387,12 +404,20 @@ where
         session::wipe_sessions(self).await
     }
 
-    async fn update_session_runtime_config(
+    async fn update_session_inference_settings(
         &self,
         id: String,
-        runtime_config: SessionRuntimeConfigRequest,
+        inference_settings: InferenceSettingsRequest,
     ) -> Result<SessionSummary, ClientError> {
-        session::update_session_runtime_config(self, id, runtime_config).await
+        session::update_session_inference_settings(self, id, inference_settings).await
+    }
+
+    async fn update_session_agent(
+        &self,
+        id: String,
+        agent_name: String,
+    ) -> Result<SessionSummary, ClientError> {
+        session::update_session_agent(self, id, agent_name).await
     }
 
     async fn watch_sessions(&self) -> Result<SessionWatchStream, ClientError> {

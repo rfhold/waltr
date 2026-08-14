@@ -4,9 +4,9 @@ use crate::config::ConfigHandle;
 use futures_util::Stream;
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
 use waltr_agent::{
-    AgentSession, AgentSessionActiveRunState, AgentSessionRunError, AgentSessionRunSubmission,
-    CredentialStore, FilesystemSessionStore, MemorySessionStore, SessionCoordinator, SessionId,
-    SessionListUpdate, SessionStore, SessionSummary,
+    AgentDefinitionCatalog, AgentSession, AgentSessionActiveRunState, AgentSessionRunError,
+    AgentSessionRunSubmission, CredentialStore, FilesystemSessionStore, MemorySessionStore,
+    SessionCoordinator, SessionId, SessionListUpdate, SessionStore, SessionSummary,
 };
 use std::{pin::Pin, sync::Arc};
 use tonic::service::RoutesBuilder;
@@ -16,7 +16,7 @@ pub mod storage;
 
 mod convert;
 mod error;
-mod runtime_config;
+mod inference_settings;
 mod timeline_convert;
 
 pub use service::SessionService;
@@ -57,12 +57,14 @@ pub fn add_service_from_env(
     config: ConfigHandle,
     credential_store: CredentialStore,
     trusted_mcp_oauth_origin: Option<reqwest::Url>,
+    agent_catalog: AgentDefinitionCatalog,
 ) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
     add_service_from_env_with_oauth_policy(
         routes,
         config,
         credential_store,
         trusted_mcp_oauth_origin.into_iter().collect(),
+        agent_catalog,
     )
 }
 
@@ -71,6 +73,7 @@ pub(crate) fn add_service_from_env_with_oauth_policy(
     config: ConfigHandle,
     credential_store: CredentialStore,
     trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    agent_catalog: AgentDefinitionCatalog,
 ) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
     let host = match SessionStorageConfig::from_env()? {
         SessionStorageConfig::Memory => add_store_service(
@@ -79,6 +82,7 @@ pub(crate) fn add_service_from_env_with_oauth_policy(
             config,
             credential_store,
             trusted_mcp_oauth_origins,
+            agent_catalog,
         ),
         SessionStorageConfig::Filesystem { root } => add_store_service(
             routes,
@@ -86,6 +90,7 @@ pub(crate) fn add_service_from_env_with_oauth_policy(
             config,
             credential_store,
             trusted_mcp_oauth_origins,
+            agent_catalog,
         ),
         SessionStorageConfig::S3(s3_config) => add_store_service(
             routes,
@@ -93,26 +98,11 @@ pub(crate) fn add_service_from_env_with_oauth_policy(
             config,
             credential_store,
             trusted_mcp_oauth_origins,
+            agent_catalog,
         ),
     };
 
     Ok(host)
-}
-
-/// Add the default session service to the gRPC routes builder.
-pub fn add_default_service(
-    routes: &mut RoutesBuilder,
-    credential_store: CredentialStore,
-) -> Arc<dyn SessionHost> {
-    let service = SessionService::new_with_oauth_policy(
-        MemorySessionStore::new(),
-        ConfigHandle::default(),
-        credential_store,
-        Vec::new(),
-    );
-    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
-    let host: Arc<dyn SessionHost> = service;
-    host
 }
 
 /// Add an in-memory session service using an explicit config store.
@@ -120,6 +110,7 @@ pub fn add_memory_service(
     routes: &mut RoutesBuilder,
     config: ConfigHandle,
     credential_store: CredentialStore,
+    agent_catalog: AgentDefinitionCatalog,
 ) -> Arc<dyn SessionHost> {
     add_store_service(
         routes,
@@ -127,16 +118,22 @@ pub fn add_memory_service(
         config,
         credential_store,
         Vec::new(),
+        agent_catalog,
     )
 }
 
 /// Add an in-memory session service using an existing session coordinator.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "service registration receives independent coordinator dependencies"
+)]
 pub fn add_sessions_service<S>(
     routes: &mut RoutesBuilder,
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
     credential_store: CredentialStore,
     trusted_mcp_oauth_origin: Option<reqwest::Url>,
+    agent_catalog: AgentDefinitionCatalog,
 ) -> Arc<dyn SessionHost>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
@@ -147,15 +144,21 @@ where
         config,
         credential_store,
         trusted_mcp_oauth_origin.into_iter().collect(),
+        agent_catalog,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "service registration receives independent coordinator dependencies"
+)]
 pub(crate) fn add_sessions_service_with_oauth_policy<S>(
     routes: &mut RoutesBuilder,
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
     credential_store: CredentialStore,
     trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    agent_catalog: AgentDefinitionCatalog,
 ) -> Arc<dyn SessionHost>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
@@ -165,18 +168,24 @@ where
         config,
         credential_store,
         trusted_mcp_oauth_origins,
+        agent_catalog,
     );
     routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
     let host: Arc<dyn SessionHost> = service;
     host
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "service registration receives independent coordinator dependencies"
+)]
 fn add_store_service<S>(
     routes: &mut RoutesBuilder,
     store: S,
     config: ConfigHandle,
     credential_store: CredentialStore,
     trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    agent_catalog: AgentDefinitionCatalog,
 ) -> Arc<dyn SessionHost>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
@@ -186,6 +195,7 @@ where
         config,
         credential_store,
         trusted_mcp_oauth_origins,
+        agent_catalog,
     );
     routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
     let host: Arc<dyn SessionHost> = service;

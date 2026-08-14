@@ -155,8 +155,8 @@ impl GrpcEffectExecutor {
     /// # Errors
     ///
     /// Returns an error when the transport cannot create the session.
-    pub async fn create_session(&self) -> Result<SessionSummary, ClientError> {
-        self.transport.create_session().await
+    pub async fn create_session(&self, agent_name: String) -> Result<SessionSummary, ClientError> {
+        self.transport.create_session(agent_name).await
     }
 
     /// List current server-side sessions.
@@ -214,7 +214,11 @@ impl GrpcEffectExecutor {
     }
 
     /// Execute one client side-effect intent and return client events for the reducer.
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::future_not_send,
+        clippy::too_many_lines,
+        reason = "client shell runtimes execute effects on a local task set"
+    )]
     pub async fn execute_effect<Sleep, SleepFuture>(
         &self,
         effect: ClientEffect,
@@ -224,204 +228,225 @@ impl GrpcEffectExecutor {
         Sleep: FnOnce(u64) -> SleepFuture,
         SleepFuture: Future<Output = ()>,
     {
-        match effect {
-            ClientEffect::Auth(AuthEffect::ListStatuses) => {
-                match self.transport.list_auth_statuses().await {
-                    Ok(statuses) => vec![ClientEvent::Auth(AuthEvent::Listed(statuses))],
-                    Err(error) => vec![ClientEvent::Auth(AuthEvent::ListFailed(error))],
+        self.execute_effect_boxed(effect, sleep).await
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        clippy::too_many_lines,
+        reason = "the large effect future is boxed before it is polled"
+    )]
+    fn execute_effect_boxed<'a, Sleep, SleepFuture>(
+        &'a self,
+        effect: ClientEffect,
+        sleep: Sleep,
+    ) -> Pin<Box<dyn Future<Output = Vec<ClientEvent>> + 'a>>
+    where
+        Sleep: FnOnce(u64) -> SleepFuture + 'a,
+        SleepFuture: Future<Output = ()> + 'a,
+    {
+        Box::pin(async move {
+            match effect {
+                ClientEffect::Auth(AuthEffect::ListStatuses) => {
+                    match self.transport.list_auth_statuses().await {
+                        Ok(statuses) => vec![ClientEvent::Auth(AuthEvent::Listed(statuses))],
+                        Err(error) => vec![ClientEvent::Auth(AuthEvent::ListFailed(error))],
+                    }
                 }
-            }
-            ClientEffect::Auth(AuthEffect::Begin {
-                operation_key,
-                target,
-            }) => match self.transport.begin_auth(target.clone()).await {
-                Ok(attempt) => vec![ClientEvent::Auth(AuthEvent::Begun {
+                ClientEffect::Auth(AuthEffect::Begin {
                     operation_key,
                     target,
-                    attempt,
-                })],
-                Err(error) => vec![ClientEvent::Auth(AuthEvent::BeginFailed {
-                    operation_key,
-                    target,
-                    error,
-                })],
-            },
-            ClientEffect::Auth(AuthEffect::Complete {
-                operation_key,
-                attempt_id,
-                input,
-            }) => match self.transport.complete_auth(attempt_id, input).await {
-                Ok(status) => vec![ClientEvent::Auth(AuthEvent::Completed {
-                    operation_key,
-                    status,
-                })],
-                Err(error) => vec![ClientEvent::Auth(AuthEvent::CompleteFailed {
-                    operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Auth(AuthEffect::Poll {
-                attempt_id,
-                poll_generation,
-                delay_ms,
-            }) => {
-                sleep(delay_ms).await;
-                match self
-                    .transport
-                    .get_auth_attempt_status(attempt_id.clone())
-                    .await
-                {
-                    Ok(response) => vec![ClientEvent::Auth(AuthEvent::Polled {
-                        attempt_id,
-                        poll_generation,
-                        response,
+                }) => match self.transport.begin_auth(target.clone()).await {
+                    Ok(attempt) => vec![ClientEvent::Auth(AuthEvent::Begun {
+                        operation_key,
+                        target,
+                        attempt,
                     })],
-                    Err(error) => vec![ClientEvent::Auth(AuthEvent::PollFailed {
-                        attempt_id,
-                        poll_generation,
+                    Err(error) => vec![ClientEvent::Auth(AuthEvent::BeginFailed {
+                        operation_key,
+                        target,
                         error,
                     })],
+                },
+                ClientEffect::Auth(AuthEffect::Complete {
+                    operation_key,
+                    attempt_id,
+                    input,
+                }) => match self.transport.complete_auth(attempt_id, input).await {
+                    Ok(status) => vec![ClientEvent::Auth(AuthEvent::Completed {
+                        operation_key,
+                        status,
+                    })],
+                    Err(error) => vec![ClientEvent::Auth(AuthEvent::CompleteFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Auth(AuthEffect::Poll {
+                    attempt_id,
+                    poll_generation,
+                    delay_ms,
+                }) => {
+                    sleep(delay_ms).await;
+                    match self
+                        .transport
+                        .get_auth_attempt_status(attempt_id.clone())
+                        .await
+                    {
+                        Ok(response) => vec![ClientEvent::Auth(AuthEvent::Polled {
+                            attempt_id,
+                            poll_generation,
+                            response,
+                        })],
+                        Err(error) => vec![ClientEvent::Auth(AuthEvent::PollFailed {
+                            attempt_id,
+                            poll_generation,
+                            error,
+                        })],
+                    }
                 }
-            }
-            ClientEffect::Auth(AuthEffect::Cancel {
-                operation_key,
-                attempt_id,
-            }) => match self.transport.cancel_auth(attempt_id).await {
-                Ok(()) => vec![ClientEvent::Auth(AuthEvent::Canceled { operation_key })],
-                Err(error) => vec![ClientEvent::Auth(AuthEvent::CancelFailed {
+                ClientEffect::Auth(AuthEffect::Cancel {
                     operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Auth(AuthEffect::Refresh {
-                operation_key,
-                target,
-            }) => match self.transport.refresh_auth(target).await {
-                Ok(status) => vec![ClientEvent::Auth(AuthEvent::Refreshed {
+                    attempt_id,
+                }) => match self.transport.cancel_auth(attempt_id).await {
+                    Ok(()) => vec![ClientEvent::Auth(AuthEvent::Canceled { operation_key })],
+                    Err(error) => vec![ClientEvent::Auth(AuthEvent::CancelFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Auth(AuthEffect::Refresh {
                     operation_key,
-                    status,
-                })],
-                Err(error) => vec![ClientEvent::Auth(AuthEvent::RefreshFailed {
+                    target,
+                }) => match self.transport.refresh_auth(target).await {
+                    Ok(status) => vec![ClientEvent::Auth(AuthEvent::Refreshed {
+                        operation_key,
+                        status,
+                    })],
+                    Err(error) => vec![ClientEvent::Auth(AuthEvent::RefreshFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Auth(AuthEffect::Logout {
                     operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Auth(AuthEffect::Logout {
-                operation_key,
-                target,
-            }) => match self.transport.logout(target).await {
-                Ok(status) => vec![ClientEvent::Auth(AuthEvent::LoggedOut {
-                    operation_key,
-                    status,
-                })],
-                Err(error) => vec![ClientEvent::Auth(AuthEvent::LogoutFailed {
-                    operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Catalog(CatalogEffect::SearchModels {
-                request_id,
-                query,
-                provider_id,
-                limit,
-            }) => match self
-                .transport
-                .search_catalog_models(SearchCatalogModelsRequest {
+                    target,
+                }) => match self.transport.logout(target).await {
+                    Ok(status) => vec![ClientEvent::Auth(AuthEvent::LoggedOut {
+                        operation_key,
+                        status,
+                    })],
+                    Err(error) => vec![ClientEvent::Auth(AuthEvent::LogoutFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Catalog(CatalogEffect::SearchModels {
+                    request_id,
                     query,
-                    provider_id: provider_id.unwrap_or_default(),
+                    provider_id,
                     limit,
-                })
-                .await
-            {
-                Ok(response) => vec![ClientEvent::Catalog(CatalogEvent::ModelsSearched {
+                }) => match self
+                    .transport
+                    .search_catalog_models(SearchCatalogModelsRequest {
+                        query,
+                        provider_id: provider_id.unwrap_or_default(),
+                        limit,
+                    })
+                    .await
+                {
+                    Ok(response) => vec![ClientEvent::Catalog(CatalogEvent::ModelsSearched {
+                        request_id,
+                        models: response.models,
+                        stale: response.stale,
+                    })],
+                    Err(error) => vec![ClientEvent::Catalog(CatalogEvent::ModelsSearchFailed {
+                        request_id,
+                        error,
+                    })],
+                },
+                ClientEffect::Catalog(CatalogEffect::SuggestMatches {
                     request_id,
-                    models: response.models,
-                    stale: response.stale,
-                })],
-                Err(error) => vec![ClientEvent::Catalog(CatalogEvent::ModelsSearchFailed {
-                    request_id,
-                    error,
-                })],
-            },
-            ClientEffect::Catalog(CatalogEffect::SuggestMatches {
-                request_id,
-                provider_key,
-                model_key,
-                limit,
-            }) => match self
-                .transport
-                .suggest_catalog_matches(SuggestCatalogMatchesRequest {
                     provider_key,
                     model_key,
                     limit,
-                })
-                .await
-            {
-                Ok(response) => vec![ClientEvent::Catalog(CatalogEvent::MatchesSuggested {
-                    request_id,
-                    matches: response.matches,
-                    stale: response.stale,
-                })],
-                Err(error) => vec![ClientEvent::Catalog(CatalogEvent::MatchesSuggestFailed {
-                    request_id,
-                    error,
-                })],
-            },
-            ClientEffect::Config(ConfigEffect::Load) => match self.transport.get_config().await {
-                Ok(config) => vec![ClientEvent::Config(ConfigEvent::Loaded(config))],
-                Err(error) => vec![ClientEvent::Config(ConfigEvent::LoadFailed(error))],
-            },
-            ClientEffect::Config(ConfigEffect::Patch {
-                operation_key,
-                patch,
-                expected_etag,
-            }) => match self.transport.patch_config(patch, expected_etag).await {
-                Ok(config) => vec![ClientEvent::Config(ConfigEvent::Patched {
-                    operation_key,
-                    config,
-                })],
-                Err(error) => vec![ClientEvent::Config(ConfigEvent::PatchFailed {
-                    operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Config(ConfigEffect::Reset {
-                operation_key,
-                expected_etag,
-            }) => match self.transport.reset_config(expected_etag).await {
-                Ok(config) => vec![ClientEvent::Config(ConfigEvent::Reset {
-                    operation_key,
-                    config,
-                })],
-                Err(error) => vec![ClientEvent::Config(ConfigEvent::ResetFailed {
-                    operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Config(ConfigEffect::Watch { open_id }) => {
-                match self.transport.watch_config().await {
-                    Ok(_) => vec![ClientEvent::Config(ConfigEvent::WatchStartedForOpen {
-                        open_id,
+                }) => match self
+                    .transport
+                    .suggest_catalog_matches(SuggestCatalogMatchesRequest {
+                        provider_key,
+                        model_key,
+                        limit,
+                    })
+                    .await
+                {
+                    Ok(response) => vec![ClientEvent::Catalog(CatalogEvent::MatchesSuggested {
+                        request_id,
+                        matches: response.matches,
+                        stale: response.stale,
                     })],
-                    Err(error) => vec![ClientEvent::Config(ConfigEvent::WatchOpenFailed {
-                        open_id,
+                    Err(error) => vec![ClientEvent::Catalog(CatalogEvent::MatchesSuggestFailed {
+                        request_id,
                         error,
                     })],
-                }
-            }
-            ClientEffect::Status(StatusEffect::Watch { epoch }) => {
-                match self.transport.watch_status().await {
-                    Ok(_) => vec![ClientEvent::Status(StatusEvent::WatchStartedForEpoch {
-                        epoch,
+                },
+                ClientEffect::Config(ConfigEffect::Load) => match self.transport.get_config().await
+                {
+                    Ok(config) => vec![ClientEvent::Config(ConfigEvent::Loaded(config))],
+                    Err(error) => vec![ClientEvent::Config(ConfigEvent::LoadFailed(error))],
+                },
+                ClientEffect::Config(ConfigEffect::Patch {
+                    operation_key,
+                    patch,
+                    expected_etag,
+                }) => match self.transport.patch_config(patch, expected_etag).await {
+                    Ok(config) => vec![ClientEvent::Config(ConfigEvent::Patched {
+                        operation_key,
+                        config,
                     })],
-                    Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailedForEpoch {
-                        epoch,
+                    Err(error) => vec![ClientEvent::Config(ConfigEvent::PatchFailed {
+                        operation_key,
                         error,
                     })],
+                },
+                ClientEffect::Config(ConfigEffect::Reset {
+                    operation_key,
+                    expected_etag,
+                }) => match self.transport.reset_config(expected_etag).await {
+                    Ok(config) => vec![ClientEvent::Config(ConfigEvent::Reset {
+                        operation_key,
+                        config,
+                    })],
+                    Err(error) => vec![ClientEvent::Config(ConfigEvent::ResetFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Config(ConfigEffect::Watch { open_id }) => {
+                    match self.transport.watch_config().await {
+                        Ok(_) => vec![ClientEvent::Config(ConfigEvent::WatchStartedForOpen {
+                            open_id,
+                        })],
+                        Err(error) => vec![ClientEvent::Config(ConfigEvent::WatchOpenFailed {
+                            open_id,
+                            error,
+                        })],
+                    }
                 }
-            }
-            ClientEffect::Session(SessionEffect::Create { operation_key }) => {
-                match self.transport.create_session().await {
+                ClientEffect::Status(StatusEffect::Watch { epoch }) => {
+                    match self.transport.watch_status().await {
+                        Ok(_) => vec![ClientEvent::Status(StatusEvent::WatchStartedForEpoch {
+                            epoch,
+                        })],
+                        Err(error) => vec![ClientEvent::Status(StatusEvent::WatchFailedForEpoch {
+                            epoch,
+                            error,
+                        })],
+                    }
+                }
+                ClientEffect::Session(SessionEffect::Create {
+                    operation_key,
+                    agent_name,
+                }) => match self.transport.create_session(agent_name).await {
                     Ok(session) => vec![ClientEvent::Session(SessionEvent::Created {
                         operation_key,
                         session,
@@ -430,247 +455,282 @@ impl GrpcEffectExecutor {
                         operation_key,
                         error,
                     })],
+                },
+                ClientEffect::Session(SessionEffect::Delete { operation_key, id }) => {
+                    match self.transport.delete_session(id.clone()).await {
+                        Ok(()) => vec![ClientEvent::Session(SessionEvent::Deleted {
+                            operation_key,
+                            id,
+                        })],
+                        Err(error) => vec![ClientEvent::Session(SessionEvent::DeleteFailed {
+                            operation_key,
+                            id,
+                            error,
+                        })],
+                    }
                 }
-            }
-            ClientEffect::Session(SessionEffect::Delete { operation_key, id }) => {
-                match self.transport.delete_session(id.clone()).await {
-                    Ok(()) => vec![ClientEvent::Session(SessionEvent::Deleted {
-                        operation_key,
-                        id,
-                    })],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::DeleteFailed {
-                        operation_key,
-                        id,
-                        error,
-                    })],
+                ClientEffect::Session(SessionEffect::Wipe { operation_key }) => {
+                    match self.transport.wipe_sessions().await {
+                        Ok(()) => vec![ClientEvent::Session(SessionEvent::Wiped { operation_key })],
+                        Err(error) => vec![ClientEvent::Session(SessionEvent::WipeFailed {
+                            operation_key,
+                            error,
+                        })],
+                    }
                 }
-            }
-            ClientEffect::Session(SessionEffect::Wipe { operation_key }) => {
-                match self.transport.wipe_sessions().await {
-                    Ok(()) => vec![ClientEvent::Session(SessionEvent::Wiped { operation_key })],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::WipeFailed {
-                        operation_key,
-                        error,
-                    })],
+                ClientEffect::Session(SessionEffect::UpdateInferenceSettings {
+                    operation_key,
+                    id,
+                    inference_settings,
+                }) => {
+                    match self
+                        .transport
+                        .update_session_inference_settings(id, *inference_settings)
+                        .await
+                    {
+                        Ok(session) => vec![ClientEvent::Session(
+                            SessionEvent::InferenceSettingsUpdated {
+                                operation_key,
+                                session,
+                            },
+                        )],
+                        Err(error) => vec![ClientEvent::Session(
+                            SessionEvent::InferenceSettingsUpdateFailed {
+                                operation_key,
+                                error,
+                            },
+                        )],
+                    }
                 }
-            }
-            ClientEffect::Session(SessionEffect::UpdateRuntimeConfig {
-                operation_key,
-                id,
-                runtime_config,
-            }) => {
-                match self
-                    .transport
-                    .update_session_runtime_config(id, *runtime_config)
-                    .await
-                {
-                    Ok(session) => vec![ClientEvent::Session(SessionEvent::RuntimeConfigUpdated {
+                ClientEffect::Session(SessionEffect::UpdateAgent {
+                    operation_key,
+                    id,
+                    agent_name,
+                }) => match self.transport.update_session_agent(id, agent_name).await {
+                    Ok(session) => vec![ClientEvent::Session(SessionEvent::SessionAgentUpdated {
                         operation_key,
                         session,
                     })],
                     Err(error) => vec![ClientEvent::Session(
-                        SessionEvent::RuntimeConfigUpdateFailed {
+                        SessionEvent::SessionAgentUpdateFailed {
                             operation_key,
                             error,
                         },
                     )],
-                }
-            }
-            ClientEffect::Session(SessionEffect::List) => {
-                match self.transport.list_sessions().await {
-                    Ok(sessions) => vec![ClientEvent::Session(SessionEvent::Listed(sessions))],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::ListFailed(error))],
-                }
-            }
-            ClientEffect::Session(SessionEffect::GetTimeline { session_id, query }) => {
-                match self.transport.get_timeline(session_id.clone(), query).await {
-                    Ok(events) => vec![ClientEvent::Session(SessionEvent::TimelineLoaded {
-                        session_id,
-                        events,
-                    })],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::TimelineLoadFailed {
-                        session_id,
-                        error,
-                    })],
-                }
-            }
-            ClientEffect::Session(SessionEffect::SearchTemplates {
-                request_id,
-                session_id,
-                query,
-                limit,
-                kinds,
-                target,
-                cursor,
-            }) => match self
-                .transport
-                .search_session_templates(SearchSessionTemplatesRequest {
-                    request_id: request_id.clone(),
-                    session_id: session_id.clone(),
-                    query,
-                    limit,
-                    kinds: kinds.into_iter().map(|kind| kind as i32).collect(),
-                    target: target as i32,
-                    cursor,
-                })
-                .await
-            {
-                Ok(response) => match response.result {
-                    Some(search_session_templates_response::Result::Options(options)) => {
-                        vec![ClientEvent::Session(SessionEvent::TemplatesSearched {
-                            request_id: response.request_id,
-                            session_id,
-                            options: options.options,
-                        })]
-                    }
-                    Some(search_session_templates_response::Result::Error(error)) => {
-                        vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
-                            request_id: response.request_id,
-                            session_id,
-                            error: ClientError::new(error.message),
-                        })]
-                    }
-                    None => vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
-                        request_id,
-                        session_id,
-                        error: ClientError::new("session resource search response missing result"),
-                    })],
                 },
-                Err(error) => vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+                ClientEffect::Session(SessionEffect::ListAgents { request_id }) => {
+                    match self.transport.list_agents().await {
+                        Ok(response) => vec![ClientEvent::Session(SessionEvent::AgentsLoaded {
+                            request_id,
+                            agents: response.agents,
+                            default_agent_name: response.default_agent_name,
+                        })],
+                        Err(error) => vec![ClientEvent::Session(SessionEvent::AgentsLoadFailed {
+                            request_id,
+                            error,
+                        })],
+                    }
+                }
+                ClientEffect::Session(SessionEffect::List) => {
+                    match self.transport.list_sessions().await {
+                        Ok(sessions) => vec![ClientEvent::Session(SessionEvent::Listed(sessions))],
+                        Err(error) => vec![ClientEvent::Session(SessionEvent::ListFailed(error))],
+                    }
+                }
+                ClientEffect::Session(SessionEffect::GetTimeline { session_id, query }) => {
+                    match self.transport.get_timeline(session_id.clone(), query).await {
+                        Ok(events) => vec![ClientEvent::Session(SessionEvent::TimelineLoaded {
+                            session_id,
+                            events,
+                        })],
+                        Err(error) => {
+                            vec![ClientEvent::Session(SessionEvent::TimelineLoadFailed {
+                                session_id,
+                                error,
+                            })]
+                        }
+                    }
+                }
+                ClientEffect::Session(SessionEffect::SearchTemplates {
                     request_id,
                     session_id,
-                    error,
-                })],
-            },
-            ClientEffect::Session(SessionEffect::Watch { open_id }) => {
-                match self.transport.watch_sessions().await {
-                    Ok(_) => vec![ClientEvent::Session(SessionEvent::WatchStartedForOpen {
-                        open_id,
-                    })],
-                    Err(error) => vec![ClientEvent::Session(SessionEvent::WatchOpenFailed {
-                        open_id,
-                        error,
-                    })],
-                }
-            }
-            ClientEffect::Session(SessionEffect::WatchTimeline { key, open_id }) => {
-                match self
+                    query,
+                    limit,
+                    kinds,
+                    target,
+                    cursor,
+                }) => match self
                     .transport
-                    .watch_timeline(
-                        key.session_id.clone(),
-                        key.after_cursor,
-                        key.channels.clone(),
-                        key.initial_limit,
-                    )
+                    .search_session_templates(SearchSessionTemplatesRequest {
+                        request_id: request_id.clone(),
+                        session_id: session_id.clone(),
+                        query,
+                        limit,
+                        kinds: kinds.into_iter().map(|kind| kind as i32).collect(),
+                        target: target as i32,
+                        cursor,
+                    })
                     .await
                 {
-                    Ok(_) => vec![ClientEvent::Session(
-                        SessionEvent::TimelineWatchStartedForOpen { key, open_id },
-                    )],
-                    Err(error) => vec![ClientEvent::Session(
-                        SessionEvent::TimelineWatchOpenFailed {
-                            key,
+                    Ok(response) => match response.result {
+                        Some(search_session_templates_response::Result::Options(options)) => {
+                            vec![ClientEvent::Session(SessionEvent::TemplatesSearched {
+                                request_id: response.request_id,
+                                session_id,
+                                options: options.options,
+                            })]
+                        }
+                        Some(search_session_templates_response::Result::Error(error)) => {
+                            vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+                                request_id: response.request_id,
+                                session_id,
+                                error: ClientError::new(error.message),
+                            })]
+                        }
+                        None => vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+                            request_id,
+                            session_id,
+                            error: ClientError::new(
+                                "session resource search response missing result",
+                            ),
+                        })],
+                    },
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::TemplatesSearchFailed {
+                        request_id,
+                        session_id,
+                        error,
+                    })],
+                },
+                ClientEffect::Session(SessionEffect::Watch { open_id }) => {
+                    match self.transport.watch_sessions().await {
+                        Ok(_) => vec![ClientEvent::Session(SessionEvent::WatchStartedForOpen {
                             open_id,
+                        })],
+                        Err(error) => vec![ClientEvent::Session(SessionEvent::WatchOpenFailed {
+                            open_id,
+                            error,
+                        })],
+                    }
+                }
+                ClientEffect::Session(SessionEffect::WatchTimeline { key, open_id }) => {
+                    match self
+                        .transport
+                        .watch_timeline(
+                            key.session_id.clone(),
+                            key.after_cursor,
+                            key.channels.clone(),
+                            key.initial_limit,
+                        )
+                        .await
+                    {
+                        Ok(_) => vec![ClientEvent::Session(
+                            SessionEvent::TimelineWatchStartedForOpen { key, open_id },
+                        )],
+                        Err(error) => vec![ClientEvent::Session(
+                            SessionEvent::TimelineWatchOpenFailed {
+                                key,
+                                open_id,
+                                error,
+                            },
+                        )],
+                    }
+                }
+                ClientEffect::Session(SessionEffect::SubmitUserMessage {
+                    operation_key,
+                    session_id,
+                    text,
+                }) => match self.transport.submit_user_message(session_id, text).await {
+                    Ok(()) => vec![ClientEvent::Session(SessionEvent::UserMessageSubmitted {
+                        operation_key,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(
+                        SessionEvent::UserMessageSubmitFailed {
+                            operation_key,
                             error,
                         },
                     )],
+                },
+                ClientEffect::Session(SessionEffect::RespondExternalRequest {
+                    operation_key,
+                    session_id,
+                    request_id,
+                    response_json,
+                }) => match self
+                    .transport
+                    .respond_external_request(session_id, request_id, response_json)
+                    .await
+                {
+                    Ok(()) => vec![ClientEvent::Session(
+                        SessionEvent::ExternalRequestResponded { operation_key },
+                    )],
+                    Err(error) => vec![ClientEvent::Session(
+                        SessionEvent::ExternalRequestRespondFailed {
+                            operation_key,
+                            error,
+                        },
+                    )],
+                },
+                ClientEffect::Session(SessionEffect::Interrupt {
+                    operation_key,
+                    session_id,
+                }) => match self.transport.interrupt_session(session_id).await {
+                    Ok(()) => vec![ClientEvent::Session(SessionEvent::Interrupted {
+                        operation_key,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::InterruptFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Session(SessionEffect::Rollback {
+                    operation_key,
+                    session_id,
+                    target,
+                }) => match self.transport.rollback_session(session_id, target).await {
+                    Ok(session) => vec![ClientEvent::Session(SessionEvent::RolledBack {
+                        operation_key,
+                        session,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::RollbackFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Session(SessionEffect::Continue {
+                    operation_key,
+                    session_id,
+                    target,
+                }) => match self.transport.continue_session(session_id, target).await {
+                    Ok(()) => vec![ClientEvent::Session(SessionEvent::Continued {
+                        operation_key,
+                    })],
+                    Err(error) => vec![ClientEvent::Session(SessionEvent::ContinueFailed {
+                        operation_key,
+                        error,
+                    })],
+                },
+                ClientEffect::Config(ConfigEffect::SleepReconnect { delay_ms }) => {
+                    sleep(delay_ms).await;
+                    vec![ClientEvent::Config(ConfigEvent::ReconnectReady)]
+                }
+                ClientEffect::Status(StatusEffect::SleepReconnect { epoch, delay_ms }) => {
+                    sleep(delay_ms).await;
+                    vec![ClientEvent::Status(StatusEvent::ReconnectReadyForEpoch {
+                        epoch,
+                    })]
+                }
+                ClientEffect::Session(SessionEffect::SleepReconnect { delay_ms }) => {
+                    sleep(delay_ms).await;
+                    vec![ClientEvent::Session(SessionEvent::ReconnectReady)]
+                }
+                ClientEffect::Session(SessionEffect::SleepTimelineReconnect { key, delay_ms }) => {
+                    sleep(delay_ms).await;
+                    vec![ClientEvent::Session(SessionEvent::TimelineReconnectReady {
+                        key,
+                    })]
                 }
             }
-            ClientEffect::Session(SessionEffect::SubmitUserMessage {
-                operation_key,
-                session_id,
-                text,
-            }) => match self.transport.submit_user_message(session_id, text).await {
-                Ok(()) => vec![ClientEvent::Session(SessionEvent::UserMessageSubmitted {
-                    operation_key,
-                })],
-                Err(error) => vec![ClientEvent::Session(
-                    SessionEvent::UserMessageSubmitFailed {
-                        operation_key,
-                        error,
-                    },
-                )],
-            },
-            ClientEffect::Session(SessionEffect::RespondExternalRequest {
-                operation_key,
-                session_id,
-                request_id,
-                response_json,
-            }) => match self
-                .transport
-                .respond_external_request(session_id, request_id, response_json)
-                .await
-            {
-                Ok(()) => vec![ClientEvent::Session(
-                    SessionEvent::ExternalRequestResponded { operation_key },
-                )],
-                Err(error) => vec![ClientEvent::Session(
-                    SessionEvent::ExternalRequestRespondFailed {
-                        operation_key,
-                        error,
-                    },
-                )],
-            },
-            ClientEffect::Session(SessionEffect::Interrupt {
-                operation_key,
-                session_id,
-            }) => match self.transport.interrupt_session(session_id).await {
-                Ok(()) => vec![ClientEvent::Session(SessionEvent::Interrupted {
-                    operation_key,
-                })],
-                Err(error) => vec![ClientEvent::Session(SessionEvent::InterruptFailed {
-                    operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Session(SessionEffect::Rollback {
-                operation_key,
-                session_id,
-                target,
-            }) => match self.transport.rollback_session(session_id, target).await {
-                Ok(session) => vec![ClientEvent::Session(SessionEvent::RolledBack {
-                    operation_key,
-                    session,
-                })],
-                Err(error) => vec![ClientEvent::Session(SessionEvent::RollbackFailed {
-                    operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Session(SessionEffect::Continue {
-                operation_key,
-                session_id,
-                target,
-            }) => match self.transport.continue_session(session_id, target).await {
-                Ok(()) => vec![ClientEvent::Session(SessionEvent::Continued {
-                    operation_key,
-                })],
-                Err(error) => vec![ClientEvent::Session(SessionEvent::ContinueFailed {
-                    operation_key,
-                    error,
-                })],
-            },
-            ClientEffect::Config(ConfigEffect::SleepReconnect { delay_ms }) => {
-                sleep(delay_ms).await;
-                vec![ClientEvent::Config(ConfigEvent::ReconnectReady)]
-            }
-            ClientEffect::Status(StatusEffect::SleepReconnect { epoch, delay_ms }) => {
-                sleep(delay_ms).await;
-                vec![ClientEvent::Status(StatusEvent::ReconnectReadyForEpoch {
-                    epoch,
-                })]
-            }
-            ClientEffect::Session(SessionEffect::SleepReconnect { delay_ms }) => {
-                sleep(delay_ms).await;
-                vec![ClientEvent::Session(SessionEvent::ReconnectReady)]
-            }
-            ClientEffect::Session(SessionEffect::SleepTimelineReconnect { key, delay_ms }) => {
-                sleep(delay_ms).await;
-                vec![ClientEvent::Session(SessionEvent::TimelineReconnectReady {
-                    key,
-                })]
-            }
-        }
+        })
     }
 }
 
@@ -679,7 +739,7 @@ impl From<crate::Configuration> for ConfigPatch {
         Self {
             providers: Some(config.providers),
             mcp_servers: Some(config.mcp_servers),
-            runtime_defaults: config.runtime_defaults,
+            inference_defaults: config.inference_defaults,
         }
     }
 }

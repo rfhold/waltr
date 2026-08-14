@@ -3,7 +3,7 @@ use waltr::grpc::waltr::session::v1::{
     SearchSessionTemplatesRequest, SessionTemplateKind, SessionTemplateSearchTarget,
     search_session_templates_response,
 };
-use waltr_agent::{ModelApi, SessionProviderRuntimeSettings, SessionRuntimeSettings};
+use waltr_agent::{InferenceProviderSettings, InferenceSettings, ModelApi};
 use waltr_server::test_support::setup_server_with_sessions;
 use std::collections::BTreeMap;
 
@@ -12,7 +12,7 @@ async fn search_session_templates_returns_tagged_tool_results()
 -> Result<(), Box<dyn std::error::Error>> {
     let (server, sessions) = setup_server_with_sessions();
     let session_id = sessions
-        .create_with_runtime_settings(Some(test_runtime_settings()), BTreeMap::default())
+        .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::default())
         .await?
         .id()
         .as_str()
@@ -62,9 +62,9 @@ async fn search_session_templates_returns_tagged_tool_results()
     Ok(())
 }
 
-fn test_runtime_settings() -> SessionRuntimeSettings {
-    SessionRuntimeSettings {
-        provider: SessionProviderRuntimeSettings {
+fn test_inference_settings() -> InferenceSettings {
+    InferenceSettings {
+        provider: InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -74,7 +74,5 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             oauth: None,
             reasoning_effort: None,
         },
-        mcp_servers: Vec::new(),
-        mcp_trace_propagation: false,
     }
 }

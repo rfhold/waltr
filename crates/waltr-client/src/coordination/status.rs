@@ -59,9 +59,14 @@ pub fn reduce(state: &mut ClientState, event: StatusEvent) -> ClientUpdate {
 }
 
 fn apply_status_changed(state: &mut ClientState, status: crate::SystemStatus) -> ClientUpdate {
+    let was_ready = state.is_system_ready();
     state.set_status_watch_changed(status);
     let mut update = config::maintain_watch(state);
     update.extend(session::maintain_watch(state));
+    if !was_ready && state.sessions.watch.interests > 0 {
+        state.access.reload_agents = false;
+        update.extend(session::maintain_agents(state, true));
+    }
     if state.access.reload_config {
         state.access.reload_config = false;
         update.extend(ClientUpdate::with_effect(ClientEffect::Config(

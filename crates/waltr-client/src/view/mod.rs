@@ -10,17 +10,16 @@ pub use catalog::{
     CatalogModelRefView, CatalogModelSummaryView,
 };
 pub use config::{
-    CatalogMatchSourceView, ConfigView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView, ModelTypeView,
-    ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    CatalogMatchSourceView, ConfigView, InferenceDefaultsView, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
+    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
-    RuntimeDefaultsView,
 };
 pub use session::{
-    ExternalRequestView, RuntimeConfigMatchView, SessionMcpServerRuntimeView, SessionMetricsView,
-    SessionPhaseView, SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView,
-    SessionTimelineView, SessionView, TimelineContentView, TimelineEventKindView,
-    TimelineEventView, TimelineStatusView, TimestampView,
+    ExternalRequestView, InferenceProviderSettingsView, InferenceSettingsMatchView,
+    InferenceSettingsView, SelectableAgentView, SessionMetricsView, SessionPhaseView,
+    SessionStatusView, SessionTimelineView, SessionView, TimelineContentView,
+    TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
 };
 
 #[cfg(test)]
@@ -40,8 +39,8 @@ mod tests {
         ClientSnapshot, ClientTimelineDirection, ConfigSnapshot, Configuration,
         McpAuthorizationContextSnapshot, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits,
         ModelOptions, ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider,
-        ProviderType, RollbackTargetView, SessionSnapshot, SessionTemplateOptionView,
-        SessionTemplateSearchSnapshot, StatusSnapshot,
+        ProviderType, RollbackTargetView, SessionAgentCatalogSnapshot, SessionSnapshot,
+        SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -63,7 +62,7 @@ mod tests {
             )]),
             etag: "v1".to_owned(),
             mcp_servers: HashMap::new(),
-            runtime_defaults: None,
+            inference_defaults: None,
         };
 
         let view = ConfigView::from(config.clone());
@@ -204,7 +203,7 @@ mod tests {
             OAuthProviderView::decl(),
             McpServerTypeView::decl(),
             McpServerView::decl(),
-            RuntimeDefaultsView::decl(),
+            InferenceDefaultsView::decl(),
             ProviderView::decl(),
             ConfigView::decl(),
             CatalogModelRefView::decl(),
@@ -221,11 +220,11 @@ mod tests {
             TimestampView::decl(),
             SessionPhaseView::decl(),
             SessionStatusView::decl(),
-            RuntimeConfigMatchView::decl(),
-            SessionProviderRuntimeView::decl(),
-            SessionMcpServerRuntimeView::decl(),
-            SessionRuntimeConfigView::decl(),
+            InferenceSettingsMatchView::decl(),
+            InferenceProviderSettingsView::decl(),
+            InferenceSettingsView::decl(),
             SessionMetricsView::decl(),
+            SelectableAgentView::decl(),
             SessionView::decl(),
             TimelineEventKindView::decl(),
             TimelineStatusView::decl(),
@@ -249,6 +248,7 @@ mod tests {
             OperationSnapshot::decl(),
             ConfigSnapshot::decl(),
             StatusSnapshot::decl(),
+            SessionAgentCatalogSnapshot::decl(),
             SessionSnapshot::decl(),
             ClientSnapshot::decl(),
             ClientSessionTemplateKind::decl(),

@@ -14,7 +14,7 @@ use waltr::grpc::waltr::config::v1::{
 };
 use waltr_agent::{
     AgentSessionRunDisposition, AuthTarget, ExternalRequest, ExternalRequestKind,
-    ExternalRequestStatus, PendingWork, PendingWorkStatus, SessionId, SessionRuntimeSettings,
+    ExternalRequestStatus, InferenceSettings, PendingWork, PendingWorkStatus, SessionId,
     SessionStatus, SessionSummary, Suspension,
 };
 use mcp::server::{ServerError, ServerResult};
@@ -89,9 +89,9 @@ struct PatchConfigurationInput {
     /// Replacement MCP servers section: `{ "mcp_servers": { "key": { ... } }`.
     #[serde(default)]
     mcp_servers: Option<Value>,
-    /// Replacement runtime defaults section.
+    /// Replacement inference defaults section.
     #[serde(default)]
-    runtime_defaults: Option<Value>,
+    inference_defaults: Option<Value>,
 }
 
 impl WaltrMcpServer {
@@ -169,7 +169,7 @@ impl WaltrMcpServer {
     fn configuration_runbook(&self) -> ServerResult<String> {
         Ok("## Waltr configuration runbook\n\n\
 1. Call `configuration.inspect` to load the current configuration and ETag.\n\
-2. Decide the smallest top-level section replacement needed: `providers`, `mcp_servers`, or `runtime_defaults`.\n\
+2. Decide the smallest top-level section replacement needed: `providers`, `mcp_servers`, or `inference_defaults`.\n\
 3. Build the replacement carefully: any provided top-level key replaces that entire section.\n\
 4. Call `configuration.patch` with `expected_etag` from the inspected config.\n\
 5. On validation or stale-ETag errors, inspect again before retrying.\n"
@@ -183,7 +183,7 @@ impl WaltrMcpServer {
         let mut sessions = Vec::with_capacity(summaries.len());
         for summary in summaries {
             let active = self.sessions.active_state(&summary.id).await;
-            sessions.push(project_summary(summary, active));
+            sessions.push(project_summary(&summary, active));
         }
         Ok(json!({ "sessions": sessions }))
     }
@@ -241,6 +241,10 @@ impl WaltrMcpServer {
 
     /// Wait until a jq condition matches, the session stops running, or time expires.
     #[action(tool = "sessions", name = "wait")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the wait loop keeps jq evaluation and race-free session reconciliation together"
+    )]
     async fn wait_session(&self, input: WaitInput) -> ServerResult<Value> {
         let id = required_session_id(input.id)?;
         let timeout_seconds = input.timeout_seconds.unwrap_or(DEFAULT_WAIT_SECONDS);
@@ -292,18 +296,18 @@ impl WaltrMcpServer {
                 .collect::<ServerResult<Vec<_>>>()?;
             let evaluated_output = jq_output(&outputs);
             if outputs.iter().any(jq_truthy) {
-                return Ok(wait_result("condition_met", projection, evaluated_output));
+                return Ok(wait_result("condition_met", &projection, &evaluated_output));
             }
             if !projection["running"].as_bool().unwrap_or(false) {
                 return Ok(wait_result(
                     "session_not_running",
-                    projection,
-                    evaluated_output,
+                    &projection,
+                    &evaluated_output,
                 ));
             }
 
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(deadline) => {
                     let projection = self.session_projection(&id).await?;
                     let inputs = RcIter::new(std::iter::empty());
                     let outputs = filter
@@ -319,23 +323,12 @@ impl WaltrMcpServer {
                     } else {
                         "timeout"
                     };
-                    return Ok(wait_result(reason, projection, jq_output(&outputs)));
+                    return Ok(wait_result(reason, &projection, &jq_output(&outputs)));
                 }
                 _ = reconcile.tick() => {
                     // Reload durable state periodically to reconcile lagged or process-local events.
                 }
-                update = updates.next() => {
-                    if let Some(update) = update {
-                        let update_id = match &update.event {
-                            waltr_agent::SessionListEvent::Upsert(summary) => &summary.id,
-                            waltr_agent::SessionListEvent::Deleted(deleted_id) => deleted_id,
-                            waltr_agent::SessionListEvent::Cleared => continue,
-                        };
-                        if update_id != &id {
-                            continue;
-                        }
-                    }
-                }
+                _update = updates.next() => {}
             }
         }
     }
@@ -357,8 +350,8 @@ impl PatchConfigurationInput {
         if let Some(value) = self.mcp_servers {
             request.insert("mcp_servers".to_owned(), value);
         }
-        if let Some(value) = self.runtime_defaults {
-            request.insert("runtime_defaults".to_owned(), value);
+        if let Some(value) = self.inference_defaults {
+            request.insert("inference_defaults".to_owned(), value);
         }
         serde_json::from_value(Value::Object(request)).map_err(|error| {
             ServerError::invalid_params(format!("invalid configuration patch input: {error}"))
@@ -380,7 +373,7 @@ fn project_session(
 ) -> Value {
     let snapshot = record.snapshot();
     let summary = record.summary();
-    let mut value = project_summary(summary, active);
+    let mut value = project_summary(&summary, active);
     let object = value
         .as_object_mut()
         .expect("session projection is an object");
@@ -404,7 +397,7 @@ fn project_session(
 }
 
 fn project_summary(
-    summary: SessionSummary,
+    summary: &SessionSummary,
     active: Option<waltr_agent::AgentSessionActiveRunState>,
 ) -> Value {
     let (status, durably_running, suspension, failure, retry) = project_status(&summary.status);
@@ -427,12 +420,16 @@ fn project_summary(
             "updated_at_ms": unix_millis(summary.updated_at),
             "last_activity_at_ms": unix_millis(summary.last_activity_at)
         },
-        "runtime": summary.runtime_settings.as_ref().map(project_runtime),
+        "inference": summary.inference_settings.as_ref().map(project_inference),
         "metrics": summary.metrics
     })
 }
 
-fn session_is_running(status: &SessionStatus, durably_running: bool, has_active_run: bool) -> bool {
+const fn session_is_running(
+    status: &SessionStatus,
+    durably_running: bool,
+    has_active_run: bool,
+) -> bool {
     durably_running || (has_active_run && !matches!(status, SessionStatus::Suspended(_)))
 }
 
@@ -556,22 +553,15 @@ fn project_external_request(request: &ExternalRequest) -> Value {
     })
 }
 
-fn project_runtime(runtime: &SessionRuntimeSettings) -> Value {
+fn project_inference(settings: &InferenceSettings) -> Value {
     json!({
         "provider": {
-            "key": runtime.provider.key,
-            "api": snake_debug(&runtime.provider.api),
-            "url": runtime.provider.url,
-            "model_id": runtime.provider.model_id,
-            "reasoning_effort": runtime.provider.reasoning_effort
-        },
-        "mcp_servers": runtime.mcp_servers.iter().map(|server| json!({
-            "key": server.key,
-            "kind": snake_debug(&server.kind),
-            "command": server.command,
-            "url": server.url
-        })).collect::<Vec<_>>(),
-        "mcp_trace_propagation": runtime.mcp_trace_propagation
+            "key": settings.provider.key,
+            "api": snake_debug(&settings.provider.api),
+            "url": settings.provider.url,
+            "model_id": settings.provider.model_id,
+            "reasoning_effort": settings.provider.reasoning_effort
+        }
     })
 }
 
@@ -595,7 +585,7 @@ fn unix_millis(time: std::time::SystemTime) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn jq_truthy(value: &Value) -> bool {
+const fn jq_truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false) | Value::Null)
 }
 
@@ -607,7 +597,7 @@ fn jq_output(outputs: &[Value]) -> Value {
     }
 }
 
-fn wait_result(reason: &str, session: Value, jq_output: Value) -> Value {
+fn wait_result(reason: &str, session: &Value, jq_output: &Value) -> Value {
     json!({ "reason": reason, "session": session, "jq_output": jq_output })
 }
 
@@ -616,6 +606,10 @@ fn response_to_value<T: Serialize>(response: T) -> ServerResult<Value> {
         .map_err(|error| ServerError::internal(format!("failed to serialize response: {error}")))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the signature is used directly as a Result::map_err conversion"
+)]
 fn session_error(error: waltr_agent::LlmError) -> ServerError {
     let message = error.to_string();
     if message.contains("session not found:") {
@@ -625,6 +619,10 @@ fn session_error(error: waltr_agent::LlmError) -> ServerError {
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the signature is used directly as a Result::map_err conversion"
+)]
 fn run_error(error: waltr_agent::AgentSessionRunError) -> ServerError {
     let message = error.to_string();
     match error {

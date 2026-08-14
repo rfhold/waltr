@@ -1,7 +1,7 @@
 use crate::support::grpc::{config_client, config_with_provider, get_config};
 use waltr::grpc::waltr::config::v1::{
-    Configuration, McpServer, McpServerMapPatch, McpServerType, Model, ModelType,
-    PatchConfigRequest, Provider, ProviderMapPatch, ProviderType, RuntimeDefaults,
+    Configuration, InferenceDefaults, McpServer, McpServerMapPatch, McpServerType, Model,
+    ModelType, PatchConfigRequest, Provider, ProviderMapPatch, ProviderType,
 };
 use waltr_server::test_support::setup_server;
 use tonic::Code;
@@ -19,7 +19,7 @@ async fn config_service_rejects_invalid_provider_names() -> Result<(), Box<dyn s
                 providers: config_with_provider("Open AI").providers,
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect_err("invalid provider names should be rejected");
@@ -44,7 +44,7 @@ async fn config_service_rejects_model_with_unspecified_type()
                     .providers,
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect_err("model with unspecified type should be rejected");
@@ -67,7 +67,7 @@ async fn config_service_accepts_model_with_valid_type() -> Result<(), Box<dyn st
                 providers: config_with_model("anthropic", "claude", ModelType::Llm).providers,
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect("model with a valid type should be accepted");
@@ -96,7 +96,7 @@ async fn config_service_rejects_mcp_server_with_unspecified_type()
             mcp_servers: Some(McpServerMapPatch {
                 mcp_servers: config_with_mcp_server("tools", server_def).mcp_servers,
             }),
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect_err("mcp server with unspecified type should be rejected");
@@ -126,7 +126,7 @@ async fn config_service_rejects_stdio_server_without_command()
             mcp_servers: Some(McpServerMapPatch {
                 mcp_servers: config_with_mcp_server("tools", server_def).mcp_servers,
             }),
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect_err("stdio server without command should be rejected");
@@ -155,7 +155,7 @@ async fn config_service_rejects_sse_server_without_url() -> Result<(), Box<dyn s
             mcp_servers: Some(McpServerMapPatch {
                 mcp_servers: config_with_mcp_server("tools", server_def).mcp_servers,
             }),
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect_err("sse server without url should be rejected");
@@ -202,7 +202,7 @@ async fn config_service_accepts_valid_mcp_servers() -> Result<(), Box<dyn std::e
             mcp_servers: Some(McpServerMapPatch {
                 mcp_servers: config.mcp_servers,
             }),
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await
         .expect("valid stdio and sse mcp servers should be accepted");
@@ -211,7 +211,7 @@ async fn config_service_accepts_valid_mcp_servers() -> Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
-async fn config_service_rejects_unknown_runtime_default_provider()
+async fn config_service_rejects_unknown_inference_default_provider()
 -> Result<(), Box<dyn std::error::Error>> {
     let server = setup_server();
     let mut client = config_client(server).await?;
@@ -222,11 +222,9 @@ async fn config_service_rejects_unknown_runtime_default_provider()
             expected_etag: initial.etag,
             providers: None,
             mcp_servers: None,
-            runtime_defaults: Some(RuntimeDefaults {
+            inference_defaults: Some(InferenceDefaults {
                 provider_key: "missing".to_owned(),
                 model_key: "model".to_owned(),
-                mcp_default_enabled: None,
-                enabled_mcp_server_keys: Vec::new(),
                 reasoning_effort: None,
             }),
         })
@@ -239,7 +237,7 @@ async fn config_service_rejects_unknown_runtime_default_provider()
 }
 
 #[tokio::test]
-async fn config_service_rejects_unknown_runtime_default_reasoning_effort()
+async fn config_service_rejects_unknown_inference_default_reasoning_effort()
 -> Result<(), Box<dyn std::error::Error>> {
     let server = setup_server();
     let mut client = config_client(server).await?;
@@ -250,11 +248,9 @@ async fn config_service_rejects_unknown_runtime_default_reasoning_effort()
             expected_etag: initial.etag,
             providers: None,
             mcp_servers: None,
-            runtime_defaults: Some(RuntimeDefaults {
+            inference_defaults: Some(InferenceDefaults {
                 provider_key: "anthropic".to_owned(),
                 model_key: "claude-haiku-4-5".to_owned(),
-                mcp_default_enabled: None,
-                enabled_mcp_server_keys: Vec::new(),
                 reasoning_effort: Some("high".to_owned()),
             }),
         })

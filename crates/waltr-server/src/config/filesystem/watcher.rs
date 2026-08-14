@@ -220,8 +220,8 @@ fn changed_keys(previous: &Configuration, current: &Configuration) -> Vec<String
     if previous.mcp_servers != current.mcp_servers {
         keys.insert("mcp_servers".to_owned());
     }
-    if previous.runtime_defaults != current.runtime_defaults {
-        keys.insert("runtime_defaults".to_owned());
+    if previous.inference_defaults != current.inference_defaults {
+        keys.insert("inference_defaults".to_owned());
     }
     keys.into_iter().collect()
 }
@@ -238,10 +238,10 @@ fn changed_config(previous: &Configuration, current: &Configuration) -> Configur
     if previous.mcp_servers != current.mcp_servers {
         config.mcp_servers.clone_from(&current.mcp_servers);
     }
-    if previous.runtime_defaults != current.runtime_defaults {
+    if previous.inference_defaults != current.inference_defaults {
         config
-            .runtime_defaults
-            .clone_from(&current.runtime_defaults);
+            .inference_defaults
+            .clone_from(&current.inference_defaults);
     }
 
     config
@@ -252,7 +252,7 @@ mod tests {
     use super::*;
     use crate::config::{ConfigPubSub, ConfigStore, FilesystemConfigPubSub};
     use waltr::grpc::waltr::config::v1::{
-        McpServer, McpServerType, Provider, ProviderType, RuntimeDefaults,
+        InferenceDefaults, McpServer, McpServerType, Provider, ProviderType,
     };
     use notify::{Event, EventKind};
     use tokio_stream::StreamExt;
@@ -474,15 +474,13 @@ mod tests {
     }
 
     #[test]
-    fn changed_config_includes_runtime_default_changes() {
+    fn changed_config_includes_inference_default_changes() {
         let previous = Configuration::default();
         let current = Configuration {
             etag: "etag-2".to_owned(),
-            runtime_defaults: Some(RuntimeDefaults {
+            inference_defaults: Some(InferenceDefaults {
                 provider_key: "anthropic".to_owned(),
                 model_key: "sonnet".to_owned(),
-                mcp_default_enabled: None,
-                enabled_mcp_server_keys: Vec::new(),
                 reasoning_effort: None,
             }),
             ..Configuration::default()
@@ -491,9 +489,9 @@ mod tests {
         let changed_keys = changed_keys(&previous, &current);
         let config = changed_config(&previous, &current);
 
-        assert_eq!(changed_keys, vec!["runtime_defaults"]);
+        assert_eq!(changed_keys, vec!["inference_defaults"]);
         assert_eq!(config.etag, "etag-2");
-        assert_eq!(config.runtime_defaults, current.runtime_defaults);
+        assert_eq!(config.inference_defaults, current.inference_defaults);
         assert!(config.providers.is_empty());
         assert!(config.mcp_servers.is_empty());
     }

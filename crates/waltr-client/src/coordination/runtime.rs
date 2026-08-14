@@ -22,11 +22,11 @@ use crate::{
     AccessAttemptId, AccessStatus, AuthAttemptState, AuthStatus, AuthTarget, CatalogEffect,
     CatalogMatchView, CatalogModelSummaryView, Client, ClientEffect, ClientError, ClientEvent,
     ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
-    McpAuthorizationContext, McpServerView, OperationKey, OperationStatus,
-    OutboundAuthenticationFailure, ProviderView, RollbackTarget, RuntimeDefaultsView,
-    SessionEffect, SessionEvent, SessionRuntimeConfigRequest, SessionTemplateKind,
-    SessionTemplateOption, SessionTimelineView, SessionView, StatusChangeStream, StatusEffect,
-    StatusEvent, TimelineDirection, TimelineQuery, TimelineWatchKey, rollback_target,
+    InferenceDefaultsView, InferenceSettingsRequest, McpAuthorizationContext, McpServerView,
+    OperationKey, OperationStatus, OutboundAuthenticationFailure, ProviderView, RollbackTarget,
+    SessionEffect, SessionEvent, SessionTemplateKind, SessionTemplateOption, SessionTimelineView,
+    SessionView, StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
+    TimelineWatchKey, rollback_target,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -172,17 +172,23 @@ pub enum ClientCommand {
         /// MCP server key to delete.
         name: String,
     },
-    /// Replace runtime defaults for newly created sessions.
-    SetRuntimeDefaults {
-        /// Runtime defaults to store, or null to clear defaults.
-        defaults: Option<RuntimeDefaultsView>,
+    /// Replace inference defaults for newly created sessions.
+    SetInferenceDefaults {
+        /// Inference defaults to store, or null to clear defaults.
+        defaults: Option<InferenceDefaultsView>,
     },
     /// Register current interest in configuration watch updates.
     RegisterConfigWatchInterest,
     /// Release current interest in configuration watch updates.
     ReleaseConfigWatchInterest,
     /// Create a new server-side session.
-    CreateSession,
+    CreateSession {
+        /// Exact selectable agent name.
+        #[serde(rename = "agentName")]
+        agent_name: String,
+    },
+    /// Retry loading selectable session agents.
+    RequestSessionAgents,
     /// Delete a server-side session by id.
     DeleteSession {
         /// Session id to delete.
@@ -190,8 +196,8 @@ pub enum ClientCommand {
     },
     /// Delete every server-side session after local confirmation.
     WipeSessions,
-    /// Replace runtime config metadata for a server-side session.
-    UpdateSessionRuntimeConfig {
+    /// Replace inference settings for a server-side session.
+    UpdateSessionInferenceSettings {
         /// Session id to update.
         id: String,
         /// Provider key to use on subsequent prompts.
@@ -200,12 +206,17 @@ pub enum ClientCommand {
         /// Model id to use on subsequent prompts.
         #[serde(rename = "modelId")]
         model_id: String,
-        /// MCP server keys enabled for subsequent prompts.
-        #[serde(rename = "enabledMcpServerKeys")]
-        enabled_mcp_server_keys: Vec<String>,
         /// Optional per-session reasoning effort.
         #[serde(rename = "reasoningEffort")]
         reasoning_effort: Option<String>,
+    },
+    /// Switch a session to an exact selectable agent.
+    UpdateSessionAgent {
+        /// Session id to update.
+        id: String,
+        /// Exact selectable agent name.
+        #[serde(rename = "agentName")]
+        agent_name: String,
     },
     /// Register current interest in session watch updates.
     RegisterSessionWatchInterest,
@@ -687,8 +698,17 @@ pub enum ClientOperationView {
         /// Last operation error, when present.
         error: Option<String>,
     },
-    /// Session runtime metadata update command result.
-    SessionRuntimeConfigUpdate {
+    /// Session inference settings update command result.
+    SessionInferenceSettingsUpdate {
+        /// Stable operation status name.
+        status: &'static str,
+        /// Last operation error, when present.
+        error: Option<String>,
+        /// Updated session, when the operation completed successfully.
+        session: Option<SessionView>,
+    },
+    /// Session agent update command result.
+    SessionAgentUpdate {
         /// Stable operation status name.
         status: &'static str,
         /// Last operation error, when present.
@@ -826,6 +846,8 @@ pub struct StatusSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
+    /// Selectable session agent catalog.
+    pub agents: SessionAgentCatalogSnapshot,
     /// Last known sessions.
     pub current: Vec<SessionView>,
     /// Session create operation snapshot.
@@ -836,8 +858,10 @@ pub struct SessionSnapshot {
     pub delete: OperationSnapshot,
     /// Session wipe operation snapshot.
     pub wipe: OperationSnapshot,
-    /// Session runtime metadata update operation snapshot.
-    pub runtime_config_update: OperationSnapshot,
+    /// Session inference settings update operation snapshot.
+    pub inference_settings_update: OperationSnapshot,
+    /// Session agent update operation snapshot.
+    pub agent_update: OperationSnapshot,
     /// User message submit operation snapshot.
     pub submit_user_message: OperationSnapshot,
     /// External request response operation snapshot.
@@ -854,6 +878,18 @@ pub struct SessionSnapshot {
     pub timelines: BTreeMap<String, SessionTimelineView>,
     /// Latest resource search state by session id.
     pub template_searches: BTreeMap<String, SessionTemplateSearchSnapshot>,
+}
+
+/// Stable selectable session agent catalog snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAgentCatalogSnapshot {
+    /// Deterministically ordered selectable agents.
+    pub entries: Vec<crate::SelectableAgentView>,
+    /// Server-selected default agent name.
+    pub default_agent_name: String,
+    /// Catalog load operation snapshot.
+    pub load: OperationSnapshot,
 }
 
 /// Stable snapshot of resource search state for one session.
@@ -1461,15 +1497,17 @@ impl ClientStateStream {
             | ClientCommand::AddMcpServer { .. }
             | ClientCommand::UpdateMcpServer { .. }
             | ClientCommand::DeleteMcpServer { .. }
-            | ClientCommand::SetRuntimeDefaults { .. }
+            | ClientCommand::SetInferenceDefaults { .. }
             | ClientCommand::RegisterConfigWatchInterest
             | ClientCommand::ReleaseConfigWatchInterest => self.begin_config_command(command)?,
             ClientCommand::SearchCatalogModels { .. }
             | ClientCommand::SuggestCatalogMatches { .. } => self.begin_catalog_command(command),
-            ClientCommand::CreateSession
+            ClientCommand::CreateSession { .. }
+            | ClientCommand::RequestSessionAgents
             | ClientCommand::DeleteSession { .. }
             | ClientCommand::WipeSessions
-            | ClientCommand::UpdateSessionRuntimeConfig { .. }
+            | ClientCommand::UpdateSessionInferenceSettings { .. }
+            | ClientCommand::UpdateSessionAgent { .. }
             | ClientCommand::SearchSessionTemplates { .. }
             | ClientCommand::RegisterSessionWatchInterest
             | ClientCommand::ReleaseSessionWatchInterest
@@ -1579,10 +1617,10 @@ impl ClientStateStream {
             ClientCommand::DeleteMcpServer { name } => {
                 self.runtime.reducer.delete_mcp_server(&name)?
             }
-            ClientCommand::SetRuntimeDefaults { defaults } => self
+            ClientCommand::SetInferenceDefaults { defaults } => self
                 .runtime
                 .reducer
-                .set_runtime_defaults(defaults.map(Into::into))?,
+                .set_inference_defaults(defaults.map(Into::into))?,
             ClientCommand::RegisterConfigWatchInterest => {
                 self.runtime.reducer.register_config_watch_interest()
             }
@@ -1644,24 +1682,28 @@ impl ClientStateStream {
     #[allow(clippy::too_many_lines)]
     fn begin_session_command(&mut self, command: ClientCommand) -> ClientUpdate {
         match command {
-            ClientCommand::CreateSession => self.runtime.reducer.create_session(),
+            ClientCommand::CreateSession { agent_name } => {
+                self.runtime.reducer.create_session(agent_name)
+            }
+            ClientCommand::RequestSessionAgents => self.runtime.reducer.request_session_agents(),
             ClientCommand::DeleteSession { id } => self.runtime.reducer.delete_session(id),
             ClientCommand::WipeSessions => self.runtime.reducer.wipe_sessions(),
-            ClientCommand::UpdateSessionRuntimeConfig {
+            ClientCommand::UpdateSessionInferenceSettings {
                 id,
                 provider_key,
                 model_id,
-                enabled_mcp_server_keys,
                 reasoning_effort,
-            } => self.runtime.reducer.update_session_runtime_config(
+            } => self.runtime.reducer.update_session_inference_settings(
                 id,
-                SessionRuntimeConfigRequest {
+                InferenceSettingsRequest {
                     provider_key,
                     model_id,
-                    enabled_mcp_server_keys,
                     reasoning_effort,
                 },
             ),
+            ClientCommand::UpdateSessionAgent { id, agent_name } => {
+                self.runtime.reducer.update_session_agent(id, agent_name)
+            }
             ClientCommand::SearchSessionTemplates {
                 request_id,
                 session_id,
@@ -1692,7 +1734,12 @@ impl ClientStateStream {
                 if self.runtime.reducer.state().sessions.watch.interests == 0 {
                     self.runtime.session_watch = None;
                     self.cancel_effects(|effect| {
-                        matches!(effect, ClientEffect::Session(SessionEffect::Watch { .. }))
+                        matches!(
+                            effect,
+                            ClientEffect::Session(
+                                SessionEffect::Watch { .. } | SessionEffect::ListAgents { .. }
+                            )
+                        )
                     });
                 }
                 update
@@ -2259,6 +2306,18 @@ impl ClientSnapshot {
                 ),
             },
             sessions: SessionSnapshot {
+                agents: SessionAgentCatalogSnapshot {
+                    entries: state
+                        .sessions
+                        .agents
+                        .entries
+                        .iter()
+                        .cloned()
+                        .map(Into::into)
+                        .collect(),
+                    default_agent_name: state.sessions.agents.default_agent_name.clone(),
+                    load: OperationSnapshot::from_state(&state.sessions.agents.load),
+                },
                 current: state
                     .sessions
                     .current
@@ -2270,9 +2329,10 @@ impl ClientSnapshot {
                 list: OperationSnapshot::from_state(&state.sessions.list),
                 delete: OperationSnapshot::from_state(&state.sessions.delete),
                 wipe: OperationSnapshot::from_state(&state.sessions.wipe),
-                runtime_config_update: OperationSnapshot::from_state(
-                    &state.sessions.runtime_config_update,
+                inference_settings_update: OperationSnapshot::from_state(
+                    &state.sessions.inference_settings_update,
                 ),
+                agent_update: OperationSnapshot::from_state(&state.sessions.agent_update),
                 submit_user_message: OperationSnapshot::from_state(
                     &state.sessions.submit_user_message,
                 ),
@@ -2653,11 +2713,20 @@ impl From<ClientOperationState> for ClientOperationView {
                 status: operation_status_name(status),
                 error,
             },
-            ClientOperationState::SessionRuntimeConfigUpdate {
+            ClientOperationState::SessionInferenceSettingsUpdate {
                 status,
                 error,
                 session,
-            } => Self::SessionRuntimeConfigUpdate {
+            } => Self::SessionInferenceSettingsUpdate {
+                status: operation_status_name(status),
+                error,
+                session: session.map(SessionView::from),
+            },
+            ClientOperationState::SessionAgentUpdate {
+                status,
+                error,
+                session,
+            } => Self::SessionAgentUpdate {
                 status: operation_status_name(status),
                 error,
                 session: session.map(SessionView::from),
@@ -3329,12 +3398,13 @@ mod tests {
             [
                 ClientEffect::Config(ConfigEffect::Watch { .. }),
                 ClientEffect::Session(SessionEffect::Watch { .. }),
+                ClientEffect::Session(SessionEffect::ListAgents { .. }),
                 ClientEffect::Config(ConfigEffect::Load),
                 ClientEffect::Session(SessionEffect::List),
             ]
         ));
         stream.extend_effects(&update);
-        assert_eq!(stream.effects.len(), 4);
+        assert_eq!(stream.effects.len(), 5);
         assert!(matches!(
             stream.runtime.reducer.maintain_watches().effects(),
             [ClientEffect::Session(SessionEffect::WatchTimeline { .. })]
@@ -3384,6 +3454,70 @@ mod tests {
     }
 
     #[test]
+    fn inference_commands_have_stable_json_contracts() {
+        let defaults = serde_json::to_value(ClientCommand::SetInferenceDefaults {
+            defaults: Some(InferenceDefaultsView {
+                provider_key: "openai".to_owned(),
+                model_id: "gpt-5".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
+            }),
+        })
+        .expect("defaults command should serialize");
+        assert_eq!(
+            defaults,
+            serde_json::json!({
+                "type": "setInferenceDefaults",
+                "defaults": {
+                    "providerKey": "openai",
+                    "modelId": "gpt-5",
+                    "reasoningEffort": "high",
+                },
+            })
+        );
+
+        let create = serde_json::to_value(ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            create,
+            serde_json::json!({"type": "createSession", "agentName": "coding"})
+        );
+
+        let switch = serde_json::to_value(ClientCommand::UpdateSessionAgent {
+            id: "session-1".to_owned(),
+            agent_name: "research".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            switch,
+            serde_json::json!({
+                "type": "updateSessionAgent",
+                "id": "session-1",
+                "agentName": "research"
+            })
+        );
+
+        let session = serde_json::to_value(ClientCommand::UpdateSessionInferenceSettings {
+            id: "session-1".to_owned(),
+            provider_key: "openai".to_owned(),
+            model_id: "gpt-5".to_owned(),
+            reasoning_effort: None,
+        })
+        .expect("session command should serialize");
+        assert_eq!(
+            session,
+            serde_json::json!({
+                "type": "updateSessionInferenceSettings",
+                "id": "session-1",
+                "providerKey": "openai",
+                "modelId": "gpt-5",
+                "reasoningEffort": null,
+            })
+        );
+    }
+
+    #[test]
     fn session_clear_drops_timeline_runtime_state_but_preserves_list_watch_work() {
         let mut stream =
             ClientRuntime::for_endpoint("http://127.0.0.1:0").into_state_stream(no_sleep);
@@ -3403,10 +3537,7 @@ mod tests {
             },
             QueuedEffect {
                 access_generation: 0,
-                effect: ClientEffect::Session(SessionEffect::WatchTimeline {
-                    key: key.clone(),
-                    open_id: 2,
-                }),
+                effect: ClientEffect::Session(SessionEffect::WatchTimeline { key, open_id: 2 }),
             },
             QueuedEffect {
                 access_generation: 0,

@@ -45,6 +45,7 @@ async fn session_service_watch_emits_created_sessions() -> Result<(), Box<dyn st
     assert!(update.sequence > 0);
     assert_eq!(watched.id, created.id);
     assert_eq!(watched.revision, 0);
+    assert_eq!(watched.agent_name, "coding");
     assert_eq!(
         watched.status.expect("status should be present").phase,
         SessionPhase::Idle as i32

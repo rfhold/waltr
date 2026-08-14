@@ -75,6 +75,10 @@ pub enum McpOAuthConfig {
 }
 
 /// Validated enabled configuration.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent deployment policy switches are validated together at startup"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpOAuthEnabledConfig {
     issuer: String,

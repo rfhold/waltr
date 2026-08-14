@@ -10,10 +10,27 @@ use crate::{
 #[allow(clippy::match_same_arms)]
 pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
     match event {
-        SessionEvent::CreateRequested(operation_key) => {
+        SessionEvent::AgentsLoadRequested => maintain_agents(state, true),
+        SessionEvent::AgentsLoaded {
+            request_id,
+            agents,
+            default_agent_name,
+        } => {
+            state.set_session_agents_ready(request_id, agents, default_agent_name);
+            ClientUpdate::default()
+        }
+        SessionEvent::AgentsLoadFailed { request_id, error } => {
+            state.set_session_agents_failed(request_id, error.to_string());
+            ClientUpdate::default()
+        }
+        SessionEvent::CreateRequested {
+            operation_key,
+            agent_name,
+        } => {
             state.set_session_create_loading(operation_key.clone());
             ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::Create {
                 operation_key,
+                agent_name,
             }))
         }
         SessionEvent::Created {
@@ -64,30 +81,58 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             state.set_session_wipe_failed(operation_key, error.to_string());
             ClientUpdate::default()
         }
-        SessionEvent::RuntimeConfigUpdateRequested {
+        SessionEvent::InferenceSettingsUpdateRequested {
             operation_key,
             id,
-            runtime_config,
+            inference_settings,
         } => {
-            state.set_session_runtime_config_update_loading(operation_key.clone());
-            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::UpdateRuntimeConfig {
-                operation_key,
-                id,
-                runtime_config,
-            }))
+            state.set_session_inference_settings_update_loading(operation_key.clone());
+            ClientUpdate::with_effect(ClientEffect::Session(
+                SessionEffect::UpdateInferenceSettings {
+                    operation_key,
+                    id,
+                    inference_settings,
+                },
+            ))
         }
-        SessionEvent::RuntimeConfigUpdated {
+        SessionEvent::InferenceSettingsUpdated {
             operation_key,
             session,
         } => {
-            state.set_session_runtime_config_update_ready(operation_key, session);
+            state.set_session_inference_settings_update_ready(operation_key, session);
             ClientUpdate::default()
         }
-        SessionEvent::RuntimeConfigUpdateFailed {
+        SessionEvent::InferenceSettingsUpdateFailed {
             operation_key,
             error,
         } => {
-            state.set_session_runtime_config_update_failed(operation_key, error.to_string());
+            state.set_session_inference_settings_update_failed(operation_key, error.to_string());
+            ClientUpdate::default()
+        }
+        SessionEvent::SessionAgentUpdateRequested {
+            operation_key,
+            id,
+            agent_name,
+        } => {
+            state.set_session_agent_update_loading(operation_key.clone());
+            ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::UpdateAgent {
+                operation_key,
+                id,
+                agent_name,
+            }))
+        }
+        SessionEvent::SessionAgentUpdated {
+            operation_key,
+            session,
+        } => {
+            state.set_session_agent_update_ready(operation_key, session);
+            ClientUpdate::default()
+        }
+        SessionEvent::SessionAgentUpdateFailed {
+            operation_key,
+            error,
+        } => {
+            state.set_session_agent_update_failed(operation_key, error.to_string());
             ClientUpdate::default()
         }
         SessionEvent::ListRequested => {
@@ -159,7 +204,9 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
         }
         SessionEvent::WatchInterestRegistered => {
             state.add_session_watch_interest();
-            maintain_watch(state)
+            let mut update = maintain_watch(state);
+            update.extend(maintain_agents(state, false));
+            update
         }
         SessionEvent::WatchInterestReleased => {
             state.remove_session_watch_interest();
@@ -383,6 +430,24 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
     }
 }
 
+pub fn maintain_agents(state: &mut ClientState, force: bool) -> ClientUpdate {
+    if state.sessions.watch.interests == 0 || !state.permits_watch_maintenance() {
+        return ClientUpdate::default();
+    }
+    if !force
+        && matches!(
+            state.sessions.agents.load.status,
+            OperationStatus::Loading | OperationStatus::Ready
+        )
+    {
+        return ClientUpdate::default();
+    }
+    let request_id = state.set_session_agents_loading();
+    ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::ListAgents {
+        request_id,
+    }))
+}
+
 pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
     if state.sessions.watch.interests == 0 {
         return ClientUpdate::default();
@@ -564,6 +629,99 @@ mod tests {
     use waltr::grpc::waltr::auth::v1::{
         AuthenticationDomain, AuthenticationFailureReason, BeginAuthResponse, auth_target,
     };
+    use waltr::grpc::waltr::session::v1::SelectableAgent;
+
+    #[test]
+    fn stale_agent_catalog_completion_is_ignored_and_entries_are_sorted() {
+        let mut client = Client::new();
+        client.apply(ClientEvent::Status(crate::StatusEvent::WatchChanged(
+            crate::SystemStatus { ready: true },
+        )));
+        let first = client.register_session_watch_interest();
+        let request_id = first
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                ClientEffect::Session(SessionEffect::ListAgents { request_id }) => {
+                    Some(*request_id)
+                }
+                _ => None,
+            })
+            .expect("agent catalog effect");
+        let second = client.request_session_agents();
+        let newer_id = match second.effects() {
+            [ClientEffect::Session(SessionEffect::ListAgents { request_id })] => *request_id,
+            effects => panic!("unexpected effects: {effects:?}"),
+        };
+
+        client.apply(ClientEvent::Session(SessionEvent::AgentsLoaded {
+            request_id,
+            agents: vec![SelectableAgent {
+                name: "stale".to_owned(),
+                description: None,
+            }],
+            default_agent_name: "stale".to_owned(),
+        }));
+        assert!(client.state().sessions.agents.entries.is_empty());
+
+        client.apply(ClientEvent::Session(SessionEvent::AgentsLoaded {
+            request_id: newer_id,
+            agents: vec![
+                SelectableAgent {
+                    name: "zeta".to_owned(),
+                    description: None,
+                },
+                SelectableAgent {
+                    name: "alpha".to_owned(),
+                    description: Some("Alpha".to_owned()),
+                },
+            ],
+            default_agent_name: "alpha".to_owned(),
+        }));
+        assert_eq!(client.state().sessions.agents.entries[0].name, "alpha");
+        assert_eq!(client.state().sessions.agents.default_agent_name, "alpha");
+    }
+
+    #[test]
+    fn stale_agent_update_does_not_close_newer_aggregate_operation() {
+        let mut client = Client::new();
+        let first = client.update_session_agent("session-1", "alpha");
+        let first_key = match first.effects() {
+            [ClientEffect::Session(SessionEffect::UpdateAgent { operation_key, .. })] => {
+                operation_key.clone()
+            }
+            effects => panic!("unexpected effects: {effects:?}"),
+        };
+        let second = client.update_session_agent("session-1", "beta");
+        let second_key = match second.effects() {
+            [ClientEffect::Session(SessionEffect::UpdateAgent { operation_key, .. })] => {
+                operation_key.clone()
+            }
+            effects => panic!("unexpected effects: {effects:?}"),
+        };
+
+        client.apply(ClientEvent::Session(SessionEvent::SessionAgentUpdated {
+            operation_key: first_key.clone(),
+            session: crate::SessionSummary {
+                id: "session-1".to_owned(),
+                agent_name: "alpha".to_owned(),
+                ..crate::SessionSummary::default()
+            },
+        }));
+        assert_eq!(client.state().sessions.agent_update.key, Some(second_key));
+        assert_eq!(
+            client.state().sessions.agent_update.status,
+            OperationStatus::Loading
+        );
+        assert!(client.state().sessions.current.is_empty());
+        assert!(matches!(
+            client.state().operations.get(&first_key),
+            Some(crate::ClientOperationState::SessionAgentUpdate {
+                status: OperationStatus::Ready,
+                ..
+            })
+        ));
+    }
 
     fn target() -> crate::AuthTarget {
         crate::AuthTarget {

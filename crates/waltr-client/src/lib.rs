@@ -28,15 +28,16 @@ pub use coordination::runtime::{
     ClientRuntime, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
     McpAuthorizationContextSnapshot, OperationCollectionSnapshot, OperationSnapshot,
-    RollbackTargetView, SessionSnapshot, SessionTemplateOptionView, SessionTemplateSearchSnapshot,
-    StatusSnapshot,
+    RollbackTargetView, SessionAgentCatalogSnapshot, SessionSnapshot, SessionTemplateOptionView,
+    SessionTemplateSearchSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
     AccessAttemptId, AccessClientState, AccessStatus, AuthAttemptState, AuthClientState,
     CatalogClientState, CatalogMatchSuggestionState, CatalogModelSearchState, ClientOperationState,
     ClientState, ConfigClientState, OperationKey, OperationState, OperationStatus,
-    SessionClientState, SessionTemplateSearchState, StatusClientState, StreamClientState,
-    StreamState, StreamStatus, TimelineWatchKey, WatchState, watch_reconnect_delay_ms,
+    SessionAgentCatalogState, SessionClientState, SessionTemplateSearchState, StatusClientState,
+    StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
+    watch_reconnect_delay_ms,
 };
 pub use error::{
     ClientError, ClientErrorKind, McpAuthorizationContext, OutboundAuthenticationFailure,
@@ -54,19 +55,19 @@ pub use waltr::grpc::waltr::catalog::v1::{
     SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
 };
 pub use waltr::grpc::waltr::config::v1::{
-    CatalogMatchSource, Configuration, McpServer, McpServerType, Model, ModelCapabilities,
-    ModelCatalogMatch, ModelCost, ModelLimits, ModelOptions, ModelType, OAuthProvider,
-    OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, OauthUrlParam, Provider,
-    ProviderType, RuntimeDefaults,
+    CatalogMatchSource, Configuration, InferenceDefaults, McpServer, McpServerType, Model,
+    ModelCapabilities, ModelCatalogMatch, ModelCost, ModelLimits, ModelOptions, ModelType,
+    OAuthProvider, OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, OauthUrlParam,
+    Provider, ProviderType,
 };
 pub use waltr::grpc::waltr::session::v1::{
-    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, RollbackTarget,
-    RuntimeConfigMatch, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse,
-    SessionMcpServerRuntime, SessionMetrics, SessionPhase, SessionProviderRuntime,
-    SessionRuntimeConfig, SessionRuntimeConfigRequest, SessionStatus, SessionSummary,
-    SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, Suspension,
-    SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent, TimelineEventKind,
-    TimelineQuery, TimelineStatus, TimelineTruncation, rollback_target,
+    ExternalRequest, ExternalRequestKind, InferenceProviderSettings, InferenceSettings,
+    InferenceSettingsMatch, InferenceSettingsRequest, ListAgentsResponse, PendingWork,
+    PendingWorkStatus, RollbackTarget, SearchSessionTemplatesRequest,
+    SearchSessionTemplatesResponse, SelectableAgent, SessionMetrics, SessionPhase, SessionStatus,
+    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
+    Suspension, SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent,
+    TimelineEventKind, TimelineQuery, TimelineStatus, TimelineTruncation, rollback_target,
     search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
@@ -81,12 +82,12 @@ pub use view::{
     CatalogMatchConfidenceView, CatalogMatchSourceView, CatalogMatchView,
     CatalogModelCapabilitySummaryView, CatalogModelCostSummaryView, CatalogModelLimitsSummaryView,
     CatalogModelReasoningSummaryView, CatalogModelRefView, CatalogModelSummaryView, ConfigView,
-    ExternalRequestView, McpServerTypeView, McpServerView, ModelCapabilitiesView,
-    ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView, ModelTypeView,
-    ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
+    ExternalRequestView, InferenceDefaultsView, InferenceProviderSettingsView,
+    InferenceSettingsMatchView, InferenceSettingsView, McpServerTypeView, McpServerView,
+    ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
+    ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
-    RuntimeConfigMatchView, RuntimeDefaultsView, SessionMcpServerRuntimeView, SessionMetricsView,
-    SessionPhaseView, SessionProviderRuntimeView, SessionRuntimeConfigView, SessionStatusView,
+    SelectableAgentView, SessionMetricsView, SessionPhaseView, SessionStatusView,
     SessionTimelineView, SessionView, TimelineContentView, TimelineEventKindView,
     TimelineEventView, TimelineStatusView, TimestampView,
 };

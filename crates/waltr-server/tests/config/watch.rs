@@ -36,7 +36,7 @@ async fn config_service_watch_emits_initial_and_changed_config()
                 providers: patch.providers.clone(),
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await?
         .into_inner();

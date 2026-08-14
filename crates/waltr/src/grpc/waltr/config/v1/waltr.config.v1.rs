@@ -10,19 +10,15 @@ pub struct Configuration {
     #[prost(map="string, message", tag="3")]
     pub mcp_servers: ::std::collections::HashMap<::prost::alloc::string::String, McpServer>,
     #[prost(message, optional, tag="4")]
-    pub runtime_defaults: ::core::option::Option<RuntimeDefaults>,
+    pub inference_defaults: ::core::option::Option<InferenceDefaults>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RuntimeDefaults {
+pub struct InferenceDefaults {
     #[prost(string, tag="1")]
     pub provider_key: ::prost::alloc::string::String,
     #[prost(string, tag="2")]
     pub model_key: ::prost::alloc::string::String,
-    #[prost(bool, optional, tag="3")]
-    pub mcp_default_enabled: ::core::option::Option<bool>,
-    #[prost(string, repeated, tag="4")]
-    pub enabled_mcp_server_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, optional, tag="5")]
     pub reasoning_effort: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -200,7 +196,7 @@ pub struct PatchConfigRequest {
     #[prost(message, optional, tag="3")]
     pub mcp_servers: ::core::option::Option<McpServerMapPatch>,
     #[prost(message, optional, tag="4")]
-    pub runtime_defaults: ::core::option::Option<RuntimeDefaults>,
+    pub inference_defaults: ::core::option::Option<InferenceDefaults>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, PartialEq, ::prost::Message)]

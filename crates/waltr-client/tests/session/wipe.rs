@@ -16,12 +16,22 @@ async fn confirmed_wipe_completes_by_key_and_remote_watch_remains_interested() {
     open_session_watch(&mut initiating).await;
     open_session_watch(&mut remote).await;
 
-    dispatch_stream_command(&mut initiating, ClientCommand::CreateSession)
-        .await
-        .expect("first session create should succeed");
-    dispatch_stream_command(&mut initiating, ClientCommand::CreateSession)
-        .await
-        .expect("second session create should succeed");
+    dispatch_stream_command(
+        &mut initiating,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("first session create should succeed");
+    dispatch_stream_command(
+        &mut initiating,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("second session create should succeed");
     next_snapshot_until(&mut initiating, |snapshot| {
         snapshot.sessions.current.len() == 2
     })
@@ -53,7 +63,7 @@ async fn confirmed_wipe_completes_by_key_and_remote_watch_remains_interested() {
                 status: "ready",
                 ..
             })
-        )
+        ) && snapshot.sessions.current.is_empty()
     })
     .await;
     assert!(completed.sessions.current.is_empty());
@@ -64,9 +74,14 @@ async fn confirmed_wipe_completes_by_key_and_remote_watch_remains_interested() {
     assert_eq!(remotely_cleared.sessions.watch.status, "received");
     assert_eq!(remotely_cleared.sessions.wipe.status, "idle");
 
-    dispatch_stream_command(&mut initiating, ClientCommand::CreateSession)
-        .await
-        .expect("session create after wipe should succeed");
+    dispatch_stream_command(
+        &mut initiating,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("session create after wipe should succeed");
     next_snapshot_until(&mut initiating, |snapshot| {
         snapshot.sessions.current.len() == 1
     })
@@ -76,10 +91,18 @@ async fn confirmed_wipe_completes_by_key_and_remote_watch_remains_interested() {
     assert_eq!(remote_after_create.sessions.watch.status, "received");
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "the client state stream intentionally runs on a local task set"
+)]
 async fn wait_for_ready(stream: &mut waltr_client::ClientStateStream) {
     next_snapshot_until(stream, |snapshot| snapshot.status.ready).await;
 }
 
+#[allow(
+    clippy::future_not_send,
+    reason = "the client state stream intentionally runs on a local task set"
+)]
 async fn open_session_watch(stream: &mut waltr_client::ClientStateStream) {
     dispatch_stream_command(stream, ClientCommand::RegisterSessionWatchInterest)
         .await

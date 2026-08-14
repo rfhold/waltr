@@ -10,17 +10,20 @@ service ConfigService {
 }
 
 message Configuration {
+  reserved "runtime_defaults";
+
   map<string, Provider> providers = 1;
   string etag = 2;
   map<string, McpServer> mcp_servers = 3;
-  RuntimeDefaults runtime_defaults = 4;
+  InferenceDefaults inference_defaults = 4;
 }
 
-message RuntimeDefaults {
+message InferenceDefaults {
+  reserved 3, 4;
+  reserved "mcp_default_enabled", "enabled_mcp_server_keys";
+
   string provider_key = 1;
   string model_key = 2;
-  optional bool mcp_default_enabled = 3;
-  repeated string enabled_mcp_server_keys = 4;
   optional string reasoning_effort = 5;
 }
 
@@ -161,10 +164,12 @@ enum McpServerType {
 }
 
 message PatchConfigRequest {
+  reserved "runtime_defaults";
+
   string expected_etag = 1;
   ProviderMapPatch providers = 2;
   McpServerMapPatch mcp_servers = 3;
-  RuntimeDefaults runtime_defaults = 4;
+  InferenceDefaults inference_defaults = 4;
 }
 
 message ProviderMapPatch {

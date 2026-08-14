@@ -16,7 +16,7 @@ async fn config_service_patch_persists_provider() -> Result<(), Box<dyn std::err
                 providers: patch.providers.clone(),
             }),
             mcp_servers: None,
-            runtime_defaults: None,
+            inference_defaults: None,
         })
         .await?
         .into_inner()

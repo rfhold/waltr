@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use waltr::grpc::waltr::config::v1::{
-    Configuration, Model, ModelType, Provider, ProviderType, RuntimeDefaults,
+    Configuration, InferenceDefaults, Model, ModelType, Provider, ProviderType,
 };
 use waltr_client::{ClientCommand, ClientRuntime, ClientSnapshot, TimelineContentView};
 use waltr_server::{
@@ -87,9 +87,14 @@ async fn assert_client_can_submit_user_message(
 }
 
 async fn create_live_session(stream: &mut waltr_client::ClientStateStream) -> String {
-    dispatch_stream_command(stream, ClientCommand::CreateSession)
-        .await
-        .expect("session create should dispatch");
+    dispatch_stream_command(
+        stream,
+        ClientCommand::CreateSession {
+            agent_name: "coding".to_owned(),
+        },
+    )
+    .await
+    .expect("session create should dispatch");
     let snapshot = next_live_snapshot_until(stream, |snapshot| {
         snapshot.sessions.create.status == "ready" && !snapshot.sessions.current.is_empty()
     })
@@ -208,11 +213,9 @@ fn live_config(provider: LiveClientProvider) -> Configuration {
                 provider.model_key,
             ),
         )]),
-        runtime_defaults: Some(RuntimeDefaults {
+        inference_defaults: Some(InferenceDefaults {
             provider_key,
             model_key,
-            mcp_default_enabled: Some(false),
-            enabled_mcp_server_keys: Vec::new(),
             reasoning_effort: None,
         }),
         ..Configuration::default()

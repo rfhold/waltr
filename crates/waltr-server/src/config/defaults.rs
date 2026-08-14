@@ -37,6 +37,10 @@ impl DefaultConfigBuilder {
     }
 
     /// Construct a complete fresh configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the self-MCP URL or provider catalog is invalid or unavailable.
     pub async fn build(&self) -> Result<Configuration, ConfigError> {
         let mcp_url = self
             .mcp_url

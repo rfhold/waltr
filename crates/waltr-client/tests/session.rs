@@ -5,6 +5,9 @@ mod support;
 #[path = "session/create.rs"]
 mod create;
 
+#[path = "session/agents.rs"]
+mod agents;
+
 #[path = "session/delete.rs"]
 mod delete;
 

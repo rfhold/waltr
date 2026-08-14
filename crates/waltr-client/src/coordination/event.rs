@@ -3,10 +3,10 @@
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
     AccessAttemptId, AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientError,
-    Configuration, GenericAuthAttempt, GenericAuthAttemptStatus, OperationKey, Provider,
-    RollbackTarget, RuntimeDefaults, SessionRuntimeConfigRequest, SessionSummary,
-    SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus,
-    TimelineEvent, TimelineQuery, TimelineWatchKey,
+    Configuration, GenericAuthAttempt, GenericAuthAttemptStatus, InferenceDefaults,
+    InferenceSettingsRequest, OperationKey, Provider, RollbackTarget, SelectableAgent,
+    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
+    SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -385,8 +385,31 @@ pub enum StatusEvent {
 /// Session coordination event applied to the reducer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
+    /// A caller requested the selectable agent catalog.
+    AgentsLoadRequested,
+    /// The selectable agent catalog loaded successfully.
+    AgentsLoaded {
+        /// Runtime-local request identity.
+        request_id: u64,
+        /// Selectable agents returned by the server.
+        agents: Vec<SelectableAgent>,
+        /// Server-selected default agent name.
+        default_agent_name: String,
+    },
+    /// The selectable agent catalog failed to load.
+    AgentsLoadFailed {
+        /// Runtime-local request identity.
+        request_id: u64,
+        /// Failure returned by the load effect.
+        error: ClientError,
+    },
     /// A caller requested a new session.
-    CreateRequested(OperationKey),
+    CreateRequested {
+        /// Operation key allocated when session creation was requested.
+        operation_key: OperationKey,
+        /// Exact selectable agent name.
+        agent_name: String,
+    },
     /// A session was created successfully.
     Created {
         /// Operation key allocated when session creation was requested.
@@ -438,24 +461,47 @@ pub enum SessionEvent {
         /// Failure returned by the wipe effect.
         error: ClientError,
     },
-    /// A caller requested session runtime metadata replacement.
-    RuntimeConfigUpdateRequested {
+    /// A caller requested session inference settings replacement.
+    InferenceSettingsUpdateRequested {
         /// Operation key allocated when the update was requested.
         operation_key: OperationKey,
         /// Session id to update.
         id: String,
-        /// Runtime config request to resolve and store.
-        runtime_config: Box<SessionRuntimeConfigRequest>,
+        /// Inference settings request to resolve and store.
+        inference_settings: Box<InferenceSettingsRequest>,
     },
-    /// Session runtime metadata replacement completed successfully.
-    RuntimeConfigUpdated {
+    /// Session inference settings replacement completed successfully.
+    InferenceSettingsUpdated {
         /// Operation key allocated when the update was requested.
         operation_key: OperationKey,
         /// Updated session returned by the server.
         session: SessionSummary,
     },
-    /// Session runtime metadata replacement failed.
-    RuntimeConfigUpdateFailed {
+    /// Session inference settings replacement failed.
+    InferenceSettingsUpdateFailed {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Failure returned by the update effect.
+        error: ClientError,
+    },
+    /// A caller requested a session agent switch.
+    SessionAgentUpdateRequested {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Session id to update.
+        id: String,
+        /// Exact selectable agent name.
+        agent_name: String,
+    },
+    /// A session agent switch completed successfully.
+    SessionAgentUpdated {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Updated session returned by the server.
+        session: SessionSummary,
+    },
+    /// A session agent switch failed.
+    SessionAgentUpdateFailed {
         /// Operation key allocated when the update was requested.
         operation_key: OperationKey,
         /// Failure returned by the update effect.
@@ -822,8 +868,8 @@ pub struct ConfigPatch {
     pub providers: Option<std::collections::HashMap<String, crate::Provider>>,
     /// Replacement MCP servers map. `None` leaves MCP servers unchanged.
     pub mcp_servers: Option<std::collections::HashMap<String, crate::McpServer>>,
-    /// Replacement runtime defaults. `None` leaves defaults unchanged.
-    pub runtime_defaults: Option<RuntimeDefaults>,
+    /// Replacement inference defaults. `None` leaves defaults unchanged.
+    pub inference_defaults: Option<InferenceDefaults>,
 }
 
 /// Configuration side-effect intent emitted by the client.
@@ -884,6 +930,8 @@ pub enum SessionEffect {
     Create {
         /// Operation key allocated when session creation was requested.
         operation_key: OperationKey,
+        /// Exact selectable agent name.
+        agent_name: String,
     },
     /// Delete a server-side session.
     Delete {
@@ -897,14 +945,28 @@ pub enum SessionEffect {
         /// Operation key allocated when the wipe was requested.
         operation_key: OperationKey,
     },
-    /// Replace server-side session runtime metadata.
-    UpdateRuntimeConfig {
+    /// Replace server-side session inference settings.
+    UpdateInferenceSettings {
         /// Operation key allocated when the update was requested.
         operation_key: OperationKey,
         /// Session id to update.
         id: String,
-        /// Runtime config request to resolve and store.
-        runtime_config: Box<SessionRuntimeConfigRequest>,
+        /// Inference settings request to resolve and store.
+        inference_settings: Box<InferenceSettingsRequest>,
+    },
+    /// Switch the server-side session agent.
+    UpdateAgent {
+        /// Operation key allocated when the update was requested.
+        operation_key: OperationKey,
+        /// Session id to update.
+        id: String,
+        /// Exact selectable agent name.
+        agent_name: String,
+    },
+    /// Load selectable session agents.
+    ListAgents {
+        /// Runtime-local request identity.
+        request_id: u64,
     },
     /// Load the current server-side session list.
     List,

@@ -7,7 +7,7 @@ use crate::config::ConfigHandle;
 use super::{
     convert::session_summary_to_proto,
     error::{agent_error_to_status, session_run_error_to_status},
-    runtime_config::{resolve_runtime_config, resolve_runtime_config_for_create},
+    inference_settings::{resolve_inference_settings, resolve_inference_settings_for_create},
     timeline_convert::{
         catchup_query, channel_matches, initial_query, query_from_proto, timeline_event_to_proto,
     },
@@ -17,16 +17,18 @@ use waltr::grpc::waltr::{
     session::v1::{
         ContinueSessionRequest, ContinueSessionResponse, CreateSessionRequest,
         CreateSessionResponse, DeleteSessionRequest, DeleteSessionResponse, GetTimelineRequest,
-        GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse,
-        ListSessionsRequest, ListSessionsResponse, RespondExternalRequestRequest,
-        RespondExternalRequestResponse, RollbackSessionRequest, RollbackSessionResponse,
-        SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionListCleared,
-        SessionListSnapshot, SessionTemplateKind as ProtoSessionTemplateKind,
+        GetTimelineResponse, InterruptSessionRequest, InterruptSessionResponse, ListAgentsRequest,
+        ListAgentsResponse, ListSessionsRequest, ListSessionsResponse,
+        RespondExternalRequestRequest, RespondExternalRequestResponse, RollbackSessionRequest,
+        RollbackSessionResponse, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse,
+        SelectableAgent, SessionListCleared, SessionListSnapshot,
+        SessionTemplateKind as ProtoSessionTemplateKind,
         SessionTemplateOption as ProtoSessionTemplateOption, SessionTemplateOptions,
         SessionTemplateSearchError,
         SessionTemplateSearchTarget as ProtoSessionTemplateSearchTarget, SubmitUserMessageRequest,
-        SubmitUserMessageResponse, TimelineTruncation, UpdateSessionRuntimeConfigRequest,
-        UpdateSessionRuntimeConfigResponse, WatchSessionsRequest, WatchSessionsResponse,
+        SubmitUserMessageResponse, TimelineTruncation, UpdateSessionAgentRequest,
+        UpdateSessionAgentResponse, UpdateSessionInferenceSettingsRequest,
+        UpdateSessionInferenceSettingsResponse, WatchSessionsRequest, WatchSessionsResponse,
         WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest, WipeSessionsResponse,
         rollback_target, search_session_templates_response,
         session_service_server::SessionService as GeneratedSessionService, watch_sessions_response,
@@ -34,11 +36,13 @@ use waltr::grpc::waltr::{
     },
 };
 use waltr_agent::{
-    AgentSession, AgentSessionActiveRunState, AgentSessionRunError, AgentSessionRunSubmission,
-    AgentSessionRuntimeFactory, CredentialStore, ExternalRequestId, RunConflictPolicy,
-    SessionCoordinator, SessionId, SessionListEvent, SessionListUpdate, SessionStore,
-    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchRequest,
-    SessionTemplateSearchTarget, SessionTimelineEvent, TimelineCursor,
+    AgentDefinitionCatalog, AgentSession, AgentSessionActiveRunState, AgentSessionRunError,
+    AgentSessionRunSubmission, AgentSessionRuntimeError, AgentSessionRuntimeFactory,
+    CredentialStore, ExternalRequestId, McpConnectionKind, McpConnectionResolveRequest,
+    McpResolvedConnection, ResolvedAgent, RunConflictPolicy, SessionCoordinator, SessionId,
+    SessionListEvent, SessionListUpdate, SessionStore, SessionSummary, SessionTemplateKind,
+    SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
+    SessionTimelineEvent, TimelineCursor,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -53,6 +57,7 @@ where
 {
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
+    agent_catalog: AgentDefinitionCatalog,
 }
 
 impl<S> SessionService<S>
@@ -66,12 +71,14 @@ where
         config: ConfigHandle,
         credential_store: CredentialStore,
         trusted_mcp_oauth_origin: Option<reqwest::Url>,
+        agent_catalog: AgentDefinitionCatalog,
     ) -> Arc<Self> {
         Self::new_with_oauth_policy(
             store,
             config,
             credential_store,
             trusted_mcp_oauth_origin.into_iter().collect(),
+            agent_catalog,
         )
     }
 
@@ -80,12 +87,14 @@ where
         config: ConfigHandle,
         credential_store: CredentialStore,
         trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+        agent_catalog: AgentDefinitionCatalog,
     ) -> Arc<Self> {
         Self::from_sessions_with_oauth_policy(
             SessionCoordinator::new(store),
             config,
             credential_store,
             trusted_mcp_oauth_origins,
+            agent_catalog,
         )
     }
 
@@ -96,12 +105,14 @@ where
         config: ConfigHandle,
         credential_store: CredentialStore,
         trusted_mcp_oauth_origin: Option<reqwest::Url>,
+        agent_catalog: AgentDefinitionCatalog,
     ) -> Arc<Self> {
         Self::from_sessions_with_oauth_policy(
             sessions,
             config,
             credential_store,
             trusted_mcp_oauth_origin.into_iter().collect(),
+            agent_catalog,
         )
     }
 
@@ -110,15 +121,49 @@ where
         config: ConfigHandle,
         credential_store: CredentialStore,
         trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+        agent_catalog: AgentDefinitionCatalog,
     ) -> Arc<Self> {
-        let runtime_factory = AgentSessionRuntimeFactory::new(default_root(), credential_store)
-            .with_trusted_mcp_oauth_origins(trusted_mcp_oauth_origins);
+        let default_agent_definition = agent_catalog
+            .resolved(agent_catalog.default_agent_name())
+            .expect("catalog default agent must be present")
+            .clone();
+        let runtime_factory = runtime_factory(
+            credential_store,
+            trusted_mcp_oauth_origins,
+            default_agent_definition,
+            agent_catalog.clone(),
+            config.clone(),
+        );
         let sessions = sessions.with_runtime_factory(runtime_factory);
-        Arc::new(Self { sessions, config })
+        Arc::new(Self {
+            sessions,
+            config,
+            agent_catalog,
+        })
     }
 
     async fn load_config(&self) -> Configuration {
         self.config.load().await
+    }
+
+    fn selected_agent_bundle(
+        &self,
+        agent_name: &str,
+    ) -> Result<waltr_agent::AgentDefinitionBundle, Status> {
+        if agent_name.trim().is_empty() {
+            return Err(Status::invalid_argument("agent name must not be empty"));
+        }
+        self.agent_catalog.bundle(agent_name).ok_or_else(|| {
+            Status::invalid_argument(format!("agent '{agent_name}' is not selectable"))
+        })
+    }
+
+    fn summary_to_proto(
+        &self,
+        summary: SessionSummary,
+        config: &Configuration,
+    ) -> waltr::grpc::waltr::session::v1::SessionSummary {
+        session_summary_to_proto(summary, config, self.agent_catalog.default_agent_name())
     }
 }
 
@@ -171,6 +216,24 @@ where
         Pin<Box<dyn Stream<Item = Result<WatchSessionsResponse, Status>> + Send>>;
     type WatchTimelineStream =
         Pin<Box<dyn Stream<Item = Result<WatchTimelineResponse, Status>> + Send>>;
+
+    async fn list_agents(
+        &self,
+        _request: Request<ListAgentsRequest>,
+    ) -> Result<Response<ListAgentsResponse>, Status> {
+        Ok(Response::new(ListAgentsResponse {
+            agents: self
+                .agent_catalog
+                .entries()
+                .into_iter()
+                .map(|agent| SelectableAgent {
+                    name: agent.name,
+                    description: agent.description,
+                })
+                .collect(),
+            default_agent_name: self.agent_catalog.default_agent_name().to_owned(),
+        }))
+    }
     #[tracing::instrument(
         name = "server.write",
         skip(self, request),
@@ -183,17 +246,26 @@ where
         let request = request.into_inner();
         tracing::info!("session create accepted");
         let config = self.load_config().await;
-        let runtime_config = resolve_runtime_config_for_create(request.runtime_config, &config)?;
+        let inference_settings =
+            resolve_inference_settings_for_create(request.inference_settings, &config)?;
+        let agent_bundle = match request.agent_selection {
+            Some(selection) => self.selected_agent_bundle(&selection.agent_name)?,
+            None => self.agent_catalog.default_bundle(),
+        };
         let session = self
             .sessions
-            .create_with_runtime_settings(runtime_config, BTreeMap::default())
+            .create_with_inference_settings(
+                inference_settings,
+                Some(agent_bundle),
+                BTreeMap::default(),
+            )
             .await
             .map_err(agent_error_to_status)?;
         tracing::Span::current().record("session_id", session.record.id.as_str());
         tracing::info!(session_id = %session.record.id.as_str(), "session create completed");
 
         Ok(Response::new(CreateSessionResponse {
-            session: Some(session_summary_to_proto(session.record.summary(), &config)),
+            session: Some(self.summary_to_proto(session.record.summary(), &config)),
         }))
     }
 
@@ -209,7 +281,7 @@ where
             .await
             .map_err(agent_error_to_status)?
             .into_iter()
-            .map(|summary| session_summary_to_proto(summary, &config))
+            .map(|summary| self.summary_to_proto(summary, &config))
             .collect();
 
         Ok(Response::new(ListSessionsResponse { sessions }))
@@ -266,32 +338,57 @@ where
     #[tracing::instrument(
         name = "server.write",
         skip(self, request),
-        fields(operation = "update_session_runtime_config", session_id)
+        fields(operation = "update_session_inference_settings", session_id)
     )]
-    async fn update_session_runtime_config(
+    async fn update_session_inference_settings(
         &self,
-        request: Request<UpdateSessionRuntimeConfigRequest>,
-    ) -> Result<Response<UpdateSessionRuntimeConfigResponse>, Status> {
+        request: Request<UpdateSessionInferenceSettingsRequest>,
+    ) -> Result<Response<UpdateSessionInferenceSettingsResponse>, Status> {
         let request = request.into_inner();
         if request.id.trim().is_empty() {
             return Err(Status::invalid_argument("session id must not be empty"));
         }
         tracing::Span::current().record("session_id", request.id.as_str());
-        tracing::info!("session runtime config update accepted");
-        let runtime_config = request
-            .runtime_config
-            .ok_or_else(|| Status::invalid_argument("runtime config is required"))?;
+        tracing::info!("session inference settings update accepted");
+        let inference_settings = request
+            .inference_settings
+            .ok_or_else(|| Status::invalid_argument("inference settings are required"))?;
         let config = self.load_config().await;
-        let runtime_config = resolve_runtime_config(runtime_config, &config)?;
+        let inference_settings = resolve_inference_settings(inference_settings, &config)?;
         let session = self
             .sessions
-            .set_runtime_settings(&SessionId::new(request.id), Some(runtime_config))
+            .set_inference_settings(&SessionId::new(request.id), Some(inference_settings))
             .await
             .map_err(agent_error_to_status)?;
-        tracing::info!("session runtime config update completed");
+        tracing::info!("session inference settings update completed");
 
-        Ok(Response::new(UpdateSessionRuntimeConfigResponse {
-            session: Some(session_summary_to_proto(session.record.summary(), &config)),
+        Ok(Response::new(UpdateSessionInferenceSettingsResponse {
+            session: Some(self.summary_to_proto(session.record.summary(), &config)),
+        }))
+    }
+
+    async fn update_session_agent(
+        &self,
+        request: Request<UpdateSessionAgentRequest>,
+    ) -> Result<Response<UpdateSessionAgentResponse>, Status> {
+        let request = request.into_inner();
+        let session_id = required_session_id(&request.id)?;
+        let selection = request
+            .agent_selection
+            .ok_or_else(|| Status::invalid_argument("agent selection is required"))?;
+        self.selected_agent_bundle(&selection.agent_name)?;
+        self.sessions
+            .load(&session_id)
+            .await
+            .map_err(session_load_error_to_status)?;
+        let session = self
+            .sessions
+            .switch_agent(&session_id, &selection.agent_name)
+            .await
+            .map_err(session_agent_error_to_status)?;
+        let config = self.load_config().await;
+        Ok(Response::new(UpdateSessionAgentResponse {
+            session: Some(self.summary_to_proto(session.record.summary(), &config)),
         }))
     }
 
@@ -309,7 +406,7 @@ where
             .await
             .map_err(agent_error_to_status)?
             .into_iter()
-            .map(|summary| session_summary_to_proto(summary, &config))
+            .map(|summary| self.summary_to_proto(summary, &config))
             .collect();
         let snapshot = Ok(WatchSessionsResponse {
             sequence,
@@ -318,13 +415,15 @@ where
             )),
         });
         let config = self.config.clone();
+        let default_agent_name = self.agent_catalog.default_agent_name().to_owned();
         let stream = tokio_stream::once(snapshot).chain(subscription.then(move |update| {
             let config = config.clone();
+            let default_agent_name = default_agent_name.clone();
             async move {
                 let current_config = config.load().await;
                 let event = match update.event {
                     SessionListEvent::Upsert(session) => watch_sessions_response::Event::Session(
-                        session_summary_to_proto(session, &current_config),
+                        session_summary_to_proto(session, &current_config, &default_agent_name),
                     ),
                     SessionListEvent::Deleted(id) => {
                         watch_sessions_response::Event::DeletedId(id.as_str().to_owned())
@@ -640,7 +739,7 @@ where
         let config = self.load_config().await;
         tracing::info!("session rollback completed");
         Ok(Response::new(RollbackSessionResponse {
-            session: Some(session_summary_to_proto(session.record.summary(), &config)),
+            session: Some(self.summary_to_proto(session.record.summary(), &config)),
             truncation: Some(TimelineTruncation {
                 session_id: session_id.as_str().to_owned(),
                 after_cursor,
@@ -690,6 +789,26 @@ fn required_session_id(value: &str) -> Result<SessionId, Status> {
         Err(Status::invalid_argument("session id must not be empty"))
     } else {
         Ok(SessionId::new(value.to_owned()))
+    }
+}
+
+fn session_load_error_to_status(error: waltr_agent::LlmError) -> Status {
+    if error.to_string().contains("session not found:") {
+        Status::not_found(error.to_string())
+    } else {
+        agent_error_to_status(error)
+    }
+}
+
+fn session_agent_error_to_status(error: AgentSessionRunError) -> Status {
+    match error {
+        AgentSessionRunError::Runtime(AgentSessionRuntimeError::FailedPrecondition(message)) => {
+            Status::failed_precondition(message)
+        }
+        AgentSessionRunError::Agent(error) if error.to_string().contains("session not found:") => {
+            Status::not_found(error.to_string())
+        }
+        error => session_run_error_to_status(error),
     }
 }
 
@@ -808,4 +927,202 @@ fn push_history(
 
 fn default_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn runtime_factory(
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    default_agent_definition: ResolvedAgent,
+    agent_catalog: AgentDefinitionCatalog,
+    config: ConfigHandle,
+) -> AgentSessionRuntimeFactory {
+    AgentSessionRuntimeFactory::new(default_root(), credential_store, default_agent_definition)
+        .with_agent_catalog(agent_catalog)
+        .with_trusted_mcp_oauth_origins(trusted_mcp_oauth_origins)
+        // TODO: This feels like it should be a similar catalog like the agents catalog
+        .with_mcp_connection_resolver(move |request| {
+            let config = config.clone();
+            Box::pin(async move { resolve_mcp_connections(&config.load().await, request) })
+        })
+}
+
+fn resolve_mcp_connections(
+    config: &Configuration,
+    request: McpConnectionResolveRequest,
+) -> Result<Vec<McpResolvedConnection>, AgentSessionRuntimeError> {
+    use waltr::grpc::waltr::config::v1::McpServerType;
+    use waltr_agent::definition::McpServerSelection;
+
+    if let McpServerSelection::Include(keys) = &request.servers {
+        let missing = keys
+            .iter()
+            .filter(|key| !config.mcp_servers.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(AgentSessionRuntimeError::FailedPrecondition(format!(
+                "configured MCP servers are missing: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+
+    let mut keys = match request.servers {
+        McpServerSelection::Include(keys) => keys.into_iter().collect::<Vec<_>>(),
+        McpServerSelection::Exclude(excluded) => config
+            .mcp_servers
+            .keys()
+            .filter(|key| !excluded.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>(),
+    };
+    keys.sort();
+    keys.into_iter()
+        .map(|key| {
+            let server = &config.mcp_servers[&key];
+            let kind = match McpServerType::try_from(server.r#type)
+                .unwrap_or(McpServerType::Unspecified)
+            {
+                McpServerType::Stdio => McpConnectionKind::Stdio,
+                McpServerType::Sse => McpConnectionKind::StreamableHttp,
+                McpServerType::Unspecified => {
+                    return Err(AgentSessionRuntimeError::FailedPrecondition(format!(
+                        "mcp server '{key}' type is unspecified"
+                    )));
+                }
+            };
+            Ok(McpResolvedConnection {
+                key,
+                kind,
+                command: server.command.clone(),
+                url: server.url.clone(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashMap};
+
+    use waltr::grpc::waltr::config::v1::{Configuration, McpServer, McpServerType, Provider};
+    use waltr_agent::{
+        AgentSessionRuntimeError, McpConnectionKind, McpConnectionResolveRequest,
+        definition::McpServerSelection,
+    };
+
+    use super::resolve_mcp_connections;
+
+    fn inventory() -> Configuration {
+        Configuration {
+            mcp_servers: HashMap::from([
+                (
+                    "zeta".to_owned(),
+                    McpServer {
+                        r#type: McpServerType::Sse as i32,
+                        url: "https://zeta.example/mcp".to_owned(),
+                        ..McpServer::default()
+                    },
+                ),
+                (
+                    "alpha".to_owned(),
+                    McpServer {
+                        r#type: McpServerType::Stdio as i32,
+                        command: "alpha-mcp --stdio".to_owned(),
+                        ..McpServer::default()
+                    },
+                ),
+            ]),
+            ..Configuration::default()
+        }
+    }
+
+    #[test]
+    fn resolver_selects_all_by_default_in_key_order() {
+        let resolved = resolve_mcp_connections(
+            &inventory(),
+            McpConnectionResolveRequest {
+                servers: McpServerSelection::Exclude(BTreeSet::new()),
+            },
+        )
+        .expect("inventory resolves");
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+        assert_eq!(resolved[0].kind, McpConnectionKind::Stdio);
+        assert_eq!(resolved[0].command, "alpha-mcp --stdio");
+        assert_eq!(resolved[1].kind, McpConnectionKind::StreamableHttp);
+        assert_eq!(resolved[1].url, "https://zeta.example/mcp");
+    }
+
+    #[test]
+    fn resolver_include_empty_selects_none_and_missing_exclude_is_ignored() {
+        let none = resolve_mcp_connections(
+            &inventory(),
+            McpConnectionResolveRequest {
+                servers: McpServerSelection::Include(BTreeSet::new()),
+            },
+        )
+        .expect("empty include resolves");
+        assert!(none.is_empty());
+
+        let all = resolve_mcp_connections(
+            &inventory(),
+            McpConnectionResolveRequest {
+                servers: McpServerSelection::Exclude(BTreeSet::from(["missing".to_owned()])),
+            },
+        )
+        .expect("missing exclude is ignored");
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn resolver_reports_all_missing_includes_deterministically() {
+        let error = resolve_mcp_connections(
+            &inventory(),
+            McpConnectionResolveRequest {
+                servers: McpServerSelection::Include(BTreeSet::from([
+                    "missing-z".to_owned(),
+                    "alpha".to_owned(),
+                    "missing-a".to_owned(),
+                ])),
+            },
+        )
+        .expect_err("missing includes fail");
+        let AgentSessionRuntimeError::FailedPrecondition(message) = error else {
+            panic!("expected failed precondition");
+        };
+        assert_eq!(
+            message,
+            "configured MCP servers are missing: missing-a, missing-z"
+        );
+    }
+
+    #[test]
+    fn resolver_uses_current_endpoint_inventory_independent_of_providers() {
+        let selection = McpConnectionResolveRequest {
+            servers: McpServerSelection::Include(BTreeSet::from(["zeta".to_owned()])),
+        };
+        let initial = resolve_mcp_connections(&inventory(), selection.clone())
+            .expect("initial inventory resolves");
+
+        let mut changed = inventory();
+        changed
+            .providers
+            .insert("unrelated".to_owned(), Provider::default());
+        changed.mcp_servers.get_mut("zeta").expect("server").url =
+            "https://changed.example/mcp".to_owned();
+        let current =
+            resolve_mcp_connections(&changed, selection).expect("changed inventory resolves");
+
+        assert_eq!(initial[0].url, "https://zeta.example/mcp");
+        assert_eq!(current[0].url, "https://changed.example/mcp");
+        assert_eq!(initial[0].key, current[0].key);
+        assert_eq!(initial[0].kind, current[0].kind);
+    }
 }
