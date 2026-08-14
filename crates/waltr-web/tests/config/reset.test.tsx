@@ -15,7 +15,7 @@ describe("config reset", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Reset configuration" }));
     expect(screen.getByRole("group", { name: "Reset configuration confirmation" }).textContent)
-      .toContain("providers, MCP servers, and runtime defaults");
+      .toContain("providers, MCP servers, and inference defaults");
     expect(screen.getByText(/Credentials remain untouched/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel reset configuration" }));
@@ -162,6 +162,6 @@ function serverDefaultConfig(): ConfigView {
     etag: "server-default",
     providers: { anthropic: { ...provider, name: "anthropic" } },
     mcpServers: { waltr: mcpServerView({ name: "waltr", kind: "unknown", url: "https://waltr.example/mcp" }) },
-    runtimeDefaults: null,
+    inferenceDefaults: null,
   };
 }

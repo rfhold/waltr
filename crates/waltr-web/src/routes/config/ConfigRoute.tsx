@@ -8,7 +8,7 @@ import type { TabItem } from "../../components/ui";
 import type { ClientCommand } from "../../generated/waltr-client";
 import { McpServersSection } from "./McpServersSection";
 import { ProvidersSection } from "./ProvidersSection";
-import { RuntimeDefaultsSection } from "./RuntimeDefaultsSection";
+import { InferenceDefaultsSection } from "./InferenceDefaultsSection";
 
 export {
   ConfigCreateRoute,
@@ -138,7 +138,7 @@ export function ConfigRoute(props: ParentProps) {
             >
               <ConfirmAction
                 label="Reset configuration confirmation"
-                prompt="Reset providers, MCP servers, and runtime defaults to server defaults? Credentials remain untouched."
+                prompt="Reset providers, MCP servers, and inference defaults to server defaults? Credentials remain untouched."
                 confirmLabel={resetPending() ? "Resetting..." : "Reset configuration"}
                 confirmAriaLabel="Confirm reset configuration"
                 cancelAriaLabel="Cancel reset configuration"
@@ -195,7 +195,7 @@ export function ConfigRoute(props: ParentProps) {
             </McpServersSection>
           </Match>
           <Match when={visibleTab() === "defaults"}>
-            <RuntimeDefaultsSection watchedConfig={watchedConfig} />
+            <InferenceDefaultsSection watchedConfig={watchedConfig} />
           </Match>
         </Switch>
       </TabPanel>

@@ -9,7 +9,7 @@ describe("splash status", () => {
   test("renders the Waltr splash logo before the app is ready", () => {
     renderWithAppState(() => <SplashRouteWithRouter />, {
       routePath: "/",
-      snapshot: snapshotWithConfig({ etag: "", providers: {}, mcpServers: {}, runtimeDefaults: null }, { ready: false }),
+      snapshot: snapshotWithConfig({ etag: "", providers: {}, mcpServers: {}, inferenceDefaults: null }, { ready: false }),
     });
 
     const logo = screen.getByLabelText("Waltr logo");

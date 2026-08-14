@@ -1826,28 +1826,104 @@
   background: var(--color-accent-hover);
 }
 
-.sessions__runtime-dialog {
+.sessions__inference-dialog {
   width: min(42rem, calc(100vw - 2rem));
 }
 
-.sessions__runtime-editor {
+.sessions__agent-dialog {
+  width: min(38rem, calc(100vw - 2rem));
+}
+
+.sessions__agent-selector {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.sessions__agent-note {
+  margin: 0;
+  color: var(--color-text-muted);
+  line-height: 1.5;
+}
+
+.sessions__agent-list {
+  display: grid;
+  gap: var(--space-2);
+  max-height: min(22rem, 48vh);
+  overflow-y: auto;
+  margin: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+}
+
+.sessions__agent-list legend {
+  padding: 0 var(--space-2);
+  color: var(--color-text-muted);
+  font-weight: 700;
+}
+
+.sessions__agent-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.8rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+.sessions__agent-option.is-selected {
+  border-color: var(--border-accent);
+  background: var(--color-accent-soft);
+}
+
+.sessions__agent-option input {
+  margin-top: 0.2rem;
+  accent-color: var(--color-accent);
+}
+
+.sessions__agent-option span {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.sessions__agent-option strong {
+  overflow-wrap: anywhere;
+}
+
+.sessions__agent-option small {
+  color: var(--color-text-muted);
+  line-height: 1.4;
+}
+
+.sessions__agent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.sessions__inference-editor {
   display: grid;
   gap: 1rem;
 }
 
-.sessions__runtime-note {
+.sessions__inference-note {
   margin: 0;
   color: var(--color-text-muted);
 }
 
-.sessions__runtime-search {
+.sessions__inference-search {
   display: grid;
   gap: 0.4rem;
   color: var(--color-text-muted);
 }
 
-.sessions__runtime-search input,
-.sessions__runtime-search select {
+.sessions__inference-search input,
+.sessions__inference-search select {
   border: 1px solid var(--border-control);
   border-radius: var(--radius-sm);
   padding: 0.65rem 0.75rem;
@@ -1856,7 +1932,7 @@
   font: inherit;
 }
 
-.sessions__runtime-list {
+.sessions__inference-list {
   display: grid;
   max-height: min(20rem, 42vh);
   overflow: auto;
@@ -1865,7 +1941,7 @@
   background: var(--color-surface-soft);
 }
 
-.sessions__runtime-option {
+.sessions__inference-option {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1880,41 +1956,15 @@
   text-align: left;
 }
 
-.sessions__runtime-option:last-child {
+.sessions__inference-option:last-child {
   border-bottom: 0;
 }
 
-.sessions__runtime-option.is-selected {
+.sessions__inference-option.is-selected {
   background: var(--color-accent-soft);
 }
 
-.sessions__runtime-state {
-  border: 1px solid var(--border-subtle);
-  border-radius: 999px;
-  padding: 0.18rem 0.45rem;
-  color: var(--color-text-subtle);
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.sessions__runtime-state--configured {
-  border-color: var(--border-accent);
-  color: var(--color-accent);
-}
-
-.sessions__runtime-state--changed {
-  border-color: var(--color-warning);
-  color: var(--color-warning);
-}
-
-.sessions__runtime-state--missing {
-  border-color: var(--border-danger);
-  color: var(--color-danger-text);
-}
-
-.sessions__runtime-actions {
+.sessions__inference-actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
@@ -2499,34 +2549,6 @@
   color: var(--color-text-muted);
 }
 
-.config__form label.runtime-defaults__all-mcp,
-.config__form label.provider-row__summary.runtime-defaults__mcp-row {
-  display: flex;
-  align-items: center;
-}
-
-.config__form label.runtime-defaults__all-mcp {
-  flex-direction: row;
-  justify-content: flex-start;
-}
-
-.config__form label.provider-row__summary.runtime-defaults__mcp-row {
-  flex-direction: row;
-  justify-content: space-between;
-}
-
-.config__form .runtime-defaults__all-mcp input,
-.config__form .runtime-defaults__mcp-row input {
-  flex: 0 0 auto;
-  width: auto;
-  padding: 0;
-  accent-color: var(--color-accent);
-}
-
-.runtime-defaults__mcp-row strong {
-  margin-left: 0.25rem;
-}
-
 @media (max-width: 700px) {
   .config__header {
     align-items: stretch;
@@ -2653,5 +2675,9 @@
   .sessions__detail-status .session-row__actions {
     width: 100%;
     margin-left: 0;
+  }
+
+  .sessions__agent-actions button {
+    flex: 1 1 9rem;
   }
 }

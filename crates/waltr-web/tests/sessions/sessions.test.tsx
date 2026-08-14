@@ -53,7 +53,7 @@ describe("sessions route", () => {
 
   test("session detail metrics use full context tokens with cache", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-cache"),
+      sessionWithInferenceSettings("session-cache"),
     ]);
     snapshot.sessions.current[0]!.metrics = {
       ...sessionMetricsView(),
@@ -109,11 +109,12 @@ describe("sessions route", () => {
       snapshot: snapshotWithSessions([]),
     });
 
-    fireEvent.click(screen.getByText("Create session"));
+    fireEvent.click(screen.getByRole("button", { name: "Create session" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Create session dialog" })).getByRole("button", { name: "Create session" }));
 
     await waitFor(() => expect(testHistory().get()).toBe("/sessions/session-1"));
     expect(screen.getByLabelText("Session status summary").textContent).not.toContain("idle");
-    expect(commands.map((command) => command.type)).toContain("createSession");
+    expect(commands).toContainEqual({ type: "createSession", agentName: "default" });
   });
 
   test("shows session create failures without routing", async () => {
@@ -123,10 +124,122 @@ describe("sessions route", () => {
       snapshot: snapshotWithSessions([]),
     });
 
-    fireEvent.click(screen.getByText("Create session"));
+    fireEvent.click(screen.getByRole("button", { name: "Create session" }));
+    fireEvent.click(within(screen.getByRole("dialog", { name: "Create session dialog" })).getByRole("button", { name: "Create session" }));
 
     await waitFor(() => expect(screen.getByText("session service unavailable")).toBeTruthy());
     expect(testHistory().get()).toBe("/sessions");
+  });
+
+  test("creates with an alternate agent selected in the dialog", async () => {
+    const commands: ClientCommand[] = [];
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions",
+      snapshot: snapshotWithSessions([]),
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Create session" }));
+    const dialog = screen.getByRole("dialog", { name: "Create session dialog" });
+    fireEvent.click(within(dialog).getByRole("radio", { name: /reviewer/i }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Create session" }));
+
+    await waitFor(() => expect(commands).toContainEqual({ type: "createSession", agentName: "reviewer" }));
+  });
+
+  test("canceling create restores focus and does not dispatch create", async () => {
+    const commands: ClientCommand[] = [];
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions",
+      snapshot: snapshotWithSessions([]),
+    });
+
+    const trigger = screen.getByRole("button", { name: "Create session" });
+    trigger.focus();
+    fireEvent.click(trigger);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("radio", { name: /default/i })));
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "Create session dialog" }), { key: "Escape" });
+
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+    expect(screen.queryByRole("dialog", { name: "Create session dialog" })).toBeNull();
+    expect(commands.some((command) => command.type === "createSession")).toBe(false);
+  });
+
+  test.each([
+    ["loading", "Loading agents..."],
+    ["ready", "No agents are available."],
+  ] as const)("shows agent catalog %s state", (status, message) => {
+    const snapshot = snapshotWithSessions([]);
+    snapshot.sessions.agents = { entries: [], defaultAgentName: "", load: { status, error: null, key: null } };
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions", snapshot });
+
+    fireEvent.click(screen.getByRole("button", { name: "Create session" }));
+    expect(screen.getByText(message)).toBeTruthy();
+    expect((within(screen.getByRole("dialog")).getByRole("button", { name: "Create session" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test("shows catalog errors and retries through the shared command", () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([]);
+    snapshot.sessions.agents.load = { status: "failed", error: "catalog unavailable", key: "agents-1" };
+    renderWithAppState(() => <SessionsRouteWithRouter />, { commands, routePath: "/sessions", snapshot });
+
+    fireEvent.click(screen.getByRole("button", { name: "Create session" }));
+    expect(screen.getByText(/Unable to load agents/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(commands).toContainEqual({ type: "requestSessionAgents" });
+  });
+
+  test("switches the selected session agent and closes on success", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([sessionView({ id: "session-agent", agentName: "default" })]);
+    snapshot.sessions.timelines["session-agent"] = readySessionTimeline();
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      commands,
+      routePath: "/sessions/session-agent",
+      snapshot,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch agent" }));
+    const dialog = screen.getByRole("dialog", { name: "Switch agent dialog" });
+    expect((within(dialog).getByRole("radio", { name: /default/i }) as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(within(dialog).getByRole("radio", { name: /reviewer/i }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Switch agent" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Switch agent dialog" })).toBeNull());
+    expect(commands).toContainEqual({ type: "updateSessionAgent", id: "session-agent", agentName: "reviewer" });
+    expect(screen.getByLabelText("Session status summary").textContent).toContain("reviewer");
+  });
+
+  test("keeps agent selection and error visible after switch failure", async () => {
+    const snapshot = snapshotWithSessions([sessionView({ id: "session-agent-fail", agentName: "default" })]);
+    snapshot.sessions.timelines["session-agent-fail"] = readySessionTimeline();
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions/session-agent-fail",
+      snapshot,
+      sessionAgentUpdateError: "agent update rejected",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch agent" }));
+    fireEvent.click(screen.getByRole("radio", { name: /reviewer/i }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Switch agent" }));
+
+    await screen.findByText("agent update rejected");
+    expect((screen.getByRole("radio", { name: /reviewer/i }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByRole("dialog", { name: "Switch agent dialog" })).toBeTruthy();
+  });
+
+  test("explains next-cycle behavior when switching an active session", () => {
+    const snapshot = snapshotWithSessions([sessionView({
+      id: "session-agent-active",
+      status: { phase: "streamingProvider", failedMessage: "", authenticationFailure: null },
+    })]);
+    snapshot.sessions.timelines["session-agent-active"] = readySessionTimeline();
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-agent-active", snapshot });
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch agent" }));
+    expect(screen.getByText(/current cycle will finish.*next cycle.*history is preserved/i)).toBeTruthy();
   });
 
   test("deleting a session from the list dispatches deleteSession and removes it", async () => {
@@ -169,7 +282,7 @@ describe("sessions route", () => {
     const commands: ClientCommand[] = [];
 
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-compose"),
+      sessionWithInferenceSettings("session-compose"),
     ]);
     snapshot.sessions.timelines["session-compose"] = readySessionTimeline();
 
@@ -196,7 +309,7 @@ describe("sessions route", () => {
     try {
       const commands: ClientCommand[] = [];
       const snapshot = snapshotWithSessions([
-        sessionWithRuntime("session-resource-rules"),
+        sessionWithInferenceSettings("session-resource-rules"),
       ]);
       snapshot.sessions.timelines["session-resource-rules"] = readySessionTimeline();
 
@@ -239,7 +352,7 @@ describe("sessions route", () => {
     try {
       const commands: ClientCommand[] = [];
       const snapshot = snapshotWithSessions([
-        sessionWithRuntime("session-prompt-rules"),
+        sessionWithInferenceSettings("session-prompt-rules"),
       ]);
       snapshot.sessions.timelines["session-prompt-rules"] = readySessionTimeline();
 
@@ -284,7 +397,7 @@ describe("sessions route", () => {
       const commands: ClientCommand[] = [];
       let setSnapshot!: (snapshot: ClientSnapshot) => void;
       const snapshot = snapshotWithSessions([
-        sessionWithRuntime("session-resource-delayed"),
+        sessionWithInferenceSettings("session-resource-delayed"),
       ]);
       snapshot.sessions.timelines["session-resource-delayed"] = readySessionTimeline();
 
@@ -318,7 +431,7 @@ describe("sessions route", () => {
       const commands: ClientCommand[] = [];
       let setSnapshot!: (snapshot: ClientSnapshot) => void;
       const snapshot = snapshotWithSessions([
-        sessionWithRuntime("session-resource-remount"),
+        sessionWithInferenceSettings("session-resource-remount"),
       ]);
       snapshot.sessions.timelines["session-resource-remount"] = readySessionTimeline();
 
@@ -373,7 +486,7 @@ describe("sessions route", () => {
       const commands: ClientCommand[] = [];
       let setSnapshot!: (snapshot: ClientSnapshot) => void;
       const snapshot = snapshotWithSessions([
-        sessionWithRuntime("session-resource-keyboard"),
+        sessionWithInferenceSettings("session-resource-keyboard"),
       ]);
       snapshot.sessions.timelines["session-resource-keyboard"] = readySessionTimeline();
 
@@ -420,7 +533,7 @@ describe("sessions route", () => {
       const commands: ClientCommand[] = [];
       let setSnapshot!: (snapshot: ClientSnapshot) => void;
       const snapshot = snapshotWithSessions([
-        sessionWithRuntime("session-resource-caret"),
+        sessionWithInferenceSettings("session-resource-caret"),
       ]);
       snapshot.sessions.timelines["session-resource-caret"] = readySessionTimeline();
 
@@ -459,7 +572,7 @@ describe("sessions route", () => {
       const commands: ClientCommand[] = [];
       let setSnapshot!: (snapshot: ClientSnapshot) => void;
       const snapshot = snapshotWithSessions([
-        sessionWithRuntime("session-resource-click"),
+        sessionWithInferenceSettings("session-resource-click"),
       ]);
       snapshot.sessions.timelines["session-resource-click"] = readySessionTimeline();
 
@@ -499,7 +612,7 @@ describe("sessions route", () => {
 
   test("session detail composer highlights resource-looking text", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-resource-highlight"),
+      sessionWithInferenceSettings("session-resource-highlight"),
     ]);
     snapshot.sessions.timelines["session-resource-highlight"] = readySessionTimeline();
 
@@ -516,7 +629,7 @@ describe("sessions route", () => {
 
   test("session detail composer highlights first-line prompt text", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-prompt-highlight"),
+      sessionWithInferenceSettings("session-prompt-highlight"),
     ]);
     snapshot.sessions.timelines["session-prompt-highlight"] = readySessionTimeline();
 
@@ -534,7 +647,7 @@ describe("sessions route", () => {
   test("session detail composer keeps draft and shows operation failures", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-compose-fail"),
+      sessionWithInferenceSettings("session-compose-fail"),
     ]);
     snapshot.sessions.timelines["session-compose-fail"] = readySessionTimeline();
 
@@ -558,7 +671,7 @@ describe("sessions route", () => {
 
   test("session detail shows assistant pending state while active", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-active", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-active", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-active"] = readySessionTimeline();
 
@@ -572,7 +685,7 @@ describe("sessions route", () => {
 
   test("session detail treats suspended sessions as waiting", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-suspended", { phase: "suspended", failedMessage: "", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-suspended", { phase: "suspended", failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-suspended"] = readySessionTimeline();
 
@@ -590,7 +703,7 @@ describe("sessions route", () => {
 
   test("session detail shows failed status in important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-failed", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-failed", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-failed"] = readySessionTimeline();
 
@@ -627,7 +740,7 @@ describe("sessions route", () => {
       errorUri: "https://mcp.example/errors/invalid-token",
       realm: "remote",
     };
-    const snapshot = snapshotWithSessions([sessionWithRuntime("session-auth-status", status)]);
+    const snapshot = snapshotWithSessions([sessionWithInferenceSettings("session-auth-status", status)]);
     snapshot.sessions.timelines["session-auth-status"] = readySessionTimeline();
 
     renderWithAppState(() => <SessionsRouteWithRouter />, {
@@ -645,7 +758,7 @@ describe("sessions route", () => {
 
   test("session detail shows timeline watch errors in the important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-timeline-error", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-timeline-error", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
     ]);
     const timeline = readySessionTimeline();
     timeline.watch = { status: "failed", error: "timeline disconnected", key: null };
@@ -664,7 +777,7 @@ describe("sessions route", () => {
   test("session detail keeps initial timeline replay pinned to the bottom", async () => {
     let publishSnapshot!: (snapshot: ClientSnapshot) => void;
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-scroll"),
+      sessionWithInferenceSettings("session-scroll"),
     ]);
     snapshot.sessions.timelines["session-scroll"] = readySessionTimeline();
 
@@ -698,7 +811,7 @@ describe("sessions route", () => {
   test("session detail sticks to bottom during streaming only when the user is at the bottom", async () => {
     let publishSnapshot!: (snapshot: ClientSnapshot) => void;
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-stream"),
+      sessionWithInferenceSettings("session-stream"),
     ]);
     snapshot.sessions.timelines["session-stream"] = readySessionTimeline();
     snapshot.sessions.timelines["session-stream"].events = [
@@ -744,7 +857,7 @@ describe("sessions route", () => {
   test("session detail loads older history when scrolling near the top", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-history"),
+      sessionWithInferenceSettings("session-history"),
     ]);
     snapshot.sessions.timelines["session-history"] = readySessionTimeline();
     snapshot.sessions.timelines["session-history"].events = [
@@ -776,7 +889,7 @@ describe("sessions route", () => {
   test("session detail loads older history after a fast wheel to the top", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-fast-top"),
+      sessionWithInferenceSettings("session-fast-top"),
     ]);
     snapshot.sessions.timelines["session-fast-top"] = readySessionTimeline();
     snapshot.sessions.timelines["session-fast-top"].events = [
@@ -808,7 +921,7 @@ describe("sessions route", () => {
   test("session detail auto-loads older history when initial content is not scrollable", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-short-history"),
+      sessionWithInferenceSettings("session-short-history"),
     ]);
     snapshot.sessions.timelines["session-short-history"] = readySessionTimeline();
     snapshot.sessions.timelines["session-short-history"].events = [
@@ -838,7 +951,7 @@ describe("sessions route", () => {
     const commands: ClientCommand[] = [];
     let publishSnapshot!: (snapshot: ClientSnapshot) => void;
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-prepend"),
+      sessionWithInferenceSettings("session-prepend"),
     ]);
     snapshot.sessions.timelines["session-prepend"] = readySessionTimeline();
     snapshot.sessions.timelines["session-prepend"].events = [
@@ -881,7 +994,7 @@ describe("sessions route", () => {
     const commands: ClientCommand[] = [];
     let publishSnapshot!: (snapshot: ClientSnapshot) => void;
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-top-chain"),
+      sessionWithInferenceSettings("session-top-chain"),
     ]);
     snapshot.sessions.timelines["session-top-chain"] = readySessionTimeline();
     snapshot.sessions.timelines["session-top-chain"].events = [
@@ -927,7 +1040,7 @@ describe("sessions route", () => {
 
   test("session detail renders assistant markdown", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-markdown"),
+      sessionWithInferenceSettings("session-markdown"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -958,7 +1071,7 @@ describe("sessions route", () => {
 
   test("session detail renders template results like composer resource text", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-template-render"),
+      sessionWithInferenceSettings("session-template-render"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1027,7 +1140,7 @@ describe("sessions route", () => {
   test("session detail edit user message rolls back before cursor and pre-fills composer", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-edit-user"),
+      sessionWithInferenceSettings("session-edit-user"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1065,7 +1178,7 @@ describe("sessions route", () => {
   test("session detail edit user message re-templatizes rendered template results", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-edit-template-user"),
+      sessionWithInferenceSettings("session-edit-template-user"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1116,7 +1229,7 @@ describe("sessions route", () => {
   test("session detail rerun user message continues from cursor", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-rerun-user"),
+      sessionWithInferenceSettings("session-rerun-user"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1147,7 +1260,7 @@ describe("sessions route", () => {
 
   test("session detail renders structured rerun authentication failures without beginning OAuth", async () => {
     const commands: ClientCommand[] = [];
-    const snapshot = snapshotWithSessions([sessionWithRuntime("session-rerun-auth")]);
+    const snapshot = snapshotWithSessions([sessionWithInferenceSettings("session-rerun-auth")]);
     const timeline = readySessionTimeline();
     timeline.events = [timelineEvent({
       cursor: 9n,
@@ -1174,7 +1287,7 @@ describe("sessions route", () => {
 
   test("session detail renders thinking markdown", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-thinking-markdown"),
+      sessionWithInferenceSettings("session-thinking-markdown"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1213,7 +1326,7 @@ describe("sessions route", () => {
 
   test("session detail sanitizes assistant markdown html", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-sanitized"),
+      sessionWithInferenceSettings("session-sanitized"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1239,7 +1352,7 @@ describe("sessions route", () => {
 
   test("session detail renders shell tools with terminal output", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-tools"),
+      sessionWithInferenceSettings("session-tools"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1286,7 +1399,7 @@ describe("sessions route", () => {
 
   test("session detail collapses long shell output to recent lines", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-long-shell-output"),
+      sessionWithInferenceSettings("session-long-shell-output"),
     ]);
     let setSnapshot: (snapshot: ClientSnapshot) => void = () => {};
     const timeline = readySessionTimeline();
@@ -1366,7 +1479,7 @@ describe("sessions route", () => {
 
   test("session detail shows loading shell tools", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-tool-loading"),
+      sessionWithInferenceSettings("session-tool-loading"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1391,7 +1504,7 @@ describe("sessions route", () => {
 
   test("session detail renders apply_patch input as a diff", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-patch"),
+      sessionWithInferenceSettings("session-patch"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1433,7 +1546,7 @@ describe("sessions route", () => {
 
   test("session detail renders edit input as a before and after diff", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-edit"),
+      sessionWithInferenceSettings("session-edit"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1476,7 +1589,7 @@ describe("sessions route", () => {
 
   test("session detail renders resolved external requests as compact results", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-permission"),
+      sessionWithInferenceSettings("session-permission"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1522,7 +1635,7 @@ describe("sessions route", () => {
   test("session detail re-answer permission rolls back to opened prompt cursor", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-permission-reanswer"),
+      sessionWithInferenceSettings("session-permission-reanswer"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [
@@ -1581,7 +1694,7 @@ describe("sessions route", () => {
   test("session detail re-answer question rolls back to opened prompt cursor", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-question-reanswer"),
+      sessionWithInferenceSettings("session-question-reanswer"),
     ]);
     const timeline = readySessionTimeline();
     const payload = {
@@ -1641,7 +1754,7 @@ describe("sessions route", () => {
   test("session detail renders unresolved permission prompts and submits decisions", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-permission"),
+      sessionWithInferenceSettings("session-permission"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [externalRequestOpenEvent({
@@ -1685,7 +1798,7 @@ describe("sessions route", () => {
   test("session detail shows external response operation failures", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-permission-fail"),
+      sessionWithInferenceSettings("session-permission-fail"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [externalRequestOpenEvent({
@@ -1716,7 +1829,7 @@ describe("sessions route", () => {
 
   test("session detail shows interrupt operation failures", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-interrupt-fail", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-interrupt-fail", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-interrupt-fail"] = readySessionTimeline();
 
@@ -1734,7 +1847,7 @@ describe("sessions route", () => {
   test("session detail renders unresolved question prompts and submits answers", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithSessions([
-      sessionWithRuntime("session-question"),
+      sessionWithInferenceSettings("session-question"),
     ]);
     const timeline = readySessionTimeline();
     timeline.events = [externalRequestOpenEvent({
@@ -1832,7 +1945,7 @@ describe("sessions route", () => {
     expect(screen.getByLabelText("Confirm delete session session-stay")).toBeTruthy();
   });
 
-  test("provider editor dispatches session runtime metadata update", async () => {
+  test("inference settings editor dispatches session inference update", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithConfig({
       ...emptyConfig("v1"),
@@ -1841,29 +1954,28 @@ describe("sessions route", () => {
         anthropic: provider("Anthropic", ["claude-4"]),
       },
     });
-    snapshot.sessions.current = [sessionWithRuntime("runtime-session")];
+    snapshot.sessions.current = [sessionWithInferenceSettings("inference-session")];
 
     renderWithAppState(() => <SessionsRouteWithRouter />, {
       commands,
-      routePath: "/sessions/runtime-session",
+      routePath: "/sessions/inference-session",
       snapshot,
     });
 
     fireEvent.click(screen.getByLabelText("Edit provider/model"));
     fireEvent.click(screen.getByText("anthropic"));
-    fireEvent.click(screen.getByText("Save runtime"));
+    fireEvent.click(screen.getByText("Save inference settings"));
 
     await waitFor(() => expect(commands).toContainEqual({
-      type: "updateSessionRuntimeConfig",
-      id: "runtime-session",
+      type: "updateSessionInferenceSettings",
+      id: "inference-session",
       providerKey: "anthropic",
       modelId: "claude-4",
       reasoningEffort: null,
-      enabledMcpServerKeys: ["git"],
     }));
   });
 
-  test("provider editor keeps dialog open and shows runtime update failures", async () => {
+  test("inference settings editor keeps dialog open and shows update failures", async () => {
     const snapshot = snapshotWithConfig({
       ...emptyConfig("v1"),
       providers: {
@@ -1871,78 +1983,62 @@ describe("sessions route", () => {
         anthropic: provider("Anthropic", ["claude-4"]),
       },
     });
-    snapshot.sessions.current = [sessionWithRuntime("runtime-session-fail")];
+    snapshot.sessions.current = [sessionWithInferenceSettings("inference-session-fail")];
 
     renderWithAppState(() => <SessionsRouteWithRouter />, {
-      routePath: "/sessions/runtime-session-fail",
+      routePath: "/sessions/inference-session-fail",
       snapshot,
-      sessionRuntimeConfigUpdateError: "runtime update rejected",
+      sessionInferenceSettingsUpdateError: "inference settings update rejected",
     });
 
     fireEvent.click(screen.getByLabelText("Edit provider/model"));
     fireEvent.click(screen.getByText("anthropic"));
-    fireEvent.click(screen.getByText("Save runtime"));
+    fireEvent.click(screen.getByText("Save inference settings"));
 
-    await waitFor(() => expect(screen.getByText("runtime update rejected")).toBeTruthy());
-    expect(screen.getByRole("dialog", { name: "Edit provider/model dialog" })).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("inference settings update rejected")).toBeTruthy());
+    expect(screen.getByRole("dialog", { name: "Edit inference settings dialog" })).toBeTruthy();
   });
 
-  test("bottom bar thinking dropdown dispatches session runtime metadata update", async () => {
+  test("bottom bar thinking dropdown dispatches session inference update", async () => {
     const commands: ClientCommand[] = [];
     const snapshot = snapshotWithConfig({
       ...emptyConfig("v1"),
       providers: { openai: provider("OpenAI", ["gpt-4o"], ["low", "high"]) },
     });
-    snapshot.sessions.current = [sessionWithRuntime("thinking-runtime-session")];
+    snapshot.sessions.current = [sessionWithInferenceSettings("thinking-inference-session")];
 
     renderWithAppState(() => <SessionsRouteWithRouter />, {
       commands,
-      routePath: "/sessions/thinking-runtime-session",
+      routePath: "/sessions/thinking-inference-session",
       snapshot,
     });
 
     fireEvent.change(screen.getByLabelText("Session thinking level"), { target: { value: "high" } });
 
     await waitFor(() => expect(commands).toContainEqual({
-      type: "updateSessionRuntimeConfig",
-      id: "thinking-runtime-session",
+      type: "updateSessionInferenceSettings",
+      id: "thinking-inference-session",
       providerKey: "openai",
       modelId: "gpt-4o",
       reasoningEffort: "high",
-      enabledMcpServerKeys: ["git"],
     }));
   });
 
-  test("mcp editor dispatches selected session runtime servers", async () => {
-    const commands: ClientCommand[] = [];
+  test("session detail has no per-session MCP controls or inference drift labels", () => {
     const snapshot = snapshotWithConfig({
       ...emptyConfig("v1"),
       providers: { openai: provider("OpenAI", ["gpt-4o"]) },
-      mcpServers: {
-        git: { name: "git", kind: "stdio", command: "git-mcp", url: "" },
-        files: { name: "files", kind: "stdio", command: "files-mcp", url: "" },
-      },
+      mcpServers: { git: { name: "git", kind: "stdio", command: "git-mcp", url: "" } },
     });
-    snapshot.sessions.current = [sessionWithRuntime("runtime-session")];
+    snapshot.sessions.current = [sessionWithInferenceSettings("inference-session")];
 
     renderWithAppState(() => <SessionsRouteWithRouter />, {
-      commands,
-      routePath: "/sessions/runtime-session",
+      routePath: "/sessions/inference-session",
       snapshot,
     });
 
-    fireEvent.click(screen.getByLabelText("Edit MCP"));
-    fireEvent.click(screen.getByText("files"));
-    fireEvent.click(screen.getByText("Save MCP"));
-
-    await waitFor(() => expect(commands).toContainEqual({
-      type: "updateSessionRuntimeConfig",
-      id: "runtime-session",
-      providerKey: "openai",
-      modelId: "gpt-4o",
-      reasoningEffort: null,
-      enabledMcpServerKeys: ["git", "files"],
-    }));
+    expect(screen.queryByLabelText("Edit MCP")).toBeNull();
+    expect(screen.queryByText("Configured")).toBeNull();
   });
 });
 
@@ -2083,11 +2179,11 @@ function provider(name: string, modelIds: string[], reasoningEfforts: string[] =
   };
 }
 
-function sessionWithRuntime(id: string, status: SessionStatusView = { phase: "idle", failedMessage: "", authenticationFailure: null }) {
+function sessionWithInferenceSettings(id: string, status: SessionStatusView = { phase: "idle", failedMessage: "", authenticationFailure: null }) {
   return sessionView({
     id,
     status,
-    runtimeConfig: {
+    inferenceSettings: {
       provider: {
         key: "openai",
         kind: "openAiChatCompletions",
@@ -2096,13 +2192,6 @@ function sessionWithRuntime(id: string, status: SessionStatusView = { phase: "id
         reasoningEffort: null,
         matchStatus: "configured",
       },
-      mcpServers: [{
-        key: "git",
-        kind: "stdio",
-        command: "git-mcp",
-        url: "",
-        matchStatus: "configured",
-      }],
     },
   });
 }

@@ -9,7 +9,7 @@ describe("landing status", () => {
   test("renders the ready home route", () => {
     renderWithAppState(() => <ShellRouteWithChildren />, {
       routePath: "/",
-      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, runtimeDefaults: null }),
+      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
     });
 
     expect(screen.getByText("Waltr is ready.")).toBeTruthy();

@@ -30,9 +30,8 @@ import type {
   ClientSnapshot,
   ConfigView,
   ExternalRequestView,
-  McpServerView,
   ProviderView,
-  RuntimeConfigMatchView,
+  SelectableAgentView,
   SessionTemplateOptionView,
   SessionTimelineView,
   SessionView,
@@ -69,7 +68,7 @@ type SessionsContextValue = {
   confirmingDelete: Accessor<string | undefined>;
   deletingSession: Accessor<string | undefined>;
   deleteErrors: Accessor<Record<string, string>>;
-  createSession: () => Promise<void>;
+  createSession: (agentName: string) => Promise<void>;
   promptDelete: (id: string) => void;
   cancelDelete: () => void;
   deleteSession: (id: string) => Promise<void>;
@@ -158,12 +157,12 @@ export function SessionsRoute(props: ParentProps) {
     });
   });
 
-  const createSession = async () => {
+  const createSession = async (agentName: string) => {
     setCreating(true);
     setCreateError(undefined);
 
     try {
-      const terminalSnapshot = await app.dispatchCreateSession();
+      const terminalSnapshot = await app.dispatchCreateSession(agentName);
       const key = terminalSnapshot.sessions.create.key;
       const result = key ? terminalSnapshot.operations.current[key] : undefined;
       const session = result?.kind === "sessionCreate" ? result.session : null;
@@ -226,8 +225,10 @@ export function SessionsRoute(props: ParentProps) {
 }
 
 export function SessionsListRoute() {
+  const app = useAppState();
   const navigate = useNavigate();
   const sessions = useSessionsRoute();
+  const [creatingSession, setCreatingSession] = createSignal(false);
 
   return (
     <section class="sessions sessions--list" aria-labelledby="sessions-title">
@@ -238,7 +239,10 @@ export function SessionsListRoute() {
             <A class="sessions__data-link" href="/sessions/data">Manage session data</A>
             <button
               type="button"
-              onClick={() => void sessions.createSession()}
+              onClick={() => {
+                setCreatingSession(true);
+                void requestAgentsIfNeeded(app);
+              }}
               disabled={sessions.createDisabled()}
             >
               {sessions.creating() ? "Creating..." : "Create session"}
@@ -248,6 +252,24 @@ export function SessionsListRoute() {
       />
 
       <SessionRouteAlerts />
+
+      <Show when={creatingSession()}>
+        <AgentSelectionDialog
+          title="Create session"
+          confirmLabel="Create session"
+          pendingLabel="Creating..."
+          initialName={app.snapshot()?.sessions.agents.defaultAgentName ?? ""}
+          pending={sessions.creating()}
+          error={sessions.createError()}
+          onRetry={() => requestSessionAgents(app)}
+          onClose={() => {
+            if (!sessions.creating()) setCreatingSession(false);
+          }}
+          onConfirm={async (agentName) => {
+            await sessions.createSession(agentName);
+          }}
+        />
+      </Show>
 
       <section class="sessions__list-panel" aria-labelledby="sessions-list-title">
         <h2 id="sessions-list-title">Recent sessions</h2>
@@ -422,10 +444,6 @@ function SessionRouteAlerts() {
 
   return (
     <>
-      <Show when={sessions.createError()}>
-        {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
-      </Show>
-
       <Switch>
         <Match when={sessions.listError()}>
           <InlineAlert tone="danger">Unable to load sessions.</InlineAlert>
@@ -441,7 +459,8 @@ function SessionRouteAlerts() {
 function SessionDetail(props: { session: SessionView }) {
   const app = useAppState();
   const sessions = useSessionsRoute();
-  const [editingRuntime, setEditingRuntime] = createSignal<"provider" | "mcp">();
+  const [editingInferenceSettings, setEditingInferenceSettings] = createSignal(false);
+  const [editingAgent, setEditingAgent] = createSignal(false);
   const [draft, setDraft] = createSignal("");
   const [caret, setCaret] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
   const [resourceInputVersion, setResourceInputVersion] = createSignal(0);
@@ -1130,14 +1149,17 @@ function SessionDetail(props: { session: SessionView }) {
       <SessionDetailStatusBar
         session={props.session}
         contextTokens={latestContextTokens(latestMetrics())}
-        onEditProvider={() => setEditingRuntime("provider")}
-        onEditMcp={() => setEditingRuntime("mcp")}
+        onEditInferenceSettings={() => setEditingInferenceSettings(true)}
+        onEditAgent={() => {
+          setEditingAgent(true);
+          void requestAgentsIfNeeded(app);
+        }}
       />
-      <Show when={editingRuntime() === "provider"}>
-        <SessionProviderDialog session={props.session} onClose={() => setEditingRuntime(undefined)} />
+      <Show when={editingInferenceSettings()}>
+        <SessionInferenceSettingsDialog session={props.session} onClose={() => setEditingInferenceSettings(false)} />
       </Show>
-      <Show when={editingRuntime() === "mcp"}>
-        <SessionMcpDialog session={props.session} onClose={() => setEditingRuntime(undefined)} />
+      <Show when={editingAgent()}>
+        <SessionAgentDialog session={props.session} active={active()} onClose={() => setEditingAgent(false)} />
       </Show>
     </div>
   );
@@ -2918,39 +2940,38 @@ function normalizeQuestion(value: unknown): QuestionModel {
 function SessionDetailStatusBar(props: {
   session: SessionView;
   contextTokens: bigint;
-  onEditProvider: () => void;
-  onEditMcp: () => void;
+  onEditInferenceSettings: () => void;
+  onEditAgent: () => void;
 }) {
   const app = useAppState();
-  const [reasoningEffort, setReasoningEffort] = createSignal(props.session.runtimeConfig?.provider?.reasoningEffort ?? "");
+  const [reasoningEffort, setReasoningEffort] = createSignal(props.session.inferenceSettings?.provider?.reasoningEffort ?? "");
   const [savingReasoningEffort, setSavingReasoningEffort] = createSignal(false);
   const [reasoningEffortError, setReasoningEffortError] = createSignal<string>();
   const config = createMemo(() => app.snapshot()?.config.current ?? undefined);
   const reasoningEfforts = createMemo(() => currentReasoningEfforts(config(), props.session));
 
   createEffect(() => {
-    const current = props.session.runtimeConfig?.provider?.reasoningEffort ?? "";
+    const current = props.session.inferenceSettings?.provider?.reasoningEffort ?? "";
     props.session.id;
-    props.session.runtimeConfig?.provider?.key;
-    props.session.runtimeConfig?.provider?.modelId;
+    props.session.inferenceSettings?.provider?.key;
+    props.session.inferenceSettings?.provider?.modelId;
     if (!untrack(savingReasoningEffort)) {
       setReasoningEffort(current);
     }
   });
 
   const updateReasoningEffort = async (effort: string) => {
-    const provider = props.session.runtimeConfig?.provider;
+    const provider = props.session.inferenceSettings?.provider;
     if (!provider) {
       setReasoningEffortError("Choose a provider before setting thinking.");
       return;
     }
 
     setReasoningEffort(effort);
-    await updateRuntimeConfig(app.dispatchUpdateSessionRuntimeConfig, props.session, {
+    await updateInferenceSettings(app.dispatchUpdateSessionInferenceSettings, props.session, {
       providerKey: provider.key,
       modelId: provider.modelId,
       reasoningEffort: effort || null,
-      enabledMcpServerKeys: props.session.runtimeConfig?.mcpServers.map((server) => server.key) ?? [],
       setSaving: setSavingReasoningEffort,
       setError: setReasoningEffortError,
       onClose: () => undefined,
@@ -2960,12 +2981,23 @@ function SessionDetailStatusBar(props: {
   return (
     <footer class="sessions__detail-status" aria-label="Session status summary">
       <span class="sessions__detail-status-item">
-        <strong>Provider</strong> {formatRuntimeProvider(props.session)}
+        <strong>Agent</strong> {props.session.agentName}
+        <button
+          type="button"
+          class="sessions__detail-status-button"
+          aria-label="Switch agent"
+          onClick={props.onEditAgent}
+        >
+          Edit
+        </button>
+      </span>
+      <span class="sessions__detail-status-item">
+        <strong>Provider</strong> {formatInferenceProvider(props.session)}
         <button
           type="button"
           class="sessions__detail-status-button"
           aria-label="Edit provider/model"
-          onClick={props.onEditProvider}
+          onClick={props.onEditInferenceSettings}
         >
           Edit
         </button>
@@ -2987,17 +3019,6 @@ function SessionDetailStatusBar(props: {
       <Show when={reasoningEffortError()}>
         {(message) => <span class="sessions__detail-status-error">{message()}</span>}
       </Show>
-      <span class="sessions__detail-status-item">
-        <strong>MCP</strong> {formatRuntimeMcpServers(props.session)}
-        <button
-          type="button"
-          class="sessions__detail-status-button"
-          aria-label="Edit MCP"
-          onClick={props.onEditMcp}
-        >
-          Edit
-        </button>
-      </span>
       <span class="sessions__detail-metrics" aria-label="Session token and cost totals">
         <span class="sessions__detail-status-item" title="Latest reported input + output tokens">
           <strong>Ctx</strong> {formatTokenCount(props.contextTokens)}
@@ -3012,6 +3033,138 @@ function SessionDetailStatusBar(props: {
       <SessionDeleteAction session={props.session} compact />
     </footer>
   );
+}
+
+function SessionAgentDialog(props: { session: SessionView; active: boolean; onClose: () => void }) {
+  const app = useAppState();
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string>();
+
+  return (
+    <AgentSelectionDialog
+      title="Switch agent"
+      confirmLabel="Switch agent"
+      pendingLabel="Switching..."
+      initialName={props.session.agentName}
+      pending={saving()}
+      error={error()}
+      note={props.active ? "The current cycle will finish with the current agent. The new agent applies on the next cycle; history is preserved." : "The new agent applies on the next cycle. Session history is preserved."}
+      onRetry={() => requestSessionAgents(app)}
+      onClose={() => {
+        if (!saving()) props.onClose();
+      }}
+      onConfirm={async (agentName) => {
+        if (saving()) return;
+        setSaving(true);
+        setError(undefined);
+        try {
+          await app.dispatchUpdateSessionAgent(props.session.id, agentName);
+          props.onClose();
+        } catch (error) {
+          setError(error instanceof Error ? error.message : "Unable to switch agent.");
+        } finally {
+          setSaving(false);
+        }
+      }}
+    />
+  );
+}
+
+function AgentSelectionDialog(props: {
+  title: string;
+  confirmLabel: string;
+  pendingLabel: string;
+  initialName: string;
+  pending: boolean;
+  error?: string;
+  note?: string;
+  onRetry: () => Promise<ClientSnapshot>;
+  onClose: () => void;
+  onConfirm: (agentName: string) => Promise<void>;
+}) {
+  const app = useAppState();
+  const [selectedName, setSelectedName] = createSignal(props.initialName);
+  const catalog = createMemo(() => app.snapshot()?.sessions.agents);
+  const entries = createMemo(() => catalog()?.entries ?? []);
+  const loading = createMemo(() => catalog()?.load.status === "loading" || catalog()?.load.status === "idle");
+  const loadError = createMemo(() => catalog()?.load.error);
+
+  createEffect(() => {
+    if (!selectedName()) {
+      setSelectedName(catalog()?.defaultAgentName ?? entries()[0]?.name ?? "");
+    }
+  });
+
+  return (
+    <Dialog title={props.title} onClose={props.onClose} class="sessions__agent-dialog">
+      <form
+        class="sessions__agent-selector"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!props.pending && selectedName()) void props.onConfirm(selectedName());
+        }}
+      >
+        <Show when={props.note}><p class="sessions__agent-note">{props.note}</p></Show>
+        <Show when={props.error}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
+        <Switch>
+          <Match when={loadError()}>
+            <InlineAlert tone="danger">
+              <span>Unable to load agents. </span>
+              <button type="button" onClick={() => void props.onRetry()} disabled={loading()}>Retry</button>
+            </InlineAlert>
+          </Match>
+          <Match when={loading()}>
+            <InlineAlert>Loading agents...</InlineAlert>
+          </Match>
+          <Match when={entries().length === 0}>
+            <InlineAlert>No agents are available.</InlineAlert>
+          </Match>
+          <Match when={true}>
+            <fieldset class="sessions__agent-list">
+              <legend>Choose an agent</legend>
+              <For each={entries()}>
+                {(agent) => (
+                  <AgentOption
+                    agent={agent}
+                    selected={selectedName() === agent.name}
+                    disabled={props.pending}
+                    onSelect={() => setSelectedName(agent.name)}
+                  />
+                )}
+              </For>
+            </fieldset>
+          </Match>
+        </Switch>
+        <div class="sessions__agent-actions">
+          <button type="button" onClick={props.onClose} disabled={props.pending}>Cancel</button>
+          <button type="submit" disabled={props.pending || loading() || Boolean(loadError()) || !selectedName()}>
+            {props.pending ? props.pendingLabel : props.confirmLabel}
+          </button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
+
+function AgentOption(props: { agent: SelectableAgentView; selected: boolean; disabled: boolean; onSelect: () => void }) {
+  return (
+    <label class={`sessions__agent-option${props.selected ? " is-selected" : ""}`}>
+      <input type="radio" name="session-agent" value={props.agent.name} checked={props.selected} disabled={props.disabled} onChange={props.onSelect} />
+      <span>
+        <strong>{props.agent.name}</strong>
+        <Show when={props.agent.description}>{(description) => <small>{description()}</small>}</Show>
+      </span>
+    </label>
+  );
+}
+
+function requestAgentsIfNeeded(app: ReturnType<typeof useAppState>) {
+  const load = app.snapshot()?.sessions.agents.load;
+  return load?.status === "idle" ? requestSessionAgents(app) : Promise.resolve(app.snapshot()!);
+}
+
+function requestSessionAgents(app: ReturnType<typeof useAppState>) {
+  return app.dispatch({ type: "requestSessionAgents" });
 }
 
 function formatTokenCount(value: bigint) {
@@ -3034,7 +3187,7 @@ function formatCostMicros(micros: bigint, currency: string | null) {
 }
 
 function currentReasoningEfforts(config: ConfigView | undefined, session: SessionView) {
-  const provider = session.runtimeConfig?.provider;
+  const provider = session.inferenceSettings?.provider;
   if (!provider) {
     return [];
   }
@@ -3042,12 +3195,12 @@ function currentReasoningEfforts(config: ConfigView | undefined, session: Sessio
   return config?.providers[provider.key]?.models[provider.modelId]?.options.reasoningEfforts ?? [];
 }
 
-function SessionProviderDialog(props: { session: SessionView; onClose: () => void }) {
+function SessionInferenceSettingsDialog(props: { session: SessionView; onClose: () => void }) {
   const app = useAppState();
   const [query, setQuery] = createSignal("");
-  const [providerKey, setProviderKey] = createSignal(props.session.runtimeConfig?.provider?.key ?? "");
-  const [modelId, setModelId] = createSignal(props.session.runtimeConfig?.provider?.modelId ?? "");
-  const [reasoningEffort, setReasoningEffort] = createSignal(props.session.runtimeConfig?.provider?.reasoningEffort ?? "");
+  const [providerKey, setProviderKey] = createSignal(props.session.inferenceSettings?.provider?.key ?? "");
+  const [modelId, setModelId] = createSignal(props.session.inferenceSettings?.provider?.modelId ?? "");
+  const [reasoningEffort, setReasoningEffort] = createSignal(props.session.inferenceSettings?.provider?.reasoningEffort ?? "");
   const [error, setError] = createSignal<string>();
   const [saving, setSaving] = createSignal(false);
   const config = createMemo(() => app.snapshot()?.config.current ?? undefined);
@@ -3078,11 +3231,10 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
       setError("Choose a provider and model.");
       return;
     }
-    await updateRuntimeConfig(app.dispatchUpdateSessionRuntimeConfig, props.session, {
+    await updateInferenceSettings(app.dispatchUpdateSessionInferenceSettings, props.session, {
       providerKey: provider,
       modelId: model,
       reasoningEffort: reasoningEffort() || null,
-      enabledMcpServerKeys: props.session.runtimeConfig?.mcpServers.map((server) => server.key) ?? [],
       setSaving,
       setError,
       onClose: props.onClose,
@@ -3090,34 +3242,33 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
   };
 
   return (
-    <Dialog title="Edit provider/model" onClose={props.onClose} class="sessions__runtime-dialog">
-      <div class="sessions__runtime-editor">
-        <p class="sessions__runtime-note">
-          Updates this session metadata immediately. The next prompt will use the selected runtime.
+    <Dialog title="Edit inference settings" onClose={props.onClose} class="sessions__inference-dialog">
+      <div class="sessions__inference-editor">
+        <p class="sessions__inference-note">
+          Updates this session immediately. The next prompt will use the selected inference settings.
         </p>
         <Show when={error()}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
-        <label class="sessions__runtime-search">
+        <label class="sessions__inference-search">
           Search providers
           <input value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
         </label>
-        <div class="sessions__runtime-list" role="listbox" aria-label="Provider options">
+        <div class="sessions__inference-list" role="listbox" aria-label="Provider options">
           <For each={providers()}>
             {([key, provider]) => (
               <button
                 type="button"
-                class={`sessions__runtime-option ${providerKey() === key ? "is-selected" : ""}`.trim()}
+                class={`sessions__inference-option ${providerKey() === key ? "is-selected" : ""}`.trim()}
                 onClick={() => {
                   setProviderKey(key);
                   setModelId(Object.keys(provider.models)[0] ?? "");
                 }}
               >
                 <span>{key}</span>
-                <RuntimeStateBadge state={providerRuntimeState(props.session, key)} />
               </button>
             )}
           </For>
         </div>
-        <label class="sessions__runtime-search">
+        <label class="sessions__inference-search">
           Model
           <select value={modelId()} onChange={(event) => setModelId(event.currentTarget.value)}>
             <For each={models()}>
@@ -3125,7 +3276,7 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
             </For>
           </select>
         </label>
-        <label class="sessions__runtime-search">
+        <label class="sessions__inference-search">
           Thinking level
           <select value={reasoningEffort()} onChange={(event) => setReasoningEffort(event.currentTarget.value)} disabled={reasoningEfforts().length === 0}>
             <option value="">None</option>
@@ -3134,10 +3285,10 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
             </For>
           </select>
         </label>
-        <div class="sessions__runtime-actions">
+        <div class="sessions__inference-actions">
           <button type="button" onClick={props.onClose}>Cancel</button>
           <button type="button" onClick={() => void save()} disabled={saving()}>
-            {saving() ? "Saving..." : "Save runtime"}
+            {saving() ? "Saving..." : "Save inference settings"}
           </button>
         </div>
       </div>
@@ -3145,79 +3296,8 @@ function SessionProviderDialog(props: { session: SessionView; onClose: () => voi
   );
 }
 
-function SessionMcpDialog(props: { session: SessionView; onClose: () => void }) {
-  const app = useAppState();
-  const [query, setQuery] = createSignal("");
-  const [selected, setSelected] = createSignal(new Set(props.session.runtimeConfig?.mcpServers.map((server) => server.key) ?? []));
-  const [error, setError] = createSignal<string>();
-  const [saving, setSaving] = createSignal(false);
-  const config = createMemo(() => app.snapshot()?.config.current ?? undefined);
-  const servers = createMemo(() => mcpEntries(config(), props.session, query()));
-
-  const toggle = (key: string) => {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(key)) {
-        next.delete(key);
-      } else {
-        next.add(key);
-      }
-      return next;
-    });
-  };
-
-  const save = async () => {
-    await updateRuntimeConfig(app.dispatchUpdateSessionRuntimeConfig, props.session, {
-      providerKey: props.session.runtimeConfig?.provider?.key ?? "",
-      modelId: props.session.runtimeConfig?.provider?.modelId ?? "",
-      reasoningEffort: props.session.runtimeConfig?.provider?.reasoningEffort ?? null,
-      enabledMcpServerKeys: Array.from(selected()),
-      setSaving,
-      setError,
-      onClose: props.onClose,
-    });
-  };
-
-  return (
-    <Dialog title="Edit MCP servers" onClose={props.onClose} class="sessions__runtime-dialog">
-      <div class="sessions__runtime-editor">
-        <p class="sessions__runtime-note">
-          Missing servers stay visible so drift is explicit before you save.
-        </p>
-        <Show when={error()}>{(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}</Show>
-        <label class="sessions__runtime-search">
-          Search MCP servers
-          <input value={query()} onInput={(event) => setQuery(event.currentTarget.value)} />
-        </label>
-        <div class="sessions__runtime-list" aria-label="MCP server options">
-          <For each={servers()}>
-            {(server) => (
-              <label class={`sessions__runtime-option ${selected().has(server.key) ? "is-selected" : ""}`.trim()}>
-                <input
-                  type="checkbox"
-                  checked={selected().has(server.key)}
-                  onChange={() => toggle(server.key)}
-                  disabled={!server.configured}
-                />
-                <span>{server.key}</span>
-                <RuntimeStateBadge state={server.state} />
-              </label>
-            )}
-          </For>
-        </div>
-        <div class="sessions__runtime-actions">
-          <button type="button" onClick={props.onClose}>Cancel</button>
-          <button type="button" onClick={() => void save()} disabled={saving()}>
-            {saving() ? "Saving..." : "Save MCP"}
-          </button>
-        </div>
-      </div>
-    </Dialog>
-  );
-}
-
-function formatRuntimeProvider(session: SessionView) {
-  const provider = session.runtimeConfig?.provider;
+function formatInferenceProvider(session: SessionView) {
+  const provider = session.inferenceSettings?.provider;
 
   if (!provider) {
     return "none";
@@ -3226,82 +3306,23 @@ function formatRuntimeProvider(session: SessionView) {
   return provider.reasoningEffort ? `${provider.key}/${provider.modelId} (${provider.reasoningEffort})` : `${provider.key}/${provider.modelId}`;
 }
 
-function formatRuntimeMcpServers(session: SessionView) {
-  const servers = session.runtimeConfig?.mcpServers ?? [];
-
-  if (servers.length === 0) {
-    return "none";
-  }
-
-  return servers.map((server) => server.key).join(", ");
-}
-
-function RuntimeStateBadge(props: { state: RuntimeConfigMatchView | "available" }) {
-  return <span class={`sessions__runtime-state sessions__runtime-state--${props.state}`}>{runtimeStateLabel(props.state)}</span>;
-}
-
 function providerEntries(config: ConfigView | undefined, query: string): Array<[string, ProviderView]> {
   return Object.entries(config?.providers ?? {})
     .filter((entry): entry is [string, ProviderView] => Boolean(entry[1]))
     .filter(([key, provider]) => searchable(`${key} ${provider.name}`, query));
 }
 
-function mcpEntries(config: ConfigView | undefined, session: SessionView, query: string) {
-  const configured = Object.entries(config?.mcpServers ?? {})
-    .filter((entry): entry is [string, McpServerView] => Boolean(entry[1]))
-    .map(([key]) => ({
-      key,
-      configured: true,
-      state: mcpRuntimeState(session, key) ?? "available" as const,
-    }));
-  const missing = (session.runtimeConfig?.mcpServers ?? [])
-    .filter((server) => !(config?.mcpServers ?? {})[server.key])
-    .map((server) => ({
-      key: server.key,
-      configured: false,
-      state: server.matchStatus,
-    }));
-
-  return [...configured, ...missing].filter((server) => searchable(server.key, query));
-}
-
-function providerRuntimeState(session: SessionView, key: string) {
-  return session.runtimeConfig?.provider?.key === key
-    ? session.runtimeConfig.provider.matchStatus
-    : "available";
-}
-
-function mcpRuntimeState(session: SessionView, key: string) {
-  return session.runtimeConfig?.mcpServers.find((server) => server.key === key)?.matchStatus;
-}
-
-function runtimeStateLabel(state: RuntimeConfigMatchView | "available") {
-  switch (state) {
-    case "configured":
-      return "Configured";
-    case "changed":
-      return "Changed";
-    case "missing":
-      return "Missing";
-    case "available":
-      return "Available";
-    default:
-      return "Unknown";
-  }
-}
-
 function searchable(value: string, query: string) {
   return value.toLowerCase().includes(query.trim().toLowerCase());
 }
 
-async function updateRuntimeConfig(
-  dispatchUpdateSessionRuntimeConfig: (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => Promise<unknown>,
+async function updateInferenceSettings(
+  dispatchUpdateSessionInferenceSettings: (command: Extract<ClientCommand, { type: "updateSessionInferenceSettings" }>) => Promise<unknown>,
   session: SessionView,
   options: {
     providerKey: string;
     modelId: string;
     reasoningEffort: string | null;
-    enabledMcpServerKeys: string[];
     setSaving: (saving: boolean) => void;
     setError: (message: string | undefined) => void;
     onClose: () => void;
@@ -3311,17 +3332,16 @@ async function updateRuntimeConfig(
   options.setError(undefined);
 
   try {
-    await dispatchUpdateSessionRuntimeConfig({
-      type: "updateSessionRuntimeConfig",
+    await dispatchUpdateSessionInferenceSettings({
+      type: "updateSessionInferenceSettings",
       id: session.id,
       providerKey: options.providerKey,
       modelId: options.modelId,
       reasoningEffort: options.reasoningEffort,
-      enabledMcpServerKeys: options.enabledMcpServerKeys,
     });
     options.onClose();
   } catch (error) {
-    options.setError(error instanceof Error ? error.message : "Unable to update session runtime.");
+    options.setError(error instanceof Error ? error.message : "Unable to update session inference settings.");
   } finally {
     options.setSaving(false);
   }

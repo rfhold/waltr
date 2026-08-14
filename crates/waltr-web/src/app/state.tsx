@@ -185,9 +185,9 @@ export function AppStateProvider(props: AppStateProviderProps) {
       failureMessage: "credential reset failed",
     });
 
-  const dispatchCreateSession = async () => {
+  const dispatchCreateSession = async (agentName: string) => {
     return dispatchAndWaitForOperation({
-      command: { type: "createSession" },
+      command: { type: "createSession", agentName },
       key: (snapshot) => snapshot.sessions.create.key,
       kind: "sessionCreate",
       missingKeyMessage: "session create command did not produce an operation key",
@@ -215,13 +215,23 @@ export function AppStateProvider(props: AppStateProviderProps) {
     });
   };
 
-  const dispatchUpdateSessionRuntimeConfig = async (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => {
+  const dispatchUpdateSessionInferenceSettings = async (command: Extract<ClientCommand, { type: "updateSessionInferenceSettings" }>) => {
     return dispatchAndWaitForOperation({
       command,
-      key: (snapshot) => snapshot.sessions.runtimeConfigUpdate.key,
-      kind: "sessionRuntimeConfigUpdate",
-      missingKeyMessage: "session runtime config update command did not produce an operation key",
-      failureMessage: "session runtime config update failed",
+      key: (snapshot) => snapshot.sessions.inferenceSettingsUpdate.key,
+      kind: "sessionInferenceSettingsUpdate",
+      missingKeyMessage: "session inference settings update command did not produce an operation key",
+      failureMessage: "session inference settings update failed",
+    });
+  };
+
+  const dispatchUpdateSessionAgent = async (id: string, agentName: string) => {
+    return dispatchAndWaitForOperation({
+      command: { type: "updateSessionAgent", id, agentName },
+      key: (snapshot) => snapshot.sessions.agentUpdate.key,
+      kind: "sessionAgentUpdate",
+      missingKeyMessage: "session agent update command did not produce an operation key",
+      failureMessage: "session agent update failed",
     });
   };
 
@@ -324,7 +334,8 @@ export function AppStateProvider(props: AppStateProviderProps) {
         dispatchCreateSession,
         dispatchDeleteSession,
         dispatchWipeSessions,
-        dispatchUpdateSessionRuntimeConfig,
+          dispatchUpdateSessionInferenceSettings,
+          dispatchUpdateSessionAgent,
         dispatchSubmitUserMessage,
         dispatchRespondExternalRequest,
         dispatchInterruptSession,

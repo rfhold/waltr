@@ -26,7 +26,8 @@ export function renderWithAppState(
     sessionCreateError?: string;
     sessionDeleteError?: string;
     sessionWipeError?: string;
-    sessionRuntimeConfigUpdateError?: string;
+    sessionInferenceSettingsUpdateError?: string;
+    sessionAgentUpdateError?: string;
     submitUserMessageError?: string;
     respondExternalRequestError?: string;
     continueSessionError?: string;
@@ -103,20 +104,21 @@ export function renderWithAppState(
       return ready;
     };
 
-    const dispatchCreateSession = async () => {
-      const command: ClientCommand = { type: "createSession" };
+    const dispatchCreateSession = async (agentName: string) => {
+      const command: ClientCommand = { type: "createSession", agentName };
       commands.push(command);
       const key = `op-${nextOperationId++}`;
       const current = snapshot() ?? snapshotWithConfig(emptyConfig(""));
       const session: SessionView = {
         id: `session-${nextOperationId}`,
+        agentName,
         revision: 0n,
         status: { phase: "idle", failedMessage: "", authenticationFailure: null },
         currentPrompt: null,
         createdAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         updatedAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         lastActivityAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
-        runtimeConfig: null,
+        inferenceSettings: null,
         metrics: {
           inputTokens: 0n,
           outputTokens: 0n,
@@ -185,6 +187,48 @@ export function renderWithAppState(
       };
       setSnapshot(ready);
 
+      return ready;
+    };
+
+    const dispatchUpdateSessionAgent = async (id: string, agentName: string) => {
+      const command: ClientCommand = { type: "updateSessionAgent", id, agentName };
+      commands.push(command);
+      const key = `op-${nextOperationId++}`;
+      const current = snapshot() ?? snapshotWithConfig(emptyConfig(""));
+      const loading: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current } },
+        sessions: { ...current.sessions, agentUpdate: { status: "loading", error: null, key } },
+      };
+      loading.operations.current[key] = { kind: "sessionAgentUpdate", status: "loading", error: null, session: null };
+      setSnapshot(loading);
+      await Promise.resolve();
+
+      if (options.sessionAgentUpdateError) {
+        const failed: ClientSnapshot = {
+          ...current,
+          operations: { current: { ...current.operations.current } },
+          sessions: { ...current.sessions, agentUpdate: { status: "failed", error: options.sessionAgentUpdateError, key } },
+        };
+        failed.operations.current[key] = { kind: "sessionAgentUpdate", status: "failed", error: options.sessionAgentUpdateError, session: null };
+        setSnapshot(failed);
+        throw new Error(options.sessionAgentUpdateError);
+      }
+
+      const updated = current.sessions.current.find((session) => session.id === id);
+      if (!updated) throw new Error("session not found");
+      const session = { ...updated, agentName };
+      const ready: ClientSnapshot = {
+        ...current,
+        operations: { current: { ...current.operations.current } },
+        sessions: {
+          ...current.sessions,
+          current: current.sessions.current.map((entry) => entry.id === id ? session : entry),
+          agentUpdate: { status: "ready", error: null, key },
+        },
+      };
+      ready.operations.current[key] = { kind: "sessionAgentUpdate", status: "ready", error: null, session };
+      setSnapshot(ready);
       return ready;
     };
 
@@ -262,15 +306,15 @@ export function renderWithAppState(
       });
     };
 
-    const dispatchUpdateSessionRuntimeConfig = async (command: Extract<ClientCommand, { type: "updateSessionRuntimeConfig" }>) => {
+    const dispatchUpdateSessionInferenceSettings = async (command: Extract<ClientCommand, { type: "updateSessionInferenceSettings" }>) => {
       return dispatchSessionOperation({
         command,
-        operationName: "runtimeConfigUpdate",
-        kind: "sessionRuntimeConfigUpdate",
-        error: options.sessionRuntimeConfigUpdateError,
-        loadingOperation: { kind: "sessionRuntimeConfigUpdate", status: "loading", error: null, session: null },
-        readyOperation: (current) => ({ kind: "sessionRuntimeConfigUpdate", status: "ready", error: null, session: current.sessions.current.find((session) => session.id === command.id) ?? null }),
-        failedOperation: (error) => ({ kind: "sessionRuntimeConfigUpdate", status: "failed", error, session: null }),
+        operationName: "inferenceSettingsUpdate",
+        kind: "sessionInferenceSettingsUpdate",
+        error: options.sessionInferenceSettingsUpdateError,
+        loadingOperation: { kind: "sessionInferenceSettingsUpdate", status: "loading", error: null, session: null },
+        readyOperation: (current) => ({ kind: "sessionInferenceSettingsUpdate", status: "ready", error: null, session: current.sessions.current.find((session) => session.id === command.id) ?? null }),
+        failedOperation: (error) => ({ kind: "sessionInferenceSettingsUpdate", status: "failed", error, session: null }),
       });
     };
 
@@ -324,7 +368,7 @@ export function renderWithAppState(
 
     const dispatchSessionOperation = async (operation: {
       command: ClientCommand;
-      operationName: "wipe" | "runtimeConfigUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt" | "continueSession";
+      operationName: "wipe" | "inferenceSettingsUpdate" | "submitUserMessage" | "respondExternalRequest" | "interrupt" | "continueSession";
       kind: ClientOperationView["kind"];
       error?: string;
       loadingOperation: ClientOperationView;
@@ -413,7 +457,8 @@ export function renderWithAppState(
           dispatchCreateSession,
           dispatchDeleteSession,
           dispatchWipeSessions,
-          dispatchUpdateSessionRuntimeConfig,
+          dispatchUpdateSessionInferenceSettings,
+          dispatchUpdateSessionAgent,
           dispatchSubmitUserMessage,
           dispatchRespondExternalRequest,
           dispatchInterruptSession,
@@ -477,8 +522,8 @@ function applyConfigPatchCommand(current: ConfigView, command: ClientCommand): C
     return { ...current, mcpServers };
   }
 
-  if (command.type === "setRuntimeDefaults") {
-    return { ...current, runtimeDefaults: command.defaults };
+  if (command.type === "setInferenceDefaults") {
+    return { ...current, inferenceDefaults: command.defaults };
   }
 
   return current;

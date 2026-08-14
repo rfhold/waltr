@@ -71,12 +71,14 @@ export function emptyAuthSnapshot(): AuthSnapshot {
 
 export function emptySessionSnapshot(): SessionSnapshot {
   return {
+    agents: { entries: [], defaultAgentName: "", load: operationSnapshot("idle") },
     current: [],
     create: operationSnapshot("idle"),
     list: operationSnapshot("idle"),
     delete: operationSnapshot("idle"),
     wipe: operationSnapshot("idle"),
-    runtimeConfigUpdate: operationSnapshot("idle"),
+    inferenceSettingsUpdate: operationSnapshot("idle"),
+    agentUpdate: operationSnapshot("idle"),
     submitUserMessage: operationSnapshot("idle"),
     respondExternalRequest: operationSnapshot("idle"),
     interrupt: operationSnapshot("idle"),
@@ -101,18 +103,27 @@ export function readySessionTimeline(): SessionTimelineView {
 }
 
 export function emptyConfig(etag = "v1"): ConfigView {
-  return { etag, providers: {}, mcpServers: {}, runtimeDefaults: null };
+  return { etag, providers: {}, mcpServers: {}, inferenceDefaults: null };
 }
 
 export function snapshotWithSessions(sessions: SessionView[]): ClientSnapshot {
   const snapshot = snapshotWithConfig(emptyConfig("v1"));
   snapshot.sessions = {
+    agents: {
+      entries: [
+        { name: "default", description: "General-purpose agent" },
+        { name: "reviewer", description: "Reviews changes and risks" },
+      ],
+      defaultAgentName: "default",
+      load: operationSnapshot("ready"),
+    },
     current: sessions,
     create: operationSnapshot("idle"),
     list: operationSnapshot("ready"),
     delete: operationSnapshot("idle"),
     wipe: operationSnapshot("idle"),
-    runtimeConfigUpdate: operationSnapshot("idle"),
+    inferenceSettingsUpdate: operationSnapshot("idle"),
+    agentUpdate: operationSnapshot("idle"),
     submitUserMessage: operationSnapshot("idle"),
     respondExternalRequest: operationSnapshot("idle"),
     interrupt: operationSnapshot("idle"),
@@ -131,13 +142,14 @@ export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
 
   return {
     id,
+    agentName: "default",
     revision: 0n,
     status: { phase: "idle", failedMessage: "", authenticationFailure: null },
     currentPrompt: null,
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),
     lastActivityAt: timestamp(1_700_000_000),
-    runtimeConfig: null,
+    inferenceSettings: null,
     metrics: sessionMetricsView(),
     ...overrides,
   };
@@ -209,6 +221,6 @@ export function claudeConfig(): ConfigView {
     etag: "v1",
     providers: { claude },
     mcpServers: {},
-    runtimeDefaults: null,
+    inferenceDefaults: null,
   };
 }
