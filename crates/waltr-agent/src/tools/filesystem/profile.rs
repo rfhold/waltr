@@ -65,12 +65,9 @@ impl FilesystemToolSet {
             ResolvedFilesystemToolProfile::WholeFileWrite => {
                 vec![FilesystemToolKind::Write, FilesystemToolKind::Delete]
             }
-            ResolvedFilesystemToolProfile::StructuredPatch => vec![
-                FilesystemToolKind::Edit,
-                FilesystemToolKind::Write,
-                FilesystemToolKind::Delete,
-                FilesystemToolKind::ApplyPatch,
-            ],
+            ResolvedFilesystemToolProfile::StructuredPatch => {
+                vec![FilesystemToolKind::ApplyPatch]
+            }
         };
 
         Self {

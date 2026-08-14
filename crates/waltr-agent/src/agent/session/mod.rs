@@ -22,16 +22,17 @@ pub use run::{
 pub(super) use run::{RunOutcomeSender, RunResult};
 pub use runtime::{AgentSessionRuntime, RuntimeResumeOutput};
 pub use runtime_factory::{
-    AgentSessionRuntimeFactory, CredentialRefreshCoordinator, CredentialRefreshError, RefreshMode,
+    AgentRuntimeProvider, AgentSessionRuntimeFactory, CredentialRefreshCoordinator,
+    CredentialRefreshError, McpConnectionKind, McpConnectionResolveFuture,
+    McpConnectionResolveRequest, McpResolvedConnection, RefreshMode,
 };
 pub use settings::{
-    CredentialStore, FileCredentialStore, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration,
-    McpOAuthRegistrationMethod, OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext,
-    OAuthCredentialRecord, OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim,
-    OAuthRefreshClaimResult, OAuthTokenSet, SessionMcpServerRuntimeKind,
-    SessionMcpServerRuntimeSettings, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
-    SessionOAuthProviderSettings, SessionOAuthTokenField, SessionOAuthTokenFieldTarget,
-    SessionOAuthTokenRequestStyle, SessionProviderRuntimeSettings, SessionRuntimeSettings,
+    CredentialStore, FileCredentialStore, InferenceProviderSettings, InferenceSettings,
+    McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration, McpOAuthRegistrationMethod,
+    OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext, OAuthCredentialRecord,
+    OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult,
+    OAuthTokenSet, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
     StoredCredential,
 };
 pub use storage::{

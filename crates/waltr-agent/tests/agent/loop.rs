@@ -14,25 +14,29 @@ use waltr_agent::{
     CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO,
     CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent, CompletionReplayItem,
     CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
-    FileCredentialStore, FilesystemPromptConfig, LlmError, LlmStream, MemorySessionStore, ModelApi,
+    FileCredentialStore, FilesystemPromptConfig, InferenceProviderSettings, InferenceSettings,
+    LlmError, LlmStream, McpConnectionKind, McpResolvedConnection, MemorySessionStore, ModelApi,
     ModelRef, ProviderId, ProviderRetryConfig, ProviderTurnMetadata, ResumeInput,
-    SessionCoordinator, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
-    SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStatus, SessionStore,
-    SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget, SkillsConfig,
-    ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind,
-    TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
+    SessionCoordinator, SessionStatus, SessionStore, SessionTemplateKind,
+    SessionTemplateSearchRequest, SessionTemplateSearchTarget, SkillsConfig, ThinkingBlock,
+    ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind, TimelineQuery,
+    TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
     tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
 #[cfg(feature = "shell")]
 use waltr_agent::{PermissionCommandPattern, tools::shell::ShellConfig};
-use waltr_agent::{PermissionEffect, PermissionPolicy, PermissionToolSelector};
+use waltr_agent::{
+    PermissionEffect, PermissionInputCondition, PermissionInputRule, PermissionInputScalar,
+    PermissionInputValueMatcher, PermissionJsonPointer, PermissionPolicy, PermissionToolSelector,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::scripted_provider::ScriptedProvider;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn session_template_search_finds_files_and_tools() {
     let root = tempfile::tempdir().expect("temp dir");
     fs::create_dir_all(root.path().join("src/nested")).expect("created dirs");
@@ -40,34 +44,24 @@ async fn session_template_search_finds_files_and_tools() {
     fs::write(root.path().join("src/two words.md"), "notes").expect("wrote file");
     fs::write(root.path().join(".hidden.rs"), "hidden").expect("wrote hidden file");
 
-    let invoked = Arc::new(Mutex::new(false));
-    let invoked_for_tool = Arc::clone(&invoked);
     let provider = Arc::new(ScriptedProvider::from_turns("resource-search", Vec::new()));
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
         root.path().to_path_buf(),
         FileCredentialStore::new(root.path().join("auth.json")),
+        crate::agent_definitions::filesystem_agent(),
     )
-    .with_runtime_builder(move |_| {
-        let invoked_for_tool = Arc::clone(&invoked_for_tool);
-        Ok(
-            AgentRuntime::builder(test_model(), provider.clone()).with_tool(AgentTool::new(
-                ToolDefinition::new(
-                    "custom_search",
-                    "Search custom test resources",
-                    json!({ "type": "object", "required": ["query"] }),
-                ),
-                move |context| {
-                    *invoked_for_tool.lock().expect("invoked lock") = true;
-                    Ok(context.result("unexpected"))
-                },
-            )),
-        )
+    .with_runtime_provider(move |_| {
+        Ok(waltr_agent::AgentRuntimeProvider::new(
+            test_model(),
+            provider.clone(),
+        ))
     });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
     let session_id = sessions
-        .create_with_runtime_settings(
-            Some(test_runtime_settings()),
+        .create_with_inference_settings(
+            Some(test_inference_settings()),
+            None,
             std::collections::BTreeMap::default(),
         )
         .await
@@ -79,7 +73,7 @@ async fn session_template_search_finds_files_and_tools() {
         .search_templates(
             &session_id,
             SessionTemplateSearchRequest {
-                query: "resource".to_owned(),
+                query: "re".to_owned(),
                 limit: 10,
                 kinds: Vec::new(),
                 target: SessionTemplateSearchTarget::Resources,
@@ -96,11 +90,10 @@ async fn session_template_search_finds_files_and_tools() {
     }));
     assert!(options.iter().any(|option| {
         option.kind == SessionTemplateKind::Tool
-            && option.label == "custom_search"
-            && option.template == "@tool(custom_search, {\"query\":\"\"})"
+            && option.label == "read"
+            && option.template == "@tool(read, {\"filePath\":\"\"})"
     }));
     assert!(!options.iter().any(|option| option.detail == ".hidden.rs"));
-    assert!(!*invoked.lock().expect("invoked lock"));
 
     let quoted = sessions
         .search_templates(
@@ -135,13 +128,20 @@ async fn session_template_search_clamps_oversized_limits() {
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
         root.path().to_path_buf(),
         FileCredentialStore::new(root.path().join("auth.json")),
+        crate::agent_definitions::filesystem_agent(),
     )
-    .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
+    .with_runtime_provider(move |_| {
+        Ok(waltr_agent::AgentRuntimeProvider::new(
+            test_model(),
+            provider.clone(),
+        ))
+    });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
     let session_id = sessions
-        .create_with_runtime_settings(
-            Some(test_runtime_settings()),
+        .create_with_inference_settings(
+            Some(test_inference_settings()),
+            None,
             std::collections::BTreeMap::default(),
         )
         .await
@@ -172,18 +172,26 @@ async fn session_template_search_ignores_mcp_startup_failures() {
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
         root.path().to_path_buf(),
         FileCredentialStore::new(root.path().join("auth.json")),
-    );
+        crate::agent_definitions::filesystem_mcp_agent(),
+    )
+    .with_mcp_connection_resolver(|_| {
+        Box::pin(async {
+            Ok(vec![McpResolvedConnection {
+                key: "missing".to_owned(),
+                kind: McpConnectionKind::Stdio,
+                command: "definitely-not-installed-waltr-mcp".to_owned(),
+                url: String::new(),
+            }])
+        })
+    });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
-    let mut settings = test_runtime_settings();
-    settings.mcp_servers.push(SessionMcpServerRuntimeSettings {
-        key: "missing".to_owned(),
-        kind: SessionMcpServerRuntimeKind::Stdio,
-        command: "definitely-not-installed-waltr-mcp".to_owned(),
-        url: String::new(),
-    });
     let session_id = sessions
-        .create_with_runtime_settings(Some(settings), std::collections::BTreeMap::default())
+        .create_with_inference_settings(
+            Some(test_inference_settings()),
+            None,
+            std::collections::BTreeMap::default(),
+        )
         .await
         .expect("created session")
         .id()
@@ -218,13 +226,20 @@ async fn session_template_search_empty_query_returns_no_options() {
     let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
         root.path().to_path_buf(),
         FileCredentialStore::new(root.path().join("auth.json")),
+        crate::agent_definitions::filesystem_agent(),
     )
-    .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
+    .with_runtime_provider(move |_| {
+        Ok(waltr_agent::AgentRuntimeProvider::new(
+            test_model(),
+            provider.clone(),
+        ))
+    });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
     let session_id = sessions
-        .create_with_runtime_settings(
-            Some(test_runtime_settings()),
+        .create_with_inference_settings(
+            Some(test_inference_settings()),
+            None,
             std::collections::BTreeMap::default(),
         )
         .await
@@ -1329,6 +1344,51 @@ async fn user_prompt_template_tool_respects_permission_denies() {
     )));
 }
 
+#[tokio::test]
+async fn user_prompt_template_tool_applies_nested_input_deny_before_invocation() {
+    let invoked = Arc::new(Mutex::new(false));
+    let observed = Arc::clone(&invoked);
+    let provider = Arc::new(ScriptedProvider::new("template-input-deny", |request| {
+        assert!(
+            request
+                .prompt
+                .contains("tool input does not satisfy policy"),
+            "{request:?}"
+        );
+        vec![Ok(CompletionEvent::Finished)]
+    }));
+    let tool = AgentTool::new(
+        ToolDefinition::new("generic", "Generic tool.", json!({ "type": "object" })),
+        move |call| {
+            *observed.lock().unwrap() = true;
+            Ok(call.result("should not run"))
+        },
+    );
+    let policy = PermissionPolicy::default().with_input_rule(
+        PermissionToolSelector::exact("generic"),
+        PermissionInputRule::new(
+            vec![PermissionInputCondition {
+                pointer: PermissionJsonPointer::parse("/options/dryRun").unwrap(),
+                value: PermissionInputValueMatcher::Exact(PermissionInputScalar::Bool(false)),
+            }],
+            PermissionEffect::deny(),
+        )
+        .unwrap(),
+    );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_tool(tool)
+        .with_permission_policy(policy)
+        .build();
+
+    drain(
+        agent
+            .prompt("@tool(generic, {\"options\":{\"dryRun\":false}})")
+            .stream(),
+    )
+    .await;
+    assert!(!*invoked.lock().unwrap());
+}
+
 #[cfg(feature = "shell")]
 #[tokio::test]
 async fn user_prompt_template_tool_auto_approves_ask_permissions() {
@@ -1486,6 +1546,136 @@ async fn runtime_prompt_template_tool_runs_after_permission_approval() {
     .await;
 }
 
+#[cfg(feature = "shell")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn runtime_template_whole_tool_and_contextual_ask_need_exactly_two_approvals() {
+    let root = TempRoot::new("waltr-agent-runtime-template-two-stage-root");
+    let marker = root.path().join("template-approved.txt");
+    let command = format!("printf approved > {}", marker.display());
+    root.write(
+        AGENTS_INSTRUCTION_FILE,
+        &format!(
+            "Run fixture: @tool(shell, {{\"command\":{command:?},\"description\":\"Write the approval marker.\"}})\n"
+        ),
+    );
+    let provider = Arc::new(ScriptedProvider::new(
+        "runtime-template-two-stage-permission",
+        |_request| vec![Ok(CompletionEvent::Finished)],
+    ));
+    let policy = PermissionPolicy::default()
+        .with_tool_rule(
+            PermissionToolSelector::exact("shell"),
+            PermissionEffect::ask(),
+        )
+        .with_command_rule(
+            PermissionToolSelector::exact("shell"),
+            PermissionCommandPattern::Name("printf".to_owned()),
+            PermissionEffect::ask(),
+        );
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_agents_system_prompt(AgentsPromptConfig::new(root.path()))
+        .with_shell_tool(ShellConfig::new(root.path()))
+        .with_permission_policy(policy)
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let session_id = create_session_id(&sessions).await;
+
+    let first = collect_events(
+        sessions
+            .prompt(&agent, session_id.clone(), "hello")
+            .stream(),
+    )
+    .await;
+    let whole_tool_request = first
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("whole-tool permission request");
+    assert_eq!(
+        whole_tool_request.tool_call_id.as_deref(),
+        Some("template-shell")
+    );
+    assert_eq!(whole_tool_request.payload["claims"], json!([]));
+    assert_eq!(whole_tool_request.payload["claim_identities"], json!([]));
+    assert!(
+        !marker.exists(),
+        "template tool ran before whole-tool approval"
+    );
+
+    let second = collect_events(
+        sessions
+            .resume(
+                &agent,
+                session_id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id: whole_tool_request.id.clone(),
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    let contextual_request = second
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("contextual permission request");
+    assert_ne!(contextual_request.id, whole_tool_request.id);
+    assert_eq!(
+        contextual_request.tool_call_id.as_deref(),
+        Some("template-shell")
+    );
+    assert!(
+        contextual_request.payload["claims"]
+            .as_array()
+            .is_some_and(|claims| !claims.is_empty())
+    );
+    assert!(
+        contextual_request.payload["claim_identities"]
+            .as_array()
+            .is_some_and(|claims| !claims.is_empty())
+    );
+    assert!(
+        !marker.exists(),
+        "template tool ran before contextual approval"
+    );
+    let suspended = store
+        .load(&session_id)
+        .await
+        .expect("stored session")
+        .snapshot();
+    let one_shot = &suspended.middleware_state["permissions"]["one_shot"];
+    assert_eq!(one_shot.as_array().map(Vec::len), Some(1));
+    assert_eq!(one_shot[0]["request_id"], whole_tool_request.id.as_str());
+    assert_eq!(one_shot[0]["stage"], "whole_tool");
+
+    let third = collect_events(
+        sessions
+            .resume(
+                &agent,
+                session_id,
+                ResumeInput::ExternalResponse {
+                    request_id: contextual_request.id.clone(),
+                    response: ExternalResponse::new(json!("allow-once")),
+                },
+            )
+            .stream(),
+    )
+    .await;
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "approved");
+    assert!(
+        third
+            .iter()
+            .all(|event| !matches!(event.content, TimelineContent::ExternalRequest { .. }))
+    );
+}
+
 #[tokio::test]
 async fn user_prompt_template_tool_result_includes_arguments() {
     let provider = Arc::new(ScriptedProvider::new(
@@ -1640,6 +1830,118 @@ async fn load_skill_loads_content_and_lists_resources_once() {
     assert!(tool_results[0].contains("Follow example steps."));
     assert!(tool_results[0].contains("- references/guide.md"));
     assert!(tool_results[1].contains("already loaded"));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
+    let temp = TempRoot::new("waltr-agent-load-skill-permission-test");
+    temp.write_skill(
+        "example",
+        "Use for example tasks.",
+        "# Example\nSecret skill content.\n",
+    );
+    let provider = ScriptedProvider::new("load_skill_permission_provider", |request| {
+        if request
+            .tool_results()
+            .any(|result| result.call_id == "load_ask")
+        {
+            vec![Ok(CompletionEvent::Finished)]
+        } else {
+            vec![Ok(CompletionEvent::ToolCall(ToolCall::new(
+                "load_ask",
+                "load_skill",
+                json!({ "name": "example" }),
+            )))]
+        }
+    });
+    let ask_agent = AgentRuntime::builder(test_model(), Arc::new(provider))
+        .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+            PermissionToolSelector::exact("load_skill"),
+            PermissionEffect::ask(),
+        ))
+        .with_skills(SkillsConfig::new(temp.path()))
+        .build();
+
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store);
+    let session_id = sessions
+        .create()
+        .await
+        .expect("create session")
+        .id()
+        .clone();
+    let events = sessions
+        .prompt(&ask_agent, session_id.clone(), "load skill")
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("agent event"))
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        &event.content,
+        TimelineContent::ExternalRequest { request }
+            if request.kind == ExternalRequestKind::Permission
+                && request.tool_call_id.as_deref() == Some("load_ask")
+    )));
+    assert!(events.iter().all(|event| !matches!(
+        &event.content,
+        TimelineContent::ToolResult { result } if result.content.contains("Secret skill content")
+    )));
+
+    let request = events
+        .iter()
+        .find_map(|event| match &event.content {
+            TimelineContent::ExternalRequest { request } => Some(request),
+            _ => None,
+        })
+        .expect("permission request");
+    let resumed = sessions
+        .resume(
+            &ask_agent,
+            session_id,
+            ResumeInput::ExternalResponse {
+                request_id: request.id.clone(),
+                response: ExternalResponse::new(json!(waltr_agent::PermissionResponse::AllowOnce)),
+            },
+        )
+        .stream()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|event| event.expect("resumed event"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resumed
+            .iter()
+            .filter(|event| matches!(
+                &event.content,
+                TimelineContent::ToolResult { result }
+                    if result.content.contains("Secret skill content")
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        resumed
+            .iter()
+            .all(|event| !matches!(event.content, TimelineContent::ExternalRequest { .. }))
+    );
+
+    let allow_agent = AgentRuntime::builder(
+        test_model(),
+        Arc::new(LoadSkillProvider::new(json!({ "name": "example" }))),
+    )
+    .with_permission_policy(PermissionPolicy::default().with_tool_rule(
+        PermissionToolSelector::exact("load_skill"),
+        PermissionEffect::allow(),
+    ))
+    .with_skills(SkillsConfig::new(temp.path()))
+    .build();
+    let results = tool_results(allow_agent.prompt("load skill").stream()).await;
+
+    assert!(results[0].contains("Secret skill content"));
 }
 
 #[tokio::test]
@@ -1908,9 +2210,9 @@ fn test_model() -> ModelRef {
     ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses)
 }
 
-fn test_runtime_settings() -> SessionRuntimeSettings {
-    SessionRuntimeSettings {
-        provider: SessionProviderRuntimeSettings {
+fn test_inference_settings() -> InferenceSettings {
+    InferenceSettings {
+        provider: InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -1920,8 +2222,6 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             oauth: None,
             reasoning_effort: None,
         },
-        mcp_servers: Vec::new(),
-        mcp_trace_propagation: false,
     }
 }
 

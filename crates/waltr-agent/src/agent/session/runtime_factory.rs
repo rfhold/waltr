@@ -1,14 +1,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     sync::Arc,
 };
 
 use crate::{
-    AgentRuntimeBuilder, AgentsPromptConfig, AuthTarget, AuthenticationFailure,
-    BoxCompletionStream, BoxStreamFuture, CompletionRequest, FilesystemPromptConfig, LlmError,
-    LlmStream, ModelApi, ModelCost, ModelRef, PermissionEffect, PermissionPolicy, ProviderId,
-    SkillsConfig,
+    AgentFeature, AgentPermissionSelector, AgentRuntime, AgentRuntimeBuilder, AgentsPromptConfig,
+    AuthTarget, AuthenticationFailure, BoxCompletionStream, BoxStreamFuture, CompletionRequest,
+    FilesystemPromptConfig, LlmError, LlmStream, McpFeatureConfig, ModelApi, ModelCost, ModelRef,
+    PermissionEffect, PermissionLevel, PermissionPolicy, PermissionToolSelector, ProviderId,
+    ResolvedAgent, ResolvedPermission, SkillsConfig,
+    definition::{AgentDefinitionBundle, AgentDefinitionCatalog, McpServerSelection},
     filesystem::FilesystemConfig,
     mcp::{McpClientRuntime, McpConfig, McpServerConfig},
     provider::{
@@ -16,7 +20,7 @@ use crate::{
         OpenAiReasoningSummary, OpenAiResponses, OpenAiResponsesWebSocket,
     },
     question::QuestionConfig,
-    tools::task::{DEFAULT_MAX_SUBAGENT_DEPTH, TaskConfig},
+    tools::task::TaskConfig,
 };
 #[cfg(feature = "shell")]
 use crate::{ShellPromptConfig, shell::ShellConfig};
@@ -31,19 +35,138 @@ use oauth::now_ms;
 pub use oauth::{CredentialRefreshCoordinator, CredentialRefreshError, RefreshMode};
 
 use super::{
-    AgentSessionRuntimeError, CredentialStore, OAuthCredential, SessionCoordinator,
-    SessionMcpServerRuntimeKind, SessionProviderRuntimeSettings, SessionRuntimeSettings,
-    SessionStore,
+    AgentSessionRuntimeError, CredentialStore, InferenceProviderSettings, InferenceSettings,
+    OAuthCredential, SessionCoordinator, SessionRecord, SessionStore,
 };
 
 const ENV_PREFIX: &str = "${env:";
 const OAUTH_REFRESH_AHEAD_MS: i64 = 5 * 60 * 1000;
 
-type RuntimeBuilderOverride = Arc<
-    dyn Fn(&SessionRuntimeSettings) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError>
+type RuntimeProviderOverride = Arc<
+    dyn Fn(&InferenceSettings) -> Result<AgentRuntimeProvider, AgentSessionRuntimeError>
         + Send
         + Sync,
 >;
+
+/// Provider-neutral request for host-resolved MCP connections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConnectionResolveRequest {
+    /// Definition-owned server selection.
+    pub servers: McpServerSelection,
+}
+
+/// Transport used by one host-resolved MCP connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpConnectionKind {
+    /// Child process connected over standard input/output.
+    Stdio,
+    /// Remote Streamable HTTP endpoint.
+    StreamableHttp,
+}
+
+/// Current host-resolved data needed to start one MCP connection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct McpResolvedConnection {
+    /// Stable configured server key.
+    pub key: String,
+    /// Connection transport.
+    pub kind: McpConnectionKind,
+    /// Command line for a stdio connection.
+    pub command: String,
+    /// Endpoint for a Streamable HTTP connection.
+    pub url: String,
+}
+
+/// Asynchronous result returned by an MCP connection resolver.
+pub type McpConnectionResolveFuture = Pin<
+    Box<dyn Future<Output = Result<Vec<McpResolvedConnection>, AgentSessionRuntimeError>> + Send>,
+>;
+
+type McpConnectionResolver =
+    Arc<dyn Fn(McpConnectionResolveRequest) -> McpConnectionResolveFuture + Send + Sync>;
+
+/// Structural identity of a prepared MCP runtime. Credentials are intentionally excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRuntimeFingerprint {
+    pub trace_propagation: bool,
+    pub connections: Vec<McpRuntimeFingerprintConnection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct McpRuntimeFingerprintConnection {
+    pub key: String,
+    pub kind: McpConnectionKind,
+    pub target: String,
+}
+
+impl McpRuntimeFingerprintConnection {
+    pub fn from_resolved(connection: &McpResolvedConnection) -> Self {
+        Self {
+            key: connection.key.clone(),
+            kind: connection.kind,
+            target: match connection.kind {
+                McpConnectionKind::Stdio => connection.command.clone(),
+                McpConnectionKind::StreamableHttp => connection.url.clone(),
+            },
+        }
+    }
+}
+
+/// Fully resolved MCP preparation data for one reconstruction.
+#[derive(Debug)]
+pub struct PreparedMcpRuntime {
+    pub fingerprint: McpRuntimeFingerprint,
+    pub connections: Vec<McpResolvedConnection>,
+    pub config: McpConfig,
+    pub credentialed_servers: BTreeSet<String>,
+}
+
+/// Provider-only input for session runtime construction.
+#[derive(Clone)]
+pub struct AgentRuntimeProvider {
+    model: ModelRef,
+    provider: Arc<dyn LlmStream>,
+    model_cost: Option<ModelCost>,
+}
+
+impl AgentRuntimeProvider {
+    /// Create provider input for a model.
+    #[must_use]
+    pub fn new<P>(model: ModelRef, provider: Arc<P>) -> Self
+    where
+        P: LlmStream + 'static,
+    {
+        Self {
+            model,
+            provider,
+            model_cost: None,
+        }
+    }
+
+    /// Set model pricing used to journal per-turn cost.
+    #[must_use]
+    pub fn with_model_cost(mut self, cost: ModelCost) -> Self {
+        self.model_cost = Some(cost);
+        self
+    }
+
+    fn into_builder(self) -> AgentRuntimeBuilder {
+        builder_with_model_cost(
+            AgentRuntimeBuilder::new_dyn(self.model, self.provider),
+            self.model_cost,
+        )
+    }
+}
+
+impl std::fmt::Debug for AgentRuntimeProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentRuntimeProvider")
+            .field("model", &self.model)
+            .field("model_cost", &self.model_cost)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Agent runtime factory shared by sessions.
 #[derive(Clone)]
@@ -52,11 +175,12 @@ pub struct AgentSessionRuntimeFactory {
     pub root: PathBuf,
     /// Credential store used for provider auth.
     pub credential_store: CredentialStore,
-    task_max_subagent_depth: usize,
-    mcp_server_instructions_enabled: bool,
     outbound_oauth_loopback_test_mode: bool,
     trusted_mcp_oauth_origins: Vec<reqwest::Url>,
-    runtime_builder_override: Option<RuntimeBuilderOverride>,
+    definition: ResolvedAgent,
+    catalog: Option<AgentDefinitionCatalog>,
+    runtime_provider_override: Option<RuntimeProviderOverride>,
+    mcp_connection_resolver: Option<McpConnectionResolver>,
 }
 
 impl std::fmt::Debug for AgentSessionRuntimeFactory {
@@ -65,51 +189,92 @@ impl std::fmt::Debug for AgentSessionRuntimeFactory {
             .debug_struct("AgentSessionRuntimeFactory")
             .field("root", &self.root)
             .field("credential_store", &self.credential_store)
-            .field("task_max_subagent_depth", &self.task_max_subagent_depth)
-            .field(
-                "mcp_server_instructions_enabled",
-                &self.mcp_server_instructions_enabled,
-            )
             .field(
                 "outbound_oauth_loopback_test_mode",
                 &self.outbound_oauth_loopback_test_mode,
             )
             .field("trusted_mcp_oauth_origins", &self.trusted_mcp_oauth_origins)
+            .field("definition", &self.definition)
+            .field("catalog", &self.catalog)
             .field(
-                "runtime_builder_override",
-                &self.runtime_builder_override.as_ref().map(|_| "<override>"),
+                "runtime_provider_override",
+                &self
+                    .runtime_provider_override
+                    .as_ref()
+                    .map(|_| "<override>"),
             )
-            .finish()
+            .field(
+                "mcp_connection_resolver",
+                &self.mcp_connection_resolver.as_ref().map(|_| "<resolver>"),
+            )
+            .finish_non_exhaustive()
     }
 }
 
 impl AgentSessionRuntimeFactory {
     /// Create a runtime factory.
     #[must_use]
-    pub fn new(root: PathBuf, credential_store: impl Into<CredentialStore>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        credential_store: impl Into<CredentialStore>,
+        definition: ResolvedAgent,
+    ) -> Self {
         Self {
             root,
             credential_store: credential_store.into(),
-            task_max_subagent_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
-            mcp_server_instructions_enabled: true,
             outbound_oauth_loopback_test_mode: false,
             trusted_mcp_oauth_origins: Vec::new(),
-            runtime_builder_override: None,
+            definition,
+            catalog: None,
+            runtime_provider_override: None,
+            mcp_connection_resolver: None,
         }
     }
 
-    /// Override the default task tool subagent depth for this runtime factory.
+    /// Configure every agent selectable from the current startup catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the catalog does not contain its declared default agent.
     #[must_use]
-    pub const fn with_task_max_subagent_depth(mut self, max_subagent_depth: usize) -> Self {
-        self.task_max_subagent_depth = max_subagent_depth;
+    pub fn with_agent_catalog(mut self, catalog: AgentDefinitionCatalog) -> Self {
+        self.definition = catalog
+            .resolved(catalog.default_agent_name())
+            .expect("catalog default agent must be present")
+            .clone();
+        self.catalog = Some(catalog);
         self
     }
 
-    /// Enable or disable adding MCP server instructions to the system prompt.
+    /// Return the current default agent name.
     #[must_use]
-    pub const fn with_mcp_server_instructions_enabled(mut self, enabled: bool) -> Self {
-        self.mcp_server_instructions_enabled = enabled;
-        self
+    pub fn default_agent_name(&self) -> &str {
+        self.catalog.as_ref().map_or(
+            self.definition.name.as_str(),
+            AgentDefinitionCatalog::default_agent_name,
+        )
+    }
+
+    /// Build a fresh durable bundle for a currently selectable agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentSessionRuntimeError::FailedPrecondition`] when `name` is absent from the
+    /// current startup catalog or this factory has no catalog.
+    pub fn bundle_for_agent(
+        &self,
+        name: &str,
+    ) -> Result<AgentDefinitionBundle, AgentSessionRuntimeError> {
+        let bundle = self
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.bundle(name))
+            .ok_or_else(|| {
+                AgentSessionRuntimeError::FailedPrecondition(format!(
+                    "agent '{name}' is not present in the current startup catalog"
+                ))
+            })?;
+        Ok(bundle)
     }
 
     /// Permit private HTTPS peers for host-supplied MCP OAuth origins.
@@ -131,121 +296,385 @@ impl AgentSessionRuntimeFactory {
         self
     }
 
-    /// Override runtime construction for embedders that provide their own provider builder.
+    /// Override provider construction while retaining definition-owned runtime behavior.
     #[must_use]
-    pub fn with_runtime_builder(
+    pub fn with_runtime_provider(
         mut self,
-        build: impl Fn(&SessionRuntimeSettings) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError>
+        build: impl Fn(&InferenceSettings) -> Result<AgentRuntimeProvider, AgentSessionRuntimeError>
         + Send
         + Sync
         + 'static,
     ) -> Self {
-        self.runtime_builder_override = Some(Arc::new(build));
+        self.runtime_provider_override = Some(Arc::new(build));
         self
     }
 
-    /// Build a runtime builder from session settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when provider, credential, MCP, or runtime construction fails.
-    pub async fn runtime_builder(
-        &self,
-        settings: &SessionRuntimeSettings,
-    ) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError> {
-        if let Some(build) = self.runtime_builder_override.as_ref() {
-            return build(settings)
-                .map(|builder| builder.with_template_base_dir(self.root.clone()));
-        }
-        let builder = self.provider_builder(settings).await?;
-        let mut builder = builder
-            .with_template_base_dir(self.root.clone())
-            .with_base_system_prompt()
-            .with_permission_policy(PermissionPolicy::filesystem_external(
-                self.root.clone(),
-                PermissionEffect::ask(),
-            ))
-            .with_filesystem_tools(
-                FilesystemConfig::new(self.root.clone())
-                    .with_agents_read_context()
-                    .with_skills_context(),
-            )
-            .with_filesystem_system_prompt(FilesystemPromptConfig::new(self.root.clone()))
-            .with_agents_system_prompt(AgentsPromptConfig::new(self.root.clone()))
-            .with_skills(SkillsConfig::new(self.root.clone()))
-            .with_question_tool(QuestionConfig::new());
-
-        #[cfg(feature = "shell")]
-        {
-            builder = builder
-                .with_shell_tool(ShellConfig::new(self.root.clone()))
-                .with_shell_system_prompt(ShellPromptConfig::new(self.root.clone()));
-        }
-
-        Ok(builder)
+    /// Resolve current host-owned MCP definitions for every runtime reconstruction.
+    #[must_use]
+    pub fn with_mcp_connection_resolver(
+        mut self,
+        resolve: impl Fn(McpConnectionResolveRequest) -> McpConnectionResolveFuture
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.mcp_connection_resolver = Some(Arc::new(resolve));
+        self
     }
 
-    /// Build a runtime builder with default session-backed tools.
-    pub(crate) async fn runtime_builder_for_sessions<S>(
+    async fn base_runtime_builder(
         &self,
-        settings: &SessionRuntimeSettings,
+        settings: &InferenceSettings,
+        definition: &ResolvedAgent,
+    ) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError> {
+        #[cfg(not(feature = "shell"))]
+        if definition.features.shell.is_some() {
+            return Err(AgentSessionRuntimeError::FailedPrecondition(
+                "agent definition enables shell but waltr-agent was built without the shell feature"
+                    .to_owned(),
+            ));
+        }
+        let builder = if let Some(build) = self.runtime_provider_override.as_ref() {
+            build(settings)?.into_builder()
+        } else {
+            self.provider_builder(settings).await?
+        };
+        Ok(self.apply_definition(builder, definition))
+    }
+
+    fn apply_definition(
+        &self,
+        mut builder: AgentRuntimeBuilder,
+        definition: &ResolvedAgent,
+    ) -> AgentRuntimeBuilder {
+        builder = builder.with_template_base_dir(self.root.clone());
+        if let Some(prompt) = definition.system_prompt.as_ref() {
+            builder = builder.with_system_prompt(prompt.clone());
+        }
+        if let Some(filesystem) = definition.features.filesystem.as_ref() {
+            let mut config = FilesystemConfig::new(self.root.clone());
+            if filesystem.agents_read_context {
+                config = config.with_agents_read_context();
+            }
+            if filesystem.skills_context {
+                config = config.with_skills_context();
+            }
+            builder = builder.with_filesystem_tools(config);
+            if filesystem.system_prompt {
+                builder = builder
+                    .with_filesystem_system_prompt(FilesystemPromptConfig::new(self.root.clone()));
+            }
+        }
+        if definition
+            .features
+            .agents
+            .as_ref()
+            .is_some_and(|agents| agents.system_prompt)
+        {
+            builder = builder.with_agents_system_prompt(AgentsPromptConfig::new(self.root.clone()));
+        }
+        if definition.features.skills.is_some() {
+            builder = builder.with_skills(SkillsConfig::new(self.root.clone()));
+        }
+        if definition.permissions.iter().any(|entry| {
+            matches!(&entry.selector, AgentPermissionSelector::Name(name) if name == "question")
+        }) {
+            builder = builder.with_question_tool(QuestionConfig::new());
+        }
+
+        #[cfg(feature = "shell")]
+        if let Some(shell) = definition.features.shell.as_ref() {
+            builder = builder.with_shell_tool(ShellConfig::new(self.root.clone()));
+            if shell.system_prompt {
+                builder =
+                    builder.with_shell_system_prompt(ShellPromptConfig::new(self.root.clone()));
+            }
+        }
+        builder
+    }
+
+    fn definition_permission_policy(
+        &self,
+        definition: &ResolvedAgent,
+        model: &ModelRef,
+        mcp_tool_names: &[String],
+    ) -> PermissionPolicy {
+        let mut policy = PermissionPolicy::new(PermissionLevel::Deny);
+        let feature_tools = |feature| {
+            self.definition_feature_tool_names(definition, model, feature, mcp_tool_names)
+        };
+
+        for feature in [
+            AgentFeature::Filesystem,
+            AgentFeature::Skills,
+            AgentFeature::Shell,
+            AgentFeature::Task,
+            AgentFeature::Mcp,
+        ] {
+            if feature_default_permissions(&definition.features, feature) {
+                for name in feature_tools(feature) {
+                    policy = policy.with_tool_rule(
+                        PermissionToolSelector::exact(name),
+                        PermissionEffect::allow(),
+                    );
+                }
+            }
+        }
+
+        for entry in &definition.permissions {
+            let names = match &entry.selector {
+                AgentPermissionSelector::Name(name) => vec![name.clone()],
+                AgentPermissionSelector::Feature(feature) => feature_tools(*feature),
+            };
+            for name in names {
+                let selector = PermissionToolSelector::exact(name);
+                match &entry.permission {
+                    ResolvedPermission::Tool(effect) => {
+                        policy = policy.with_tool_rule(selector, effect.clone());
+                    }
+                    ResolvedPermission::Resources(resources) => {
+                        for rule in &resources.paths {
+                            let pattern = match &rule.pattern {
+                                crate::PermissionPathPattern::OutsideRoot(_) => {
+                                    crate::PermissionPathPattern::OutsideRoot(self.root.clone())
+                                }
+                                pattern => pattern.clone(),
+                            };
+                            policy = policy.with_directory_rule(
+                                selector.clone(),
+                                pattern,
+                                rule.effect.clone(),
+                            );
+                        }
+                        for rule in &resources.commands {
+                            policy = policy.with_command_rule(
+                                selector.clone(),
+                                rule.pattern.clone(),
+                                rule.effect.clone(),
+                            );
+                        }
+                    }
+                    ResolvedPermission::Inputs(rules) => {
+                        for rule in rules {
+                            policy = policy.with_input_rule(selector.clone(), rule.clone());
+                        }
+                    }
+                }
+            }
+        }
+        policy
+    }
+
+    fn definition_feature_tool_names(
+        &self,
+        definition: &ResolvedAgent,
+        model: &ModelRef,
+        feature: AgentFeature,
+        mcp_tool_names: &[String],
+    ) -> Vec<String> {
+        match feature {
+            AgentFeature::Filesystem if definition.features.filesystem.is_some() => {
+                FilesystemConfig::new(self.root.clone())
+                    .exposed_tools(model)
+                    .all()
+                    .into_iter()
+                    .map(|kind| kind.name().to_owned())
+                    .collect()
+            }
+            AgentFeature::Skills if definition.features.skills.is_some() => {
+                vec!["load_skill".to_owned()]
+            }
+            AgentFeature::Shell if definition.features.shell.is_some() => {
+                vec!["shell".to_owned()]
+            }
+            AgentFeature::Task if definition.features.task.is_some() => vec!["task".to_owned()],
+            AgentFeature::Mcp
+                if definition
+                    .features
+                    .mcp
+                    .as_ref()
+                    .is_some_and(|mcp| mcp.expose_tools) =>
+            {
+                mcp_tool_names.to_vec()
+            }
+            AgentFeature::Agents
+            | AgentFeature::Filesystem
+            | AgentFeature::Skills
+            | AgentFeature::Shell
+            | AgentFeature::Task
+            | AgentFeature::Mcp => Vec::new(),
+        }
+    }
+
+    /// Assemble a finished runtime from one durable session record.
+    pub(crate) async fn runtime_for_session<S>(
+        &self,
+        record: &SessionRecord,
         sessions: SessionCoordinator<S>,
         mcp_runtime: Option<Arc<McpClientRuntime>>,
-    ) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError>
+    ) -> Result<AgentRuntime, AgentSessionRuntimeError>
     where
         S: SessionStore + Clone + Send + Sync + 'static,
     {
-        let mut builder = self.runtime_builder(settings).await?.with_task_tool(
-            TaskConfig::new(sessions).with_max_subagent_depth(self.task_max_subagent_depth),
+        let settings = record.inference_settings.as_ref().ok_or_else(|| {
+            AgentSessionRuntimeError::FailedPrecondition(
+                "session runtime settings are required before prompting".to_owned(),
+            )
+        })?;
+        let definition = self.definition_for_session(record)?;
+        let identity = record.agent_definition.as_ref().map_or_else(
+            || {
+                self.catalog.as_ref().map_or_else(
+                    || self.default_agent_name().to_owned(),
+                    |catalog| catalog.default_bundle().identity(),
+                )
+            },
+            AgentDefinitionBundle::identity,
         );
-        if let Some(mcp_runtime) = mcp_runtime {
-            for tool in mcp_runtime.agent_tools().await {
-                builder = builder.with_tool(tool);
+        let mut builder = self.base_runtime_builder(settings, &definition).await?;
+        builder = builder.with_system_prompt_identity(identity);
+        if let Some(task) = definition.features.task.as_ref() {
+            let captured_bundle = record.agent_definition.clone().or_else(|| {
+                self.catalog
+                    .as_ref()
+                    .map(AgentDefinitionCatalog::default_bundle)
+            });
+            builder = builder.with_task_tool(
+                TaskConfig::new(sessions)
+                    .with_agent_definition(captured_bundle)
+                    .with_max_subagent_depth(task.max_subagent_depth),
+            );
+        }
+        let mut mcp_tool_names = Vec::new();
+        if let Some(mcp_runtime) = mcp_runtime
+            && let Some(mcp) = definition.features.mcp.as_ref()
+        {
+            if mcp.expose_tools {
+                for tool in mcp_runtime.agent_tools().await {
+                    mcp_tool_names.push(tool.definition().name.clone());
+                    builder = builder.with_tool(tool);
+                }
             }
-            if self.mcp_server_instructions_enabled {
+            if mcp.instructions {
                 builder = builder.with_middleware(
                     crate::middleware::mcp_instructions::McpInstructionsMiddleware::new(
                         Arc::clone(&mcp_runtime),
                     ),
                 );
             }
-            builder = builder
-                .with_middleware(
+            if mcp.resources {
+                builder = builder.with_middleware(
                     crate::middleware::mcp_resources::McpResourcesMiddleware::new(Arc::clone(
                         &mcp_runtime,
                     )),
-                )
-                .with_middleware(crate::middleware::mcp_prompts::McpPromptsMiddleware::new(
-                    mcp_runtime,
-                ));
+                );
+            }
+            if mcp.prompts {
+                builder = builder.with_middleware(
+                    crate::middleware::mcp_prompts::McpPromptsMiddleware::new(mcp_runtime),
+                );
+            }
         }
-        Ok(builder)
+        let policy =
+            self.definition_permission_policy(&definition, builder.model(), &mcp_tool_names);
+        Ok(builder.with_permission_policy(policy).build())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn mcp_config(
+    fn definition_for_session(
         &self,
-        settings: &SessionRuntimeSettings,
-    ) -> Result<McpConfig, AgentSessionRuntimeError> {
-        self.mcp_config_with_credentials(settings)
-            .await
-            .map(|(config, _)| config)
+        record: &SessionRecord,
+    ) -> Result<ResolvedAgent, AgentSessionRuntimeError> {
+        let Some(bundle) = record.agent_definition.as_ref() else {
+            return Ok(self.definition.clone());
+        };
+        if self
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.resolved(&bundle.agent_name).is_none())
+        {
+            return Err(AgentSessionRuntimeError::FailedPrecondition(format!(
+                "stored session agent '{}' is not present in the current startup catalog",
+                bundle.agent_name
+            )));
+        }
+        bundle.resolve().map_err(|error| {
+            AgentSessionRuntimeError::FailedPrecondition(format!(
+                "stored session agent definition is invalid: {error}"
+            ))
+        })
     }
 
-    pub(crate) async fn mcp_config_and_credentialed_servers(
+    pub(crate) fn mcp_feature_for_session(
         &self,
-        settings: &SessionRuntimeSettings,
-    ) -> Result<(McpConfig, BTreeSet<String>), AgentSessionRuntimeError> {
-        self.mcp_config_with_credentials(settings).await
+        record: &SessionRecord,
+    ) -> Result<Option<McpFeatureConfig>, AgentSessionRuntimeError> {
+        Ok(self.definition_for_session(record)?.features.mcp)
+    }
+
+    pub(crate) async fn prepare_mcp_runtime(
+        &self,
+        feature: &McpFeatureConfig,
+    ) -> Result<Option<PreparedMcpRuntime>, AgentSessionRuntimeError> {
+        if matches!(&feature.servers, McpServerSelection::Include(keys) if keys.is_empty()) {
+            return Ok(None);
+        }
+        let connections = match &self.mcp_connection_resolver {
+            Some(resolve) => {
+                resolve(McpConnectionResolveRequest {
+                    servers: feature.servers.clone(),
+                })
+                .await?
+            }
+            None => match &feature.servers {
+                McpServerSelection::Include(keys) if !keys.is_empty() => {
+                    return Err(missing_mcp_servers(keys));
+                }
+                _ => Vec::new(),
+            },
+        };
+        let mut connections = connections;
+        connections.sort();
+        if let McpServerSelection::Include(requested) = &feature.servers {
+            let resolved = connections
+                .iter()
+                .map(|connection| connection.key.as_str())
+                .collect::<BTreeSet<_>>();
+            let missing = requested
+                .iter()
+                .filter(|key| !resolved.contains(key.as_str()))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !missing.is_empty() {
+                return Err(missing_mcp_servers(&missing));
+            }
+        }
+        if connections.is_empty() {
+            return Ok(None);
+        }
+        let fingerprint = McpRuntimeFingerprint {
+            trace_propagation: feature.trace_propagation,
+            connections: connections
+                .iter()
+                .map(McpRuntimeFingerprintConnection::from_resolved)
+                .collect(),
+        };
+        let (config, credentialed_servers) = self
+            .mcp_config_with_credentials(&connections, feature.trace_propagation)
+            .await?;
+        Ok(Some(PreparedMcpRuntime {
+            fingerprint,
+            connections,
+            config,
+            credentialed_servers,
+        }))
     }
 
     pub(crate) async fn preflight_cached_mcp_authentication(
         &self,
-        settings: &SessionRuntimeSettings,
+        connections: &[McpResolvedConnection],
         credentialed_servers: &BTreeSet<String>,
     ) -> Result<(), AgentSessionRuntimeError> {
-        for server in settings
-            .mcp_servers
+        for server in connections
             .iter()
             .filter(|server| credentialed_servers.contains(&server.key))
         {
@@ -268,7 +697,7 @@ impl AgentSessionRuntimeFactory {
     #[allow(clippy::too_many_lines)]
     async fn provider_builder(
         &self,
-        settings: &SessionRuntimeSettings,
+        settings: &InferenceSettings,
     ) -> Result<AgentRuntimeBuilder, AgentSessionRuntimeError> {
         let provider = &settings.provider;
         let headers = resolve_provider_headers(&provider.headers)?;
@@ -366,7 +795,7 @@ impl AgentSessionRuntimeFactory {
 
     async fn oauth_access(
         &self,
-        provider: &SessionProviderRuntimeSettings,
+        provider: &InferenceProviderSettings,
         resolved_headers: &BTreeMap<String, String>,
     ) -> Result<Option<OAuthCredential>, AgentSessionRuntimeError> {
         if configured_credential(resolved_headers).is_some() {
@@ -390,18 +819,20 @@ impl AgentSessionRuntimeFactory {
             })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn mcp_config_with_credentials(
         &self,
-        settings: &SessionRuntimeSettings,
+        connections: &[McpResolvedConnection],
+        trace_propagation: bool,
     ) -> Result<(McpConfig, BTreeSet<String>), AgentSessionRuntimeError> {
         let mut mcp = McpConfig::new();
         let mut credentialed_servers = BTreeSet::new();
-        if settings.mcp_trace_propagation {
+        if trace_propagation {
             mcp = mcp.with_trace_propagation(McpTracePropagation::TraceContext);
         }
-        for server in &settings.mcp_servers {
+        for server in connections {
             let config = match server.kind {
-                SessionMcpServerRuntimeKind::Stdio => {
+                McpConnectionKind::Stdio => {
                     let mut parts = server.command.split_whitespace();
                     let command = parts.next().ok_or_else(|| {
                         AgentSessionRuntimeError::FailedPrecondition(format!(
@@ -411,7 +842,7 @@ impl AgentSessionRuntimeFactory {
                     })?;
                     McpServerConfig::stdio(server.key.clone(), command, parts)
                 }
-                SessionMcpServerRuntimeKind::StreamableHttp => {
+                McpConnectionKind::StreamableHttp => {
                     let credential_key = AuthTarget::mcp_server(&server.key).credential_key();
                     if self
                         .credential_store
@@ -469,7 +900,7 @@ impl AgentSessionRuntimeFactory {
     #[allow(clippy::too_many_lines)]
     async fn mcp_bearer_token(
         &self,
-        server: &super::SessionMcpServerRuntimeSettings,
+        server: &McpResolvedConnection,
     ) -> Result<Option<String>, AgentSessionRuntimeError> {
         self.refresh_coordinator()
             .refresh_mcp(server, RefreshMode::Normal)
@@ -596,7 +1027,7 @@ fn validate_mcp_access_token(
 }
 
 fn validate_mcp_credential(
-    server: &super::SessionMcpServerRuntimeSettings,
+    server: &McpResolvedConnection,
     credential: &OAuthCredential,
 ) -> Result<(), AgentSessionRuntimeError> {
     let Some(context) = credential.mcp_context() else {
@@ -682,8 +1113,44 @@ fn builder_with_model_cost(
     builder
 }
 
+fn feature_default_permissions(
+    features: &crate::ResolvedAgentFeatures,
+    feature: AgentFeature,
+) -> bool {
+    match feature {
+        AgentFeature::Filesystem => features
+            .filesystem
+            .as_ref()
+            .is_some_and(|config| config.default_permissions),
+        AgentFeature::Skills => features
+            .skills
+            .as_ref()
+            .is_some_and(|config| config.default_permissions),
+        AgentFeature::Shell => features
+            .shell
+            .as_ref()
+            .is_some_and(|config| config.default_permissions),
+        AgentFeature::Task => features
+            .task
+            .as_ref()
+            .is_some_and(|config| config.default_permissions),
+        AgentFeature::Mcp => features
+            .mcp
+            .as_ref()
+            .is_some_and(|config| config.default_permissions),
+        AgentFeature::Agents => false,
+    }
+}
+
+fn missing_mcp_servers(keys: &BTreeSet<String>) -> AgentSessionRuntimeError {
+    AgentSessionRuntimeError::FailedPrecondition(format!(
+        "selected MCP servers are not configured: {}",
+        keys.iter().cloned().collect::<Vec<_>>().join(", ")
+    ))
+}
+
 fn ensure_no_reasoning_effort(
-    settings: &SessionRuntimeSettings,
+    settings: &InferenceSettings,
     provider_name: &str,
 ) -> Result<(), AgentSessionRuntimeError> {
     if settings.provider.reasoning_effort.is_some() {
@@ -695,7 +1162,7 @@ fn ensure_no_reasoning_effort(
 }
 
 fn openai_reasoning_config(
-    settings: &SessionRuntimeSettings,
+    settings: &InferenceSettings,
 ) -> Result<Option<OpenAiReasoningConfig>, AgentSessionRuntimeError> {
     let Some(effort) = settings.provider.reasoning_effort.as_deref() else {
         return Ok(None);
@@ -810,6 +1277,631 @@ mod tests {
         routing::post,
     };
     use tokio::sync::Mutex;
+
+    fn resolved_test_agent(resources: &str) -> ResolvedAgent {
+        let mut registry = crate::AgentDefinitionRegistry::new();
+        registry
+            .load_yaml(&format!(
+                "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: test }}\n{resources}"
+            ))
+            .expect("load test definition");
+        registry.resolve_agent("test").expect("resolve test agent")
+    }
+
+    fn empty_test_agent() -> ResolvedAgent {
+        resolved_test_agent("spec: {}")
+    }
+
+    fn mcp_feature(selection: McpServerSelection, trace_propagation: bool) -> McpFeatureConfig {
+        McpFeatureConfig {
+            servers: selection,
+            expose_tools: true,
+            instructions: true,
+            resources: true,
+            prompts: true,
+            trace_propagation,
+            default_permissions: true,
+        }
+    }
+
+    fn connection(key: &str, kind: McpConnectionKind, target: &str) -> McpResolvedConnection {
+        McpResolvedConnection {
+            key: key.to_owned(),
+            kind,
+            command: if kind == McpConnectionKind::Stdio {
+                target.to_owned()
+            } else {
+                String::new()
+            },
+            url: if kind == McpConnectionKind::StreamableHttp {
+                target.to_owned()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_resolver_receives_selection_and_fingerprint_is_sorted_and_structural() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let resolver_requests = Arc::clone(&requests);
+        let factory = test_factory(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        )
+        .with_mcp_connection_resolver(move |request| {
+            let requests = Arc::clone(&resolver_requests);
+            Box::pin(async move {
+                requests.lock().await.push(request);
+                Ok(vec![
+                    connection(
+                        "zeta",
+                        McpConnectionKind::StreamableHttp,
+                        "https://example.test/mcp",
+                    ),
+                    connection("alpha", McpConnectionKind::Stdio, "server --stdio"),
+                ])
+            })
+        });
+        let selection = McpServerSelection::Exclude(BTreeSet::from(["ignored".to_owned()]));
+
+        let prepared = factory
+            .prepare_mcp_runtime(&mcp_feature(selection.clone(), true))
+            .await
+            .expect("resolve MCP")
+            .expect("non-empty MCP preparation");
+
+        assert_eq!(
+            requests.lock().await.as_slice(),
+            &[McpConnectionResolveRequest { servers: selection }]
+        );
+        assert!(prepared.fingerprint.trace_propagation);
+        assert_eq!(prepared.fingerprint.connections[0].key, "alpha");
+        assert_eq!(prepared.fingerprint.connections[1].key, "zeta");
+        let fingerprint =
+            |connections: Vec<McpResolvedConnection>, trace_propagation| McpRuntimeFingerprint {
+                trace_propagation,
+                connections: connections
+                    .iter()
+                    .map(McpRuntimeFingerprintConnection::from_resolved)
+                    .collect(),
+            };
+        let command_changed = fingerprint(
+            vec![connection(
+                "alpha",
+                McpConnectionKind::Stdio,
+                "server --changed",
+            )],
+            true,
+        );
+        assert_ne!(prepared.fingerprint, command_changed);
+        for changed in [
+            McpRuntimeFingerprint {
+                trace_propagation: false,
+                connections: prepared.fingerprint.connections.clone(),
+            },
+            fingerprint(
+                vec![connection(
+                    "alpha",
+                    McpConnectionKind::StreamableHttp,
+                    "https://example.test/changed",
+                )],
+                true,
+            ),
+            fingerprint(
+                vec![connection(
+                    "different-key",
+                    McpConnectionKind::Stdio,
+                    "server --stdio",
+                )],
+                true,
+            ),
+        ] {
+            assert_ne!(prepared.fingerprint, changed);
+        }
+    }
+
+    #[test]
+    fn mcp_fingerprint_ignores_inactive_transport_fields() {
+        let stdio = McpResolvedConnection {
+            key: "stdio".to_owned(),
+            kind: McpConnectionKind::Stdio,
+            command: "server --stdio".to_owned(),
+            url: "https://inactive.example/one".to_owned(),
+        };
+        let mut stdio_inactive_changed = stdio.clone();
+        stdio_inactive_changed.url = "https://inactive.example/two".to_owned();
+        assert_eq!(
+            McpRuntimeFingerprintConnection::from_resolved(&stdio),
+            McpRuntimeFingerprintConnection::from_resolved(&stdio_inactive_changed)
+        );
+        let mut stdio_active_changed = stdio.clone();
+        stdio_active_changed.command = "server --changed".to_owned();
+        assert_ne!(
+            McpRuntimeFingerprintConnection::from_resolved(&stdio),
+            McpRuntimeFingerprintConnection::from_resolved(&stdio_active_changed)
+        );
+
+        let http = McpResolvedConnection {
+            key: "http".to_owned(),
+            kind: McpConnectionKind::StreamableHttp,
+            command: "inactive-command".to_owned(),
+            url: "https://example.test/one".to_owned(),
+        };
+        let mut http_inactive_changed = http.clone();
+        http_inactive_changed.command = "changed-inactive-command".to_owned();
+        assert_eq!(
+            McpRuntimeFingerprintConnection::from_resolved(&http),
+            McpRuntimeFingerprintConnection::from_resolved(&http_inactive_changed)
+        );
+        let mut http_active_changed = http.clone();
+        http_active_changed.url = "https://example.test/two".to_owned();
+        assert_ne!(
+            McpRuntimeFingerprintConnection::from_resolved(&http),
+            McpRuntimeFingerprintConnection::from_resolved(&http_active_changed)
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_resolver_empty_selection_and_missing_includes_are_deterministic() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = test_factory(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+        )
+        .with_mcp_connection_resolver(|_| Box::pin(async { Ok(Vec::new()) }));
+
+        assert!(
+            factory
+                .prepare_mcp_runtime(&mcp_feature(
+                    McpServerSelection::Include(BTreeSet::new()),
+                    false,
+                ))
+                .await
+                .expect("empty include resolves")
+                .is_none()
+        );
+        let error = factory
+            .prepare_mcp_runtime(&mcp_feature(
+                McpServerSelection::Include(BTreeSet::from([
+                    "zeta".to_owned(),
+                    "alpha".to_owned(),
+                ])),
+                false,
+            ))
+            .await
+            .expect_err("missing includes fail");
+        assert_eq!(
+            error.to_string(),
+            "selected MCP servers are not configured: alpha, zeta"
+        );
+    }
+
+    fn test_factory(
+        root: PathBuf,
+        credential_store: impl Into<CredentialStore>,
+    ) -> AgentSessionRuntimeFactory {
+        AgentSessionRuntimeFactory::new(root, credential_store, empty_test_agent())
+    }
+
+    struct EmptyProvider;
+
+    impl LlmStream for EmptyProvider {
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async { Ok(Box::pin(futures_util::stream::empty()) as BoxCompletionStream) })
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn provider_override_receives_definition_features_and_policy() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().to_path_buf();
+        let definition = resolved_test_agent(
+            r"spec:
+  features:
+    - filesystem:
+        root: $(session.workspace.root)
+        profile: auto
+        defaultPermissions: true
+  permissions:
+    - { name: read, permission: allow }",
+        );
+        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+        let override_model = model.clone();
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("auth.json")),
+            definition,
+        )
+        .with_runtime_provider(move |_| {
+            Ok(AgentRuntimeProvider::new(
+                override_model.clone(),
+                Arc::new(EmptyProvider),
+            ))
+        });
+
+        let record = SessionRecord::with_inference_settings_and_metadata_values(
+            "provider-override",
+            Some(InferenceSettings {
+                provider: InferenceProviderSettings {
+                    key: "unused".to_owned(),
+                    api: ModelApi::OpenAiResponses,
+                    url: String::new(),
+                    model_id: "gpt-4".to_owned(),
+                    model_cost: None,
+                    headers: BTreeMap::new(),
+                    oauth: None,
+                    reasoning_effort: None,
+                },
+            }),
+            None,
+            BTreeMap::new(),
+        );
+        let runtime = factory
+            .runtime_for_session(
+                &record,
+                SessionCoordinator::new(crate::MemorySessionStore::new()),
+                None,
+            )
+            .await
+            .expect("build overridden runtime");
+
+        assert_eq!(runtime.model(), &model);
+        assert!(
+            runtime
+                .tools()
+                .iter()
+                .any(|tool| tool.definition().name == "read")
+        );
+        assert_eq!(
+            runtime.permission_policy.evaluate_tool("read"),
+            PermissionLevel::Allow
+        );
+        assert!(
+            runtime
+                .tools()
+                .iter()
+                .any(|tool| tool.definition().name == "apply_patch")
+        );
+        assert_eq!(
+            runtime.permission_policy.evaluate_tool("apply_patch"),
+            PermissionLevel::Allow
+        );
+        for excluded in ["edit", "write", "delete"] {
+            assert!(
+                runtime
+                    .tools()
+                    .iter()
+                    .all(|tool| tool.definition().name != excluded),
+                "unexpected {excluded} tool"
+            );
+            assert_eq!(
+                runtime.permission_policy.evaluate_tool(excluded),
+                PermissionLevel::Deny,
+                "{excluded} permission"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_definition_is_self_contained_for_features_and_permissions() {
+        let root = std::env::temp_dir();
+        let current = resolved_test_agent(
+            r"spec:
+  systemPrompt: current prompt
+  features: [{ featureSetRef: { name: current-features } }]
+  permissions: [{ permissionSetRef: { name: current-permissions } }]
+---
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata: { name: current-features }
+spec: { skills: { root: $(session.workspace.root) } }
+---
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata: { name: current-permissions }
+spec: { tools: [{ name: load_skill, permission: allow }] }",
+        );
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("waltr-agent-definition-merge-auth.json")),
+            current.clone(),
+        );
+        let mut record = SessionRecord::new("definition-merge");
+        record.agent_definition = Some(crate::definition::AgentDefinitionBundle::new(
+            "stored",
+            vec![
+                r"apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata:
+  name: stored
+spec:
+  description: stored description
+  systemPrompt: stored prompt
+  features: [{ featureSetRef: { name: old-features } }]
+  permissions: [{ permissionSetRef: { name: old-permissions } }]
+---
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata: { name: old-features }
+spec: { filesystem: { root: $(session.workspace.root), profile: auto } }
+---
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata: { name: old-permissions }
+spec: { tools: [{ name: read, permission: allow }] }
+"
+                .to_owned(),
+            ],
+        ));
+
+        let effective = factory
+            .definition_for_session(&record)
+            .expect("stored definition resolves");
+
+        assert_eq!(effective.name, "stored");
+        assert_eq!(effective.description.as_deref(), Some("stored description"));
+        assert_eq!(effective.system_prompt.as_deref(), Some("stored prompt"));
+        assert_ne!(effective.features, current.features);
+        assert_ne!(effective.permissions, current.permissions);
+        assert!(effective.features.filesystem.is_some());
+        assert!(effective.features.skills.is_none());
+    }
+
+    #[test]
+    fn malformed_stored_definition_fails_closed() {
+        let root = std::env::temp_dir();
+        let factory = test_factory(
+            root.clone(),
+            FileCredentialStore::new(root.join("waltr-agent-invalid-definition-auth.json")),
+        );
+        let mut record = SessionRecord::new("invalid-definition");
+        record.agent_definition = Some(crate::definition::AgentDefinitionBundle::new(
+            "stored",
+            vec!["not: [valid".to_owned()],
+        ));
+
+        let error = factory
+            .definition_for_session(&record)
+            .expect_err("present malformed definition must fail");
+
+        assert!(matches!(
+            error,
+            AgentSessionRuntimeError::FailedPrecondition(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("stored session agent definition is invalid")
+        );
+    }
+
+    #[test]
+    fn bundle_less_uses_default_but_catalog_missing_stored_name_fails_closed() {
+        let root = std::env::temp_dir();
+        let source =
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: default }\nspec: {}\n";
+        let catalog = AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "default")
+            .expect("catalog resolves");
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("waltr-agent-catalog-auth.json")),
+            catalog.resolved("default").unwrap().clone(),
+        )
+        .with_agent_catalog(catalog);
+
+        assert_eq!(
+            factory
+                .definition_for_session(&SessionRecord::new("legacy"))
+                .unwrap()
+                .name,
+            "default"
+        );
+        let mut missing = SessionRecord::new("missing");
+        missing.agent_definition = Some(AgentDefinitionBundle::new(
+            "removed",
+            vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: removed }\nspec: {}\n".to_owned()],
+        ));
+        assert!(matches!(
+            factory.definition_for_session(&missing),
+            Err(AgentSessionRuntimeError::FailedPrecondition(message))
+                if message.contains("not present in the current startup catalog")
+        ));
+    }
+
+    #[test]
+    fn resolved_definition_drives_registered_feature_inventory() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().to_path_buf();
+        let definition = resolved_test_agent(
+            r"spec:
+  features: [{ featureSetRef: { name: features } }]
+  permissions: [{ permissionSetRef: { name: permissions } }]
+---
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata: { name: features }
+spec:
+  filesystem: { root: $(session.workspace.root), profile: auto, defaultPermissions: true }
+  shell: { root: $(session.workspace.root), defaultPermissions: true }
+---
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata: { name: permissions }
+spec:
+  tools: [{ name: question, permission: allow }]",
+        );
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("auth.json")),
+            definition.clone(),
+        );
+        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+        let policy = factory.definition_permission_policy(&definition, &model, &[]);
+        let runtime = factory
+            .apply_definition(
+                AgentRuntimeBuilder::new(model.clone(), Arc::new(EmptyProvider)),
+                &definition,
+            )
+            .with_permission_policy(policy)
+            .build();
+        let names = runtime
+            .tools()
+            .iter()
+            .map(|tool| tool.definition().name.as_str())
+            .collect::<BTreeSet<_>>();
+
+        for kind in FilesystemConfig::new(&root).exposed_tools(&model).all() {
+            assert!(names.contains(kind.name()), "missing {}", kind.name());
+        }
+        assert!(names.contains("shell"));
+        assert!(names.contains("question"));
+        assert!(!names.contains("task"));
+        assert!(!names.contains("disabled_tool"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn resolved_coding_permissions_compile_for_concrete_tools_and_resources() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().to_path_buf();
+        let definition = resolved_test_agent(
+            r"spec:
+  features: [{ featureSetRef: { name: features } }]
+  permissions: [{ permissionSetRef: { name: permissions } }]
+---
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata: { name: features }
+spec:
+  filesystem: { root: $(session.workspace.root), profile: auto, defaultPermissions: true }
+  skills: { root: $(session.workspace.root), defaultPermissions: true }
+  shell: { root: $(session.workspace.root), defaultPermissions: true }
+  task: { maxSubagentDepth: 1, defaultPermissions: true }
+  mcp: { exposeTools: true, defaultPermissions: true }
+---
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata: { name: permissions }
+spec:
+  tools:
+    - { name: question, permission: allow }
+    - feature: filesystem
+      permission: { resources: { paths: [{ match: { outsideRoot: $(session.workspace.root) }, effect: ask }] } }
+    - name: shell
+      permission:
+        resources:
+          paths: [{ match: { outsideRoot: $(session.workspace.root) }, effect: ask }]
+          commands: [{ match: { names: [git, kubectl, ssh] }, effect: ask }]",
+        );
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("auth.json")),
+            definition.clone(),
+        );
+        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+        let policy = factory.definition_permission_policy(
+            &definition,
+            &model,
+            &["mcp_remote_lookup".to_owned()],
+        );
+
+        for name in FilesystemConfig::new(&root).exposed_tools(&model).all() {
+            assert_eq!(policy.evaluate_tool(name.name()), PermissionLevel::Allow);
+        }
+        for name in [
+            "question",
+            "load_skill",
+            "shell",
+            "task",
+            "mcp_remote_lookup",
+        ] {
+            assert_eq!(policy.evaluate_tool(name), PermissionLevel::Allow, "{name}");
+        }
+        assert_eq!(policy.evaluate_tool("disabled_tool"), PermissionLevel::Deny);
+
+        let outside = crate::PermissionClaim::new(
+            crate::PermissionOperation::Read,
+            crate::PermissionResource::FilesystemPath(
+                root.parent().expect("root parent").join("outside"),
+            ),
+            "outside workspace",
+        );
+        assert_eq!(
+            policy.evaluate_claim("read", &outside),
+            PermissionLevel::Ask
+        );
+
+        for command in ["git status", "kubectl get pods", "ssh host"] {
+            let claim = crate::PermissionClaim::new(
+                crate::PermissionOperation::Execute,
+                crate::PermissionResource::ShellCommand(command.to_owned()),
+                command,
+            );
+            assert_eq!(policy.evaluate_claim("shell", &claim), PermissionLevel::Ask);
+        }
+        let ordinary = crate::PermissionClaim::new(
+            crate::PermissionOperation::Execute,
+            crate::PermissionResource::ShellCommand("cargo test".to_owned()),
+            "cargo test",
+        );
+        assert_eq!(
+            policy.evaluate_claim("shell", &ordinary),
+            PermissionLevel::Allow
+        );
+    }
+
+    #[test]
+    fn resolved_input_permissions_compile_for_concrete_mcp_tools() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let root = directory.path().to_path_buf();
+        let definition = resolved_test_agent(
+            r"spec:
+  features:
+    - mcp: { exposeTools: true }
+  permissions:
+    - feature: mcp
+      permission:
+        inputs:
+          - match:
+              - pointer: /action
+                value: { wildcard: 'sessions.*' }
+            effect: deny",
+        );
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("auth.json")),
+            definition.clone(),
+        );
+        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+        let policy = factory.definition_permission_policy(
+            &definition,
+            &model,
+            &["mcp_remote_lookup".to_owned()],
+        );
+
+        assert_eq!(
+            policy.evaluate_tool("mcp_remote_lookup"),
+            PermissionLevel::Deny
+        );
+        assert_eq!(
+            policy
+                .evaluate_input(
+                    "mcp_remote_lookup",
+                    &serde_json::json!({ "action": "sessions.read" }),
+                )
+                .expect("input rule matches")
+                .effect
+                .level,
+            PermissionLevel::Deny
+        );
+    }
 
     struct StoredCredential;
 
@@ -1066,10 +2158,10 @@ mod tests {
         )
     }
 
-    fn mcp_server_settings() -> super::super::SessionMcpServerRuntimeSettings {
-        super::super::SessionMcpServerRuntimeSettings {
+    fn mcp_server_settings() -> McpResolvedConnection {
+        McpResolvedConnection {
             key: "remote".to_owned(),
-            kind: SessionMcpServerRuntimeKind::StreamableHttp,
+            kind: McpConnectionKind::StreamableHttp,
             command: String::new(),
             url: "https://mcp.example/resource".to_owned(),
         }
@@ -1081,6 +2173,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         );
         let mut credential = mcp_state("https://issuer.example/token".to_owned());
         credential.token.expires_at_ms = None;
@@ -1095,24 +2188,50 @@ mod tests {
         anonymous.key = "anonymous".to_owned();
 
         let (_, credentialed) = factory
-            .mcp_config_and_credentialed_servers(&SessionRuntimeSettings {
-                provider: SessionProviderRuntimeSettings {
-                    key: "test".to_owned(),
-                    api: ModelApi::OpenAiResponses,
-                    url: String::new(),
-                    model_id: "test-model".to_owned(),
-                    model_cost: None,
-                    headers: BTreeMap::new(),
-                    oauth: None,
-                    reasoning_effort: None,
-                },
-                mcp_servers: vec![mcp_server_settings(), anonymous],
-                mcp_trace_propagation: false,
-            })
+            .mcp_config_with_credentials(&[mcp_server_settings(), anonymous], false)
             .await
             .expect("build MCP config");
 
         assert_eq!(credentialed, BTreeSet::from(["remote".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn mcp_preparation_detects_bearer_capability_upgrade_without_fingerprint_change() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let factory = AgentSessionRuntimeFactory::new(
+            directory.path().to_path_buf(),
+            FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
+        )
+        .with_mcp_connection_resolver(|_| Box::pin(async { Ok(vec![mcp_server_settings()]) }));
+        let feature = mcp_feature(McpServerSelection::Exclude(BTreeSet::new()), true);
+        let anonymous = factory
+            .prepare_mcp_runtime(&feature)
+            .await
+            .expect("prepare anonymous MCP")
+            .expect("MCP is selected");
+        assert!(anonymous.credentialed_servers.is_empty());
+
+        let mut credential = mcp_state("https://issuer.example/token".to_owned());
+        credential.token.expires_at_ms = None;
+        factory
+            .credential_store
+            .modify(&AuthTarget::mcp_server("remote").credential_key(), |_| {
+                Some(StoredCredential::McpOAuth(credential))
+            })
+            .await
+            .expect("store credential");
+        let authenticated = factory
+            .prepare_mcp_runtime(&feature)
+            .await
+            .expect("prepare authenticated MCP")
+            .expect("MCP is selected");
+
+        assert_eq!(anonymous.fingerprint, authenticated.fingerprint);
+        assert_eq!(
+            authenticated.credentialed_servers,
+            BTreeSet::from(["remote".to_owned()])
+        );
     }
 
     fn provider_oauth_settings(token_url: String) -> SessionOAuthProviderSettings {
@@ -1183,9 +2302,10 @@ mod tests {
             FileCredentialStore::new(
                 std::env::temp_dir().join("waltr-agent-runtime-test-auth.json"),
             ),
+            empty_test_agent(),
         );
-        let settings = SessionRuntimeSettings {
-            provider: SessionProviderRuntimeSettings {
+        let settings = InferenceSettings {
+            provider: InferenceProviderSettings {
                 key: "test".to_owned(),
                 api: ModelApi::OpenAiResponses,
                 url: String::new(),
@@ -1198,12 +2318,10 @@ mod tests {
                 oauth: None,
                 reasoning_effort: None,
             },
-            mcp_servers: Vec::new(),
-            mcp_trace_propagation: false,
         };
 
         let error = factory
-            .runtime_builder(&settings)
+            .base_runtime_builder(&settings, &factory.definition)
             .await
             .expect_err("missing env should fail at runtime resolution");
 
@@ -1225,8 +2343,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let auth_path = auth_dir.join("auth.json");
-        let factory =
-            AgentSessionRuntimeFactory::new(auth_dir, FileCredentialStore::new(auth_path));
+        let factory = test_factory(auth_dir, FileCredentialStore::new(auth_path));
         factory
             .credential_store
             .modify(&AuthTarget::provider("test").credential_key(), |_| {
@@ -1239,7 +2356,7 @@ mod tests {
             })
             .await
             .expect("store credential");
-        let provider = SessionProviderRuntimeSettings {
+        let provider = InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -1272,9 +2389,10 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         );
-        let settings = SessionRuntimeSettings {
-            provider: SessionProviderRuntimeSettings {
+        let settings = InferenceSettings {
+            provider: InferenceProviderSettings {
                 key: "configured-provider".to_owned(),
                 api: ModelApi::OpenAiResponses,
                 url: "https://provider.example/v1/responses".to_owned(),
@@ -1286,12 +2404,10 @@ mod tests {
                 )),
                 reasoning_effort: None,
             },
-            mcp_servers: Vec::new(),
-            mcp_trace_propagation: false,
         };
 
         let error = factory
-            .runtime_builder(&settings)
+            .base_runtime_builder(&settings, &factory.definition)
             .await
             .expect_err("missing configured OAuth credential must fail");
 
@@ -1365,8 +2481,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let auth_path = auth_dir.join("auth.json");
-        let factory =
-            AgentSessionRuntimeFactory::new(auth_dir, FileCredentialStore::new(auth_path));
+        let factory = test_factory(auth_dir, FileCredentialStore::new(auth_path));
         factory
             .credential_store
             .modify(&AuthTarget::provider("test").credential_key(), |_| {
@@ -1379,7 +2494,7 @@ mod tests {
             })
             .await
             .expect("store credential");
-        let provider = SessionProviderRuntimeSettings {
+        let provider = InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -1654,6 +2769,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         )
         .with_outbound_oauth_loopback_test_mode();
         let key = AuthTarget::mcp_server("remote").credential_key();
@@ -1712,6 +2828,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         )
         .with_outbound_oauth_loopback_test_mode();
         let key = AuthTarget::mcp_server("remote").credential_key();
@@ -1777,6 +2894,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         )
         .with_outbound_oauth_loopback_test_mode();
         let key = AuthTarget::mcp_server("remote").credential_key();
@@ -2066,6 +3184,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         )
         .with_outbound_oauth_loopback_test_mode();
         let key = AuthTarget::mcp_server("remote").credential_key();
@@ -2078,20 +3197,7 @@ mod tests {
             .expect("store credential");
 
         let error = factory
-            .mcp_config(&SessionRuntimeSettings {
-                provider: SessionProviderRuntimeSettings {
-                    key: "test".to_owned(),
-                    api: ModelApi::OpenAiResponses,
-                    url: String::new(),
-                    model_id: "test-model".to_owned(),
-                    model_cost: None,
-                    headers: BTreeMap::new(),
-                    oauth: None,
-                    reasoning_effort: None,
-                },
-                mcp_servers: vec![mcp_server_settings()],
-                mcp_trace_propagation: false,
-            })
+            .mcp_config_with_credentials(&[mcp_server_settings()], false)
             .await
             .expect_err("runtime MCP refresh rejection is an authentication failure");
         assert!(matches!(
@@ -2137,6 +3243,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         )
         .with_outbound_oauth_loopback_test_mode();
         let key = AuthTarget::mcp_server("remote").credential_key();
@@ -2179,6 +3286,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         );
         let key = AuthTarget::mcp_server("remote").credential_key();
         let mut credential = mcp_state("https://issuer.example/token".to_owned());
@@ -2221,6 +3329,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         );
         let key = AuthTarget::mcp_server("remote").credential_key();
         let mut credential = mcp_state("https://issuer.example/token".to_owned());
@@ -2288,6 +3397,7 @@ mod tests {
         let factory = AgentSessionRuntimeFactory::new(
             directory.path().to_path_buf(),
             FileCredentialStore::new(directory.path().join("auth.json")),
+            empty_test_agent(),
         );
         let key = AuthTarget::mcp_server("remote").credential_key();
         let mut credential = mcp_state("https://issuer.example/token".to_owned());

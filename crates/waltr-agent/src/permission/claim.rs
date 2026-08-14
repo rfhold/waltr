@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::{PermissionInputScalar, PermissionJsonPointer};
+
 /// Abstract operation requested by a tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionOperation {
@@ -30,6 +32,15 @@ pub enum PermissionResource {
     WorkingDirectory(PathBuf),
     /// Shell command.
     ShellCommand(String),
+    /// Exact scalar selected from one concrete tool's input.
+    ToolInput {
+        /// Concrete provider-facing tool name.
+        tool: String,
+        /// Canonical JSON Pointer.
+        pointer: PermissionJsonPointer,
+        /// Exact observed typed scalar.
+        value: PermissionInputScalar,
+    },
 }
 
 /// One permission claim extracted from a tool call.
@@ -62,7 +73,7 @@ impl PermissionClaim {
             PermissionResource::FilesystemPath(path)
             | PermissionResource::FilesystemPathPrefix(path)
             | PermissionResource::WorkingDirectory(path) => Some(path),
-            PermissionResource::ShellCommand(_) => None,
+            PermissionResource::ShellCommand(_) | PermissionResource::ToolInput { .. } => None,
         }
     }
 }

@@ -33,6 +33,7 @@ pub struct AgentRuntimeBuilder {
     tools: Vec<AgentTool>,
     middleware_chain: MiddlewareChain,
     system_prompt: SystemPromptBuilder,
+    system_prompt_identity: Option<String>,
     agents_prompt_configs: Vec<AgentsPromptConfig>,
     agents_read_roots: Vec<PathBuf>,
     skills_enabled: bool,
@@ -51,6 +52,10 @@ impl AgentRuntimeBuilder {
     where
         P: LlmStream + 'static,
     {
+        Self::new_dyn(model, provider)
+    }
+
+    pub(crate) fn new_dyn(model: ModelRef, provider: Arc<dyn LlmStream>) -> Self {
         Self {
             provider,
             model,
@@ -58,6 +63,7 @@ impl AgentRuntimeBuilder {
             tools: Vec::new(),
             middleware_chain: MiddlewareChain::new(),
             system_prompt: SystemPromptBuilder::new(),
+            system_prompt_identity: None,
             agents_prompt_configs: Vec::new(),
             agents_read_roots: Vec::new(),
             skills_enabled: false,
@@ -68,6 +74,10 @@ impl AgentRuntimeBuilder {
             retry_config: ProviderRetryConfig::default(),
             template_base_dir: None,
         }
+    }
+
+    pub(crate) const fn model(&self) -> &ModelRef {
+        &self.model
     }
 
     /// Set model pricing used to journal per-turn cost.
@@ -110,6 +120,13 @@ impl AgentRuntimeBuilder {
     #[must_use]
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = self.system_prompt.with_fragment(prompt);
+        self
+    }
+
+    /// Identify the definition-owned base prompt for durable replacement semantics.
+    #[must_use]
+    pub fn with_system_prompt_identity(mut self, identity: impl Into<String>) -> Self {
+        self.system_prompt_identity = Some(identity.into());
         self
     }
 
@@ -256,7 +273,11 @@ impl AgentRuntimeBuilder {
     #[must_use]
     pub fn build(self) -> AgentRuntime {
         let mut middleware_chain = MiddlewareChain::new();
-        middleware_chain.push(SystemPromptMiddleware::new(self.system_prompt.build()));
+        let mut prompt_middleware = SystemPromptMiddleware::new(self.system_prompt.build());
+        if let Some(identity) = self.system_prompt_identity {
+            prompt_middleware = prompt_middleware.with_identity(identity);
+        }
+        middleware_chain.push(prompt_middleware);
         middleware_chain.push(FileTemplateMiddleware);
         middleware_chain.push(PermissionFilteredToolRegistryMiddleware::new(
             self.tools.clone(),
@@ -296,6 +317,7 @@ impl fmt::Debug for AgentRuntimeBuilder {
             .field("tools", &self.tools)
             .field("middleware_chain_len", &self.middleware_chain.len())
             .field("system_prompt", &self.system_prompt)
+            .field("system_prompt_identity", &self.system_prompt_identity)
             .field("agents_prompt_configs", &self.agents_prompt_configs)
             .field("agents_read_roots", &self.agents_read_roots)
             .field("skills_enabled", &self.skills_enabled)

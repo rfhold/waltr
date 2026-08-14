@@ -15,7 +15,10 @@ use crate::{
         context::{MiddlewareStateLog, TemplateRenderContext, ToolCallContext, ToolResultContext},
         tools::tool_is_visible,
     },
-    permission::{PERMISSION_STATE_NAMESPACE, PermissionRuntimeState},
+    permission::{
+        PERMISSION_STATE_NAMESPACE, PermissionApprovalStage, PermissionClaimIdentity,
+        PermissionRuntimeState, permission_claim_identities,
+    },
 };
 
 const MAX_TEMPLATE_DEPTH: usize = 8;
@@ -340,6 +343,45 @@ pub(crate) async fn render_tool_template_reference(
         ));
     }
 
+    let whole_tool_level = ctx.permission_policy.evaluate_tool(&call.name);
+    let whole_tool_request = PermissionRequestContext {
+        session_id: ctx.session_id,
+        turn: ctx.turn,
+        stage: PermissionApprovalStage::WholeTool,
+        policy: ctx.permission_policy,
+    };
+    let whole_tool_request_id = template_permission_request_id(&whole_tool_request, &call, &[]);
+    let mut whole_tool_approved = false;
+    match whole_tool_level {
+        PermissionLevel::Allow => {}
+        PermissionLevel::Deny => {
+            return Ok(TemplateReferenceRender::Rendered(
+                template_tool_error_result(
+                    name,
+                    &arguments,
+                    format!("tool is not permitted: {name}"),
+                ),
+            ));
+        }
+        PermissionLevel::Ask => {
+            let state = permission_runtime_state(ctx.middleware_state)?;
+            if state.has_one_shot(
+                &whole_tool_request_id,
+                &call.id,
+                PermissionApprovalStage::WholeTool,
+                &[],
+            ) {
+                whole_tool_approved = true;
+            } else if ctx.source == TemplateSource::RuntimePrompt {
+                return Ok(TemplateReferenceRender::Suspend(permission_suspension(
+                    &whole_tool_request,
+                    &call,
+                    &[],
+                )));
+            }
+        }
+    }
+
     let mut claims = Vec::new();
     let before_outcome = {
         let middleware_chain = ctx.middleware_chain;
@@ -379,12 +421,28 @@ pub(crate) async fn render_tool_template_reference(
         TemplatePermissionOutcome::Ask(claims) => {
             if ctx.source == TemplateSource::RuntimePrompt {
                 return Ok(TemplateReferenceRender::Suspend(permission_suspension(
-                    ctx.session_id,
-                    ctx.turn,
+                    &PermissionRequestContext {
+                        session_id: ctx.session_id,
+                        turn: ctx.turn,
+                        stage: PermissionApprovalStage::Contextual,
+                        policy: ctx.permission_policy,
+                    },
                     &call,
                     &claims,
                 )));
             }
+        }
+    }
+
+    if whole_tool_approved {
+        let mut state = permission_runtime_state(ctx.middleware_state)?;
+        if state.consume_one_shot(
+            &whole_tool_request_id,
+            &call.id,
+            PermissionApprovalStage::WholeTool,
+            &[],
+        ) {
+            set_permission_runtime_state(ctx.middleware_state, &state)?;
         }
     }
 
@@ -460,36 +518,59 @@ fn permission_outcome(
         )));
     }
 
+    let input = ctx
+        .permission_policy
+        .evaluate_input(&tool_call.name, &tool_call.arguments);
+    if input
+        .as_ref()
+        .is_some_and(|evaluation| evaluation.effect.level == PermissionLevel::Deny)
+    {
+        return Ok(TemplatePermissionOutcome::Deny(
+            "permission denied: tool input does not satisfy policy".to_owned(),
+        ));
+    }
+
     let mut state = permission_runtime_state(ctx.middleware_state)?;
+    let input_claims = input
+        .as_ref()
+        .filter(|input| input.effect.level == PermissionLevel::Ask)
+        .map_or(&[][..], |input| input.claims.as_slice());
     let unmatched = claims
         .iter()
-        .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
+        .filter(|claim| {
+            ctx.permission_policy
+                .evaluate_claim_refinement_effect(&tool_call.name, claim)
+                .is_some_and(|effect| effect.level == PermissionLevel::Ask)
+        })
         .cloned()
+        .chain(input_claims.iter().cloned())
+        .filter(|claim| !state.patterns.iter().any(|pattern| pattern.matches(claim)))
         .collect::<Vec<_>>();
+    let identities = permission_claim_identities(&unmatched);
+    let request_id = template_permission_request_id(
+        &PermissionRequestContext {
+            session_id: ctx.session_id,
+            turn: ctx.turn,
+            stage: PermissionApprovalStage::Contextual,
+            policy: ctx.permission_policy,
+        },
+        tool_call,
+        &identities,
+    );
+    if state.consume_one_shot(
+        &request_id,
+        &tool_call.id,
+        PermissionApprovalStage::Contextual,
+        &identities,
+    ) {
+        set_permission_runtime_state(ctx.middleware_state, &state)?;
+        return Ok(TemplatePermissionOutcome::Allow);
+    }
     if unmatched.is_empty() {
         return Ok(TemplatePermissionOutcome::Allow);
     }
 
-    if state.consume_one_shot(&tool_call.id) {
-        set_permission_runtime_state(ctx.middleware_state, &state)?;
-        return Ok(TemplatePermissionOutcome::Allow);
-    }
-
-    let ask = unmatched
-        .iter()
-        .filter(|claim| {
-            ctx.permission_policy
-                .evaluate_claim_effect(&tool_call.name, claim)
-                .level
-                == PermissionLevel::Ask
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if ask.is_empty() {
-        Ok(TemplatePermissionOutcome::Allow)
-    } else {
-        Ok(TemplatePermissionOutcome::Ask(ask))
-    }
+    Ok(TemplatePermissionOutcome::Ask(unmatched))
 }
 
 fn permission_runtime_state(
@@ -718,9 +799,15 @@ fn template_tool_error_result(
     )
 }
 
-fn permission_suspension(
-    session_id: &str,
+struct PermissionRequestContext<'a> {
+    session_id: &'a str,
     turn: u64,
+    stage: PermissionApprovalStage,
+    policy: &'a PermissionPolicy,
+}
+
+fn permission_suspension(
+    request: &PermissionRequestContext<'_>,
     call: &ToolCall,
     claims: &[PermissionClaim],
 ) -> middleware::Suspension {
@@ -737,23 +824,42 @@ fn permission_suspension(
             .map(|claim| {
                 json!({
                     "operation": format!("{:?}", claim.operation),
-                    "resource": format!("{:?}", claim.resource),
+                    "resource": permission_claim_resource(&claim.resource),
                     "summary": claim.summary,
                 })
             })
             .collect::<Vec<_>>(),
         "patterns": permission_patterns(claims),
+        "claim_identities": permission_claim_identities(claims),
     });
     middleware::Suspension::external(
         "permission",
         middleware::ExternalRequestDraft {
-            id: format!("permission:{session_id}:{turn}:{}", call.id),
+            id: template_permission_request_id(request, call, &permission_claim_identities(claims)),
             kind: middleware::ExternalRequestKind::Permission,
             tool_call_id: Some(call.id.clone()),
             prompt: summary,
             payload,
             status: middleware::ExternalRequestStatus::Pending,
         },
+    )
+}
+
+fn template_permission_request_id(
+    request: &PermissionRequestContext<'_>,
+    call: &ToolCall,
+    claims: &[PermissionClaimIdentity],
+) -> String {
+    let identity = serde_json::to_string(&(request.stage, request.policy.identity(), claims))
+        .expect("permission request identity serializes");
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in identity.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!(
+        "permission:{}:{}:{}:{hash:016x}",
+        request.session_id, request.turn, call.id
     )
 }
 
@@ -786,6 +892,15 @@ fn permission_pattern(claim: &PermissionClaim) -> PermissionPattern {
                 resource: PermissionResourcePattern::ShellCommand(command.clone()),
             };
         }
+        PermissionResource::ToolInput {
+            tool,
+            pointer,
+            value,
+        } => PermissionResourcePattern::ToolInput {
+            tool: tool.clone(),
+            pointer: pointer.clone(),
+            value: value.clone(),
+        },
     };
     PermissionPattern {
         operation: Some(claim.operation),
@@ -803,6 +918,15 @@ fn permission_claim_message(prefix: &str, claims: &[PermissionClaim]) -> String 
         prefix.to_owned()
     } else {
         format!("{prefix}: {summaries}")
+    }
+}
+
+fn permission_claim_resource(resource: &PermissionResource) -> String {
+    match resource {
+        PermissionResource::ToolInput { tool, pointer, .. } => {
+            format!("ToolInput {{ tool: {tool:?}, pointer: {pointer:?} }}")
+        }
+        resource => format!("{resource:?}"),
     }
 }
 

@@ -9,17 +9,16 @@ use std::{
 };
 
 use waltr_agent::{
-    AgentRuntime, AgentSessionRuntimeFactory, AgentTool, BoxStreamFuture, CompletionRequest,
-    FileCredentialStore, LlmError, LlmStream, MemorySessionStore, ModelRef, SessionCoordinator,
-    SessionId, SessionProviderRuntimeSettings, SessionRuntimeSettings, ToolDefinition,
-    tools::task::TASK_TOOL_NAME,
+    AgentRuntimeProvider, AgentSessionRuntimeFactory, BoxStreamFuture, CompletionRequest,
+    FileCredentialStore, InferenceProviderSettings, InferenceSettings, LlmError, LlmStream,
+    MemorySessionStore, ModelRef, SessionCoordinator, SessionId,
+    tools::{question::QUESTION_TOOL_NAME, task::TASK_TOOL_NAME},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::time::timeout;
 
 use crate::{live_provider, scripted_provider::CapturingProvider};
 
-const MARKER_TOOL_NAME: &str = "live_marker";
 const LIVE_TASK_CASE_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_TASK_CASE_REQUEST_LIMIT: usize = 5;
 const TASK_PROMPT: &str = r#"use the task tool and give it the prompt "return a comma separated list of your tool names" then once its complete, repeat that bare list back with no other content"#;
@@ -63,9 +62,10 @@ async fn run_live_task_tool_visibility(
         let sessions = task_sessions(model.clone(), Arc::clone(&provider), case.max_depth);
         let session_id = SessionId::new(format!("live-task-depth-{}", case.max_depth));
         sessions
-            .create_with_id_and_runtime_settings(
+            .create_with_id_and_inference_settings(
                 session_id.clone(),
-                Some(runtime_settings(&model)),
+                Some(inference_settings(&model)),
+                None,
                 std::collections::BTreeMap::default(),
             )
             .await?;
@@ -92,7 +92,7 @@ async fn run_live_task_tool_visibility(
             "{context}"
         );
         assert!(
-            tools.iter().any(|tool| tool == MARKER_TOOL_NAME),
+            tools.iter().any(|tool| tool == QUESTION_TOOL_NAME),
             "{context}"
         );
         assert_eq!(
@@ -220,20 +220,21 @@ where
     let environment = AgentSessionRuntimeFactory::new(
         std::env::temp_dir(),
         FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-live-task-auth.json")),
+        crate::agent_definitions::live_task_visibility_agent(max_depth, tool_names_system_prompt()),
     )
-    .with_task_max_subagent_depth(max_depth)
-    .with_runtime_builder(move |_| {
-        Ok(AgentRuntime::builder(model.clone(), Arc::clone(&provider))
-            .with_system_prompt(tool_names_system_prompt())
-            .with_tool(marker_tool()))
+    .with_runtime_provider(move |_| {
+        Ok(AgentRuntimeProvider::new(
+            model.clone(),
+            Arc::clone(&provider),
+        ))
     });
 
     SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment)
 }
 
-fn runtime_settings(model: &ModelRef) -> SessionRuntimeSettings {
-    SessionRuntimeSettings {
-        provider: SessionProviderRuntimeSettings {
+fn inference_settings(model: &ModelRef) -> InferenceSettings {
+    InferenceSettings {
+        provider: InferenceProviderSettings {
             key: "live".to_owned(),
             api: model.api,
             url: String::new(),
@@ -243,24 +244,7 @@ fn runtime_settings(model: &ModelRef) -> SessionRuntimeSettings {
             oauth: None,
             reasoning_effort: None,
         },
-        mcp_servers: Vec::new(),
-        mcp_trace_propagation: false,
     }
-}
-
-fn marker_tool() -> AgentTool {
-    AgentTool::new(
-        ToolDefinition::new(
-            MARKER_TOOL_NAME,
-            "Marker tool used only to prove non-task tools remain visible.",
-            json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false,
-            }),
-        ),
-        |context| Ok(context.result("marker tool called")),
-    )
 }
 
 const fn tool_names_system_prompt() -> &'static str {
@@ -268,8 +252,8 @@ const fn tool_names_system_prompt() -> &'static str {
 - If the user asks you to use the task tool, call the task tool exactly once with the prompt exactly "return a comma separated list of your tool names".
 - After a task result arrives, never call the task tool again in that turn. Extract the JSON result field and answer with only that bare value.
 - If the user asks for a comma separated list of your tool names, do not call any tool. Answer with only the exact tool names available in the current request, separated by commas.
-- Include live_marker when it is available. Include task only when a tool named task is available in the current request. Never invent task when it is hidden.
-- Never call live_marker."#
+- Include question when it is available. Include task only when a tool named task is available in the current request. Never invent task when it is hidden.
+- Never call question."#
 }
 
 fn parse_tool_csv(output: &str) -> Vec<String> {

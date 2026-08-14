@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{PermissionClaim, PermissionOperation, PermissionResource};
+use super::{
+    PermissionClaim, PermissionInputScalar, PermissionJsonPointer, PermissionOperation,
+    PermissionResource,
+};
 
 /// Path pattern used by permission policy rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +120,15 @@ pub enum PermissionResourcePattern {
     ShellCommand(String),
     /// Shell command prefix.
     ShellCommandPrefix(String),
+    /// Exact scalar selected from one concrete tool input.
+    ToolInput {
+        /// Concrete provider-facing tool name.
+        tool: String,
+        /// Canonical JSON Pointer.
+        pointer: PermissionJsonPointer,
+        /// Exact observed typed scalar.
+        value: PermissionInputScalar,
+    },
 }
 
 impl PermissionResourcePattern {
@@ -139,6 +151,18 @@ impl PermissionResourcePattern {
             (Self::ShellCommandPrefix(pattern), PermissionResource::ShellCommand(command)) => {
                 command.starts_with(pattern)
             }
+            (
+                Self::ToolInput {
+                    tool: pattern_tool,
+                    pointer: pattern_pointer,
+                    value: pattern_value,
+                },
+                PermissionResource::ToolInput {
+                    tool,
+                    pointer,
+                    value,
+                },
+            ) => pattern_tool == tool && pattern_pointer == pointer && pattern_value == value,
             _ => false,
         }
     }

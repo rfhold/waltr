@@ -10,13 +10,14 @@ use serde_json::Value;
 use crate::{
     AuthenticationFailure, CompletionTurn, ModelRef, PromptTurn, ProviderTurnMetadata,
     ThinkingBlock, ToolCall, ToolResult, TurnItem,
+    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, TimelineContent,
         TimelineCursor, TimelineEventKind, TimelineStatus,
     },
 };
 
-use super::SessionRuntimeSettings;
+use super::InferenceSettings;
 
 /// Durable session identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -177,9 +178,12 @@ pub struct SessionRecord {
     /// Durable metadata used by hosts to list and order sessions.
     #[serde(default = "SessionMetadata::now")]
     pub metadata: SessionMetadata,
-    /// Runtime settings used to execute the session.
+    /// Durable settings used for session inference.
     #[serde(default)]
-    pub runtime_settings: Option<SessionRuntimeSettings>,
+    pub inference_settings: Option<InferenceSettings>,
+    /// Self-contained agent definitions selected for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition: Option<AgentDefinitionBundle>,
     /// Ordered durable journal, including cursor-assigned timeline events.
     pub journal: Vec<SessionJournalEvent>,
 }
@@ -232,9 +236,12 @@ pub struct SessionSummary {
     /// Durable usage and cost totals derived from journaled provider turns.
     #[serde(default)]
     pub metrics: SessionMetrics,
-    /// Runtime settings used to execute the session.
+    /// Durable settings used for session inference.
     #[serde(default)]
-    pub runtime_settings: Option<SessionRuntimeSettings>,
+    pub inference_settings: Option<InferenceSettings>,
+    /// Currently selected durable agent name, when the session has an explicit bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     /// Host-defined durable metadata values.
     #[serde(default)]
     pub metadata_values: BTreeMap<String, Value>,
@@ -300,7 +307,8 @@ impl SessionRecord {
             id: id.into(),
             revision: Revision::ZERO,
             metadata: SessionMetadata::now(),
-            runtime_settings: None,
+            inference_settings: None,
+            agent_definition: None,
             journal: Vec::new(),
         }
     }
@@ -315,20 +323,28 @@ impl SessionRecord {
         record
     }
 
-    /// Create a session record with initial runtime settings and metadata values.
-    pub fn with_runtime_settings_and_metadata_values(
+    /// Create a session record with initial inference settings and metadata values.
+    pub fn with_inference_settings_and_metadata_values(
         id: impl Into<SessionId>,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
         metadata_values: BTreeMap<String, Value>,
     ) -> Self {
         let mut record = Self::with_metadata_values(id, metadata_values);
-        record.runtime_settings = runtime_settings;
+        record.inference_settings = inference_settings;
+        record.agent_definition = agent_definition;
         record
     }
 
-    /// Set session runtime settings and mark metadata as updated.
-    pub fn set_runtime_settings(&mut self, runtime_settings: Option<SessionRuntimeSettings>) {
-        self.runtime_settings = runtime_settings;
+    /// Set session inference settings and mark metadata as updated.
+    pub fn set_inference_settings(&mut self, inference_settings: Option<InferenceSettings>) {
+        self.inference_settings = inference_settings;
+        self.touch_metadata();
+    }
+
+    /// Set the self-contained agent-definition bundle and mark metadata as updated.
+    pub fn set_agent_definition(&mut self, agent_definition: Option<AgentDefinitionBundle>) {
+        self.agent_definition = agent_definition;
         self.touch_metadata();
     }
 
@@ -380,7 +396,11 @@ impl SessionRecord {
             updated_at: self.metadata.updated_at,
             last_activity_at: self.metadata.last_activity_at,
             metrics,
-            runtime_settings: self.runtime_settings.clone(),
+            inference_settings: self.inference_settings.clone(),
+            agent_name: self
+                .agent_definition
+                .as_ref()
+                .map(|bundle| bundle.agent_name.clone()),
             metadata_values: self.metadata.values.clone(),
         }
     }
@@ -1188,7 +1208,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        ThinkingBlockKind,
+        InferenceProviderSettings, ModelApi, ThinkingBlockKind,
         timeline::{
             CHANNEL_EXTERNAL_REQUEST, PendingTimelineEvent, PendingTimelineItemId, TimelineChannel,
             TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
@@ -1222,6 +1242,82 @@ mod tests {
 
     fn assigned(cursor: u64, pending: PendingTimelineEvent) -> SessionJournalEvent {
         SessionJournalEvent::Timeline(pending.with_cursor(TimelineCursor::new(cursor)))
+    }
+
+    fn inference_settings() -> InferenceSettings {
+        InferenceSettings {
+            provider: InferenceProviderSettings {
+                key: "test".to_owned(),
+                api: ModelApi::OpenAiResponses,
+                url: "https://provider.example/v1".to_owned(),
+                model_id: "test-model".to_owned(),
+                model_cost: None,
+                headers: BTreeMap::new(),
+                oauth: None,
+                reasoning_effort: Some("medium".to_owned()),
+            },
+        }
+    }
+
+    #[test]
+    fn session_record_serializes_inference_settings_field() {
+        let mut record = SessionRecord::new("session-1");
+        record.inference_settings = Some(inference_settings());
+
+        let serialized = serde_json::to_value(record).expect("session record serializes");
+
+        assert!(serialized.get("inference_settings").is_some());
+        assert!(serialized.get("runtime_settings").is_none());
+    }
+
+    #[test]
+    fn runtime_settings_field_does_not_populate_inference_settings() {
+        let serialized = serde_json::to_value(SessionRecord::new("session-1"))
+            .expect("session record serializes");
+        let mut object = serialized
+            .as_object()
+            .expect("session record object")
+            .clone();
+        object.remove("inference_settings");
+        object.insert(
+            "runtime_settings".to_owned(),
+            serde_json::to_value(inference_settings()).expect("settings serialize"),
+        );
+
+        let restored: SessionRecord =
+            serde_json::from_value(Value::Object(object)).expect("old record deserializes");
+
+        assert!(restored.inference_settings.is_none());
+    }
+
+    #[test]
+    fn session_record_bundle_is_optional_and_legacy_json_loads_as_none() {
+        let record = SessionRecord::new("session-1");
+        let serialized = serde_json::to_value(&record).unwrap();
+        assert!(serialized.get("agent_definition").is_none());
+
+        let restored: SessionRecord = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.agent_definition, None);
+    }
+
+    #[test]
+    fn session_record_bundle_round_trips_outside_the_journal() {
+        let bundle = AgentDefinitionBundle::new(
+            "selected",
+            vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: selected\nspec: {}\n".to_owned()],
+        );
+        let record = SessionRecord::with_inference_settings_and_metadata_values(
+            "session-1",
+            None,
+            Some(bundle.clone()),
+            BTreeMap::new(),
+        );
+
+        let restored: SessionRecord =
+            serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
+
+        assert_eq!(restored.agent_definition, Some(bundle));
+        assert!(restored.journal.is_empty());
     }
 
     #[test]

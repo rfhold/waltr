@@ -1,24 +1,26 @@
 //! MCP agent integration tests.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
+    ops::Deref,
     process::Child,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use futures_util::StreamExt;
+use waltr_agent::definition::McpServerSelection;
 use waltr_agent::{
-    AgentRuntime, AgentSessionRunError, AgentSessionRuntimeError, AgentSessionRuntimeFactory,
-    AgentTimelineEvent, AuthTarget, CHANNEL_ASSISTANT_TEXT, CHANNEL_TOOL_CALL,
-    CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent, FileCredentialStore,
-    LlmStream, MemorySessionStore, ModelApi, ModelRef, PendingWorkStatus, ProviderId,
-    SessionCoordinator, SessionMcpServerRuntimeKind, SessionMcpServerRuntimeSettings,
-    SessionProviderRuntimeSettings, SessionRuntimeSettings, SessionStore, SessionTemplateKind,
+    AgentRuntimeProvider, AgentSessionRunError, AgentSessionRuntimeError,
+    AgentSessionRuntimeFactory, AgentTimelineEvent, AuthTarget, CHANNEL_ASSISTANT_TEXT,
+    CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent,
+    FileCredentialStore, InferenceProviderSettings, InferenceSettings, LlmStream,
+    McpConnectionKind, McpResolvedConnection, MemorySessionStore, ModelApi, ModelRef,
+    PendingWorkStatus, ProviderId, SessionCoordinator, SessionStore, SessionTemplateKind,
     SessionTemplateSearchRequest, SessionTemplateSearchTarget, Suspension, TimelineContent,
     TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall, ToolResultContentBlock,
 };
@@ -35,6 +37,125 @@ use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 use crate::session::AgentTestSession;
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
+
+#[tokio::test]
+async fn mcp_definition_selection_is_forwarded_to_host_resolver() -> waltr_agent::Result<()> {
+    for (servers, expected) in [
+        (
+            "{ include: [selected] }",
+            McpServerSelection::Include(BTreeSet::from(["selected".to_owned()])),
+        ),
+        (
+            "{ exclude: [ignored] }",
+            McpServerSelection::Exclude(BTreeSet::from(["ignored".to_owned()])),
+        ),
+        (
+            "{ exclude: [] }",
+            McpServerSelection::Exclude(BTreeSet::new()),
+        ),
+    ] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let resolver_requests = Arc::clone(&requests);
+        let provider = Arc::new(ScriptedProvider::from_turns(
+            "mcp_selection_provider",
+            vec![vec![CompletionEvent::Finished]],
+        ));
+        let root = tempfile::tempdir()?.keep();
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("credentials.json")),
+            crate::agent_definitions::mcp_agent_with_servers(servers),
+        )
+        .with_runtime_provider(move |_| {
+            Ok(AgentRuntimeProvider::new(test_model(), provider.clone()))
+        })
+        .with_mcp_connection_resolver(move |request| {
+            resolver_requests
+                .lock()
+                .expect("resolver requests lock")
+                .push(request);
+            Box::pin(async { Ok(Vec::new()) })
+        });
+        let sessions =
+            SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+        let session_id = sessions
+            .create_with_inference_settings(
+                Some(test_inference_settings()),
+                None,
+                std::collections::BTreeMap::new(),
+            )
+            .await?
+            .id()
+            .clone();
+        let result = sessions
+            .submit_prompt(
+                session_id,
+                "resolve selection",
+                waltr_agent::RunConflictPolicy::ReplaceActive,
+            )
+            .await;
+
+        if matches!(expected, McpServerSelection::Include(_)) {
+            assert!(matches!(
+                result,
+                Err(AgentSessionRunError::Runtime(
+                    AgentSessionRuntimeError::FailedPrecondition(_)
+                ))
+            ));
+        } else {
+            result?.handle.wait().await?;
+        }
+        assert_eq!(
+            requests.lock().expect("resolver requests lock").as_slice(),
+            &[waltr_agent::McpConnectionResolveRequest { servers: expected }]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_include_empty_selects_none_without_calling_host_resolver() -> waltr_agent::Result<()> {
+    let called = Arc::new(AtomicBool::new(false));
+    let resolver_called = Arc::clone(&called);
+    let provider = Arc::new(ScriptedProvider::from_turns(
+        "mcp_empty_selection_provider",
+        vec![vec![CompletionEvent::Finished]],
+    ));
+    let root = tempfile::tempdir()?.keep();
+    let factory = AgentSessionRuntimeFactory::new(
+        root.clone(),
+        FileCredentialStore::new(root.join("credentials.json")),
+        crate::agent_definitions::mcp_agent_with_servers("{ include: [] }"),
+    )
+    .with_runtime_provider(move |_| Ok(AgentRuntimeProvider::new(test_model(), provider.clone())))
+    .with_mcp_connection_resolver(move |_| {
+        resolver_called.store(true, Ordering::SeqCst);
+        Box::pin(async { Ok(Vec::new()) })
+    });
+    let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
+    let session_id = sessions
+        .create_with_inference_settings(
+            Some(test_inference_settings()),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+        .await?
+        .id()
+        .clone();
+    sessions
+        .submit_prompt(
+            session_id,
+            "no MCP",
+            waltr_agent::RunConflictPolicy::ReplaceActive,
+        )
+        .await?
+        .handle
+        .wait()
+        .await?;
+
+    assert!(!called.load(Ordering::SeqCst));
+    Ok(())
+}
 
 #[tokio::test]
 async fn mcp_agent_loop_discovers_and_calls_stdio_and_streamable_http_direct_tools()
@@ -151,15 +272,10 @@ async fn mcp_streamable_http_auth_failure_is_reported_as_auth_required() -> walt
         "mcp_auth_required_provider",
         vec![vec![CompletionEvent::Finished]],
     ));
-    let sessions = mcp_sessions(provider);
+    let sessions = mcp_sessions_with_connections(provider, vec![http_runtime_server(&http_server)]);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![http_runtime_server(
-                &http_server,
-            )])),
-        )
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
 
     let result = sessions
@@ -197,25 +313,35 @@ async fn mcp_authentication_is_the_first_blocker_before_provider_authentication(
 -> waltr_agent::Result<()> {
     let http_server = HttpMcpTestServer::start_requiring_bearer("valid-token").await?;
     let expected_endpoint = http_server.endpoint.clone();
+    let resolved_endpoint = expected_endpoint.clone();
     let root = tempfile::tempdir()?.keep();
     let credentials = FileCredentialStore::new(root.join("credentials.json"));
-    let factory = AgentSessionRuntimeFactory::new(root, credentials).with_runtime_builder(|_| {
+    let factory = AgentSessionRuntimeFactory::new(
+        root,
+        credentials,
+        crate::agent_definitions::mcp_agent(true),
+    )
+    .with_runtime_provider(|_| {
         Err(AgentSessionRuntimeError::Authentication {
             target: AuthTarget::provider("configured-provider"),
             message: "provider OAuth credential is required".to_owned(),
             reason: waltr_agent::AuthenticationFailureReason::CredentialRequired,
             mcp_authorization: None,
         })
+    })
+    .with_mcp_connection_resolver(move |_| {
+        let connection = McpResolvedConnection {
+            key: "http_test".to_owned(),
+            kind: McpConnectionKind::StreamableHttp,
+            command: String::new(),
+            url: resolved_endpoint.clone(),
+        };
+        Box::pin(async move { Ok(vec![connection]) })
     });
     let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![http_runtime_server(
-                &http_server,
-            )])),
-        )
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
 
     let error = sessions
@@ -297,7 +423,7 @@ async fn mcp_progress_notifications_are_forwarded_to_timeline() -> waltr_agent::
 }
 
 #[tokio::test]
-async fn mcp_trace_propagation_disabled_by_default() -> waltr_agent::Result<()> {
+async fn mcp_trace_propagation_explicit_false_is_preserved() -> waltr_agent::Result<()> {
     global::set_text_map_propagator(TraceContextPropagator::new());
     let _trace = TestTraceCapture::start();
     let stdio_command = test_stdio_server_command();
@@ -312,7 +438,7 @@ async fn mcp_trace_propagation_disabled_by_default() -> waltr_agent::Result<()> 
             vec![CompletionEvent::Finished],
         ],
     ));
-    let sessions = mcp_sessions(provider);
+    let sessions = mcp_sessions_with_trace(provider, false);
 
     let session = run_session_prompt(
         &sessions,
@@ -345,13 +471,10 @@ async fn mcp_trace_propagation_reaches_tool_requests() -> waltr_agent::Result<()
         ],
     ));
     let sessions = mcp_sessions(provider);
-    let mut settings = test_runtime_settings(vec![stdio_runtime_server(&stdio_command)]);
-    settings.mcp_trace_propagation = true;
-
-    let session = run_session_prompt_with_settings(
+    let session = run_session_prompt(
         &sessions,
         "call MCP tool with trace propagation",
-        settings,
+        vec![stdio_runtime_server(&stdio_command)],
     )
     .await?;
 
@@ -378,11 +501,10 @@ async fn mcp_trace_propagation_reaches_prompt_resource_and_completion_requests()
         },
     )));
     let sessions = mcp_sessions(provider.clone());
+    sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
     let session_id = sessions.create().await?.id().clone();
-    let mut settings = test_runtime_settings(vec![stdio_runtime_server(&stdio_command)]);
-    settings.mcp_trace_propagation = true;
     sessions
-        .set_runtime_settings(&session_id, Some(settings))
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
 
     let query = "@resource(stdio_test, \"test://items/4\")".to_owned();
@@ -441,11 +563,12 @@ async fn mcp_trace_tool_request_span_is_child_of_agent_tool_call() -> waltr_agen
         ],
     ));
     let sessions = mcp_sessions(provider);
-    let mut settings = test_runtime_settings(vec![stdio_runtime_server(&stdio_command)]);
-    settings.mcp_trace_propagation = true;
-
-    run_session_prompt_with_settings(&sessions, "call MCP tool for span assertions", settings)
-        .await?;
+    run_session_prompt(
+        &sessions,
+        "call MCP tool for span assertions",
+        vec![stdio_runtime_server(&stdio_command)],
+    )
+    .await?;
 
     let spans = trace.finished_spans();
     let turn = find_span(&spans, "agent.turn", |_| true);
@@ -502,14 +625,10 @@ async fn mcp_cancellation_cancels_tool_work_and_preserves_stdio_runtime() -> wal
     ));
     let store = MemorySessionStore::new();
     let sessions = mcp_sessions_with_store(store.clone(), provider);
+    sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![stdio_runtime_server(
-                &stdio_command,
-            )])),
-        )
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
     let submission = sessions
         .submit_prompt(
@@ -608,14 +727,10 @@ async fn mcp_prompt_templates_are_discovered_from_stdio_server() -> waltr_agent:
         vec![Ok(CompletionEvent::Finished)]
     }));
     let sessions = mcp_sessions(provider);
+    sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![stdio_runtime_server(
-                &stdio_command,
-            )])),
-        )
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
 
     let options = sessions
@@ -735,14 +850,10 @@ async fn mcp_resource_templates_are_discovered_from_stdio_server() -> waltr_agen
         |_| vec![Ok(CompletionEvent::Finished)],
     ));
     let sessions = mcp_sessions(provider);
+    sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![stdio_runtime_server(
-                &stdio_command,
-            )])),
-        )
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
 
     let options = sessions
@@ -779,14 +890,10 @@ async fn mcp_uri_resource_templates_are_discovered_from_stdio_server() -> waltr_
         |_| vec![Ok(CompletionEvent::Finished)],
     ));
     let sessions = mcp_sessions(provider);
+    sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![stdio_runtime_server(
-                &stdio_command,
-            )])),
-        )
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
 
     let options = sessions
@@ -823,14 +930,10 @@ async fn mcp_uri_resource_template_completions_are_search_options() -> waltr_age
         |_| vec![Ok(CompletionEvent::Finished)],
     ));
     let sessions = mcp_sessions(provider);
+    sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(
-            &session_id,
-            Some(test_runtime_settings(vec![stdio_runtime_server(
-                &stdio_command,
-            )])),
-        )
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
 
     let query = "@resource(stdio_test, \"test://items/4\")".to_owned();
@@ -1039,7 +1142,7 @@ async fn mcp_server_instructions_are_ordered_by_server_key() -> waltr_agent::Res
 }
 
 #[tokio::test]
-async fn mcp_server_instructions_can_be_disabled_on_factory() -> waltr_agent::Result<()> {
+async fn mcp_server_instructions_can_be_disabled_by_definition() -> waltr_agent::Result<()> {
     let server = HttpMcpTestServer::start_with_instructions("disabled instructions marker").await?;
     let provider = Arc::new(CapturingProvider::new(ScriptedProvider::new(
         "mcp_disabled_instructions_provider",
@@ -1063,39 +1166,75 @@ async fn mcp_server_instructions_can_be_disabled_on_factory() -> waltr_agent::Re
     Ok(())
 }
 
-fn stdio_runtime_server(command: &str) -> SessionMcpServerRuntimeSettings {
-    SessionMcpServerRuntimeSettings {
+fn stdio_runtime_server(command: &str) -> McpResolvedConnection {
+    McpResolvedConnection {
         key: "stdio_test".to_owned(),
-        kind: SessionMcpServerRuntimeKind::Stdio,
+        kind: McpConnectionKind::Stdio,
         command: command.to_owned(),
         url: String::new(),
     }
 }
 
-fn http_runtime_server(server: &HttpMcpTestServer) -> SessionMcpServerRuntimeSettings {
+fn http_runtime_server(server: &HttpMcpTestServer) -> McpResolvedConnection {
     http_runtime_server_with_key("http_test", server)
 }
 
-fn http_runtime_server_with_key(
-    key: &str,
-    server: &HttpMcpTestServer,
-) -> SessionMcpServerRuntimeSettings {
-    SessionMcpServerRuntimeSettings {
+fn http_runtime_server_with_key(key: &str, server: &HttpMcpTestServer) -> McpResolvedConnection {
+    McpResolvedConnection {
         key: key.to_owned(),
-        kind: SessionMcpServerRuntimeKind::StreamableHttp,
+        kind: McpConnectionKind::StreamableHttp,
         command: String::new(),
         url: server.endpoint.clone(),
     }
 }
 
-fn mcp_sessions(provider: Arc<impl LlmStream + 'static>) -> SessionCoordinator<MemorySessionStore> {
+struct TestMcpSessions {
+    sessions: SessionCoordinator<MemorySessionStore>,
+    connections: Arc<Mutex<Vec<McpResolvedConnection>>>,
+}
+
+impl TestMcpSessions {
+    fn set_connections(&self, connections: Vec<McpResolvedConnection>) {
+        *self.connections.lock().expect("MCP connections lock") = connections;
+    }
+}
+
+impl Deref for TestMcpSessions {
+    type Target = SessionCoordinator<MemorySessionStore>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sessions
+    }
+}
+
+fn mcp_sessions(provider: Arc<impl LlmStream + 'static>) -> TestMcpSessions {
     mcp_sessions_with_instructions_enabled(provider, true)
+}
+
+fn mcp_sessions_with_trace(
+    provider: Arc<impl LlmStream + 'static>,
+    trace_propagation: bool,
+) -> TestMcpSessions {
+    mcp_sessions_with_store_and_definition(
+        MemorySessionStore::new(),
+        provider,
+        crate::agent_definitions::mcp_agent_with_trace(true, Some(trace_propagation)),
+    )
+}
+
+fn mcp_sessions_with_connections(
+    provider: Arc<impl LlmStream + 'static>,
+    connections: Vec<McpResolvedConnection>,
+) -> TestMcpSessions {
+    let sessions = mcp_sessions(provider);
+    sessions.set_connections(connections);
+    sessions
 }
 
 fn mcp_sessions_with_instructions_enabled(
     provider: Arc<impl LlmStream + 'static>,
     instructions_enabled: bool,
-) -> SessionCoordinator<MemorySessionStore> {
+) -> TestMcpSessions {
     mcp_sessions_with_store_and_instructions_enabled(
         MemorySessionStore::new(),
         provider,
@@ -1106,7 +1245,7 @@ fn mcp_sessions_with_instructions_enabled(
 fn mcp_sessions_with_store(
     store: MemorySessionStore,
     provider: Arc<impl LlmStream + 'static>,
-) -> SessionCoordinator<MemorySessionStore> {
+) -> TestMcpSessions {
     mcp_sessions_with_store_and_instructions_enabled(store, provider, true)
 }
 
@@ -1114,31 +1253,49 @@ fn mcp_sessions_with_store_and_instructions_enabled(
     store: MemorySessionStore,
     provider: Arc<impl LlmStream + 'static>,
     instructions_enabled: bool,
-) -> SessionCoordinator<MemorySessionStore> {
+) -> TestMcpSessions {
+    mcp_sessions_with_store_and_definition(
+        store,
+        provider,
+        crate::agent_definitions::mcp_agent(instructions_enabled),
+    )
+}
+
+fn mcp_sessions_with_store_and_definition(
+    store: MemorySessionStore,
+    provider: Arc<impl LlmStream + 'static>,
+    definition: waltr_agent::ResolvedAgent,
+) -> TestMcpSessions {
     let root = tempfile::tempdir().expect("tempdir").keep();
     let credentials = FileCredentialStore::new(root.join("credentials.json"));
-    let factory = AgentSessionRuntimeFactory::new(root, credentials)
-        .with_mcp_server_instructions_enabled(instructions_enabled)
-        .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
-    SessionCoordinator::new(store).with_runtime_factory(factory)
+    let factory = AgentSessionRuntimeFactory::new(root, credentials, definition)
+        .with_runtime_provider(move |_| {
+            Ok(AgentRuntimeProvider::new(test_model(), provider.clone()))
+        });
+    let connections = Arc::new(Mutex::new(Vec::new()));
+    let resolver_connections = Arc::clone(&connections);
+    let factory = factory.with_mcp_connection_resolver(move |_| {
+        let resolved = resolver_connections
+            .lock()
+            .expect("MCP connections lock")
+            .clone();
+        Box::pin(async move { Ok(resolved) })
+    });
+    TestMcpSessions {
+        sessions: SessionCoordinator::new(store).with_runtime_factory(factory),
+        connections,
+    }
 }
 
 async fn run_session_prompt(
-    sessions: &SessionCoordinator<MemorySessionStore>,
+    sessions: &TestMcpSessions,
     prompt: &str,
-    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
+    connections: Vec<McpResolvedConnection>,
 ) -> waltr_agent::Result<AgentTestSession> {
-    run_session_prompt_with_settings(sessions, prompt, test_runtime_settings(mcp_servers)).await
-}
-
-async fn run_session_prompt_with_settings(
-    sessions: &SessionCoordinator<MemorySessionStore>,
-    prompt: &str,
-    settings: SessionRuntimeSettings,
-) -> waltr_agent::Result<AgentTestSession> {
+    sessions.set_connections(connections);
     let session_id = sessions.create().await?.id().clone();
     sessions
-        .set_runtime_settings(&session_id, Some(settings))
+        .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
     let submission = sessions
         .submit_prompt(
@@ -1154,11 +1311,9 @@ async fn run_session_prompt_with_settings(
     Ok(test_session_from_timeline(events))
 }
 
-fn test_runtime_settings(
-    mcp_servers: Vec<SessionMcpServerRuntimeSettings>,
-) -> SessionRuntimeSettings {
-    SessionRuntimeSettings {
-        provider: SessionProviderRuntimeSettings {
+fn test_inference_settings() -> InferenceSettings {
+    InferenceSettings {
+        provider: InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -1168,8 +1323,6 @@ fn test_runtime_settings(
             oauth: None,
             reasoning_effort: None,
         },
-        mcp_servers,
-        mcp_trace_propagation: false,
     }
 }
 

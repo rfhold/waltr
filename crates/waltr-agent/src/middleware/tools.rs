@@ -36,14 +36,10 @@ impl PermissionFilteredToolRegistryMiddleware {
 }
 
 impl AgentMiddleware for PermissionFilteredToolRegistryMiddleware {
-    async fn list_tools(&self, ctx: &mut RequestContext<'_>, draft: &mut ToolDraft) -> Result<()> {
-        draft.tools.extend(
-            self.tools
-                .iter()
-                .map(AgentTool::definition)
-                .filter(|tool| tool_is_visible(&ctx.permission_policy, tool, self.ask_available))
-                .cloned(),
-        );
+    async fn list_tools(&self, _ctx: &mut RequestContext<'_>, draft: &mut ToolDraft) -> Result<()> {
+        draft
+            .tools
+            .extend(self.tools.iter().map(AgentTool::definition).cloned());
         Ok(())
     }
 
@@ -168,7 +164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filters_tool_definitions_by_permission_visibility() {
+    async fn leaves_registered_tool_filtering_to_the_middleware_chain() {
         use crate::{PermissionEffect, PermissionToolSelector};
 
         let allowed = tool("allowed");
@@ -202,11 +198,11 @@ mod tests {
         .await
         .expect("filtered tool middleware should run");
 
-        assert_eq!(draft.tools, vec![allowed, ask]);
+        assert_eq!(draft.tools, vec![allowed, ask, tool("denied")]);
     }
 
     #[tokio::test]
-    async fn hides_ask_tool_definitions_without_ask_path() {
+    async fn does_not_filter_registered_ask_tools() {
         use crate::{PermissionEffect, PermissionToolSelector};
 
         let allowed = tool("allowed");
@@ -230,6 +226,6 @@ mod tests {
         .await
         .expect("filtered tool middleware should run");
 
-        assert_eq!(draft.tools, vec![allowed]);
+        assert_eq!(draft.tools, vec![allowed, tool("ask")]);
     }
 }

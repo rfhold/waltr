@@ -11,9 +11,9 @@ use super::{
 };
 use crate::{
     agent::session::{
-        Revision, SessionId, SessionJournalEvent, SessionRecord, SessionRuntimeSettings,
-        SessionSummary,
+        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
+    definition::AgentDefinitionBundle,
     timeline::{
         AgentTimelineEvent, PendingTimelineEvent, TimelineItemId, TimelineItemText, TimelineQuery,
     },
@@ -112,17 +112,19 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
-    fn create_with_runtime_settings(
+    fn create_with_inference_settings(
         &self,
         id: SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
         metadata_values: BTreeMap<String, Value>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::with_runtime_settings_and_metadata_values(
+            let record = SessionRecord::with_inference_settings_and_metadata_values(
                 id,
-                runtime_settings,
+                inference_settings,
+                agent_definition,
                 metadata_values,
             );
             let mut records = store
@@ -282,10 +284,10 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
-    fn set_runtime_settings(
+    fn set_inference_settings(
         &self,
         id: &SessionId,
-        runtime_settings: Option<SessionRuntimeSettings>,
+        inference_settings: Option<InferenceSettings>,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
@@ -297,7 +299,29 @@ impl SessionStore for MemorySessionStore {
             let record = records
                 .get_mut(&id)
                 .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
-            record.set_runtime_settings(runtime_settings);
+            record.set_inference_settings(inference_settings);
+            let record = record.clone();
+            drop(records);
+            Ok(record)
+        }
+    }
+
+    fn set_agent_definition(
+        &self,
+        id: &SessionId,
+        agent_definition: Option<AgentDefinitionBundle>,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            let record = records
+                .get_mut(&id)
+                .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
+            record.set_agent_definition(agent_definition);
             let record = record.clone();
             drop(records);
             Ok(record)
@@ -343,7 +367,7 @@ mod tests {
         RequestRecord, SessionStatus,
     };
     use crate::{
-        ModelApi, ModelRef, ProviderId, ToolCall, ToolResult,
+        InferenceProviderSettings, ModelApi, ModelRef, ProviderId, ToolCall, ToolResult,
         timeline::{
             CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_THINKING, CHANNEL_TOOL_CALL,
             TimelineChannel, TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
@@ -392,6 +416,47 @@ mod tests {
             PendingTimelineItemId::New,
             format!("delta-{index}"),
         )
+    }
+
+    #[tokio::test]
+    async fn metadata_mutations_preserve_concurrent_journal_and_revision() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        store.create(id.clone()).await.unwrap();
+        let settings = InferenceSettings {
+            provider: InferenceProviderSettings {
+                key: "test".to_owned(),
+                api: ModelApi::OpenAiResponses,
+                url: String::new(),
+                model_id: "updated".to_owned(),
+                model_cost: None,
+                headers: BTreeMap::new(),
+                oauth: None,
+                reasoning_effort: None,
+            },
+        };
+        let bundle = AgentDefinitionBundle::new("selected", vec!["kind: Agent".to_owned()]);
+
+        let (append, inference, definition) = tokio::join!(
+            store.append_journal(
+                &id,
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "hello".to_owned(),
+                }],
+            ),
+            store.set_inference_settings(&id, Some(settings.clone())),
+            store.set_agent_definition(&id, Some(bundle.clone())),
+        );
+
+        assert_eq!(append.unwrap(), Revision::new(1));
+        inference.unwrap();
+        definition.unwrap();
+        let record = store.load(&id).await.unwrap();
+        assert_eq!(record.revision, Revision::new(1));
+        assert_eq!(record.inference_settings, Some(settings));
+        assert_eq!(record.agent_definition, Some(bundle));
+        assert_eq!(record.journal.len(), 1);
     }
 
     fn pending_thinking_delta(id: &SessionId, index: usize) -> PendingTimelineEvent {
@@ -446,6 +511,73 @@ mod tests {
         assert_eq!(loaded_again.id, id);
         assert_eq!(loaded_again.revision, Revision::ZERO);
         assert!(loaded_again.journal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inference_creation_atomically_stores_settings_and_agent_definition_bundle() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        let bundle = AgentDefinitionBundle::new(
+            "selected",
+            vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: selected\nspec: {}\n".to_owned()],
+        );
+        let inference_settings = InferenceSettings {
+            provider: InferenceProviderSettings {
+                key: "test".to_owned(),
+                api: ModelApi::OpenAiResponses,
+                url: "https://provider.example/v1".to_owned(),
+                model_id: "test-model".to_owned(),
+                model_cost: None,
+                headers: BTreeMap::new(),
+                oauth: None,
+                reasoning_effort: None,
+            },
+        };
+
+        let created = store
+            .create_with_inference_settings(
+                id.clone(),
+                Some(inference_settings.clone()),
+                Some(bundle.clone()),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let loaded = store.load(&id).await.unwrap();
+
+        assert_eq!(created.agent_definition, Some(bundle.clone()));
+        assert_eq!(loaded.agent_definition, Some(bundle));
+        assert_eq!(created.inference_settings, Some(inference_settings.clone()));
+        assert_eq!(loaded.inference_settings, Some(inference_settings));
+        assert!(loaded.journal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_inference_creation_does_not_overwrite_existing_record() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        let original = AgentDefinitionBundle::new("original", Vec::new());
+        let replacement = AgentDefinitionBundle::new("replacement", Vec::new());
+        store
+            .create_with_inference_settings(
+                id.clone(),
+                None,
+                Some(original.clone()),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let error = store
+            .create_with_inference_settings(id.clone(), None, Some(replacement), BTreeMap::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, SessionStoreError::AlreadyExists { id: id.clone() });
+        assert_eq!(
+            store.load(&id).await.unwrap().agent_definition,
+            Some(original)
+        );
     }
 
     #[tokio::test]

@@ -3,13 +3,14 @@
 use std::sync::Arc;
 
 use futures_util::{StreamExt as _, stream};
+use waltr_agent::definition::AgentDefinitionBundle;
 use waltr_agent::{
-    AgentRuntime, AgentSessionRuntimeFactory, BoxCompletionStream, BoxStreamFuture,
+    AgentRuntimeProvider, AgentSessionRuntimeFactory, BoxCompletionStream, BoxStreamFuture,
     CHANNEL_TOOL_PROGRESS_INFO, CompletionEvent, CompletionReplayItem, CompletionRequest,
-    FileCredentialStore, LlmStream, MemorySessionStore, ModelApi, ModelRef, ProviderId,
-    RunConflictPolicy, SessionCoordinator, SessionId, SessionJournalEvent,
-    SessionProviderRuntimeSettings, SessionRuntimeSettings, TimelineChannel, TimelineContent,
-    TimelineQuery, ToolCall, tools::task::TASK_TOOL_NAME,
+    FileCredentialStore, InferenceProviderSettings, InferenceSettings, LlmStream,
+    MemorySessionStore, ModelApi, ModelRef, ProviderId, RunConflictPolicy, SessionCoordinator,
+    SessionId, SessionJournalEvent, TimelineChannel, TimelineContent, TimelineQuery, ToolCall,
+    tools::task::TASK_TOOL_NAME,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify};
@@ -53,9 +54,11 @@ async fn task_tool_sync_mode_returns_child_assistant_text() -> waltr_agent::Resu
     )));
     let runs = task_sessions(provider.clone(), 1);
     let parent_id = SessionId::new("ephemeral");
-    runs.create_with_id_and_runtime_settings(
+    let agent_definition = task_agent_definition();
+    runs.create_with_id_and_inference_settings(
         parent_id.clone(),
-        Some(test_runtime_settings()),
+        Some(test_inference_settings()),
+        Some(agent_definition.clone()),
         std::collections::BTreeMap::default(),
     )
     .await?;
@@ -87,6 +90,11 @@ async fn task_tool_sync_mode_returns_child_assistant_text() -> waltr_agent::Resu
         .load(&SessionId::new("task_ephemeral_0_task-call"))
         .await?;
     assert_eq!(child.record.metadata.values["waltr.task.depth"], json!(1));
+    assert_eq!(
+        child.record.inference_settings,
+        Some(test_inference_settings())
+    );
+    assert_eq!(child.record.agent_definition, Some(agent_definition));
     let progress = task_progress_events(&runs, &SessionId::new("ephemeral")).await?;
     assert!(
         progress
@@ -157,9 +165,10 @@ async fn task_tool_default_depth_blocks_subagents_from_spawning_tasks() -> waltr
     )));
     let runs = task_sessions(provider.clone(), 1);
     let parent_id = SessionId::new("ephemeral");
-    runs.create_with_id_and_runtime_settings(
+    runs.create_with_id_and_inference_settings(
         parent_id.clone(),
-        Some(test_runtime_settings()),
+        Some(test_inference_settings()),
+        None,
         std::collections::BTreeMap::default(),
     )
     .await?;
@@ -175,6 +184,7 @@ async fn task_tool_default_depth_blocks_subagents_from_spawning_tasks() -> waltr
         .load(&SessionId::new("task_ephemeral_0_root-task"))
         .await?;
     assert_eq!(child.record.metadata.values["waltr.task.depth"], json!(1));
+    assert_eq!(child.record.agent_definition, None);
     assert!(
         runs.load(&SessionId::new(
             "task_task_ephemeral_0_root-task_0_nested-task"
@@ -238,9 +248,10 @@ async fn task_tool_max_depth_allows_configured_nested_subagent() -> waltr_agent:
     )));
     let runs = task_sessions(provider.clone(), 2);
     let parent_id = SessionId::new("ephemeral");
-    runs.create_with_id_and_runtime_settings(
+    runs.create_with_id_and_inference_settings(
         parent_id.clone(),
-        Some(test_runtime_settings()),
+        Some(test_inference_settings()),
+        None,
         std::collections::BTreeMap::default(),
     )
     .await?;
@@ -276,10 +287,21 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
     let runs = task_sessions(provider.clone(), 1);
 
     let parent_id = SessionId::new("parent");
-    runs.create_with_id_and_runtime_settings(
+    let parent_definition = task_agent_definition();
+    runs.create_with_id_and_inference_settings(
         parent_id.clone(),
-        Some(test_runtime_settings()),
+        Some(test_inference_settings()),
+        Some(parent_definition.clone()),
         std::collections::BTreeMap::default(),
+    )
+    .await?;
+    let existing_child_id = SessionId::new("task_parent_0_task-2");
+    let existing_definition = basic_agent_definition("existing");
+    runs.create_with_id_and_inference_settings(
+        existing_child_id.clone(),
+        Some(test_inference_settings()),
+        Some(existing_definition.clone()),
+        std::collections::BTreeMap::from([("existing".to_owned(), json!(true))]),
     )
     .await?;
     let parent_run = runs
@@ -298,7 +320,15 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
     );
 
     let first_task_id = SessionId::new("task_parent_0_task-1");
-    let second_task_id = SessionId::new("task_parent_0_task-2");
+    let second_task_id = existing_child_id;
+    let first_child = runs.load(&first_task_id).await?;
+    assert_eq!(first_child.record.agent_definition, Some(parent_definition));
+    let second_child = runs.load(&second_task_id).await?;
+    assert_eq!(
+        second_child.record.agent_definition,
+        Some(existing_definition)
+    );
+    assert_eq!(second_child.record.metadata.values["existing"], json!(true));
     assert!(
         runs.active_state(&first_task_id).await.is_some(),
         "first child task should still be running"
@@ -396,9 +426,10 @@ async fn async_task_callbacks_coalesce_while_parent_is_active() -> waltr_agent::
     let runs = task_sessions(provider.clone(), 1);
 
     let parent_id = SessionId::new("parent");
-    runs.create_with_id_and_runtime_settings(
+    runs.create_with_id_and_inference_settings(
         parent_id.clone(),
-        Some(test_runtime_settings()),
+        Some(test_inference_settings()),
+        None,
         std::collections::BTreeMap::default(),
     )
     .await?;
@@ -525,16 +556,16 @@ where
     let environment = AgentSessionRuntimeFactory::new(
         std::env::temp_dir(),
         FileCredentialStore::new(std::env::temp_dir().join("waltr-agent-task-test-auth.json")),
+        crate::agent_definitions::task_agent(max_subagent_depth),
     )
-    .with_task_max_subagent_depth(max_subagent_depth)
-    .with_runtime_builder(move |_| Ok(AgentRuntime::builder(test_model(), provider.clone())));
+    .with_runtime_provider(move |_| Ok(AgentRuntimeProvider::new(test_model(), provider.clone())));
 
     SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment)
 }
 
-fn test_runtime_settings() -> SessionRuntimeSettings {
-    SessionRuntimeSettings {
-        provider: SessionProviderRuntimeSettings {
+fn test_inference_settings() -> InferenceSettings {
+    InferenceSettings {
+        provider: InferenceProviderSettings {
             key: "test".to_owned(),
             api: ModelApi::OpenAiResponses,
             url: String::new(),
@@ -544,9 +575,37 @@ fn test_runtime_settings() -> SessionRuntimeSettings {
             oauth: None,
             reasoning_effort: None,
         },
-        mcp_servers: Vec::new(),
-        mcp_trace_propagation: false,
     }
+}
+
+fn task_agent_definition() -> AgentDefinitionBundle {
+    AgentDefinitionBundle::new(
+        "test",
+        vec![
+            r"apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata: { name: test }
+spec:
+  features: [{ featureSetRef: { name: task } }]
+---
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata: { name: task }
+spec:
+  task: { maxSubagentDepth: 1, defaultPermissions: true }
+"
+            .to_owned(),
+        ],
+    )
+}
+
+fn basic_agent_definition(name: &str) -> AgentDefinitionBundle {
+    AgentDefinitionBundle::new(
+        name,
+        vec![format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: {name} }}\nspec: {{}}\n"
+        )],
+    )
 }
 
 async fn wait_until_inactive(runs: &SessionCoordinator<MemorySessionStore>, session_id: SessionId) {

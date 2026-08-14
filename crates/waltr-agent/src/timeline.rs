@@ -73,6 +73,10 @@ pub struct TimelineItemId(String);
 
 impl TimelineItemId {
     /// Create an item identity from the cursor of its first durable event.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cursor` is zero, which cannot identify a durable event.
     #[must_use]
     pub fn from_first_cursor(cursor: TimelineCursor) -> Self {
         assert!(
