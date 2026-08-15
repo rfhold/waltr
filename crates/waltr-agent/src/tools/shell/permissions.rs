@@ -11,7 +11,11 @@ pub(super) fn infer_permission_claims(
     root: &Path,
     workdir: &Path,
 ) -> (Vec<PermissionClaim>, Vec<PermissionPattern>) {
-    let mut claims = Vec::new();
+    let mut claims = vec![PermissionClaim::new(
+        PermissionOperation::Read,
+        PermissionResource::WorkingDirectory(workdir.to_path_buf()),
+        format!("access working directory {}", workdir.display()),
+    )];
     let mut patterns = Vec::new();
     for parsed_command in parsed {
         if parsed_command.is_cwd_command {

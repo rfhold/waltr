@@ -40,8 +40,9 @@ mod tests {
 
     use crate::{
         CHANNEL_TOOL_PROGRESS_ERROR, CHANNEL_TOOL_PROGRESS_INFO, PendingTimelineEvent,
-        PermissionOperation, PermissionResource, PermissionResourcePattern, SessionId,
-        TimelineChannel, TimelineContent, TimelineItemId, ToolProgressSink,
+        PermissionEffect, PermissionLevel, PermissionOperation, PermissionPolicy,
+        PermissionResource, PermissionResourcePattern, SessionId, TimelineChannel, TimelineContent,
+        TimelineItemId, ToolProgressSink,
         tools::shell::{ShellConfig, ShellInput},
     };
     use std::sync::Mutex;
@@ -60,6 +61,49 @@ mod tests {
             PermissionResource::ShellCommand(command) if command == "echo hello"
         )));
         drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
+    fn scan_claims_effective_default_workdir() {
+        let root = temp_root("default-workdir-claim");
+        let workdir = root.join("subdir");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        let scan = ShellConfig::new(&root)
+            .with_default_workdir(&workdir)
+            .scan(&ShellInput::new("cargo test", "test"))
+            .expect("scan");
+
+        assert!(scan.claims.iter().any(|claim| {
+            claim.operation == PermissionOperation::Read
+                && matches!(&claim.resource, PermissionResource::WorkingDirectory(path) if path == &workdir)
+        }));
+        drop(fs::remove_dir_all(root));
+    }
+
+    #[test]
+    fn explicit_outside_root_workdir_matches_path_policy() {
+        let root = temp_root("outside-workdir-root");
+        let outside = temp_root("outside-workdir");
+        let scan = ShellConfig::new(&root)
+            .scan(
+                &ShellInput::new("cargo test", "test").with_workdir(outside.display().to_string()),
+            )
+            .expect("scan");
+        let workdir_claim = scan
+            .claims
+            .iter()
+            .find(|claim| {
+                matches!(&claim.resource, PermissionResource::WorkingDirectory(path) if path == &outside)
+            })
+            .expect("effective workdir claim");
+        let policy = PermissionPolicy::filesystem_external(&root, PermissionEffect::ask());
+
+        assert_eq!(
+            policy.evaluate_claim("shell", workdir_claim),
+            PermissionLevel::Ask
+        );
+        drop(fs::remove_dir_all(root));
+        drop(fs::remove_dir_all(outside));
     }
 
     #[test]
