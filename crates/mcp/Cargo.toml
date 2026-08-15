@@ -13,7 +13,7 @@ oauth-authorization-server-sqlite = ["oauth-authorization-server", "dep:sqlx", "
 oauth-resource-owner-oidc = ["oauth-authorization-server", "dep:cookie", "dep:jsonwebtoken", "dep:sha2", "dep:zeroize"]
 oauth-resource-owner-oidc-postgres = ["oauth-resource-owner-oidc", "oauth-authorization-server-postgres"]
 oauth-resource-owner-oidc-sqlite = ["oauth-resource-owner-oidc", "oauth-authorization-server-sqlite"]
-progressive = ["macros", "dep:jaq-interpret", "dep:jaq-parse", "dep:schemars"]
+progressive = ["macros", "dep:jaq-core", "dep:jaq-interpret", "dep:jaq-parse", "dep:jaq-std", "dep:schemars"]
 
 [dependencies]
 aes-gcm = { workspace = true, optional = true }
@@ -21,8 +21,10 @@ axum.workspace = true
 base64.workspace = true
 cookie = { workspace = true, optional = true }
 futures-util.workspace = true
+jaq-core = { workspace = true, optional = true }
 jaq-interpret = { workspace = true, optional = true }
 jaq-parse = { workspace = true, optional = true }
+jaq-std = { workspace = true, optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 mcp-macros = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["form", "json", "rustls", "stream"] }
