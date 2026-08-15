@@ -290,6 +290,16 @@ fn progressive_tool_results_keep_text_exact_and_structure_non_objects() {
 }
 
 #[test]
+fn progressive_filters_load_boolean_literals_and_standard_definitions() {
+    let result = mcp::progressive::tool_result(
+        json!({ "running": false, "items": [1, 2, 3] }),
+        Some("select(.running == false) | .items | map(. + 1) | length"),
+    )
+    .expect("standard jq definitions should compile and evaluate");
+    assert_eq!(result.raw["structuredContent"], json!({ "result": 3 }));
+}
+
+#[test]
 fn progressive_semantic_results_preserve_unfiltered_envelopes_and_json_values() {
     for structured_content in [
         json!({ "ok": true }),

@@ -677,6 +677,8 @@ fn apply_filter(input: Value, filter: &str) -> ServerResult<Value> {
     const MAX_FILTER_OUTPUTS: usize = 256;
 
     let mut defs = ParseCtx::new(Vec::new());
+    defs.insert_natives(jaq_core::core());
+    defs.insert_defs(jaq_std::std());
     let (filter, parse_errors) = jaq_parse::parse(filter, jaq_parse::main());
     if !parse_errors.is_empty() {
         return Err(ServerError::invalid_params(format!(
