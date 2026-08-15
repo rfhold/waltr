@@ -401,6 +401,7 @@ const appSecret = new k8s.core.v1.Secret(
         "AWS_SECRET_ACCESS_KEY",
       ),
       WALTR_SESSION_S3_FORCE_PATH_STYLE: "true",
+      WALTR_SESSION_S3_WRITE_MODE: "single-writer",
     },
   },
   { dependsOn: [database, data, browserApp, nativeApp] },

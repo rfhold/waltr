@@ -20,7 +20,7 @@ pub use filesystem::FilesystemSessionStore;
 pub use memory::MemorySessionStore;
 pub use opendal::OpenDalSessionStore;
 pub use postgresql::{opendal_postgresql_session_store, run_postgresql_migrations};
-pub use s3::S3SessionStore;
+pub use s3::{S3SessionStore, S3SessionWriteMode};
 pub use scylla::ScyllaSessionStore;
 
 use crate::{

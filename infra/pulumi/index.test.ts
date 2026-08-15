@@ -361,6 +361,15 @@ describe("hosted MCP OAuth deployment", () => {
     );
   });
 
+  test("runs Ceph session storage in single-writer mode", () => {
+    const deployment = resource("kubernetes:apps/v1:Deployment", "waltr");
+    const spec = deployment.inputs.spec as any;
+
+    assert.equal(environment().WALTR_SESSION_S3_WRITE_MODE, "single-writer");
+    assert.equal(spec.replicas, 1);
+    assert.deepEqual(spec.strategy, { type: "Recreate" });
+  });
+
   test("creates a service, streaming HTTPRoute, resources, readiness, and controlled egress", () => {
     const deployment = resource("kubernetes:apps/v1:Deployment", "waltr");
     const container = (deployment.inputs.spec as any).template.spec

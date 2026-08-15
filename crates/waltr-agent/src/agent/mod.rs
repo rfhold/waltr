@@ -30,13 +30,14 @@ pub use session::{
     OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult,
     OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, RequestId,
     RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
-    ScyllaSessionStore, SessionCoordinator, SessionId, SessionJournalEvent, SessionListEvent,
-    SessionListSubscription, SessionListUpdate, SessionMetrics, SessionOAuthJwtMetadata,
-    SessionOAuthJwtToken, SessionOAuthProviderSettings, SessionOAuthTokenField,
-    SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle, SessionRecord, SessionSnapshot,
-    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential,
-    Suspension, opendal_postgresql_session_store, run_postgresql_migrations,
+    S3SessionWriteMode, ScyllaSessionStore, SessionCoordinator, SessionId, SessionJournalEvent,
+    SessionListEvent, SessionListSubscription, SessionListUpdate, SessionMetrics,
+    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
+    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionStoreError,
+    SessionStoreResult, SessionSummary, SessionTimelineEvent, SessionTimelineSubscription,
+    SessionTimelineUpdate, StoredCredential, Suspension, opendal_postgresql_session_store,
+    run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 

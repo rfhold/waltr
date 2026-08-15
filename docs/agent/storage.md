@@ -40,7 +40,7 @@ Agent storage persists durable sessions for `crates/waltr-agent/`. A session is 
 
 The agent loop depends on this trait rather than a concrete backend.
 
-Metadata mutations, including inference settings and selected agent bundles, must not overwrite concurrent journal or timeline appends. Memory, filesystem, and OpenDAL backends without usable ETags provide this guarantee only among stores in the same process through shared per-session ownership locks. Independently constructed OpenDAL operators that alias the same endpoint but do not expose the same operator identity must use the same explicit mutation namespace. This is not distributed atomicity. OpenDAL uses conditional ETag writes when its service supplies an ETag. The dedicated S3 backend uses object ETag compare-and-swap across writers, and Scylla uses lightweight transactions over revision and record content.
+Metadata mutations, including inference settings and selected agent bundles, must not overwrite concurrent journal or timeline appends. Memory, filesystem, and OpenDAL backends without usable ETags provide this guarantee only among stores in the same process through shared per-session ownership locks. Independently constructed OpenDAL operators that alias the same endpoint but do not expose the same operator identity must use the same explicit mutation namespace. This is not distributed atomicity. OpenDAL uses conditional ETag writes when its service supplies an ETag. The dedicated S3 backend defaults to object ETag compare-and-swap across writers. It retries at most eight conflicting conditional PUTs before returning a backend error so unsupported `PutObject` `If-Match` behavior or sustained contention cannot spin indefinitely. Its explicit single-writer mode instead serializes each session within one process and uses unconditional PUTs; it does not protect against another process or external writer. Scylla uses lightweight transactions over revision and record content.
 
 The coordinator also serializes inference and agent mutations with runtime record capture. A successful agent switch is therefore immediately authoritative for cycles captured after that mutation boundary, while an already captured runtime remains unchanged.
 
@@ -106,6 +106,7 @@ Focused coverage:
 | [../../crates/waltr-agent/src/agent/session/types.rs](../../crates/waltr-agent/src/agent/session/types.rs) | Session type serialization and behavior. |
 | [../../crates/waltr-agent/src/agent/session/storage/memory.rs](../../crates/waltr-agent/src/agent/session/storage/memory.rs) | In-memory store behavior and trait expectations. |
 | [../../crates/waltr-agent/tests/agent/session.rs](../../crates/waltr-agent/tests/agent/session.rs) | Deterministic session integration and durable replay. |
+| [../../crates/waltr-agent/tests/agent/session_storage.rs](../../crates/waltr-agent/tests/agent/session_storage.rs) | Deterministic S3 write-mode, conditional-conflict, and same-process serialization coverage. |
 | [../../crates/waltr-agent/tests/live/agent/session_storage.rs](../../crates/waltr-agent/tests/live/agent/session_storage.rs) | Ignored live/container-backed storage coverage. |
 
 ## References

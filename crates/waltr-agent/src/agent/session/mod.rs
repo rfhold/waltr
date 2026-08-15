@@ -37,7 +37,7 @@ pub use settings::{
 };
 pub use storage::{
     FilesystemSessionStore, MemorySessionStore, OpenDalSessionStore, S3SessionStore,
-    ScyllaSessionStore, SessionStore, SessionStoreError, SessionStoreResult,
+    S3SessionWriteMode, ScyllaSessionStore, SessionStore, SessionStoreError, SessionStoreResult,
     opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use types::{
