@@ -1,8 +1,12 @@
 //! S3-backed session storage.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex, OnceLock, Weak},
+};
 
 use aws_sdk_s3::{Client, error::DisplayErrorContext, primitives::ByteStream};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
@@ -19,18 +23,59 @@ use crate::{
 };
 use serde_json::Value;
 
+const CONDITIONAL_PUT_ATTEMPTS: usize = 8;
+
+type SessionLock = AsyncMutex<()>;
+type SessionLockRegistry = Mutex<HashMap<SessionLockKey, Weak<SessionLock>>>;
+
+static SESSION_LOCKS: OnceLock<SessionLockRegistry> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SessionLockKey {
+    bucket: String,
+    prefix: String,
+    session_id: SessionId,
+}
+
+/// Write behavior used by [`S3SessionStore`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum S3SessionWriteMode {
+    /// Protect writes with S3 conditional `ETag` compare-and-swap operations.
+    #[default]
+    ConditionalEtagCas,
+    /// Serialize process-local writers and issue unconditional S3 writes.
+    SingleWriter,
+}
+
 /// S3 JSON-object implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
 pub struct S3SessionStore {
     client: Client,
     bucket: String,
     prefix: String,
+    write_mode: S3SessionWriteMode,
 }
 
 impl S3SessionStore {
     /// Create an S3-backed store.
     #[must_use]
     pub fn new(client: Client, bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self::new_with_write_mode(
+            client,
+            bucket,
+            prefix,
+            S3SessionWriteMode::ConditionalEtagCas,
+        )
+    }
+
+    /// Create an S3-backed store with explicit write behavior.
+    #[must_use]
+    pub fn new_with_write_mode(
+        client: Client,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        write_mode: S3SessionWriteMode,
+    ) -> Self {
         let mut prefix = prefix.into();
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
@@ -39,6 +84,7 @@ impl S3SessionStore {
             client,
             bucket: bucket.into(),
             prefix,
+            write_mode,
         }
     }
 
@@ -49,7 +95,7 @@ impl S3SessionStore {
     async fn load_record_with_etag(
         &self,
         id: &SessionId,
-    ) -> SessionStoreResult<(SessionRecord, String)> {
+    ) -> SessionStoreResult<(SessionRecord, Option<String>)> {
         let key = self.key(id);
         let output = self
             .client
@@ -59,12 +105,7 @@ impl S3SessionStore {
             .send()
             .await
             .map_err(|error| map_s3_error(id, error))?;
-        let etag = output
-            .e_tag()
-            .ok_or_else(|| SessionStoreError::Backend {
-                message: format!("S3 object for {} has no ETag", id.as_str()),
-            })?
-            .to_owned();
+        let etag = output.e_tag().map(str::to_owned);
         let bytes = output
             .body
             .collect()
@@ -93,6 +134,28 @@ impl S3SessionStore {
             .await
             .map_err(backend_error)?;
         Ok(())
+    }
+
+    async fn session_guard(&self, id: &SessionId) -> SessionStoreResult<OwnedMutexGuard<()>> {
+        let key = SessionLockKey {
+            bucket: self.bucket.clone(),
+            prefix: self.prefix.clone(),
+            session_id: id.clone(),
+        };
+        let lock = {
+            let mut locks = SESSION_LOCKS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let existing = locks.get(&key).and_then(Weak::upgrade);
+            existing.unwrap_or_else(|| {
+                let lock = Arc::new(SessionLock::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            })
+        };
+        Ok(lock.lock_owned().await)
     }
 
     async fn list_records(&self) -> SessionStoreResult<Vec<SessionSummary>> {
@@ -147,7 +210,8 @@ impl S3SessionStore {
         expected_revision: Revision,
         update: impl Fn(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
     ) -> SessionStoreResult<(Revision, T)> {
-        loop {
+        let _guard = self.session_guard(id).await?;
+        for attempt in 1..=self.put_attempts() {
             let (mut record, etag) = self.load_record_with_etag(id).await?;
             if record.revision != expected_revision {
                 return Err(SessionStoreError::StaleRevision {
@@ -160,24 +224,32 @@ impl S3SessionStore {
             record.revision = revision;
             let value = update(&mut record, revision)?;
             let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
+            let if_match = self.conditional_etag(id, etag)?;
             let result = self
                 .client
                 .put_object()
                 .bucket(&self.bucket)
                 .key(self.key(id))
-                .if_match(etag)
+                .set_if_match(if_match)
                 .body(ByteStream::from(bytes))
                 .send()
                 .await;
             match result {
                 Ok(_) => return Ok((revision, value)),
                 Err(error)
-                    if error
-                        .raw_response()
-                        .is_some_and(|response| response.status().as_u16() == 412) => {}
+                    if self.write_mode == S3SessionWriteMode::ConditionalEtagCas
+                        && error
+                            .raw_response()
+                            .is_some_and(|response| response.status().as_u16() == 412) =>
+                {
+                    if attempt == CONDITIONAL_PUT_ATTEMPTS {
+                        return Err(conditional_put_exhausted(id, attempt));
+                    }
+                }
                 Err(error) => return Err(backend_error(error)),
             }
         }
+        unreachable!("S3 write modes always allow at least one PUT attempt")
     }
 
     async fn update_metadata_record(
@@ -185,27 +257,61 @@ impl S3SessionStore {
         id: &SessionId,
         update: impl Fn(&mut SessionRecord) + Send,
     ) -> SessionStoreResult<SessionRecord> {
-        loop {
+        let _guard = self.session_guard(id).await?;
+        for attempt in 1..=self.put_attempts() {
             let (mut record, etag) = self.load_record_with_etag(id).await?;
             update(&mut record);
             let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
+            let if_match = self.conditional_etag(id, etag)?;
             let result = self
                 .client
                 .put_object()
                 .bucket(&self.bucket)
                 .key(self.key(id))
-                .if_match(etag)
+                .set_if_match(if_match)
                 .body(ByteStream::from(bytes))
                 .send()
                 .await;
             match result {
                 Ok(_) => return Ok(record),
                 Err(error)
-                    if error
-                        .raw_response()
-                        .is_some_and(|response| response.status().as_u16() == 412) => {}
+                    if self.write_mode == S3SessionWriteMode::ConditionalEtagCas
+                        && error
+                            .raw_response()
+                            .is_some_and(|response| response.status().as_u16() == 412) =>
+                {
+                    if attempt == CONDITIONAL_PUT_ATTEMPTS {
+                        return Err(conditional_put_exhausted(id, attempt));
+                    }
+                }
                 Err(error) => return Err(backend_error(error)),
             }
+        }
+        unreachable!("S3 write modes always allow at least one PUT attempt")
+    }
+
+    const fn put_attempts(&self) -> usize {
+        match self.write_mode {
+            S3SessionWriteMode::ConditionalEtagCas => CONDITIONAL_PUT_ATTEMPTS,
+            S3SessionWriteMode::SingleWriter => 1,
+        }
+    }
+
+    fn conditional_etag(
+        &self,
+        id: &SessionId,
+        etag: Option<String>,
+    ) -> SessionStoreResult<Option<String>> {
+        match self.write_mode {
+            S3SessionWriteMode::ConditionalEtagCas => {
+                etag.map(Some).ok_or_else(|| SessionStoreError::Backend {
+                    message: format!(
+                        "S3 object for session {} has no ETag required for conditional writes",
+                        id.as_str()
+                    ),
+                })
+            }
+            S3SessionWriteMode::SingleWriter => Ok(None),
         }
     }
 
@@ -255,6 +361,7 @@ impl SessionStore for S3SessionStore {
         let store = self.clone();
         async move {
             let record = SessionRecord::new(id);
+            let _guard = store.session_guard(&record.id).await?;
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
                 Err(SessionStoreError::NotFound { .. }) => {
@@ -274,6 +381,7 @@ impl SessionStore for S3SessionStore {
         let store = self.clone();
         async move {
             let record = SessionRecord::with_metadata_values(id, metadata_values);
+            let _guard = store.session_guard(&record.id).await?;
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
                 Err(SessionStoreError::NotFound { .. }) => {
@@ -300,6 +408,7 @@ impl SessionStore for S3SessionStore {
                 agent_definition,
                 metadata_values,
             );
+            let _guard = store.session_guard(&record.id).await?;
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
                 Err(SessionStoreError::NotFound { .. }) => {
@@ -327,6 +436,7 @@ impl SessionStore for S3SessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
+            let _guard = store.session_guard(&id).await?;
             store
                 .client
                 .delete_object()
@@ -494,5 +604,14 @@ fn map_s3_error(id: &SessionId, error: impl std::error::Error) -> SessionStoreEr
 fn backend_error(error: impl std::error::Error) -> SessionStoreError {
     SessionStoreError::Backend {
         message: DisplayErrorContext(&error).to_string(),
+    }
+}
+
+fn conditional_put_exhausted(id: &SessionId, attempts: usize) -> SessionStoreError {
+    SessionStoreError::Backend {
+        message: format!(
+            "conditional S3 write for session {} failed with status 412 after {attempts} PUT attempts; the backend may not support PutObject If-Match or writers may be contending; use SingleWriter only when all writers share this process",
+            id.as_str()
+        ),
     }
 }

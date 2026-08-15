@@ -6,7 +6,7 @@ use aws_sdk_s3::{
     Client,
     config::{Credentials, Region},
 };
-use waltr_agent::S3SessionStore;
+use waltr_agent::{S3SessionStore, S3SessionWriteMode};
 use url::Url;
 
 const ENV_SESSION_STORE: &str = "WALTR_SESSION_STORE";
@@ -18,6 +18,7 @@ const ENV_S3_PREFIX: &str = "WALTR_SESSION_S3_PREFIX";
 const ENV_S3_ACCESS_KEY_ID: &str = "WALTR_SESSION_S3_ACCESS_KEY_ID";
 const ENV_S3_SECRET_ACCESS_KEY: &str = "WALTR_SESSION_S3_SECRET_ACCESS_KEY";
 const ENV_S3_FORCE_PATH_STYLE: &str = "WALTR_SESSION_S3_FORCE_PATH_STYLE";
+const ENV_S3_WRITE_MODE: &str = "WALTR_SESSION_S3_WRITE_MODE";
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum SessionStorageConfig {
@@ -48,6 +49,7 @@ pub(super) struct S3SessionStorageConfig {
     access_key_id: String,
     secret_access_key: String,
     force_path_style: bool,
+    write_mode: S3SessionWriteMode,
 }
 
 impl fmt::Debug for S3SessionStorageConfig {
@@ -61,6 +63,7 @@ impl fmt::Debug for S3SessionStorageConfig {
             .field("access_key_id", &"<redacted>")
             .field("secret_access_key", &"<redacted>")
             .field("force_path_style", &self.force_path_style)
+            .field("write_mode", &self.write_mode)
             .finish()
     }
 }
@@ -81,7 +84,12 @@ impl S3SessionStorageConfig {
             .credentials_provider(credentials)
             .force_path_style(self.force_path_style)
             .build();
-        S3SessionStore::new(Client::from_conf(sdk_config), self.bucket, self.prefix)
+        S3SessionStore::new_with_write_mode(
+            Client::from_conf(sdk_config),
+            self.bucket,
+            self.prefix,
+            self.write_mode,
+        )
     }
 }
 
@@ -131,6 +139,7 @@ impl S3SessionStorageConfig {
             ENV_S3_FORCE_PATH_STYLE,
             &required(&lookup, ENV_S3_FORCE_PATH_STYLE)?,
         )?;
+        let write_mode = parse_s3_write_mode(lookup(ENV_S3_WRITE_MODE).as_deref())?;
 
         Ok(Self {
             endpoint,
@@ -140,6 +149,7 @@ impl S3SessionStorageConfig {
             access_key_id,
             secret_access_key,
             force_path_style,
+            write_mode,
         })
     }
 }
@@ -160,6 +170,19 @@ fn parse_bool(variable: &'static str, value: &str) -> Result<bool, SessionStorag
         _ => Err(SessionStorageConfigError::Invalid {
             variable,
             requirement: "must be exactly `true` or `false`",
+        }),
+    }
+}
+
+fn parse_s3_write_mode(
+    value: Option<&str>,
+) -> Result<S3SessionWriteMode, SessionStorageConfigError> {
+    match value {
+        None | Some("conditional-etag") => Ok(S3SessionWriteMode::ConditionalEtagCas),
+        Some("single-writer") => Ok(S3SessionWriteMode::SingleWriter),
+        Some(_) => Err(SessionStorageConfigError::Invalid {
+            variable: ENV_S3_WRITE_MODE,
+            requirement: "must be exactly `conditional-etag` or `single-writer`",
         }),
     }
 }
@@ -321,7 +344,35 @@ mod tests {
         assert_eq!(config.bucket, "waltr-sessions");
         assert_eq!(config.prefix, "production/sessions");
         assert!(config.force_path_style);
+        assert_eq!(config.write_mode, S3SessionWriteMode::ConditionalEtagCas);
         let _store = config.into_store();
+    }
+
+    #[test]
+    fn s3_store_parses_write_mode_exactly() {
+        for (value, expected) in [
+            ("conditional-etag", S3SessionWriteMode::ConditionalEtagCas),
+            ("single-writer", S3SessionWriteMode::SingleWriter),
+        ] {
+            let mut values = s3_values();
+            values.push((ENV_S3_WRITE_MODE, value));
+            let SessionStorageConfig::S3(config) = config(&values).unwrap() else {
+                panic!("expected S3 config");
+            };
+            assert_eq!(config.write_mode, expected);
+        }
+
+        for invalid in ["", "Conditional-Etag", "SINGLE-WRITER", "unknown"] {
+            let mut values = s3_values();
+            values.push((ENV_S3_WRITE_MODE, invalid));
+            assert!(matches!(
+                config(&values),
+                Err(SessionStorageConfigError::Invalid {
+                    variable: ENV_S3_WRITE_MODE,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -443,6 +494,7 @@ mod tests {
         assert!(!debug.contains("access-key-value"));
         assert!(!debug.contains("secret-key-value"));
         assert_eq!(debug.matches("<redacted>").count(), 2);
+        assert!(debug.contains("write_mode: ConditionalEtagCas"));
 
         let mut values = s3_values();
         values

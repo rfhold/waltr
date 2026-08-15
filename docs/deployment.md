@@ -47,7 +47,7 @@ The `test` and `test-auth` profiles use tmpfs persistence, internal-only network
 | --- | --- |
 | Unset or `filesystem` | Uses `WALTR_SESSION_FILESYSTEM_ROOT`, defaulting to `$HOME/.local/share/waltr/sessions`. |
 | `memory` | Ephemeral process-local sessions; suitable only for development and tests. |
-| `s3` | Requires every `WALTR_SESSION_S3_*` variable below. |
+| `s3` | Requires the S3 connection and credential variables below; write mode is optional. |
 
 | S3 variable | Contract |
 | --- | --- |
@@ -58,8 +58,11 @@ The `test` and `test-auth` profiles use tmpfs persistence, internal-only network
 | `WALTR_SESSION_S3_ACCESS_KEY_ID` | Static S3 access-key ID. |
 | `WALTR_SESSION_S3_SECRET_ACCESS_KEY` | Static S3 secret access key. |
 | `WALTR_SESSION_S3_FORCE_PATH_STYLE` | Exactly `true` or `false`. |
+| `WALTR_SESSION_S3_WRITE_MODE` | Optional exact value `conditional-etag` or `single-writer`; defaults to `conditional-etag`. |
 
-The Pulumi workload definition uses S3 session storage. It intentionally specifies one Waltr replica with a `Recreate` strategy; do not increase the replica count without validating session-store write coordination and the documented cross-replica operational checks.
+`conditional-etag` uses S3 object ETags to compare and swap updates across writers. A backend that does not support `If-Match` on `PutObject` fails after eight conditional attempts rather than retrying forever. `single-writer` uses process-local per-session serialization and unconditional PUTs. It is safe only when one Waltr process owns the session prefix and no external writer modifies those objects; overlapping processes can lose updates.
+
+The Pulumi workload definition uses S3 session storage backed by Ceph RGW, which does not support the required conditional PUT behavior. Pulumi therefore explicitly selects `single-writer`, one Waltr replica, and a `Recreate` strategy. Do not increase the replica count, change to a strategy that overlaps old and new pods, or introduce another writer without first selecting and validating a session-store mode with cross-writer coordination.
 
 The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not modify either Waltr or MCP SQL data, authentication sessions, OAuth credentials, or configuration. The operation is a blind delete without active-run or cross-replica coordination; stop session activity before invoking it or concurrent work may recreate records.
 
