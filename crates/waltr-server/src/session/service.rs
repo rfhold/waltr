@@ -165,6 +165,30 @@ where
     ) -> waltr::grpc::waltr::session::v1::SessionSummary {
         session_summary_to_proto(summary, config, self.agent_catalog.default_agent_name())
     }
+
+    async fn create_session_internal(
+        &self,
+        inference_settings: Option<waltr::grpc::waltr::session::v1::InferenceSettingsRequest>,
+        agent_name: Option<&str>,
+    ) -> Result<(AgentSession, Configuration), Status> {
+        let config = self.load_config().await;
+        let inference_settings =
+            resolve_inference_settings_for_create(inference_settings, &config)?;
+        let agent_bundle = match agent_name {
+            Some(agent_name) => self.selected_agent_bundle(agent_name)?,
+            None => self.agent_catalog.default_bundle(),
+        };
+        let session = self
+            .sessions
+            .create_with_inference_settings(
+                inference_settings,
+                Some(agent_bundle),
+                BTreeMap::default(),
+            )
+            .await
+            .map_err(agent_error_to_status)?;
+        Ok((session, config))
+    }
 }
 
 #[tonic::async_trait]
@@ -172,6 +196,12 @@ impl<S> super::SessionHost for SessionService<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
+    async fn create(&self, agent_name: Option<String>) -> Result<AgentSession, Status> {
+        self.create_session_internal(None, agent_name.as_deref())
+            .await
+            .map(|(session, _)| session)
+    }
+
     async fn list(&self) -> Result<Vec<SessionSummary>, waltr_agent::LlmError> {
         self.sessions.list().await
     }
@@ -245,22 +275,13 @@ where
     ) -> Result<Response<CreateSessionResponse>, Status> {
         let request = request.into_inner();
         tracing::info!("session create accepted");
-        let config = self.load_config().await;
-        let inference_settings =
-            resolve_inference_settings_for_create(request.inference_settings, &config)?;
-        let agent_bundle = match request.agent_selection {
-            Some(selection) => self.selected_agent_bundle(&selection.agent_name)?,
-            None => self.agent_catalog.default_bundle(),
-        };
-        let session = self
-            .sessions
-            .create_with_inference_settings(
-                inference_settings,
-                Some(agent_bundle),
-                BTreeMap::default(),
-            )
-            .await
-            .map_err(agent_error_to_status)?;
+        let agent_name = request
+            .agent_selection
+            .as_ref()
+            .map(|selection| selection.agent_name.as_str());
+        let (session, config) = self
+            .create_session_internal(request.inference_settings, agent_name)
+            .await?;
         tracing::Span::current().record("session_id", session.record.id.as_str());
         tracing::info!(session_id = %session.record.id.as_str(), "session create completed");
 

@@ -1,5 +1,5 @@
 use crate::support::grpc::{config_client, get_config};
-use waltr::grpc::waltr::config::v1::McpServerType;
+use waltr::grpc::waltr::config::v1::{InferenceDefaults, McpServerType};
 use waltr_agent::{
     InferenceProviderSettings, InferenceSettings, MemorySessionStore, ModelApi,
     PendingTimelineEvent, SessionCoordinator, SessionId, SessionStore, TimelineContent,
@@ -17,7 +17,13 @@ use waltr_server::{
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io, net::SocketAddr, sync::atomic::Ordering};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    net::SocketAddr,
+    sync::atomic::Ordering,
+    time::Duration,
+};
 use tokio::sync::oneshot;
 
 #[tokio::test]
@@ -137,7 +143,7 @@ async fn mcp_sessions_share_the_registered_grpc_coordinator()
         .find(|tool| tool["name"] == "sessions")
         .expect("sessions tool");
     let schema = sessions_tool["inputSchema"].to_string();
-    for field in ["wipe", "confirm", "id"] {
+    for field in ["create", "agent_name", "prompt", "wipe", "confirm", "id"] {
         assert!(schema.contains(field), "missing {field} in {schema}");
     }
     assert!(!schema.contains("render"), "unexpected render in {schema}");
@@ -155,6 +161,13 @@ async fn mcp_sessions_share_the_registered_grpc_coordinator()
     let help_actions = help["structuredContent"]["actions"]
         .as_array()
         .expect("session help actions");
+    assert_eq!(
+        help_actions
+            .iter()
+            .map(|action| action["action"].as_str().expect("action name"))
+            .collect::<Vec<_>>(),
+        ["list", "create", "get", "wipe", "interrupt", "send", "wait"]
+    );
     assert!(
         help_actions
             .iter()
@@ -199,7 +212,7 @@ async fn mcp_sessions_share_the_registered_grpc_coordinator()
         "sessions",
         json!({
             "action": "wait",
-            "input": { "id": id.as_str(), "jq": ".status == \"finished\"", "timeout_seconds": 1 }
+            "input": { "id": id.as_str(), "jq": ".running == false and .status == \"finished\"", "timeout_seconds": 1 }
         }),
     )
     .await?;
@@ -275,6 +288,153 @@ async fn mcp_sessions_share_the_registered_grpc_coordinator()
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the integration test verifies creation validation and prompt admission through MCP"
+)]
+async fn mcp_session_create_selects_defaults_validates_before_create_and_starts_prompt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = temp_root();
+    let persistence = Persistence::initialize(DatabaseConfig::from_url(&format!(
+        "sqlite://{}",
+        root.join("waltr.sqlite3").display()
+    ))?)
+    .await?;
+    let coordinator = SessionCoordinator::new(MemorySessionStore::new());
+    let config_service = ConfigService::new(root.clone(), default_config_builder())?;
+    let mut config = config_service.store().load().await?;
+    let provider_key = "openai".to_owned();
+    let model_key = config
+        .providers
+        .get(&provider_key)
+        .and_then(|provider| provider.models.keys().next())
+        .cloned()
+        .expect("test defaults include an OpenAI model");
+    config.inference_defaults = Some(InferenceDefaults {
+        provider_key: provider_key.clone(),
+        model_key,
+        reasoning_effort: None,
+    });
+    config
+        .providers
+        .get_mut(&provider_key)
+        .expect("selected provider")
+        .headers
+        .clear();
+    config.mcp_servers.clear();
+    config_service.store().save(config).await?;
+    let app = build_app_with_services(config_service, persistence, {
+        let coordinator = coordinator.clone();
+        move |routes, config, credential_store| {
+            session::add_sessions_service(
+                routes,
+                coordinator,
+                config,
+                credential_store,
+                None,
+                waltr_server::test_support::default_agent_catalog(),
+            )
+        }
+    })
+    .await?;
+    let router = TestRouter::start(app).await?;
+
+    let selected = call_tool(
+        &router.endpoint,
+        "sessions",
+        json!({
+            "action": "create",
+            "input": { "agent_name": "coding", "prompt": "selected prompt" }
+        }),
+    )
+    .await?;
+    assert_eq!(
+        selected["structuredContent"]
+            .as_object()
+            .expect("create structured content")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "agent_name",
+            "disposition",
+            "queue_position",
+            "run_id",
+            "session_id",
+        ])
+    );
+    assert_eq!(selected["structuredContent"]["agent_name"], "coding");
+    assert_eq!(selected["structuredContent"]["disposition"], "started");
+    assert_eq!(selected["structuredContent"]["queue_position"], Value::Null);
+    let selected_id = SessionId::new(
+        selected["structuredContent"]["session_id"]
+            .as_str()
+            .expect("selected session id"),
+    );
+    assert!(selected["structuredContent"]["run_id"].as_u64().is_some());
+    let selected_session = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let session = coordinator.load(&selected_id).await?;
+            if session.record.summary().current_prompt.as_deref() == Some("selected prompt") {
+                break Ok::<_, waltr_agent::LlmError>(session);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "prompt was not journaled"))??;
+    assert_eq!(
+        selected_session
+            .record
+            .agent_definition
+            .as_ref()
+            .map(|bundle| bundle.agent_name.as_str()),
+        Some("coding")
+    );
+
+    let defaulted = call_tool(
+        &router.endpoint,
+        "sessions",
+        json!({ "action": "create", "input": { "prompt": "default prompt" } }),
+    )
+    .await?;
+    assert_eq!(defaulted["structuredContent"]["agent_name"], "coding");
+    assert_eq!(defaulted["structuredContent"]["disposition"], "started");
+    assert!(defaulted["structuredContent"]["run_id"].as_u64().is_some());
+    assert_eq!(coordinator.list().await?.len(), 2);
+
+    let blank_prompt = call_tool_response(
+        &router.endpoint,
+        "sessions",
+        json!({
+            "action": "create",
+            "input": { "agent_name": "missing", "prompt": "  " }
+        }),
+    )
+    .await?;
+    assert_mcp_error(&blank_prompt, -32602, "prompt must not be empty");
+    assert_eq!(coordinator.list().await?.len(), 2);
+
+    for agent_name in ["", "missing"] {
+        let invalid_agent = call_tool_response(
+            &router.endpoint,
+            "sessions",
+            json!({
+                "action": "create",
+                "input": { "agent_name": agent_name, "prompt": "must not create" }
+            }),
+        )
+        .await?;
+        assert_mcp_error(&invalid_agent, -32602, "agent");
+        assert_eq!(coordinator.list().await?.len(), 2);
+    }
+
+    router.shutdown().await?;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_sessions_reject_invalid_wait_inputs() -> Result<(), Box<dyn std::error::Error>> {
     let server = setup_server();
     for arguments in [
@@ -298,6 +458,10 @@ async fn mcp_sessions_reject_invalid_wait_inputs() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the integration test covers bounded jq output and wait lifecycle reconciliation"
+)]
 async fn mcp_session_wait_reconciles_durable_state_and_reports_fallbacks()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = temp_root();
@@ -333,6 +497,21 @@ async fn mcp_session_wait_reconciles_durable_state_and_reports_fallbacks()
     )
     .await?;
     let router = TestRouter::start(app).await?;
+
+    let overflow = call_tool_response(
+        &router.endpoint,
+        "sessions",
+        json!({
+            "action": "wait",
+            "input": { "id": id.as_str(), "jq": "range(0; 257)", "timeout_seconds": 1 }
+        }),
+    )
+    .await?;
+    assert_mcp_error(
+        &overflow,
+        -32602,
+        "jq filter produced more than 256 results",
+    );
 
     let wait_for_finish = call_tool(
         &router.endpoint,

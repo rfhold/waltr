@@ -27,6 +27,8 @@ use storage::SessionStorageConfig;
 /// Object-safe access to the coordinator owned by the registered gRPC session service.
 #[tonic::async_trait]
 pub trait SessionHost: Send + Sync {
+    /// Create a durable session using server inference defaults and an optional agent selection.
+    async fn create(&self, agent_name: Option<String>) -> Result<AgentSession, tonic::Status>;
     /// List durable sessions.
     async fn list(&self) -> Result<Vec<SessionSummary>, waltr_agent::LlmError>;
     /// Load one durable session.
