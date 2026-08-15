@@ -50,6 +50,15 @@ struct SessionIdInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct CreateInput {
+    /// Exact startup agent name. Omit to use the server default.
+    #[serde(default)]
+    agent_name: Option<String>,
+    /// Initial user prompt to start immediately.
+    prompt: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct WipeInput {
     /// Must be true to delete every hosted agent session.
     confirm: bool,
@@ -188,6 +197,43 @@ impl WaltrMcpServer {
         Ok(json!({ "sessions": sessions }))
     }
 
+    /// Create a hosted session and immediately start its required prompt.
+    #[action(tool = "sessions", name = "create")]
+    async fn create_session(&self, input: CreateInput) -> ServerResult<Value> {
+        if input.prompt.trim().is_empty() {
+            return Err(ServerError::invalid_params("prompt must not be empty"));
+        }
+        let session = self
+            .sessions
+            .create(input.agent_name)
+            .await
+            .map_err(|status| session_creation_error(&status))?;
+        let session_id = session.record.id.clone();
+        let agent_name = session.record.summary().agent_name;
+        let submission = self
+            .sessions
+            .submit_prompt(session_id.clone(), input.prompt)
+            .await
+            .map_err(|error| {
+                ServerError::internal(format!(
+                    "session {} was created, but prompt submission failed: {error}",
+                    session_id.as_str()
+                ))
+            })?;
+        let (disposition, queue_position) = match submission.disposition {
+            AgentSessionRunDisposition::Started => ("started", None),
+            AgentSessionRunDisposition::ReplacedActive => ("replaced_active", None),
+            AgentSessionRunDisposition::Queued { position } => ("queued", Some(position)),
+        };
+        Ok(json!({
+            "session_id": submission.session_id.as_str(),
+            "agent_name": agent_name,
+            "run_id": submission.run_id,
+            "disposition": disposition,
+            "queue_position": queue_position
+        }))
+    }
+
     /// Get one durable session using the stable MCP session projection.
     #[action(tool = "sessions", name = "get")]
     async fn get_session(&self, input: SessionIdInput) -> ServerResult<Value> {
@@ -255,6 +301,8 @@ impl WaltrMcpServer {
         }
 
         let mut defs = ParseCtx::new(Vec::new());
+        defs.insert_natives(jaq_core::core());
+        defs.insert_defs(jaq_std::std());
         let (parsed, parse_errors) = jaq_parse::parse(&input.jq, jaq_parse::main());
         if !parse_errors.is_empty() {
             return Err(ServerError::invalid_params(format!(
@@ -285,15 +333,7 @@ impl WaltrMcpServer {
 
         loop {
             let projection = self.session_projection(&id).await?;
-            let inputs = RcIter::new(std::iter::empty());
-            let outputs = filter
-                .run((Ctx::new([], &inputs), Val::from(projection.clone())))
-                .map(|output| {
-                    output.map(Value::from).map_err(|error| {
-                        ServerError::invalid_params(format!("jq filter failed: {error}"))
-                    })
-                })
-                .collect::<ServerResult<Vec<_>>>()?;
+            let outputs = evaluate_jq(&filter, &projection)?;
             let evaluated_output = jq_output(&outputs);
             if outputs.iter().any(jq_truthy) {
                 return Ok(wait_result("condition_met", &projection, &evaluated_output));
@@ -309,13 +349,7 @@ impl WaltrMcpServer {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => {
                     let projection = self.session_projection(&id).await?;
-                    let inputs = RcIter::new(std::iter::empty());
-                    let outputs = filter
-                        .run((Ctx::new([], &inputs), Val::from(projection.clone())))
-                        .map(|output| output.map(Value::from).map_err(|error| {
-                            ServerError::invalid_params(format!("jq filter failed: {error}"))
-                        }))
-                        .collect::<ServerResult<Vec<_>>>()?;
+                    let outputs = evaluate_jq(&filter, &projection)?;
                     let reason = if outputs.iter().any(jq_truthy) {
                         "condition_met"
                     } else if !projection["running"].as_bool().unwrap_or(false) {
@@ -589,6 +623,25 @@ const fn jq_truthy(value: &Value) -> bool {
     !matches!(value, Value::Bool(false) | Value::Null)
 }
 
+fn evaluate_jq(filter: &jaq_interpret::Filter, input: &Value) -> ServerResult<Vec<Value>> {
+    const MAX_FILTER_OUTPUTS: usize = 256;
+
+    let inputs = RcIter::new(std::iter::empty());
+    let mut outputs = Vec::new();
+    for output in filter.run((Ctx::new([], &inputs), Val::from(input.clone()))) {
+        let output = output
+            .map(Value::from)
+            .map_err(|error| ServerError::invalid_params(format!("jq filter failed: {error}")))?;
+        if outputs.len() == MAX_FILTER_OUTPUTS {
+            return Err(ServerError::invalid_params(format!(
+                "jq filter produced more than {MAX_FILTER_OUTPUTS} results"
+            )));
+        }
+        outputs.push(output);
+    }
+    Ok(outputs)
+}
+
 fn jq_output(outputs: &[Value]) -> Value {
     match outputs {
         [] => Value::Null,
@@ -635,6 +688,18 @@ fn run_error(error: waltr_agent::AgentSessionRunError) -> ServerError {
             provider: "session-run",
             message,
         }),
+    }
+}
+
+fn session_creation_error(status: &Status) -> ServerError {
+    if status.code() == Code::InvalidArgument {
+        ServerError::invalid_params(status.message())
+    } else {
+        ServerError::internal(format!(
+            "session creation failed with {}: {}",
+            status.code(),
+            status.message()
+        ))
     }
 }
 
