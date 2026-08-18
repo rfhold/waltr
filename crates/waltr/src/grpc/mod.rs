@@ -21,6 +21,11 @@ pub mod waltr {
             include!("waltr/session/v1/waltr.session.v1.rs");
         }
     }
+    pub mod resource {
+        pub mod v1 {
+            include!("waltr/resource/v1/waltr.resource.v1.rs");
+        }
+    }
     pub mod status {
         pub mod v1 {
             include!("waltr/status/v1/waltr.status.v1.rs");

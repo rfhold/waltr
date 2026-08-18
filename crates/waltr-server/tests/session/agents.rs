@@ -21,7 +21,7 @@ async fn list_agents_is_sorted_and_reports_default() -> Result<(), Box<dyn std::
         .iter()
         .map(|agent| agent.name.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names, ["coding", "default"]);
+    assert_eq!(names, ["coding", "configuration", "default"]);
     assert!(
         response
             .agents

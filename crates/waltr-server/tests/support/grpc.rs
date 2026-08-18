@@ -1,23 +1,23 @@
 use waltr::grpc::waltr::catalog::v1::catalog_service_client::CatalogServiceClient;
-use waltr::grpc::waltr::config::v1::{
-    Configuration, GetConfigRequest, Provider, ProviderType,
-    config_service_client::ConfigServiceClient,
+use waltr::grpc::waltr::config::v1::Configuration;
+use waltr::grpc::waltr::resource::v1::{
+    GetResourceCatalogRequest, ResourceCatalog, resource_service_client::ResourceServiceClient,
 };
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use waltr_server::test_support::TestServer;
 use tonic::transport::{Channel, Endpoint};
 
-pub async fn config_client(
+pub async fn resource_client(
     server: &TestServer,
-) -> Result<ConfigServiceClient<Channel>, Box<dyn std::error::Error>> {
-    config_client_for_url(server.base_url()).await
+) -> Result<ResourceServiceClient<Channel>, Box<dyn std::error::Error>> {
+    resource_client_for_url(server.base_url()).await
 }
 
-pub async fn config_client_for_addr(
+pub async fn resource_client_for_addr(
     addr: std::net::SocketAddr,
-) -> Result<ConfigServiceClient<Channel>, Box<dyn std::error::Error>> {
-    config_client_for_url(format!("http://{addr}")).await
+) -> Result<ResourceServiceClient<Channel>, Box<dyn std::error::Error>> {
+    resource_client_for_url(format!("http://{addr}")).await
 }
 
 pub async fn status_client(
@@ -41,35 +41,29 @@ pub async fn session_client(
     Ok(SessionServiceClient::new(channel))
 }
 
-pub async fn get_config(
-    client: &mut ConfigServiceClient<Channel>,
-) -> Result<Configuration, Box<dyn std::error::Error>> {
+pub async fn get_catalog(
+    client: &mut ResourceServiceClient<Channel>,
+) -> Result<ResourceCatalog, Box<dyn std::error::Error>> {
     Ok(client
-        .get_config(GetConfigRequest::default())
+        .get_resource_catalog(GetResourceCatalogRequest {})
         .await?
         .into_inner()
-        .config
-        .expect("config should be present"))
+        .catalog
+        .expect("resource catalog should be present"))
 }
 
-pub fn config_with_provider(name: &str) -> Configuration {
-    Configuration {
-        providers: std::collections::HashMap::from([(
-            name.to_owned(),
-            Provider {
-                r#type: ProviderType::AnthropicMessages as i32,
-                name: name.to_owned(),
-                url: "https://api.anthropic.com/v1/messages".to_owned(),
-                ..Provider::default()
-            },
-        )]),
-        ..Configuration::default()
-    }
+pub async fn get_config(
+    client: &mut ResourceServiceClient<Channel>,
+) -> Result<Configuration, Box<dyn std::error::Error>> {
+    Ok(get_catalog(client)
+        .await?
+        .effective_configuration
+        .expect("effective configuration should be present"))
 }
 
-async fn config_client_for_url(
+async fn resource_client_for_url(
     url: String,
-) -> Result<ConfigServiceClient<Channel>, Box<dyn std::error::Error>> {
+) -> Result<ResourceServiceClient<Channel>, Box<dyn std::error::Error>> {
     let channel = Endpoint::from_shared(url)?.connect().await?;
-    Ok(ConfigServiceClient::new(channel))
+    Ok(ResourceServiceClient::new(channel))
 }

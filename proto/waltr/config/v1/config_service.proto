@@ -2,13 +2,6 @@ syntax = "proto3";
 
 package waltr.config.v1;
 
-service ConfigService {
-  rpc PatchConfig(PatchConfigRequest) returns (PatchConfigResponse);
-  rpc ResetConfig(ResetConfigRequest) returns (ResetConfigResponse);
-  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
-  rpc WatchConfig(WatchConfigRequest) returns (stream WatchConfigResponse);
-}
-
 message Configuration {
   reserved "runtime_defaults";
 
@@ -160,50 +153,5 @@ message McpServer {
 enum McpServerType {
   MCP_SERVER_TYPE_UNSPECIFIED = 0;
   MCP_SERVER_TYPE_STDIO = 1;
-  MCP_SERVER_TYPE_SSE = 2;
-}
-
-message PatchConfigRequest {
-  reserved "runtime_defaults";
-
-  string expected_etag = 1;
-  ProviderMapPatch providers = 2;
-  McpServerMapPatch mcp_servers = 3;
-  InferenceDefaults inference_defaults = 4;
-}
-
-message ProviderMapPatch {
-  map<string, Provider> providers = 1;
-}
-
-message McpServerMapPatch {
-  map<string, McpServer> mcp_servers = 1;
-}
-
-message PatchConfigResponse {
-  Configuration config = 1;
-}
-
-message ResetConfigRequest {
-  string expected_etag = 1;
-}
-
-message ResetConfigResponse {
-  Configuration config = 1;
-}
-
-message GetConfigRequest {}
-
-message GetConfigResponse {
-  Configuration config = 1;
-}
-
-message WatchConfigRequest {}
-
-message WatchConfigResponse {
-  string previous_etag = 1;
-  string etag = 2;
-  repeated string changed_keys = 3;
-  string error = 4;
-  Configuration config = 5;
+  MCP_SERVER_TYPE_STREAMABLE_HTTP = 2;
 }

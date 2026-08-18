@@ -2,7 +2,7 @@
 
 mod models_dev;
 
-use crate::config::{ConfigError, ConfigPatch, ConfigStore, FilesystemConfigStore};
+use crate::agent_definition::AgentDefinitionState;
 use waltr::grpc::waltr::{catalog::v1 as catalog_proto, config::v1 as config_proto};
 use std::{
     fmt,
@@ -21,18 +21,6 @@ const CACHE_RELATIVE_PATH: &[&str] = &[".local", "share", "waltr", "cache", "mod
 const CATALOG_FRESHNESS: Duration = Duration::from_hours(24);
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
-const REQUIRED_CLAUDE_MODELS: [&str; 10] = [
-    "claude-haiku-4-5",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "claude-opus-4-5",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-fable-5",
-];
 
 /// Loaded catalog with freshness metadata.
 #[derive(Clone, Debug)]
@@ -50,6 +38,79 @@ impl LoadedCatalog {
     #[must_use]
     const fn stale(&self) -> bool {
         self.stale
+    }
+}
+
+/// Immutable models.dev facts used while materializing provider resources.
+#[derive(Clone, Debug)]
+pub struct CatalogMaterializer {
+    loaded: LoadedCatalog,
+}
+
+impl CatalogMaterializer {
+    /// Load one immutable catalog generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when neither the configured models.dev source nor its cache can load.
+    pub async fn load(loader: &CatalogLoader) -> Result<Self, CatalogLoadError> {
+        Ok(Self {
+            loaded: loader.load().await?,
+        })
+    }
+
+    /// Materialize models selected from one models.dev provider.
+    pub(crate) fn select_models(
+        &self,
+        provider_id: &str,
+        include: &[String],
+        aliases: &std::collections::BTreeMap<String, String>,
+        key_prefix: &str,
+    ) -> Result<std::collections::HashMap<String, config_proto::Model>, String> {
+        let provider = self
+            .loaded
+            .catalog()
+            .provider(provider_id)
+            .ok_or_else(|| format!("models.dev provider `{provider_id}` does not exist"))?;
+        let mut selected = std::collections::HashMap::new();
+        for model in provider.models.values() {
+            if model
+                .status
+                .as_deref()
+                .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+                || !include
+                    .iter()
+                    .any(|pattern| wildcard_match(pattern, &model.id))
+            {
+                continue;
+            }
+            selected.insert(
+                format!("{key_prefix}{}", model.id),
+                configured_catalog_model(model, provider_id),
+            );
+        }
+        for (key, model_id) in aliases {
+            let model = provider.models.get(model_id).ok_or_else(|| {
+                format!("models.dev model `{provider_id}/{model_id}` does not exist")
+            })?;
+            selected.insert(key.clone(), configured_catalog_model(model, provider_id));
+        }
+        if selected.is_empty() {
+            return Err(format!(
+                "models.dev selector for provider `{provider_id}` matched no models"
+            ));
+        }
+        Ok(selected)
+    }
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) if !suffix.contains('*') => {
+            value.starts_with(prefix) && value.ends_with(suffix)
+        }
+        Some(_) => false,
+        None => pattern == value,
     }
 }
 
@@ -125,78 +186,6 @@ impl CatalogLoader {
             CatalogRefreshRole::Follower(generation) => generation.wait().await.into_result(),
             CatalogRefreshRole::Leader(generation) => self.run_refresh_generation(generation).await,
         }
-    }
-
-    pub(crate) async fn build_default_configuration(
-        &self,
-        mcp_url: &str,
-    ) -> Result<config_proto::Configuration, ConfigError> {
-        let loaded = self
-            .load()
-            .await
-            .map_err(|error| ConfigError::unavailable(error.to_string()))?;
-        let catalog = loaded.catalog();
-        let anthropic = catalog.provider("anthropic").ok_or_else(|| {
-            ConfigError::unavailable("models.dev catalog is missing provider 'anthropic'")
-        })?;
-        let openai = catalog.provider("openai").ok_or_else(|| {
-            ConfigError::unavailable("models.dev catalog is missing provider 'openai'")
-        })?;
-
-        let mut claude_models = std::collections::HashMap::new();
-        for model_id in REQUIRED_CLAUDE_MODELS {
-            let model = anthropic.models.get(model_id).ok_or_else(|| {
-                ConfigError::unavailable(format!(
-                    "models.dev catalog is missing required model 'anthropic/{model_id}'"
-                ))
-            })?;
-            claude_models.insert(
-                model_id.to_owned(),
-                configured_catalog_model(model, "anthropic"),
-            );
-        }
-
-        let openai_models = openai
-            .models
-            .values()
-            .filter(|model| is_supported_gpt_5_model(model))
-            .map(|model| (model.id.clone(), configured_catalog_model(model, "openai")))
-            .collect::<std::collections::HashMap<_, _>>();
-
-        let mut config = crate::config::defaults::provider_templates();
-        config
-            .providers
-            .get_mut("anthropic")
-            .expect("anthropic provider template")
-            .models
-            .clone_from(&claude_models);
-        config
-            .providers
-            .get_mut("claude-code")
-            .expect("claude-code provider template")
-            .models = claude_models;
-        config
-            .providers
-            .get_mut("openai")
-            .expect("openai provider template")
-            .models
-            .clone_from(&openai_models);
-        config
-            .providers
-            .get_mut("codex")
-            .expect("codex provider template")
-            .models = openai_models;
-        config.mcp_servers.insert(
-            "waltr".to_owned(),
-            config_proto::McpServer {
-                name: "waltr".to_owned(),
-                r#type: config_proto::McpServerType::Sse as i32,
-                command: String::new(),
-                url: mcp_url.to_owned(),
-            },
-        );
-        config.inference_defaults = None;
-        Ok(config)
     }
 
     async fn fresh_cached(&self) -> Option<LoadedCatalog> {
@@ -330,28 +319,6 @@ fn configured_catalog_model(
         },
     );
     model
-}
-
-fn is_supported_gpt_5_model(model: &models_dev::CatalogModel) -> bool {
-    if model
-        .status
-        .as_deref()
-        .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
-    {
-        return false;
-    }
-    let Some(version) = model.id.strip_prefix("gpt-5.") else {
-        return false;
-    };
-    let minor = version
-        .bytes()
-        .take_while(u8::is_ascii_digit)
-        .collect::<Vec<_>>();
-    !minor.is_empty()
-        && std::str::from_utf8(&minor)
-            .ok()
-            .and_then(|minor| minor.parse::<u32>().ok())
-            .is_some_and(|minor| minor >= 3)
 }
 
 #[derive(Debug, Default)]
@@ -965,116 +932,6 @@ mod loader_tests {
     }
 }
 
-#[cfg(test)]
-mod default_tests {
-    use std::collections::BTreeSet;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn defaults_select_exact_claude_and_semantic_gpt_inventory_with_metadata() {
-        let config = crate::test_support::default_config_builder()
-            .build()
-            .await
-            .expect("fixture defaults should build");
-        let expected_claude = REQUIRED_CLAUDE_MODELS
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        let anthropic = &config.providers["anthropic"];
-        let claude_code = &config.providers["claude-code"];
-        assert_eq!(
-            anthropic.models.keys().cloned().collect::<BTreeSet<_>>(),
-            expected_claude
-        );
-        assert_eq!(claude_code.models, anthropic.models);
-        assert!(!anthropic.models.contains_key("claude-sonnet-4-5-20250929"));
-
-        let expected_openai = ["gpt-5.3", "gpt-5.3-mini", "gpt-5.10"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        let openai = &config.providers["openai"];
-        assert_eq!(
-            openai.models.keys().cloned().collect::<BTreeSet<_>>(),
-            expected_openai
-        );
-        assert_eq!(config.providers["codex"].models, openai.models);
-
-        let model = &openai.models["gpt-5.3"];
-        assert_eq!(model.name, "GPT 5.3");
-        assert_eq!(
-            model.limits.as_ref().and_then(|limits| limits.context),
-            Some(400_000)
-        );
-        assert_eq!(
-            model
-                .cost
-                .as_ref()
-                .and_then(|cost| cost.input_per_million_tokens),
-            Some(2.0)
-        );
-        assert!(
-            model
-                .capabilities
-                .as_ref()
-                .is_some_and(|value| value.tools && value.image)
-        );
-        assert_eq!(
-            model
-                .options
-                .as_ref()
-                .map(|value| value.reasoning_efforts.clone()),
-            Some(vec![
-                "high".to_owned(),
-                "low".to_owned(),
-                "medium".to_owned()
-            ])
-        );
-        assert_eq!(
-            model
-                .catalog_match
-                .as_ref()
-                .map(|value| (value.provider_id.as_str(), value.model_id.as_str())),
-            Some(("openai", "gpt-5.3"))
-        );
-        assert_eq!(config.mcp_servers["waltr"].url, "http://127.0.0.1:14333/mcp");
-        assert!(config.inference_defaults.is_none());
-    }
-
-    #[tokio::test]
-    async fn defaults_fail_when_catalog_is_unavailable_or_required_claude_is_missing() {
-        let unavailable = crate::config::DefaultConfigBuilder::new(
-            CatalogLoader::from_path(crate::test_support::temp_root().join("missing.json")),
-            "http://127.0.0.1/mcp",
-        )
-        .build()
-        .await
-        .expect_err("missing catalog should fail");
-        assert!(unavailable.is_unavailable());
-
-        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/models-dev-defaults.json");
-        let data = tokio::fs::read_to_string(fixture)
-            .await
-            .expect("read defaults fixture")
-            .replace("\"claude-fable-5\"", "\"missing-fable\"");
-        let path = crate::test_support::temp_root().join("catalog.json");
-        tokio::fs::write(&path, data)
-            .await
-            .expect("write incomplete fixture");
-        let missing = crate::config::DefaultConfigBuilder::new(
-            CatalogLoader::from_path(path),
-            "http://127.0.0.1/mcp",
-        )
-        .build()
-        .await
-        .expect_err("missing required Claude should fail");
-        assert!(missing.is_unavailable());
-        assert!(missing.to_string().contains("claude-fable-5"));
-    }
-}
-
 fn parse_catalog(data: &str, stale: bool) -> Result<LoadedCatalog, CatalogLoadError> {
     let catalog = models_dev::ModelCatalog::from_json_str(data)
         .map_err(|_| CatalogLoadError::new("decode catalog", CatalogFailureKind::Decode))?;
@@ -1274,27 +1131,21 @@ impl fmt::Display for CatalogFailureKind {
 
 /// gRPC catalog service backed by the shared configuration store.
 #[derive(Debug)]
-pub struct CatalogService<S = FilesystemConfigStore> {
-    store: S,
+pub struct CatalogService {
+    resources: AgentDefinitionState,
     loader: CatalogLoader,
 }
 
-impl<S> CatalogService<S>
-where
-    S: ConfigStore,
-{
-    /// Create a catalog service from a config store and catalog loader.
+impl CatalogService {
+    /// Create a catalog service from the unified resource state and catalog loader.
     #[must_use]
-    pub fn new(store: S, loader: CatalogLoader) -> Arc<Self> {
-        Arc::new(Self { store, loader })
+    pub fn new(resources: AgentDefinitionState, loader: CatalogLoader) -> Arc<Self> {
+        Arc::new(Self { resources, loader })
     }
 }
 
 #[tonic::async_trait]
-impl<S> catalog_proto::catalog_service_server::CatalogService for CatalogService<S>
-where
-    S: ConfigStore,
-{
+impl catalog_proto::catalog_service_server::CatalogService for CatalogService {
     async fn search_catalog_models(
         &self,
         request: Request<catalog_proto::SearchCatalogModelsRequest>,
@@ -1330,7 +1181,7 @@ where
         request: Request<catalog_proto::SuggestCatalogMatchesRequest>,
     ) -> Result<Response<catalog_proto::SuggestCatalogMatchesResponse>, Status> {
         let request = request.into_inner();
-        let config = self.load_config().await?;
+        let config = self.load_config();
         let provider_url = config
             .providers
             .get(&request.provider_key)
@@ -1361,7 +1212,7 @@ where
         request: Request<catalog_proto::GetModelCatalogDriftRequest>,
     ) -> Result<Response<catalog_proto::GetModelCatalogDriftResponse>, Status> {
         let request = request.into_inner();
-        let config = self.load_config().await?;
+        let config = self.load_config();
         let (provider, model) =
             configured_model(&config, &request.provider_key, &request.model_key)?;
         let loaded = self.load_catalog().await?;
@@ -1394,86 +1245,9 @@ where
             catalog_match,
         }))
     }
-
-    async fn set_model_catalog_match(
-        &self,
-        request: Request<catalog_proto::SetModelCatalogMatchRequest>,
-    ) -> Result<Response<catalog_proto::SetModelCatalogMatchResponse>, Status> {
-        let request = request.into_inner();
-        let mut config = self.load_config().await?;
-        let provider = config
-            .providers
-            .get_mut(&request.provider_key)
-            .ok_or_else(|| provider_not_found(&request.provider_key))?;
-        let model = provider
-            .models
-            .get_mut(&request.model_key)
-            .ok_or_else(|| model_not_found(&request.provider_key, &request.model_key))?;
-
-        if request.clear_match {
-            model.catalog_match = None;
-        } else {
-            let catalog_match = request.catalog_match.ok_or_else(|| {
-                Status::invalid_argument("catalog_match is required unless clear_match is true")
-            })?;
-            model.catalog_match = Some(normalize_catalog_match(
-                catalog_match,
-                config_proto::CatalogMatchSource::Manual,
-            )?);
-        }
-
-        let config = self.patch_providers(config, &request.expected_etag).await?;
-        Ok(Response::new(catalog_proto::SetModelCatalogMatchResponse {
-            config: Some(config),
-        }))
-    }
-
-    async fn apply_catalog_model_defaults(
-        &self,
-        request: Request<catalog_proto::ApplyCatalogModelDefaultsRequest>,
-    ) -> Result<Response<catalog_proto::ApplyCatalogModelDefaultsResponse>, Status> {
-        let request = request.into_inner();
-        let mut config = self.load_config().await?;
-        let loaded = self.load_catalog().await?;
-        let (provider, model) =
-            configured_model(&config, &request.provider_key, &request.model_key)?;
-        let catalog_match = resolve_catalog_match(
-            loaded.catalog(),
-            &request.provider_key,
-            provider,
-            &request.model_key,
-            model,
-            request.catalog_match,
-            config_proto::CatalogMatchSource::Applied,
-        )?
-        .ok_or_else(|| Status::not_found("no high-confidence catalog match found"))?;
-        let catalog_model = lookup_catalog_model(loaded.catalog(), &catalog_match)
-            .ok_or_else(|| Status::not_found("catalog model was not found"))?;
-        let fields = RequestedDefaultFields::from_proto(&request.fields);
-
-        let provider = config
-            .providers
-            .get_mut(&request.provider_key)
-            .ok_or_else(|| provider_not_found(&request.provider_key))?;
-        let model = provider
-            .models
-            .get_mut(&request.model_key)
-            .ok_or_else(|| model_not_found(&request.provider_key, &request.model_key))?;
-        apply_defaults(model, catalog_model, &catalog_match, fields);
-
-        let config = self.patch_providers(config, &request.expected_etag).await?;
-        Ok(Response::new(
-            catalog_proto::ApplyCatalogModelDefaultsResponse {
-                config: Some(config),
-            },
-        ))
-    }
 }
 
-impl<S> CatalogService<S>
-where
-    S: ConfigStore,
-{
+impl CatalogService {
     async fn load_catalog(&self) -> Result<LoadedCatalog, Status> {
         self.loader.load().await.map_err(|error| {
             tracing::warn!(%error, "catalog load failed");
@@ -1481,32 +1255,8 @@ where
         })
     }
 
-    async fn load_config(&self) -> Result<config_proto::Configuration, Status> {
-        self.store.load().await.map_err(|error| {
-            tracing::warn!(%error, "catalog config load failed");
-            config_error_to_status(&error)
-        })
-    }
-
-    async fn patch_providers(
-        &self,
-        config: config_proto::Configuration,
-        expected_etag: &str,
-    ) -> Result<config_proto::Configuration, Status> {
-        self.store
-            .patch(
-                ConfigPatch {
-                    providers: Some(config.providers),
-                    mcp_servers: None,
-                    inference_defaults: None,
-                },
-                expected_etag,
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "catalog config patch failed");
-                config_error_to_status(&error)
-            })
+    fn load_config(&self) -> config_proto::Configuration {
+        self.resources.snapshot().configuration().clone()
     }
 }
 
@@ -1521,41 +1271,6 @@ struct RequestedDefaultFields {
     limits: bool,
     capabilities: bool,
     cost: bool,
-}
-
-impl RequestedDefaultFields {
-    fn from_proto(fields: &[i32]) -> Self {
-        if fields.is_empty() {
-            return Self {
-                name: true,
-                model_type: true,
-                limits: true,
-                capabilities: true,
-                cost: true,
-            };
-        }
-
-        let mut requested = Self {
-            name: false,
-            model_type: false,
-            limits: false,
-            capabilities: false,
-            cost: false,
-        };
-        for field in fields {
-            match catalog_proto::CatalogDefaultField::try_from(*field).ok() {
-                Some(catalog_proto::CatalogDefaultField::Name) => requested.name = true,
-                Some(catalog_proto::CatalogDefaultField::Type) => requested.model_type = true,
-                Some(catalog_proto::CatalogDefaultField::Limits) => requested.limits = true,
-                Some(catalog_proto::CatalogDefaultField::Capabilities) => {
-                    requested.capabilities = true;
-                }
-                Some(catalog_proto::CatalogDefaultField::Cost) => requested.cost = true,
-                Some(catalog_proto::CatalogDefaultField::Unspecified) | None => {}
-            }
-        }
-        requested
-    }
 }
 
 fn apply_defaults(
@@ -2020,14 +1735,4 @@ fn model_not_found(provider_key: &str, model_key: &str) -> Status {
     Status::not_found(format!(
         "model '{model_key}' was not found in provider '{provider_key}'"
     ))
-}
-
-fn config_error_to_status(error: &ConfigError) -> Status {
-    if error.is_etag_mismatch() {
-        Status::failed_precondition(error.to_string())
-    } else if error.is_invalid() {
-        Status::invalid_argument(error.to_string())
-    } else {
-        Status::internal(error.to_string())
-    }
 }

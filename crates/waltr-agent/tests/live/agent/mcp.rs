@@ -5,9 +5,9 @@ use std::{net::SocketAddr, sync::Arc};
 use waltr_agent::{
     AgentRuntimeProvider, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, FileCredentialStore, InferenceProviderSettings,
-    InferenceSettings, LlmError, LlmStream, McpConnectionKind, McpResolvedConnection,
-    MemorySessionStore, ModelApi, ModelRef, RunConflictPolicy, SessionCoordinator, TimelineContent,
-    TimelineEventKind, TimelineQuery, TimelineStatus,
+    InferenceSettings, LlmError, LlmStream, McpResolvedConnection, MemorySessionStore, ModelApi,
+    ModelRef, RunConflictPolicy, SessionCoordinator, TimelineContent, TimelineEventKind,
+    TimelineQuery, TimelineStatus,
 };
 use mcp::{
     McpToolCall, McpToolDefinition, McpToolResult,
@@ -122,7 +122,7 @@ fn test_stdio_server_command() -> String {
 fn stdio_runtime_server(command: &str) -> McpResolvedConnection {
     McpResolvedConnection {
         key: "stdio_test".to_owned(),
-        kind: McpConnectionKind::Stdio,
+        kind: waltr_agent::McpConnectionKind::Stdio,
         command: command.to_owned(),
         url: String::new(),
     }
@@ -131,7 +131,7 @@ fn stdio_runtime_server(command: &str) -> McpResolvedConnection {
 fn http_runtime_server(server: &HttpMcpTestServer) -> McpResolvedConnection {
     McpResolvedConnection {
         key: "http_test".to_owned(),
-        kind: McpConnectionKind::StreamableHttp,
+        kind: waltr_agent::McpConnectionKind::StreamableHttp,
         command: String::new(),
         url: format!("http://{}/mcp", server.address),
     }

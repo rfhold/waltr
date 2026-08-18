@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package waltr.resource.v1;
+
+import "waltr/config/v1/config_service.proto";
+
+service ResourceService {
+  rpc GetResourceCatalog(GetResourceCatalogRequest) returns (GetResourceCatalogResponse);
+  rpc WatchResourceCatalog(WatchResourceCatalogRequest) returns (stream WatchResourceCatalogResponse);
+  rpc InspectResource(InspectResourceRequest) returns (InspectResourceResponse);
+  rpc ReplaceResource(ReplaceResourceRequest) returns (ReplaceResourceResponse);
+  rpc ResetResource(ResetResourceRequest) returns (ResetResourceResponse);
+}
+
+enum ResourceKind {
+  RESOURCE_KIND_UNSPECIFIED = 0;
+  RESOURCE_KIND_AGENT = 1;
+  RESOURCE_KIND_FEATURE_SET = 2;
+  RESOURCE_KIND_PERMISSION_SET = 3;
+  RESOURCE_KIND_PROVIDER = 4;
+  RESOURCE_KIND_MCP_SERVER = 5;
+  RESOURCE_KIND_DEFAULTS = 6;
+}
+
+enum ResourceOrigin {
+  RESOURCE_ORIGIN_UNSPECIFIED = 0;
+  RESOURCE_ORIGIN_BUNDLED = 1;
+  RESOURCE_ORIGIN_FILESYSTEM = 2;
+}
+
+message Resource {
+  string path = 1;
+  ResourceKind kind = 2;
+  string name = 3;
+  ResourceOrigin origin = 4;
+  string source_etag = 5;
+  ResourceObject effective_value = 6;
+  string persisted_etag = 7;
+  string active_source = 8;
+}
+
+message ResourceObject { map<string, ResourceValue> fields = 1; }
+message ResourceList { repeated ResourceValue values = 1; }
+message ResourceValue {
+  oneof kind {
+    bool null_value = 1;
+    bool bool_value = 2;
+    double number_value = 3;
+    string string_value = 4;
+    ResourceList list_value = 5;
+    ResourceObject object_value = 6;
+  }
+}
+
+message ResourceCatalog {
+  repeated Resource resources = 1;
+  waltr.config.v1.Configuration effective_configuration = 2;
+  string etag = 3;
+  string reload_error = 4;
+}
+
+message ResourceInspection {
+  string path = 1;
+  ResourceKind kind = 2;
+  string name = 3;
+  bool persisted = 4;
+  string persisted_etag = 5;
+  optional string persisted_source = 6;
+  Resource active = 7;
+  optional string active_source = 8;
+  string reload_error = 9;
+}
+
+message GetResourceCatalogRequest {}
+message GetResourceCatalogResponse { ResourceCatalog catalog = 1; }
+message WatchResourceCatalogRequest {}
+message WatchResourceCatalogResponse { ResourceCatalog catalog = 1; }
+
+message InspectResourceRequest { optional string path = 1; }
+message InspectResourceResponse {
+  repeated ResourceInspection resources = 1;
+  string catalog_etag = 2;
+  string reload_error = 3;
+}
+
+message ReplaceResourceRequest {
+  string path = 1;
+  string source = 2;
+  string expected_etag = 3;
+}
+message ReplaceResourceResponse {
+  ResourceInspection resource = 1;
+  ResourceCatalog catalog = 2;
+}
+
+message ResetResourceRequest {
+  string path = 1;
+  string expected_etag = 2;
+}
+message ResetResourceResponse {
+  ResourceInspection resource = 1;
+  ResourceCatalog catalog = 2;
+}

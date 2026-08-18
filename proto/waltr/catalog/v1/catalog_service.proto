@@ -8,8 +8,6 @@ service CatalogService {
   rpc SearchCatalogModels(SearchCatalogModelsRequest) returns (SearchCatalogModelsResponse);
   rpc SuggestCatalogMatches(SuggestCatalogMatchesRequest) returns (SuggestCatalogMatchesResponse);
   rpc GetModelCatalogDrift(GetModelCatalogDriftRequest) returns (GetModelCatalogDriftResponse);
-  rpc SetModelCatalogMatch(SetModelCatalogMatchRequest) returns (SetModelCatalogMatchResponse);
-  rpc ApplyCatalogModelDefaults(ApplyCatalogModelDefaultsRequest) returns (ApplyCatalogModelDefaultsResponse);
 }
 
 message CatalogModelRef {
@@ -126,28 +124,4 @@ message GetModelCatalogDriftResponse {
   repeated CatalogDriftField fields = 1;
   bool stale = 2;
   waltr.config.v1.ModelCatalogMatch catalog_match = 3;
-}
-
-message SetModelCatalogMatchRequest {
-  string expected_etag = 1;
-  string provider_key = 2;
-  string model_key = 3;
-  waltr.config.v1.ModelCatalogMatch catalog_match = 4;
-  bool clear_match = 5;
-}
-
-message SetModelCatalogMatchResponse {
-  waltr.config.v1.Configuration config = 1;
-}
-
-message ApplyCatalogModelDefaultsRequest {
-  string expected_etag = 1;
-  string provider_key = 2;
-  string model_key = 3;
-  waltr.config.v1.ModelCatalogMatch catalog_match = 4;
-  repeated CatalogDefaultField fields = 5;
-}
-
-message ApplyCatalogModelDefaultsResponse {
-  waltr.config.v1.Configuration config = 1;
 }

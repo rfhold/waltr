@@ -23,6 +23,7 @@
       "gpt-5.2": {"name":"GPT 5.2","status":"stable"},
       "gpt-5.3": {"name":"GPT 5.3","status":"stable","limit":{"context":400000,"output":128000},"cost":{"input":2,"output":8,"cache_read":0.2},"attachment":true,"reasoning":true,"tool_call":true,"reasoning_options":[{"type":"effort","values":["low","medium","high"]}]},
       "gpt-5.3-mini": {"name":"GPT 5.3 Mini","status":"preview","tool_call":true},
+      "gpt-5.6": {"name":"GPT 5.6","status":"stable","limit":{"context":400000,"output":128000},"attachment":true,"reasoning":true,"tool_call":true,"reasoning_options":[{"type":"effort","values":["low","medium","high"]}]},
       "gpt-5.4-old": {"name":"GPT 5.4 Old","status":"deprecated","tool_call":true},
       "gpt-5.10": {"name":"GPT 5.10","tool_call":true},
       "gpt-5.x": {"name":"Not semantic","tool_call":true},

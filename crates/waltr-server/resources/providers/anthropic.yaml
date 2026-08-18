@@ -1,0 +1,22 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata:
+  name: anthropic
+spec:
+  transport: anthropicMessages
+  url: https://api.anthropic.com/v1/messages
+  headers:
+    x-api-key: ${env:ANTHROPIC_API_KEY}
+  catalog:
+    provider: anthropic
+    include:
+      - claude-haiku-4-5
+      - claude-sonnet-4-5
+      - claude-sonnet-4-6
+      - claude-sonnet-5
+      - claude-opus-4-5
+      - claude-opus-4-6
+      - claude-opus-4-7
+      - claude-opus-4-8
+      - claude-opus-5
+      - claude-fable-5

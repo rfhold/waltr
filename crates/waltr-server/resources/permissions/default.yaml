@@ -1,0 +1,8 @@
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata:
+  name: default
+spec:
+  tools:
+    - name: question
+      permission: allow

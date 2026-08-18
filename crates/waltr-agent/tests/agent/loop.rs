@@ -15,13 +15,12 @@ use waltr_agent::{
     CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent, CompletionReplayItem,
     CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
     FileCredentialStore, FilesystemPromptConfig, InferenceProviderSettings, InferenceSettings,
-    LlmError, LlmStream, McpConnectionKind, McpResolvedConnection, MemorySessionStore, ModelApi,
-    ModelRef, ProviderId, ProviderRetryConfig, ProviderTurnMetadata, ResumeInput,
-    SessionCoordinator, SessionStatus, SessionStore, SessionTemplateKind,
-    SessionTemplateSearchRequest, SessionTemplateSearchTarget, SkillsConfig, ThinkingBlock,
-    ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind, TimelineQuery,
-    TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
-    tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
+    LlmError, LlmStream, McpResolvedConnection, MemorySessionStore, ModelApi, ModelRef, ProviderId,
+    ProviderRetryConfig, ProviderTurnMetadata, ResumeInput, SessionCoordinator, SessionStatus,
+    SessionStore, SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
+    SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent,
+    TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition,
+    TurnItem, tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
 #[cfg(feature = "shell")]
@@ -178,7 +177,7 @@ async fn session_template_search_ignores_mcp_startup_failures() {
         Box::pin(async {
             Ok(vec![McpResolvedConnection {
                 key: "missing".to_owned(),
-                kind: McpConnectionKind::Stdio,
+                kind: waltr_agent::McpConnectionKind::Stdio,
                 command: "definitely-not-installed-waltr-mcp".to_owned(),
                 url: String::new(),
             }])

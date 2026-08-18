@@ -47,6 +47,7 @@ type RuntimeProviderOverride = Arc<
         + Send
         + Sync,
 >;
+type AgentCatalogProvider = Arc<dyn Fn() -> AgentDefinitionCatalog + Send + Sync>;
 
 /// Provider-neutral request for host-resolved MCP connections.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,18 +90,18 @@ type McpConnectionResolver =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpRuntimeFingerprint {
     pub trace_propagation: bool,
-    pub connections: Vec<McpRuntimeFingerprintConnection>,
+    pub(super) connections: Vec<McpRuntimeFingerprintConnection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct McpRuntimeFingerprintConnection {
-    pub key: String,
-    pub kind: McpConnectionKind,
-    pub target: String,
+pub(super) struct McpRuntimeFingerprintConnection {
+    pub(super) key: String,
+    pub(super) kind: McpConnectionKind,
+    pub(super) target: String,
 }
 
 impl McpRuntimeFingerprintConnection {
-    pub fn from_resolved(connection: &McpResolvedConnection) -> Self {
+    pub(super) fn from_resolved(connection: &McpResolvedConnection) -> Self {
         Self {
             key: connection.key.clone(),
             kind: connection.kind,
@@ -179,6 +180,7 @@ pub struct AgentSessionRuntimeFactory {
     trusted_mcp_oauth_origins: Vec<reqwest::Url>,
     definition: ResolvedAgent,
     catalog: Option<AgentDefinitionCatalog>,
+    catalog_provider: Option<AgentCatalogProvider>,
     runtime_provider_override: Option<RuntimeProviderOverride>,
     mcp_connection_resolver: Option<McpConnectionResolver>,
 }
@@ -196,6 +198,10 @@ impl std::fmt::Debug for AgentSessionRuntimeFactory {
             .field("trusted_mcp_oauth_origins", &self.trusted_mcp_oauth_origins)
             .field("definition", &self.definition)
             .field("catalog", &self.catalog)
+            .field(
+                "catalog_provider",
+                &self.catalog_provider.as_ref().map(|_| "<provider>"),
+            )
             .field(
                 "runtime_provider_override",
                 &self
@@ -226,6 +232,7 @@ impl AgentSessionRuntimeFactory {
             trusted_mcp_oauth_origins: Vec::new(),
             definition,
             catalog: None,
+            catalog_provider: None,
             runtime_provider_override: None,
             mcp_connection_resolver: None,
         }
@@ -243,6 +250,20 @@ impl AgentSessionRuntimeFactory {
             .expect("catalog default agent must be present")
             .clone();
         self.catalog = Some(catalog);
+        self.catalog_provider = None;
+        self
+    }
+
+    /// Configure a synchronous provider for agents selectable by future explicit switches.
+    ///
+    /// The factory's initial definition and default name remain stable. Only
+    /// [`Self::bundle_for_agent`] consults this provider.
+    #[must_use]
+    pub fn with_agent_catalog_provider(
+        mut self,
+        provide: impl Fn() -> AgentDefinitionCatalog + Send + Sync + 'static,
+    ) -> Self {
+        self.catalog_provider = Some(Arc::new(provide));
         self
     }
 
@@ -260,18 +281,19 @@ impl AgentSessionRuntimeFactory {
     /// # Errors
     ///
     /// Returns [`AgentSessionRuntimeError::FailedPrecondition`] when `name` is absent from the
-    /// current startup catalog or this factory has no catalog.
+    /// current catalog or this factory has no catalog.
     pub fn bundle_for_agent(
         &self,
         name: &str,
     ) -> Result<AgentDefinitionBundle, AgentSessionRuntimeError> {
-        let bundle = self
-            .catalog
+        let provided_catalog = self.catalog_provider.as_ref().map(|provide| provide());
+        let bundle = provided_catalog
             .as_ref()
+            .or(self.catalog.as_ref())
             .and_then(|catalog| catalog.bundle(name))
             .ok_or_else(|| {
                 AgentSessionRuntimeError::FailedPrecondition(format!(
-                    "agent '{name}' is not present in the current startup catalog"
+                    "agent '{name}' is not present in the current catalog"
                 ))
             })?;
         Ok(bundle)
@@ -1263,7 +1285,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         sync::{
-            Arc,
+            Arc, RwLock,
             atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
@@ -1429,6 +1451,7 @@ mod tests {
             command: "inactive-command".to_owned(),
             url: "https://example.test/one".to_owned(),
         };
+
         let mut http_inactive_changed = http.clone();
         http_inactive_changed.command = "changed-inactive-command".to_owned();
         assert_eq!(
@@ -1713,6 +1736,74 @@ spec: { tools: [{ name: read, permission: allow }] }
             Err(AgentSessionRuntimeError::FailedPrecondition(message))
                 if message.contains("not present in the current startup catalog")
         ));
+    }
+
+    #[test]
+    fn static_agent_catalog_still_drives_bundles_and_replaces_a_provider() {
+        let source =
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: default }\nspec: {}\n";
+        let catalog = AgentDefinitionCatalog::from_sources(vec![source.to_owned()], "default")
+            .expect("catalog resolves");
+        let provider_catalog = catalog.clone();
+        let root = std::env::temp_dir();
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("waltr-agent-static-catalog-auth.json")),
+            catalog.resolved("default").unwrap().clone(),
+        )
+        .with_agent_catalog_provider(move || provider_catalog.clone())
+        .with_agent_catalog(catalog);
+
+        let bundle = factory.bundle_for_agent("default").expect("bundle exists");
+        assert_eq!(bundle.agent_name, "default");
+        assert_eq!(bundle.sources, [source]);
+        assert!(format!("{factory:?}").contains("catalog_provider: None"));
+    }
+
+    #[test]
+    fn agent_catalog_provider_uses_later_catalog_without_changing_legacy_fallback() {
+        let initial_source =
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: initial }\nspec: {}\n";
+        let initial =
+            AgentDefinitionCatalog::from_sources(vec![initial_source.to_owned()], "initial")
+                .expect("initial catalog resolves");
+        let later_source = format!(
+            "{initial_source}---\napiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: later }}\nspec: {{ systemPrompt: later }}\n"
+        );
+        let later = AgentDefinitionCatalog::from_sources(vec![later_source.clone()], "later")
+            .expect("later catalog resolves");
+        let later_identity = later.bundle("later").unwrap().identity();
+        let current = Arc::new(RwLock::new(initial.clone()));
+        let root = std::env::temp_dir();
+        let factory = AgentSessionRuntimeFactory::new(
+            root.clone(),
+            FileCredentialStore::new(root.join("waltr-agent-dynamic-catalog-auth.json")),
+            initial.resolved("initial").unwrap().clone(),
+        )
+        .with_agent_catalog_provider({
+            let current = Arc::clone(&current);
+            move || current.read().expect("catalog lock").clone()
+        });
+
+        assert!(factory.bundle_for_agent("later").is_err());
+        *current.write().expect("catalog lock") = later;
+        let bundle = factory
+            .bundle_for_agent("later")
+            .expect("later bundle exists");
+
+        assert_eq!(bundle.sources, [later_source]);
+        assert_eq!(bundle.identity(), later_identity);
+        assert_eq!(factory.default_agent_name(), "initial");
+        assert_eq!(
+            factory
+                .definition_for_session(&SessionRecord::new("legacy"))
+                .expect("legacy fallback remains valid")
+                .name,
+            "initial"
+        );
+        let debug = format!("{factory:?}");
+        assert!(debug.contains("catalog_provider: Some(\"<provider>\")"));
+        assert!(!debug.contains("systemPrompt: later"));
     }
 
     #[test]

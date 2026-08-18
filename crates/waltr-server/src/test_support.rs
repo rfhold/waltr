@@ -12,7 +12,6 @@ use crate::{
     },
     build_app_with_catalog_loader,
     catalog::CatalogLoader,
-    config::DefaultConfigBuilder,
     config_service::ConfigService,
     mcp_oauth::{McpOAuthEnabledConfig, McpOAuthServer},
     persistence::{DatabaseConfig, Persistence},
@@ -67,12 +66,6 @@ pub fn default_catalog_loader() -> CatalogLoader {
     )
 }
 
-/// Return deterministic catalog-backed defaults used by server tests.
-#[must_use]
-pub fn default_config_builder() -> DefaultConfigBuilder {
-    DefaultConfigBuilder::new(default_catalog_loader(), "http://127.0.0.1:14333/mcp")
-}
-
 /// Resolve the bundled coding agent used by server tests.
 #[must_use]
 pub fn default_agent_definition() -> (ResolvedAgent, AgentDefinitionBundle) {
@@ -90,11 +83,56 @@ pub fn default_agent_catalog() -> AgentDefinitionCatalog {
 }
 
 fn config_service_with_loader(loader: &CatalogLoader) -> Arc<ConfigService> {
-    ConfigService::new(
-        temp_root(),
-        DefaultConfigBuilder::new(loader.clone(), "http://127.0.0.1:14333/mcp"),
-    )
-    .expect("config service should start")
+    let root = temp_root();
+    persist_test_self_mcp(&root);
+    let loader = loader.clone();
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .expect("test resource runtime should start")
+            .block_on(ConfigService::new(root, loader))
+            .expect("resource service should start")
+    })
+    .join()
+    .expect("test resource initialization thread should join")
+}
+
+/// Persist a deterministic self-MCP override without mutating process environment.
+pub fn persist_test_self_mcp(root: &std::path::Path) {
+    let mcp_dir = root.join(".waltr/resources/mcp-servers");
+    std::fs::create_dir_all(&mcp_dir).expect("test MCP resource directory should be created");
+    let path = mcp_dir.join("waltr.yaml");
+    if !path.exists() {
+        std::fs::write(
+            path,
+            "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: waltr\nspec:\n  transport: streamableHttp\n  url: http://127.0.0.1:14333/mcp\n",
+        )
+        .expect("test MCP resource should be written");
+    }
+}
+
+/// Load a deterministic unified state with optional exact persisted resources.
+#[must_use]
+pub fn resource_state_with_overrides(overrides: &[(&str, &str)]) -> crate::AgentDefinitionState {
+    let root = temp_root();
+    persist_test_self_mcp(&root);
+    for (path, source) in overrides {
+        let target = root.join(".waltr/resources").join(path);
+        std::fs::create_dir_all(target.parent().expect("resource has category"))
+            .expect("test resource category should be created");
+        std::fs::write(target, source).expect("test resource should be written");
+    }
+    let service = {
+        let loader = default_catalog_loader();
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .expect("test resource runtime should start")
+                .block_on(ConfigService::new(root, loader))
+                .expect("resource service should start")
+        })
+        .join()
+        .expect("test resource initialization thread should join")
+    };
+    service.state().clone()
 }
 
 /// Observability and join controls for a server application with blocked cleanup.
@@ -745,14 +783,14 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                 persistence,
                 catalog_loader,
                 authenticator,
-                |routes, config, credential_store| {
-                    session::add_sessions_service(
+                |routes, config, credential_store, agent_state| {
+                    session::add_sessions_service_with_agent_state(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),
                         config,
                         credential_store,
                         None,
-                        default_agent_catalog(),
+                        agent_state,
                     )
                 },
             )
@@ -788,7 +826,7 @@ pub fn setup_server() -> &'static TestServer {
     let catalog_loader = default_catalog_loader();
     let config_service = config_service_with_loader(&catalog_loader);
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
-    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader)
+    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader, false)
 }
 
 /// Start an isolated integration test server at a fixed address.
@@ -797,7 +835,7 @@ pub fn setup_server_at(addr: SocketAddr) -> &'static TestServer {
     let catalog_loader = default_catalog_loader();
     let config_service = config_service_with_loader(&catalog_loader);
     let listener = TcpListener::bind(addr).expect("test server should bind fixed address");
-    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader)
+    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader, false)
 }
 
 /// Start an isolated integration test server with an explicit config service.
@@ -810,9 +848,11 @@ pub fn setup_server_with_services(config_service: Arc<ConfigService>) -> &'stati
 /// Start an isolated integration test server with an explicit catalog loader.
 #[must_use]
 pub fn setup_server_with_catalog_loader(catalog_loader: CatalogLoader) -> &'static TestServer {
-    let config_service = config_service_with_loader(&catalog_loader);
+    // Catalog integration fixtures are intentionally partial; fresh config still needs the
+    // canonical deterministic catalog that contains every required default model.
+    let config_service = config_service_with_loader(&default_catalog_loader());
     let listener = TcpListener::bind("127.0.0.1:0").expect("test server should bind");
-    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader)
+    setup_server_with_listener_and_catalog_loader(config_service, listener, catalog_loader, true)
 }
 
 /// Start an isolated integration test server with an explicit session coordinator.
@@ -828,6 +868,7 @@ pub fn setup_server_with_sessions() -> (&'static TestServer, SessionCoordinator<
         listener,
         sessions.clone(),
         catalog_loader,
+        false,
     );
     (server, sessions)
 }
@@ -845,6 +886,7 @@ pub fn setup_server_with_seeded_sessions(
         listener,
         sessions,
         catalog_loader,
+        false,
     )
 }
 
@@ -863,12 +905,14 @@ fn setup_server_with_listener_and_catalog_loader(
     config_service: Arc<ConfigService>,
     listener: TcpListener,
     catalog_loader: CatalogLoader,
+    seed_catalog_fixture_model: bool,
 ) -> &'static TestServer {
     setup_server_with_listener_sessions_and_catalog_loader(
         config_service,
         listener,
         SessionCoordinator::new(MemorySessionStore::new()),
         catalog_loader,
+        seed_catalog_fixture_model,
     )
 }
 
@@ -883,6 +927,7 @@ fn setup_server_with_listener_and_sessions(
         listener,
         sessions,
         catalog_loader,
+        false,
     )
 }
 
@@ -891,6 +936,7 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
     listener: TcpListener,
     sessions: SessionCoordinator<MemorySessionStore>,
     catalog_loader: CatalogLoader,
+    _seed_catalog_fixture_model: bool,
 ) -> &'static TestServer {
     listener
         .set_nonblocking(true)
@@ -917,14 +963,14 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
                 config_service,
                 persistence,
                 catalog_loader,
-                |routes, config, credential_store| {
-                    session::add_sessions_service(
+                |routes, config, credential_store, agent_state| {
+                    session::add_sessions_service_with_agent_state(
                         routes,
                         sessions,
                         config,
                         credential_store,
                         None,
-                        default_agent_catalog(),
+                        agent_state,
                     )
                 },
             )
@@ -941,6 +987,7 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
         _thread: server_thread,
     }))
 }
+
 async fn test_persistence() -> Persistence {
     Persistence::initialize(
         DatabaseConfig::for_tests().expect("test persistence config should be valid"),
@@ -1100,14 +1147,14 @@ END
                 catalog_loader,
                 authenticator,
                 mcp_oauth,
-                move |routes, config, credential_store| {
-                    session::add_sessions_service(
+                move |routes, config, credential_store, agent_state| {
+                    session::add_sessions_service_with_agent_state(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),
                         config,
                         credential_store,
                         trusted_mcp_oauth_origin,
-                        default_agent_catalog(),
+                        agent_state,
                     )
                 },
             )

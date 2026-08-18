@@ -1,6 +1,6 @@
 // @generated
 /// Generated client implementations.
-pub mod config_service_client {
+pub mod resource_service_client {
     #![allow(
         unused_variables,
         dead_code,
@@ -11,10 +11,10 @@ pub mod config_service_client {
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
     #[derive(Debug, Clone)]
-    pub struct ConfigServiceClient<T> {
+    pub struct ResourceServiceClient<T> {
         inner: tonic::client::Grpc<T>,
     }
-    impl<T> ConfigServiceClient<T>
+    impl<T> ResourceServiceClient<T>
     where
         T: tonic::client::GrpcService<tonic::body::Body>,
         T::Error: Into<StdError>,
@@ -32,7 +32,7 @@ pub mod config_service_client {
         pub fn with_interceptor<F>(
             inner: T,
             interceptor: F,
-        ) -> ConfigServiceClient<InterceptedService<T, F>>
+        ) -> ResourceServiceClient<InterceptedService<T, F>>
         where
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
@@ -46,7 +46,7 @@ pub mod config_service_client {
                 http::Request<tonic::body::Body>,
             >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            ConfigServiceClient::new(InterceptedService::new(inner, interceptor))
+            ResourceServiceClient::new(InterceptedService::new(inner, interceptor))
         }
         /// Compress requests with the given encoding.
         ///
@@ -79,11 +79,11 @@ pub mod config_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
-        pub async fn patch_config(
+        pub async fn get_resource_catalog(
             &mut self,
-            request: impl tonic::IntoRequest<super::PatchConfigRequest>,
+            request: impl tonic::IntoRequest<super::GetResourceCatalogRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::PatchConfigResponse>,
+            tonic::Response<super::GetResourceCatalogResponse>,
             tonic::Status,
         > {
             self.inner
@@ -96,18 +96,25 @@ pub mod config_service_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waltr.config.v1.ConfigService/PatchConfig",
+                "/waltr.resource.v1.ResourceService/GetResourceCatalog",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("waltr.config.v1.ConfigService", "PatchConfig"));
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.resource.v1.ResourceService",
+                        "GetResourceCatalog",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
-        pub async fn reset_config(
+        pub async fn watch_resource_catalog(
             &mut self,
-            request: impl tonic::IntoRequest<super::ResetConfigRequest>,
+            request: impl tonic::IntoRequest<super::WatchResourceCatalogRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::ResetConfigResponse>,
+            tonic::Response<
+                tonic::codec::Streaming<super::WatchResourceCatalogResponse>,
+            >,
             tonic::Status,
         > {
             self.inner
@@ -120,65 +127,106 @@ pub mod config_service_client {
                 })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/waltr.config.v1.ConfigService/ResetConfig",
+                "/waltr.resource.v1.ResourceService/WatchResourceCatalog",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("waltr.config.v1.ConfigService", "ResetConfig"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn get_config(
-            &mut self,
-            request: impl tonic::IntoRequest<super::GetConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::GetConfigResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/waltr.config.v1.ConfigService/GetConfig",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("waltr.config.v1.ConfigService", "GetConfig"));
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn watch_config(
-            &mut self,
-            request: impl tonic::IntoRequest<super::WatchConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<tonic::codec::Streaming<super::WatchConfigResponse>>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/waltr.config.v1.ConfigService/WatchConfig",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("waltr.config.v1.ConfigService", "WatchConfig"));
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.resource.v1.ResourceService",
+                        "WatchResourceCatalog",
+                    ),
+                );
             self.inner.server_streaming(req, path, codec).await
+        }
+        pub async fn inspect_resource(
+            &mut self,
+            request: impl tonic::IntoRequest<super::InspectResourceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InspectResourceResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.resource.v1.ResourceService/InspectResource",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.resource.v1.ResourceService",
+                        "InspectResource",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn replace_resource(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ReplaceResourceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReplaceResourceResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.resource.v1.ResourceService/ReplaceResource",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "waltr.resource.v1.ResourceService",
+                        "ReplaceResource",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn reset_resource(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ResetResourceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResetResourceResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/waltr.resource.v1.ResourceService/ResetResource",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("waltr.resource.v1.ResourceService", "ResetResource"),
+                );
+            self.inner.unary(req, path, codec).await
         }
     }
 }
 /// Generated server implementations.
-pub mod config_service_server {
+pub mod resource_service_server {
     #![allow(
         unused_variables,
         dead_code,
@@ -187,53 +235,63 @@ pub mod config_service_server {
         clippy::let_unit_value,
     )]
     use tonic::codegen::*;
-    /// Generated trait containing gRPC methods that should be implemented for use with ConfigServiceServer.
+    /// Generated trait containing gRPC methods that should be implemented for use with ResourceServiceServer.
     #[async_trait]
-    pub trait ConfigService: std::marker::Send + std::marker::Sync + 'static {
-        async fn patch_config(
+    pub trait ResourceService: std::marker::Send + std::marker::Sync + 'static {
+        async fn get_resource_catalog(
             &self,
-            request: tonic::Request<super::PatchConfigRequest>,
+            request: tonic::Request<super::GetResourceCatalogRequest>,
         ) -> std::result::Result<
-            tonic::Response<super::PatchConfigResponse>,
+            tonic::Response<super::GetResourceCatalogResponse>,
             tonic::Status,
         >;
-        async fn reset_config(
-            &self,
-            request: tonic::Request<super::ResetConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ResetConfigResponse>,
-            tonic::Status,
-        >;
-        async fn get_config(
-            &self,
-            request: tonic::Request<super::GetConfigRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::GetConfigResponse>,
-            tonic::Status,
-        >;
-        /// Server streaming response type for the WatchConfig method.
-        type WatchConfigStream: tonic::codegen::tokio_stream::Stream<
-                Item = std::result::Result<super::WatchConfigResponse, tonic::Status>,
+        /// Server streaming response type for the WatchResourceCatalog method.
+        type WatchResourceCatalogStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<
+                    super::WatchResourceCatalogResponse,
+                    tonic::Status,
+                >,
             >
             + std::marker::Send
             + 'static;
-        async fn watch_config(
+        async fn watch_resource_catalog(
             &self,
-            request: tonic::Request<super::WatchConfigRequest>,
+            request: tonic::Request<super::WatchResourceCatalogRequest>,
         ) -> std::result::Result<
-            tonic::Response<Self::WatchConfigStream>,
+            tonic::Response<Self::WatchResourceCatalogStream>,
+            tonic::Status,
+        >;
+        async fn inspect_resource(
+            &self,
+            request: tonic::Request<super::InspectResourceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::InspectResourceResponse>,
+            tonic::Status,
+        >;
+        async fn replace_resource(
+            &self,
+            request: tonic::Request<super::ReplaceResourceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ReplaceResourceResponse>,
+            tonic::Status,
+        >;
+        async fn reset_resource(
+            &self,
+            request: tonic::Request<super::ResetResourceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ResetResourceResponse>,
             tonic::Status,
         >;
     }
     #[derive(Debug)]
-    pub struct ConfigServiceServer<T> {
+    pub struct ResourceServiceServer<T> {
         inner: Arc<T>,
         accept_compression_encodings: EnabledCompressionEncodings,
         send_compression_encodings: EnabledCompressionEncodings,
         max_decoding_message_size: Option<usize>,
         max_encoding_message_size: Option<usize>,
     }
-    impl<T> ConfigServiceServer<T> {
+    impl<T> ResourceServiceServer<T> {
         pub fn new(inner: T) -> Self {
             Self::from_arc(Arc::new(inner))
         }
@@ -284,9 +342,9 @@ pub mod config_service_server {
             self
         }
     }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for ConfigServiceServer<T>
+    impl<T, B> tonic::codegen::Service<http::Request<B>> for ResourceServiceServer<T>
     where
-        T: ConfigService,
+        T: ResourceService,
         B: Body + std::marker::Send + 'static,
         B::Error: Into<StdError> + std::marker::Send + 'static,
     {
@@ -301,25 +359,29 @@ pub mod config_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/waltr.config.v1.ConfigService/PatchConfig" => {
+                "/waltr.resource.v1.ResourceService/GetResourceCatalog" => {
                     #[allow(non_camel_case_types)]
-                    struct PatchConfigSvc<T: ConfigService>(pub Arc<T>);
+                    struct GetResourceCatalogSvc<T: ResourceService>(pub Arc<T>);
                     impl<
-                        T: ConfigService,
-                    > tonic::server::UnaryService<super::PatchConfigRequest>
-                    for PatchConfigSvc<T> {
-                        type Response = super::PatchConfigResponse;
+                        T: ResourceService,
+                    > tonic::server::UnaryService<super::GetResourceCatalogRequest>
+                    for GetResourceCatalogSvc<T> {
+                        type Response = super::GetResourceCatalogResponse;
                         type Future = BoxFuture<
                             tonic::Response<Self::Response>,
                             tonic::Status,
                         >;
                         fn call(
                             &mut self,
-                            request: tonic::Request<super::PatchConfigRequest>,
+                            request: tonic::Request<super::GetResourceCatalogRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ConfigService>::patch_config(&inner, request).await
+                                <T as ResourceService>::get_resource_catalog(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -330,7 +392,7 @@ pub mod config_service_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
-                        let method = PatchConfigSvc(inner);
+                        let method = GetResourceCatalogSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -346,116 +408,31 @@ pub mod config_service_server {
                     };
                     Box::pin(fut)
                 }
-                "/waltr.config.v1.ConfigService/ResetConfig" => {
+                "/waltr.resource.v1.ResourceService/WatchResourceCatalog" => {
                     #[allow(non_camel_case_types)]
-                    struct ResetConfigSvc<T: ConfigService>(pub Arc<T>);
+                    struct WatchResourceCatalogSvc<T: ResourceService>(pub Arc<T>);
                     impl<
-                        T: ConfigService,
-                    > tonic::server::UnaryService<super::ResetConfigRequest>
-                    for ResetConfigSvc<T> {
-                        type Response = super::ResetConfigResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ResetConfigRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as ConfigService>::reset_config(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ResetConfigSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/waltr.config.v1.ConfigService/GetConfig" => {
-                    #[allow(non_camel_case_types)]
-                    struct GetConfigSvc<T: ConfigService>(pub Arc<T>);
-                    impl<
-                        T: ConfigService,
-                    > tonic::server::UnaryService<super::GetConfigRequest>
-                    for GetConfigSvc<T> {
-                        type Response = super::GetConfigResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::GetConfigRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as ConfigService>::get_config(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = GetConfigSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/waltr.config.v1.ConfigService/WatchConfig" => {
-                    #[allow(non_camel_case_types)]
-                    struct WatchConfigSvc<T: ConfigService>(pub Arc<T>);
-                    impl<
-                        T: ConfigService,
-                    > tonic::server::ServerStreamingService<super::WatchConfigRequest>
-                    for WatchConfigSvc<T> {
-                        type Response = super::WatchConfigResponse;
-                        type ResponseStream = T::WatchConfigStream;
+                        T: ResourceService,
+                    > tonic::server::ServerStreamingService<
+                        super::WatchResourceCatalogRequest,
+                    > for WatchResourceCatalogSvc<T> {
+                        type Response = super::WatchResourceCatalogResponse;
+                        type ResponseStream = T::WatchResourceCatalogStream;
                         type Future = BoxFuture<
                             tonic::Response<Self::ResponseStream>,
                             tonic::Status,
                         >;
                         fn call(
                             &mut self,
-                            request: tonic::Request<super::WatchConfigRequest>,
+                            request: tonic::Request<super::WatchResourceCatalogRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ConfigService>::watch_config(&inner, request).await
+                                <T as ResourceService>::watch_resource_catalog(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -466,7 +443,7 @@ pub mod config_service_server {
                     let max_encoding_message_size = self.max_encoding_message_size;
                     let inner = self.inner.clone();
                     let fut = async move {
-                        let method = WatchConfigSvc(inner);
+                        let method = WatchResourceCatalogSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
@@ -478,6 +455,144 @@ pub mod config_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.resource.v1.ResourceService/InspectResource" => {
+                    #[allow(non_camel_case_types)]
+                    struct InspectResourceSvc<T: ResourceService>(pub Arc<T>);
+                    impl<
+                        T: ResourceService,
+                    > tonic::server::UnaryService<super::InspectResourceRequest>
+                    for InspectResourceSvc<T> {
+                        type Response = super::InspectResourceResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::InspectResourceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ResourceService>::inspect_resource(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = InspectResourceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.resource.v1.ResourceService/ReplaceResource" => {
+                    #[allow(non_camel_case_types)]
+                    struct ReplaceResourceSvc<T: ResourceService>(pub Arc<T>);
+                    impl<
+                        T: ResourceService,
+                    > tonic::server::UnaryService<super::ReplaceResourceRequest>
+                    for ReplaceResourceSvc<T> {
+                        type Response = super::ReplaceResourceResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ReplaceResourceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ResourceService>::replace_resource(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ReplaceResourceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/waltr.resource.v1.ResourceService/ResetResource" => {
+                    #[allow(non_camel_case_types)]
+                    struct ResetResourceSvc<T: ResourceService>(pub Arc<T>);
+                    impl<
+                        T: ResourceService,
+                    > tonic::server::UnaryService<super::ResetResourceRequest>
+                    for ResetResourceSvc<T> {
+                        type Response = super::ResetResourceResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ResetResourceRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ResourceService>::reset_resource(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ResetResourceSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
@@ -504,7 +619,7 @@ pub mod config_service_server {
             }
         }
     }
-    impl<T> Clone for ConfigServiceServer<T> {
+    impl<T> Clone for ResourceServiceServer<T> {
         fn clone(&self) -> Self {
             let inner = self.inner.clone();
             Self {
@@ -517,8 +632,8 @@ pub mod config_service_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "waltr.config.v1.ConfigService";
-    impl<T> tonic::server::NamedService for ConfigServiceServer<T> {
+    pub const SERVICE_NAME: &str = "waltr.resource.v1.ResourceService";
+    impl<T> tonic::server::NamedService for ResourceServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }

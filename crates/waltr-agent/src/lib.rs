@@ -46,11 +46,12 @@ pub use auth::{
 };
 pub use definition::{
     AGENT_DEFINITION_API_VERSION, AgentCatalogEntry, AgentDefinitionBundle, AgentDefinitionCatalog,
-    AgentDefinitionError, AgentDefinitionRegistry, AgentDefinitionResourceKind, AgentFeature,
-    AgentPermissionSelector, AgentSwitchAudit, AgentsFeatureConfig, FilesystemFeatureConfig,
-    FilesystemFeatureProfile, McpFeatureConfig, ResolvedAgent, ResolvedAgentFeatures,
-    ResolvedPermission, ResolvedPermissionEntry, ResolvedPermissionResources,
-    SESSION_WORKSPACE_ROOT, ShellFeatureConfig, SkillsFeatureConfig, TaskFeatureConfig,
+    AgentDefinitionError, AgentDefinitionRegistry, AgentDefinitionResourceKey,
+    AgentDefinitionResourceKind, AgentFeature, AgentPermissionSelector, AgentSwitchAudit,
+    AgentsFeatureConfig, FilesystemFeatureConfig, FilesystemFeatureProfile, McpFeatureConfig,
+    ResolvedAgent, ResolvedAgentFeatures, ResolvedPermission, ResolvedPermissionEntry,
+    ResolvedPermissionResources, SESSION_WORKSPACE_ROOT, ShellFeatureConfig, SkillsFeatureConfig,
+    TaskFeatureConfig, inspect_agent_definition_source,
 };
 pub use error::{LlmError, Result};
 pub use model::{ModelApi, ModelId, ModelRef, ProviderId};

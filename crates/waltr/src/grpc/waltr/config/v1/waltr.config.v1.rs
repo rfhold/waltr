@@ -187,76 +187,6 @@ pub struct McpServer {
     pub url: ::prost::alloc::string::String,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PatchConfigRequest {
-    #[prost(string, tag="1")]
-    pub expected_etag: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="2")]
-    pub providers: ::core::option::Option<ProviderMapPatch>,
-    #[prost(message, optional, tag="3")]
-    pub mcp_servers: ::core::option::Option<McpServerMapPatch>,
-    #[prost(message, optional, tag="4")]
-    pub inference_defaults: ::core::option::Option<InferenceDefaults>,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ProviderMapPatch {
-    #[prost(map="string, message", tag="1")]
-    pub providers: ::std::collections::HashMap<::prost::alloc::string::String, Provider>,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct McpServerMapPatch {
-    #[prost(map="string, message", tag="1")]
-    pub mcp_servers: ::std::collections::HashMap<::prost::alloc::string::String, McpServer>,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PatchConfigResponse {
-    #[prost(message, optional, tag="1")]
-    pub config: ::core::option::Option<Configuration>,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ResetConfigRequest {
-    #[prost(string, tag="1")]
-    pub expected_etag: ::prost::alloc::string::String,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ResetConfigResponse {
-    #[prost(message, optional, tag="1")]
-    pub config: ::core::option::Option<Configuration>,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetConfigRequest {
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct GetConfigResponse {
-    #[prost(message, optional, tag="1")]
-    pub config: ::core::option::Option<Configuration>,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct WatchConfigRequest {
-}
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WatchConfigResponse {
-    #[prost(string, tag="1")]
-    pub previous_etag: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
-    pub etag: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag="3")]
-    pub changed_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, tag="4")]
-    pub error: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="5")]
-    pub config: ::core::option::Option<Configuration>,
-}
-#[derive(serde::Serialize, serde::Deserialize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum OauthTokenRequestStyle {
@@ -427,7 +357,7 @@ impl ModelType {
 pub enum McpServerType {
     Unspecified = 0,
     Stdio = 1,
-    Sse = 2,
+    StreamableHttp = 2,
 }
 impl McpServerType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -438,7 +368,7 @@ impl McpServerType {
         match self {
             Self::Unspecified => "MCP_SERVER_TYPE_UNSPECIFIED",
             Self::Stdio => "MCP_SERVER_TYPE_STDIO",
-            Self::Sse => "MCP_SERVER_TYPE_SSE",
+            Self::StreamableHttp => "MCP_SERVER_TYPE_STREAMABLE_HTTP",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -446,10 +376,9 @@ impl McpServerType {
         match value {
             "MCP_SERVER_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
             "MCP_SERVER_TYPE_STDIO" => Some(Self::Stdio),
-            "MCP_SERVER_TYPE_SSE" => Some(Self::Sse),
+            "MCP_SERVER_TYPE_STREAMABLE_HTTP" => Some(Self::StreamableHttp),
             _ => None,
         }
     }
 }
-include!("waltr.config.v1.tonic.rs");
 // @@protoc_insertion_point(module)

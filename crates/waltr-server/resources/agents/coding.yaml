@@ -1,0 +1,14 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata:
+  name: coding
+spec:
+  description: Provide the complete coding behavior currently assembled by the server.
+  inheritsFrom:
+    name: default
+  features:
+    - featureSetRef:
+        name: coding
+  permissions:
+    - permissionSetRef:
+        name: coding
