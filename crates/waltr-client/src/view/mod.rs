@@ -39,8 +39,8 @@ mod tests {
         ClientSnapshot, ClientTimelineDirection, ConfigSnapshot, Configuration,
         McpAuthorizationContextSnapshot, Model, ModelCapabilities, ModelCatalogMatch, ModelLimits,
         ModelOptions, ModelType, OperationCollectionSnapshot, OperationSnapshot, Provider,
-        ProviderType, RollbackTargetView, SessionAgentCatalogSnapshot, SessionSnapshot,
-        SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
+        ProviderType, ResourceEditBaselineView, RollbackTargetView, SessionAgentCatalogSnapshot,
+        SessionSnapshot, SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
     };
 
     use super::*;
@@ -246,6 +246,7 @@ mod tests {
             ClientOperationView::decl(),
             OperationCollectionSnapshot::decl(),
             OperationSnapshot::decl(),
+            ResourceEditBaselineView::decl(),
             ConfigSnapshot::decl(),
             StatusSnapshot::decl(),
             SessionAgentCatalogSnapshot::decl(),

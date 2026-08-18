@@ -1214,6 +1214,24 @@ error: string | null,
  */
 key: string | null, };
 
+export type ResourceEditBaselineView = {
+/**
+ * Canonical resource path.
+ */
+path: string,
+/**
+ * Persisted-slot entity tag.
+ */
+persistedEtag: string,
+/**
+ * Catalog-observed entity tag for an absent persisted slot.
+ */
+absentEtag: string,
+/**
+ * Exact active YAML source.
+ */
+activeSource: string, };
+
 export type ConfigSnapshot = {
 /**
  * Last known configuration snapshot.
