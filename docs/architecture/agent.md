@@ -33,7 +33,7 @@ The agent crate owns provider-neutral domain types and host-tool contracts. Host
 
 ## Agent Definitions
 
-`waltr-agent` accepts strict, multi-document YAML containing `waltr.dev/v1alpha1` `Agent`, `FeatureSet`, and `PermissionSet` resources. Unknown fields, unsupported values or constructs, malformed YAML, empty required names, and unsupported API versions fail parsing. A single YAML source may not repeat the same `(kind, metadata.name)` resource. Loading a later source replaces an earlier resource with the same kind and name, which lets the server layer define source precedence.
+`waltr-agent` parses strict `waltr.dev/v1alpha1` `Agent`, `FeatureSet`, and `PermissionSet` resources. Unknown fields, unsupported values, malformed YAML, empty names, and unsupported API versions fail parsing.
 
 The implemented resource model is:
 
@@ -43,7 +43,13 @@ The implemented resource model is:
 | `FeatureSet` | Optional `filesystem`, `agents`, `skills`, `shell`, `task`, and `mcp` feature configurations. Workspace-root fields accept only `$(session.workspace.root)`, the filesystem profile is `auto`, and the instruction filename is `AGENTS.md`. MCP selection and trace propagation belong to the `mcp` feature. |
 | `PermissionSet` | Ordered `spec.tools` entries selected by exact tool `name` or by implemented `feature`, with whole-tool `allow`, `ask`, or `deny`, or filesystem path and shell command resource rules. |
 
-See [the agent-definition examples](../examples/agents/README.md) and the [bundled server definitions](../../crates/waltr-server/agent-definitions.yaml) for concrete implemented resources.
+The unified server catalog bundles these agent resources:
+
+| Kind | Bundled resources |
+| --- | --- |
+| `Agent` | [`coding`](../../crates/waltr-server/resources/agents/coding.yaml), [`configuration`](../../crates/waltr-server/resources/agents/configuration.yaml), and [`default`](../../crates/waltr-server/resources/agents/default.yaml). |
+| `FeatureSet` | [`coding`](../../crates/waltr-server/resources/features/coding.yaml). |
+| `PermissionSet` | [`coding`](../../crates/waltr-server/resources/permissions/coding.yaml) and [`default`](../../crates/waltr-server/resources/permissions/default.yaml). |
 
 Resolution is parent-first. Nonempty parent and child system-prompt fragments compose in that order, separated by a blank line. The parent fully composes before the child applies each list left-to-right. Every `spec.features[]` entry contains exactly one `featureSetRef: { name }` or one inline `filesystem`, `agents`, `skills`, `shell`, `task`, or `mcp` feature. A later feature replaces that whole feature configuration. Every `spec.permissions[]` entry contains exactly one `permissionSetRef: { name }` or one inline tool `name`/`feature` selector and permission. Permissions append in composition order and use the existing conflict rules. Missing references and inheritance cycles fail resolution.
 
@@ -61,7 +67,23 @@ spec:
       permission: ask
 ```
 
-The server owns definition loading and selection. It loads its compile-time source, then optional external sources, compiles every final valid agent into a name-sorted startup catalog, and marks the configured default. Definition files remain startup inputs: the server reads them only during startup and has no watcher, shared TOML, or RPC editor. `ListAgents` returns catalog names and descriptions plus the default name.
+The server owns resource persistence, live snapshots, and selection. Agent resources occupy the `agents`, `features`, and `permissions` catalog categories.
+
+Each runtime file contains exactly one strict resource. Its directory fixes the resource kind. Its filename stem must equal `metadata.name`.
+
+A persisted file replaces bundled bytes at the same canonical relative path. A new path adds one resource. Waltr applies no field merge.
+
+The server compiles each valid catalog snapshot into a name-sorted agent catalog and marks the configured default.
+
+Invalid persisted state fails startup. After startup, invalid direct edits remain on disk. The server retains the last-known-good active snapshot and exposes the reload error. A later valid edit activates without a restart.
+
+The public `/mcp` actions `resources.inspect`, `resources.replace`, and `resources.reset` manage every catalog kind. See [Resource Catalog](config.md#administration).
+
+Per-slot ETags and checks serialize writes through Waltr. They do not isolate the resource tree from another local process that can write `.waltr`.
+
+`ListAgents`, new sessions, and later explicit agent selections read the current successful snapshot. Current session bundles do not passively rebase after a resource reload.
+
+The bundled `configuration` agent explicitly includes only the `waltr` MCP resource. Its policy permits resource actions and denies session actions.
 
 Each new top-level session stores an `AgentDefinitionBundle` with a selected catalog name and the exact ordered YAML source texts. Current clients require an explicit selection; omission in the older create RPC shape uses the configured default. Session summaries project the effective agent name. Legacy sessions without a bundle also project and use the configured default without being backfilled.
 
@@ -264,6 +286,8 @@ Focused paths:
 | [../../crates/mcp/](../../crates/mcp/) | Generic MCP protocol crate. |
 | [../../crates/waltr-agent/src/permission/mod.rs](../../crates/waltr-agent/src/permission/mod.rs) | Permission policy, claims, matching, and effects. |
 | [../../crates/waltr-agent/src/definition/mod.rs](../../crates/waltr-agent/src/definition/mod.rs) | Strict agent-definition registry, schema model, and resolution. |
-| [../../crates/waltr-server/agent-definitions.yaml](../../crates/waltr-server/agent-definitions.yaml) | Bundled server agent definitions. |
+| [../../crates/waltr-server/resources/](../../crates/waltr-server/resources/) | Bundled unified resource catalog. |
+| [../../crates/waltr-server/src/agent_definition.rs](../../crates/waltr-server/src/agent_definition.rs) | Unified catalog persistence, validation, snapshots, and watcher lifecycle. |
+| [config.md](config.md) | Canonical unified catalog contract. |
 | [../agent/README.md](../agent/README.md) | Index of detailed agent feature docs. |
 | [../mcp/README.md](../mcp/README.md) | Generic MCP protocol documentation. |

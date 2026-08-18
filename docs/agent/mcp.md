@@ -43,17 +43,17 @@ Selection uses these exact rules:
 | `exclude: []` | All configured servers. |
 | `include: []` | No servers. |
 | `include: [a, b]` | Only current keys `a` and `b`. |
-| `exclude: [a, b]` | All current keys except `a` and `b`. |
+| `exclude: [a, b]` | All current configured keys except `a` and `b`. |
 
 Include names match current configuration keys exactly. If any include is absent, reconstruction fails and names every missing key in deterministic order. Missing exclude names have no effect. Blank or whitespace-only names, duplicate names, both selectors, an empty selector mapping, `null`, and unknown fields fail strict definition parsing.
 
-The bundled `coding` feature uses `servers: { exclude: [] }`. This explicit selector selects every server in the current configuration.
+The bundled `coding` feature uses `servers: { exclude: [] }`. This selects every configured server, including `waltr` when it is present.
 
 MCP server selection is part of the selected agent definition stored with the session, not an independent MCP setting. Session RPCs and clients can create or switch the session's agent definition, but expose no separate MCP selector, endpoint snapshot, drift status, or trace switch.
 
-## Current Configuration Authority
+## Current Connection Authority
 
-Every normal run and template search reconstruction uses the cycle's selected agent definition and resolves its MCP feature against the current server `ConfigHandle`. The current stdio command or remote URL is authoritative. Provider configuration changes do not affect MCP resolution.
+Every normal run and template search reconstruction uses the cycle's selected agent definition. Waltr resolves all MCP keys against the current catalog snapshot. The current stdio command or Streamable HTTP URL is authoritative. Provider resource changes do not affect MCP resolution.
 
 A new reconstruction, including one after an agent switch, sees selected server additions, removals, command changes, URL changes, transport changes, and definition trace changes. An active captured runtime continues with its old MCP runtime. Unselected server changes have no effect. An absent required include fails that reconstruction instead of exposing a stale cached runtime.
 
@@ -61,7 +61,7 @@ Template search uses the same current resolution. It treats MCP preparation fail
 
 ## Cache Lifecycle
 
-The coordinator caches one MCP runtime per durable session. Its structural fingerprint contains the sorted selected keys, transport kinds, stdio commands, remote URLs, and trace-propagation value. Provider settings, credentials, and unselected MCP entries do not belong to this fingerprint.
+The coordinator caches one MCP runtime per durable session. Its structural fingerprint contains selected keys, transport kinds, targets, and trace propagation. Provider settings, credentials, and unselected MCP entries do not belong to this fingerprint.
 
 An equal fingerprint reuses the cached runtime after credential preflight. Provider-only and unselected-server changes therefore reuse it. A changed fingerprint starts the replacement before the cache swap. Startup failure keeps the old cached runtime for a later attempt, but the failed reconstruction receives the error and cannot use the stale runtime. After a successful swap, current `Arc` users finish with the old runtime. Waltr shuts it down after those users release it.
 
@@ -96,7 +96,7 @@ When a provider calls an MCP-backed tool, the agent uses the normal tool executi
 
 MCP result conversion preserves text order, represents unknown content with explicit unsupported-content markers, appends `structuredContent` as text, and preserves MCP `isError` as structured tool-result state. Image blocks must use canonical standard Base64, declare `image/png`, `image/jpeg`, or `image/webp`, and match that type's file signature. Waltr accepts at most four images and 4 MiB of decoded image data in one result. Invalid encoding, unsupported media, signature mismatches, and excess data become bounded MCP protocol errors; image data is never included in the error.
 
-Waltr opts into an 8 MiB MCP message and SSE-line limit so one bounded 4 MiB decoded image plus Base64 and JSON framing fits over Streamable HTTP. Generic MCP client defaults remain smaller. Tool results persist their ordered blocks for session replay, while text-only consumers receive a projection containing text plus image media type, decoded size, and SHA-256 digest, never Base64.
+Waltr opts into an 8 MiB MCP message and event-stream line limit. This limit fits one bounded 4 MiB decoded image plus Base64 and JSON framing. Generic MCP client defaults remain smaller. Tool results persist ordered blocks for session replay. Text-only consumers receive media type, decoded size, and SHA-256 digest instead of Base64.
 
 Provider adapters deliver validated images as follows:
 
@@ -209,9 +209,11 @@ The agent integration also wraps Waltr-facing MCP operations in `mcp.agent.opera
 
 ## Outbound OAuth
 
+The bundled `mcp-servers/waltr.yaml` resource uses the same target-scoped credentials as every other Streamable HTTP MCP server. Public hosted `/mcp` OAuth remains a separate inbound authorization boundary.
+
 Streamable HTTP authentication failures preserve the parsed bearer challenge instead of flattening it into a display string. Session errors carry the server endpoint, HTTP status, protected-resource metadata URL, scope, bearer `error`, sanitized `error_description`, `error_uri`, and realm through `McpAuthorizationContext`; the server exposes that context in typed `AuthenticationFailure` gRPC status details under the outbound-MCP domain.
 
-A Streamable HTTP bearer challenge becomes an ordinary target-scoped session failure and never begins authorization itself. The user explicitly starts authorization for that MCP server from Config. The server then discovers the exact RFC 9728 protected resource, tries advertised authorization servers until it finds a compatible public server, and discovers RFC 8414 endpoints before selecting registration. Production discovery and every discovered authorization, token, registration, revocation, and JWKS destination require HTTPS and a public network destination by default. The server automatically adds its initialized hosted MCP origin to the allowed origins supplied to agent session refresh, while server-owned authorization orchestration admits that origin only for the exact initialized self resource. Operators may additionally allow RFC 1918 IPv4 or IPv6 unique-local ingress for exact HTTPS origins with `WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS`; the comma-separated entries contain no path and match scheme, host, and effective port. Provider OAuth never receives this trust. Redirects are disabled, DNS answers are checked and pinned for direct requests, loopback/link-local/metadata addresses remain rejected, and the connected peer is checked where the HTTP stack exposes it. Registration selection is:
+A Streamable HTTP bearer challenge becomes an ordinary target-scoped session failure and never begins authorization itself. The user explicitly starts authorization for that MCP server from Config. The server then discovers the exact RFC 9728 protected resource, tries advertised authorization servers until it finds a compatible public server, and discovers RFC 8414 endpoints before selecting registration. Production discovery and every discovered authorization, token, registration, revocation, and JWKS destination require HTTPS and a public network destination by default. Waltr automatically supplies its initialized hosted MCP origin to agent session refresh, while server-owned authorization orchestration admits that origin only for the exact initialized self resource. Operators may additionally allow RFC 1918 IPv4 or IPv6 unique-local ingress for exact HTTPS origins with `WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS`; the comma-separated entries contain no path and match scheme, host, and effective port. Provider OAuth never receives this trust. Redirects are disabled, DNS answers are checked and pinned for direct requests, loopback/link-local/metadata addresses remain rejected, and the connected peer is checked where the HTTP stack exposes it. Registration selection is:
 
 1. A configured preregistered client for that server key.
 2. A still-valid persisted preregistered or CIMD registration for the same issuer, resource, and redirect.
@@ -236,8 +238,8 @@ Agent transports use a bearer provider rather than copying one token into transp
 - Generic MCP meta-tools such as `search_mcp_tools` or `call_mcp_tool` are not exposed; discovered MCP tools are exposed directly.
 - Stdio env/cwd configuration and HTTP auth/header configuration are not implemented in the agent MCP config.
 - Session RPC and UI timeline results expose the safe text projection rather than inline image data; direct model delivery and durable agent replay retain validated image blocks.
-- The shared server config names the HTTP MCP server type `SSE`; current host resolution maps that to the agent's Streamable HTTP transport.
-- Streamable HTTP sends one POST per message and uses request-scoped JSON or SSE responses. Protocol sessions, GET delivery, resumability, and DELETE termination are absent.
+- MCP server resources select `streamableHttp` or `stdio`. See [Resource Catalog](../architecture/config.md#resource-schemas).
+- Streamable HTTP sends one POST per message and uses request-scoped JSON or event-stream responses. Protocol sessions, GET delivery, resumability, and DELETE termination are absent.
 - Confidential downstream clients and registration-management credentials are not supported; outbound registration is public-client only.
 
 ## Tests

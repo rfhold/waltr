@@ -31,6 +31,7 @@ The build installs pnpm dependencies from workspace manifests before copying Rus
 - Derived MCP database `/data/mcp.sqlite3`
 - `WALTR_SESSION_STORE=filesystem`
 - `WALTR_SESSION_FILESYSTEM_ROOT=/data/sessions`
+- `WALTR_PUBLIC_URL=http://127.0.0.1:14333`
 - Named volume `waltr-dev-data` mounted at `/data`
 
 The static profile does not consume ambient `WALTR_*` deployment settings. Change server environment configuration in the actual process/container runtime used by a deployment, not through this Compose fixture.
@@ -66,49 +67,43 @@ The Pulumi workload definition uses S3 session storage backed by Ceph RGW, which
 
 The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not modify either Waltr or MCP SQL data, authentication sessions, OAuth credentials, or configuration. The operation is a blind delete without active-run or cross-replica coordination; stop session activity before invoking it or concurrent work may recreate records.
 
-## Agent Definitions
+## Resource Catalog
 
-The server always loads the definitions bundled at compile time in `crates/waltr-server/agent-definitions.yaml`. Two environment variables control startup additions and selection:
+The server embeds one YAML catalog under [`crates/waltr-server/resources`](../crates/waltr-server/resources/). Persisted overrides live under `.waltr/resources` at the server root.
 
-| Variable | Contract |
+The catalog uses `agents`, `features`, `permissions`, `providers`, `mcp-servers`, and `defaults`. Only `defaults/default.yaml` is valid in the defaults category.
+
+Each persisted file contains one strict YAML document. Its category, `kind`, filename stem, and `metadata.name` must identify the same resource.
+
+Bundled resources supply defaults. A persisted exact-path file replaces its bundle. Reset removes the persisted override and reveals the bundle.
+
+Waltr validates the complete catalog before startup. Invalid YAML, identity mismatches, unresolved references, invalid models.dev selectors, and invalid environment templates fail startup.
+
+The bundled self-MCP resource requires `WALTR_PUBLIC_URL` in every access-auth mode. It consumes the variable independently of OIDC, joins `/mcp` through URL parsing, and preserves a deployment path prefix. With access auth disabled, actual partial browser, API, or hosted-MCP OIDC settings still fail startup.
+
+The server watches `.waltr/resources` after startup. An invalid reload preserves the last-known-good snapshot and exposes the reload error.
+
+Public `/mcp` actions provide resource administration:
+
+| Action | Behavior |
 | --- | --- |
-| `WALTR_AGENT_DEFINITION_PATHS` | Optional platform-native path list, such as colon-separated paths on Unix or semicolon-separated paths on Windows. Each entry must be a regular file or directory. A directory contributes its direct regular files with `.yaml` or `.yml` extensions in lexical path order; nested directories and other extensions are ignored. |
-| `WALTR_DEFAULT_AGENT` | Default catalog agent after all sources load. It defaults to `coding`; an explicitly empty, whitespace-only, or non-Unicode value fails startup. |
+| `resources.inspect` | Lists resource slots or inspects one canonical path. |
+| `resources.replace` | Validates and atomically replaces one complete YAML resource. |
+| `resources.reset` | Removes one persisted override and reveals any bundled fallback. |
 
-Sources load in this order: the bundled source, then path-list entries in their declared order, with each directory's files in lexical order. A source may contain multiple YAML documents. Duplicate `(kind, metadata.name)` resources within one source fail atomically, while a resource in a later separately loaded source replaces an earlier resource of the same kind and name. External definitions can therefore override bundled `Agent`, `FeatureSet`, or `PermissionSet` resources without replacing the whole bundle.
+Replace and reset require the latest persisted-slot ETag. They validate the complete candidate catalog before filesystem mutation.
 
-Definition files are read only during startup. Missing or unsupported paths, unreadable files or directories, invalid YAML or schema, duplicate resources within one source, unresolved references or inheritance cycles in any final agent, failure to resolve `WALTR_DEFAULT_AGENT`, and an unsupported feature on the default prevent startup. Nondefault agents with features omitted from the server build are not selectable. All compiled-valid agents are retained in deterministic name order; the default is one catalog entry. There is no file watcher or configuration RPC for definitions; restart the server to apply source changes.
+`waltr.resource.v1.ResourceService` provides equivalent gRPC reads, watches, inspection, replace, and reset operations. Reads and watch events contain complete catalog snapshots.
 
-`ListAgents` publishes names, descriptions, and the default. New clients require a selected catalog name when creating a session; omission in the older RPC request shape uses the default. Each top-level session stores an `AgentDefinitionBundle` with that name and the exact ordered YAML source texts. Task children inherit the cycle-captured bundle and inference settings. Session summaries project the effective agent name.
+Provider resources can materialize models.dev selectors with optional `keyPrefix` and aliases. MCP resources select `streamableHttp` or `stdio`.
 
-`UpdateSessionAgent` persists any exact catalog name for the next capture boundary. Active work finishes on its captured definition. Queued and resumed cycles and later template searches use the new one, preserving history and policy-constrained approvals. The next cycle materializes the new base prompt; MCP replacement waits until reconstruction and fingerprint comparison. Multiple pre-boundary switches coalesce into one old-to-final `session_info` audit event.
+`defaults/default.yaml` stores inference defaults. Agent definitions own MCP selection.
 
-When Waltr reconstructs a session with a bundle, that bundle supplies the prompt, features, permissions, and MCP definition behavior. A malformed present bundle fails reconstruction.
+Provider and MCP credentials remain in Waltr SQL. They never enter resource source, catalog snapshots, or resource reset behavior.
 
-Durable middleware state preserves first-execution behavior for one definition identity. The stored prompt takes precedence until an agent switch changes that identity. Captured `AGENTS.md` content and the stored skill catalog remain stable. Skill content becomes durable when the session loads that skill, not when the catalog first appears.
+New sessions snapshot provider inference settings. They also store exact agent-definition source texts. Later resource changes do not rewrite those durable values.
 
-Legacy records without a bundle use the configured default and remain unchanged on disk. A restart can change their definition-derived behavior. Definition files still load only at startup; reconstruction reads stored source texts from the session record rather than from the original files.
-
-Agent-definition syntax is also a hard cut. `spec.features` and `spec.permissions` are ordered inline/reference lists. The old `featureSetRefs` and `permissionSetRefs` fields are rejected with no alias or migration. Replace them in every external definition and clear or rewrite stored bundles that contain them before upgrade. Routine/routine tools, deferred tools, harness tools, and definition watching/editing remain unsupported.
-
-## Inference Cutover
-
-This release uses a hard session-data and workspace-config cutover. Durable session JSON uses `inference_settings`, whose only member is the provider settings snapshot. The snapshot contains provider key, API, URL, model ID and cost, headers, OAuth refresh settings, and reasoning effort. The old `runtime_settings` field has no alias or backfill.
-
-Workspace TOML uses only `[inference_defaults]` for `provider_key`, `model_key`, and optional `reasoning_effort`. `[runtime_defaults]` is unsupported. MCP defaults do not exist because the current agent definition owns MCP selection.
-
-Before the new binary starts:
-
-1. Stop session activity and every process that can write the configured session store.
-2. Clear old durable session records, or rewrite them to the exact `inference_settings` schema.
-3. Replace `[runtime_defaults]` with `[inference_defaults]` in the workspace configuration.
-4. Remove old MCP-default fields from that table.
-5. Validate the selected agent definitions and current MCP server keys.
-6. Start the new binary only after the store and configuration updates finish.
-
-Waltr performs no session-store migration, alias, or backfill for this cutover. Keep a rollback backup until the new process and session flows pass operator checks. This procedure describes preparation only; it does not deploy a server.
-
-See [Agent Architecture](architecture/agent.md#agent-definitions) and [Agent Definition Examples](examples/agents/README.md) for the implemented schema and examples.
+See [Resource Catalog](architecture/config.md) for the canonical contract. See [Agent Architecture](architecture/agent.md#agent-definitions) for agent resource syntax.
 
 ## OIDC Access Domains
 
@@ -155,9 +150,9 @@ Private OAuth destinations are denied by default. Two optional, comma-separated 
 | `WALTR_MCP_OAUTH_CIMD_TRUSTED_PRIVATE_ORIGINS` | Client metadata documents fetched by Waltr's hosted authorization server. |
 | `WALTR_MCP_OUTBOUND_OAUTH_TRUSTED_PRIVATE_ORIGINS` | MCP discovery, registration, exchange, revocation, and refresh performed by Waltr's outbound MCP client. |
 
-Each entry must be only `https://host[:port]`, without credentials, a path, query, or fragment. Matching includes the effective port, duplicate origins are rejected, and the lists do not grant trust across directions. Waltr automatically trusts its initialized deployment origin for hosted self-CIMD. Server-owned outbound authorization gates automatic trust to the exact initialized self-MCP resource; the server supplies its origin as an ordinary allowed origin to agent session refresh. The Pulumi settings `mcpOAuthCimdTrustedPrivateOrigins` and `mcpOutboundOAuthTrustedPrivateOrigins` project nonempty lists into the corresponding environment variables.
+Each entry must be only `https://host[:port]`, without credentials, a path, query, or fragment. Matching includes the effective port, duplicate origins are rejected, and the lists do not grant trust across directions. Waltr automatically trusts its initialized deployment origin for hosted self-CIMD. Server-owned outbound authorization gates automatic trust to the exact initialized self-MCP resource, and the server supplies that origin to agent session refresh. The Pulumi settings `mcpOAuthCimdTrustedPrivateOrigins` and `mcpOutboundOAuthTrustedPrivateOrigins` project nonempty lists into the corresponding environment variables.
 
-`WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. It is required in OIDC mode, must use HTTPS except in explicit loopback mode, and is not inferred from the browser callback. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly.
+`WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. It is required in every auth mode because the bundled self-MCP resource consumes it independently of access authentication. It must use HTTPS except for loopback development and is not inferred from the browser callback. Disabling access auth permits this variable but still rejects actual partial browser, API, or hosted-MCP OIDC settings. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly.
 
 `WALTR_OIDC_CLIENT_SECRET` is optional only when browser-provider metadata supports token endpoint auth method `none`. `WALTR_AUTH_SESSION_TTL` optionally sets browser-session seconds and defaults to eight hours. `WALTR_TRUSTED_PROXIES` is optional; when set it is a comma-separated CIDR allowlist for trusting forwarded client addresses. Omit it unless a known reverse proxy overwrites forwarding headers.
 
@@ -220,11 +215,15 @@ Pipelines as Code definitions under `.tekton/` are configured to build the Docke
 
 ## Startup And Operation
 
-The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets, completes both standard migrators, validates access-auth and hosted-OAuth configuration, performs upstream OIDC discovery and initial JWKS loading, loads the wrapping ring, decrypts or creates the local active signer, loads and resolves the startup agent definition, and initializes agent session storage before returning `ServerApplication`. That server-owned lifecycle contains the router, five-minute bounded cleanup, and daily signing rotation/rewrap; graceful shutdown cancels and joins that work. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds. `/health` is process liveness. `/ready` fails closed when either database is unavailable, the hosted OAuth store or active signer is unusable, signer PKCS#8 and public JWK disagree, maintenance is unhealthy, or revocation termination exceeds its bounded durable-check policy. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
+The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
 
-When `.waltr/waltr.toml` is absent, startup also loads the models.dev catalog to construct the initial provider inventory. Explicit configuration reset repeats that catalog load. The loader uses `WALTR_MODELS_DEV_PATH` or `WALTR_MODELS_DEV_URL` when configured, otherwise `https://models.dev/api.json`, and may fall back to its disk cache. If neither the source nor cache is available, missing-file startup fails and reset preserves the current configuration. Existing configuration files do not require a catalog load during startup.
+The bundled `mcp-servers/waltr.yaml` resource expands required `${env:WALTR_PUBLIC_URL}` and joins `/mcp`. The resource uses the normal target-scoped outbound OAuth lifecycle. When hosted MCP OAuth starts, Waltr admits its private HTTPS origin only for that exact self resource. Other private origins require explicit configuration.
 
-The default `mcp_servers.waltr` URL is derived from `WALTR_PUBLIC_URL` by appending `/mcp`. The public URL must use HTTPS except for explicit loopback HTTP and must not contain userinfo, a query, or a fragment; invalid configured values make missing-file initialization or reset fail without changing configuration. If `WALTR_PUBLIC_URL` is unset, the server uses `http://127.0.0.1:<port>/mcp`, where `<port>` comes from `WALTR_SERVER_ADDR` or the default listen address. Set `WALTR_PUBLIC_URL` for proxy, TLS, container, or hosted deployments where the loopback fallback is not the correct target identity. The entry uses the same outbound discovery, authorization, and credential lifecycle as every other remote MCP server. When hosted MCP OAuth is initialized, server-owned authorization orchestration automatically trusts its private RFC 1918 or unique-local HTTPS origin only for the exact self resource, and session construction supplies that origin to agent refresh. Other private MCP and OAuth origins must be listed explicitly.
+`/health` reports process liveness. `/ready` checks persistence, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content alone does not fail readiness while the watcher and last-known-good snapshot remain healthy.
+
+`ServerApplication` owns the definition watcher and hosted OAuth maintenance. Graceful shutdown cancels and joins each owned task. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
+
+Startup loads models.dev to materialize provider resource selectors. The loader uses `WALTR_MODELS_DEV_PATH` or `WALTR_MODELS_DEV_URL`, then its configured default. The disk cache can satisfy an unavailable source. Startup fails when no source or cache can materialize the complete catalog.
 
 Local revocation wakes same-process streams after the database commit. Every hosted stream also performs an authoritative durable check at most every five seconds; another replica's revocation therefore closes it within five seconds plus scheduling and query latency. PostgreSQL `LISTEN/NOTIFY` is not implemented. Do not increase the current one-replica Pulumi workload until the documented container-backed concurrency and cross-replica operational checks have been exercised.
 

@@ -35,15 +35,17 @@ flowchart LR
 
 The client talks to the server through generated gRPC contracts under `proto/waltr/`.
 
-Config traffic uses `waltr.config.v1.ConfigService`:
+Resource traffic uses `waltr.resource.v1.ResourceService`:
 
 | RPC | Client Use |
 | --- | --- |
-| `GetConfig` | Load the current config snapshot. |
-| `PatchConfig` | Submit sparse top-level config patches with an expected ETag. |
-| `WatchConfig` | Receive an initial config snapshot and subsequent config change events. |
+| `GetResourceCatalog` | Load the complete current catalog snapshot. |
+| `WatchResourceCatalog` | Receive complete initial and later catalog snapshots. |
+| `InspectResource` | Read one persisted slot and its ETag. |
+| `ReplaceResource` | Replace one complete YAML resource. |
+| `ResetResource` | Remove one persisted override. |
 
-Status traffic uses the status service to watch system readiness. Config watch maintenance depends on the status watch because the reducer only opens or reopens config watches after the server reports ready.
+Status traffic uses the status service to watch system readiness. Catalog watch maintenance waits until the server reports ready.
 
 `crates/waltr-client/src/transport/mod.rs` defines the runtime-neutral `WaltrTransport` trait and the default transports:
 
@@ -52,7 +54,7 @@ Status traffic uses the status service to watch system readiness. Config watch m
 | Native | `NativeGrpcTransport`, backed by tonic channels. |
 | Browser/WASM | `WasmGrpcTransport`, backed by gRPC-web over `fetch`. |
 
-Transport code converts server RPC messages into client domain types such as `Configuration`, `ConfigWatchUpdate`, and `SystemStatus`. UI implementations should not call generated service clients directly when a shared client command or runtime path exists.
+Transport code converts RPC messages into `ResourceCatalog`, effective `Configuration`, and `SystemStatus` values. UI code uses shared client commands instead of generated clients.
 
 Session RPCs and shared views use `InferenceSettings`, `InferenceSettingsRequest`, and `UpdateSessionInferenceSettings` for provider, model, reasoning effort, and provider match status. `ListAgents` independently returns the name-sorted startup catalog with descriptions and the configured default. Create commands select a catalog name, while the older RPC omission uses the default. `UpdateSessionAgent` switches an existing session by exact name. Session summaries expose the effective agent name. MCP selection, endpoint snapshots, drift status, and trace propagation are not separate session controls; they belong to the selected agent definition.
 
@@ -64,14 +66,14 @@ The reducer is intentionally split from side effects:
 
 | Concept | Role |
 | --- | --- |
-| `ClientState` | Current access, config, status, stream state, operation status, watch status, errors, watch interest counts, and retry attempts. |
-| `ClientEvent` | Facts that already happened, such as access changed, config loaded, patch failed, watch changed, or reconnect delay elapsed. |
-| `ClientEffect` | Work that must happen outside the reducer, such as load config, patch config, open a watch, or sleep before reconnecting. |
+| `ClientState` | Current access, catalog, effective configuration, status, streams, operations, watches, errors, interests, and retry attempts. |
+| `ClientEvent` | Facts such as access changes, catalog loads, resource-write failures, watch changes, or reconnect delays. |
+| `ClientEffect` | Work outside the reducer, such as catalog loads, resource writes, watches, or reconnect sleeps. |
 | `ClientUpdate` | Reducer output containing side-effect intents for the runtime to execute. |
 
 Operation state uses shared statuses: `Idle`, `Loading`, `Ready`, `Opened`, `Received`, `Waiting`, and `Failed`. UI clients should render from these statuses instead of deriving separate server-data state.
 
-Command operations that complete asynchronously also receive a runtime-local operation key. The immediate command snapshot records that key on the operation-specific snapshot, such as `snapshot.config.patch.key` or `snapshot.sessions.create.key`, and `snapshot.operations.current[key]` carries the keyed result. Shells that need command completion should keep their UI pending until the matching keyed result reaches `ready` or `failed`; they should not treat the immediate dispatch snapshot or the latest global operation status as completion for a specific command.
+Asynchronous commands receive a runtime-local operation key. `snapshot.operations.current[key]` carries the keyed result. Shells wait for `ready` or `failed`.
 
 ```mermaid
 flowchart TD
@@ -157,9 +159,9 @@ Web and TUI implementations should follow these rules:
 - Use `ClientRuntime`, `ClientStateStream`, `ClientCommand`, `ClientSnapshot`, and stable view models from `waltr-client` for server-backed state.
 - Keep form drafts, focus, route params, modal state, animation state, and terminal/browser rendering concerns local to the implementation.
 - Dispatch shared commands for server data mutations instead of constructing RPC requests in UI code.
-- Treat snapshots as the source of truth for loaded config, patch/load/watch status, status readiness, and operation errors.
+- Treat snapshots as the source of truth for the catalog, effective configuration, watches, readiness, and operation errors.
 - For async command completion, capture the operation key from the immediate command snapshot and observe `snapshot.operations.current[key]` until it reaches `ready` or `failed`.
-- Register config watch interest while a UI surface needs live config updates, and release interest when that surface no longer needs them.
+- Register catalog watch interest while a UI surface needs live resource updates. Release interest when that surface no longer needs them.
 - Preserve feature parity between web and TUI by changing shared reducer behavior in `waltr-client` when behavior is not platform-specific.
 - Keep Waltr access state distinct from provider/upstream-MCP `AuthTarget` state, and ignore stale login attempts, credential leases, and watch epochs.
 - Keep provider and MCP catalog loading, mutation commands, operation keys, and snapshots in the shared reducer; browser bindings must not construct direct catalog transports.
@@ -178,10 +180,10 @@ The TUI opens create selection with `C-x s` and switches the open session with `
 | --- | --- |
 | [../../crates/waltr-client/src/client.rs](../../crates/waltr-client/src/client.rs) | Reducer entry point and command helpers. |
 | [../../crates/waltr-client/src/coordination/state.rs](../../crates/waltr-client/src/coordination/state.rs) | Shared client state and operation statuses. |
-| [../../crates/waltr-client/src/coordination/event.rs](../../crates/waltr-client/src/coordination/event.rs) | Client events, effects, and config patch shape. |
+| [../../crates/waltr-client/src/coordination/event.rs](../../crates/waltr-client/src/coordination/event.rs) | Client events, effects, and resource-write intents. |
 | [../../crates/waltr-client/src/coordination/runtime.rs](../../crates/waltr-client/src/coordination/runtime.rs) | Runtime and state-stream orchestration. |
 | [../../crates/waltr-client/src/transport/mod.rs](../../crates/waltr-client/src/transport/mod.rs) | RPC transport boundary. |
 | [../../crates/waltr-client/src/view/mod.rs](../../crates/waltr-client/src/view/mod.rs) | Stable shell-facing view models. |
-| [../../proto/waltr/config/v1/config_service.proto](../../proto/waltr/config/v1/config_service.proto) | Config RPC contract. |
-| [config.md](config.md) | Config patch, ETag, and watch behavior. |
+| [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC contract. |
+| [config.md](config.md) | Unified catalog, per-slot ETag, and watch behavior. |
 | [access-authentication.md](access-authentication.md) | Access boundaries and browser, native, and MCP authentication flows. |
