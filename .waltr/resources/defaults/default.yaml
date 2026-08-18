@@ -5,4 +5,4 @@ metadata:
 spec:
   inference:
     provider: agent-gateway-codex
-    model: codex/gpt-5.6-sol
+    model: gpt-5.6-sol

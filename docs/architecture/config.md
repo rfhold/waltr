@@ -49,7 +49,7 @@ Agent, feature, and permission syntax is documented in [Agent Architecture](agen
 
 `Provider` selects one inference transport and URL. It can define headers, OAuth metadata, explicit models, and a models.dev catalog selector.
 
-A provider catalog selector names a models.dev provider and an `include` list. Optional `keyPrefix` and `aliases` alter materialized model keys.
+A provider catalog selector names a models.dev provider and an `include` list. Optional `keyPrefix` and `aliases` alter materialized model keys. Waltr uses the materialized key as the session and upstream model identifier, so prefixes are functional routing identifiers rather than presentation-only namespaces.
 
 `McpServer` uses `spec.transport: streamableHttp` with a URL, or `spec.transport: stdio` with a command.
 

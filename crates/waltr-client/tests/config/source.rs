@@ -70,8 +70,6 @@ async fn provider_and_mcp_edits_preserve_bundled_raw_source() {
         .expect("catalog should load");
     let codex_source = resource_source(&catalog, "providers/codex.yaml");
     assert!(codex_source.contains("include:\n    - gpt-5.*"));
-    assert!(codex_source.contains("keyPrefix: codex/"));
-    assert!(codex_source.contains("codex/gpt-5.6: gpt-5.6"));
     let mcp_source = resource_source(&catalog, "mcp-servers/waltr.yaml");
     assert_eq!(mcp_source, initial_mcp_source);
 }

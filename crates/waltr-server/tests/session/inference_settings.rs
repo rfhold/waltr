@@ -21,7 +21,7 @@ async fn create_session_persists_resource_defaults() -> Result<(), Box<dyn std::
         .expect("created session");
     let provider = session.inference_settings.unwrap().provider.unwrap();
     assert_eq!(provider.key, "codex");
-    assert_eq!(provider.model_id, "codex/gpt-5.6");
+    assert_eq!(provider.model_id, "gpt-5.6-sol");
     assert_eq!(provider.reasoning_effort.as_deref(), Some("high"));
     let listed = client
         .list_sessions(ListSessionsRequest::default())
@@ -115,7 +115,7 @@ async fn resource_change_reports_provider_drift() -> Result<(), Box<dyn std::err
     resources
         .replace_resource(ReplaceResourceRequest {
             path: "providers/codex.yaml".to_owned(),
-            source: "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: codex\nspec:\n  transport: openaiResponses\n  url: https://changed.example.test/responses\n  catalog:\n    provider: openai\n    include: [gpt-5.*]\n    keyPrefix: codex/\n".to_owned(),
+            source: "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: codex\nspec:\n  transport: openaiResponses\n  url: https://changed.example.test/responses\n  catalog:\n    provider: openai\n    include: [gpt-5.*]\n".to_owned(),
             expected_etag: inspection.persisted_etag,
         })
         .await?;

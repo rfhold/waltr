@@ -63,7 +63,7 @@ export default async function () {
     const resetMcpServers = await waitForText(page, ".config__list", "waltr");
     await page.locator('[role="tablist"][aria-label="Configuration sections"] a[href="/config/defaults"]').click();
     const resetProviderDefault = await waitForSelectValue(page, "#inference-default-provider", "codex");
-    const resetModelDefault = await waitForSelectValue(page, "#inference-default-model", "codex/gpt-5.6");
+    const resetModelDefault = await waitForSelectValue(page, "#inference-default-model", "gpt-5.6-sol");
 
     check({
       defaultsRoute,
@@ -91,7 +91,7 @@ export default async function () {
         !includesText(customProviderRemoved, PROVIDER) &&
         includesText(resetMcpServers, "waltr") &&
         resetProviderDefault === "codex" &&
-        resetModelDefault === "codex/gpt-5.6",
+        resetModelDefault === "gpt-5.6-sol",
     });
   });
 }
