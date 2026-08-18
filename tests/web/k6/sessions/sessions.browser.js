@@ -45,7 +45,7 @@ export default async function () {
     await screenshot(page, "sessions-detail-thinking-high");
 
     await clickButtonByLabel(page, "Edit provider/model");
-    await waitForText(page, '[role="dialog"]', "Edit provider/model");
+    await waitForText(page, '[role="dialog"]', "Edit inference settings");
     const providerDialogThinking = await waitForLabeledSelectValue(page, "Thinking level", "high");
     await screenshot(page, "sessions-provider-runtime-thinking-dialog");
     await clickRuntimeProviderOption(page, SECONDARY_PROVIDER);

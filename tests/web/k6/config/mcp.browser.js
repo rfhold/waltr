@@ -47,16 +47,16 @@ export default async function () {
     const editServerTabSelected = await mcpTabContextPreserved(page);
     await waitForText(page, 'form[aria-label="Edit MCP server"]', "Name");
     await screenshot(page, "config-mcp-edit-form-stdio");
-    await page.locator('form[aria-label="Edit MCP server"] select[name="kind"]').selectOption("sse");
+    await page.locator('form[aria-label="Edit MCP server"] select[name="kind"]').selectOption("streamableHttp");
     await setInputValue(
       page,
       'form[aria-label="Edit MCP server"] input[name="url"]',
-      "https://localhost:8787/sse",
+      "https://localhost:8787/mcp",
     );
     await page.locator('form[aria-label="Edit MCP server"] button[type="submit"]').click();
     const editedServer = await waitForText(page, ".config__list", "localstdio");
-    const editedKind = await waitForText(page, ".config__list", "sse");
-    const editedUrl = await waitForText(page, ".config__list", "https://localhost:8787/sse");
+    const editedKind = await waitForText(page, ".config__list", "streamableHttp");
+    const editedUrl = await waitForText(page, ".config__list", "https://localhost:8787/mcp");
     const editedCommandRemoved = await waitForMissingText(page, ".config__list", "npx local-mcp");
 
     await page.locator('button[aria-label="Delete localstdio"]').click();
@@ -107,8 +107,8 @@ export default async function () {
         editServerRoute &&
         editServerTabSelected &&
         includesText(editedServer, "localstdio") &&
-        includesText(editedKind, "sse") &&
-        includesText(editedUrl, "https://localhost:8787/sse") &&
+        includesText(editedKind, "streamableHttp") &&
+        includesText(editedUrl, "https://localhost:8787/mcp") &&
         !includesText(editedCommandRemoved, "npx local-mcp") &&
         includesText(deleteConfirm, "Delete?") &&
         !includesText(deletedServer, "localstdio"),

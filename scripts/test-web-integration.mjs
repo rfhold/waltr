@@ -37,10 +37,24 @@ const logRoot = fileURLToPath(new URL("../.dev/logs", import.meta.url));
 const screenshotRoot = fileURLToPath(new URL("../.dev/web-screenshots", import.meta.url));
 const screenshotLockPath = `${screenshotRoot}/.lock`;
 const modelsDevFixture = `${repoRoot}/tests/web/k6/support/models-dev-api.fixture.json`;
-const emptyConfigFixture = `${repoRoot}/tests/web/k6/support/empty-config.fixture.toml`;
-const sessionsRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/sessions-runtime-config.fixture.toml`;
-const mcpOauthRuntimeConfigFixture = `${repoRoot}/tests/web/k6/support/mcp-oauth-runtime-config.fixture.toml`;
+const resourceFixtureRoot = `${repoRoot}/tests/web/k6/support/resource-trees`;
 const screenshotSnapshotDir = `${repoRoot}/tests/web/k6/snapshots/screenshots`;
+const RESOURCE_CATEGORIES = [
+  "providers",
+  "mcp-servers",
+  "defaults",
+  "features",
+  "permissions",
+  "agents",
+];
+const RESOURCE_REMOVAL_ORDER = [
+  "agents",
+  "features",
+  "permissions",
+  "defaults",
+  "mcp-servers",
+  "providers",
+];
 const BUILD_TIMEOUT_MS = 20 * 60_000;
 const COMPOSE_UP_TIMEOUT_MS = 3 * 60_000;
 const K6_TIMEOUT_MS = 10 * 60_000;
@@ -1893,6 +1907,7 @@ async function startDevStack(state) {
     env: {
       WALTR_SERVER_ADDR: `127.0.0.1:${serverPort}`,
       WALTR_AUTH_MODE: "disabled",
+      WALTR_PUBLIC_URL: state.serverUrl,
       WALTR_DATABASE_URL: `sqlite://${state.runRoot}/waltr.sqlite3`,
       WALTR_MCP_DATABASE_URL: `sqlite://${state.runRoot}/mcp.sqlite3`,
       WALTR_MODELS_DEV_PATH: modelsDevFixture,
@@ -1918,77 +1933,247 @@ async function startDevStack(state) {
 }
 
 function seedDevConfig(state, browserScript) {
-  const configDir = `${state.runRoot}/.waltr`;
-  const configPath = `${configDir}/waltr.toml`;
-  const nextPath = `${configPath}.next`;
-  mkdirSync(configDir, { recursive: true });
-  copyFileSync(fixtureForBrowserScript(browserScript), nextPath);
-  const staged = lstatSync(nextPath);
-  if (staged.isSymbolicLink() || !staged.isFile()) {
-    throw new Error(`refusing unsafe staged dev config ${nextPath}`);
-  }
-  const stagedIdentity = fileIdentityFromStat(staged);
-  // Replacing config is intentional publication between browser scripts.
-  renameSync(nextPath, configPath);
-  const published = lstatSync(configPath);
-  if (published.isSymbolicLink() || !published.isFile() ||
-    !sameFileIdentity(fileIdentityFromStat(published), stagedIdentity)) {
-    throw new Error(`dev config changed during publication: ${configPath}`);
-  }
+  publishResourceFixtureTree(
+    `${state.runRoot}/.waltr/resources`,
+    fixtureForBrowserScript(browserScript),
+    runtimeFor(state),
+  );
 }
 
 async function seedComposeConfig(state, phase, browserScript) {
-  const target = "/data/.waltr/waltr.toml";
-  const staged = "/tmp/waltr.toml.seed";
-  const next = `${target}.next`;
+  const fixtureName = fixtureNameForBrowserScript(browserScript);
   await runComposeChecked(state, [
     "--profile",
     phase.profile,
     "exec",
     "-T",
     phase.waltrService,
-    "mkdir",
-    "-p",
-    "/data/.waltr",
-  ], DOCKER_TIMEOUT_MS);
-  await runComposeChecked(state, [
-    "--profile",
-    phase.profile,
-    "cp",
-    fixtureForBrowserScript(browserScript),
-    `${phase.waltrService}:${staged}`,
-  ], DOCKER_TIMEOUT_MS);
-  await runComposeChecked(state, [
-    "--profile",
-    phase.profile,
-    "exec",
-    "-T",
-    phase.waltrService,
-    "cp",
-    staged,
-    next,
-  ], DOCKER_TIMEOUT_MS);
-  await runComposeChecked(state, [
-    "--profile",
-    phase.profile,
-    "exec",
-    "-T",
-    phase.waltrService,
-    "mv",
-    next,
-    target,
+    "/bin/bash",
+    "-ceu",
+    COMPOSE_RESOURCE_PUBLISH_SCRIPT,
+    "--",
+    fixtureName === null ? "-" : `/fixtures/resource-trees/${fixtureName}/.waltr/resources`,
   ], DOCKER_TIMEOUT_MS);
 }
 
 function fixtureForBrowserScript(browserScript) {
+  const fixtureName = fixtureNameForBrowserScript(browserScript);
+  return fixtureName === null
+    ? null
+    : `${resourceFixtureRoot}/${fixtureName}/.waltr/resources`;
+}
+
+export function fixtureNameForBrowserScript(browserScript) {
   if (browserScript === "tests/web/k6/sessions/sessions.browser.js") {
-    return sessionsRuntimeConfigFixture;
+    return "sessions-runtime";
   }
   if (browserScript === "tests/web/k6/sessions/mcp-oauth.browser.js") {
-    return mcpOauthRuntimeConfigFixture;
+    return "mcp-oauth-runtime";
   }
-  return emptyConfigFixture;
+  return null;
 }
+
+export function publishResourceFixtureTree(targetRoot, fixtureRoot, runtime = createHarnessRuntime()) {
+  const configRoot = dirname(targetRoot);
+  const serverRoot = dirname(configRoot);
+  ensurePlainChildDirectory(serverRoot, configRoot, runtime, "web integration config root");
+  ensurePlainChildDirectory(configRoot, targetRoot, runtime, "web integration resource root");
+  assertResourceCategoryLayout(targetRoot, runtime, "published resource tree");
+
+  const fixtureFiles = new Map(RESOURCE_CATEGORIES.map((category) => [category, []]));
+  if (fixtureRoot !== null) {
+    verifyPlainDirectory(fixtureRoot, runtime, "resource fixture root");
+    assertResourceCategoryLayout(fixtureRoot, runtime, "resource fixture tree", false);
+    for (const category of RESOURCE_CATEGORIES) {
+      const categoryPath = join(fixtureRoot, category);
+      const categoryStat = lstatIfExists(categoryPath, runtime);
+      if (!categoryStat) {
+        continue;
+      }
+      verifyPlainDirectory(categoryPath, runtime, `resource fixture category ${category}`);
+      for (const entry of runtime.readdirSync(categoryPath).sort()) {
+        const sourcePath = join(categoryPath, entry);
+        assertYamlResourceFile(sourcePath, runtime, "resource fixture");
+        fixtureFiles.get(category).push(sourcePath);
+      }
+    }
+  }
+
+  for (const category of RESOURCE_REMOVAL_ORDER) {
+    const categoryPath = join(targetRoot, category);
+    ensurePlainChildDirectory(targetRoot, categoryPath, runtime, `published resource category ${category}`);
+    for (const entry of runtime.readdirSync(categoryPath)) {
+      const path = join(categoryPath, entry);
+      assertYamlResourceFile(path, runtime, "published resource");
+      runtime.rmSync(path);
+    }
+  }
+
+  for (const category of RESOURCE_CATEGORIES) {
+    const categoryPath = join(targetRoot, category);
+    for (const sourcePath of fixtureFiles.get(category)) {
+      publishResourceFile(sourcePath, join(categoryPath, basename(sourcePath)), runtime);
+    }
+  }
+}
+
+function ensurePlainChildDirectory(parent, path, runtime, label) {
+  assertDirectChild(parent, path, label);
+  verifyPlainDirectory(parent, runtime, `${label} parent`);
+  if (!lstatIfExists(path, runtime)) {
+    runtime.mkdirSync(path);
+  }
+  verifyPlainDirectory(path, runtime, label);
+}
+
+function assertResourceCategoryLayout(root, runtime, label, createCategories = true) {
+  for (const entry of runtime.readdirSync(root)) {
+    if (!RESOURCE_CATEGORIES.includes(entry)) {
+      throw new Error(`refusing unknown ${label} entry ${join(root, entry)}`);
+    }
+    verifyPlainDirectory(join(root, entry), runtime, `${label} category ${entry}`);
+  }
+  if (createCategories) {
+    for (const category of RESOURCE_CATEGORIES) {
+      ensurePlainChildDirectory(root, join(root, category), runtime, `${label} category ${category}`);
+    }
+  }
+}
+
+function assertYamlResourceFile(path, runtime, label) {
+  const stat = runtime.lstatSync(path);
+  if (!path.endsWith(".yaml") || stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`refusing symlinked, non-file, or non-YAML ${label} ${path}`);
+  }
+  return stat;
+}
+
+function assertRegularFile(path, runtime, label) {
+  const stat = runtime.lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`refusing symlinked or non-file ${label} ${path}`);
+  }
+  return stat;
+}
+
+function publishResourceFile(sourcePath, targetPath, runtime) {
+  const source = assertYamlResourceFile(sourcePath, runtime, "resource fixture");
+  const sourceIdentity = fileIdentityFromStat(source);
+  const stagedPath = join(dirname(targetPath), `.${basename(targetPath)}.next`);
+  if (lstatIfExists(stagedPath, runtime)) {
+    throw new Error(`refusing existing staged resource ${stagedPath}`);
+  }
+  try {
+    runtime.copyFileSync(sourcePath, stagedPath);
+    const sourceAfter = assertYamlResourceFile(sourcePath, runtime, "resource fixture");
+    if (!sameFileIdentity(sourceIdentity, fileIdentityFromStat(sourceAfter))) {
+      throw new Error(`resource fixture changed during publication: ${sourcePath}`);
+    }
+    const staged = assertRegularFile(stagedPath, runtime, "staged resource");
+    const stagedIdentity = fileIdentityFromStat(staged);
+    runtime.renameSync(stagedPath, targetPath);
+    const published = assertYamlResourceFile(targetPath, runtime, "published resource");
+    if (!sameFileIdentity(stagedIdentity, fileIdentityFromStat(published))) {
+      throw new Error(`resource changed during publication: ${targetPath}`);
+    }
+  } catch (error) {
+    const staged = lstatIfExists(stagedPath, runtime);
+    if (staged && !staged.isSymbolicLink() && staged.isFile()) {
+      runtime.rmSync(stagedPath);
+    }
+    throw error;
+  }
+}
+
+const COMPOSE_RESOURCE_PUBLISH_SCRIPT = `
+source_root=$1
+target_root=/data/.waltr/resources
+categories=(providers mcp-servers defaults features permissions agents)
+removal_order=(agents features permissions defaults mcp-servers providers)
+shopt -s nullglob dotglob
+
+ensure_directory() {
+  local path=$1
+  if [[ -L $path || ( -e $path && ! -d $path ) ]]; then
+    echo "refusing symlinked or non-directory resource path $path" >&2
+    exit 1
+  fi
+  mkdir -p -- "$path"
+}
+
+validate_tree_root() {
+  local root=$1 entry name allowed
+  [[ ! -L $root && -d $root ]] || { echo "unsafe resource tree root $root" >&2; exit 1; }
+  for entry in "$root"/*; do
+    name=$(basename -- "$entry")
+    allowed=false
+    for category in "\${categories[@]}"; do
+      [[ $name == "$category" ]] && allowed=true
+    done
+    [[ $allowed == true && ! -L $entry && -d $entry ]] || {
+      echo "refusing unknown or unsafe resource category $entry" >&2
+      exit 1
+    }
+  done
+}
+
+validate_yaml_file() {
+  local path=$1
+  [[ $path == *.yaml ]] || {
+    echo "refusing symlinked, non-file, or non-YAML resource $path" >&2
+    exit 1
+  }
+  validate_regular_file "$path"
+}
+
+validate_regular_file() {
+  local path=$1
+  [[ ! -L $path && -f $path ]] || {
+    echo "refusing symlinked or non-file resource $path" >&2
+    exit 1
+  }
+}
+
+ensure_directory /data/.waltr
+ensure_directory "$target_root"
+validate_tree_root "$target_root"
+for category in "\${categories[@]}"; do
+  ensure_directory "$target_root/$category"
+done
+
+for category in "\${removal_order[@]}"; do
+  for entry in "$target_root/$category"/*; do
+    validate_yaml_file "$entry"
+    rm -- "$entry"
+  done
+done
+
+if [[ $source_root != - ]]; then
+  validate_tree_root "$source_root"
+  for category in "\${categories[@]}"; do
+    source_category="$source_root/$category"
+    [[ ! -e $source_category && ! -L $source_category ]] && continue
+    [[ ! -L $source_category && -d $source_category ]] || {
+      echo "unsafe resource fixture category $source_category" >&2
+      exit 1
+    }
+    for source in "$source_category"/*; do
+      validate_yaml_file "$source"
+      name=$(basename -- "$source")
+      staged="$target_root/$category/.$name.next"
+      target="$target_root/$category/$name"
+      [[ ! -e $staged && ! -L $staged ]] || {
+        echo "refusing existing staged resource $staged" >&2
+        exit 1
+      }
+      cp -- "$source" "$staged"
+      validate_regular_file "$staged"
+      mv -T -- "$staged" "$target"
+      validate_yaml_file "$target"
+    done
+  done
+fi
+`;
 
 export async function runDevK6(state, browserScript) {
   state.directContainerNames ??= new Set();

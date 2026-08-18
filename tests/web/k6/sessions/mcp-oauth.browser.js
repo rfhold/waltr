@@ -12,11 +12,11 @@ export default async function () {
     await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
     await waitForPathname(page, "/sessions");
     await createSession(page);
-    const sessionUrl = page.url();
-    const sessionPath = await page.evaluate(() => window.location.pathname);
 
     const protectedPrompt = "trigger protected mcp oauth";
     await typeAndKeepFocus(page, '[aria-label="Session message"]', protectedPrompt);
+    const sessionUrl = page.url();
+    const sessionPath = await page.evaluate(() => window.location.pathname);
     await page.locator('[aria-label="Send session message"] button[type="submit"]').click();
     const authenticationFailure = await waitForText(
       page,
@@ -115,7 +115,10 @@ export default async function () {
     }
 
     await waitForMissingElement(page, '.oauth-dialog', 20_000);
-    await page.goto(sessionUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(`${baseUrl}/sessions`, { waitUntil: "domcontentloaded" });
+    await waitForPathname(page, "/sessions");
+    const sessionId = sessionPath.split("/").at(-1);
+    await page.locator(`[aria-label="Open session ${sessionId}"]`).click();
     await waitForPathname(page, sessionPath);
     await typeAndKeepFocus(page, '[aria-label="Session message"]', protectedPrompt);
     await page.locator('[aria-label="Send session message"] button[type="submit"]').click();
@@ -126,17 +129,17 @@ export default async function () {
     await waitForPathname(page, "/sessions");
     await createSession(page);
     await clearTextarea(page, '[aria-label="Session message"]');
-    await typeAndKeepFocus(page, '[aria-label="Session message"]', "@configuration");
+    await typeAndKeepFocus(page, '[aria-label="Session message"]', "@resources");
     const suggestions = await waitForText(
       page,
       '[aria-label="Resource suggestions"]',
-      "configuration.inspect",
+      "mcp_protected_exec",
     );
-    await clickResourceSuggestion(page, "configuration.inspect");
+    await clickResourceSuggestion(page, "mcp_protected_exec");
     const selectedOperation = await waitForTextareaValueChange(
       page,
       '[aria-label="Session message"]',
-      "@configuration",
+      "@resources",
     );
     visibleSnapshots.push(await visibleText(page, "body"));
     await screenshot(page, "sessions-mcp-oauth-authorized-resource-search");
@@ -156,9 +159,9 @@ export default async function () {
       "explicit retry is admitted without another MCP auth blocker": () => noRetryDialog,
       "dynamic bearer reaches the protected Waltr MCP resource": () =>
         authorizationContract.callbackUri === `${baseUrl}/outbound-oauth/callback` &&
-        includesText(suggestions, "configuration.inspect"),
-      "protected configuration.inspect operation is selectable": () =>
-        includesText(suggestions, "configuration.inspect") && selectedOperation !== "@configuration",
+        includesText(suggestions, "mcp_protected_exec"),
+      "protected Waltr dispatcher is selectable": () =>
+        includesText(suggestions, "mcp_protected_exec") && selectedOperation !== "@resources",
       "authorization URL omits the PKCE verifier": () => authorizationContract.codeVerifier === "",
       "authorization request carries callback state": () => authorizationContract.state.length >= 8,
       "authorization request carries an S256 challenge": () => authorizationContract.codeChallenge.length >= 8,

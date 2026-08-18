@@ -1,0 +1,7 @@
+apiVersion: waltr.dev/v1alpha1
+kind: McpServer
+metadata:
+  name: git
+spec:
+  transport: stdio
+  command: git-mcp

@@ -1,0 +1,7 @@
+apiVersion: waltr.dev/v1alpha1
+kind: McpServer
+metadata:
+  name: files
+spec:
+  transport: stdio
+  command: files-mcp
