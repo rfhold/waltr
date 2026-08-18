@@ -347,7 +347,7 @@ fn render_composer_metadata(
         Layout::horizontal([Constraint::Percentage(80), Constraint::Percentage(20)]).areas(area);
 
     frame.render_widget(
-        Paragraph::new(composer_inference_line(session)).style(panel_style()),
+        Paragraph::new(composer_inference_line(session, left.width)).style(panel_style()),
         left,
     );
     frame.render_widget(
@@ -358,7 +358,7 @@ fn render_composer_metadata(
     );
 }
 
-fn composer_inference_line(session: &SessionView) -> Line<'static> {
+fn composer_inference_line(session: &SessionView, available_width: u16) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled("agent ", panel_muted_style()),
@@ -373,19 +373,26 @@ fn composer_inference_line(session: &SessionView) -> Line<'static> {
         Span::raw(" "),
         Span::styled("(C-x p)", THEME.focus_style()),
     ];
-    if let Some(thinking) = provider_thinking_status_text(session.inference_settings.as_ref()) {
-        spans.extend([
+    let optional_spans = if let Some(thinking) =
+        provider_thinking_status_text(session.inference_settings.as_ref())
+    {
+        vec![
             Span::raw("  "),
             Span::styled("t ", panel_muted_style()),
             Span::raw(thinking),
             Span::raw(" "),
             Span::styled("(Ctrl-T)", THEME.focus_style()),
-        ]);
+        ]
     } else {
-        spans.extend([
+        vec![
             Span::raw(" "),
             Span::styled("(Ctrl-T)", THEME.focus_style()),
-        ]);
+        ]
+    };
+    let width = spans.iter().map(Span::width).sum::<usize>();
+    let optional_width = optional_spans.iter().map(Span::width).sum::<usize>();
+    if width.saturating_add(optional_width) <= usize::from(available_width) {
+        spans.extend(optional_spans);
     }
     Line::from(spans)
 }
@@ -439,4 +446,76 @@ fn provider_thinking_status_text(settings: Option<&InferenceSettingsView>) -> Op
             .unwrap_or("none")
             .to_owned(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use waltr_client::{
+        InferenceProviderSettingsView, InferenceSettingsMatchView, InferenceSettingsView,
+        ProviderKindView, SessionMetricsView, SessionPhaseView, SessionStatusView, SessionView,
+    };
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    use super::render_composer_metadata;
+
+    #[test]
+    fn narrow_metadata_never_clips_thinking_hint_into_context_metrics() {
+        let session = session();
+
+        for width in 75..=90 {
+            let backend = TestBackend::new(width, 1);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| {
+                    render_composer_metadata(frame, Rect::new(0, 0, width, 1), &session, 0);
+                })
+                .expect("metadata render");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            let before_metrics = rendered.split("ctx").next().expect("metadata prefix");
+
+            assert!(!rendered.contains("tctx"), "width {width}: {rendered:?}");
+            assert!(
+                !before_metrics.contains("Ctrl") || before_metrics.contains("(Ctrl-T)"),
+                "width {width}: {rendered:?}"
+            );
+            assert!(
+                before_metrics.contains("provider codex/gpt-5.6-sol (C-x p)"),
+                "width {width}: {rendered:?}"
+            );
+        }
+    }
+
+    fn session() -> SessionView {
+        SessionView {
+            id: "session".to_owned(),
+            agent_name: "coding".to_owned(),
+            revision: 1,
+            status: SessionStatusView {
+                phase: SessionPhaseView::Idle,
+                failed_message: String::new(),
+                authentication_failure: None,
+            },
+            current_prompt: None,
+            created_at: None,
+            updated_at: None,
+            last_activity_at: None,
+            inference_settings: Some(InferenceSettingsView {
+                provider: Some(InferenceProviderSettingsView {
+                    key: "codex".to_owned(),
+                    kind: ProviderKindView::OpenAiResponses,
+                    url: String::new(),
+                    model_id: "gpt-5.6-sol".to_owned(),
+                    reasoning_effort: None,
+                    match_status: InferenceSettingsMatchView::Configured,
+                }),
+            }),
+            metrics: SessionMetricsView::default(),
+        }
+    }
 }

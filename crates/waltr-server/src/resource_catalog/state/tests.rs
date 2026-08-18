@@ -71,7 +71,7 @@ async fn unified_catalog_materializes_all_six_kinds_and_runtime_indexes() {
     assert!(
         config.providers["codex"]
             .models
-            .contains_key("codex/gpt-5.3")
+            .contains_key("gpt-5.3")
     );
     assert_eq!(config.inference_defaults.unwrap().provider_key, "codex");
     assert_eq!(catalog.etag, state.snapshot().etag());

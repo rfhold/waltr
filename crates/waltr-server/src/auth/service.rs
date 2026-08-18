@@ -2084,7 +2084,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
         let codex = format!(
-            "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: codex\nspec:\n  transport: openaiResponses\n  url: https://chatgpt.com/backend-api/codex/responses\n  oauth:\n    name: Test Codex\n    authorizeUrl: {base}/authorize\n    tokenUrl: {base}/token\n    clientId: test-client\n    redirectUri: http://127.0.0.1/provider-callback\n    tokenRequestStyle: formUrlencoded\n  catalog:\n    provider: openai\n    include: [gpt-5.*]\n    keyPrefix: codex/\n"
+            "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: codex\nspec:\n  transport: openaiResponses\n  url: https://chatgpt.com/backend-api/codex/responses\n  oauth:\n    name: Test Codex\n    authorizeUrl: {base}/authorize\n    tokenUrl: {base}/token\n    clientId: test-client\n    redirectUri: http://127.0.0.1/provider-callback\n    tokenRequestStyle: formUrlencoded\n  catalog:\n    provider: openai\n    include: [gpt-5.*]\n"
         );
         let remote = format!(
             "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: remote\nspec:\n  transport: streamableHttp\n  url: {resource}\n"

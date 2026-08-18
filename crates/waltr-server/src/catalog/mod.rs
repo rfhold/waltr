@@ -664,6 +664,30 @@ mod loader_tests {
             .await;
     }
 
+    #[test]
+    fn select_models_materializes_prefixed_and_alias_keys_with_upstream_ids() {
+        let materializer = CatalogMaterializer {
+            loaded: parse_catalog(CATALOG, false).expect("parse catalog fixture"),
+        };
+        let aliases = std::collections::BTreeMap::from([(
+            "model-alias".to_owned(),
+            "model".to_owned(),
+        )]);
+
+        let selected = materializer
+            .select_models("test", &["model".to_owned()], &aliases, "prefixed/")
+            .expect("select fixture models");
+
+        assert_eq!(selected.len(), 2);
+        for key in ["prefixed/model", "model-alias"] {
+            let model = selected.get(key).expect("materialized model key");
+            assert_eq!(model.name, "Test Model");
+            let catalog_match = model.catalog_match.as_ref().expect("catalog match");
+            assert_eq!(catalog_match.provider_id, "test");
+            assert_eq!(catalog_match.model_id, "model");
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_cold_loads_share_one_refresh() {
         const CALLERS: usize = 8;

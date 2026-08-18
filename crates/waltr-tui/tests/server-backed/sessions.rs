@@ -93,7 +93,7 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     let rendered = render_app(&app);
     assert!(rendered.contains("agent "));
     assert!(rendered.contains("(C-x a)"));
-    assert!(rendered.contains("provider codex/codex/gpt-5.6 (C-x p)"));
+    assert!(rendered.contains("provider codex/gpt-5.6-sol (C-x p)"));
     assert!(rendered.contains("ctx 0"));
     insta::assert_snapshot!(
         "sessions_detail_real_server",
