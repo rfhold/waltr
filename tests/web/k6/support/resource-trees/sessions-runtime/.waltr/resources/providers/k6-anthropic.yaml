@@ -1,0 +1,17 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata:
+  name: k6-anthropic
+spec:
+  transport: anthropicMessages
+  url: https://example.invalid/v1
+  models:
+    claude:
+      name: claude
+      type: 1
+      options:
+        reasoning_efforts: []
+      limits: {}
+      capabilities:
+        tools: false
+        image: false

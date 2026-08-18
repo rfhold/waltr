@@ -32,7 +32,7 @@ export default async function () {
     await submitForm(page, 'form[aria-label="Create provider"]');
     await waitForText(page, '[aria-label="Provider list"]', PROVIDER);
 
-    await page.locator('a[href="/config/defaults"]').click();
+    await page.locator('[role="tablist"][aria-label="Configuration sections"] a[href="/config/defaults"]').click();
     const defaultsRoute = await waitForPathname(page, "/config/defaults");
     await waitForText(page, "#inference-defaults-title", "New session inference");
     await waitForSelectOption(page, "#inference-default-provider", PROVIDER);
@@ -52,18 +52,18 @@ export default async function () {
     await page.locator('button[aria-label="Confirm reset configuration"]').click();
     const resetSuccess = await waitForText(page, ".config", "Configuration reset.");
 
-    await page.locator('a[href="/config/provider"]').click();
+    await page.locator('[role="tablist"][aria-label="Configuration sections"] a[href="/config/provider"]').click();
     const resetProviders = await waitForText(page, '[aria-label="Provider list"]', "claude-code");
     await waitForText(page, '[aria-label="Provider list"]', "anthropic");
     await waitForText(page, '[aria-label="Provider list"]', "openai");
     await waitForText(page, '[aria-label="Provider list"]', "codex");
     const customProviderRemoved = await waitForMissingText(page, '[aria-label="Provider list"]', PROVIDER);
 
-    await page.locator('a[href="/config/mcp"]').click();
+    await page.locator('[role="tablist"][aria-label="Configuration sections"] a[href="/config/mcp"]').click();
     const resetMcpServers = await waitForText(page, ".config__list", "waltr");
-    await page.locator('a[href="/config/defaults"]').click();
-    const resetProviderDefault = await waitForSelectValue(page, "#inference-default-provider", "");
-    const resetModelDefault = await waitForSelectValue(page, "#inference-default-model", "");
+    await page.locator('[role="tablist"][aria-label="Configuration sections"] a[href="/config/defaults"]').click();
+    const resetProviderDefault = await waitForSelectValue(page, "#inference-default-provider", "codex");
+    const resetModelDefault = await waitForSelectValue(page, "#inference-default-model", "codex/gpt-5.6");
 
     check({
       defaultsRoute,
@@ -90,8 +90,8 @@ export default async function () {
         ["anthropic", "claude-code", "openai", "codex"].every((provider) => includesText(resetProviders, provider)) &&
         !includesText(customProviderRemoved, PROVIDER) &&
         includesText(resetMcpServers, "waltr") &&
-        resetProviderDefault === "" &&
-        resetModelDefault === "",
+        resetProviderDefault === "codex" &&
+        resetModelDefault === "codex/gpt-5.6",
     });
   });
 }

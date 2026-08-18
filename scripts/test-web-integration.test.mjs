@@ -36,7 +36,9 @@ import {
   exitCodeFor,
   integrationPhases,
   parseCliArgs,
+  fixtureNameForBrowserScript,
   profileForPhase,
+  publishResourceFixtureTree,
   releaseScreenshotLock,
   requestSignalStop,
   runCli,
@@ -189,6 +191,78 @@ test("script selection only schedules phases where the script exists", () => {
       "sessions/mcp-oauth.browser.js",
     ])),
     /selected web integration script is not enabled/,
+  );
+});
+
+test("browser scripts select complete resource-tree fixtures", () => {
+  assert.equal(
+    fixtureNameForBrowserScript("tests/web/k6/sessions/sessions.browser.js"),
+    "sessions-runtime",
+  );
+  assert.equal(
+    fixtureNameForBrowserScript("tests/web/k6/sessions/mcp-oauth.browser.js"),
+    "mcp-oauth-runtime",
+  );
+  assert.equal(fixtureNameForBrowserScript("tests/web/k6/config/providers.browser.js"), null);
+});
+
+test("resource fixture publication removes stale slots and atomically publishes files", (context) => {
+  const root = mkdtempSync(join(tmpdir(), "waltr-resource-fixture-contract-"));
+  const serverRoot = join(root, "server");
+  const firstFixture = join(root, "first");
+  const secondFixture = join(root, "second");
+  const target = join(serverRoot, ".waltr", "resources");
+  context.after(() => rmSync(root, { force: true, recursive: true }));
+  mkdirSync(serverRoot);
+  mkdirSync(join(firstFixture, "providers"), { recursive: true });
+  mkdirSync(join(firstFixture, "defaults"));
+  mkdirSync(join(firstFixture, "features"));
+  mkdirSync(join(secondFixture, "mcp-servers"), { recursive: true });
+  writeFileSync(join(firstFixture, "providers", "first.yaml"), "first\n");
+  writeFileSync(join(firstFixture, "defaults", "default.yaml"), "default\n");
+  writeFileSync(join(firstFixture, "features", "coding.yaml"), "feature\n");
+  writeFileSync(join(secondFixture, "mcp-servers", "second.yaml"), "second\n");
+
+  publishResourceFixtureTree(target, firstFixture);
+  assert.deepEqual(readdirSync(join(target, "providers")), ["first.yaml"]);
+  assert.deepEqual(readdirSync(join(target, "defaults")), ["default.yaml"]);
+  assert.deepEqual(readdirSync(join(target, "features")), ["coding.yaml"]);
+
+  publishResourceFixtureTree(target, secondFixture);
+  assert.deepEqual(readdirSync(join(target, "providers")), []);
+  assert.deepEqual(readdirSync(join(target, "defaults")), []);
+  assert.deepEqual(readdirSync(join(target, "features")), []);
+  assert.deepEqual(readdirSync(join(target, "mcp-servers")), ["second.yaml"]);
+  assert.equal(readFileSync(join(target, "mcp-servers", "second.yaml"), "utf8"), "second\n");
+  assert.deepEqual(
+    readdirSync(join(target, "mcp-servers")).filter((entry) => entry.endsWith(".next")),
+    [],
+  );
+});
+
+test("resource fixture publication rejects unsafe source and target entries", (context) => {
+  const root = mkdtempSync(join(tmpdir(), "waltr-resource-fixture-safety-"));
+  const serverRoot = join(root, "server");
+  const fixture = join(root, "fixture");
+  const target = join(serverRoot, ".waltr", "resources");
+  const external = join(root, "external.yaml");
+  context.after(() => rmSync(root, { force: true, recursive: true }));
+  mkdirSync(serverRoot);
+  mkdirSync(join(fixture, "providers"), { recursive: true });
+  writeFileSync(external, "external\n");
+  symlinkSync(external, join(fixture, "providers", "linked.yaml"));
+
+  assert.throws(
+    () => publishResourceFixtureTree(target, fixture),
+    /refusing symlinked, non-file, or non-YAML resource fixture/,
+  );
+  rmSync(join(fixture, "providers", "linked.yaml"));
+  writeFileSync(join(fixture, "providers", "safe.yaml"), "safe\n");
+  publishResourceFixtureTree(target, fixture);
+  mkdirSync(join(target, "providers", "not-a-file.yaml"));
+  assert.throws(
+    () => publishResourceFixtureTree(target, null),
+    /refusing symlinked, non-file, or non-YAML published resource/,
   );
 });
 

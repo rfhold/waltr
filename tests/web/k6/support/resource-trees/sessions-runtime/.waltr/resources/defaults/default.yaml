@@ -1,0 +1,8 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Defaults
+metadata:
+  name: default
+spec:
+  inference:
+    provider: k6-openai
+    model: gpt-5-nano

@@ -1,0 +1,17 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata:
+  name: k6-openai
+spec:
+  transport: openaiChatCompletions
+  url: https://example.invalid/v1
+  models:
+    gpt-5-nano:
+      name: gpt-5-nano
+      type: 1
+      options:
+        reasoning_efforts: []
+      limits: {}
+      capabilities:
+        tools: true
+        image: false

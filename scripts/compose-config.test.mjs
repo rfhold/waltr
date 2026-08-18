@@ -18,7 +18,9 @@ const caScript = readFileSync(caScriptPath, "utf8");
 const k6Entrypoint = readFileSync(`${repoRoot}/tests/web/k6/support/k6-entrypoint.sh`, "utf8");
 const trustScript = readFileSync(`${repoRoot}/tests/web/k6/access/trust.browser.js`, "utf8");
 const hostedOauthScript = readFileSync(`${repoRoot}/tests/web/k6/sessions/mcp-oauth.browser.js`, "utf8");
-const hostedOauthFixture = readFileSync(`${repoRoot}/tests/web/k6/support/mcp-oauth-runtime-config.fixture.toml`, "utf8");
+const hostedOauthMcpFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/mcp-oauth-runtime/.waltr/resources/mcp-servers/protected.yaml`, "utf8");
+const hostedOauthCodingFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/mcp-oauth-runtime/.waltr/resources/features/coding.yaml`, "utf8");
+const hostedOauthDefaultsFixture = readFileSync(`${repoRoot}/tests/web/k6/support/resource-trees/mcp-oauth-runtime/.waltr/resources/defaults/default.yaml`, "utf8");
 const config = composeConfig("*");
 
 const expectedServicesByProfile = {
@@ -83,10 +85,12 @@ test("all Waltr services have exact static environments", () => {
     waltr: {
       ...expectedCommonEnvironment,
       WALTR_AUTH_MODE: "disabled",
+      WALTR_PUBLIC_URL: "http://127.0.0.1:14333",
     },
     "waltr-test": {
       ...expectedCommonEnvironment,
       WALTR_AUTH_MODE: "disabled",
+      WALTR_PUBLIC_URL: "http://127.0.0.1:14333",
     },
     "waltr-auth": {
       ...expectedCommonEnvironment,
@@ -132,16 +136,28 @@ test("all Waltr services have exact static environments", () => {
   }
 });
 
-test("hosted MCP OAuth fixture uses the OIDC/TLS Waltr resource contract", () => {
-  assert.match(hostedOauthFixture, /^url = "https:\/\/waltr\.test\/mcp"$/m);
-  assert.match(hostedOauthFixture, /^\[inference_defaults\]$/m);
-  assert.match(hostedOauthFixture, /^provider_key = "k6-openai"$/m);
-  assert.match(hostedOauthFixture, /^model_key = "gpt-5-nano"$/m);
-  assert.doesNotMatch(hostedOauthFixture, /runtime_defaults|mcp_default_enabled|enabled_mcp_server_keys/);
+test("hosted MCP OAuth resource tree uses the OIDC/TLS Waltr contract", () => {
+  assert.match(hostedOauthMcpFixture, /^kind: McpServer$/m);
+  assert.match(hostedOauthMcpFixture, /^  url: https:\/\/waltr\.test\/mcp$/m);
+  assert.match(hostedOauthCodingFixture, /^kind: FeatureSet$/m);
+  assert.match(hostedOauthCodingFixture, /^  name: coding$/m);
+  assert.match(hostedOauthCodingFixture, /^      include: \[protected\]$/m);
+  assert.match(hostedOauthDefaultsFixture, /^kind: Defaults$/m);
+  assert.match(hostedOauthDefaultsFixture, /^    provider: k6-openai$/m);
+  assert.match(hostedOauthDefaultsFixture, /^    model: gpt-5-nano$/m);
   assert.match(hostedOauthScript, /\.well-known\/oauth-client\/waltr/);
   assert.match(hostedOauthScript, /outbound-oauth\/callback/);
-  assert.match(hostedOauthScript, /configuration\.inspect/);
+  assert.match(hostedOauthScript, /mcp_protected_exec/);
   assert.doesNotMatch(hostedOauthScript, /completeDexLoginViaHttp/);
+});
+
+test("test MCP authorization is enabled only for the HTTPS fixture", () => {
+  assert.equal(config.services.mcp.environment, undefined);
+  assert.equal(
+    config.services["mcp-auth"].environment.WALTR_TEST_MCP_RESOURCE,
+    "http://127.0.0.1:14666/mcp",
+  );
+  assert.equal(config.services["mcp-auth"].environment.WALTR_TEST_MCP_OAUTH_ISSUER, "https://dex.test");
 });
 
 test("test services use profile-local internal networks", () => {

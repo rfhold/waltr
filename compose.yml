@@ -9,6 +9,7 @@ services:
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
       WALTR_AUTH_MODE: disabled
+      WALTR_PUBLIC_URL: http://127.0.0.1:14333
       WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
       WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
       WALTR_SESSION_STORE: filesystem
@@ -40,6 +41,7 @@ services:
     environment:
       WALTR_SERVER_ADDR: 0.0.0.0:14333
       WALTR_AUTH_MODE: disabled
+      WALTR_PUBLIC_URL: http://127.0.0.1:14333
       WALTR_DATABASE_URL: sqlite:///data/waltr.sqlite3
       WALTR_MCP_DATABASE_URL: sqlite:///data/mcp.sqlite3
       WALTR_SESSION_STORE: filesystem
@@ -58,6 +60,7 @@ services:
           - waltr
     volumes:
       - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
+      - ./tests/web/k6/support/resource-trees:/fixtures/resource-trees:ro
 
   dex:
     profiles:
@@ -85,10 +88,6 @@ services:
     depends_on:
       dex:
         condition: service_healthy
-    environment:
-      WALTR_TEST_MCP_OAUTH_ISSUER: http://dex:5556/dex
-      WALTR_TEST_MCP_OAUTH_CLIENT_ID: waltr-test
-      WALTR_TEST_MCP_RESOURCE: http://mcp:14666/mcp
     healthcheck:
       test: ["CMD", "curl", "--silent", "--show-error", "--max-time", "2", "--output", "/dev/null", "--request", "POST", "--header", "Content-Type: application/json", "--data", "{}", "http://127.0.0.1:14666/mcp"]
       interval: 2s
@@ -235,6 +234,7 @@ services:
       - test-auth
     volumes:
       - ./tests/web/k6/support/models-dev-api.fixture.json:/fixtures/models-dev-api.fixture.json:ro
+      - ./tests/web/k6/support/resource-trees:/fixtures/resource-trees:ro
       - test-ca-public:/test-ca-public:ro
 
   mcp-auth:
@@ -258,7 +258,7 @@ services:
     environment:
       WALTR_TEST_MCP_OAUTH_ISSUER: https://dex.test
       WALTR_TEST_MCP_OAUTH_CLIENT_ID: waltr-test
-      WALTR_TEST_MCP_RESOURCE: http://mcp:14666/mcp
+      WALTR_TEST_MCP_RESOURCE: http://127.0.0.1:14666/mcp
     healthcheck:
       test: ["CMD", "curl", "--silent", "--show-error", "--max-time", "2", "--output", "/dev/null", "--request", "POST", "--header", "Content-Type: application/json", "--data", "{}", "http://127.0.0.1:14666/mcp"]
       interval: 2s
