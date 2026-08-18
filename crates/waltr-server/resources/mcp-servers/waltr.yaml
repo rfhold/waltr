@@ -1,0 +1,8 @@
+apiVersion: waltr.dev/v1alpha1
+kind: McpServer
+metadata:
+  name: waltr
+spec:
+  transport: streamableHttp
+  url: ${env:WALTR_PUBLIC_URL}
+  path: /mcp

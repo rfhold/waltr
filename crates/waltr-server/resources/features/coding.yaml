@@ -1,0 +1,35 @@
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata:
+  name: coding
+spec:
+  filesystem:
+    root: $(session.workspace.root)
+    profile: auto
+    systemPrompt: true
+    agentsReadContext: true
+    skillsContext: true
+    defaultPermissions: true
+  agents:
+    root: $(session.workspace.root)
+    filename: AGENTS.md
+    systemPrompt: true
+  skills:
+    root: $(session.workspace.root)
+    defaultPermissions: true
+  shell:
+    root: $(session.workspace.root)
+    systemPrompt: true
+    defaultPermissions: true
+  task:
+    maxSubagentDepth: 1
+    defaultPermissions: true
+  mcp:
+    servers:
+      exclude: []
+    exposeTools: true
+    instructions: true
+    resources: true
+    prompts: true
+    tracePropagation: true
+    defaultPermissions: true

@@ -5,13 +5,12 @@
     reason = "the progressive_server macro generates this allocation"
 )]
 
-use crate::{config_service::ConfigService, session::SessionHost};
+use crate::{
+    agent_definition::{AgentDefinitionLoadError, AgentDefinitionState},
+    session::SessionHost,
+};
 use futures_util::StreamExt as _;
 use jaq_interpret::{Ctx, FilterT as _, ParseCtx, RcIter, Val};
-use waltr::grpc::waltr::config::v1::{
-    GetConfigRequest, GetConfigResponse, PatchConfigRequest,
-    config_service_server::ConfigService as GeneratedConfigService,
-};
 use waltr_agent::{
     AgentSessionRunDisposition, AuthTarget, ExternalRequest, ExternalRequestKind,
     ExternalRequestStatus, InferenceSettings, PendingWork, PendingWorkStatus, SessionId,
@@ -20,9 +19,9 @@ use waltr_agent::{
 use mcp::server::{ServerError, ServerResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
-use tonic::{Code, Request, Status};
+use tonic::{Code, Status};
 
 const DEFAULT_WAIT_SECONDS: u64 = 60;
 const MAX_WAIT_SECONDS: u64 = 300;
@@ -31,8 +30,8 @@ const WAIT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 /// MCP server backed by Waltr's registered configuration and session services.
 #[derive(Clone)]
 pub struct WaltrMcpServer {
-    config_service: Arc<ConfigService>,
     sessions: Arc<dyn SessionHost>,
+    resources: AgentDefinitionState,
 }
 
 impl std::fmt::Debug for WaltrMcpServer {
@@ -89,38 +88,42 @@ struct WaitInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct PatchConfigurationInput {
-    /// Current configuration `ETag` from `configuration.inspect`.
+struct InspectResourcesInput {
+    /// Canonical relative path such as `agents/coding.yaml`. Omit to list all entries.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReplaceResourceInput {
+    /// Canonical relative path such as `agents/coding.yaml`.
+    path: String,
+    /// Complete strict YAML source for exactly one resource.
+    source: String,
+    /// Current persisted-slot `ETag` from `resources.inspect`.
     expected_etag: String,
-    /// Replacement providers section: `{ "providers": { "key": { ... } } }`.
-    #[serde(default)]
-    providers: Option<Value>,
-    /// Replacement MCP servers section: `{ "mcp_servers": { "key": { ... } }`.
-    #[serde(default)]
-    mcp_servers: Option<Value>,
-    /// Replacement inference defaults section.
-    #[serde(default)]
-    inference_defaults: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ResetResourceInput {
+    /// Canonical relative path such as `agents/coding.yaml`.
+    path: String,
+    /// Current persisted-slot `ETag` from `resources.inspect`.
+    expected_etag: String,
 }
 
 impl WaltrMcpServer {
     /// Create a Waltr MCP server backed by the same services registered with gRPC.
     #[must_use]
-    pub fn new(config_service: Arc<ConfigService>, sessions: Arc<dyn SessionHost>) -> Self {
+    pub fn new(sessions: Arc<dyn SessionHost>, resources: AgentDefinitionState) -> Self {
         Self {
-            config_service,
             sessions,
+            resources,
         }
     }
 
-    async fn get_config_response(&self) -> ServerResult<GetConfigResponse> {
-        let response = GeneratedConfigService::get_config(
-            self.config_service.as_ref(),
-            Request::new(GetConfigRequest::default()),
-        )
-        .await
-        .map_err(|status| rpc_status_to_server_error(&status))?;
-        Ok(response.into_inner())
+    const fn resources(&self) -> &AgentDefinitionState {
+        &self.resources
     }
 
     async fn session_projection(&self, id: &SessionId) -> ServerResult<Value> {
@@ -134,13 +137,13 @@ impl WaltrMcpServer {
 #[mcp::progressive_server(
     name = "waltr",
     version = env!("CARGO_PKG_VERSION"),
-    description = "Waltr server configuration and hosted session MCP surface.",
+    description = "Waltr resource administration and hosted session MCP surface.",
     tool(
         name = "exec",
-        description = "Inspect and update Waltr server configuration.",
+        description = "Inspect and update complete Waltr resources.",
         namespace(
-            configuration,
-            description = "Inspect and update Waltr server configuration through the same RPC contract used by Waltr clients."
+            resources,
+            description = "Inspect, replace, and reset complete live YAML resources."
         ),
         runbook_uri_template = "waltr://runbooks/{runbook}"
     ),
@@ -150,37 +153,54 @@ impl WaltrMcpServer {
     )
 )]
 impl WaltrMcpServer {
-    /// Inspect the current Waltr configuration before proposing or applying a change.
-    #[action(
-        tool = "exec",
-        name = "configuration.inspect",
-        resource = "waltr://configuration/current"
-    )]
-    async fn inspect_configuration(&self) -> ServerResult<Value> {
-        response_to_value(self.get_config_response().await?)
+    /// Inspect all active resources or one canonical persisted slot.
+    #[action(tool = "exec", name = "resources.inspect")]
+    fn inspect_resources(&self, input: InspectResourcesInput) -> ServerResult<Value> {
+        let path = input.path;
+        let resources = self
+            .resources()
+            .inspect(path.as_deref())
+            .map_err(|error| agent_definition_error(&error))?;
+        response_to_value(resources)
     }
 
-    /// Patch the Waltr configuration with whole-section replacements.
-    #[action(tool = "exec", name = "configuration.patch")]
-    async fn patch_configuration(&self, input: PatchConfigurationInput) -> ServerResult<Value> {
-        let response = GeneratedConfigService::patch_config(
-            self.config_service.as_ref(),
-            Request::new(input.into_request()?),
-        )
-        .await
-        .map_err(|status| rpc_status_to_server_error(&status))?;
-        response_to_value(response.into_inner())
+    /// Validate and atomically replace one complete resource file.
+    #[action(tool = "exec", name = "resources.replace")]
+    async fn replace_resource(&self, input: ReplaceResourceInput) -> ServerResult<Value> {
+        let result = self
+            .resources()
+            .replace(&input.path, input.source, &input.expected_etag)
+            .await
+            .map_err(|error| agent_definition_error(&error))?;
+        drop(result);
+        self.inspect_resources(InspectResourcesInput {
+            path: Some(input.path),
+        })
     }
 
-    /// Configure Waltr by inspecting, preparing a minimal patch, and applying it.
-    #[runbook(tool = "exec", name = "configuration")]
+    /// Remove one persisted resource, restoring its bundle fallback when present.
+    #[action(tool = "exec", name = "resources.reset")]
+    async fn reset_resource(&self, input: ResetResourceInput) -> ServerResult<Value> {
+        let result = self
+            .resources()
+            .reset(&input.path, &input.expected_etag)
+            .await
+            .map_err(|error| agent_definition_error(&error))?;
+        drop(result);
+        self.inspect_resources(InspectResourcesInput {
+            path: Some(input.path),
+        })
+    }
+
+    /// Administer Waltr resources with stale-write protection.
+    #[runbook(tool = "exec", name = "resources")]
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn configuration_runbook(&self) -> ServerResult<String> {
-        Ok("## Waltr configuration runbook\n\n\
-1. Call `configuration.inspect` to load the current configuration and ETag.\n\
-2. Decide the smallest top-level section replacement needed: `providers`, `mcp_servers`, or `inference_defaults`.\n\
-3. Build the replacement carefully: any provided top-level key replaces that entire section.\n\
-4. Call `configuration.patch` with `expected_etag` from the inspected config.\n\
+        Ok("## Waltr resource runbook\n\n\
+1. Call `resources.inspect` for the canonical resource path.\n\
+2. Edit one complete strict YAML resource.\n\
+3. Call `resources.replace` with its persisted-slot `expected_etag`.\n\
+4. Use `resources.reset` to remove a persisted override and reveal its bundled fallback.\n\
 5. On validation or stale-ETag errors, inspect again before retrying.\n"
             .to_owned())
     }
@@ -365,31 +385,6 @@ impl WaltrMcpServer {
                 _update = updates.next() => {}
             }
         }
-    }
-}
-
-impl PatchConfigurationInput {
-    fn into_request(self) -> ServerResult<PatchConfigRequest> {
-        if self.expected_etag.trim().is_empty() {
-            return Err(ServerError::invalid_params("missing expected_etag"));
-        }
-        let mut request = Map::new();
-        request.insert(
-            "expected_etag".to_owned(),
-            Value::String(self.expected_etag),
-        );
-        if let Some(value) = self.providers {
-            request.insert("providers".to_owned(), value);
-        }
-        if let Some(value) = self.mcp_servers {
-            request.insert("mcp_servers".to_owned(), value);
-        }
-        if let Some(value) = self.inference_defaults {
-            request.insert("inference_defaults".to_owned(), value);
-        }
-        serde_json::from_value(Value::Object(request)).map_err(|error| {
-            ServerError::invalid_params(format!("invalid configuration patch input: {error}"))
-        })
     }
 }
 
@@ -703,18 +698,74 @@ fn session_creation_error(status: &Status) -> ServerError {
     }
 }
 
-fn rpc_status_to_server_error(status: &Status) -> ServerError {
-    let message = format!("config RPC {}: {}", status.code(), status.message());
-    match status.code() {
-        Code::InvalidArgument | Code::FailedPrecondition => ServerError::invalid_params(message),
-        _ => ServerError::internal(message),
+fn agent_definition_error(error: &AgentDefinitionLoadError) -> ServerError {
+    if error.is_failed_precondition() {
+        ServerError::invalid_params(
+            "failed precondition: agent-definition state changed; inspect and retry",
+        )
+    } else if error.is_validation() {
+        ServerError::invalid_params(error.sanitized_validation_message())
+    } else {
+        ServerError::internal("agent-definition service unavailable")
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::session_is_running;
-    use waltr_agent::{SessionStatus, Suspension};
+    use super::*;
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::Request as HttpRequest,
+    };
+    use futures_util::Stream;
+    use waltr_agent::{
+        AgentSession, AgentSessionActiveRunState, AgentSessionRunError, AgentSessionRunSubmission,
+        LlmError, SessionListUpdate, SessionStatus, Suspension,
+    };
+    use std::{io, path::PathBuf, pin::Pin};
+    use tower::ServiceExt as _;
+
+    struct UnusedSessionHost;
+
+    #[tonic::async_trait]
+    impl SessionHost for UnusedSessionHost {
+        async fn create(&self, _: Option<String>) -> Result<AgentSession, Status> {
+            unreachable!()
+        }
+
+        async fn list(&self) -> Result<Vec<SessionSummary>, LlmError> {
+            unreachable!()
+        }
+
+        async fn load(&self, _: &SessionId) -> Result<AgentSession, LlmError> {
+            unreachable!()
+        }
+
+        async fn wipe(&self) -> Result<(), LlmError> {
+            unreachable!()
+        }
+
+        async fn interrupt(&self, _: &SessionId) -> Result<AgentSession, LlmError> {
+            unreachable!()
+        }
+
+        async fn active_state(&self, _: &SessionId) -> Option<AgentSessionActiveRunState> {
+            unreachable!()
+        }
+
+        async fn submit_prompt(
+            &self,
+            _: SessionId,
+            _: String,
+        ) -> Result<AgentSessionRunSubmission, AgentSessionRunError> {
+            unreachable!()
+        }
+
+        fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
 
     #[test]
     fn active_run_bridges_pre_journal_status_without_overriding_suspension() {
@@ -730,5 +781,203 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_definition_action_handlers_dispatch_inspect_replace_and_reset() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let server = WaltrMcpServer::new(Arc::new(UnusedSessionHost), state);
+
+        let inspected = server
+            .inspect_resources(InspectResourcesInput {
+                path: Some("agents/coding.yaml".to_owned()),
+            })
+            .unwrap();
+        let expected_etag = inspected["persisted_etag"].as_str().unwrap().to_owned();
+        let source = "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: coding\nspec:\n  description: managed\n";
+        let replaced = server
+            .replace_resource(ReplaceResourceInput {
+                path: "agents/coding.yaml".to_owned(),
+                source: source.to_owned(),
+                expected_etag,
+            })
+            .await
+            .unwrap();
+        assert_eq!(replaced["persisted_source"], source);
+
+        let reset = server
+            .reset_resource(ResetResourceInput {
+                path: "agents/coding.yaml".to_owned(),
+                expected_etag: replaced["persisted_etag"].as_str().unwrap().to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reset["origin"], "bundled");
+        assert_eq!(reset["persisted"], false);
+    }
+
+    #[tokio::test]
+    async fn public_mcp_publishes_agent_definition_schema_help_and_calls() {
+        let router = mcp::server::streamable_http_router(test_server());
+
+        let tools = mcp_request(
+            &router,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+        let exec = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "exec")
+            .unwrap();
+        let schema = exec["inputSchema"].to_string();
+        assert!(schema.contains("resources"));
+        assert!(!schema.contains("configuration.inspect"));
+
+        let help = call_exec(&router, json!({ "action": "help" })).await;
+        assert!(help.to_string().contains("resources"));
+
+        let definitions = call_exec(
+            &router,
+            json!({ "action": "resources.inspect", "input": {} }),
+        )
+        .await;
+        assert!(definitions.get("error").is_none(), "{definitions}");
+        assert!(definitions.to_string().contains("agents/coding.yaml"));
+
+        let sessions = mcp_request(
+            &router,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "sessions", "arguments": { "action": "help" } }
+            }),
+        )
+        .await;
+        assert!(sessions["result"].is_object());
+    }
+
+    #[tokio::test]
+    async fn agent_definition_actions_classify_and_sanitize_failures() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let inner = Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state));
+
+        let validation = inner
+            .inspect_resources(InspectResourcesInput {
+                path: Some("/private/tmp/invalid.yml".to_owned()),
+            })
+            .unwrap_err();
+        assert_server_error(&validation, -32602, "invalid canonical", &["/private/tmp"]);
+
+        let inspected = inner
+            .inspect_resources(InspectResourcesInput {
+                path: Some("agents/coding.yaml".to_owned()),
+            })
+            .unwrap();
+        let stale_error = inner
+            .replace_resource(ReplaceResourceInput {
+                path: "agents/coding.yaml".to_owned(),
+                source: "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: coding\nspec: {}\n".to_owned(),
+                expected_etag: format!("{}-stale", inspected["persisted_etag"].as_str().unwrap()),
+            })
+            .await
+            .unwrap_err();
+        assert_server_error(&stale_error, -32602, "failed precondition:", &["sha256:"]);
+
+        let read = agent_definition_error(&AgentDefinitionLoadError::Read {
+            path: PathBuf::from("/private/tmp/secret.yaml"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "permission denied detail"),
+        });
+        assert_server_error(
+            &read,
+            -32603,
+            "agent-definition service unavailable",
+            &["/private/tmp", "permission denied"],
+        );
+        let write = agent_definition_error(&AgentDefinitionLoadError::Write {
+            path: PathBuf::from("/private/tmp/secret.yaml"),
+            source: io::Error::other("disk detail"),
+        });
+        assert_server_error(
+            &write,
+            -32603,
+            "service unavailable",
+            &["secret", "disk detail"],
+        );
+        let internal = agent_definition_error(&AgentDefinitionLoadError::Watch(
+            notify::Error::generic("watcher detail"),
+        ));
+        assert_server_error(
+            &internal,
+            -32603,
+            "service unavailable",
+            &["watcher detail"],
+        );
+    }
+
+    fn test_server() -> Arc<WaltrMcpServer> {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        Arc::new(WaltrMcpServer::new(Arc::new(UnusedSessionHost), state))
+    }
+
+    async fn call_exec(router: &Router, arguments: Value) -> Value {
+        mcp_request(
+            router,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "exec", "arguments": arguments }
+            }),
+        )
+        .await
+    }
+
+    async fn mcp_request(router: &Router, mut body: Value) -> Value {
+        body["params"] = body.get("params").cloned().unwrap_or_else(|| json!({}));
+        body["params"]["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": mcp::protocol::MCP_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": { "name": "waltr-server-tests", "version": "1" }
+        });
+        let method = body["method"].as_str().unwrap();
+        let mut request = HttpRequest::post("/mcp")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", mcp::protocol::MCP_PROTOCOL_VERSION)
+            .header("mcp-method", method);
+        if method == "tools/call" {
+            request = request.header("mcp-name", body["params"]["name"].as_str().unwrap());
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let json = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(text.as_str());
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn assert_server_error(error: &ServerError, code: i64, message: &str, absent: &[&str]) {
+        let debug = format!("{error:?}");
+        assert!(debug.contains(&format!("code: {code}")), "{debug}");
+        assert!(debug.contains(message), "{debug}");
+        for value in absent {
+            assert!(!debug.contains(value), "{debug}");
+        }
     }
 }

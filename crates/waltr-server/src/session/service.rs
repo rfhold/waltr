@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf, pin::Pin, sync::Arc};
 
-use crate::config::ConfigHandle;
+use crate::{agent_definition::AgentDefinitionState, config::ConfigHandle};
 
 use super::{
     convert::session_summary_to_proto,
@@ -57,7 +57,22 @@ where
 {
     sessions: SessionCoordinator<S>,
     config: ConfigHandle,
-    agent_catalog: AgentDefinitionCatalog,
+    agent_catalog: AgentCatalogSource,
+}
+
+#[derive(Debug, Clone)]
+enum AgentCatalogSource {
+    Static(AgentDefinitionCatalog),
+    Dynamic(AgentDefinitionState),
+}
+
+impl AgentCatalogSource {
+    fn catalog(&self) -> AgentDefinitionCatalog {
+        match self {
+            Self::Static(catalog) => catalog.clone(),
+            Self::Dynamic(state) => state.snapshot().catalog().clone(),
+        }
+    }
 }
 
 impl<S> SessionService<S>
@@ -89,12 +104,46 @@ where
         trusted_mcp_oauth_origins: Vec<reqwest::Url>,
         agent_catalog: AgentDefinitionCatalog,
     ) -> Arc<Self> {
-        Self::from_sessions_with_oauth_policy(
+        Self::from_sessions_with_catalog_source(
             SessionCoordinator::new(store),
             config,
             credential_store,
             trusted_mcp_oauth_origins,
-            agent_catalog,
+            AgentCatalogSource::Static(agent_catalog),
+        )
+    }
+
+    /// Create a session service backed by the current successful agent-definition state.
+    #[must_use]
+    pub fn new_with_config_and_agent_state(
+        store: S,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origin: Option<reqwest::Url>,
+        agent_state: AgentDefinitionState,
+    ) -> Arc<Self> {
+        Self::new_with_oauth_policy_and_agent_state(
+            store,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origin.into_iter().collect(),
+            agent_state,
+        )
+    }
+
+    pub(crate) fn new_with_oauth_policy_and_agent_state(
+        store: S,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+        agent_state: AgentDefinitionState,
+    ) -> Arc<Self> {
+        Self::from_sessions_with_catalog_source(
+            SessionCoordinator::new(store),
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            AgentCatalogSource::Dynamic(agent_state),
         )
     }
 
@@ -107,12 +156,12 @@ where
         trusted_mcp_oauth_origin: Option<reqwest::Url>,
         agent_catalog: AgentDefinitionCatalog,
     ) -> Arc<Self> {
-        Self::from_sessions_with_oauth_policy(
+        Self::from_sessions_with_catalog_source(
             sessions,
             config,
             credential_store,
             trusted_mcp_oauth_origin.into_iter().collect(),
-            agent_catalog,
+            AgentCatalogSource::Static(agent_catalog),
         )
     }
 
@@ -123,15 +172,70 @@ where
         trusted_mcp_oauth_origins: Vec<reqwest::Url>,
         agent_catalog: AgentDefinitionCatalog,
     ) -> Arc<Self> {
-        let default_agent_definition = agent_catalog
-            .resolved(agent_catalog.default_agent_name())
+        Self::from_sessions_with_catalog_source(
+            sessions,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            AgentCatalogSource::Static(agent_catalog),
+        )
+    }
+
+    /// Create a session service from an existing coordinator and live agent-definition state.
+    #[must_use]
+    pub fn from_sessions_with_config_and_agent_state(
+        sessions: SessionCoordinator<S>,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origin: Option<reqwest::Url>,
+        agent_state: AgentDefinitionState,
+    ) -> Arc<Self> {
+        Self::from_sessions_with_oauth_policy_and_agent_state(
+            sessions,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origin.into_iter().collect(),
+            agent_state,
+        )
+    }
+
+    pub(crate) fn from_sessions_with_oauth_policy_and_agent_state(
+        sessions: SessionCoordinator<S>,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+        agent_state: AgentDefinitionState,
+    ) -> Arc<Self> {
+        Self::from_sessions_with_catalog_source(
+            sessions,
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            AgentCatalogSource::Dynamic(agent_state),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "runtime construction receives independent session and host policy dependencies"
+    )]
+    fn from_sessions_with_catalog_source(
+        sessions: SessionCoordinator<S>,
+        config: ConfigHandle,
+        credential_store: CredentialStore,
+        trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+        agent_catalog: AgentCatalogSource,
+    ) -> Arc<Self> {
+        let current_catalog = agent_catalog.catalog();
+        let default_agent_definition = current_catalog
+            .resolved(current_catalog.default_agent_name())
             .expect("catalog default agent must be present")
             .clone();
         let runtime_factory = runtime_factory(
             credential_store,
             trusted_mcp_oauth_origins,
             default_agent_definition,
-            agent_catalog.clone(),
+            &agent_catalog,
             config.clone(),
         );
         let sessions = sessions.with_runtime_factory(runtime_factory);
@@ -147,36 +251,38 @@ where
     }
 
     fn selected_agent_bundle(
-        &self,
+        catalog: &AgentDefinitionCatalog,
         agent_name: &str,
     ) -> Result<waltr_agent::AgentDefinitionBundle, Status> {
         if agent_name.trim().is_empty() {
             return Err(Status::invalid_argument("agent name must not be empty"));
         }
-        self.agent_catalog.bundle(agent_name).ok_or_else(|| {
+        catalog.bundle(agent_name).ok_or_else(|| {
             Status::invalid_argument(format!("agent '{agent_name}' is not selectable"))
         })
     }
 
     fn summary_to_proto(
-        &self,
         summary: SessionSummary,
         config: &Configuration,
+        default_agent_name: &str,
     ) -> waltr::grpc::waltr::session::v1::SessionSummary {
-        session_summary_to_proto(summary, config, self.agent_catalog.default_agent_name())
+        session_summary_to_proto(summary, config, default_agent_name)
     }
 
     async fn create_session_internal(
         &self,
         inference_settings: Option<waltr::grpc::waltr::session::v1::InferenceSettingsRequest>,
         agent_name: Option<&str>,
-    ) -> Result<(AgentSession, Configuration), Status> {
+    ) -> Result<(AgentSession, Configuration, String), Status> {
         let config = self.load_config().await;
         let inference_settings =
             resolve_inference_settings_for_create(inference_settings, &config)?;
+        let catalog = self.agent_catalog.catalog();
+        let default_agent_name = catalog.default_agent_name().to_owned();
         let agent_bundle = match agent_name {
-            Some(agent_name) => self.selected_agent_bundle(agent_name)?,
-            None => self.agent_catalog.default_bundle(),
+            Some(agent_name) => Self::selected_agent_bundle(&catalog, agent_name)?,
+            None => catalog.default_bundle(),
         };
         let session = self
             .sessions
@@ -187,7 +293,7 @@ where
             )
             .await
             .map_err(agent_error_to_status)?;
-        Ok((session, config))
+        Ok((session, config, default_agent_name))
     }
 }
 
@@ -199,7 +305,7 @@ where
     async fn create(&self, agent_name: Option<String>) -> Result<AgentSession, Status> {
         self.create_session_internal(None, agent_name.as_deref())
             .await
-            .map(|(session, _)| session)
+            .map(|(session, _, _)| session)
     }
 
     async fn list(&self) -> Result<Vec<SessionSummary>, waltr_agent::LlmError> {
@@ -251,9 +357,9 @@ where
         &self,
         _request: Request<ListAgentsRequest>,
     ) -> Result<Response<ListAgentsResponse>, Status> {
+        let catalog = self.agent_catalog.catalog();
         Ok(Response::new(ListAgentsResponse {
-            agents: self
-                .agent_catalog
+            agents: catalog
                 .entries()
                 .into_iter()
                 .map(|agent| SelectableAgent {
@@ -261,7 +367,7 @@ where
                     description: agent.description,
                 })
                 .collect(),
-            default_agent_name: self.agent_catalog.default_agent_name().to_owned(),
+            default_agent_name: catalog.default_agent_name().to_owned(),
         }))
     }
     #[tracing::instrument(
@@ -279,14 +385,18 @@ where
             .agent_selection
             .as_ref()
             .map(|selection| selection.agent_name.as_str());
-        let (session, config) = self
+        let (session, config, default_agent_name) = self
             .create_session_internal(request.inference_settings, agent_name)
             .await?;
         tracing::Span::current().record("session_id", session.record.id.as_str());
         tracing::info!(session_id = %session.record.id.as_str(), "session create completed");
 
         Ok(Response::new(CreateSessionResponse {
-            session: Some(self.summary_to_proto(session.record.summary(), &config)),
+            session: Some(Self::summary_to_proto(
+                session.record.summary(),
+                &config,
+                &default_agent_name,
+            )),
         }))
     }
 
@@ -296,13 +406,14 @@ where
     ) -> Result<Response<ListSessionsResponse>, Status> {
         tracing::trace!("list sessions requested");
         let config = self.load_config().await;
+        let catalog = self.agent_catalog.catalog();
         let sessions = self
             .sessions
             .list()
             .await
             .map_err(agent_error_to_status)?
             .into_iter()
-            .map(|summary| self.summary_to_proto(summary, &config))
+            .map(|summary| Self::summary_to_proto(summary, &config, catalog.default_agent_name()))
             .collect();
 
         Ok(Response::new(ListSessionsResponse { sessions }))
@@ -382,9 +493,14 @@ where
             .await
             .map_err(agent_error_to_status)?;
         tracing::info!("session inference settings update completed");
+        let catalog = self.agent_catalog.catalog();
 
         Ok(Response::new(UpdateSessionInferenceSettingsResponse {
-            session: Some(self.summary_to_proto(session.record.summary(), &config)),
+            session: Some(Self::summary_to_proto(
+                session.record.summary(),
+                &config,
+                catalog.default_agent_name(),
+            )),
         }))
     }
 
@@ -397,7 +513,8 @@ where
         let selection = request
             .agent_selection
             .ok_or_else(|| Status::invalid_argument("agent selection is required"))?;
-        self.selected_agent_bundle(&selection.agent_name)?;
+        let catalog = self.agent_catalog.catalog();
+        Self::selected_agent_bundle(&catalog, &selection.agent_name)?;
         self.sessions
             .load(&session_id)
             .await
@@ -409,7 +526,11 @@ where
             .map_err(session_agent_error_to_status)?;
         let config = self.load_config().await;
         Ok(Response::new(UpdateSessionAgentResponse {
-            session: Some(self.summary_to_proto(session.record.summary(), &config)),
+            session: Some(Self::summary_to_proto(
+                session.record.summary(),
+                &config,
+                catalog.default_agent_name(),
+            )),
         }))
     }
 
@@ -421,13 +542,14 @@ where
         let subscription = self.sessions.watch_sessions();
         let sequence = subscription.initial_sequence();
         let config = self.load_config().await;
+        let catalog = self.agent_catalog.catalog();
         let sessions = self
             .sessions
             .list()
             .await
             .map_err(agent_error_to_status)?
             .into_iter()
-            .map(|summary| self.summary_to_proto(summary, &config))
+            .map(|summary| Self::summary_to_proto(summary, &config, catalog.default_agent_name()))
             .collect();
         let snapshot = Ok(WatchSessionsResponse {
             sequence,
@@ -436,16 +558,21 @@ where
             )),
         });
         let config = self.config.clone();
-        let default_agent_name = self.agent_catalog.default_agent_name().to_owned();
+        let agent_catalog = self.agent_catalog.clone();
         let stream = tokio_stream::once(snapshot).chain(subscription.then(move |update| {
             let config = config.clone();
-            let default_agent_name = default_agent_name.clone();
+            let agent_catalog = agent_catalog.clone();
             async move {
                 let current_config = config.load().await;
+                let catalog = agent_catalog.catalog();
                 let event = match update.event {
-                    SessionListEvent::Upsert(session) => watch_sessions_response::Event::Session(
-                        session_summary_to_proto(session, &current_config, &default_agent_name),
-                    ),
+                    SessionListEvent::Upsert(session) => {
+                        watch_sessions_response::Event::Session(session_summary_to_proto(
+                            session,
+                            &current_config,
+                            catalog.default_agent_name(),
+                        ))
+                    }
                     SessionListEvent::Deleted(id) => {
                         watch_sessions_response::Event::DeletedId(id.as_str().to_owned())
                     }
@@ -758,9 +885,14 @@ where
             .last()
             .map(|event| event.cursor.get());
         let config = self.load_config().await;
+        let catalog = self.agent_catalog.catalog();
         tracing::info!("session rollback completed");
         Ok(Response::new(RollbackSessionResponse {
-            session: Some(self.summary_to_proto(session.record.summary(), &config)),
+            session: Some(Self::summary_to_proto(
+                session.record.summary(),
+                &config,
+                catalog.default_agent_name(),
+            )),
             truncation: Some(TimelineTruncation {
                 session_id: session_id.as_str().to_owned(),
                 after_cursor,
@@ -950,15 +1082,27 @@ fn default_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "runtime factory policy is supplied by independent server-owned capabilities"
+)]
 fn runtime_factory(
     credential_store: CredentialStore,
     trusted_mcp_oauth_origins: Vec<reqwest::Url>,
     default_agent_definition: ResolvedAgent,
-    agent_catalog: AgentDefinitionCatalog,
+    agent_catalog: &AgentCatalogSource,
     config: ConfigHandle,
 ) -> AgentSessionRuntimeFactory {
-    AgentSessionRuntimeFactory::new(default_root(), credential_store, default_agent_definition)
-        .with_agent_catalog(agent_catalog)
+    let factory =
+        AgentSessionRuntimeFactory::new(default_root(), credential_store, default_agent_definition);
+    let factory = match agent_catalog {
+        AgentCatalogSource::Static(catalog) => factory.with_agent_catalog(catalog.clone()),
+        AgentCatalogSource::Dynamic(state) => {
+            let state = state.clone();
+            factory.with_agent_catalog_provider(move || state.snapshot().catalog().clone())
+        }
+    };
+    factory
         .with_trusted_mcp_oauth_origins(trusted_mcp_oauth_origins)
         // TODO: This feels like it should be a similar catalog like the agents catalog
         .with_mcp_connection_resolver(move |request| {
@@ -1005,7 +1149,7 @@ fn resolve_mcp_connections(
                 .unwrap_or(McpServerType::Unspecified)
             {
                 McpServerType::Stdio => McpConnectionKind::Stdio,
-                McpServerType::Sse => McpConnectionKind::StreamableHttp,
+                McpServerType::StreamableHttp => McpConnectionKind::StreamableHttp,
                 McpServerType::Unspecified => {
                     return Err(AgentSessionRuntimeError::FailedPrecondition(format!(
                         "mcp server '{key}' type is unspecified"
@@ -1024,15 +1168,50 @@ fn resolve_mcp_connections(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
-
-    use waltr::grpc::waltr::config::v1::{Configuration, McpServer, McpServerType, Provider};
-    use waltr_agent::{
-        AgentSessionRuntimeError, McpConnectionKind, McpConnectionResolveRequest,
-        definition::McpServerSelection,
+    use std::{
+        collections::{BTreeSet, HashMap},
+        fs,
+        time::Duration,
     };
 
-    use super::resolve_mcp_connections;
+    use waltr::grpc::waltr::config::v1::{Configuration, McpServer, McpServerType, Provider};
+    use waltr::grpc::waltr::session::v1::{
+        AgentSelectionRequest, CreateSessionRequest, ListAgentsRequest, UpdateSessionAgentRequest,
+    };
+    use waltr_agent::{
+        AgentSessionRuntimeError, CredentialStore, FileCredentialStore, McpConnectionKind,
+        McpConnectionResolveRequest, MemorySessionStore, SessionCoordinator, SessionId,
+        definition::McpServerSelection,
+    };
+    use tonic::Request;
+
+    use crate::{
+        agent_definition::{AgentDefinitionInspection, AgentDefinitionState},
+        config::ConfigHandle,
+    };
+
+    use super::{GeneratedSessionService, SessionService, resolve_mcp_connections};
+
+    fn agent_source(name: &str, description: &str) -> String {
+        format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: {{ name: {name} }}\nspec: {{ description: {description} }}\n"
+        )
+    }
+
+    fn config_handle() -> ConfigHandle {
+        ConfigHandle::from_resources(crate::test_support::resource_state_with_overrides(&[]))
+    }
+
+    fn credential_store(root: &std::path::Path) -> CredentialStore {
+        FileCredentialStore::new(root.join("credentials.json")).into()
+    }
+
+    fn persisted_etag(state: &AgentDefinitionState, path: &str) -> String {
+        match state.inspect(Some(path)).expect("resource inspects") {
+            AgentDefinitionInspection::Resource(detail) => detail.persisted_etag,
+            AgentDefinitionInspection::Catalog { .. } => unreachable!(),
+        }
+    }
 
     fn inventory() -> Configuration {
         Configuration {
@@ -1040,7 +1219,7 @@ mod tests {
                 (
                     "zeta".to_owned(),
                     McpServer {
-                        r#type: McpServerType::Sse as i32,
+                        r#type: McpServerType::StreamableHttp as i32,
                         url: "https://zeta.example/mcp".to_owned(),
                         ..McpServer::default()
                     },
@@ -1145,5 +1324,230 @@ mod tests {
         assert_eq!(current[0].url, "https://changed.example/mcp");
         assert_eq!(initial[0].key, current[0].key);
         assert_eq!(initial[0].kind, current[0].kind);
+    }
+
+    #[test]
+    fn resolver_treats_waltr_as_an_ordinary_configured_server() {
+        let mut inventory = inventory();
+        inventory.mcp_servers.insert(
+            "waltr".to_owned(),
+            McpServer {
+                r#type: McpServerType::StreamableHttp as i32,
+                url: "https://waltr.example/mcp".to_owned(),
+                ..McpServer::default()
+            },
+        );
+        let resolved = resolve_mcp_connections(
+            &inventory,
+            McpConnectionResolveRequest {
+                servers: McpServerSelection::Exclude(BTreeSet::new()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "waltr", "zeta"]
+        );
+        let selected = resolve_mcp_connections(
+            &inventory,
+            McpConnectionResolveRequest {
+                servers: McpServerSelection::Include(BTreeSet::from(["waltr".to_owned()])),
+            },
+        )
+        .unwrap();
+        assert_eq!(selected[0].key, "waltr");
+        assert_eq!(selected[0].url, "https://waltr.example/mcp");
+    }
+
+    #[tokio::test]
+    async fn dynamic_list_agents_tracks_valid_state_and_keeps_last_known_good() {
+        let directory = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&directory, &[], "coding").unwrap();
+        let service = SessionService::new_with_config_and_agent_state(
+            MemorySessionStore::new(),
+            config_handle(),
+            credential_store(&directory),
+            None,
+            state.clone(),
+        );
+        let initial = service
+            .list_agents(Request::new(ListAgentsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(initial.default_agent_name, "coding");
+        assert_eq!(
+            initial
+                .agents
+                .iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            ["coding", "configuration", "default"]
+        );
+
+        let source = agent_source("later", "later agent");
+        state
+            .replace(
+                "agents/later.yaml",
+                source,
+                &persisted_etag(&state, "agents/later.yaml"),
+            )
+            .await
+            .unwrap();
+        let current = service
+            .list_agents(Request::new(ListAgentsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(current.default_agent_name, "coding");
+        assert!(current.agents.iter().any(|agent| agent.name == "later"));
+
+        let watcher = state.spawn_watcher().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fs::write(
+            directory.join(".waltr/resources/agents/later.yaml"),
+            "kind: [",
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.reload_error().is_none() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("invalid edit is observed");
+        let last_known_good = service
+            .list_agents(Request::new(ListAgentsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(last_known_good, current);
+        watcher.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dynamic_new_sessions_capture_current_sources_without_rebasing_existing_sessions() {
+        let directory = crate::test_support::temp_root();
+        let external_source = agent_source("external", "external agent");
+        let external_path = directory.join("external.yaml");
+        fs::write(&external_path, &external_source).unwrap();
+        let state = AgentDefinitionState::load(&directory, &[external_path], "coding").unwrap();
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let service = SessionService::from_sessions_with_config_and_agent_state(
+            sessions.clone(),
+            config_handle(),
+            credential_store(&directory),
+            None,
+            state.clone(),
+        );
+        let before = super::super::SessionHost::create(service.as_ref(), None)
+            .await
+            .unwrap();
+        let before_bundle = before.record.agent_definition.clone().unwrap();
+
+        let replacement = agent_source("later", "exact replacement bytes");
+        state
+            .replace(
+                "agents/later.yaml",
+                replacement.clone(),
+                &persisted_etag(&state, "agents/later.yaml"),
+            )
+            .await
+            .unwrap();
+        let after = super::super::SessionHost::create(service.as_ref(), Some("later".to_owned()))
+            .await
+            .unwrap();
+        let after_bundle = after.record.agent_definition.unwrap();
+        let reloaded_before = sessions.load(before.id()).await.unwrap();
+
+        assert_eq!(
+            after_bundle.sources,
+            state.snapshot().sources(),
+            "new bundles use one complete current snapshot"
+        );
+        assert!(after_bundle.sources.contains(&replacement));
+        assert_eq!(after_bundle.sources.last(), Some(&external_source));
+        assert_eq!(
+            reloaded_before.record.agent_definition.unwrap(),
+            before_bundle,
+            "passive replacement must not rebase an existing record"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_update_selects_new_agent_through_normal_switch_audit() {
+        let directory = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&directory, &[], "coding").unwrap();
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let service = SessionService::from_sessions_with_config_and_agent_state(
+            sessions.clone(),
+            config_handle(),
+            credential_store(&directory),
+            None,
+            state.clone(),
+        );
+        let created = service
+            .create_session(Request::new(CreateSessionRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .session
+            .unwrap();
+        let source = agent_source("later", "newly selectable");
+        state
+            .replace(
+                "agents/later.yaml",
+                source.clone(),
+                &persisted_etag(&state, "agents/later.yaml"),
+            )
+            .await
+            .unwrap();
+
+        let response = service
+            .update_session_agent(Request::new(UpdateSessionAgentRequest {
+                id: created.id.clone(),
+                agent_selection: Some(AgentSelectionRequest {
+                    agent_name: "later".to_owned(),
+                }),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let stored = sessions.load(&SessionId::new(created.id)).await.unwrap();
+        let bundle = stored.record.agent_definition.unwrap();
+        let audit = bundle
+            .pending_switch_audit
+            .expect("switch audit is retained");
+
+        assert_eq!(response.session.unwrap().agent_name, "later");
+        assert_eq!(bundle.agent_name, "later");
+        assert!(bundle.sources.contains(&source));
+        assert_eq!(audit.old_name, "coding");
+        assert_eq!(audit.new_name, "later");
+    }
+
+    #[tokio::test]
+    async fn static_service_constructor_preserves_default_agent_labeling() {
+        let directory = crate::test_support::temp_root();
+        let catalog = crate::test_support::default_agent_catalog();
+        let service = SessionService::new_with_config(
+            MemorySessionStore::new(),
+            config_handle(),
+            credential_store(&directory),
+            None,
+            catalog,
+        );
+
+        let response = service
+            .list_agents(Request::new(ListAgentsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.default_agent_name, "coding");
+        assert!(response.agents.iter().any(|agent| agent.name == "coding"));
     }
 }

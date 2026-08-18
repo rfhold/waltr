@@ -1,0 +1,37 @@
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata:
+  name: coding
+spec:
+  tools:
+    - feature: filesystem
+      permission:
+        resources:
+          paths:
+            - match:
+                outsideRoot: $(session.workspace.root)
+              effect: ask
+
+    - name: shell
+      permission:
+        resources:
+          paths:
+            - match:
+                outsideRoot: $(session.workspace.root)
+              effect: ask
+          commands:
+            - match:
+                names:
+                  - git
+                  - pulumi
+                  - kubectl
+                  - terraform
+                  - gcloud
+                  - aws
+                  - gh
+                  - help
+                  - pyinfra
+                  - ansible
+                  - sudo
+                  - ssh
+              effect: ask

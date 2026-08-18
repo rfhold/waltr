@@ -46,18 +46,13 @@ async fn submit_user_message_validates_request() -> Result<(), Box<dyn std::erro
 
 #[tokio::test]
 async fn submit_user_message_requires_session_runtime() -> Result<(), Box<dyn std::error::Error>> {
-    let server = setup_server();
+    let (server, sessions) = setup_server_with_sessions();
+    let session = sessions.create().await?;
     let mut client = session_client(server).await?;
-    let session = client
-        .create_session(CreateSessionRequest::default())
-        .await?
-        .into_inner()
-        .session
-        .expect("created session should be present");
 
     let error = client
         .submit_user_message(SubmitUserMessageRequest {
-            session_id: session.id,
+            session_id: session.record.id.as_str().to_owned(),
             text: "hello".to_owned(),
         })
         .await

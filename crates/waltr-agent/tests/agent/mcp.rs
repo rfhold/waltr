@@ -1293,6 +1293,13 @@ async fn run_session_prompt(
     connections: Vec<McpResolvedConnection>,
 ) -> waltr_agent::Result<AgentTestSession> {
     sessions.set_connections(connections);
+    run_session_prompt_with_current_connections(sessions, prompt).await
+}
+
+async fn run_session_prompt_with_current_connections(
+    sessions: &TestMcpSessions,
+    prompt: &str,
+) -> waltr_agent::Result<AgentTestSession> {
     let session_id = sessions.create().await?.id().clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))

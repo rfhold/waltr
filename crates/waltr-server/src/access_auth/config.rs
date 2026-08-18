@@ -110,7 +110,6 @@ impl AccessAuthConfig {
                     name.starts_with("WALTR_OIDC_")
                         || name.starts_with("WALTR_API_OIDC_")
                         || name.starts_with("WALTR_AUTH_") && *name != "WALTR_AUTH_MODE"
-                        || *name == "WALTR_PUBLIC_URL"
                         || *name == "WALTR_API_REQUIRED_SCOPES"
                         || *name == "WALTR_TRUSTED_PROXIES"
                 });
@@ -649,6 +648,16 @@ mod tests {
     fn defaults_to_disabled() {
         assert_eq!(
             AccessAuthConfig::from_values(&HashMap::new()).unwrap(),
+            AccessAuthConfig::disabled()
+        );
+    }
+
+    #[test]
+    fn public_url_is_allowed_while_access_authentication_is_disabled() {
+        let values = HashMap::from([("WALTR_PUBLIC_URL", "https://waltr.example/api".to_owned())]);
+
+        assert_eq!(
+            AccessAuthConfig::from_values(&values).unwrap(),
             AccessAuthConfig::disabled()
         );
     }

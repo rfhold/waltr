@@ -1,17 +1,16 @@
-use std::collections::HashMap;
-
 use crate::support::grpc::session_client;
 use waltr::grpc::waltr::{
-    config::v1::{Configuration, InferenceDefaults, Model, ModelType, Provider, ProviderType},
+    config::v1::ProviderType,
     session::v1::{
         CreateSessionRequest, GetTimelineRequest, SubmitUserMessageRequest, TimelineDirection,
         TimelineQuery, timeline_content, watch_timeline_response,
     },
 };
 use waltr_server::{
-    config::ConfigStore as _,
     config_service::ConfigService,
-    test_support::{default_config_builder, setup_server_with_services, temp_root},
+    test_support::{
+        default_catalog_loader, resource_state_with_overrides, setup_server_with_services,
+    },
 };
 
 const OPENAI_TEST_MODEL: &str = "gpt-5-nano";
@@ -72,7 +71,7 @@ async fn openai_chat_completions_watch_timeline_reconnects_with_cursor()
 async fn assert_provider_submit_user_message(
     provider: LiveServerProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server = setup_live_server(live_config(provider)).await;
+    let server = setup_live_server(provider).await;
     let mut client = session_client(server).await?;
 
     let session = client
@@ -100,7 +99,7 @@ async fn assert_provider_submit_user_message(
 async fn assert_provider_watch_timeline_reconnects_with_cursor(
     provider: LiveServerProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server = setup_live_server(live_config(provider)).await;
+    let server = setup_live_server(provider).await;
     let mut client = session_client(server).await?;
 
     let session = client
@@ -141,42 +140,32 @@ async fn assert_provider_watch_timeline_reconnects_with_cursor(
 }
 
 async fn setup_live_server(
-    config: Configuration,
+    provider: LiveServerProvider,
 ) -> &'static waltr_server::test_support::TestServer {
-    let config_service = ConfigService::new(temp_root(), default_config_builder())
-        .expect("config service should start");
-    config_service
-        .store()
-        .save(config)
-        .await
-        .expect("config should save");
+    let transport = match provider.provider_type {
+        ProviderType::AnthropicMessages => "anthropicMessages",
+        ProviderType::OpenaiChatCompletions => "openaiChatCompletions",
+        _ => panic!("unsupported live provider transport"),
+    };
+    let provider_source = format!(
+        "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: {}\nspec:\n  transport: {transport}\n  url: {}\n  headers:\n    api_key: {:?}\n  models:\n    {:?}:\n      name: {:?}\n      type: 1\n",
+        provider.key, provider.url, provider.api_key, provider.model_key, provider.model_key
+    );
+    let defaults_source = format!(
+        "apiVersion: waltr.dev/v1alpha1\nkind: Defaults\nmetadata:\n  name: default\nspec:\n  inference:\n    provider: {}\n    model: {}\n",
+        provider.key, provider.model_key
+    );
+    let resources = resource_state_with_overrides(&[
+        (
+            format!("providers/{}.yaml", provider.key).as_str(),
+            provider_source.as_str(),
+        ),
+        ("defaults/default.yaml", defaults_source.as_str()),
+    ]);
+    let config_service = ConfigService::from_state(resources, default_catalog_loader());
     let server = setup_server_with_services(config_service);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     server
-}
-
-fn live_config(provider: LiveServerProvider) -> Configuration {
-    let provider_key = provider.key.to_owned();
-    let model_key = provider.model_key.to_owned();
-
-    Configuration {
-        providers: HashMap::from([(
-            provider_key.clone(),
-            provider_config(
-                provider.provider_type,
-                provider.key,
-                provider.url,
-                provider.api_key,
-                provider.model_key,
-            ),
-        )]),
-        inference_defaults: Some(InferenceDefaults {
-            provider_key,
-            model_key,
-            reasoning_effort: None,
-        }),
-        ..Configuration::default()
-    }
 }
 
 struct LiveServerProvider {
@@ -227,30 +216,6 @@ fn gateway_anthropic_messages_provider() -> Result<LiveServerProvider, MissingLi
         api_key: String::new(),
         model_key: GATEWAY_ANTHROPIC_TEST_MODEL,
     })
-}
-
-fn provider_config(
-    provider_type: ProviderType,
-    name: &str,
-    url: &str,
-    header_value: String,
-    model_key: &str,
-) -> Provider {
-    Provider {
-        r#type: provider_type as i32,
-        name: name.to_owned(),
-        url: url.to_owned(),
-        headers: HashMap::from([("api_key".to_owned(), header_value)]),
-        models: HashMap::from([(
-            model_key.to_owned(),
-            Model {
-                name: model_key.to_owned(),
-                r#type: ModelType::Llm as i32,
-                ..Model::default()
-            },
-        )]),
-        ..Provider::default()
-    }
 }
 
 #[derive(Debug)]

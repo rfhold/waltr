@@ -1,0 +1,35 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata:
+  name: claude-code
+spec:
+  transport: anthropicMessages
+  url: https://api.anthropic.com/v1/messages?beta=true
+  headers:
+    anthropic-beta: claude-code-20250219,oauth-2025-04-20
+    user-agent: claude-cli/2.1.75
+    x-app: cli
+  oauth:
+    name: Claude Code
+    authorizeUrl: https://claude.ai/oauth/authorize
+    tokenUrl: https://platform.claude.com/v1/oauth/token
+    clientId: 9d1c250a-e61b-44d9-88ed-5944d1962f5e
+    redirectUri: http://localhost:53692/callback
+    scopes: [org:create_api_key, user:profile, user:inference, user:sessions:claude_code, user:mcp_servers, user:file_upload]
+    tokenRequestStyle: json
+    authUrlParams:
+      code: "true"
+    sendStateInTokenRequest: true
+  catalog:
+    provider: anthropic
+    include:
+      - claude-haiku-4-5
+      - claude-sonnet-4-5
+      - claude-sonnet-4-6
+      - claude-sonnet-5
+      - claude-opus-4-5
+      - claude-opus-4-6
+      - claude-opus-4-7
+      - claude-opus-4-8
+      - claude-opus-5
+      - claude-fable-5

@@ -1,24 +1,166 @@
 use std::{collections::BTreeSet, path::PathBuf};
 
 use crate::{
-    PermissionCommandPattern, PermissionLevel, PermissionPathPattern,
+    AgentDefinitionResourceKey, PermissionCommandPattern, PermissionLevel, PermissionPathPattern,
     definition::{
         AgentDefinitionBundle, AgentDefinitionCatalog, AgentDefinitionError,
         AgentDefinitionRegistry, AgentDefinitionResourceKind, AgentFeature,
         AgentPermissionSelector, FilesystemFeatureProfile, McpServerSelection, ResolvedPermission,
         SESSION_WORKSPACE_ROOT,
     },
+    inspect_agent_definition_source,
 };
 
 const DEFAULT_AGENT: &str = "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: default }\nspec:\n  description: Provide the shared base behavior for Waltr agents.\n  systemPrompt: >-\n    You are Waltr Agent, a careful coding and operations assistant. Follow the user's instructions, use available tools when they are helpful, and report results clearly. Treat tool errors as recoverable information and continue when possible.\n  permissions:\n    - permissionSetRef: { name: default }\n";
 const CODING_AGENT: &str = "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: coding }\nspec:\n  description: Provide the complete coding behavior currently assembled by the server.\n  inheritsFrom: { name: default }\n  features:\n    - featureSetRef: { name: coding }\n  permissions:\n    - permissionSetRef: { name: coding }\n";
-const CODING_FEATURES: &str = include_str!("../../../../docs/examples/agents/coding-features.yaml");
-const DEFAULT_PERMISSIONS: &str =
-    include_str!("../../../../docs/examples/agents/default-permissions.yaml");
-const CODING_PERMISSIONS: &str =
-    include_str!("../../../../docs/examples/agents/coding-permissions.yaml");
-const BUNDLED_DEFINITIONS: &str =
-    include_str!("../../../../crates/waltr-server/agent-definitions.yaml");
+const CODING_FEATURES: &str = r"apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata:
+  name: coding
+spec:
+  filesystem:
+    root: $(session.workspace.root)
+    profile: auto
+    systemPrompt: true
+    agentsReadContext: true
+    skillsContext: true
+    defaultPermissions: true
+  agents:
+    root: $(session.workspace.root)
+    filename: AGENTS.md
+    systemPrompt: true
+  skills:
+    root: $(session.workspace.root)
+    defaultPermissions: true
+  shell:
+    root: $(session.workspace.root)
+    systemPrompt: true
+    defaultPermissions: true
+  task:
+    maxSubagentDepth: 1
+    defaultPermissions: true
+  mcp:
+    servers:
+      exclude: []
+    exposeTools: true
+    instructions: true
+    resources: true
+    prompts: true
+    tracePropagation: true
+    defaultPermissions: true
+";
+const DEFAULT_PERMISSIONS: &str = r"apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata:
+  name: default
+spec:
+  tools:
+    - name: question
+      permission: allow
+";
+const CODING_PERMISSIONS: &str = r"apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata:
+  name: coding
+spec:
+  tools:
+    - feature: filesystem
+      permission:
+        resources:
+          paths:
+            - match:
+                outsideRoot: $(session.workspace.root)
+              effect: ask
+    - name: shell
+      permission:
+        resources:
+          paths:
+            - match:
+                outsideRoot: $(session.workspace.root)
+              effect: ask
+          commands:
+            - match:
+                names:
+                  - git
+                  - pulumi
+                  - kubectl
+                  - terraform
+                  - gcloud
+                  - aws
+                  - gh
+                  - help
+                  - pyinfra
+                  - ansible
+                  - sudo
+                  - ssh
+              effect: ask
+";
+
+#[test]
+fn source_inspection_returns_resource_keys_in_document_order() {
+    let keys = inspect_agent_definition_source(
+        r"
+apiVersion: waltr.dev/v1alpha1
+kind: PermissionSet
+metadata: { name: permissions }
+spec: { tools: [] }
+---
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata: { name: agent }
+spec: {}
+---
+apiVersion: waltr.dev/v1alpha1
+kind: FeatureSet
+metadata: { name: features }
+spec: {}
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        keys,
+        vec![
+            AgentDefinitionResourceKey {
+                kind: AgentDefinitionResourceKind::PermissionSet,
+                name: "permissions".to_owned(),
+            },
+            AgentDefinitionResourceKey {
+                kind: AgentDefinitionResourceKind::Agent,
+                name: "agent".to_owned(),
+            },
+            AgentDefinitionResourceKey {
+                kind: AgentDefinitionResourceKind::FeatureSet,
+                name: "features".to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn source_inspection_preserves_strict_validation_and_duplicate_errors() {
+    let invalid = inspect_agent_definition_source(
+        "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: invalid }\nspec: { model: unsupported }\n",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        invalid,
+        AgentDefinitionError::Yaml { document: 1, .. }
+    ));
+
+    let duplicate = inspect_agent_definition_source(
+        "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: duplicate }\nspec: {}\n---\napiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: duplicate }\nspec: {}\n",
+    )
+    .unwrap_err();
+    assert!(matches!(
+        duplicate,
+        AgentDefinitionError::DuplicateResource {
+            document: 2,
+            kind: AgentDefinitionResourceKind::Agent,
+            ref name,
+        } if name == "duplicate"
+    ));
+}
 
 #[test]
 fn durable_bundle_reloads_sources_in_order_and_resolves_selection() {
@@ -342,7 +484,15 @@ spec:
 #[test]
 fn bundled_coding_definition_selects_all_mcp_servers_explicitly() {
     let mut registry = AgentDefinitionRegistry::new();
-    registry.load_yaml(BUNDLED_DEFINITIONS).unwrap();
+    for source in [
+        DEFAULT_AGENT,
+        CODING_AGENT,
+        CODING_FEATURES,
+        DEFAULT_PERMISSIONS,
+        CODING_PERMISSIONS,
+    ] {
+        registry.load_yaml(source).unwrap();
+    }
 
     let mcp = registry
         .resolve_agent("coding")

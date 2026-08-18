@@ -6,16 +6,17 @@ use crate::{
         AccessAuthConfig, AccessAuthConfigError, AccessAuthError, AccessAuthHttpClient,
         AccessAuthenticator, GrpcAccessAuthLayer, GrpcTransportLayer,
     },
-    agent_definition::load_default_agent_from_env,
+    agent_definition::{AgentDefinitionState, AgentDefinitionWatcher, DefinitionWatcherHealth},
     auth::{
         AuthService, CredentialStore, TrustedPrivateOriginsError, trusted_private_origins_from_env,
     },
     catalog::{CatalogLoader, CatalogService},
-    config::{ConfigError, ConfigHandle, DefaultConfigBuilder},
+    config::ConfigHandle,
     config_service::ConfigService,
     mcp_oauth::{McpOAuthConfig, McpOAuthConfigError, McpOAuthError, McpOAuthServer},
     mcp_service::WaltrMcpServer,
     persistence::{Persistence, PersistenceError},
+    resource_error::ResourceError,
     session,
     status_service::StatusService,
 };
@@ -29,7 +30,7 @@ use axum::{
 };
 use waltr::grpc::waltr::auth::v1::auth_service_server::AuthServiceServer;
 use waltr::grpc::waltr::catalog::v1::catalog_service_server::CatalogServiceServer;
-use waltr::grpc::waltr::config::v1::config_service_server::ConfigServiceServer;
+use waltr::grpc::waltr::resource::v1::resource_service_server::ResourceServiceServer;
 use waltr::grpc::waltr::status::v1::status_service_server::StatusServiceServer;
 use serde::Serialize;
 use std::{error::Error, fmt, future::Future, io, sync::Arc, time::Duration};
@@ -50,11 +51,14 @@ struct HealthResponse {
 struct Readiness {
     persistence: Persistence,
     oauth: Option<McpOAuthServer>,
+    definitions: tokio::sync::watch::Receiver<DefinitionWatcherHealth>,
 }
 
 impl Readiness {
     async fn response(self) -> axum::response::Response {
-        let ready = self.persistence.ready().await.is_ok()
+        let definitions_ready = definition_watcher_ready(&self.definitions);
+        let ready = definitions_ready
+            && self.persistence.ready().await.is_ok()
             && match self.oauth {
                 Some(oauth) => oauth.ready().await.is_ok(),
                 None => true,
@@ -67,9 +71,16 @@ impl Readiness {
     }
 }
 
+fn definition_watcher_ready(
+    health: &tokio::sync::watch::Receiver<DefinitionWatcherHealth>,
+) -> bool {
+    health.has_changed().is_ok() && matches!(&*health.borrow(), DefinitionWatcherHealth::Running)
+}
+
 /// Waltr router and server-owned background work.
 pub struct ServerApplication {
     router: Router,
+    definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
     test_background: Option<TestBackgroundTask>,
 }
@@ -83,9 +94,14 @@ impl fmt::Debug for ServerApplication {
 }
 
 impl ServerApplication {
-    fn new(router: Router, oauth: Option<McpOAuthServer>) -> Self {
+    fn new(
+        router: Router,
+        definition_watcher: AgentDefinitionWatcher,
+        oauth: Option<McpOAuthServer>,
+    ) -> Self {
         Self {
             router,
+            definition_watcher: Some(definition_watcher),
             oauth_maintenance: oauth.map(McpOAuthMaintenanceTask::spawn),
             test_background: None,
         }
@@ -100,11 +116,12 @@ impl ServerApplication {
     pub async fn shutdown(self) {
         let Self {
             router,
+            definition_watcher,
             oauth_maintenance,
             test_background,
         } = self;
-        shutdown_background_tasks(oauth_maintenance, test_background).await;
         drop(router);
+        shutdown_background_tasks(definition_watcher, oauth_maintenance, test_background).await;
     }
 
     #[cfg(any(debug_assertions, feature = "test"))]
@@ -114,6 +131,7 @@ impl ServerApplication {
     ) -> Self {
         Self {
             router: Router::new(),
+            definition_watcher: None,
             oauth_maintenance: None,
             test_background: Some(TestBackgroundTask { cancellation, task }),
         }
@@ -160,38 +178,33 @@ impl ServerApplication {
     {
         let Self {
             router,
+            definition_watcher,
             oauth_maintenance,
             test_background,
         } = self;
-        let oauth_cancellation = oauth_maintenance
-            .as_ref()
-            .map(|task| task.cancellation.clone());
-        let test_cancellation = test_background
-            .as_ref()
-            .map(|task| task.cancellation.clone());
         let result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
             shutdown.await;
-            if let Some(cancellation) = oauth_cancellation {
-                cancellation.cancel();
-            }
-            if let Some(cancellation) = test_cancellation {
-                cancellation.cancel();
-            }
         })
         .await;
-        shutdown_background_tasks(oauth_maintenance, test_background).await;
+        shutdown_background_tasks(definition_watcher, oauth_maintenance, test_background).await;
         result
     }
 }
 
 async fn shutdown_background_tasks(
+    definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
     test_background: Option<TestBackgroundTask>,
 ) {
+    if let Some(definition_watcher) = definition_watcher
+        && let Err(error) = definition_watcher.shutdown().await
+    {
+        tracing::warn!(%error, "agent-definition watcher failed to join");
+    }
     if let Some(task) = &oauth_maintenance {
         task.cancellation.cancel();
     }
@@ -280,7 +293,7 @@ pub enum BuildAppError {
     /// Agent definitions could not be loaded or resolved.
     AgentDefinition(AgentDefinitionLoadError),
     /// Filesystem-backed configuration could not start.
-    Config(ConfigError),
+    Config(ResourceError),
     /// Server persistence could not initialize.
     Persistence(PersistenceError),
     /// Agent session storage configuration is invalid.
@@ -365,14 +378,14 @@ impl Error for BuildAppError {
 /// Panics if the application builder does not invoke the session-service callback.
 pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
     tracing::debug!("building app with config service from current directory");
-    let default_agent = load_default_agent_from_env().map_err(BuildAppError::AgentDefinition)?;
     let persistence = Persistence::from_env()
         .await
         .map_err(BuildAppError::Persistence)?;
     let catalog_loader = CatalogLoader::from_env();
-    let config_service =
-        ConfigService::from_current_dir(DefaultConfigBuilder::from_env(catalog_loader.clone()))
-            .map_err(BuildAppError::Config)?;
+    let config_service = ConfigService::from_current_dir(catalog_loader.clone())
+        .await
+        .map_err(BuildAppError::Config)?;
+    let agent_state = config_service.state().clone();
     let access_auth_config =
         AccessAuthConfig::from_env().map_err(BuildAppError::AccessAuthConfig)?;
     let mcp_oauth_config =
@@ -387,14 +400,8 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
                 AccessAuthError::Persistence(_) => BuildAppError::AccessAuthStore(error),
                 _ => BuildAppError::AccessAuthDiscovery(error),
             })?;
-    let mcp_oauth = match mcp_oauth_config {
-        McpOAuthConfig::Disabled => None,
-        McpOAuthConfig::Enabled(config) => Some(
-            McpOAuthServer::initialize(config, &persistence, access_authenticator.clone())
-                .await
-                .map_err(BuildAppError::McpOAuth)?,
-        ),
-    };
+    let mcp_oauth =
+        initialize_mcp_oauth(mcp_oauth_config, &persistence, access_authenticator.clone()).await?;
     let automatic_self_mcp_resource = mcp_oauth
         .as_ref()
         .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
@@ -403,37 +410,40 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         automatic_self_mcp_resource.as_ref(),
     );
     let mut session_storage = None;
-    let router = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
-        config_service,
-        persistence,
-        catalog_loader,
-        access_authenticator,
-        mcp_oauth,
-        outbound_private_origins,
-        automatic_self_mcp_resource,
-        |grpc_routes, config, credential_store| {
-            match session::add_service_from_env_with_oauth_policy(
-                grpc_routes,
-                config.clone(),
-                credential_store.clone(),
-                session_private_origins,
-                default_agent.catalog.clone(),
-            ) {
-                Ok(host) => {
-                    session_storage = Some(Ok(Arc::clone(&host)));
-                    host
+    let router = std::future::ready(
+        build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
+            config_service,
+            persistence,
+            catalog_loader,
+            &access_authenticator,
+            mcp_oauth,
+            outbound_private_origins.clone(),
+            automatic_self_mcp_resource,
+            Some(agent_state),
+            |grpc_routes, config, credential_store, agent_state| {
+                match session::add_service_from_env_with_oauth_policy_and_agent_state(
+                    grpc_routes,
+                    config.clone(),
+                    credential_store.clone(),
+                    session_private_origins,
+                    agent_state.clone(),
+                ) {
+                    Ok(host) => {
+                        session_storage = Some(Ok(Arc::clone(&host)));
+                        host
+                    }
+                    Err(error) => {
+                        session_storage = Some(Err(error));
+                        session::add_memory_service_with_agent_state(
+                            grpc_routes,
+                            config,
+                            credential_store,
+                            agent_state,
+                        )
+                    }
                 }
-                Err(error) => {
-                    session_storage = Some(Err(error));
-                    session::add_memory_service(
-                        grpc_routes,
-                        config,
-                        credential_store,
-                        default_agent.catalog,
-                    )
-                }
-            }
-        },
+            },
+        ),
     )
     .await
     .map_err(BuildAppError::Config)?;
@@ -441,6 +451,22 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
         .expect("session service builder should run")
         .map_err(BuildAppError::SessionStorage)?;
     Ok(router)
+}
+
+async fn initialize_mcp_oauth(
+    config: McpOAuthConfig,
+    persistence: &Persistence,
+    access_authenticator: AccessAuthenticator,
+) -> Result<Option<McpOAuthServer>, BuildAppError> {
+    match config {
+        McpOAuthConfig::Disabled => Ok(None),
+        McpOAuthConfig::Enabled(config) => {
+            McpOAuthServer::initialize(config, persistence, access_authenticator)
+                .await
+                .map(Some)
+                .map_err(BuildAppError::McpOAuth)
+        }
+    }
 }
 
 fn build_access_auth_client() -> Result<AccessAuthHttpClient, BuildAppError> {
@@ -475,9 +501,14 @@ pub async fn build_app_with_services<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     add_session_service: F,
-) -> Result<ServerApplication, ConfigError>
+) -> Result<ServerApplication, ResourceError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
+    F: FnOnce(
+        &mut RoutesBuilder,
+        ConfigHandle,
+        CredentialStore,
+        AgentDefinitionState,
+    ) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator(
@@ -500,9 +531,14 @@ pub async fn build_app_with_access_authenticator<F>(
     persistence: Persistence,
     access_authenticator: AccessAuthenticator,
     add_session_service: F,
-) -> Result<ServerApplication, ConfigError>
+) -> Result<ServerApplication, ResourceError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
+    F: FnOnce(
+        &mut RoutesBuilder,
+        ConfigHandle,
+        CredentialStore,
+        AgentDefinitionState,
+    ) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
@@ -527,9 +563,14 @@ pub async fn build_app_with_access_authenticator_and_mcp_oauth<F>(
     access_authenticator: AccessAuthenticator,
     mcp_oauth: Option<McpOAuthServer>,
     add_session_service: F,
-) -> Result<ServerApplication, ConfigError>
+) -> Result<ServerApplication, ResourceError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
+    F: FnOnce(
+        &mut RoutesBuilder,
+        ConfigHandle,
+        CredentialStore,
+        AgentDefinitionState,
+    ) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
@@ -553,9 +594,14 @@ pub async fn build_app_with_catalog_loader<F>(
     persistence: Persistence,
     catalog_loader: CatalogLoader,
     add_session_service: F,
-) -> Result<ServerApplication, ConfigError>
+) -> Result<ServerApplication, ResourceError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
+    F: FnOnce(
+        &mut RoutesBuilder,
+        ConfigHandle,
+        CredentialStore,
+        AgentDefinitionState,
+    ) -> Arc<dyn session::SessionHost>,
 {
     build_app_with_catalog_loader_and_access_authenticator(
         config_service,
@@ -587,9 +633,14 @@ pub async fn build_app_with_catalog_loader_and_access_authenticator<F>(
     catalog_loader: CatalogLoader,
     access_authenticator: AccessAuthenticator,
     add_session_service: F,
-) -> Result<ServerApplication, ConfigError>
+) -> Result<ServerApplication, ResourceError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
+    F: FnOnce(
+        &mut RoutesBuilder,
+        ConfigHandle,
+        CredentialStore,
+        AgentDefinitionState,
+    ) -> Arc<dyn session::SessionHost>,
 {
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
         config_service,
@@ -624,22 +675,30 @@ pub async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oaut
     access_authenticator: AccessAuthenticator,
     mcp_oauth: Option<McpOAuthServer>,
     add_session_service: F,
-) -> Result<ServerApplication, ConfigError>
+) -> Result<ServerApplication, ResourceError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
+    F: FnOnce(
+        &mut RoutesBuilder,
+        ConfigHandle,
+        CredentialStore,
+        AgentDefinitionState,
+    ) -> Arc<dyn session::SessionHost>,
 {
     let automatic_self_mcp_resource = mcp_oauth
         .as_ref()
         .and_then(|oauth| reqwest::Url::parse(oauth.resource()).ok());
-    build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
-        config_service,
-        persistence,
-        catalog_loader,
-        access_authenticator,
-        mcp_oauth,
-        Vec::new(),
-        automatic_self_mcp_resource,
-        add_session_service,
+    std::future::ready(
+        build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
+            config_service,
+            persistence,
+            catalog_loader,
+            &access_authenticator,
+            mcp_oauth,
+            Vec::new(),
+            automatic_self_mcp_resource,
+            None,
+            add_session_service,
+        ),
     )
     .await
 }
@@ -649,40 +708,39 @@ where
     clippy::too_many_lines,
     reason = "router assembly consumes initialized services and OAuth policy in dependency order"
 )]
-async fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy<F>(
+fn build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy<F>(
     config_service: Arc<ConfigService>,
     persistence: Persistence,
     catalog_loader: CatalogLoader,
-    access_authenticator: AccessAuthenticator,
+    access_authenticator: &AccessAuthenticator,
     mcp_oauth: Option<McpOAuthServer>,
     outbound_private_origins: Vec<reqwest::Url>,
     automatic_self_mcp_resource: Option<reqwest::Url>,
+    agent_state: Option<AgentDefinitionState>,
     add_session_service: F,
-) -> Result<ServerApplication, ConfigError>
+) -> Result<ServerApplication, ResourceError>
 where
-    F: FnOnce(&mut RoutesBuilder, ConfigHandle, CredentialStore) -> Arc<dyn session::SessionHost>,
+    F: FnOnce(
+        &mut RoutesBuilder,
+        ConfigHandle,
+        CredentialStore,
+        AgentDefinitionState,
+    ) -> Arc<dyn session::SessionHost>,
 {
     tracing::debug!("building app router");
-    let config = ConfigHandle::watching(
-        config_service.store().clone(),
-        config_service.pubsub().clone(),
-    )
-    .await?;
+    let agent_state = agent_state.unwrap_or_else(|| config_service.state().clone());
+    let config = ConfigHandle::from_resources(agent_state.clone());
     let outbound_oauth_store = persistence.outbound_oauth_store();
     let credential_store = CredentialStore::shared(outbound_oauth_store.clone());
     let auth_service = AuthService::new(
-        config_service.store().clone(),
+        agent_state.clone(),
         credential_store.clone(),
         outbound_oauth_store,
         outbound_private_origins,
         automatic_self_mcp_resource,
     );
     let outbound_oauth_router = auth_service.router();
-    let catalog_service = CatalogService::new(config_service.store().clone(), catalog_loader);
-    let readiness = Readiness {
-        persistence: persistence.clone(),
-        oauth: mcp_oauth.clone(),
-    };
+    let catalog_service = CatalogService::new(agent_state.clone(), catalog_loader);
     // Waltr has no browser MCP client, so the generic empty Origin allowlist stays in force.
     let mut mcp_options =
         mcp::server::StreamableHttpOptions::default().without_root_protected_resource_metadata();
@@ -701,21 +759,29 @@ where
         mcp_options = mcp_options.with_authorization(authorization);
     }
     let mut grpc_routes = Routes::builder();
-    let session_host = add_session_service(&mut grpc_routes, config, credential_store);
+    let session_host = add_session_service(
+        &mut grpc_routes,
+        config,
+        credential_store,
+        agent_state.clone(),
+    );
+    let waltr_mcp = Arc::new(WaltrMcpServer::new(session_host, agent_state.clone()));
+    let definition_watcher = agent_state
+        .spawn_watcher()
+        .map_err(|_| ResourceError::unavailable("resource watcher could not start"))?;
+    let readiness = Readiness {
+        persistence,
+        oauth: mcp_oauth.clone(),
+        definitions: definition_watcher.health(),
+    };
     let mcp_router = if access_authenticator.enabled() && mcp_oauth.is_none() {
         Router::new()
             .route("/mcp", any(service_unavailable))
             .route("/.well-known/oauth-protected-resource/mcp", get(not_found))
     } else {
-        mcp::server::streamable_http_router_with_options(
-            Arc::new(WaltrMcpServer::new(
-                Arc::clone(&config_service),
-                session_host,
-            )),
-            mcp_options,
-        )
+        mcp::server::streamable_http_router_with_options(waltr_mcp, mcp_options)
     };
-    grpc_routes.add_service(ConfigServiceServer::from_arc(config_service));
+    grpc_routes.add_service(ResourceServiceServer::from_arc(config_service));
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
     grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
@@ -777,7 +843,11 @@ where
     let router = router
         .fallback_service(grpc)
         .layer(TraceLayer::new_for_http().make_span_with(request_span));
-    Ok(ServerApplication::new(router, mcp_oauth))
+    Ok(ServerApplication::new(
+        router,
+        definition_watcher,
+        mcp_oauth,
+    ))
 }
 
 fn request_span<B>(request: &Request<B>) -> tracing::Span {
@@ -837,6 +907,42 @@ mod tests {
         assert_eq!(origins, [same_origin]);
     }
 
+    #[tokio::test]
+    async fn policy_builder_supplies_the_shared_agent_definition_state_to_sessions() {
+        let root = crate::test_support::temp_root();
+        let state = AgentDefinitionState::load(&root, &[], "coding").unwrap();
+        let expected_snapshot = state.snapshot();
+        let config_service =
+            ConfigService::from_state(state.clone(), crate::test_support::default_catalog_loader());
+        let persistence =
+            Persistence::initialize(crate::persistence::DatabaseConfig::for_tests().unwrap())
+                .await
+                .unwrap();
+
+        let app = build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth_policy(
+            config_service,
+            persistence,
+            crate::test_support::default_catalog_loader(),
+            &AccessAuthenticator::disabled(),
+            None,
+            Vec::new(),
+            None,
+            Some(state),
+            move |routes, config, credentials, callback_state| {
+                assert!(Arc::ptr_eq(&expected_snapshot, &callback_state.snapshot()));
+                session::add_memory_service_with_agent_state(
+                    routes,
+                    config,
+                    credentials,
+                    callback_state,
+                )
+            },
+        )
+        .unwrap();
+
+        app.shutdown().await;
+    }
+
     #[test]
     fn build_error_preserves_agent_definition_context_and_source() {
         let load_error = crate::agent_definition::load_default_agent(&[], "missing").unwrap_err();
@@ -848,6 +954,23 @@ mod tests {
                 .contains("failed to resolve default agent `missing`")
         );
         assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn maintenance_readiness_requires_live_running_tasks() {
+        let (definition_tx, definition_rx) =
+            tokio::sync::watch::channel(DefinitionWatcherHealth::Running);
+        assert!(definition_watcher_ready(&definition_rx));
+
+        definition_tx
+            .send(DefinitionWatcherHealth::Failed("watcher failed".to_owned()))
+            .unwrap();
+        assert!(!definition_watcher_ready(&definition_rx));
+
+        let (definition_tx, definition_rx) =
+            tokio::sync::watch::channel(DefinitionWatcherHealth::Running);
+        drop(definition_tx);
+        assert!(!definition_watcher_ready(&definition_rx));
     }
 
     #[tokio::test]

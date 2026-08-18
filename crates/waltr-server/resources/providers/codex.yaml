@@ -1,0 +1,34 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata:
+  name: codex
+spec:
+  transport: openaiResponses
+  url: https://chatgpt.com/backend-api/codex/responses
+  headers:
+    accept: text/event-stream
+    OpenAI-Beta: responses=experimental
+    originator: waltr
+  oauth:
+    name: OpenAI Codex
+    authorizeUrl: https://auth.openai.com/oauth/authorize
+    tokenUrl: https://auth.openai.com/oauth/token
+    clientId: app_EMoamEEZ73f0CkXaXp7hrann
+    redirectUri: http://localhost:1455/auth/callback
+    scopes: [openid, profile, email, offline_access, api.connectors.read, api.connectors.invoke]
+    tokenRequestStyle: formUrlencoded
+    authUrlParams:
+      id_token_add_organizations: "true"
+      codex_cli_simplified_flow: "true"
+      originator: waltr
+    jwtMetadata:
+      - token: id
+        metadataKey: account_id
+        claimNames: [https://api.openai.com/auth.chatgpt_account_id, chatgpt_account_id]
+        required: true
+  catalog:
+    provider: openai
+    include: [gpt-5.*]
+    keyPrefix: codex/
+    aliases:
+      codex/gpt-5.6: gpt-5.6

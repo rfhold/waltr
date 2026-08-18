@@ -1,0 +1,12 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Provider
+metadata:
+  name: openai
+spec:
+  transport: openaiChatCompletions
+  url: https://api.openai.com/v1/chat/completions
+  headers:
+    Authorization: Bearer ${env:OPENAI_API_KEY}
+  catalog:
+    provider: openai
+    include: [gpt-5.*]

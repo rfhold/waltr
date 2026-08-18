@@ -1,6 +1,6 @@
 //! Session service coordination.
 
-use crate::config::ConfigHandle;
+use crate::{agent_definition::AgentDefinitionState, config::ConfigHandle};
 use futures_util::Stream;
 use waltr::grpc::waltr::session::v1::session_service_server::SessionServiceServer;
 use waltr_agent::{
@@ -107,6 +107,64 @@ pub(crate) fn add_service_from_env_with_oauth_policy(
     Ok(host)
 }
 
+/// Add the configured session service backed by live agent-definition state.
+///
+/// # Errors
+///
+/// Returns an error when session storage environment configuration is invalid.
+pub fn add_service_from_env_with_agent_state(
+    routes: &mut RoutesBuilder,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origin: Option<reqwest::Url>,
+    agent_state: AgentDefinitionState,
+) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
+    add_service_from_env_with_oauth_policy_and_agent_state(
+        routes,
+        config,
+        credential_store,
+        trusted_mcp_oauth_origin.into_iter().collect(),
+        agent_state,
+    )
+}
+
+pub(crate) fn add_service_from_env_with_oauth_policy_and_agent_state(
+    routes: &mut RoutesBuilder,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    agent_state: AgentDefinitionState,
+) -> Result<Arc<dyn SessionHost>, SessionStorageConfigError> {
+    let host = match SessionStorageConfig::from_env()? {
+        SessionStorageConfig::Memory => add_store_service_with_agent_state(
+            routes,
+            MemorySessionStore::new(),
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            agent_state,
+        ),
+        SessionStorageConfig::Filesystem { root } => add_store_service_with_agent_state(
+            routes,
+            FilesystemSessionStore::new(root),
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            agent_state,
+        ),
+        SessionStorageConfig::S3(s3_config) => add_store_service_with_agent_state(
+            routes,
+            s3_config.into_store(),
+            config,
+            credential_store,
+            trusted_mcp_oauth_origins,
+            agent_state,
+        ),
+    };
+
+    Ok(host)
+}
+
 /// Add an in-memory session service using an explicit config store.
 pub fn add_memory_service(
     routes: &mut RoutesBuilder,
@@ -121,6 +179,23 @@ pub fn add_memory_service(
         credential_store,
         Vec::new(),
         agent_catalog,
+    )
+}
+
+/// Add an in-memory session service backed by live agent-definition state.
+pub fn add_memory_service_with_agent_state(
+    routes: &mut RoutesBuilder,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    agent_state: AgentDefinitionState,
+) -> Arc<dyn SessionHost> {
+    add_store_service_with_agent_state(
+        routes,
+        MemorySessionStore::new(),
+        config,
+        credential_store,
+        Vec::new(),
+        agent_state,
     )
 }
 
@@ -147,6 +222,32 @@ where
         credential_store,
         trusted_mcp_oauth_origin.into_iter().collect(),
         agent_catalog,
+    )
+}
+
+/// Add a session service using an existing coordinator and live agent-definition state.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "service registration receives independent coordinator dependencies"
+)]
+pub fn add_sessions_service_with_agent_state<S>(
+    routes: &mut RoutesBuilder,
+    sessions: SessionCoordinator<S>,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origin: Option<reqwest::Url>,
+    agent_state: AgentDefinitionState,
+) -> Arc<dyn SessionHost>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    add_sessions_service_with_oauth_policy_and_agent_state(
+        routes,
+        sessions,
+        config,
+        credential_store,
+        trusted_mcp_oauth_origin.into_iter().collect(),
+        agent_state,
     )
 }
 
@@ -181,6 +282,33 @@ where
     clippy::too_many_arguments,
     reason = "service registration receives independent coordinator dependencies"
 )]
+pub(crate) fn add_sessions_service_with_oauth_policy_and_agent_state<S>(
+    routes: &mut RoutesBuilder,
+    sessions: SessionCoordinator<S>,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    agent_state: AgentDefinitionState,
+) -> Arc<dyn SessionHost>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    let service = SessionService::from_sessions_with_oauth_policy_and_agent_state(
+        sessions,
+        config,
+        credential_store,
+        trusted_mcp_oauth_origins,
+        agent_state,
+    );
+    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
+    let host: Arc<dyn SessionHost> = service;
+    host
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "service registration receives independent coordinator dependencies"
+)]
 fn add_store_service<S>(
     routes: &mut RoutesBuilder,
     store: S,
@@ -198,6 +326,33 @@ where
         credential_store,
         trusted_mcp_oauth_origins,
         agent_catalog,
+    );
+    routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
+    let host: Arc<dyn SessionHost> = service;
+    host
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "service registration receives independent coordinator dependencies"
+)]
+fn add_store_service_with_agent_state<S>(
+    routes: &mut RoutesBuilder,
+    store: S,
+    config: ConfigHandle,
+    credential_store: CredentialStore,
+    trusted_mcp_oauth_origins: Vec<reqwest::Url>,
+    agent_state: AgentDefinitionState,
+) -> Arc<dyn SessionHost>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    let service = SessionService::new_with_oauth_policy_and_agent_state(
+        store,
+        config,
+        credential_store,
+        trusted_mcp_oauth_origins,
+        agent_state,
     );
     routes.add_service(SessionServiceServer::from_arc(Arc::clone(&service)));
     let host: Arc<dyn SessionHost> = service;

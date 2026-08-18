@@ -852,7 +852,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::defaults::openai_codex_oauth_settings;
     use axum::{
         Json, Router,
         http::{StatusCode, header},
@@ -860,6 +859,16 @@ mod tests {
         routing::post,
     };
     use serde_json::json;
+
+    fn openai_codex_oauth_settings() -> waltr::grpc::waltr::config::v1::OAuthProvider {
+        crate::test_support::resource_state_with_overrides(&[])
+            .snapshot()
+            .configuration()
+            .providers["codex"]
+            .oauth_settings
+            .clone()
+            .expect("bundled codex OAuth settings")
+    }
 
     async fn malicious_token_server(oversized: bool) -> (String, Arc<AtomicUsize>) {
         let redirected_requests = Arc::new(AtomicUsize::new(0));

@@ -1,9 +1,9 @@
 use crate::support::{
-    grpc::{config_client_for_addr, config_with_provider, get_config},
+    grpc::resource_client_for_addr,
     server::{temp_root, wait_for_health},
 };
 use axum::{Json, Router, extract::State, routing::get};
-use waltr::grpc::waltr::config::v1::{PatchConfigRequest, ProviderMapPatch};
+use waltr::grpc::waltr::resource::v1::{InspectResourceRequest, ReplaceResourceRequest};
 use waltr_server::persistence::{DatabaseConfig, Persistence};
 use serde_json::{Value, json};
 use sqlx::Connection as _;
@@ -60,7 +60,7 @@ async fn server_process_boots_and_serves_health() -> Result<(), Box<dyn std::err
 
     let result = async {
         wait_for_health(addr).await?;
-        patch_config(addr).await
+        replace_provider_resource(addr).await
     }
     .await;
 
@@ -361,27 +361,34 @@ async fn process_jwks(State(state): State<ProcessOidcState>) -> Json<Value> {
     }]}))
 }
 
-async fn patch_config(addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = config_client_for_addr(addr).await?;
-    let current = get_config(&mut client).await?;
-
-    let patched = tokio::time::timeout(
+async fn replace_provider_resource(
+    addr: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = resource_client_for_addr(addr).await?;
+    let inspected = client
+        .inspect_resource(InspectResourceRequest {
+            path: Some("providers/openai.yaml".to_owned()),
+        })
+        .await?
+        .into_inner()
+        .resources
+        .remove(0);
+    let replaced = tokio::time::timeout(
         Duration::from_secs(2),
-        client.patch_config(PatchConfigRequest {
-            expected_etag: current.etag,
-            providers: Some(ProviderMapPatch {
-                providers: config_with_provider("anthropic").providers,
-            }),
-            mcp_servers: None,
-            inference_defaults: None,
+        client.replace_resource(ReplaceResourceRequest {
+            path: "providers/openai.yaml".to_owned(),
+            source: "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: openai\nspec:\n  transport: openaiResponses\n  url: https://gateway.example/v1/responses\n".to_owned(),
+            expected_etag: inspected.persisted_etag,
         }),
     )
     .await??
     .into_inner()
-    .config
-    .expect("patched config should be present");
-
-    assert_eq!(patched.providers["anthropic"].name, "anthropic");
+    .catalog
+    .expect("replacement catalog should be present");
+    assert_eq!(
+        replaced.effective_configuration.unwrap().providers["openai"].url,
+        "https://gateway.example/v1/responses"
+    );
     Ok(())
 }
 
@@ -399,10 +406,13 @@ fn isolated_server_command(
     root: &std::path::Path,
     database_url: &str,
 ) -> Command {
+    let catalog_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/models-dev-defaults.json");
     let mut command = Command::new(env!("CARGO_BIN_EXE_waltr-server"));
     command
         .env("WALTR_SERVER_ADDR", addr.to_string())
         .env("WALTR_DATABASE_URL", database_url)
+        .env("WALTR_MODELS_DEV_PATH", catalog_path)
         .env_remove("WALTR_MCP_DATABASE_URL")
         .env("WALTR_SESSION_STORE", "memory")
         .env_remove("WALTR_OTEL_EXPORT")
@@ -414,6 +424,7 @@ fn isolated_server_command(
     for name in OIDC_ENVIRONMENT {
         command.env_remove(name);
     }
+    command.env("WALTR_PUBLIC_URL", format!("http://{addr}"));
     command
 }
 
@@ -514,6 +525,7 @@ async fn assert_process_database_isolation(
             "mcp_oauth_consents",
             "mcp_oauth_dynamic_clients",
             "mcp_oauth_grants",
+            "mcp_oauth_oidc_resource_owner_attempts",
             "mcp_oauth_refresh_families",
             "mcp_oauth_refresh_tokens",
             "mcp_oauth_registration_rates",

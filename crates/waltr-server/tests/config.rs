@@ -1,24 +1,138 @@
-//! Server config integration tests.
+//! Unified resource catalog integration tests.
 
 mod support;
 
-#[path = "config/read.rs"]
-mod read;
+use crate::support::grpc::{get_catalog, resource_client};
+use waltr::grpc::waltr::resource::v1::{
+    InspectResourceRequest, ReplaceResourceRequest, ResetResourceRequest,
+    WatchResourceCatalogRequest,
+};
+use waltr_server::test_support::setup_server;
 
-#[path = "config/watch.rs"]
-mod watch;
+const PROVIDER_OVERRIDE: &str = "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: openai\nspec:\n  transport: openaiResponses\n  url: https://gateway.example/v1/responses\n";
 
-#[path = "config/providers.rs"]
-mod providers;
+#[tokio::test]
+async fn read_returns_complete_six_kind_catalog() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = resource_client(setup_server()).await?;
+    let catalog = get_catalog(&mut client).await?;
+    assert_eq!(catalog.resources.len(), 12);
+    assert_eq!(
+        catalog
+            .resources
+            .iter()
+            .map(|resource| resource.kind)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        6
+    );
+    let config = catalog.effective_configuration.expect("effective config");
+    assert_eq!(config.providers.len(), 4);
+    assert!(config.mcp_servers.contains_key("waltr"));
+    assert!(config.inference_defaults.is_some());
+    Ok(())
+}
 
-#[path = "config/stale_etag.rs"]
-mod stale_etag;
+#[tokio::test]
+async fn replace_watch_and_reset_are_resource_native() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = resource_client(setup_server()).await?;
+    let mut watch = client
+        .watch_resource_catalog(WatchResourceCatalogRequest {})
+        .await?
+        .into_inner();
+    let initial = watch
+        .message()
+        .await?
+        .expect("initial snapshot")
+        .catalog
+        .unwrap();
+    let inspection = client
+        .inspect_resource(InspectResourceRequest {
+            path: Some("providers/openai.yaml".to_owned()),
+        })
+        .await?
+        .into_inner()
+        .resources
+        .remove(0);
+    assert!(!inspection.persisted);
 
-#[path = "config/reset.rs"]
-mod reset;
+    let replaced = client
+        .replace_resource(ReplaceResourceRequest {
+            path: "providers/openai.yaml".to_owned(),
+            source: PROVIDER_OVERRIDE.to_owned(),
+            expected_etag: inspection.persisted_etag,
+        })
+        .await?
+        .into_inner();
+    let replaced_catalog = replaced.catalog.expect("replacement catalog");
+    assert_ne!(replaced_catalog.etag, initial.etag);
+    assert_eq!(
+        replaced_catalog
+            .effective_configuration
+            .as_ref()
+            .unwrap()
+            .providers["openai"]
+            .url,
+        "https://gateway.example/v1/responses"
+    );
+    let watched = watch
+        .message()
+        .await?
+        .expect("changed snapshot")
+        .catalog
+        .unwrap();
+    assert_eq!(watched.etag, replaced_catalog.etag);
+    assert_eq!(watched.resources.len(), initial.resources.len());
 
-#[path = "config/validation.rs"]
-mod validation;
+    let reset = client
+        .reset_resource(ResetResourceRequest {
+            path: "providers/openai.yaml".to_owned(),
+            expected_etag: replaced.resource.unwrap().persisted_etag,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(
+        reset
+            .catalog
+            .unwrap()
+            .effective_configuration
+            .unwrap()
+            .providers["openai"]
+            .url,
+        "https://api.openai.com/v1/chat/completions"
+    );
+    assert!(!reset.resource.unwrap().persisted);
+    Ok(())
+}
 
-#[path = "config/mcp_server.rs"]
-mod mcp_server;
+#[tokio::test]
+async fn stale_etag_and_invalid_yaml_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = resource_client(setup_server()).await?;
+    let stale = client
+        .replace_resource(ReplaceResourceRequest {
+            path: "providers/openai.yaml".to_owned(),
+            source: PROVIDER_OVERRIDE.to_owned(),
+            expected_etag: "sha256:stale".to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+
+    let inspection = client
+        .inspect_resource(InspectResourceRequest {
+            path: Some("providers/openai.yaml".to_owned()),
+        })
+        .await?
+        .into_inner()
+        .resources
+        .remove(0);
+    let invalid = client
+        .replace_resource(ReplaceResourceRequest {
+            path: "providers/openai.yaml".to_owned(),
+            source: "kind: Provider\n".to_owned(),
+            expected_etag: inspection.persisted_etag,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+    Ok(())
+}

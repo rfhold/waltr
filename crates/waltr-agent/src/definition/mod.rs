@@ -238,6 +238,38 @@ impl fmt::Display for AgentDefinitionResourceKind {
     }
 }
 
+/// Identity of one resource in an agent-definition YAML source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDefinitionResourceKey {
+    /// Resource kind.
+    pub kind: AgentDefinitionResourceKind,
+    /// Resource `metadata.name`.
+    pub name: String,
+}
+
+/// Strictly parse an agent-definition YAML source and return its resource keys.
+///
+/// Keys are returned in YAML document order. Parsing validates each complete resource and rejects
+/// duplicate `(kind, metadata.name)` keys within the source.
+///
+/// # Errors
+///
+/// Returns the same errors as [`AgentDefinitionRegistry::load_yaml`] for malformed, unsupported,
+/// invalid, or duplicate resources.
+pub fn inspect_agent_definition_source(
+    source: &str,
+) -> Result<Vec<AgentDefinitionResourceKey>, AgentDefinitionError> {
+    parse::parse_source(source).map(|resources| {
+        resources
+            .into_iter()
+            .map(|resource| AgentDefinitionResourceKey {
+                kind: resource.kind(),
+                name: resource.name().to_owned(),
+            })
+            .collect()
+    })
+}
+
 /// Failure while parsing, registering, or resolving agent definitions.
 #[derive(Debug)]
 pub enum AgentDefinitionError {

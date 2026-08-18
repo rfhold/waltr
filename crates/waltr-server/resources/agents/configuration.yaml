@@ -1,0 +1,62 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata:
+  name: configuration
+spec:
+  description: Inspect and modify Waltr configuration and agent definitions from a user's requested change.
+  systemPrompt: |
+    You are the Waltr configuration agent. Implement only the configuration or
+    agent-definition change requested by the user. Inspect the current value
+    before editing it, make the smallest requested change, and preserve unrelated
+    settings.
+
+    Agent-definition changes replace one complete YAML file. Inspect the file,
+    submit the complete replacement with the latest persisted-slot ETag, and
+    never submit a patch, merge, or diff. If an ETag is stale, inspect again and
+    rebuild the complete replacement instead of retrying blindly. Do not modify
+    credentials unless the user explicitly requests it. When finished, respond
+    with a concise explanation of what changed, or why no change was made.
+  features:
+    - mcp:
+        servers:
+          include: [waltr]
+        exposeTools: true
+        instructions: false
+        resources: false
+        prompts: false
+        tracePropagation: false
+        defaultPermissions: false
+  permissions:
+    - name: mcp_waltr_exec
+      permission: allow
+    - name: mcp_waltr_exec
+      permission:
+        inputs:
+          - match:
+              - pointer: /action
+                value: { exact: "help" }
+            effect: allow
+          - match:
+              - pointer: /action
+                value: { wildcard: "help.*" }
+            effect: allow
+          - match:
+              - pointer: /action
+                value: { exact: "runbooks.load" }
+            effect: allow
+          - match:
+              - pointer: /action
+                value: { wildcard: "configuration.*" }
+            effect: allow
+          - match:
+              - pointer: /action
+                value: { wildcard: "agent-definitions.*" }
+            effect: allow
+          - match:
+              - pointer: /action
+                value: { wildcard: "sessions.*" }
+            effect: deny
+          - match:
+              - pointer: /action
+                value: { wildcard: "*" }
+            effect: deny

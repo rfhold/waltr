@@ -39,10 +39,8 @@ use waltr_agent::{
 };
 
 use crate::{
-    config::{
-        ConfigStore,
-        headers::{configured_credential, has_unresolved_credential, resolve_provider_headers},
-    },
+    agent_definition::AgentDefinitionState,
+    config::headers::{configured_credential, has_unresolved_credential, resolve_provider_headers},
     persistence::{DurableAttemptRecord, OutboundOAuthStore},
 };
 
@@ -55,8 +53,8 @@ const OAUTH_COMPLETION_LEASE_MS: i64 = 30_000;
 
 /// gRPC auth service for provider credentials.
 #[derive(Debug)]
-pub struct AuthService<S> {
-    config_store: S,
+pub struct AuthService {
+    resources: AgentDefinitionState,
     credential_store: CredentialStore,
     outbound_store: Arc<OutboundOAuthStore>,
     attempts: Mutex<HashMap<String, PendingOAuthAttempt>>,
@@ -104,21 +102,18 @@ struct McpRegistrationRequest<'a> {
     policy: OutboundHttpPolicy,
 }
 
-impl<S> AuthService<S>
-where
-    S: ConfigStore,
-{
+impl AuthService {
     /// Create an auth service.
     #[must_use]
     pub(crate) fn new(
-        config_store: S,
+        resources: AgentDefinitionState,
         credential_store: CredentialStore,
         outbound_store: Arc<OutboundOAuthStore>,
         configured_private_origins: Vec<reqwest::Url>,
         automatic_self_resource: Option<reqwest::Url>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            config_store,
+            resources,
             credential_store,
             outbound_store,
             attempts: Mutex::new(HashMap::new()),
@@ -135,13 +130,13 @@ where
 
     #[cfg(test)]
     fn new_for_tests(
-        config_store: S,
+        resources: AgentDefinitionState,
         credential_store: CredentialStore,
         outbound_store: Arc<OutboundOAuthStore>,
         outbound_redirect_uri: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            config_store,
+            resources,
             credential_store,
             outbound_store,
             attempts: Mutex::new(HashMap::new()),
@@ -153,8 +148,8 @@ where
 
     pub(crate) fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/outbound-oauth/callback", get(outbound_callback::<S>))
-            .route("/.well-known/oauth-client/waltr", get(client_metadata::<S>))
+            .route("/outbound-oauth/callback", get(outbound_callback))
+            .route("/.well-known/oauth-client/waltr", get(client_metadata))
             .with_state(Arc::clone(self))
     }
 
@@ -162,6 +157,10 @@ where
     #[must_use]
     pub const fn credential_store(&self) -> &CredentialStore {
         &self.credential_store
+    }
+
+    fn configuration(&self) -> waltr::grpc::waltr::config::v1::Configuration {
+        self.resources.snapshot().configuration().clone()
     }
 
     async fn status_for(&self, target: AuthTarget) -> Result<AuthStatus, Status> {
@@ -176,9 +175,7 @@ where
         reason = "provider status combines configuration capabilities with durable credential state"
     )]
     async fn provider_status_for(&self, provider_key: &str) -> Result<AuthStatus, Status> {
-        let config = self.config_store.load().await.map_err(|error| {
-            Status::internal(format!("failed to load config for auth status: {error}"))
-        })?;
+        let config = self.configuration();
         let provider = config.providers.get(provider_key).ok_or_else(|| {
             Status::not_found(format!("provider '{provider_key}' does not exist"))
         })?;
@@ -259,9 +256,7 @@ where
     }
 
     async fn mcp_status_for(&self, server_key: &str) -> Result<AuthStatus, Status> {
-        let config = self.config_store.load().await.map_err(|error| {
-            Status::internal(format!("failed to load config for auth status: {error}"))
-        })?;
+        let config = self.configuration();
         let server = config.mcp_servers.get(server_key).ok_or_else(|| {
             Status::not_found(format!("mcp server '{server_key}' does not exist"))
         })?;
@@ -292,9 +287,7 @@ where
         &self,
         server_key: String,
     ) -> Result<(BeginAuthResponse, AuthCompletionMode, i32), Status> {
-        let config = self.config_store.load().await.map_err(|error| {
-            Status::internal(format!("failed to load config for MCP auth: {error}"))
-        })?;
+        let config = self.configuration();
         let server = config.mcp_servers.get(&server_key).ok_or_else(|| {
             Status::not_found(format!("mcp server '{server_key}' does not exist"))
         })?;
@@ -356,9 +349,7 @@ where
         &self,
         provider_key: String,
     ) -> Result<BeginAuthResponse, Status> {
-        let config = self.config_store.load().await.map_err(|error| {
-            Status::internal(format!("failed to load config for auth: {error}"))
-        })?;
+        let config = self.configuration();
         let provider = config.providers.get(&provider_key).ok_or_else(|| {
             Status::not_found(format!("provider '{provider_key}' does not exist"))
         })?;
@@ -425,9 +416,7 @@ where
         let coordinator = CredentialRefreshCoordinator::new(self.credential_store.clone());
         match target {
             AuthTarget::Provider { key } => {
-                let config = self.config_store.load().await.map_err(|error| {
-                    Status::internal(format!("failed to load config for auth refresh: {error}"))
-                })?;
+                let config = self.configuration();
                 let provider = config
                     .providers
                     .get(key)
@@ -452,9 +441,7 @@ where
                     })?;
             }
             AuthTarget::McpServer { key } => {
-                let config = self.config_store.load().await.map_err(|error| {
-                    Status::internal(format!("failed to load config for auth refresh: {error}"))
-                })?;
+                let config = self.configuration();
                 let server = config.mcp_servers.get(key).ok_or_else(|| {
                     Status::not_found(format!("mcp server '{key}' does not exist"))
                 })?;
@@ -771,17 +758,12 @@ where
 }
 
 #[tonic::async_trait]
-impl<S> GeneratedAuthService for AuthService<S>
-where
-    S: ConfigStore,
-{
+impl GeneratedAuthService for AuthService {
     async fn list_auth_statuses(
         &self,
         _request: Request<ListAuthStatusesRequest>,
     ) -> Result<Response<ListAuthStatusesResponse>, Status> {
-        let config = self.config_store.load().await.map_err(|error| {
-            Status::internal(format!("failed to load config for auth statuses: {error}"))
-        })?;
+        let config = self.configuration();
         let mut statuses = Vec::with_capacity(config.providers.len() + config.mcp_servers.len());
         for provider_key in config.providers.keys() {
             statuses.push(self.provider_status_for(provider_key).await?);
@@ -954,13 +936,10 @@ struct OutboundCallbackQuery {
     iss: Option<String>,
 }
 
-async fn outbound_callback<S>(
-    State(service): State<Arc<AuthService<S>>>,
+async fn outbound_callback(
+    State(service): State<Arc<AuthService>>,
     Query(query): Query<OutboundCallbackQuery>,
-) -> AxumResponse
-where
-    S: ConfigStore,
-{
+) -> AxumResponse {
     outbound_callback_with_policy(service, query, None).await
 }
 
@@ -968,14 +947,11 @@ where
     clippy::too_many_lines,
     reason = "the callback handles lookup, denial, completion, and durable claim responses"
 )]
-async fn outbound_callback_with_policy<S>(
-    service: Arc<AuthService<S>>,
+async fn outbound_callback_with_policy(
+    service: Arc<AuthService>,
     query: OutboundCallbackQuery,
     policy: Option<OutboundHttpPolicy>,
-) -> AxumResponse
-where
-    S: ConfigStore,
-{
+) -> AxumResponse {
     let record = match service.outbound_store.attempt_by_state(&query.state).await {
         Ok(Some(record)) => record,
         Ok(None) => {
@@ -1072,10 +1048,7 @@ fn callback_completion_input(code: &str, state: &str, issuer: Option<&str>) -> S
     input.finish()
 }
 
-async fn client_metadata<S>(State(_service): State<Arc<AuthService<S>>>) -> AxumResponse
-where
-    S: ConfigStore,
-{
+async fn client_metadata(State(_service): State<Arc<AuthService>>) -> AxumResponse {
     let Some(client_id) = client_metadata_uri() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1803,14 +1776,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::{Router, routing::post};
-    use waltr::grpc::waltr::config::v1::{McpServer, McpServerType, OauthTokenRequestStyle};
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::{
-        config::{FilesystemConfigStore, default_configuration},
-        persistence::{DatabaseConfig, Persistence},
-    };
+    use crate::persistence::{DatabaseConfig, Persistence};
 
     #[test]
     fn missing_per_server_mcp_registration_allows_discovery_mechanisms() {
@@ -1935,21 +1904,11 @@ mod tests {
         assert!(durable.message.contains("requires reauthorization"));
     }
 
-    async fn generic_auth_service() -> Arc<AuthService<FilesystemConfigStore>> {
-        let root = crate::test_support::temp_root();
-        let config_store =
-            FilesystemConfigStore::new(root.clone(), crate::test_support::default_config_builder());
-        let mut config = default_configuration();
-        config.mcp_servers.insert(
-            "remote".to_owned(),
-            McpServer {
-                name: "remote".to_owned(),
-                r#type: McpServerType::Sse as i32,
-                url: "https://mcp.example/resource".to_owned(),
-                ..McpServer::default()
-            },
-        );
-        config_store.save(config).await.unwrap();
+    async fn generic_auth_service() -> Arc<AuthService> {
+        let resources = crate::test_support::resource_state_with_overrides(&[(
+            "mcp-servers/remote.yaml",
+            "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: remote\nspec:\n  transport: streamableHttp\n  url: https://mcp.example/resource\n",
+        )]);
         let persistence = Persistence::initialize(DatabaseConfig::for_tests().unwrap())
             .await
             .unwrap();
@@ -1985,7 +1944,7 @@ mod tests {
             .await
             .unwrap();
         AuthService::new(
-            config_store,
+            resources,
             credential_store,
             outbound_store,
             Vec::new(),
@@ -2115,7 +2074,7 @@ mod tests {
     }
 
     async fn successful_lifecycle_service() -> (
-        Arc<AuthService<FilesystemConfigStore>>,
+        Arc<AuthService>,
         tokio::task::JoinHandle<Result<(), std::io::Error>>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2124,34 +2083,23 @@ mod tests {
         let app = successful_oauth_router(&base, &resource);
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-        let root = crate::test_support::temp_root();
-        let config_store =
-            FilesystemConfigStore::new(root.clone(), crate::test_support::default_config_builder());
-        let mut config = default_configuration();
-        let provider = config.providers.get_mut("codex").unwrap();
-        let settings = provider.oauth_settings.as_mut().unwrap();
-        settings.authorize_url = format!("{base}/authorize");
-        settings.token_url = format!("{base}/token");
-        settings.redirect_uri = "http://127.0.0.1/provider-callback".to_owned();
-        settings.token_request_style = OauthTokenRequestStyle::FormUrlencoded as i32;
-        settings.jwt_metadata.clear();
-        config.mcp_servers.insert(
-            "remote".to_owned(),
-            McpServer {
-                name: "remote".to_owned(),
-                r#type: McpServerType::Sse as i32,
-                url: resource,
-                ..McpServer::default()
-            },
+        let codex = format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: codex\nspec:\n  transport: openaiResponses\n  url: https://chatgpt.com/backend-api/codex/responses\n  oauth:\n    name: Test Codex\n    authorizeUrl: {base}/authorize\n    tokenUrl: {base}/token\n    clientId: test-client\n    redirectUri: http://127.0.0.1/provider-callback\n    tokenRequestStyle: formUrlencoded\n  catalog:\n    provider: openai\n    include: [gpt-5.*]\n    keyPrefix: codex/\n"
         );
-        config_store.save(config).await.unwrap();
+        let remote = format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: remote\nspec:\n  transport: streamableHttp\n  url: {resource}\n"
+        );
+        let resources = crate::test_support::resource_state_with_overrides(&[
+            ("providers/codex.yaml", codex.as_str()),
+            ("mcp-servers/remote.yaml", remote.as_str()),
+        ]);
         let persistence = Persistence::initialize(DatabaseConfig::for_tests().unwrap())
             .await
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
         let credentials = CredentialStore::shared(outbound_store.clone());
         let service = AuthService::new_for_tests(
-            config_store,
+            resources,
             credentials,
             outbound_store,
             Some("http://127.0.0.1/callback".to_owned()),
@@ -2167,9 +2115,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn assert_non_destructive_mcp_reauthorization(
-        service: &AuthService<FilesystemConfigStore>,
-    ) {
+    async fn assert_non_destructive_mcp_reauthorization(service: &AuthService) {
         let (reauthorization, _) = oauth::begin_mcp(
             AuthTarget::mcp_server("remote"),
             "https://auth.example".to_owned(),
@@ -2204,10 +2150,7 @@ mod tests {
         );
     }
 
-    async fn assert_generic_target_lifecycle(
-        service: &AuthService<FilesystemConfigStore>,
-        target: ProtoAuthTarget,
-    ) {
+    async fn assert_generic_target_lifecycle(service: &AuthService, target: ProtoAuthTarget) {
         let begin = GeneratedAuthService::begin_auth(
             service,
             Request::new(BeginAuthRequest {
@@ -2389,7 +2332,7 @@ mod tests {
         assert_eq!(provider.metadata["account_id"], "account-123");
         assert!(provider.can_refresh);
 
-        let config = service.config_store.load().await.unwrap();
+        let config = service.configuration();
         let resource = config.mcp_servers["remote"].url.clone();
         service.refresh_outcomes.lock().await.insert(
             AuthTarget::mcp_server("remote").credential_key(),
@@ -2424,7 +2367,7 @@ mod tests {
     }
 
     async fn assert_typed_refresh_failure(
-        service: &AuthService<FilesystemConfigStore>,
+        service: &AuthService,
         target: ProtoAuthTarget,
         code: tonic::Code,
         reason: AuthenticationFailureReason,
@@ -2444,7 +2387,7 @@ mod tests {
         assert!(!error.message().contains("secret"));
     }
 
-    async fn assert_provider_refresh_failures(service: &AuthService<FilesystemConfigStore>) {
+    async fn assert_provider_refresh_failures(service: &AuthService) {
         assert_typed_refresh_failure(
             service,
             proto_provider_target("anthropic"),
@@ -2485,7 +2428,7 @@ mod tests {
         .await;
     }
 
-    async fn assert_mcp_refresh_failures(service: &AuthService<FilesystemConfigStore>) {
+    async fn assert_mcp_refresh_failures(service: &AuthService) {
         let key = AuthTarget::mcp_server("remote").credential_key();
         let mut credential = service
             .credential_store
@@ -2739,27 +2682,17 @@ mod tests {
         let token_url = format!("http://{}/token", listener.local_addr().unwrap());
         let token_server = tokio::spawn(async move { axum::serve(listener, token_app).await });
 
-        let root = crate::test_support::temp_root();
-        let config_store =
-            FilesystemConfigStore::new(root.clone(), crate::test_support::default_config_builder());
-        let mut config = default_configuration();
-        config.mcp_servers.insert(
-            "hosted".to_owned(),
-            McpServer {
-                name: "Hosted Waltr".to_owned(),
-                r#type: McpServerType::Sse as i32,
-                url: "https://waltr.example/mcp".to_owned(),
-                ..McpServer::default()
-            },
-        );
-        config_store.save(config).await.unwrap();
+        let resources = crate::test_support::resource_state_with_overrides(&[(
+            "mcp-servers/hosted.yaml",
+            "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: hosted\nspec:\n  transport: streamableHttp\n  url: https://waltr.example/mcp\n",
+        )]);
         let persistence = Persistence::initialize(DatabaseConfig::for_tests().unwrap())
             .await
             .unwrap();
         let outbound_store = persistence.outbound_oauth_store();
         let credential_store = CredentialStore::shared(outbound_store.clone());
         let service = AuthService::new(
-            config_store,
+            resources,
             credential_store,
             outbound_store,
             Vec::new(),
@@ -2769,7 +2702,7 @@ mod tests {
             .route(
                 "/outbound-oauth/callback",
                 get(
-                    |State(service): State<Arc<AuthService<FilesystemConfigStore>>>,
+                    |State(service): State<Arc<AuthService>>,
                      Query(query): Query<OutboundCallbackQuery>| async move {
                         outbound_callback_with_policy(
                             service,

@@ -166,64 +166,6 @@ pub mod catalog_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
-        pub async fn set_model_catalog_match(
-            &mut self,
-            request: impl tonic::IntoRequest<super::SetModelCatalogMatchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SetModelCatalogMatchResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/waltr.catalog.v1.CatalogService/SetModelCatalogMatch",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "waltr.catalog.v1.CatalogService",
-                        "SetModelCatalogMatch",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
-        pub async fn apply_catalog_model_defaults(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ApplyCatalogModelDefaultsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ApplyCatalogModelDefaultsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/waltr.catalog.v1.CatalogService/ApplyCatalogModelDefaults",
-            );
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "waltr.catalog.v1.CatalogService",
-                        "ApplyCatalogModelDefaults",
-                    ),
-                );
-            self.inner.unary(req, path, codec).await
-        }
     }
 }
 /// Generated server implementations.
@@ -258,20 +200,6 @@ pub mod catalog_service_server {
             request: tonic::Request<super::GetModelCatalogDriftRequest>,
         ) -> std::result::Result<
             tonic::Response<super::GetModelCatalogDriftResponse>,
-            tonic::Status,
-        >;
-        async fn set_model_catalog_match(
-            &self,
-            request: tonic::Request<super::SetModelCatalogMatchRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SetModelCatalogMatchResponse>,
-            tonic::Status,
-        >;
-        async fn apply_catalog_model_defaults(
-            &self,
-            request: tonic::Request<super::ApplyCatalogModelDefaultsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::ApplyCatalogModelDefaultsResponse>,
             tonic::Status,
         >;
     }
@@ -483,107 +411,6 @@ pub mod catalog_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetModelCatalogDriftSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/waltr.catalog.v1.CatalogService/SetModelCatalogMatch" => {
-                    #[allow(non_camel_case_types)]
-                    struct SetModelCatalogMatchSvc<T: CatalogService>(pub Arc<T>);
-                    impl<
-                        T: CatalogService,
-                    > tonic::server::UnaryService<super::SetModelCatalogMatchRequest>
-                    for SetModelCatalogMatchSvc<T> {
-                        type Response = super::SetModelCatalogMatchResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::SetModelCatalogMatchRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as CatalogService>::set_model_catalog_match(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = SetModelCatalogMatchSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
-                "/waltr.catalog.v1.CatalogService/ApplyCatalogModelDefaults" => {
-                    #[allow(non_camel_case_types)]
-                    struct ApplyCatalogModelDefaultsSvc<T: CatalogService>(pub Arc<T>);
-                    impl<
-                        T: CatalogService,
-                    > tonic::server::UnaryService<
-                        super::ApplyCatalogModelDefaultsRequest,
-                    > for ApplyCatalogModelDefaultsSvc<T> {
-                        type Response = super::ApplyCatalogModelDefaultsResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<
-                                super::ApplyCatalogModelDefaultsRequest,
-                            >,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as CatalogService>::apply_catalog_model_defaults(
-                                        &inner,
-                                        request,
-                                    )
-                                    .await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ApplyCatalogModelDefaultsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

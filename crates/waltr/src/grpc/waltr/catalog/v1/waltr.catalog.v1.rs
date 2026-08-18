@@ -144,42 +144,6 @@ pub struct GetModelCatalogDriftResponse {
     #[prost(message, optional, tag="3")]
     pub catalog_match: ::core::option::Option<super::super::config::v1::ModelCatalogMatch>,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SetModelCatalogMatchRequest {
-    #[prost(string, tag="1")]
-    pub expected_etag: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
-    pub provider_key: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
-    pub model_key: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="4")]
-    pub catalog_match: ::core::option::Option<super::super::config::v1::ModelCatalogMatch>,
-    #[prost(bool, tag="5")]
-    pub clear_match: bool,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetModelCatalogMatchResponse {
-    #[prost(message, optional, tag="1")]
-    pub config: ::core::option::Option<super::super::config::v1::Configuration>,
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ApplyCatalogModelDefaultsRequest {
-    #[prost(string, tag="1")]
-    pub expected_etag: ::prost::alloc::string::String,
-    #[prost(string, tag="2")]
-    pub provider_key: ::prost::alloc::string::String,
-    #[prost(string, tag="3")]
-    pub model_key: ::prost::alloc::string::String,
-    #[prost(message, optional, tag="4")]
-    pub catalog_match: ::core::option::Option<super::super::config::v1::ModelCatalogMatch>,
-    #[prost(enumeration="CatalogDefaultField", repeated, tag="5")]
-    pub fields: ::prost::alloc::vec::Vec<i32>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ApplyCatalogModelDefaultsResponse {
-    #[prost(message, optional, tag="1")]
-    pub config: ::core::option::Option<super::super::config::v1::Configuration>,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum CatalogMatchConfidence {

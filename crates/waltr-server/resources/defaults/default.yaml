@@ -1,0 +1,9 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Defaults
+metadata:
+  name: default
+spec:
+  inference:
+    provider: codex
+    model: codex/gpt-5.6
+    reasoningEffort: high
