@@ -10,6 +10,7 @@
 | [crates/waltr-web/](crates/waltr-web/) | Web UI client. |
 | [docs/](docs/) | Repository documentation. |
 | [docs/architecture/access-authentication.md](docs/architecture/access-authentication.md) | Canonical Waltr access-auth boundary and flows. |
+| [docs/architecture/config.md](docs/architecture/config.md) | Canonical unified YAML resource catalog and administration contract. |
 | [docs/architecture/persistence.md](docs/architecture/persistence.md) | Canonical Waltr/MCP database ownership and durable OAuth state. |
 | [docs/deployment.md](docs/deployment.md) | Database, Compose, OIDC, proxy, and native-client deployment. |
 | [docs/runbooks/mcp-oauth-key-rotation-recovery.md](docs/runbooks/mcp-oauth-key-rotation-recovery.md) | Hosted MCP OAuth wrapping/signing-key rotation and recovery. |

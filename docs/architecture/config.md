@@ -1,249 +1,137 @@
-# Config
+# Resource Catalog
 
-Waltr config architecture is server-owned and client-coordinated. The server persists and validates configuration, exposes RPCs, protects writes with ETags, and publishes watch events. Clients use the shared reducer in `crates/waltr-client/` to load, patch, watch, merge, and recover from config changes.
+Waltr uses one server-owned YAML resource catalog. The catalog defines agents, features, permissions, providers, MCP servers, and inference defaults.
 
 ```mermaid
 flowchart LR
-    Ui[Web or TUI<br/>drafts and presentation]
-    Client[waltr-client<br/>config reducer]
-    Transport[WaltrTransport]
-    Service[ConfigService<br/>Get, Patch, Reset, Watch]
-    Store[ConfigStore<br/>load, validate, save, patch, reset]
-    Watcher[Filesystem watcher]
-    PubSub[ConfigPubSub]
-    File[.waltr/waltr.toml]
+    Bundle[Bundled YAML resources]
+    Files[.waltr/resources overrides]
+    State[Last-known-good catalog]
+    Service[ResourceService]
+    Client[waltr-client reducer]
+    Runtime[Runtime, auth, and sessions]
 
-    Ui -->|commands| Client
-    Client -->|effects| Transport
-    Transport -->|RPC| Service
-    Service --> Store
-    Store <--> File
-    Watcher --> File
-    Watcher --> PubSub
-    PubSub --> Service
-    Service -->|responses and watch events| Transport
-    Transport -->|events| Client
-    Client -->|snapshots| Ui
+    Bundle --> State
+    Files --> State
+    State --> Service
+    Service --> Client
+    State --> Runtime
 ```
 
-## Responsibilities
+## Catalog Layout
 
-| Layer | Owns |
+The persisted catalog root is `.waltr/resources`. It accepts these canonical paths:
+
+| Path | Kind |
 | --- | --- |
-| Server config store | Loading, saving, validating, hashing, and patching config. |
-| Server config service | `GetConfig`, `PatchConfig`, `ResetConfig`, and `WatchConfig` RPC behavior. |
-| Server config watcher | Filesystem change detection, debounce, changed-key calculation, and pubsub publication. |
-| Client reducer | Config load/patch/watch state, ETag-aware watch merging, retry state, and reload decisions. |
-| Web and TUI | Local drafts and presentation of shared client snapshots. |
+| `agents/<name>.yaml` | `Agent` |
+| `features/<name>.yaml` | `FeatureSet` |
+| `permissions/<name>.yaml` | `PermissionSet` |
+| `providers/<name>.yaml` | `Provider` |
+| `mcp-servers/<name>.yaml` | `McpServer` |
+| `defaults/default.yaml` | `Defaults` |
 
-## Data Model
+Each file contains one strict YAML document. The category fixes `kind`. The filename stem must equal `metadata.name`.
 
-The config RPC model is `waltr.config.v1.Configuration`:
+The catalog accepts direct, regular, nonsymlink files with the exact `.yaml` suffix. It rejects nested paths, unknown categories, and extra defaults names.
 
-| Field | Purpose |
+Bundled resources supply the base catalog. A persisted file replaces the bundled resource at the same exact path. A reset removes that override and reveals the bundle.
+
+A persisted path without a bundled counterpart adds a resource. Reset removes that resource from the effective catalog.
+
+Waltr does not merge resource fields. Waltr does not support aggregate patches, TOML configuration, automatic import, or compatibility configuration APIs.
+
+## Resource Schemas
+
+All resources use `apiVersion: waltr.dev/v1alpha1`. The catalog rejects unknown fields and invalid path, kind, or name identities.
+
+Agent, feature, and permission syntax is documented in [Agent Architecture](agent.md#agent-definitions).
+
+`Provider` selects one inference transport and URL. It can define headers, OAuth metadata, explicit models, and a models.dev catalog selector.
+
+A provider catalog selector names a models.dev provider and an `include` list. Optional `keyPrefix` and `aliases` alter materialized model keys.
+
+`McpServer` uses `spec.transport: streamableHttp` with a URL, or `spec.transport: stdio` with a command.
+
+`Defaults` exists only at `defaults/default.yaml`. Its `spec.inference` value selects a provider, model, and optional `reasoningEffort`.
+
+The catalog materializes providers, MCP servers, and defaults into `waltr.config.v1.Configuration`. Runtime, auth, catalog search, and clients use this projection.
+
+## Environment Templates
+
+Resource string templates use `${env:NAME}`. Provider header values support whole-value or embedded templates.
+
+URL templates require uppercase ASCII environment names with digits or underscores. A missing required URL value fails catalog validation.
+
+The bundled [`mcp-servers/waltr.yaml`](../../crates/waltr-server/resources/mcp-servers/waltr.yaml) requires `${env:WALTR_PUBLIC_URL}`. Waltr joins its `/mcp` path through URL parsing.
+
+The join preserves a deployment path prefix and avoids duplicate separators. The public URL must meet the security rules in [Deployment](../deployment.md#oidc-access-domains).
+
+A missing or invalid required value fails initial catalog load. An invalid value during reload records an error and preserves the last-known-good snapshot.
+
+## Snapshots
+
+The server validates the complete candidate catalog before publication. One immutable snapshot contains every effective resource and its effective configuration projection.
+
+`GetResourceCatalog` returns the complete snapshot. `WatchResourceCatalog` sends a complete initial snapshot and a complete snapshot for every later event.
+
+Each snapshot includes a catalog ETag and the current reload error. Each resource includes its path, kind, name, origin, source ETag, and effective value.
+
+The watcher publishes successful catalog changes and rejected reload errors. Readiness depends on watcher health, not invalid candidate content alone.
+
+Invalid persisted state fails initial load. Invalid direct edits after startup remain on disk and preserve the active snapshot.
+
+## Administration
+
+`waltr.resource.v1.ResourceService` provides resource-native administration:
+
+| RPC | Behavior |
 | --- | --- |
-| `providers` | Configured model providers keyed by provider name. |
-| `mcp_servers` | Configured MCP servers keyed by server name. |
-| `inference_defaults` | Optional provider, model, and reasoning effort defaults for new agent sessions. |
-| `etag` | Server-generated version hash used for optimistic concurrency. |
+| `GetResourceCatalog` | Returns the complete active catalog. |
+| `WatchResourceCatalog` | Streams complete catalog snapshots. |
+| `InspectResource` | Lists slots or inspects one canonical path. |
+| `ReplaceResource` | Replaces one complete strict YAML resource. |
+| `ResetResource` | Removes one persisted override. |
 
-The filesystem store persists `.waltr/waltr.toml`. ETags are not persisted as authoritative data. On load or save, the store clears `etag`, serializes the config, hashes the serialized content with SHA-256, and returns an `etag` prefixed with `sha256:`.
+Inspection reports persisted source, persisted-slot ETag, active source, active value, and reload errors. An absent slot also has a stable ETag.
 
-Provider entries may contain public-client OAuth compatibility and settings, including authorization/token endpoints, client ID, redirect URI, scopes, request encoding, authorization parameters, and JWT metadata mappings. Credential values are not configuration and never enter config snapshots. Remote MCP entries contain transport command or URL only; OAuth discovery, registration, credential status, refresh, and reset remain in the target-scoped auth lifecycle rather than `PatchConfig`.
+Replace and reset require the current persisted-slot ETag. A stale ETag returns gRPC `failed_precondition`.
 
-## Server Defaults
+Replace validates the resource and complete candidate catalog before an atomic file replacement. Reset validates the complete fallback catalog before deletion.
 
-When `.waltr/waltr.toml` does not exist, the server builds and persists a default configuration from the models.dev catalog. Existing files are loaded as-is; startup does not merge new defaults into persisted configuration.
+The public Waltr MCP server exposes equivalent `resources.inspect`, `resources.replace`, and `resources.reset` actions. These actions use canonical relative paths and persisted-slot ETags.
 
-The default inventory uses these selection rules:
+Resource writes serialize through Waltr. They do not isolate `.waltr` from another local writer. Restrict resource-tree writes to trusted processes.
 
-- `anthropic` and `claude-code` contain the canonical, non-date-stamped IDs for Claude Haiku 4.5; Sonnet 4.5, 4.6, and 5; Opus 4.5, 4.6, 4.7, 4.8, and 5; and Fable 5.
-- `openai` and `codex` contain every non-deprecated catalog model whose ID represents GPT major version 5 and minor version 3 or later.
-- Catalog metadata supplies model names, limits, costs, capabilities, reasoning metadata, and catalog matches.
-- `mcp_servers.waltr` is an ordinary Streamable HTTP server entry for Waltr's own `/mcp` endpoint.
-- `inference_defaults` is absent.
+## Client Contract
 
-Default construction is strict. If the catalog cannot load or a required canonical Claude model is absent, first-time initialization fails rather than persisting a partial default. See [Deployment](../deployment.md) for catalog and self-MCP URL requirements.
+The shared client loads and watches `ResourceCatalog` values through `ResourceService`. Web and TUI clients render the effective configuration from that snapshot.
 
-## Partial Updates
+Provider, MCP server, and defaults edits follow one flow:
 
-`PatchConfig` accepts a sparse top-level patch:
+1. Capture the resource source and persisted-slot ETag from the watched catalog when editing begins.
+2. Build one complete strict YAML document from that captured source.
+3. Replace it with the captured persisted-slot ETag.
+4. Wait for the complete catalog watch snapshot.
 
-| Patch Field | Behavior |
-| --- | --- |
-| `providers` absent | Leave existing providers unchanged. |
-| `providers` present | Replace the entire providers map. |
-| `mcp_servers` absent | Leave existing MCP servers unchanged. |
-| `mcp_servers` present | Replace the entire MCP servers map. |
-| `inference_defaults` absent | Leave current inference defaults unchanged. |
-| `inference_defaults` present | Replace the complete inference-defaults message. |
+Reset uses the captured persisted-slot ETag and then waits for the authoritative catalog snapshot. Clients preserve the current catalog while a write fails or a reload error remains active.
 
-Patches are partial at the top-level section boundary only. They do not patch individual providers, provider fields, individual MCP servers, inference-default fields, or nested model data in place. Shared client helpers build full replacement sections from the latest loaded config for operations like add, update, delete, rename, and setting inference defaults.
+Provider and MCP credentials remain durable SQL state outside the resource catalog. Resource reset never resets credentials.
 
-The workspace TOML table is `[inference_defaults]`. It accepts only `provider_key`, `model_key`, and optional `reasoning_effort`. MCP selection does not belong in workspace defaults. `[runtime_defaults]` is unsupported and fails configuration loading. Waltr provides no alias, migration, or fallback for that table.
-
-The server validates the resulting full config before saving. Invalid provider names, provider key/name mismatches, unspecified model types, invalid MCP server types, and missing required MCP command or URL values are rejected.
-
-## ETag Behavior
-
-`PatchConfigRequest.expected_etag` must match the current server config `etag`.
-
-`ResetConfigRequest.expected_etag` has the same optimistic-concurrency requirement. A reset builds the complete current server default before taking the configuration write lock, then compares the ETag and atomically replaces providers, MCP servers, and inference defaults. Catalog or validation failure leaves the existing file unchanged. A successful reset returns the complete saved configuration and is published through the normal filesystem watch path.
-
-Reset changes configuration only. Provider API keys, provider OAuth credentials, and outbound MCP OAuth credentials remain in their target-scoped credential stores.
-
-Write flow:
-
-1. Client loads or watches a config snapshot and stores its `etag`.
-2. Client builds a patch from that snapshot and sends `expected_etag` with the patch.
-3. Server loads the current config under the write lock.
-4. Server rejects the patch if the current `etag` differs from `expected_etag`.
-5. Server applies present top-level patch sections, validates, saves, computes the new `etag`, and returns the updated config.
-
-```mermaid
-sequenceDiagram
-    participant Ui as Web or TUI
-    participant Client as waltr-client reducer
-    participant Rpc as ConfigService
-    participant Store as ConfigStore
-    participant File as .waltr/waltr.toml
-
-    Ui->>Client: dispatch add/update/delete command
-    Client->>Client: build top-level patch from current config
-    Client->>Rpc: PatchConfig(expected_etag, patch)
-    Rpc->>Store: patch(expected_etag, patch)
-    Store->>File: load current config
-    Store->>Store: compare current etag
-    alt ETag matches
-        Store->>Store: replace present top-level maps
-        Store->>Store: validate full config
-        Store->>File: save and compute new etag
-        Store-->>Rpc: updated config
-        Rpc-->>Client: PatchConfigResponse(config)
-        Client->>Client: mark patch ready and update current config
-        Client-->>Ui: snapshot with updated config
-    else ETag mismatch
-        Store-->>Rpc: etag mismatch
-        Rpc-->>Client: failed_precondition
-        Client->>Client: mark patch failed
-        Client-->>Ui: snapshot with patch error
-    end
-```
-
-An ETag mismatch is returned as gRPC `failed_precondition`. Validation errors are returned as `invalid_argument`. Other config failures are returned as `internal`.
-
-Clients should treat ETag failures as stale-edit conflicts, not as successful writes. The shared reducer records the patch error in `state.config.patch.error` and leaves the last known config in place until a watch event or explicit reload provides a fresher snapshot.
-
-## Watching
-
-`WatchConfig` returns a stream. On subscription, the server first sends a full config snapshot with `etag` and `config` populated. After that, filesystem changes are published through pubsub as watch responses.
-
-Watch change responses include:
-
-| Field | Meaning |
-| --- | --- |
-| `previous_etag` | ETag observed before the change. Empty on initial snapshots. |
-| `etag` | ETag after the change. |
-| `changed_keys` | Top-level sections that changed: `providers`, `mcp_servers`, and/or `inference_defaults`. |
-| `config` | Full initial snapshot, or a sparse config containing only changed sections plus the new ETag for later changes. |
-| `error` | Server-reported watch/load error when a change could not be loaded. |
-
-The filesystem watcher debounces changes, ignores unchanged config, reports changed top-level keys, and publishes sparse changed config sections. If loading the changed file fails, it publishes an error watch event instead of a config patch.
-
-```mermaid
-sequenceDiagram
-    participant Watcher as Filesystem watcher
-    participant File as .waltr/waltr.toml
-    participant PubSub as ConfigPubSub
-    participant Service as ConfigService WatchConfig
-    participant Client as waltr-client reducer
-    participant Ui as Web or TUI
-
-    Client->>Service: WatchConfig
-    Service-->>Client: initial full snapshot
-    Client-->>Ui: snapshot with current config
-    Watcher->>File: debounced reload after file event
-    Watcher->>Watcher: compare previous and next etag
-    alt Config changed
-        Watcher->>Watcher: calculate changed_keys
-        Watcher->>PubSub: publish sparse changed sections
-        PubSub->>Service: change event
-        Service-->>Client: previous_etag, etag, changed_keys, config
-        Client->>Client: merge changed sections or reload
-        Client-->>Ui: snapshot with refreshed config
-    else Load failed
-        Watcher->>PubSub: publish error
-        PubSub->>Service: error event
-        Service-->>Client: error
-        Client->>Client: mark watch failed and schedule reconnect
-        Client-->>Ui: snapshot with watch error or waiting state
-    end
-```
-
-## Client Watch Handling
-
-The shared client reducer applies config watch updates in `crates/waltr-client/src/coordination/config.rs`.
-
-Client merge rules:
-
-- If a watch update has a non-empty `error`, record the watch failure and schedule a reconnect when watch maintenance is permitted.
-- If `previous_etag` is empty, treat the update as a full snapshot and replace the current config with `config`.
-- If `previous_etag` is non-empty but the client has no current config, request a full reload.
-- If `previous_etag` does not match the client's current `etag`, request a full reload because the client missed an intermediate change.
-- If `config` is absent on a changed update, request a full reload.
-- Otherwise merge only the sections named in `changed_keys` and update the current `etag`.
-
-Config watch maintenance is gated by status readiness. When a UI registers config watch interest before the server is ready, config watch state becomes `Waiting`; once status reports ready, the reducer opens the config watch. Watch failures use capped reconnect delays and retry through reducer effects.
-
-```mermaid
-flowchart TD
-    Update[ConfigWatchUpdate]
-    Error{error set?}
-    Initial{previous_etag empty?}
-    HasCurrent{current config exists?}
-    Matches{previous_etag matches current etag?}
-    HasConfig{update config present?}
-    Merge[Merge changed sections and update etag]
-    Replace[Replace current config with full snapshot]
-    Reload[Emit ConfigEffect::Load]
-    Fail[Record watch failure and reconnect]
-
-    Update --> Error
-    Error -->|yes| Fail
-    Error -->|no| Initial
-    Initial -->|yes| Replace
-    Initial -->|no| HasCurrent
-    HasCurrent -->|no| Reload
-    HasCurrent -->|yes| Matches
-    Matches -->|no| Reload
-    Matches -->|yes| HasConfig
-    HasConfig -->|no| Reload
-    HasConfig -->|yes| Merge
-```
-
-## Client Reaction Contract
-
-Client implementations should react to config coordination through `waltr-client` snapshots and commands:
-
-- On ETag patch errors, keep the user's local draft visible if appropriate, show the patch error, and let the shared client receive a watch update or dispatch a config reload before retrying.
-- For config patch commands, keep save/delete UI pending until the keyed `ConfigPatch` result in `snapshot.operations.current` is `ready` or `failed`; the immediate dispatch snapshot only identifies the operation.
-- For reset commands, require explicit confirmation and keep the action pending until the matching keyed reset result is `ready` or `failed`.
-- Do not blindly resubmit a stale patch with the same `expected_etag`.
-- After a stale-edit conflict, rebuild the patch from the latest `state.config.current` before retrying.
-- On watch updates, render from the updated `state.config.current`; do not maintain a second server config cache in web or TUI code.
-- On watch error or `Waiting` status, preserve local UI state while the shared reducer reconnects or waits for system readiness.
-- Register watch interest for screens that need live config data and release it when they no longer do.
-- Use target-scoped auth commands, status snapshots, and keyed auth operation results for provider/MCP credential actions; do not encode authorize, refresh, or reset as config patches.
+Each session stores a self-contained inference snapshot. Catalog changes do not alter that durable session snapshot.
 
 ## References
 
 | Path | Purpose |
 | --- | --- |
-| [../../proto/waltr/config/v1/config_service.proto](../../proto/waltr/config/v1/config_service.proto) | Config RPC messages and service contract. |
-| [../../crates/waltr-server/src/config_service.rs](../../crates/waltr-server/src/config_service.rs) | Server RPC implementation. |
-| [../../crates/waltr-server/src/config/traits.rs](../../crates/waltr-server/src/config/traits.rs) | Config store/pubsub traits and server patch shape. |
-| [../../crates/waltr-server/src/config/filesystem/store.rs](../../crates/waltr-server/src/config/filesystem/store.rs) | Filesystem persistence, validation, patch, and ETag hashing. |
-| [../../crates/waltr-server/src/config/filesystem/watcher.rs](../../crates/waltr-server/src/config/filesystem/watcher.rs) | Filesystem watch publication and changed-section calculation. |
-| [../../crates/waltr-client/src/coordination/config.rs](../../crates/waltr-client/src/coordination/config.rs) | Client config reducer, watch merge, reload, and retry behavior. |
-| [../../crates/waltr-client/src/coordination/event.rs](../../crates/waltr-client/src/coordination/event.rs) | Client config events, effects, and client patch shape. |
+| [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC messages and service contract. |
+| [../../proto/waltr/config/v1/config_service.proto](../../proto/waltr/config/v1/config_service.proto) | Effective configuration projection types. |
+| [../../crates/waltr-server/src/resource_catalog/](../../crates/waltr-server/src/resource_catalog/) | Catalog state, materialization, persistence, ETags, and watcher lifecycle. |
+| [../../crates/waltr-server/src/agent_definition.rs](../../crates/waltr-server/src/agent_definition.rs) | Agent-facing resource catalog exports. |
+| [../../crates/waltr-server/src/config_service.rs](../../crates/waltr-server/src/config_service.rs) | `ResourceService` implementation. |
+| [../../crates/waltr-server/src/mcp_service.rs](../../crates/waltr-server/src/mcp_service.rs) | Public resource administration actions. |
+| [../../crates/waltr-server/resources/](../../crates/waltr-server/resources/) | Bundled resource catalog. |
+| [../../crates/waltr-client/src/transport/config.rs](../../crates/waltr-client/src/transport/config.rs) | Client ResourceService transport. |
+| [../../crates/waltr-client/src/resource.rs](../../crates/waltr-client/src/resource.rs) | Source-preserving provider, MCP server, and defaults YAML edits. |
+| [../../crates/waltr-client/src/coordination/config.rs](../../crates/waltr-client/src/coordination/config.rs) | Client catalog load and watch reducer. |
 | [clients.md](clients.md) | Shared client reducer and RPC architecture. |

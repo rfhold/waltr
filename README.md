@@ -10,7 +10,7 @@ It is designed around shared workspace state, so configuration and status stay c
 | --- | --- |
 | Terminal workflow | Use the TUI for keyboard-driven project work. |
 | Browser workflow | Use the web UI for visual configuration and browser-based interaction. |
-| Shared configuration | Configure providers and MCP servers once and have clients stay in sync. |
+| Shared resource catalog | Configure agents, providers, MCP servers, and defaults through one live YAML catalog. |
 | Agent tools | Give agents controlled access to shell commands, filesystem operations, MCP tools, and project instructions. |
 | Provider support | Run against supported model providers directly or through a shared gateway. |
 | Safety boundaries | Keep permissions, tool access, and workspace behavior explicit and testable. |
@@ -39,7 +39,9 @@ Run only the web development stack:
 
 # Configuration
 
-Waltr stores workspace configuration in `.waltr/waltr.toml`. The configuration includes provider settings and MCP server definitions. When config changes, connected clients update from the shared workspace state instead of each client keeping its own separate copy.
+Waltr stores persisted YAML resources under `.waltr/resources`. Bundled resources provide defaults, and exact-path files provide overrides.
+
+The catalog contains `agents`, `features`, `permissions`, `providers`, `mcp-servers`, and `defaults/default.yaml`. Connected clients receive complete live catalog snapshots.
 
 Useful environment variables:
 
@@ -92,7 +94,7 @@ For the full test matrix, see [docs/testing.md](docs/testing.md).
 | Area | Purpose |
 | --- | --- |
 | `crates/waltr-agent/` | Agent behavior, tools, permissions, sessions, skills, MCP, and provider integration. |
-| `crates/waltr-server/` | Local coordination server for shared state, status, and config. |
+| `crates/waltr-server/` | Coordination server for shared state, status, and the resource catalog. |
 | `crates/waltr-client/` | Shared client behavior used by the terminal and browser clients. |
 | `crates/waltr-tui/` | Terminal user interface. |
 | `crates/waltr-web/` | Browser user interface. |
@@ -106,7 +108,7 @@ For the full test matrix, see [docs/testing.md](docs/testing.md).
 | [docs/testing.md](docs/testing.md) | Test structure, commands, and expectations. |
 | [docs/architecture/README.md](docs/architecture/README.md) | Technical architecture details. |
 | [docs/agent/README.md](docs/agent/README.md) | Agent feature docs. |
-| [docs/architecture/config.md](docs/architecture/config.md) | Config persistence and sync behavior. |
+| [docs/architecture/config.md](docs/architecture/config.md) | Unified YAML resource catalog, administration, and watch behavior. |
 | [docs/architecture/clients.md](docs/architecture/clients.md) | Shared client, web, and TUI boundaries. |
 | [docs/architecture/access-authentication.md](docs/architecture/access-authentication.md) | Waltr access authentication and browser, native, and MCP flows. |
 | [docs/deployment.md](docs/deployment.md) | SQLite/PostgreSQL, Compose persistence, OIDC, hosted MCP OAuth, reverse proxy, and native-client deployment. |

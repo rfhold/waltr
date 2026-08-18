@@ -16,13 +16,13 @@ An access failure never creates an `AuthTarget`. Every successfully authenticate
 
 `WALTR_AUTH_MODE` is exactly `disabled` or `oidc` and defaults to `disabled`.
 
-- `disabled` admits a synthetic local principal. If any browser, API, MCP, or public-resource OIDC setting is present, startup fails instead of silently ignoring partial configuration.
+- `disabled` admits a synthetic local principal. `WALTR_PUBLIC_URL` remains required independently so the bundled self-MCP resource can materialize. Any actual browser, API, or hosted-MCP OAuth setting still fails startup instead of being silently ignored as partial OIDC configuration.
 - `oidc` requires valid configuration, successful provider discovery, an initial JWKS load, and initialized SQL persistence before the application is constructed. It never falls back to disabled mode.
 
-| Variable | Required in OIDC mode | Contract |
+| Variable | Required | Contract |
 | --- | --- | --- |
 | `WALTR_AUTH_MODE` | Yes | Exactly `disabled` or `oidc`; omitted means `disabled`. |
-| `WALTR_PUBLIC_URL` | Yes | Absolute public Waltr API resource URL. HTTPS is required except in explicit loopback mode; query, fragment, and userinfo are forbidden. |
+| `WALTR_PUBLIC_URL` | Every mode | Absolute public Waltr API resource URL, consumed independently of access authentication by the bundled self-MCP resource. HTTPS is required except for loopback development; query, fragment, and userinfo are forbidden. |
 | `WALTR_OIDC_ISSUER` | Yes | Absolute HTTP(S) issuer URL without query, fragment, or userinfo. Discovery must return this issuer exactly. |
 | `WALTR_OIDC_CLIENT_ID` | Yes | Browser authorization-code client identifier. |
 | `WALTR_OIDC_CLIENT_SECRET` | No | Confidential-client secret. When absent, provider metadata must support token endpoint auth method `none`. |
@@ -124,6 +124,8 @@ Waltr configures the generic MCP Streamable HTTP authorization hooks as follows:
 4. Waltr verifies the ES256 `at+jwt`, exact issuer/resource audience, lifetime, subject, client, scopes, and durable token/grant/family/client authorization state before dispatching every MCP POST. Direct Authentik access tokens are rejected.
 
 Missing, invalid, expired, or revoked credentials return `401`; insufficient scopes return `403` with `insufficient_scope`; authorization-store failures fail closed. Expiry and same-process revocation terminate active request-scoped response streams immediately at their observed boundary. Other replicas authoritatively recheck durable revocation at most every five seconds, plus scheduling and database latency. Waltr has no browser MCP client, so its Origin allowlist is empty: absent Origin is accepted and every present Origin is denied.
+
+Configuration and agent-definition actions are both published through public `/mcp` and use this same hosted-resource scope policy. Waltr does not assign separate action-level scopes.
 
 The cutover is intentionally clean: there is no direct-Authentik MCP validator, dual-issuer period, `WALTR_MCP_OIDC_*` compatibility surface, or special `self` client configuration. With access auth disabled, Waltr exposes neither the hosted OAuth routes nor an MCP challenge and keeps local `/mcp` unauthenticated. OIDC mode without an initialized hosted server fails `/mcp` closed.
 
