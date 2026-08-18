@@ -1,101 +1,116 @@
 use waltr_client::{ClientCommand, ClientOperationView, ClientRuntime};
 
 use crate::support::{
-    server::{server_endpoint, server_endpoint_with_unavailable_config_reset},
+    server::server_endpoint,
     snapshots::{dispatch_stream_command, next_snapshot_until, no_sleep, provider_view},
 };
 
 #[tokio::test]
-async fn stream_resets_config_and_exposes_returned_snapshot() {
+async fn provider_reset_removes_override_and_reveals_bundled_fallback() {
     let runtime = ClientRuntime::for_endpoint(server_endpoint());
     let mut stream = runtime.into_state_stream(no_sleep);
     let initial = load_config(&mut stream).await;
-    let initial_config = initial.config.current.expect("initial config");
+    let initial_provider = initial
+        .config
+        .current
+        .as_ref()
+        .and_then(|config| config.providers.get("anthropic"))
+        .cloned()
+        .expect("bundled provider");
+    let baseline = initial.config.resource_baselines["providers/anthropic.yaml"].clone();
 
+    let mut override_provider = provider_view("anthropic");
+    override_provider.url = "https://override.example.test/messages".to_owned();
     dispatch_stream_command(
         &mut stream,
-        ClientCommand::AddProvider {
-            provider: provider_view("custom"),
+        ClientCommand::UpdateProvider {
+            original_name: "anthropic".to_owned(),
+            original: Box::new(initial_provider.clone()),
+            baseline,
+            provider: override_provider,
         },
     )
     .await
-    .expect("custom config patch should start");
-    let custom = next_snapshot_until(&mut stream, |snapshot| {
+    .expect("provider override should start");
+    let overridden = next_snapshot_until(&mut stream, |snapshot| {
         snapshot.config.patch.status == "ready"
+            && snapshot
+                .config
+                .current
+                .as_ref()
+                .and_then(|config| config.providers.get("anthropic"))
+                .is_some_and(|provider| provider.url == "https://override.example.test/messages")
     })
+    .await;
+
+    let started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::DeleteProvider {
+            name: "anthropic".to_owned(),
+        },
+    )
     .await
-    .config
-    .current
-    .expect("custom config");
-    assert!(custom.providers.contains_key("custom"));
-
-    let started = dispatch_stream_command(&mut stream, ClientCommand::ResetConfig)
-        .await
-        .expect("reset should start");
-    assert_eq!(started.config.reset.status, "loading");
-    assert_eq!(started.config.current.as_ref(), Some(&custom));
-    let operation_key = started.config.reset.key.expect("reset operation key");
-    assert!(matches!(
-        started.operations.current.get(&operation_key),
-        Some(ClientOperationView::ConfigReset {
-            status: "loading",
-            config: None,
-            ..
-        })
-    ));
-
+    .expect("provider reset should start");
+    let operation_key = started.config.patch.key.expect("reset operation key");
     let reset = next_snapshot_until(&mut stream, |snapshot| {
         matches!(
             snapshot.operations.current.get(&operation_key),
-            Some(ClientOperationView::ConfigReset {
+            Some(ClientOperationView::ConfigPatch {
                 status: "ready",
+                config: None,
                 ..
             })
-        )
+        ) && snapshot
+            .config
+            .current
+            .as_ref()
+            .and_then(|config| config.providers.get("anthropic"))
+            == Some(&initial_provider)
     })
     .await;
-    let reset_config = reset.config.current.as_ref().expect("reset config");
-    assert_eq!(reset.config.reset.status, "ready");
-    assert_eq!(
-        reset.config.reset.key.as_deref(),
-        Some(operation_key.as_str())
+
+    let reset_provider = reset
+        .config
+        .current
+        .as_ref()
+        .and_then(|config| config.providers.get("anthropic"))
+        .expect("bundled fallback provider");
+    assert_eq!(reset_provider, &initial_provider);
+    assert_ne!(
+        reset.config.current.as_ref().map(|config| &config.etag),
+        overridden
+            .config
+            .current
+            .as_ref()
+            .map(|config| &config.etag)
     );
-    assert_eq!(reset_config.providers, initial_config.providers);
-    assert_eq!(reset_config.mcp_servers, initial_config.mcp_servers);
-    assert_eq!(
-        reset_config.inference_defaults,
-        initial_config.inference_defaults
-    );
-    assert_ne!(reset_config.etag, custom.etag);
-    let Some(ClientOperationView::ConfigReset {
-        config: Some(operation_config),
-        ..
-    }) = reset.operations.current.get(&operation_key)
-    else {
-        panic!("reset operation should include returned config");
-    };
-    assert_eq!(operation_config, reset_config);
 }
 
 #[tokio::test]
-async fn reset_failure_preserves_prior_config() {
-    let endpoint = server_endpoint_with_unavailable_config_reset()
-        .await
-        .expect("failure server should start");
-    let runtime = ClientRuntime::for_endpoint(endpoint);
+async fn self_mcp_reset_fails_closed_when_bundled_template_is_unavailable() {
+    let runtime = ClientRuntime::for_endpoint(server_endpoint());
     let mut stream = runtime.into_state_stream(no_sleep);
-    let prior = load_config(&mut stream)
-        .await
-        .config
-        .current
-        .expect("seeded config");
+    let initial = load_config(&mut stream).await;
+    let prior = initial.config.current.expect("seeded config");
+    assert!(prior.mcp_servers.contains_key("waltr"));
 
-    let started = dispatch_stream_command(&mut stream, ClientCommand::ResetConfig)
-        .await
-        .expect("reset should start");
-    let operation_key = started.config.reset.key.expect("reset operation key");
+    let started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::DeleteMcpServer {
+            name: "waltr".to_owned(),
+        },
+    )
+    .await
+    .expect("self MCP reset should start");
+    let operation_key = started.config.patch.key.expect("reset operation key");
     let failed = next_snapshot_until(&mut stream, |snapshot| {
-        snapshot.config.reset.status == "failed"
+        matches!(
+            snapshot.operations.current.get(&operation_key),
+            Some(ClientOperationView::ConfigPatch {
+                status: "failed",
+                ..
+            })
+        )
     })
     .await;
 
@@ -103,14 +118,14 @@ async fn reset_failure_preserves_prior_config() {
     assert!(
         failed
             .config
-            .reset
+            .patch
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("unavailable"))
+            .is_some_and(|error| error.contains("invalid_argument"))
     );
     assert!(matches!(
         failed.operations.current.get(&operation_key),
-        Some(ClientOperationView::ConfigReset {
+        Some(ClientOperationView::ConfigPatch {
             status: "failed",
             config: None,
             ..
@@ -119,49 +134,55 @@ async fn reset_failure_preserves_prior_config() {
 }
 
 #[tokio::test]
-async fn reset_rejects_stale_loaded_etag_and_preserves_snapshot() {
+async fn rename_failure_keeps_destination_and_reloads_authoritative_state() {
     let endpoint = server_endpoint();
-    let primary = ClientRuntime::for_endpoint(endpoint.clone());
-    let mut primary_stream = primary.into_state_stream(no_sleep);
-    let prior = load_config(&mut primary_stream)
-        .await
-        .config
-        .current
-        .expect("primary config");
+    let runtime = ClientRuntime::for_endpoint(endpoint.clone());
+    let mut stream = runtime.into_state_stream(no_sleep);
+    let initial = load_config(&mut stream).await;
+    let baseline = initial.config.resource_baselines["mcp-servers/waltr.yaml"].clone();
+    let prior = initial.config.current.expect("seeded config");
+    let mut renamed = prior
+        .mcp_servers
+        .get("waltr")
+        .cloned()
+        .expect("self MCP server");
+    let original = renamed.clone();
+    renamed.name = "renamed-waltr".to_owned();
 
-    let competitor = ClientRuntime::for_endpoint(endpoint);
-    let mut competitor_stream = competitor.into_state_stream(no_sleep);
-    load_config(&mut competitor_stream).await;
-    dispatch_stream_command(
-        &mut competitor_stream,
-        ClientCommand::AddProvider {
-            provider: provider_view("competitor"),
+    let started = dispatch_stream_command(
+        &mut stream,
+        ClientCommand::UpdateMcpServer {
+            original_name: "waltr".to_owned(),
+            original: Box::new(original),
+            baseline,
+            server: renamed,
         },
     )
     .await
-    .expect("competitor patch should start");
-    next_snapshot_until(&mut competitor_stream, |snapshot| {
-        snapshot.config.patch.status == "ready"
+    .expect("rename should start");
+    let operation_key = started.config.patch.key.expect("rename operation key");
+    let failed = next_snapshot_until(&mut stream, |snapshot| {
+        matches!(
+            snapshot.operations.current.get(&operation_key),
+            Some(ClientOperationView::ConfigPatch {
+                status: "failed",
+                ..
+            })
+        )
     })
     .await;
 
-    dispatch_stream_command(&mut primary_stream, ClientCommand::ResetConfig)
+    let current = failed
+        .config
+        .current
+        .expect("failed write should reload catalog");
+    assert!(current.mcp_servers.contains_key("renamed-waltr"));
+    assert!(current.mcp_servers.contains_key("waltr"));
+    let authoritative = waltr_client::GrpcEffectExecutor::for_endpoint(endpoint)
+        .load_config()
         .await
-        .expect("stale reset should start");
-    let failed = next_snapshot_until(&mut primary_stream, |snapshot| {
-        snapshot.config.reset.status == "failed"
-    })
-    .await;
-
-    assert_eq!(failed.config.current.as_ref(), Some(&prior));
-    assert!(
-        failed
-            .config
-            .reset
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("failed_precondition"))
-    );
+        .expect("authoritative config should load");
+    assert_eq!(current, authoritative);
 }
 
 #[allow(

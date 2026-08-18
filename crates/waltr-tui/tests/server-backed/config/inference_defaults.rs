@@ -9,9 +9,8 @@ use waltr_client::{
     ProviderKindView, ProviderView,
 };
 use waltr_server::{
-    config::ConfigStore as _,
     config_service::ConfigService,
-    test_support::{TestServer, default_config_builder, setup_server_with_services, temp_root},
+    test_support::{TestServer, default_catalog_loader, setup_server_with_services, temp_root},
 };
 use waltr_tui::app::{App, AppAction};
 
@@ -20,7 +19,7 @@ use crate::support::{
     render::render_app,
     server::{
         dispatch_app_command, drive_app_to_landing, next_snapshot_until, no_sleep,
-        open_config_screen,
+        open_config_screen, seed_configuration,
     },
 };
 
@@ -56,11 +55,15 @@ async fn inference_defaults_snapshot_and_save_use_real_server() {
 }
 
 async fn setup_inference_defaults_server() -> &'static TestServer {
-    let config_service = ConfigService::new(temp_root(), default_config_builder())
+    let root = temp_root();
+    waltr_server::test_support::persist_test_self_mcp(&root);
+    let config_service = ConfigService::new(root, default_catalog_loader())
+        .await
         .expect("config service should start");
-    config_service
-        .store()
-        .save(Configuration {
+    let server = setup_server_with_services(config_service);
+    seed_configuration(
+        server,
+        Configuration {
             etag: String::new(),
             providers: HashMap::from([(
                 "anthropic".to_owned(),
@@ -93,11 +96,12 @@ async fn setup_inference_defaults_server() -> &'static TestServer {
                 }
                 .into(),
             ),
-        })
-        .await
-        .expect("inference defaults seed should save");
+        },
+    )
+    .await
+    .expect("inference defaults resources should save");
 
-    setup_server_with_services(config_service)
+    server
 }
 
 fn model(name: &str) -> ModelView {

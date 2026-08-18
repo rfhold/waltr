@@ -4,9 +4,9 @@ use crate::coordination::{access, auth, catalog, config, session, status, stream
 use crate::{
     AccessAttemptId, AccessEvent, AuthEvent, AuthTarget, CatalogEvent, ClientEffect, ClientError,
     ClientEvent, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientState,
-    ConfigEffect, ConfigEvent, ConfigPatch, Configuration, InferenceDefaults,
-    InferenceSettingsRequest, McpServer, OperationKey, Provider, ProviderEditBaseline,
-    SessionEvent, StatusEvent, TimelineQuery,
+    ConfigEffect, ConfigEvent, Configuration, InferenceDefaults, InferenceSettingsRequest,
+    McpServer, OperationKey, Provider, ProviderEditBaseline, ResourceEditBaselineView,
+    ResourceKind, ResourceOrigin, ResourceWrite, SessionEvent, StatusEvent, TimelineQuery,
 };
 
 /// Single headless client reducer used by shells.
@@ -530,23 +530,33 @@ impl Client {
         ClientUpdate::default()
     }
 
-    /// Request that the configuration be patched.
-    pub fn request_config_patch(
-        &mut self,
-        patch: ConfigPatch,
-        expected_etag: impl Into<String>,
-    ) -> ClientUpdate {
-        let operation_key = self.state.next_operation_key();
-        self.request_config_patch_with_key(patch, expected_etag, operation_key)
-    }
-
     /// Request that the latest configuration be reset to server defaults.
     ///
     /// # Errors
     ///
     /// Returns an error when no configuration has loaded.
     pub fn reset_config(&mut self) -> Result<ClientUpdate, ClientError> {
-        let expected_etag = self.current_config()?.etag;
+        self.current_config()?;
+        let catalog = self
+            .state
+            .config
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ClientError::new("resource catalog not loaded"))?;
+        let writes = catalog
+            .resources
+            .iter()
+            .filter(|resource| {
+                matches!(
+                    ResourceKind::try_from(resource.kind),
+                    Ok(ResourceKind::Provider | ResourceKind::McpServer | ResourceKind::Defaults)
+                ) && ResourceOrigin::try_from(resource.origin) == Ok(ResourceOrigin::Filesystem)
+            })
+            .map(|resource| ResourceWrite::Reset {
+                path: resource.path.clone(),
+                expected_etag: resource.persisted_etag.clone(),
+            })
+            .collect();
         let operation_key = self.state.next_operation_key();
         let mut update = self.apply(ClientEvent::Config(ConfigEvent::ResetRequested(
             operation_key.clone(),
@@ -555,17 +565,13 @@ impl Client {
             .effects
             .push(ClientEffect::Config(ConfigEffect::Reset {
                 operation_key,
-                expected_etag,
+                writes,
             }));
         Ok(update)
     }
 
-    fn request_config_patch_with_key(
-        &mut self,
-        patch: ConfigPatch,
-        expected_etag: impl Into<String>,
-        operation_key: OperationKey,
-    ) -> ClientUpdate {
+    fn request_resource_writes(&mut self, writes: Vec<ResourceWrite>) -> ClientUpdate {
+        let operation_key = self.state.next_operation_key();
         let mut update = self.apply(ClientEvent::Config(ConfigEvent::PatchRequested(
             operation_key.clone(),
         )));
@@ -573,8 +579,7 @@ impl Client {
             .effects
             .push(ClientEffect::Config(ConfigEffect::Patch {
                 operation_key,
-                patch,
-                expected_etag: expected_etag.into(),
+                writes,
             }));
         update
     }
@@ -584,18 +589,26 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error when no configuration has loaded or provider names are invalid.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "command API owns submitted values"
+    )]
     pub fn add_provider(&mut self, provider: Provider) -> Result<ClientUpdate, ClientError> {
-        let mut config = self.current_config()?;
-        let expected_etag = config.etag.clone();
+        let config = self.current_config()?;
         Self::validate_provider_name(&provider.name)?;
         let name = provider.name.clone();
-        if config.providers.insert(name.clone(), provider).is_some() {
+        if config.providers.contains_key(&name) {
             return Err(ClientError::new(format!(
                 "provider name '{name}' is already used"
             )));
         }
-        Self::validate_providers(&config.providers)?;
-        Ok(self.request_config_patch(providers_patch(config.providers), expected_etag))
+        let expected_etag = self.absent_slot_etag()?;
+        let source = crate::resource::provider_source(&provider, None, None)?;
+        Ok(self.request_resource_writes(vec![ResourceWrite::Replace {
+            path: provider_path(&name),
+            source,
+            expected_etag,
+        }]))
     }
 
     /// Request a patch that replaces a provider in the latest configuration.
@@ -603,13 +616,18 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error when no configuration has loaded, the provider is missing, or names are invalid.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "command API owns submitted values"
+    )]
     pub fn update_provider(
         &mut self,
         original_name: &str,
+        original: Provider,
         provider: Provider,
+        baseline: &ResourceEditBaselineView,
     ) -> Result<ClientUpdate, ClientError> {
-        let mut config = self.current_config()?;
-        let expected_etag = config.etag.clone();
+        let config = self.current_config()?;
         Self::validate_provider_name(original_name)?;
         Self::validate_provider_name(&provider.name)?;
         let provider_name = provider.name.clone();
@@ -619,14 +637,32 @@ impl Client {
             )));
         }
 
-        config
-            .providers
-            .remove(original_name)
-            .ok_or_else(|| ClientError::new(format!("provider '{original_name}' not found")))?;
-
-        config.providers.insert(provider_name, provider);
-        Self::validate_providers(&config.providers)?;
-        Ok(self.request_config_patch(providers_patch(config.providers), expected_etag))
+        let source_path = provider_path(original_name);
+        Self::validate_edit_baseline(&source_path, baseline)?;
+        let source = crate::resource::provider_source(
+            &provider,
+            Some(&original),
+            Some(&baseline.active_source),
+        )?;
+        let mut writes = Vec::new();
+        if provider_name == original_name {
+            writes.push(ResourceWrite::Replace {
+                path: source_path,
+                source,
+                expected_etag: baseline.persisted_etag.clone(),
+            });
+        } else {
+            writes.push(ResourceWrite::Replace {
+                path: provider_path(&provider_name),
+                source,
+                expected_etag: baseline.absent_etag.clone(),
+            });
+            writes.push(ResourceWrite::Reset {
+                path: source_path,
+                expected_etag: baseline.persisted_etag.clone(),
+            });
+        }
+        Ok(self.request_resource_writes(writes))
     }
 
     /// Request a patch that deletes a provider from the latest configuration.
@@ -635,14 +671,17 @@ impl Client {
     ///
     /// Returns an error when no configuration has loaded, the provider is missing, or names are invalid.
     pub fn delete_provider(&mut self, name: &str) -> Result<ClientUpdate, ClientError> {
-        let mut config = self.current_config()?;
-        let expected_etag = config.etag.clone();
-        if config.providers.remove(name).is_none() {
+        let config = self.current_config()?;
+        if !config.providers.contains_key(name) {
             return Err(ClientError::new(format!("provider '{name}' not found")));
         }
 
-        Self::validate_providers(&config.providers)?;
-        Ok(self.request_config_patch(providers_patch(config.providers), expected_etag))
+        let path = provider_path(name);
+        let baseline = self.resource_baseline(&path)?;
+        Ok(self.request_resource_writes(vec![ResourceWrite::Reset {
+            path,
+            expected_etag: baseline.persisted_etag.clone(),
+        }]))
     }
 
     /// Request a patch that adds an MCP server to the latest configuration.
@@ -650,18 +689,26 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error when no configuration has loaded or the server key is invalid.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "command API owns submitted values"
+    )]
     pub fn add_mcp_server(&mut self, server: McpServer) -> Result<ClientUpdate, ClientError> {
-        let mut config = self.current_config()?;
-        let expected_etag = config.etag.clone();
+        let config = self.current_config()?;
         Self::validate_mcp_server_key(&server.name)?;
         let key = server.name.clone();
-        if config.mcp_servers.insert(key.clone(), server).is_some() {
+        if config.mcp_servers.contains_key(&key) {
             return Err(ClientError::new(format!(
                 "MCP server key '{key}' is already used"
             )));
         }
-        Self::validate_mcp_servers(&config.mcp_servers)?;
-        Ok(self.request_config_patch(mcp_servers_patch(config.mcp_servers), expected_etag))
+        let expected_etag = self.absent_slot_etag()?;
+        let source = crate::resource::mcp_server_source(&server, None, None)?;
+        Ok(self.request_resource_writes(vec![ResourceWrite::Replace {
+            path: mcp_server_path(&key),
+            source,
+            expected_etag,
+        }]))
     }
 
     /// Request a patch that replaces an MCP server in the latest configuration.
@@ -669,13 +716,18 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error when no configuration has loaded, the server is missing, or keys are invalid.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "command API owns submitted values"
+    )]
     pub fn update_mcp_server(
         &mut self,
         original_name: &str,
+        original: McpServer,
         server: McpServer,
+        baseline: &ResourceEditBaselineView,
     ) -> Result<ClientUpdate, ClientError> {
-        let mut config = self.current_config()?;
-        let expected_etag = config.etag.clone();
+        let config = self.current_config()?;
         Self::validate_mcp_server_key(original_name)?;
         Self::validate_mcp_server_key(&server.name)?;
         let server_key = server.name.clone();
@@ -685,14 +737,32 @@ impl Client {
             )));
         }
 
-        config
-            .mcp_servers
-            .remove(original_name)
-            .ok_or_else(|| ClientError::new(format!("MCP server '{original_name}' not found")))?;
-
-        config.mcp_servers.insert(server_key, server);
-        Self::validate_mcp_servers(&config.mcp_servers)?;
-        Ok(self.request_config_patch(mcp_servers_patch(config.mcp_servers), expected_etag))
+        let source_path = mcp_server_path(original_name);
+        Self::validate_edit_baseline(&source_path, baseline)?;
+        let source = crate::resource::mcp_server_source(
+            &server,
+            Some(&original),
+            Some(&baseline.active_source),
+        )?;
+        let mut writes = Vec::new();
+        if server_key == original_name {
+            writes.push(ResourceWrite::Replace {
+                path: source_path,
+                source,
+                expected_etag: baseline.persisted_etag.clone(),
+            });
+        } else {
+            writes.push(ResourceWrite::Replace {
+                path: mcp_server_path(&server_key),
+                source,
+                expected_etag: baseline.absent_etag.clone(),
+            });
+            writes.push(ResourceWrite::Reset {
+                path: source_path,
+                expected_etag: baseline.persisted_etag.clone(),
+            });
+        }
+        Ok(self.request_resource_writes(writes))
     }
 
     /// Request a patch that deletes an MCP server from the latest configuration.
@@ -701,14 +771,17 @@ impl Client {
     ///
     /// Returns an error when no configuration has loaded or the server is missing.
     pub fn delete_mcp_server(&mut self, name: &str) -> Result<ClientUpdate, ClientError> {
-        let mut config = self.current_config()?;
-        let expected_etag = config.etag.clone();
-        if config.mcp_servers.remove(name).is_none() {
+        let config = self.current_config()?;
+        if !config.mcp_servers.contains_key(name) {
             return Err(ClientError::new(format!("MCP server '{name}' not found")));
         }
 
-        Self::validate_mcp_servers(&config.mcp_servers)?;
-        Ok(self.request_config_patch(mcp_servers_patch(config.mcp_servers), expected_etag))
+        let path = mcp_server_path(name);
+        let baseline = self.resource_baseline(&path)?;
+        Ok(self.request_resource_writes(vec![ResourceWrite::Reset {
+            path,
+            expected_etag: baseline.persisted_etag.clone(),
+        }]))
     }
 
     /// Request a patch that replaces inference defaults in the latest configuration.
@@ -721,12 +794,30 @@ impl Client {
         defaults: Option<InferenceDefaults>,
     ) -> Result<ClientUpdate, ClientError> {
         let config = self.current_config()?;
-        let expected_etag = config.etag.clone();
         if let Some(defaults) = defaults.as_ref() {
             Self::validate_inference_defaults(defaults, &config)?;
         }
 
-        Ok(self.request_config_patch(inference_defaults_patch(defaults), expected_etag))
+        let path = "defaults/default.yaml";
+        let baseline = self.resource_baseline(path)?;
+        let write = if let Some(defaults) = defaults {
+            let source = crate::resource::defaults_source(
+                &defaults,
+                config.inference_defaults.as_ref(),
+                Some(&baseline.active_source),
+            )?;
+            ResourceWrite::Replace {
+                path: path.to_owned(),
+                source,
+                expected_etag: baseline.persisted_etag.clone(),
+            }
+        } else {
+            ResourceWrite::Reset {
+                path: path.to_owned(),
+                expected_etag: baseline.persisted_etag.clone(),
+            }
+        };
+        Ok(self.request_resource_writes(vec![write]))
     }
 
     /// Request a patch that renames a provider in the latest configuration.
@@ -740,7 +831,6 @@ impl Client {
         new_name: &str,
     ) -> Result<ClientUpdate, ClientError> {
         let mut config = self.current_config()?;
-        let expected_etag = config.etag.clone();
         Self::validate_provider_name(new_name)?;
         if new_name != original_name && config.providers.contains_key(new_name) {
             return Err(ClientError::new(format!(
@@ -753,10 +843,26 @@ impl Client {
             .remove(original_name)
             .ok_or_else(|| ClientError::new(format!("provider '{original_name}' not found")))?;
 
+        let original = provider.clone();
         new_name.clone_into(&mut provider.name);
-        config.providers.insert(new_name.to_owned(), provider);
-        Self::validate_providers(&config.providers)?;
-        Ok(self.request_config_patch(providers_patch(config.providers), expected_etag))
+        let source_path = provider_path(original_name);
+        let source_baseline = self.resource_baseline(&source_path)?;
+        let source = crate::resource::provider_source(
+            &provider,
+            Some(&original),
+            Some(&source_baseline.active_source),
+        )?;
+        Ok(self.request_resource_writes(vec![
+            ResourceWrite::Replace {
+                path: provider_path(new_name),
+                source,
+                expected_etag: self.absent_slot_etag()?,
+            },
+            ResourceWrite::Reset {
+                path: source_path,
+                expected_etag: source_baseline.persisted_etag.clone(),
+            },
+        ]))
     }
 
     /// Return a provider edit baseline from the latest configuration.
@@ -775,10 +881,12 @@ impl Client {
             .providers
             .get(name)
             .ok_or_else(|| ClientError::new(format!("provider '{name}' not found")))?;
+        let resource = self.resource_baseline(&provider_path(name))?;
 
         Ok(ProviderEditBaseline {
             name: name.to_owned(),
-            etag: config.etag.clone(),
+            persisted_etag: resource.persisted_etag.clone(),
+            active_source: resource.active_source.clone(),
             provider: provider.clone(),
         })
     }
@@ -844,18 +952,52 @@ impl Client {
             .ok_or_else(|| ClientError::new("configuration not loaded"))
     }
 
-    fn validate_providers(
-        providers: &std::collections::HashMap<String, Provider>,
-    ) -> Result<(), ClientError> {
-        for (name, provider) in providers {
-            Self::validate_provider_name(name)?;
-            if provider.name != *name {
-                return Err(ClientError::new(format!(
-                    "provider key '{name}' must match provider name"
-                )));
-            }
-        }
+    fn resource_baseline(&self, path: &str) -> Result<&crate::Resource, ClientError> {
+        self.state
+            .config
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ClientError::new("resource catalog not loaded"))?
+            .resources
+            .iter()
+            .find(|resource| resource.path == path)
+            .ok_or_else(|| ClientError::new(format!("resource baseline '{path}' not found")))
+    }
 
+    fn absent_slot_etag(&self) -> Result<String, ClientError> {
+        self.state
+            .config
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ClientError::new("resource catalog not loaded"))?
+            .resources
+            .iter()
+            .find(|resource| {
+                ResourceOrigin::try_from(resource.origin) == Ok(ResourceOrigin::Bundled)
+                    && !resource.persisted_etag.is_empty()
+            })
+            .map(|resource| resource.persisted_etag.clone())
+            .ok_or_else(|| ClientError::new("absent resource-slot baseline not found"))
+    }
+
+    fn validate_edit_baseline(
+        expected_path: &str,
+        baseline: &ResourceEditBaselineView,
+    ) -> Result<(), ClientError> {
+        if baseline.path != expected_path {
+            return Err(ClientError::new(format!(
+                "resource baseline '{}' does not match '{expected_path}'",
+                baseline.path
+            )));
+        }
+        if baseline.persisted_etag.is_empty()
+            || baseline.absent_etag.is_empty()
+            || baseline.active_source.is_empty()
+        {
+            return Err(ClientError::new(format!(
+                "resource baseline '{expected_path}' is incomplete"
+            )));
+        }
         Ok(())
     }
 
@@ -863,32 +1005,20 @@ impl Client {
         if name.is_empty() {
             return Err(ClientError::new("provider name cannot be empty"));
         }
-
         if name.chars().any(char::is_whitespace) {
             return Err(ClientError::new(format!(
                 "provider name '{name}' cannot contain spaces"
             )));
         }
-
         if name.chars().any(char::is_uppercase) {
             return Err(ClientError::new(format!(
                 "provider name '{name}' must be lowercase"
             )));
         }
-
-        Ok(())
-    }
-
-    fn validate_mcp_servers(
-        servers: &std::collections::HashMap<String, McpServer>,
-    ) -> Result<(), ClientError> {
-        for (key, server) in servers {
-            Self::validate_mcp_server_key(key)?;
-            if server.name != *key {
-                return Err(ClientError::new(format!(
-                    "MCP server key '{key}' must match server name"
-                )));
-            }
+        if !valid_resource_name(name) {
+            return Err(ClientError::new(format!(
+                "provider name '{name}' is invalid"
+            )));
         }
 
         Ok(())
@@ -898,16 +1028,19 @@ impl Client {
         if name.is_empty() {
             return Err(ClientError::new("MCP server key cannot be empty"));
         }
-
         if name.chars().any(char::is_whitespace) {
             return Err(ClientError::new(format!(
                 "MCP server key '{name}' cannot contain spaces"
             )));
         }
-
         if name.chars().any(char::is_uppercase) {
             return Err(ClientError::new(format!(
                 "MCP server key '{name}' must be lowercase"
+            )));
+        }
+        if !valid_resource_name(name) {
+            return Err(ClientError::new(format!(
+                "MCP server key '{name}' is invalid"
             )));
         }
 
@@ -1163,36 +1296,23 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
         .then(|| error.message().to_owned())
 }
 
-const fn providers_patch(
-    providers: std::collections::HashMap<String, Provider>,
-) -> crate::ConfigPatch {
-    crate::ConfigPatch {
-        providers: Some(providers),
-        mcp_servers: None,
-        inference_defaults: None,
-    }
+fn valid_resource_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
-const fn mcp_servers_patch(
-    mcp_servers: std::collections::HashMap<String, McpServer>,
-) -> crate::ConfigPatch {
-    crate::ConfigPatch {
-        providers: None,
-        mcp_servers: Some(mcp_servers),
-        inference_defaults: None,
-    }
+fn provider_path(name: &str) -> String {
+    format!("providers/{name}.yaml")
 }
 
-const fn inference_defaults_patch(defaults: Option<InferenceDefaults>) -> crate::ConfigPatch {
-    crate::ConfigPatch {
-        providers: None,
-        mcp_servers: None,
-        inference_defaults: defaults,
-    }
+fn mcp_server_path(name: &str) -> String {
+    format!("mcp-servers/{name}.yaml")
 }
 
 /// Result of applying an event to the shared client.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClientUpdate {
     effects: Vec<ClientEffect>,
 }
@@ -1330,9 +1450,9 @@ mod tests {
         drop(client.register_config_watch_interest());
         drop(client.register_session_watch_interest());
         drop(client.register_session_timeline_watch_interest("session", Some(0), Vec::new(), None));
-        client.apply(ClientEvent::Config(ConfigEvent::Loaded(
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(catalog(
             config_with_provider("anthropic", "etag-1"),
-        )));
+        ))));
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "session",
         )])));
@@ -1432,9 +1552,9 @@ mod tests {
     #[test]
     fn waltr_logout_clears_protected_data_and_provider_statuses() {
         let mut client = Client::new();
-        client.apply(ClientEvent::Config(ConfigEvent::Loaded(
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(catalog(
             config_with_provider("anthropic", "etag-1"),
-        )));
+        ))));
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
         )])));
@@ -1534,10 +1654,10 @@ mod tests {
 
         client.apply_for_access_generation(
             generation,
-            ClientEvent::Config(ConfigEvent::Loaded(config_with_provider(
+            ClientEvent::Config(ConfigEvent::Loaded(catalog(config_with_provider(
                 "stale",
                 "stale-etag",
-            ))),
+            )))),
         );
 
         assert!(client.state().config.current.is_none());
@@ -1648,9 +1768,9 @@ mod tests {
     #[test]
     fn access_loss_terminalizes_loading_operations_and_reloads_authoritative_data() {
         let mut client = Client::new();
-        client.apply(ClientEvent::Config(ConfigEvent::Loaded(
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(catalog(
             config_with_provider("anthropic", "etag-1"),
-        )));
+        ))));
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
         )])));
@@ -1733,7 +1853,7 @@ mod tests {
             ..Configuration::default()
         };
 
-        let update = client.apply(ClientEvent::Config(ConfigEvent::Loaded(config)));
+        let update = client.apply(ClientEvent::Config(ConfigEvent::Loaded(catalog(config))));
 
         assert!(update.is_empty());
         assert_eq!(client.state().config.load.status, OperationStatus::Ready);
@@ -1753,7 +1873,9 @@ mod tests {
         let mut client = Client::new();
         let config = config_with_provider("anthropic", "etag-1");
 
-        client.apply(ClientEvent::Config(ConfigEvent::Loaded(config.clone())));
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(catalog(
+            config.clone(),
+        ))));
         client.apply(ClientEvent::Config(ConfigEvent::PatchRequested(
             "op-test".to_owned(),
         )));
@@ -1783,11 +1905,12 @@ mod tests {
     fn config_reset_uses_current_etag_and_ignores_stale_completion() {
         let mut client = Client::new();
         let current = config_with_provider("custom", "etag-1");
-        client.apply(ClientEvent::Config(ConfigEvent::Loaded(current.clone())));
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(catalog(
+            current.clone(),
+        ))));
 
         let first = client.reset_config().expect("reset should start");
-        let (first_key, expected_etag) = only_reset_config(&first);
-        assert_eq!(expected_etag, "etag-1");
+        let (first_key, _) = only_reset_config(&first);
         let first_key = first_key.to_owned();
 
         let second = client.reset_config().expect("newer reset should start");
@@ -1797,19 +1920,16 @@ mod tests {
 
         client.apply(ClientEvent::Config(ConfigEvent::Reset {
             operation_key: first_key,
-            config: config_with_provider("stale", "etag-stale"),
         }));
 
         assert_eq!(client.state().config.current.as_ref(), Some(&current));
         assert_eq!(client.state().config.reset.status, OperationStatus::Loading);
         assert_eq!(client.state().config.reset.key.as_ref(), Some(&second_key));
 
-        let reset = config_with_provider("anthropic", "etag-2");
         client.apply(ClientEvent::Config(ConfigEvent::Reset {
             operation_key: second_key,
-            config: reset.clone(),
         }));
-        assert_eq!(client.state().config.current.as_ref(), Some(&reset));
+        assert_eq!(client.state().config.current.as_ref(), Some(&current));
         assert_eq!(client.state().config.reset.status, OperationStatus::Ready);
     }
 
@@ -1845,8 +1965,9 @@ mod tests {
 
         client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
             ConfigWatchUpdate {
-                config: Some(config.clone()),
-                ..ConfigWatchUpdate::default()
+                effective_configuration: Some(config.clone()),
+                etag: config.etag.clone(),
+                ..Default::default()
             },
         )));
         assert_eq!(
@@ -1857,8 +1978,10 @@ mod tests {
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
             ConfigWatchUpdate {
-                error: "stream broke".to_owned(),
-                ..ConfigWatchUpdate::default()
+                reload_error: "stream broke".to_owned(),
+                effective_configuration: Some(config.clone()),
+                etag: config.etag.clone(),
+                ..Default::default()
             },
         )));
         assert_eq!(client.state().config.watch.status, OperationStatus::Failed);
@@ -1867,12 +1990,7 @@ mod tests {
             Some("stream broke")
         );
         assert_eq!(client.state().config.current.as_ref(), Some(&config));
-        assert_eq!(
-            update.effects(),
-            &[ClientEffect::Config(ConfigEffect::SleepReconnect {
-                delay_ms: 500
-            })]
-        );
+        assert!(update.is_empty());
     }
 
     #[test]
@@ -1987,7 +2105,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_events_merge_partial_updates_when_etag_matches() {
+    fn watch_events_replace_catalog_snapshots_authoritatively() {
         let mut client = client_with_config(Configuration {
             etag: "etag-1".to_owned(),
             providers: providers([provider("anthropic")]),
@@ -1997,11 +2115,9 @@ mod tests {
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
             ConfigWatchUpdate {
-                previous_etag: "etag-1".to_owned(),
                 etag: "etag-2".to_owned(),
-                changed_keys: vec!["providers".to_owned()],
-                config: Some(config_with_provider("openai", "etag-2")),
-                ..ConfigWatchUpdate::default()
+                effective_configuration: Some(config_with_provider("openai", "etag-2")),
+                ..Default::default()
             },
         )));
 
@@ -2014,19 +2130,17 @@ mod tests {
             .expect("config should remain loaded");
         assert_eq!(current.etag, "etag-2");
         assert_eq!(current.providers, providers([provider("openai")]));
-        assert_eq!(current.mcp_servers, mcp_servers([mcp_server("filesystem")]));
+        assert!(current.mcp_servers.is_empty());
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
             ConfigWatchUpdate {
-                previous_etag: "etag-2".to_owned(),
                 etag: "etag-3".to_owned(),
-                changed_keys: vec!["mcp_servers".to_owned()],
-                config: Some(Configuration {
+                effective_configuration: Some(Configuration {
                     etag: "etag-3".to_owned(),
                     mcp_servers: mcp_servers([mcp_server("github")]),
                     ..Configuration::default()
                 }),
-                ..ConfigWatchUpdate::default()
+                ..Default::default()
             },
         )));
 
@@ -2038,21 +2152,19 @@ mod tests {
             .as_ref()
             .expect("config should remain loaded");
         assert_eq!(current.etag, "etag-3");
-        assert_eq!(current.providers, providers([provider("openai")]));
+        assert!(current.providers.is_empty());
         assert_eq!(current.mcp_servers, mcp_servers([mcp_server("github")]));
     }
 
     #[test]
-    fn watch_events_refetch_when_previous_etag_is_out_of_sync() {
+    fn watch_events_accept_complete_snapshot_without_refetch() {
         let mut client = client_with_config(config_with_provider("anthropic", "etag-1"));
 
         let update = client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
             ConfigWatchUpdate {
-                previous_etag: "etag-stale".to_owned(),
                 etag: "etag-2".to_owned(),
-                changed_keys: vec!["providers".to_owned()],
-                config: Some(config_with_provider("openai", "etag-2")),
-                ..ConfigWatchUpdate::default()
+                effective_configuration: Some(config_with_provider("openai", "etag-2")),
+                ..Default::default()
             },
         )));
 
@@ -2062,12 +2174,9 @@ mod tests {
         );
         assert_eq!(
             client.state().config.current.as_ref().unwrap().etag,
-            "etag-1"
+            "etag-2"
         );
-        assert_eq!(
-            update.effects(),
-            &[ClientEffect::Config(ConfigEffect::Load)]
-        );
+        assert!(update.is_empty());
     }
 
     #[test]
@@ -3029,7 +3138,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_commands_emit_provider_map_patch_effects() {
+    fn provider_commands_emit_canonical_resource_writes() {
         let mut client = client_with_config(Configuration {
             etag: "etag-1".to_owned(),
             providers: providers([provider("anthropic")]),
@@ -3039,35 +3148,38 @@ mod tests {
         let update = client
             .add_provider(provider("openai"))
             .expect("add provider");
-        let (patch, expected_etag) = only_patch_config(&update);
-        assert_eq!(expected_etag, "etag-1");
-        assert!(patch.mcp_servers.is_none());
-        assert_eq!(provider_patch_names(patch), vec!["anthropic", "openai"]);
+        assert_eq!(
+            provider_write_paths(only_resource_writes(&update)),
+            vec!["providers/openai.yaml"]
+        );
 
         let update = client
-            .update_provider("anthropic", provider("claude"))
+            .update_provider(
+                "anthropic",
+                provider("anthropic"),
+                provider("claude"),
+                &edit_baseline("providers/anthropic.yaml"),
+            )
             .expect("update provider");
-        let (patch, _) = only_patch_config(&update);
-        assert!(patch.mcp_servers.is_none());
-        assert_eq!(provider_patch_names(patch), vec!["claude"]);
+        assert_eq!(
+            resource_write_paths(only_resource_writes(&update)),
+            vec!["providers/claude.yaml", "providers/anthropic.yaml"]
+        );
 
         let update = client
             .rename_provider("anthropic", "renamed")
             .expect("rename provider");
-        let (patch, _) = only_patch_config(&update);
-        assert!(patch.mcp_servers.is_none());
-        assert_eq!(provider_patch_names(patch), vec!["renamed"]);
+        assert_eq!(
+            resource_write_paths(only_resource_writes(&update)),
+            vec!["providers/renamed.yaml", "providers/anthropic.yaml"]
+        );
 
         let update = client
             .delete_provider("anthropic")
             .expect("delete provider");
-        let (patch, _) = only_patch_config(&update);
-        assert!(patch.mcp_servers.is_none());
-        assert!(
-            patch
-                .providers
-                .as_ref()
-                .is_some_and(std::collections::HashMap::is_empty)
+        assert_eq!(
+            resource_write_paths(only_resource_writes(&update)),
+            vec!["providers/anthropic.yaml"]
         );
     }
 
@@ -3118,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_commands_emit_mcp_map_patch_effects() {
+    fn mcp_server_commands_emit_canonical_resource_writes() {
         let mut client = client_with_config(Configuration {
             etag: "etag-1".to_owned(),
             mcp_servers: mcp_servers([mcp_server("filesystem")]),
@@ -3128,28 +3240,30 @@ mod tests {
         let update = client
             .add_mcp_server(mcp_server("github"))
             .expect("add mcp server");
-        let (patch, expected_etag) = only_patch_config(&update);
-        assert_eq!(expected_etag, "etag-1");
-        assert!(patch.providers.is_none());
-        assert_eq!(mcp_server_patch_names(patch), vec!["filesystem", "github"]);
+        assert_eq!(
+            resource_write_paths(only_resource_writes(&update)),
+            vec!["mcp-servers/github.yaml"]
+        );
 
         let update = client
-            .update_mcp_server("filesystem", mcp_server("fs"))
+            .update_mcp_server(
+                "filesystem",
+                mcp_server("filesystem"),
+                mcp_server("fs"),
+                &edit_baseline("mcp-servers/filesystem.yaml"),
+            )
             .expect("update mcp server");
-        let (patch, _) = only_patch_config(&update);
-        assert!(patch.providers.is_none());
-        assert_eq!(mcp_server_patch_names(patch), vec!["fs"]);
+        assert_eq!(
+            resource_write_paths(only_resource_writes(&update)),
+            vec!["mcp-servers/fs.yaml", "mcp-servers/filesystem.yaml"]
+        );
 
         let update = client
             .delete_mcp_server("filesystem")
             .expect("delete mcp server");
-        let (patch, _) = only_patch_config(&update);
-        assert!(patch.providers.is_none());
-        assert!(
-            patch
-                .mcp_servers
-                .as_ref()
-                .is_some_and(std::collections::HashMap::is_empty)
+        assert_eq!(
+            resource_write_paths(only_resource_writes(&update)),
+            vec!["mcp-servers/filesystem.yaml"]
         );
     }
 
@@ -3182,7 +3296,12 @@ mod tests {
         assert!(duplicate_error.message().contains("already used"));
 
         let update_error = client
-            .update_mcp_server("filesystem", mcp_server(""))
+            .update_mcp_server(
+                "filesystem",
+                mcp_server("filesystem"),
+                mcp_server(""),
+                &edit_baseline("mcp-servers/filesystem.yaml"),
+            )
             .expect_err("empty update key should fail");
         assert!(update_error.message().contains("cannot be empty"));
     }
@@ -3200,7 +3319,7 @@ mod tests {
 
         client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
             ConfigWatchUpdate {
-                config: Some(Configuration {
+                effective_configuration: Some(Configuration {
                     etag: "etag-2".to_owned(),
                     providers: providers([provider("anthropic"), provider("new-provider")]),
                     ..Configuration::default()
@@ -3213,7 +3332,7 @@ mod tests {
 
         client.apply(ClientEvent::Config(ConfigEvent::WatchChanged(
             ConfigWatchUpdate {
-                config: Some(Configuration {
+                effective_configuration: Some(Configuration {
                     etag: "etag-3".to_owned(),
                     providers: providers([provider("changed"), provider("new-provider")]),
                     ..Configuration::default()
@@ -3251,8 +3370,50 @@ mod tests {
 
     fn client_with_config(config: Configuration) -> Client {
         let mut client = Client::new();
-        client.apply(ClientEvent::Config(ConfigEvent::Loaded(config)));
+        client.apply(ClientEvent::Config(ConfigEvent::Loaded(catalog(config))));
         client
+    }
+
+    fn catalog(config: Configuration) -> crate::ResourceCatalog {
+        let mut resources = config
+            .providers
+            .values()
+            .map(|provider| crate::Resource {
+                path: provider_path(&provider.name),
+                kind: ResourceKind::Provider as i32,
+                name: provider.name.clone(),
+                origin: ResourceOrigin::Bundled as i32,
+                persisted_etag: "absent-etag".to_owned(),
+                active_source: crate::resource::provider_source(provider, None, None).unwrap(),
+                ..crate::Resource::default()
+            })
+            .chain(config.mcp_servers.values().map(|server| crate::Resource {
+                path: mcp_server_path(&server.name),
+                kind: ResourceKind::McpServer as i32,
+                name: server.name.clone(),
+                origin: ResourceOrigin::Bundled as i32,
+                persisted_etag: "absent-etag".to_owned(),
+                active_source: crate::resource::mcp_server_source(server, None, None).unwrap(),
+                ..crate::Resource::default()
+            }))
+            .collect::<Vec<_>>();
+        if let Some(defaults) = config.inference_defaults.as_ref() {
+            resources.push(crate::Resource {
+                path: "defaults/default.yaml".to_owned(),
+                kind: ResourceKind::Defaults as i32,
+                name: "default".to_owned(),
+                origin: ResourceOrigin::Bundled as i32,
+                persisted_etag: "absent-etag".to_owned(),
+                active_source: crate::resource::defaults_source(defaults, None, None).unwrap(),
+                ..crate::Resource::default()
+            });
+        }
+        crate::ResourceCatalog {
+            resources,
+            etag: config.etag.clone(),
+            effective_configuration: Some(config),
+            ..Default::default()
+        }
     }
 
     fn config_with_provider(name: &str, etag: &str) -> Configuration {
@@ -3275,6 +3436,8 @@ mod tests {
     fn provider(name: &str) -> Provider {
         Provider {
             name: name.to_owned(),
+            r#type: crate::ProviderType::AnthropicMessages as i32,
+            url: format!("https://{name}.example.test"),
             ..Provider::default()
         }
     }
@@ -3326,51 +3489,51 @@ mod tests {
         }
     }
 
-    fn only_patch_config(update: &ClientUpdate) -> (&ConfigPatch, &str) {
+    fn edit_baseline(path: &str) -> ResourceEditBaselineView {
+        ResourceEditBaselineView {
+            path: path.to_owned(),
+            persisted_etag: "absent-etag".to_owned(),
+            absent_etag: "absent-etag".to_owned(),
+            active_source: if path.starts_with("providers/") {
+                crate::resource::provider_source(&provider("anthropic"), None, None).unwrap()
+            } else {
+                crate::resource::mcp_server_source(&mcp_server("filesystem"), None, None).unwrap()
+            },
+        }
+    }
+
+    fn only_resource_writes(update: &ClientUpdate) -> &[ResourceWrite] {
         assert_eq!(update.effects().len(), 1);
         match &update.effects()[0] {
-            ClientEffect::Config(ConfigEffect::Patch {
-                patch,
-                expected_etag,
-                ..
-            }) => (patch, expected_etag),
+            ClientEffect::Config(ConfigEffect::Patch { writes, .. }) => writes,
             effect => panic!("expected patch effect, got {effect:?}"),
         }
     }
 
-    fn only_reset_config(update: &ClientUpdate) -> (&OperationKey, &str) {
+    fn only_reset_config(update: &ClientUpdate) -> (&OperationKey, &[ResourceWrite]) {
         assert_eq!(update.effects().len(), 1);
         match &update.effects()[0] {
             ClientEffect::Config(ConfigEffect::Reset {
                 operation_key,
-                expected_etag,
-            }) => (operation_key, expected_etag),
+                writes,
+            }) => (operation_key, writes),
             effect => panic!("expected reset effect, got {effect:?}"),
         }
     }
 
-    fn provider_patch_names(patch: &ConfigPatch) -> Vec<&str> {
-        let mut names: Vec<&str> = patch
-            .providers
-            .as_ref()
-            .expect("provider patch should include providers")
-            .values()
-            .map(|provider| provider.name.as_str())
-            .collect();
-        names.sort_unstable();
-        names
+    fn provider_write_paths(writes: &[ResourceWrite]) -> Vec<&str> {
+        resource_write_paths(writes)
     }
 
-    fn mcp_server_patch_names(patch: &ConfigPatch) -> Vec<&str> {
-        let mut names: Vec<&str> = patch
-            .mcp_servers
-            .as_ref()
-            .expect("mcp patch should include mcp servers")
-            .values()
-            .map(|server| server.name.as_str())
-            .collect();
-        names.sort_unstable();
-        names
+    fn resource_write_paths(writes: &[ResourceWrite]) -> Vec<&str> {
+        writes
+            .iter()
+            .map(|write| match write {
+                ResourceWrite::Replace { path, .. } | ResourceWrite::Reset { path, .. } => {
+                    path.as_str()
+                }
+            })
+            .collect()
     }
 
     fn catalog_model(provider_id: &str, model_id: &str) -> CatalogModelSummary {

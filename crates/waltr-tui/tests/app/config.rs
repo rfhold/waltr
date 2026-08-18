@@ -415,7 +415,7 @@ fn config_mcp_form_switches_to_url_field_for_sse_and_blocks_empty() {
     assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
     let rendered = render_app(&app);
-    assert!(rendered.contains("sse"));
+    assert!(rendered.contains("streamable http"));
     assert!(rendered.contains("url required before saving"));
 
     // Empty url blocks save.
@@ -435,7 +435,7 @@ fn config_mcp_form_switches_to_url_field_for_sse_and_blocks_empty() {
     let AppAction::ClientCommand(ClientCommand::AddMcpServer { server }) = action else {
         panic!("expected add mcp server command, saw {action:?}");
     };
-    assert_eq!(server.kind, McpServerTypeView::Sse);
+    assert_eq!(server.kind, McpServerTypeView::StreamableHttp);
     assert_eq!(server.url, "https://example.test");
     assert!(server.command.is_empty());
 }
@@ -459,6 +459,7 @@ fn config_mcp_edit_and_delete_dispatch_mcp_commands() {
     let AppAction::ClientCommand(ClientCommand::UpdateMcpServer {
         original_name,
         server,
+        ..
     }) = action
     else {
         panic!("expected update mcp server command, saw {action:?}");
@@ -664,6 +665,7 @@ fn config_provider_form_stages_model_create_until_provider_save() {
     let AppAction::ClientCommand(ClientCommand::UpdateProvider {
         original_name,
         provider,
+        ..
     }) = action
     else {
         panic!("expected update provider command, saw {action:?}");
@@ -706,6 +708,7 @@ fn config_provider_form_stages_model_edit_and_delete_until_provider_save() {
     let AppAction::ClientCommand(ClientCommand::UpdateProvider {
         original_name,
         provider,
+        ..
     }) = action
     else {
         panic!("expected update provider command, saw {action:?}");
@@ -727,6 +730,48 @@ fn config_provider_form_stages_model_edit_and_delete_until_provider_save() {
             CatalogMatchSourceView::Manual,
         ))
     );
+}
+
+#[test]
+fn config_provider_form_keeps_open_resource_baseline_after_watch_update() {
+    let mut app = open_config_app();
+    let now = Instant::now();
+    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+
+    let mut remote = watched_config_snapshot();
+    remote
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .providers
+        .get_mut("anthropic")
+        .unwrap()
+        .url = "https://remote.example/messages".to_owned();
+    remote
+        .config
+        .resource_baselines
+        .get_mut("providers/anthropic.yaml")
+        .unwrap()
+        .persisted_etag = "remote-etag".to_owned();
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(remote)), now),
+        AppAction::Continue
+    );
+
+    let action = app.handle_event(&enter_press(), now);
+    let AppAction::ClientCommand(ClientCommand::UpdateProvider {
+        original,
+        baseline,
+        provider,
+        ..
+    }) = action
+    else {
+        panic!("expected update provider command, saw {action:?}");
+    };
+    assert_eq!(baseline.persisted_etag, "form-open-etag");
+    assert_eq!(original.url, "https://api.anthropic.com/v1/messages");
+    assert_eq!(provider.url, "https://api.anthropic.com/v1/messages");
 }
 
 #[test]
@@ -783,6 +828,7 @@ fn config_provider_form_list_keys_edit_and_delete_models() {
     let AppAction::ClientCommand(ClientCommand::UpdateProvider {
         original_name,
         provider,
+        ..
     }) = action
     else {
         panic!("expected update provider command for delete, saw {action:?}");
@@ -818,6 +864,7 @@ fn config_provider_form_stages_model_delete_until_provider_save() {
     let AppAction::ClientCommand(ClientCommand::UpdateProvider {
         original_name,
         provider,
+        ..
     }) = action
     else {
         panic!("expected update provider command for delete, saw {action:?}");
@@ -1843,7 +1890,7 @@ fn config_mcp_status_details_are_safe_bounded_and_render_registration_methods() 
         let config = snapshot.config.current.as_mut().unwrap();
         let mut server = config.mcp_servers.remove("files").unwrap();
         server.name = "remote".to_owned();
-        server.kind = McpServerTypeView::Sse;
+        server.kind = McpServerTypeView::StreamableHttp;
         server.command.clear();
         server.url = "https://mcp.example/sse".to_owned();
         config.mcp_servers.insert("remote".to_owned(), server);
@@ -2189,6 +2236,7 @@ fn config_right_opens_edit_form_and_updates_provider() {
     let AppAction::ClientCommand(ClientCommand::UpdateProvider {
         original_name,
         provider,
+        ..
     }) = action
     else {
         panic!("expected update provider command");
@@ -2468,4 +2516,47 @@ fn splash_logo_uses_neon_lavender() {
 
     assert_eq!(logo_cell.fg, Color::Rgb(190, 132, 242));
     assert_eq!(logo_cell.bg, THEME.panel());
+}
+
+#[test]
+fn config_mcp_form_keeps_open_resource_baseline_after_watch_update() {
+    let mut app = open_config_app_with_mcp();
+    let now = Instant::now();
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
+
+    let mut remote = patched_mcp_snapshot();
+    remote
+        .config
+        .current
+        .as_mut()
+        .unwrap()
+        .mcp_servers
+        .get_mut("files")
+        .unwrap()
+        .command = "remote-command".to_owned();
+    remote
+        .config
+        .resource_baselines
+        .get_mut("mcp-servers/files.yaml")
+        .unwrap()
+        .persisted_etag = "remote-etag".to_owned();
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(remote)), now),
+        AppAction::Continue
+    );
+
+    let action = app.handle_event(&enter_press(), now);
+    let AppAction::ClientCommand(ClientCommand::UpdateMcpServer {
+        original,
+        baseline,
+        server,
+        ..
+    }) = action
+    else {
+        panic!("expected update MCP command, saw {action:?}");
+    };
+    assert_eq!(baseline.persisted_etag, "form-open-etag");
+    assert_eq!(original.command, "fs-server");
+    assert_eq!(server.command, "fs-server");
 }

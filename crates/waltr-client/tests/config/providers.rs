@@ -67,14 +67,14 @@ async fn stream_dispatches_config_provider_commands() {
         patched.config.patch.key.as_deref(),
         Some(operation_key.as_str())
     );
-    let Some(ClientOperationView::ConfigPatch {
-        config: Some(operation_config),
-        ..
-    }) = patched.operations.current.get(&operation_key)
-    else {
-        panic!("patch operation should include patched config result");
-    };
-    assert_eq!(operation_config, &patched_config);
+    assert!(matches!(
+        patched.operations.current.get(&operation_key),
+        Some(ClientOperationView::ConfigPatch {
+            status: "ready",
+            config: None,
+            ..
+        })
+    ));
     assert_eq!(
         patched_config.providers.len(),
         initial_config.providers.len() + 1

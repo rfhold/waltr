@@ -290,8 +290,8 @@ pub enum McpServerTypeView {
     Unspecified,
     /// Stdio-based MCP server.
     Stdio,
-    /// SSE-based MCP server.
-    Sse,
+    /// Streamable HTTP MCP server.
+    StreamableHttp,
     /// MCP server type is unknown to this client version.
     Unknown,
 }
@@ -630,7 +630,7 @@ impl From<i32> for McpServerTypeView {
         match McpServerType::try_from(value) {
             Ok(McpServerType::Unspecified) => Self::Unspecified,
             Ok(McpServerType::Stdio) => Self::Stdio,
-            Ok(McpServerType::Sse) => Self::Sse,
+            Ok(McpServerType::StreamableHttp) => Self::StreamableHttp,
             Err(_) => Self::Unknown,
         }
     }
@@ -641,7 +641,7 @@ impl From<McpServerTypeView> for McpServerType {
         match kind {
             McpServerTypeView::Unspecified | McpServerTypeView::Unknown => Self::Unspecified,
             McpServerTypeView::Stdio => Self::Stdio,
-            McpServerTypeView::Sse => Self::Sse,
+            McpServerTypeView::StreamableHttp => Self::StreamableHttp,
         }
     }
 }

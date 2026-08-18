@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use waltr_client::{
     AuthStatusSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
-    ConfigView, McpServerTypeView, McpServerView,
+    ConfigView, McpServerTypeView, McpServerView, ResourceEditBaselineView,
 };
 use ratatui::{
     Frame,
@@ -50,13 +50,15 @@ pub struct McpForm {
     pub field: usize,
     /// Original server key/name for edits.
     pub original_name: Option<String>,
+    original_server: Option<McpServerView>,
+    baseline: Option<ResourceEditBaselineView>,
     /// Server key/name draft.
     pub name: String,
     /// Server type draft.
     pub kind: McpServerTypeView,
     /// Launch command draft (stdio servers).
     pub command: String,
-    /// Endpoint URL draft (sse servers).
+    /// Endpoint URL draft (streamable HTTP servers).
     pub url: String,
 }
 
@@ -68,6 +70,8 @@ impl McpForm {
             mode: McpFormMode::Create,
             field: 0,
             original_name: None,
+            original_server: None,
+            baseline: None,
             name: String::new(),
             kind: McpServerTypeView::Stdio,
             command: String::new(),
@@ -75,11 +79,13 @@ impl McpForm {
         }
     }
 
-    fn edit(key: &str, server: &McpServerView) -> Self {
+    fn edit(key: &str, server: &McpServerView, baseline: ResourceEditBaselineView) -> Self {
         Self {
             mode: McpFormMode::Edit,
             field: 0,
             original_name: Some(key.to_owned()),
+            original_server: Some(server.clone()),
+            baseline: Some(baseline),
             name: server.name.clone(),
             kind: server.kind,
             command: server.command.clone(),
@@ -89,13 +95,13 @@ impl McpForm {
 
     /// Whether the type-required conditional field is filled, gating save.
     ///
-    /// Stdio servers require a `command`; sse servers require a `url`. Other
+    /// Stdio servers require a `command`; streamable HTTP servers require a `url`. Other
     /// types cannot be saved from this form.
     #[must_use]
     pub fn type_field_filled(&self) -> bool {
         match self.kind {
             McpServerTypeView::Stdio => !self.command.trim().is_empty(),
-            McpServerTypeView::Sse => !self.url.trim().is_empty(),
+            McpServerTypeView::StreamableHttp => !self.url.trim().is_empty(),
             McpServerTypeView::Unspecified | McpServerTypeView::Unknown => false,
         }
     }
@@ -123,11 +129,11 @@ impl McpForm {
     }
 
     /// The conditional field at index 2 follows the server type: `command` for
-    /// stdio, `url` for sse.
+    /// stdio, `url` for streamable HTTP.
     const fn active_text_mut(&mut self) -> &mut String {
         match self.field {
             2 => match self.kind {
-                McpServerTypeView::Sse => &mut self.url,
+                McpServerTypeView::StreamableHttp => &mut self.url,
                 _ => &mut self.command,
             },
             _ => &mut self.name,
@@ -136,7 +142,7 @@ impl McpForm {
 
     const fn toggle_kind(&mut self) {
         self.kind = match self.kind {
-            McpServerTypeView::Stdio => McpServerTypeView::Sse,
+            McpServerTypeView::Stdio => McpServerTypeView::StreamableHttp,
             _ => McpServerTypeView::Stdio,
         };
     }
@@ -144,7 +150,7 @@ impl McpForm {
     /// Build the server view, keeping only the field relevant to the type.
     fn server(&self) -> McpServerView {
         let (command, url) = match self.kind {
-            McpServerTypeView::Sse => (String::new(), self.url.clone()),
+            McpServerTypeView::StreamableHttp => (String::new(), self.url.clone()),
             _ => (self.command.clone(), String::new()),
         };
 
@@ -169,6 +175,7 @@ pub struct McpSection {
     delete_server: Option<String>,
     selected_server: usize,
     patch: OperationTracker,
+    resource_baselines: BTreeMap<String, ResourceEditBaselineView>,
 }
 
 impl McpSection {
@@ -180,6 +187,7 @@ impl McpSection {
             delete_server: None,
             selected_server: 0,
             patch: OperationTracker::new(),
+            resource_baselines: BTreeMap::new(),
         }
     }
 
@@ -209,6 +217,7 @@ impl McpSection {
 
     /// Reconcile a submitted patch against the shared reducer operation state.
     pub fn reconcile_patch(&mut self, snapshot: &ClientSnapshot) {
+        self.resource_baselines = snapshot.config.resource_baselines.clone();
         if let Some(result) = self
             .patch
             .reconcile(&snapshot.config.patch, snapshot, |operation| {
@@ -272,9 +281,13 @@ impl McpSection {
 
         self.delete_server = None;
         self.patch.clear_error();
-        self.config_form = self
-            .selected_server_view(config)
-            .map(|(key, server)| McpForm::edit(&key, server));
+        self.config_form = self.selected_server_view(config).and_then(|(key, server)| {
+            let path = format!("mcp-servers/{key}.yaml");
+            self.resource_baselines
+                .get(&path)
+                .cloned()
+                .map(|baseline| McpForm::edit(&key, server, baseline))
+        });
     }
 
     /// Arm the delete confirmation for the current selection.
@@ -347,6 +360,8 @@ impl McpSection {
 
         let mode = form.mode;
         let original_name = form.original_name.clone();
+        let original = form.original_server.clone();
+        let baseline = form.baseline.clone();
         let server = form.server();
         self.patch.begin();
 
@@ -358,8 +373,13 @@ impl McpSection {
                 let Some(original_name) = original_name else {
                     return SectionAction::Continue;
                 };
+                let (Some(original), Some(baseline)) = (original, baseline) else {
+                    return SectionAction::Continue;
+                };
                 SectionAction::ClientCommand(ClientCommand::UpdateMcpServer {
                     original_name,
+                    original: Box::new(original),
+                    baseline,
                     server,
                 })
             }
@@ -611,7 +631,7 @@ fn mcp_target(key: String) -> ClientAuthTarget {
 
 fn server_target(server: &McpServerView) -> String {
     match server.kind {
-        McpServerTypeView::Sse => {
+        McpServerTypeView::StreamableHttp => {
             if server.url.is_empty() {
                 "no-url".to_owned()
             } else {
@@ -660,9 +680,9 @@ fn form_lines(
     patch_error: Option<&str>,
 ) -> Vec<Line<'static>> {
     // The conditional field swaps label and value with the server type: stdio
-    // shows `command`, sse shows `url`.
+    // shows `command`, streamable HTTP shows `url`.
     let (conditional_label, conditional_value) = match form.kind {
-        McpServerTypeView::Sse => ("url", form.url.as_str()),
+        McpServerTypeView::StreamableHttp => ("url", form.url.as_str()),
         _ => ("command", form.command.as_str()),
     };
 
@@ -699,7 +719,7 @@ const fn mcp_type_name(kind: McpServerTypeView) -> &'static str {
     match kind {
         McpServerTypeView::Unspecified => "unspecified",
         McpServerTypeView::Stdio => "stdio",
-        McpServerTypeView::Sse => "sse",
+        McpServerTypeView::StreamableHttp => "streamable http",
         McpServerTypeView::Unknown => "unknown",
     }
 }

@@ -212,7 +212,7 @@ jwtMetadata: Array<OAuthJwtMetadataView>,
  */
 sendStateInTokenRequest: boolean, };
 
-export type McpServerTypeView = "unspecified" | "stdio" | "sse" | "unknown";
+export type McpServerTypeView = "unspecified" | "stdio" | "streamableHttp" | "unknown";
 
 export type McpServerView = {
 /**
@@ -1220,6 +1220,10 @@ export type ConfigSnapshot = {
  */
 current: ConfigView | null,
 /**
+ * Resource-slot write baselines keyed by canonical path.
+ */
+resourceBaselines: { [key in string]?: ResourceEditBaselineView },
+/**
  * Configuration load operation snapshot.
  */
 load: OperationSnapshot,
@@ -1452,6 +1456,14 @@ provider: ProviderView, } | { "type": "updateProvider",
  */
 originalName: string,
 /**
+ * Provider value captured when editing began.
+ */
+original: ProviderView,
+/**
+ * Persisted resource slot captured when editing began.
+ */
+baseline: ResourceEditBaselineView,
+/**
  * Replacement provider definition.
  */
 provider: ProviderView, } | { "type": "deleteProvider",
@@ -1467,6 +1479,14 @@ server: McpServerView, } | { "type": "updateMcpServer",
  * Current MCP server key.
  */
 originalName: string,
+/**
+ * MCP server value captured when editing began.
+ */
+original: McpServerView,
+/**
+ * Persisted resource slot captured when editing began.
+ */
+baseline: ResourceEditBaselineView,
 /**
  * Replacement MCP server definition.
  */

@@ -14,6 +14,3 @@ mod mcp;
 
 #[path = "config/inference_defaults.rs"]
 mod inference_defaults;
-
-#[path = "config/reset.rs"]
-mod reset;

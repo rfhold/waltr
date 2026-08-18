@@ -26,7 +26,7 @@ describe("config authentication status", () => {
 
   test("shows MCP registration status without exposing registration configuration", async () => {
     const config = claudeConfig();
-    config.mcpServers.remote = mcpServerView({ name: "remote", kind: "sse", url: "https://mcp.example" });
+    config.mcpServers.remote = mcpServerView({ name: "remote", kind: "streamableHttp", url: "https://mcp.example" });
     const snapshot = snapshotWithConfig(config);
     snapshot.auth.statuses["mcp:remote"] = authStatus("mcpServer", "remote", "oauthConfigured", { registrationMethod: "preregistered" });
 
@@ -222,7 +222,7 @@ function providerAuthSnapshot(status: AuthStatusSnapshot): ClientSnapshot {
 
 function mcpAuthSnapshot(url: string): ClientSnapshot {
   const config = claudeConfig();
-  config.mcpServers.remote = mcpServerView({ name: "remote", kind: "sse", url });
+  config.mcpServers.remote = mcpServerView({ name: "remote", kind: "streamableHttp", url });
   const snapshot = snapshotWithConfig(config);
   snapshot.auth.statuses["mcp:remote"] = authStatus("mcpServer", "remote", "oauthConfigured", { registrationMethod: "preregistered" });
   return snapshot;

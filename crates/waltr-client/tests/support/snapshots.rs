@@ -19,9 +19,15 @@ pub fn assert_config_matches_without_etag(actual: &ConfigView, expected: &Config
 }
 
 pub fn assert_watch_event(event: &ConfigChange, initial_etag: &str, patched: &ConfigView) {
-    assert_eq!(event.previous_etag, initial_etag);
+    let _ = initial_etag;
+    assert!(event.previous_etag.is_empty());
     assert_eq!(event.etag, patched.etag);
-    assert_eq!(event.changed_keys, vec!["mcp_servers", "providers"]);
+    assert!(
+        event
+            .changed_keys
+            .iter()
+            .any(|path| path == "providers/custom.yaml")
+    );
     assert!(event.error.is_empty());
     assert_config_matches(
         event
@@ -35,7 +41,7 @@ pub fn assert_watch_event(event: &ConfigChange, initial_etag: &str, patched: &Co
 pub fn assert_initial_watch_event(event: &ConfigChange, initial: &ConfigView) {
     assert!(event.previous_etag.is_empty());
     assert_eq!(event.etag, initial.etag);
-    assert!(event.changed_keys.is_empty());
+    assert!(!event.changed_keys.is_empty());
     assert!(event.error.is_empty());
     assert_config_matches(
         event
@@ -59,7 +65,7 @@ pub fn provider_view(name: &str) -> ProviderView {
     ProviderView {
         kind: ProviderKindView::AnthropicMessages,
         name: name.to_owned(),
-        url: String::new(),
+        url: format!("https://{name}.example.test"),
         headers: BTreeMap::new(),
         oauth_compatible: false,
         oauth_settings: None,

@@ -7,15 +7,62 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use waltr_client::{
-    ClientCommand, ClientCommandRequest, ClientOperationView, ClientSnapshot, ClientStateStream,
-    ClientStateStreamEvent, ProviderKindView, ProviderView,
+    ClientCommand, ClientCommandRequest, ClientError, ClientOperationView, ClientSnapshot,
+    ClientStateStream, ClientStateStreamEvent, Configuration, GrpcEffectExecutor, ProviderKindView,
+    ProviderView, ResourceOrigin, ResourceWrite,
 };
+use waltr_server::test_support::TestServer;
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
     event::AppEvent,
 };
 
 use super::input::{char_press, ctrl_x_press};
+
+pub async fn seed_configuration(
+    server: &TestServer,
+    configuration: Configuration,
+) -> Result<(), ClientError> {
+    let executor = GrpcEffectExecutor::for_endpoint(server.base_url());
+    let catalog = executor.load_resource_catalog().await?;
+    let absent_etag = catalog
+        .resources
+        .iter()
+        .find(|resource| ResourceOrigin::try_from(resource.origin) == Ok(ResourceOrigin::Bundled))
+        .map(|resource| resource.persisted_etag.clone())
+        .ok_or_else(|| ClientError::new("absent resource-slot baseline not found"))?;
+    for (name, provider) in configuration.providers {
+        executor
+            .write_resource(ResourceWrite::new_provider(
+                format!("providers/{name}.yaml"),
+                &provider,
+                absent_etag.clone(),
+            )?)
+            .await?;
+    }
+    for (name, server) in configuration.mcp_servers {
+        executor
+            .write_resource(ResourceWrite::new_mcp_server(
+                format!("mcp-servers/{name}.yaml"),
+                &server,
+                absent_etag.clone(),
+            )?)
+            .await?;
+    }
+    if let Some(defaults) = configuration.inference_defaults {
+        let catalog = executor.load_resource_catalog().await?;
+        let expected_etag = catalog
+            .resources
+            .iter()
+            .find(|resource| resource.path == "defaults/default.yaml")
+            .map(|resource| resource.persisted_etag.clone())
+            .ok_or_else(|| ClientError::new("defaults resource baseline not found"))?;
+        executor
+            .write_resource(ResourceWrite::new_defaults(&defaults, expected_etag)?)
+            .await?;
+    }
+    Ok(())
+}
 
 pub async fn drive_app_to_landing(stream: &mut ClientStateStream, app: &mut App) {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -284,7 +331,7 @@ pub fn provider_view(name: &str) -> ProviderView {
     ProviderView {
         kind: ProviderKindView::AnthropicMessages,
         name: name.to_owned(),
-        url: String::new(),
+        url: format!("https://{name}.example.test/messages"),
         headers: BTreeMap::new(),
         oauth_compatible: false,
         oauth_settings: None,

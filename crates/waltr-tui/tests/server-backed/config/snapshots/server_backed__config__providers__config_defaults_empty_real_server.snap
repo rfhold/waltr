@@ -1,6 +1,6 @@
 ---
 source: crates/waltr-tui/tests/server-backed/config/providers.rs
-assertion_line: 51
+assertion_line: 55
 expression: defaults
 ---
 "                                                                                "
@@ -10,8 +10,8 @@ expression: defaults
 "                                                                                "
 "          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
-"         Default model anthropic/claude-fable-5                                 "
-"         Reasoning not supported                                                "
+"         Default model codex/codex/gpt-5.6                                      "
+"         Reasoning high                                                         "
 "         m selects model, r changes reasoning, Enter saves for new              "
 "        sessions.                                                               "
 "                                                                                "

@@ -3,10 +3,10 @@
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
     AccessAttemptId, AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientError,
-    Configuration, GenericAuthAttempt, GenericAuthAttemptStatus, InferenceDefaults,
-    InferenceSettingsRequest, OperationKey, Provider, RollbackTarget, SelectableAgent,
-    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
-    SystemStatus, TimelineEvent, TimelineQuery, TimelineWatchKey,
+    GenericAuthAttempt, GenericAuthAttemptStatus, InferenceSettingsRequest, OperationKey, Provider,
+    ResourceCatalog, RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateKind,
+    SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus, TimelineEvent, TimelineQuery,
+    TimelineWatchKey,
 };
 
 /// Runtime-local identifier for a streamed response.
@@ -273,7 +273,7 @@ pub enum ConfigEvent {
     /// A caller requested the current configuration snapshot.
     LoadRequested,
     /// The current configuration loaded successfully.
-    Loaded(Configuration),
+    Loaded(ResourceCatalog),
     /// The current configuration failed to load.
     LoadFailed(ClientError),
     /// A caller requested a configuration patch.
@@ -282,8 +282,6 @@ pub enum ConfigEvent {
     Patched {
         /// Operation key allocated when the patch was requested.
         operation_key: OperationKey,
-        /// Patched configuration returned by the server.
-        config: Configuration,
     },
     /// The configuration patch failed.
     PatchFailed {
@@ -298,8 +296,6 @@ pub enum ConfigEvent {
     Reset {
         /// Operation key allocated when the reset was requested.
         operation_key: OperationKey,
-        /// Reset configuration returned by the server.
-        config: Configuration,
     },
     /// The configuration reset failed.
     ResetFailed {
@@ -766,7 +762,7 @@ pub enum SessionEvent {
 }
 
 /// Side-effect intent emitted by the client for shells or runtimes to execute.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ClientEffect {
     /// Auth side-effect intent.
@@ -861,38 +857,46 @@ pub enum AuthEffect {
     },
 }
 
-/// Sparse top-level configuration patch emitted by the client.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ConfigPatch {
-    /// Replacement providers map. `None` leaves providers unchanged.
-    pub providers: Option<std::collections::HashMap<String, crate::Provider>>,
-    /// Replacement MCP servers map. `None` leaves MCP servers unchanged.
-    pub mcp_servers: Option<std::collections::HashMap<String, crate::McpServer>>,
-    /// Replacement inference defaults. `None` leaves defaults unchanged.
-    pub inference_defaults: Option<InferenceDefaults>,
+/// One canonical resource-slot write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResourceWrite {
+    /// Replace one resource with a complete, prevalidated document.
+    Replace {
+        /// Canonical resource path.
+        path: String,
+        /// Complete strict YAML source prepared from the command baseline.
+        source: String,
+        /// Persisted-slot entity tag from the command baseline.
+        expected_etag: String,
+    },
+    /// Reset one persisted resource slot.
+    Reset {
+        /// Canonical resource path.
+        path: String,
+        /// Persisted-slot entity tag from the command baseline.
+        expected_etag: String,
+    },
 }
 
 /// Configuration side-effect intent emitted by the client.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ConfigEffect {
     /// Load the current configuration snapshot.
     Load,
-    /// Patch top-level configuration sections using an expected entity tag.
+    /// Apply canonical resource writes.
     Patch {
         /// Operation key allocated when the patch was requested.
         operation_key: OperationKey,
-        /// Top-level section patch to submit.
-        patch: ConfigPatch,
-        /// Entity tag expected by the caller.
-        expected_etag: String,
+        /// Ordered per-resource writes to submit.
+        writes: Vec<ResourceWrite>,
     },
-    /// Reset the complete configuration using an expected entity tag.
+    /// Reset persisted configuration resource slots.
     Reset {
         /// Operation key allocated when the reset was requested.
         operation_key: OperationKey,
-        /// Entity tag expected by the caller.
-        expected_etag: String,
+        /// Prepared resource resets to submit.
+        writes: Vec<ResourceWrite>,
     },
     /// Open or continue the configuration watch stream.
     Watch {
@@ -1070,8 +1074,10 @@ pub enum SessionEffect {
 pub struct ProviderEditBaseline {
     /// Provider name at the time editing started.
     pub name: String,
-    /// Configuration entity tag at the time editing started.
-    pub etag: String,
+    /// Persisted-slot entity tag at the time editing started.
+    pub persisted_etag: String,
+    /// Exact active YAML source at the time editing started.
+    pub active_source: String,
     /// Provider snapshot at the time editing started.
     pub provider: Provider,
 }

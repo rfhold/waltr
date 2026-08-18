@@ -9,10 +9,9 @@ use waltr_client::{
     ModelView, ProviderKindView, ProviderView,
 };
 use waltr_server::{
-    config::ConfigStore as _,
     config_service::ConfigService,
     test_support::{
-        TestServer, default_config_builder, setup_server, setup_server_with_services, temp_root,
+        TestServer, default_catalog_loader, setup_server, setup_server_with_services, temp_root,
     },
 };
 use waltr_tui::app::{App, AppAction};
@@ -22,7 +21,7 @@ use crate::support::{
     render::render_app,
     server::{
         dispatch_app_command, drive_app_to_landing, next_snapshot_until, no_sleep,
-        open_sessions_screen,
+        open_sessions_screen, seed_configuration,
     },
 };
 
@@ -94,7 +93,7 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     let rendered = render_app(&app);
     assert!(rendered.contains("agent "));
     assert!(rendered.contains("(C-x a)"));
-    assert!(rendered.contains("provider none (C-x p)"));
+    assert!(rendered.contains("provider codex/codex/gpt-5.6 (C-x p)"));
     assert!(rendered.contains("ctx 0"));
     insta::assert_snapshot!(
         "sessions_detail_real_server",
@@ -259,8 +258,6 @@ async fn session_detail_updates_inference_settings_with_real_server() {
     let provider_editor = render_app(&app);
     assert!(provider_editor.contains("Inference settings"));
     assert!(provider_editor.contains("Search"));
-    assert!(provider_editor.contains("anthropic/claude"));
-    assert!(provider_editor.contains("openai/gpt4o"));
     assert!(!provider_editor.contains("Ctrl-T"));
     assert!(!provider_editor.contains("Thinking"));
 
@@ -298,11 +295,15 @@ async fn session_detail_updates_inference_settings_with_real_server() {
 }
 
 async fn setup_inference_configured_server() -> &'static TestServer {
-    let config_service = ConfigService::new(temp_root(), default_config_builder())
+    let root = temp_root();
+    waltr_server::test_support::persist_test_self_mcp(&root);
+    let config_service = ConfigService::new(root, default_catalog_loader())
+        .await
         .expect("config service should start");
-    config_service
-        .store()
-        .save(Configuration {
+    let server = setup_server_with_services(config_service);
+    seed_configuration(
+        server,
+        Configuration {
             etag: String::new(),
             providers: HashMap::from([
                 ("openai".to_owned(), provider("openai", "gpt4o").into()),
@@ -323,11 +324,12 @@ async fn setup_inference_configured_server() -> &'static TestServer {
                 }
                 .into(),
             ),
-        })
-        .await
-        .expect("inference settings seed should save");
+        },
+    )
+    .await
+    .expect("inference settings resources should save");
 
-    setup_server_with_services(config_service)
+    server
 }
 
 fn assert_inference_provider(

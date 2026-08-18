@@ -71,8 +71,8 @@ async fn client_stream_creates_edits_and_deletes_mcp_server_with_real_server() {
         .as_ref()
         .and_then(|config| config.mcp_servers.get("remote"))
         .expect("created MCP server should be persisted");
-    assert_eq!(server_view.kind, McpServerTypeView::Sse);
-    assert_eq!(server_view.url, "https://mcp.example");
+    assert_eq!(server_view.kind, McpServerTypeView::StreamableHttp);
+    assert_eq!(server_view.url, "https://mcp.example/");
     insta::assert_snapshot!("config_mcp_saved_real_server", render_app(&app));
 
     // Select and edit the added server (still on the MCP tab).
@@ -126,6 +126,14 @@ async fn client_stream_manages_provider_models_via_update_provider_with_real_ser
             AppAction::Continue
         );
     }
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&tab_press(), now), AppAction::Continue);
+    for character in "https://api.anthropic.com/v1/messages".chars() {
+        assert_eq!(
+            app.handle_event(&char_press(character), now),
+            AppAction::Continue
+        );
+    }
     let action = app.handle_event(&enter_press(), now);
     assert!(
         matches!(action, AppAction::ClientCommand(_)),
@@ -136,7 +144,11 @@ async fn client_stream_manages_provider_models_via_update_provider_with_real_ser
 
     // Open the provider form and create a model in the provider draft.
     assert_eq!(app.handle_event(&right_press(), now), AppAction::Continue);
-    assert!(render_app(&app).contains("Edit provider"));
+    let provider_editor = render_app(&app);
+    assert!(
+        provider_editor.contains("Edit provider"),
+        "expected provider editor after create; rendered: {provider_editor}"
+    );
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&char_press('c'), now), AppAction::Continue);
