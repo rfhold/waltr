@@ -1,0 +1,7 @@
+apiVersion: waltr.dev/v1alpha1
+kind: McpServer
+metadata:
+  name: waltr
+spec:
+  transport: streamableHttp
+  url: http://127.0.0.1:14333/mcp
