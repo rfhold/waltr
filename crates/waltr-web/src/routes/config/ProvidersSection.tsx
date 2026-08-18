@@ -95,7 +95,7 @@ const ProvidersSectionContext = createContext<ProvidersSectionState>();
 
 export function ProvidersSection(props: ParentProps & {
   watchedConfig: Accessor<ConfigView | undefined>;
-  resourceBaselines?: Accessor<Record<string, ResourceEditBaselineView>>;
+  resourceBaselines?: Accessor<Record<string, ResourceEditBaselineView | undefined>>;
 }) {
   const app = useAppState();
   const location = useLocation();

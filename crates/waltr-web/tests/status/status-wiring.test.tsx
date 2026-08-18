@@ -12,6 +12,7 @@ describe("status wiring", () => {
         ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
         config: {
           current: { etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null },
+          resourceBaselines: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),
@@ -34,6 +35,7 @@ describe("status wiring", () => {
         ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
         config: {
           current: null,
+          resourceBaselines: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),

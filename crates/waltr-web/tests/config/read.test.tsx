@@ -22,6 +22,7 @@ describe("config read", () => {
         ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
         config: {
           current: null,
+          resourceBaselines: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),
@@ -52,6 +53,7 @@ describe("config read", () => {
         ...snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
         config: {
           current: null,
+          resourceBaselines: {},
           load: operationSnapshot("idle"),
           patch: operationSnapshot("idle"),
           reset: operationSnapshot("idle"),

@@ -39,26 +39,31 @@ export function snapshotWithConfig(
 }
 
 function resourceBaselines(config: ConfigView): Record<string, ResourceEditBaselineView> {
-  return {
-    ...Object.fromEntries(Object.entries(config.providers).map(([name, provider]) => [
-      `providers/${name}.yaml`,
-      {
-        path: `providers/${name}.yaml`,
-        persistedEtag: config.etag,
-        absentEtag: "absent-etag",
-        activeSource: `apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: ${name}\nspec:\n  transport: ${provider.kind}\n  url: ${provider.url}\n`,
-      },
-    ])),
-    ...Object.fromEntries(Object.entries(config.mcpServers).map(([name, server]) => [
-      `mcp-servers/${name}.yaml`,
-      {
-        path: `mcp-servers/${name}.yaml`,
-        persistedEtag: config.etag,
-        absentEtag: "absent-etag",
-        activeSource: `apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: ${name}\nspec:\n  transport: ${server.kind}\n`,
-      },
-    ])),
-  };
+  const baselines: Record<string, ResourceEditBaselineView> = {};
+
+  for (const [name, provider] of Object.entries(config.providers)) {
+    if (!provider) continue;
+    const path = `providers/${name}.yaml`;
+    baselines[path] = {
+      path,
+      persistedEtag: config.etag,
+      absentEtag: "absent-etag",
+      activeSource: `apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: ${name}\nspec:\n  transport: ${provider.kind}\n  url: ${provider.url}\n`,
+    };
+  }
+
+  for (const [name, server] of Object.entries(config.mcpServers)) {
+    if (!server) continue;
+    const path = `mcp-servers/${name}.yaml`;
+    baselines[path] = {
+      path,
+      persistedEtag: config.etag,
+      absentEtag: "absent-etag",
+      activeSource: `apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: ${name}\nspec:\n  transport: ${server.kind}\n`,
+    };
+  }
+
+  return baselines;
 }
 
 export function emptyCatalogSnapshot(): CatalogSnapshot {

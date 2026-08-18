@@ -40,7 +40,7 @@ type ActiveForm =
 
 type McpServersSectionState = {
   watchedConfig: Accessor<ConfigView | undefined>;
-  resourceBaselines: Accessor<Record<string, ResourceEditBaselineView>>;
+  resourceBaselines: Accessor<Record<string, ResourceEditBaselineView | undefined>>;
   closeForm: () => void;
   operationError: Accessor<string | undefined>;
   operationPending: Accessor<boolean>;
@@ -53,7 +53,7 @@ const McpServersSectionContext = createContext<McpServersSectionState>();
 
 export function McpServersSection(props: ParentProps & {
   watchedConfig: Accessor<ConfigView | undefined>;
-  resourceBaselines?: Accessor<Record<string, ResourceEditBaselineView>>;
+  resourceBaselines?: Accessor<Record<string, ResourceEditBaselineView | undefined>>;
 }) {
   const app = useAppState();
   const location = useLocation();
