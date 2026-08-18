@@ -7,6 +7,7 @@ import type {
   ModelView,
   OperationSnapshot,
   ProviderView,
+  ResourceEditBaselineView,
   SessionSnapshot,
   SessionTimelineView,
   SessionView,
@@ -23,6 +24,7 @@ export function snapshotWithConfig(
     catalog: emptyCatalogSnapshot(),
     config: {
       current: config,
+      resourceBaselines: resourceBaselines(config),
       load: operationSnapshot("idle"),
       patch: operationSnapshot("idle"),
       reset: operationSnapshot("idle"),
@@ -33,6 +35,29 @@ export function snapshotWithConfig(
       watch: operationSnapshot("ready"),
     },
     sessions: emptySessionSnapshot(),
+  };
+}
+
+function resourceBaselines(config: ConfigView): Record<string, ResourceEditBaselineView> {
+  return {
+    ...Object.fromEntries(Object.entries(config.providers).map(([name, provider]) => [
+      `providers/${name}.yaml`,
+      {
+        path: `providers/${name}.yaml`,
+        persistedEtag: config.etag,
+        absentEtag: "absent-etag",
+        activeSource: `apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: ${name}\nspec:\n  transport: ${provider.kind}\n  url: ${provider.url}\n`,
+      },
+    ])),
+    ...Object.fromEntries(Object.entries(config.mcpServers).map(([name, server]) => [
+      `mcp-servers/${name}.yaml`,
+      {
+        path: `mcp-servers/${name}.yaml`,
+        persistedEtag: config.etag,
+        absentEtag: "absent-etag",
+        activeSource: `apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: ${name}\nspec:\n  transport: ${server.kind}\n`,
+      },
+    ])),
   };
 }
 

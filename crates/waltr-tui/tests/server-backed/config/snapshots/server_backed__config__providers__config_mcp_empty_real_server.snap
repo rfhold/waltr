@@ -1,6 +1,6 @@
 ---
 source: crates/waltr-tui/tests/server-backed/config/providers.rs
-assertion_line: 47
+assertion_line: 51
 expression: switched
 ---
 "                                                                                "
@@ -10,7 +10,7 @@ expression: switched
 "                                                                                "
 "          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
-"        > waltr  sse  http://127.0.0.1:14333/mcp                                 "
+"        > waltr  streamable http  http://127.0.0.1:14333/mcp                     "
 "            status: not connected                                               "
 "            actions: a authorize                                                "
 "            message: MCP OAuth is discovered during Streamable HTTP             "

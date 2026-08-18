@@ -120,4 +120,32 @@ describe("provider config", () => {
     expect(testHistory().get()).toBe("/config/provider/create");
     expect(commands.map((command) => command.type)).toContain("addProvider");
   });
+
+  test("keeps the form-open resource baseline after a watched update", async () => {
+    const commands: ClientCommand[] = [];
+    const initial = snapshotWithConfig(claudeConfig());
+    let publishSnapshot: ((snapshot: typeof initial) => void) | undefined;
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      snapshot: initial,
+      onSnapshotSetter: (setter) => {
+        publishSnapshot = setter;
+      },
+    });
+
+    fireEvent.click(screen.getByLabelText("Edit claude"));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Edit provider dialog" })).toBeTruthy());
+    const remote = snapshotWithConfig(claudeConfig());
+    remote.config.current!.providers.claude!.url = "https://remote.example/messages";
+    remote.config.resourceBaselines["providers/claude.yaml"]!.persistedEtag = "remote-etag";
+    publishSnapshot!(remote);
+    fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://draft.example/messages" } });
+    fireEvent.submit(screen.getByLabelText("Edit provider"));
+
+    await waitFor(() => expect(commands.some((command) => command.type === "updateProvider")).toBe(true));
+    const update = commands.find((command): command is Extract<ClientCommand, { type: "updateProvider" }> => command.type === "updateProvider")!;
+    expect(update.baseline.persistedEtag).toBe(initial.config.resourceBaselines["providers/claude.yaml"]!.persistedEtag);
+    expect(update.original.url).toBe("https://api.anthropic.com/v1/messages");
+    expect(update.provider.url).toBe("https://draft.example/messages");
+  });
 });

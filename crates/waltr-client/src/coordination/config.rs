@@ -1,7 +1,7 @@
 //! Configuration reducer responsibilities.
 
+use crate::ResourceCatalog;
 use crate::{ClientEffect, ClientState, ClientUpdate, ConfigEffect, ConfigEvent, OperationStatus};
-use waltr::config::{ConfigWatchApplyOutcome, ConfigWatchUpdate, apply_config_watch_update};
 
 pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
     match event {
@@ -21,11 +21,8 @@ pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
             state.set_config_patch_loading(operation_key);
             ClientUpdate::default()
         }
-        ConfigEvent::Patched {
-            operation_key,
-            config,
-        } => {
-            state.set_config_patch_ready(operation_key, config);
+        ConfigEvent::Patched { operation_key } => {
+            state.set_config_patch_ready(operation_key);
             ClientUpdate::default()
         }
         ConfigEvent::PatchFailed {
@@ -39,11 +36,8 @@ pub fn reduce(state: &mut ClientState, event: ConfigEvent) -> ClientUpdate {
             state.set_config_reset_loading(operation_key);
             ClientUpdate::default()
         }
-        ConfigEvent::Reset {
-            operation_key,
-            config,
-        } => {
-            state.set_config_reset_ready(operation_key, config);
+        ConfigEvent::Reset { operation_key } => {
+            state.set_config_reset_ready(operation_key);
             ClientUpdate::default()
         }
         ConfigEvent::ResetFailed {
@@ -107,21 +101,9 @@ pub fn maintain_watch(state: &mut ClientState) -> ClientUpdate {
     ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::Watch { open_id }))
 }
 
-fn apply_watch_update(state: &mut ClientState, update: &ConfigWatchUpdate) -> ClientUpdate {
-    match apply_config_watch_update(state.config.current.as_ref(), update) {
-        ConfigWatchApplyOutcome::Retry(error) => {
-            state.set_config_watch_changed(None, error);
-            watch_retry(state)
-        }
-        ConfigWatchApplyOutcome::ReloadRequired => {
-            state.set_config_watch_changed(None, String::new());
-            ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::Load))
-        }
-        ConfigWatchApplyOutcome::Updated(config) => {
-            state.set_config_watch_changed(Some(config), String::new());
-            ClientUpdate::default()
-        }
-    }
+fn apply_watch_update(state: &mut ClientState, catalog: &ResourceCatalog) -> ClientUpdate {
+    state.set_config_watch_changed(Some(catalog.clone()), catalog.reload_error.clone());
+    ClientUpdate::default()
 }
 
 fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {
@@ -129,25 +111,6 @@ fn watch_failed(state: &mut ClientState, message: String) -> ClientUpdate {
         return ClientUpdate::default();
     }
 
-    let delay_ms = state.set_config_watch_failed(message);
-
-    if state.permits_watch_maintenance() {
-        ClientUpdate::with_effect(ClientEffect::Config(ConfigEffect::SleepReconnect {
-            delay_ms,
-        }))
-    } else {
-        state.set_config_watch_waiting();
-        ClientUpdate::default()
-    }
-}
-
-fn watch_retry(state: &mut ClientState) -> ClientUpdate {
-    let message = state
-        .config
-        .watch
-        .error
-        .clone()
-        .unwrap_or_else(|| "config watch failed".to_owned());
     let delay_ms = state.set_config_watch_failed(message);
 
     if state.permits_watch_maintenance() {

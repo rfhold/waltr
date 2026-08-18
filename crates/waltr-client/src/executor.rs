@@ -12,9 +12,10 @@ use crate::transport::{
 };
 use crate::{
     AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientError, ClientEvent,
-    ConfigEffect, ConfigEvent, ConfigPatch, ConfigView, SearchCatalogModelsRequest,
-    SearchSessionTemplatesRequest, SessionEffect, SessionEvent, SessionSummary, StatusEffect,
-    StatusEvent, SuggestCatalogMatchesRequest, search_session_templates_response,
+    ConfigEffect, ConfigEvent, ConfigView, ResourceCatalog, ResourceWrite,
+    SearchCatalogModelsRequest, SearchSessionTemplatesRequest, SessionEffect, SessionEvent,
+    SessionSummary, StatusEffect, StatusEvent, SuggestCatalogMatchesRequest,
+    search_session_templates_response,
 };
 
 /// Stream of configuration changes observed through the gRPC executor.
@@ -83,39 +84,28 @@ impl GrpcEffectExecutor {
     ///
     /// Returns an error when the transport cannot load configuration.
     pub async fn load_config(&self) -> Result<ConfigView, ClientError> {
-        self.transport.get_config().await.map(ConfigView::from)
+        self.transport
+            .get_config()
+            .await
+            .and_then(catalog_config_view)
     }
 
-    /// Patch the current configuration using the stable shell-facing view model.
+    /// Load the authoritative resource catalog used as a write baseline.
     ///
     /// # Errors
     ///
-    /// Returns an error when the transport rejects or cannot apply the patch.
-    pub async fn patch_config(
-        &self,
-        config: ConfigView,
-        expected_etag: impl Into<String>,
-    ) -> Result<ConfigView, ClientError> {
-        let config: crate::Configuration = config.into();
-        self.transport
-            .patch_config(ConfigPatch::from(config), expected_etag.into())
-            .await
-            .map(ConfigView::from)
+    /// Returns an error when the transport cannot load the catalog.
+    pub async fn load_resource_catalog(&self) -> Result<ResourceCatalog, ClientError> {
+        self.transport.get_config().await
     }
 
-    /// Reset the current configuration using its expected entity tag.
+    /// Apply one prepared canonical resource-slot write.
     ///
     /// # Errors
     ///
-    /// Returns an error when the transport rejects or cannot apply the reset.
-    pub async fn reset_config(
-        &self,
-        expected_etag: impl Into<String>,
-    ) -> Result<ConfigView, ClientError> {
-        self.transport
-            .reset_config(expected_etag.into())
-            .await
-            .map(ConfigView::from)
+    /// Returns an error when replacement or reset fails.
+    pub async fn write_resource(&self, write: ResourceWrite) -> Result<(), ClientError> {
+        self.transport.write_resource(write).await
     }
 
     /// Subscribe to configuration changes as stable shell-facing view models.
@@ -396,30 +386,63 @@ impl GrpcEffectExecutor {
                 },
                 ClientEffect::Config(ConfigEffect::Patch {
                     operation_key,
-                    patch,
-                    expected_etag,
-                }) => match self.transport.patch_config(patch, expected_etag).await {
-                    Ok(config) => vec![ClientEvent::Config(ConfigEvent::Patched {
-                        operation_key,
-                        config,
-                    })],
-                    Err(error) => vec![ClientEvent::Config(ConfigEvent::PatchFailed {
-                        operation_key,
-                        error,
-                    })],
+                    writes,
+                }) => match write_resources(&self.transport, writes).await {
+                    Ok(()) => match self.transport.get_config().await {
+                        Ok(catalog) => vec![
+                            ClientEvent::Config(ConfigEvent::Loaded(catalog)),
+                            ClientEvent::Config(ConfigEvent::Patched { operation_key }),
+                        ],
+                        Err(error) => vec![ClientEvent::Config(ConfigEvent::PatchFailed {
+                            operation_key,
+                            error,
+                        })],
+                    },
+                    Err(error) => match self.transport.get_config().await {
+                        Ok(catalog) => vec![
+                            ClientEvent::Config(ConfigEvent::Loaded(catalog)),
+                            ClientEvent::Config(ConfigEvent::PatchFailed {
+                                operation_key,
+                                error,
+                            }),
+                        ],
+                        Err(reload_error) => {
+                            vec![ClientEvent::Config(ConfigEvent::PatchFailed {
+                                operation_key,
+                                error: reload_failure(&error, &reload_error),
+                            })]
+                        }
+                    },
                 },
                 ClientEffect::Config(ConfigEffect::Reset {
                     operation_key,
-                    expected_etag,
-                }) => match self.transport.reset_config(expected_etag).await {
-                    Ok(config) => vec![ClientEvent::Config(ConfigEvent::Reset {
-                        operation_key,
-                        config,
-                    })],
-                    Err(error) => vec![ClientEvent::Config(ConfigEvent::ResetFailed {
-                        operation_key,
-                        error,
-                    })],
+                    writes,
+                }) => match write_resources(&self.transport, writes).await {
+                    Ok(()) => match self.transport.get_config().await {
+                        Ok(catalog) => vec![
+                            ClientEvent::Config(ConfigEvent::Loaded(catalog)),
+                            ClientEvent::Config(ConfigEvent::Reset { operation_key }),
+                        ],
+                        Err(error) => vec![ClientEvent::Config(ConfigEvent::ResetFailed {
+                            operation_key,
+                            error,
+                        })],
+                    },
+                    Err(error) => match self.transport.get_config().await {
+                        Ok(catalog) => vec![
+                            ClientEvent::Config(ConfigEvent::Loaded(catalog)),
+                            ClientEvent::Config(ConfigEvent::ResetFailed {
+                                operation_key,
+                                error,
+                            }),
+                        ],
+                        Err(reload_error) => {
+                            vec![ClientEvent::Config(ConfigEvent::ResetFailed {
+                                operation_key,
+                                error: reload_failure(&error, &reload_error),
+                            })]
+                        }
+                    },
                 },
                 ClientEffect::Config(ConfigEffect::Watch { open_id }) => {
                     match self.transport.watch_config().await {
@@ -734,24 +757,42 @@ impl GrpcEffectExecutor {
     }
 }
 
-impl From<crate::Configuration> for ConfigPatch {
-    fn from(config: crate::Configuration) -> Self {
+impl From<ConfigWatchUpdate> for ConfigChange {
+    fn from(update: ConfigWatchUpdate) -> Self {
         Self {
-            providers: Some(config.providers),
-            mcp_servers: Some(config.mcp_servers),
-            inference_defaults: config.inference_defaults,
+            previous_etag: String::new(),
+            etag: update.etag.clone(),
+            changed_keys: update
+                .resources
+                .iter()
+                .map(|resource| resource.path.clone())
+                .collect(),
+            error: update.reload_error.clone(),
+            config: catalog_config_view(update).ok(),
         }
     }
 }
 
-impl From<ConfigWatchUpdate> for ConfigChange {
-    fn from(update: ConfigWatchUpdate) -> Self {
-        Self {
-            previous_etag: update.previous_etag,
-            etag: update.etag,
-            changed_keys: update.changed_keys,
-            error: update.error,
-            config: update.config.map(ConfigView::from),
-        }
+fn catalog_config_view(catalog: ResourceCatalog) -> Result<ConfigView, ClientError> {
+    let mut config = catalog
+        .effective_configuration
+        .ok_or_else(|| ClientError::new("resource catalog missing effective configuration"))?;
+    config.etag = catalog.etag;
+    Ok(ConfigView::from(config))
+}
+
+async fn write_resources(
+    transport: &DefaultGrpcTransport,
+    writes: Vec<ResourceWrite>,
+) -> Result<(), ClientError> {
+    for write in writes {
+        transport.write_resource(write).await?;
     }
+    Ok(())
+}
+
+fn reload_failure(error: &ClientError, reload_error: &ClientError) -> ClientError {
+    ClientError::new(format!(
+        "{error}; authoritative resource catalog reload failed: {reload_error}"
+    ))
 }

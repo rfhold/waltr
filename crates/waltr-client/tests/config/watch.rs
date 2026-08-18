@@ -4,11 +4,8 @@ use futures_util::StreamExt;
 use waltr_client::GrpcEffectExecutor;
 
 use crate::support::{
-    server::server_endpoint,
-    snapshots::{
-        assert_config_matches_without_etag, assert_initial_watch_event, assert_watch_event,
-        config_with_provider,
-    },
+    server::{absent_slot_etag, provider_resource_write, server_endpoint},
+    snapshots::{assert_initial_watch_event, assert_watch_event},
 };
 
 #[tokio::test]
@@ -33,12 +30,16 @@ async fn grpc_executor_watches_config_changes() {
         .expect("initial watch event should succeed");
     assert_initial_watch_event(&initial_watch_event, &initial);
 
-    let patch = config_with_provider("anthropic");
-    let patched = client
-        .patch_config(patch.clone(), initial_etag.clone())
+    let expected_etag = absent_slot_etag(&client).await.unwrap();
+    client
+        .write_resource(provider_resource_write("custom", expected_etag))
         .await
         .expect("config should patch");
-    assert_config_matches_without_etag(&patched, &patch);
+    let patched = client
+        .load_config()
+        .await
+        .expect("patched config should load");
+    assert!(patched.providers.contains_key("custom"));
     assert_ne!(patched.etag, initial_etag);
 
     let watch_event = tokio::time::timeout(Duration::from_secs(2), watch.next())

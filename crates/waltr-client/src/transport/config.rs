@@ -2,24 +2,23 @@ use std::pin::Pin;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
-use waltr::config::ConfigWatchUpdate;
-use waltr::grpc::waltr::config::v1::{
-    GetConfigRequest, McpServerMapPatch, PatchConfigRequest, ProviderMapPatch, ResetConfigRequest,
-    WatchConfigRequest, WatchConfigResponse,
+use waltr::grpc::waltr::resource::v1::{
+    GetResourceCatalogRequest, ReplaceResourceRequest, ResetResourceRequest, ResourceCatalog,
+    WatchResourceCatalogRequest,
 };
 use tonic::codegen::{Body, Bytes, StdError};
 
 use super::{RemoteTransport, status_error};
-use crate::{ClientError, ConfigPatch, Configuration};
+use crate::{ClientError, ResourceWrite};
 
-/// Stream returned by configuration watch transports.
-pub type ConfigWatchStream = Pin<Box<dyn Stream<Item = Result<ConfigWatchUpdate, ClientError>>>>;
+/// Stream returned by resource catalog watch transports.
+pub type ConfigWatchStream = Pin<Box<dyn Stream<Item = Result<ResourceCatalog, ClientError>>>>;
 
 #[allow(
     clippy::future_not_send,
     reason = "browser RPC futures are locally polled"
 )]
-pub(super) async fn get_config<T>(transport: &T) -> Result<Configuration, ClientError>
+pub(super) async fn get_config<T>(transport: &T) -> Result<ResourceCatalog, ClientError>
 where
     T: RemoteTransport,
     T::Inner: tonic::client::GrpcService<tonic::body::Body>,
@@ -30,26 +29,25 @@ where
         Into<StdError> + Send,
 {
     let credentials = transport.request_credentials();
-    let response = transport
-        .config_client(&credentials)
+    transport
+        .resource_client(&credentials)
         .await?
-        .get_config(GetConfigRequest::default())
+        .get_resource_catalog(GetResourceCatalogRequest {})
         .await
         .map_err(|error| status_error(&error, &credentials))?
-        .into_inner();
-
-    Ok(response.config.unwrap_or_default())
+        .into_inner()
+        .catalog
+        .ok_or_else(|| ClientError::new("resource catalog response missing catalog"))
 }
 
 #[allow(
     clippy::future_not_send,
     reason = "browser RPC futures are locally polled"
 )]
-pub(super) async fn patch_config<T>(
+pub(super) async fn write_resource<T>(
     transport: &T,
-    patch: ConfigPatch,
-    expected_etag: String,
-) -> Result<Configuration, ClientError>
+    write: ResourceWrite,
+) -> Result<(), ClientError>
 where
     T: RemoteTransport,
     T::Inner: tonic::client::GrpcService<tonic::body::Body>,
@@ -59,54 +57,40 @@ where
     <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
         Into<StdError> + Send,
 {
-    let credentials = transport.request_credentials();
-    let response = transport
-        .config_client(&credentials)
-        .await?
-        .patch_config(PatchConfigRequest {
+    match write {
+        ResourceWrite::Replace {
+            path,
+            source,
             expected_etag,
-            providers: patch
-                .providers
-                .map(|providers| ProviderMapPatch { providers }),
-            mcp_servers: patch
-                .mcp_servers
-                .map(|mcp_servers| McpServerMapPatch { mcp_servers }),
-            inference_defaults: patch.inference_defaults,
-        })
-        .await
-        .map_err(|error| status_error(&error, &credentials))?
-        .into_inner();
-
-    Ok(response.config.unwrap_or_default())
-}
-
-#[allow(
-    clippy::future_not_send,
-    reason = "browser RPC futures are locally polled"
-)]
-pub(super) async fn reset_config<T>(
-    transport: &T,
-    expected_etag: String,
-) -> Result<Configuration, ClientError>
-where
-    T: RemoteTransport,
-    T::Inner: tonic::client::GrpcService<tonic::body::Body>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::Error: Into<StdError>,
-    <T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody:
-        Body<Data = Bytes> + Send + 'static,
-    <<T::Inner as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody as Body>::Error:
-        Into<StdError> + Send,
-{
-    let credentials = transport.request_credentials();
-    let response = transport
-        .config_client(&credentials)
-        .await?
-        .reset_config(ResetConfigRequest { expected_etag })
-        .await
-        .map_err(|error| status_error(&error, &credentials))?
-        .into_inner();
-
-    Ok(response.config.unwrap_or_default())
+        } => {
+            let credentials = transport.request_credentials();
+            let mut client = transport.resource_client(&credentials).await?;
+            client
+                .replace_resource(ReplaceResourceRequest {
+                    path,
+                    source,
+                    expected_etag,
+                })
+                .await
+                .map_err(|error| status_error(&error, &credentials))?;
+            Ok(())
+        }
+        ResourceWrite::Reset {
+            path,
+            expected_etag,
+        } => {
+            let credentials = transport.request_credentials();
+            let mut client = transport.resource_client(&credentials).await?;
+            client
+                .reset_resource(ResetResourceRequest {
+                    path,
+                    expected_etag,
+                })
+                .await
+                .map_err(|error| status_error(&error, &credentials))?;
+            Ok(())
+        }
+    }
 }
 
 #[allow(
@@ -126,27 +110,20 @@ where
     let credentials = transport.request_credentials();
     let stream_credentials = credentials.clone();
     let stream = transport
-        .config_client(&credentials)
+        .resource_client(&credentials)
         .await?
-        .watch_config(WatchConfigRequest::default())
+        .watch_resource_catalog(WatchResourceCatalogRequest {})
         .await
         .map_err(|error| status_error(&error, &credentials))?
         .into_inner()
         .map(move |response| {
             response
-                .map(config_watch_update)
                 .map_err(|error| status_error(&error, &stream_credentials))
+                .and_then(|response| {
+                    response.catalog.ok_or_else(|| {
+                        ClientError::new("resource catalog watch response missing catalog")
+                    })
+                })
         });
-
     Ok(Box::pin(stream))
-}
-
-fn config_watch_update(response: WatchConfigResponse) -> ConfigWatchUpdate {
-    ConfigWatchUpdate {
-        previous_etag: response.previous_etag,
-        etag: response.etag,
-        changed_keys: response.changed_keys,
-        error: response.error,
-        config: response.config,
-    }
 }

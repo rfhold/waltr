@@ -8,36 +8,96 @@ use waltr_agent::{
     TimelineContent, TimelineEventKind, TimelineStatus,
 };
 use waltr_client::{
-    Configuration, InferenceDefaults, McpServer, McpServerType, Model, ModelOptions, ModelType,
-    Provider, ProviderType,
+    Configuration, GrpcEffectExecutor, InferenceDefaults, McpServer, McpServerType, Model,
+    ModelOptions, ModelType, Provider, ProviderType, ResourceOrigin, ResourceWrite,
 };
-use waltr_server::config::ConfigStore as _;
-
-pub async fn server_endpoint_with_unavailable_config_reset()
--> Result<String, Box<dyn std::error::Error>> {
-    let root = waltr_server::test_support::temp_root();
-    let service = waltr_server::config_service::ConfigService::new(
-        &root,
-        waltr_server::config::DefaultConfigBuilder::new(
-            waltr_server::catalog::CatalogLoader::from_path(root.join("missing-catalog.json")),
-            "http://127.0.0.1:14333/mcp",
-        ),
-    )?;
-    service.store().save(inference_config()).await?;
-    Ok(waltr_server::test_support::setup_server_with_services(service).base_url())
-}
-
 pub fn server_endpoint() -> String {
     waltr_server::test_support::setup_server().base_url()
 }
 
 pub async fn server_endpoint_with_inference_config() -> Result<String, Box<dyn std::error::Error>> {
+    let root = waltr_server::test_support::temp_root();
+    waltr_server::test_support::persist_test_self_mcp(&root);
     let config_service = waltr_server::config_service::ConfigService::new(
-        waltr_server::test_support::temp_root(),
-        waltr_server::test_support::default_config_builder(),
-    )?;
-    config_service.store().save(inference_config()).await?;
-    Ok(waltr_server::test_support::setup_server_with_services(config_service).base_url())
+        root,
+        waltr_server::test_support::default_catalog_loader(),
+    )
+    .await?;
+    let server = waltr_server::test_support::setup_server_with_services(config_service);
+    let executor = GrpcEffectExecutor::for_endpoint(server.base_url());
+    let configuration = inference_config();
+    let absent_etag = absent_slot_etag(&executor).await?;
+    for (name, provider) in configuration.providers {
+        let model = provider
+            .models
+            .keys()
+            .next()
+            .expect("seeded provider model");
+        executor
+            .write_resource(ResourceWrite::Replace {
+                path: format!("providers/{name}.yaml"),
+                source: format!(
+                    "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: {name}\nspec:\n  transport: openaiChatCompletions\n  url: {}\n  models:\n    {model}:\n      name: {model}\n      type: 1\n      options:\n        reasoning_efforts: [low, medium, high]\n",
+                    provider.url
+                ),
+                expected_etag: absent_etag.clone(),
+            })
+            .await?;
+    }
+    for (name, mcp_server) in configuration.mcp_servers {
+        executor
+            .write_resource(ResourceWrite::Replace {
+                path: format!("mcp-servers/{name}.yaml"),
+                source: format!(
+                    "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: {name}\nspec:\n  transport: stdio\n  command: {}\n",
+                    mcp_server.command
+                ),
+                expected_etag: absent_etag.clone(),
+            })
+            .await?;
+    }
+    if let Some(defaults) = configuration.inference_defaults {
+        let catalog = executor.load_resource_catalog().await?;
+        let baseline = catalog
+            .resources
+            .iter()
+            .find(|resource| resource.path == "defaults/default.yaml")
+            .ok_or("defaults baseline missing")?;
+        executor
+            .write_resource(ResourceWrite::Replace {
+                path: "defaults/default.yaml".to_owned(),
+                source: format!(
+                    "apiVersion: waltr.dev/v1alpha1\nkind: Defaults\nmetadata:\n  name: default\nspec:\n  inference:\n    provider: {}\n    model: {}\n",
+                    defaults.provider_key, defaults.model_key
+                ),
+                expected_etag: baseline.persisted_etag.clone(),
+            })
+            .await?;
+    }
+    Ok(server.base_url())
+}
+
+pub async fn absent_slot_etag(
+    executor: &GrpcEffectExecutor,
+) -> Result<String, Box<dyn std::error::Error>> {
+    executor
+        .load_resource_catalog()
+        .await?
+        .resources
+        .into_iter()
+        .find(|resource| ResourceOrigin::try_from(resource.origin) == Ok(ResourceOrigin::Bundled))
+        .map(|resource| resource.persisted_etag)
+        .ok_or_else(|| "absent slot baseline missing".into())
+}
+
+pub fn provider_resource_write(name: &str, expected_etag: String) -> ResourceWrite {
+    ResourceWrite::Replace {
+        path: format!("providers/{name}.yaml"),
+        source: format!(
+            "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: {name}\nspec:\n  transport: anthropicMessages\n  url: https://{name}.example.test\n"
+        ),
+        expected_etag,
+    }
 }
 
 pub async fn server_endpoint_with_seeded_timeline(

@@ -17,6 +17,7 @@ import type {
   ConfigView,
   McpServerTypeView,
   McpServerView,
+  ResourceEditBaselineView,
 } from "../../generated/waltr-client";
 import { AuthStatusPanel } from "./AuthStatusPanel";
 
@@ -25,6 +26,8 @@ type FormMode = "create" | "edit";
 type McpServerForm = {
   mode: FormMode;
   originalName?: string;
+  originalServer?: McpServerView;
+  baseline?: ResourceEditBaselineView;
   name: string;
   kind: McpServerTypeView;
   command: string;
@@ -33,10 +36,11 @@ type McpServerForm = {
 
 type ActiveForm =
   | { mode: "create" }
-  | { mode: "edit"; serverName: string; server: McpServerView };
+  | { mode: "edit"; serverName: string; server: McpServerView; baseline: ResourceEditBaselineView };
 
 type McpServersSectionState = {
   watchedConfig: Accessor<ConfigView | undefined>;
+  resourceBaselines: Accessor<Record<string, ResourceEditBaselineView>>;
   closeForm: () => void;
   operationError: Accessor<string | undefined>;
   operationPending: Accessor<boolean>;
@@ -49,6 +53,7 @@ const McpServersSectionContext = createContext<McpServersSectionState>();
 
 export function McpServersSection(props: ParentProps & {
   watchedConfig: Accessor<ConfigView | undefined>;
+  resourceBaselines?: Accessor<Record<string, ResourceEditBaselineView>>;
 }) {
   const app = useAppState();
   const location = useLocation();
@@ -89,6 +94,7 @@ export function McpServersSection(props: ParentProps & {
 
   const sectionState: McpServersSectionState = {
     watchedConfig,
+    resourceBaselines: () => props.resourceBaselines?.() ?? {},
     closeForm,
     operationError,
     operationPending,
@@ -131,7 +137,7 @@ export function McpServersSection(props: ParentProps & {
                     >
                       <strong>{serverName}</strong>
                       <span>{server.kind}</span>
-                      <code>{server.kind === "sse" ? server.url || "No URL configured" : server.command || "No command configured"}</code>
+                      <code>{server.kind === "streamableHttp" ? server.url || "No URL configured" : server.command || "No command configured"}</code>
                     </button>
                     <Show
                       when={deleteServer() === serverName}
@@ -215,7 +221,8 @@ export function ConfigMcpEditRoute() {
     const form = activeForm();
     if (form?.mode === "edit" && form.serverName === name) return;
     const server = section.watchedConfig()?.mcpServers[name];
-    setActiveForm(server ? { mode: "edit", serverName: name, server } : undefined);
+    const baseline = section.resourceBaselines()[`mcp-servers/${name}.yaml`];
+    setActiveForm(server && baseline ? { mode: "edit", serverName: name, server, baseline } : undefined);
   });
 
   return (
@@ -251,7 +258,7 @@ function McpServerFormPanel(props: {
   const title = () => form().mode === "create" ? "Create MCP server" : "Edit MCP server";
   const requiredFieldMissing = createMemo(() => {
     const current = form();
-    return current.kind === "sse"
+    return current.kind === "streamableHttp"
       ? current.url.trim().length === 0
       : current.command.trim().length === 0;
   });
@@ -278,12 +285,12 @@ function McpServerFormPanel(props: {
           {(field) => (
             <select name="kind" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} value={form().kind} onChange={(event) => update({ kind: event.currentTarget.value as McpServerTypeView })}>
               <option value="stdio">stdio</option>
-              <option value="sse">sse</option>
+              <option value="streamableHttp">streamable HTTP</option>
             </select>
           )}
         </Field>
         <Show
-          when={form().kind === "sse"}
+          when={form().kind === "streamableHttp"}
           fallback={
             <Field id="mcp-server-command" label="Command" required error={requiredFieldMissing() ? "A command is required for stdio servers." : undefined}>
               {(field) => (
@@ -292,7 +299,7 @@ function McpServerFormPanel(props: {
             </Field>
           }
         >
-          <Field id="mcp-server-url" label="URL" required error={requiredFieldMissing() ? "A URL is required for sse servers." : undefined}>
+          <Field id="mcp-server-url" label="URL" required error={requiredFieldMissing() ? "A URL is required for streamable HTTP servers." : undefined}>
             {(field) => (
               <input name="url" id={field.id} aria-describedby={field.describedBy} aria-invalid={field.invalid} type="url" value={form().url} onInput={(event) => update({ url: event.currentTarget.value })} />
             )}
@@ -315,13 +322,15 @@ function initialMcpServerForm(form: ActiveForm): McpServerForm {
     return { mode: "create", name: "", kind: "stdio", command: "", url: "" };
   }
 
-  return serverToForm(form.serverName, form.server);
+  return serverToForm(form.serverName, form.server, form.baseline);
 }
 
-function serverToForm(serverName: string, server: McpServerView): McpServerForm {
+function serverToForm(serverName: string, server: McpServerView, baseline: ResourceEditBaselineView): McpServerForm {
   return {
     mode: "edit",
     originalName: serverName,
+    originalServer: server,
+    baseline,
     name: serverName,
     kind: server.kind,
     command: server.command,
@@ -337,8 +346,8 @@ async function saveMcpServer(
   setOperationError: (message?: string) => void,
 ) {
   const server = formToServer(form);
-  const command: ClientCommand = form.mode === "edit" && form.originalName
-    ? { type: "updateMcpServer", originalName: form.originalName, server }
+  const command: ClientCommand = form.mode === "edit" && form.originalName && form.originalServer && form.baseline
+    ? { type: "updateMcpServer", originalName: form.originalName, original: form.originalServer, baseline: form.baseline, server }
     : { type: "addMcpServer", server };
 
   setOperationPending(true);
@@ -387,8 +396,8 @@ function formToServer(form: McpServerForm): McpServerView {
   return {
     kind: form.kind,
     name: form.name,
-    command: form.kind === "sse" ? "" : form.command,
-    url: form.kind === "sse" ? form.url : "",
+    command: form.kind === "streamableHttp" ? "" : form.command,
+    url: form.kind === "streamableHttp" ? form.url : "",
   };
 }
 

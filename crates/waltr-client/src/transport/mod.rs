@@ -7,14 +7,15 @@ mod session;
 mod status;
 
 pub use config::ConfigWatchStream;
-pub use waltr::config::ConfigWatchUpdate;
 use waltr::grpc::waltr::catalog::v1::{
-    ApplyCatalogModelDefaultsRequest, GetModelCatalogDriftRequest, GetModelCatalogDriftResponse,
-    SearchCatalogModelsRequest, SearchCatalogModelsResponse, SetModelCatalogMatchRequest,
-    SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
+    GetModelCatalogDriftRequest, GetModelCatalogDriftResponse, SearchCatalogModelsRequest,
+    SearchCatalogModelsResponse, SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
     catalog_service_client::CatalogServiceClient,
 };
-use waltr::grpc::waltr::config::v1::config_service_client::ConfigServiceClient;
+pub use waltr::grpc::waltr::resource::v1::ResourceCatalog as ConfigWatchUpdate;
+use waltr::grpc::waltr::resource::v1::{
+    ResourceCatalog, resource_service_client::ResourceServiceClient,
+};
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use prost::Message;
@@ -34,9 +35,9 @@ use tonic::metadata::AsciiMetadataValue;
 use tonic::service::{Interceptor, interceptor::InterceptedService};
 
 use crate::{
-    ClientError, ConfigPatch, Configuration, InferenceSettingsRequest, ListAgentsResponse,
-    RollbackTarget, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary,
-    TimelineEvent, TimelineQuery,
+    ClientError, InferenceSettingsRequest, ListAgentsResponse, ResourceWrite, RollbackTarget,
+    SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary, TimelineEvent,
+    TimelineQuery,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -53,20 +54,11 @@ pub trait WaltrTransport {
     type ConfigWatchStream: futures_core::Stream<Item = Result<ConfigWatchUpdate, ClientError>>;
 
     /// Load the current configuration.
-    fn get_config(&self) -> impl Future<Output = Result<Configuration, ClientError>>;
+    fn get_config(&self) -> impl Future<Output = Result<ResourceCatalog, ClientError>>;
 
-    /// Patch the current configuration.
-    fn patch_config(
-        &self,
-        patch: ConfigPatch,
-        expected_etag: String,
-    ) -> impl Future<Output = Result<Configuration, ClientError>>;
-
-    /// Reset the complete configuration to server defaults.
-    fn reset_config(
-        &self,
-        expected_etag: String,
-    ) -> impl Future<Output = Result<Configuration, ClientError>>;
+    /// Apply one prepared canonical resource-slot write.
+    fn write_resource(&self, write: ResourceWrite)
+    -> impl Future<Output = Result<(), ClientError>>;
 
     /// Subscribe to future configuration changes.
     fn watch_config(&self) -> impl Future<Output = Result<Self::ConfigWatchStream, ClientError>>;
@@ -88,18 +80,6 @@ pub trait WaltrTransport {
         &self,
         request: GetModelCatalogDriftRequest,
     ) -> impl Future<Output = Result<GetModelCatalogDriftResponse, ClientError>>;
-
-    /// Set or clear catalog linkage for a configured model.
-    fn set_model_catalog_match(
-        &self,
-        request: SetModelCatalogMatchRequest,
-    ) -> impl Future<Output = Result<Configuration, ClientError>>;
-
-    /// Apply catalog-derived model defaults to configuration.
-    fn apply_catalog_model_defaults(
-        &self,
-        request: ApplyCatalogModelDefaultsRequest,
-    ) -> impl Future<Output = Result<Configuration, ClientError>>;
 
     /// Subscribe to future system status changes.
     fn watch_status(&self) -> impl Future<Output = Result<StatusWatchStream, ClientError>>;
@@ -236,10 +216,10 @@ trait RemoteTransport {
 
     fn request_credentials(&self) -> RequestCredentials;
 
-    fn config_client(
+    fn resource_client(
         &self,
         credentials: &RequestCredentials,
-    ) -> impl Future<Output = Result<ConfigServiceClient<Self::Inner>, ClientError>>;
+    ) -> impl Future<Output = Result<ResourceServiceClient<Self::Inner>, ClientError>>;
 
     fn auth_client(
         &self,
@@ -290,20 +270,12 @@ where
 {
     type ConfigWatchStream = ConfigWatchStream;
 
-    async fn get_config(&self) -> Result<Configuration, ClientError> {
+    async fn get_config(&self) -> Result<ResourceCatalog, ClientError> {
         config::get_config(self).await
     }
 
-    async fn patch_config(
-        &self,
-        patch: ConfigPatch,
-        expected_etag: String,
-    ) -> Result<Configuration, ClientError> {
-        config::patch_config(self, patch, expected_etag).await
-    }
-
-    async fn reset_config(&self, expected_etag: String) -> Result<Configuration, ClientError> {
-        config::reset_config(self, expected_etag).await
+    async fn write_resource(&self, write: ResourceWrite) -> Result<(), ClientError> {
+        config::write_resource(self, write).await
     }
 
     async fn watch_config(&self) -> Result<Self::ConfigWatchStream, ClientError> {
@@ -329,20 +301,6 @@ where
         request: GetModelCatalogDriftRequest,
     ) -> Result<GetModelCatalogDriftResponse, ClientError> {
         catalog::get_model_catalog_drift(self, request).await
-    }
-
-    async fn set_model_catalog_match(
-        &self,
-        request: SetModelCatalogMatchRequest,
-    ) -> Result<Configuration, ClientError> {
-        catalog::set_model_catalog_match(self, request).await
-    }
-
-    async fn apply_catalog_model_defaults(
-        &self,
-        request: ApplyCatalogModelDefaultsRequest,
-    ) -> Result<Configuration, ClientError> {
-        catalog::apply_catalog_model_defaults(self, request).await
     }
 
     async fn watch_status(&self) -> Result<StatusWatchStream, ClientError> {
@@ -856,11 +814,11 @@ impl RemoteTransport for NativeGrpcTransport {
         self.credentials.request_credentials()
     }
 
-    async fn config_client(
+    async fn resource_client(
         &self,
         credentials: &RequestCredentials,
-    ) -> Result<ConfigServiceClient<Self::Inner>, ClientError> {
-        Ok(ConfigServiceClient::with_interceptor(
+    ) -> Result<ResourceServiceClient<Self::Inner>, ClientError> {
+        Ok(ResourceServiceClient::with_interceptor(
             self.channel().await?,
             Self::interceptor_for(credentials),
         ))
@@ -935,12 +893,12 @@ impl RemoteTransport for WasmGrpcTransport {
         RequestCredentials::default()
     }
 
-    async fn config_client(
+    async fn resource_client(
         &self,
         _: &RequestCredentials,
-    ) -> Result<ConfigServiceClient<Self::Inner>, ClientError> {
+    ) -> Result<ResourceServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
-        Ok(ConfigServiceClient::new(transport))
+        Ok(ResourceServiceClient::new(transport))
     }
 
     async fn auth_client(
@@ -1058,18 +1016,20 @@ mod tests {
     use futures_core::Stream;
     use futures_util::StreamExt;
     use waltr::grpc::waltr::auth::v1::auth_target;
-    use waltr::grpc::waltr::config::v1::{
-        GetConfigRequest, GetConfigResponse, PatchConfigRequest, PatchConfigResponse,
-        ResetConfigRequest, ResetConfigResponse, WatchConfigRequest, WatchConfigResponse,
-        config_service_server::{ConfigService, ConfigServiceServer},
+    use waltr::grpc::waltr::resource::v1::{
+        GetResourceCatalogRequest, GetResourceCatalogResponse, InspectResourceRequest,
+        InspectResourceResponse, ReplaceResourceRequest, ReplaceResourceResponse,
+        ResetResourceRequest, ResetResourceResponse, WatchResourceCatalogRequest,
+        WatchResourceCatalogResponse,
+        resource_service_server::{ResourceService, ResourceServiceServer},
     };
 
     #[derive(Clone, Default)]
-    struct MetadataConfigService {
+    struct MetadataResourceService {
         authorizations: Arc<Mutex<Vec<Option<String>>>>,
     }
 
-    impl MetadataConfigService {
+    impl MetadataResourceService {
         fn record<T>(&self, request: &tonic::Request<T>) {
             let authorization = request
                 .metadata()
@@ -1081,48 +1041,62 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl ConfigService for MetadataConfigService {
-        async fn patch_config(
+    impl ResourceService for MetadataResourceService {
+        async fn replace_resource(
             &self,
-            request: tonic::Request<PatchConfigRequest>,
-        ) -> Result<tonic::Response<PatchConfigResponse>, tonic::Status> {
+            request: tonic::Request<ReplaceResourceRequest>,
+        ) -> Result<tonic::Response<ReplaceResourceResponse>, tonic::Status> {
             self.record(&request);
-            Ok(tonic::Response::new(PatchConfigResponse::default()))
+            Ok(tonic::Response::new(ReplaceResourceResponse::default()))
         }
 
-        async fn get_config(
+        async fn get_resource_catalog(
             &self,
-            request: tonic::Request<GetConfigRequest>,
-        ) -> Result<tonic::Response<GetConfigResponse>, tonic::Status> {
+            request: tonic::Request<GetResourceCatalogRequest>,
+        ) -> Result<tonic::Response<GetResourceCatalogResponse>, tonic::Status> {
             self.record(&request);
-            Ok(tonic::Response::new(GetConfigResponse::default()))
+            Ok(tonic::Response::new(GetResourceCatalogResponse {
+                catalog: Some(ResourceCatalog::default()),
+            }))
         }
 
-        async fn reset_config(
+        async fn inspect_resource(
             &self,
-            request: tonic::Request<ResetConfigRequest>,
-        ) -> Result<tonic::Response<ResetConfigResponse>, tonic::Status> {
+            request: tonic::Request<InspectResourceRequest>,
+        ) -> Result<tonic::Response<InspectResourceResponse>, tonic::Status> {
             self.record(&request);
-            Ok(tonic::Response::new(ResetConfigResponse::default()))
+            Ok(tonic::Response::new(InspectResourceResponse::default()))
         }
 
-        type WatchConfigStream =
-            Pin<Box<dyn Stream<Item = Result<WatchConfigResponse, tonic::Status>> + Send>>;
-
-        async fn watch_config(
+        async fn reset_resource(
             &self,
-            request: tonic::Request<WatchConfigRequest>,
-        ) -> Result<tonic::Response<Self::WatchConfigStream>, tonic::Status> {
+            request: tonic::Request<ResetResourceRequest>,
+        ) -> Result<tonic::Response<ResetResourceResponse>, tonic::Status> {
+            self.record(&request);
+            Ok(tonic::Response::new(ResetResourceResponse::default()))
+        }
+
+        type WatchResourceCatalogStream =
+            Pin<Box<dyn Stream<Item = Result<WatchResourceCatalogResponse, tonic::Status>> + Send>>;
+
+        async fn watch_resource_catalog(
+            &self,
+            request: tonic::Request<WatchResourceCatalogRequest>,
+        ) -> Result<tonic::Response<Self::WatchResourceCatalogStream>, tonic::Status> {
             self.record(&request);
             Ok(tonic::Response::new(Box::pin(futures_util::stream::once(
-                async { Ok(WatchConfigResponse::default()) },
+                async {
+                    Ok(WatchResourceCatalogResponse {
+                        catalog: Some(ResourceCatalog::default()),
+                    })
+                },
             ))))
         }
     }
 
     async fn metadata_transport_server() -> (
         NativeGrpcTransport,
-        MetadataConfigService,
+        MetadataResourceService,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1133,11 +1107,11 @@ mod tests {
             let item = listener.accept().await.map(|(stream, _)| stream);
             Some((item, listener))
         });
-        let service = MetadataConfigService::default();
+        let service = MetadataResourceService::default();
         let server_service = service.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(ConfigServiceServer::new(server_service))
+                .add_service(ResourceServiceServer::new(server_service))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("metadata test server should run");
@@ -1463,7 +1437,9 @@ mod tests {
             tonic::transport::Server::builder()
                 .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
                 .expect("TLS fixture identity should configure")
-                .add_service(ConfigServiceServer::new(MetadataConfigService::default()))
+                .add_service(ResourceServiceServer::new(
+                    MetadataResourceService::default(),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("TLS fixture server should run");

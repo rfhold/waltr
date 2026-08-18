@@ -10,7 +10,7 @@ expression: rendered
 "                                                                                "
 "          Providers   MCP Servers   Inference  R Reset configuration            "
 "                                                                                "
-"        > remote  sse  https://mcp.example/sse                                  "
+"        > remote  streamable http  https://mcp.example/sse                      "
 "            status: authorization required                                      "
 "            actions: a reauthorize  r reset                                     "
 "            message: Authorization is required before this MCP server           "

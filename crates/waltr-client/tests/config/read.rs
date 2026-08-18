@@ -1,28 +1,28 @@
 use waltr_client::GrpcEffectExecutor;
 
-use crate::support::{
-    server::server_endpoint,
-    snapshots::{assert_config_matches, assert_config_matches_without_etag, config_with_provider},
-};
+use crate::support::server::{absent_slot_etag, provider_resource_write, server_endpoint};
 
 #[tokio::test]
 async fn grpc_executor_loads_and_reloads_config() {
     let client = GrpcEffectExecutor::for_endpoint(server_endpoint());
 
     let initial = client.load_config().await.expect("config should load");
-    let initial_etag = initial.etag.clone();
     assert!(initial.providers.contains_key("anthropic"));
     assert!(initial.providers.contains_key("openai"));
     assert!(initial.providers.contains_key("codex"));
     assert!(!initial.etag.is_empty());
 
-    let patch = config_with_provider("anthropic");
-    let patched = client
-        .patch_config(patch.clone(), initial_etag)
+    let expected_etag = absent_slot_etag(&client).await.unwrap();
+    client
+        .write_resource(provider_resource_write("custom", expected_etag))
         .await
         .expect("config should patch");
-    assert_config_matches_without_etag(&patched, &patch);
+    let patched = client
+        .load_config()
+        .await
+        .expect("patched config should load");
+    assert!(patched.providers.contains_key("custom"));
 
     let reloaded = client.load_config().await.expect("config should reload");
-    assert_config_matches(&reloaded, &patched);
+    assert_eq!(reloaded, patched);
 }

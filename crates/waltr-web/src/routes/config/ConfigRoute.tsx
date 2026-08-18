@@ -36,6 +36,7 @@ export function ConfigRoute(props: ParentProps) {
       ? (snapshot()?.config.current ?? undefined)
       : undefined,
   );
+  const resourceBaselines = createMemo(() => snapshot()?.config.resourceBaselines ?? {});
   const error = createMemo(
     () => snapshot()?.config.watch.error ?? snapshot()?.config.load?.error,
   );
@@ -185,12 +186,12 @@ export function ConfigRoute(props: ParentProps) {
             </InlineAlert>
           </Match>
           <Match when={visibleTab() === "providers"}>
-            <ProvidersSection watchedConfig={watchedConfig}>
+            <ProvidersSection watchedConfig={watchedConfig} resourceBaselines={resourceBaselines}>
               {props.children}
             </ProvidersSection>
           </Match>
           <Match when={visibleTab() === "mcp"}>
-            <McpServersSection watchedConfig={watchedConfig}>
+            <McpServersSection watchedConfig={watchedConfig} resourceBaselines={resourceBaselines}>
               {props.children}
             </McpServersSection>
           </Match>

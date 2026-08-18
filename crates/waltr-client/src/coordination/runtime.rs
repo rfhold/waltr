@@ -23,10 +23,10 @@ use crate::{
     CatalogMatchView, CatalogModelSummaryView, Client, ClientEffect, ClientError, ClientEvent,
     ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
     InferenceDefaultsView, InferenceSettingsRequest, McpAuthorizationContext, McpServerView,
-    OperationKey, OperationStatus, OutboundAuthenticationFailure, ProviderView, RollbackTarget,
-    SessionEffect, SessionEvent, SessionTemplateKind, SessionTemplateOption, SessionTimelineView,
-    SessionView, StatusChangeStream, StatusEffect, StatusEvent, TimelineDirection, TimelineQuery,
-    TimelineWatchKey, rollback_target,
+    OperationKey, OperationStatus, OutboundAuthenticationFailure, ProviderView, ResourceOrigin,
+    RollbackTarget, SessionEffect, SessionEvent, SessionTemplateKind, SessionTemplateOption,
+    SessionTimelineView, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
+    TimelineDirection, TimelineQuery, TimelineWatchKey, rollback_target,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -146,6 +146,10 @@ pub enum ClientCommand {
         /// Current provider name.
         #[serde(rename = "originalName")]
         original_name: String,
+        /// Provider value captured when editing began.
+        original: Box<ProviderView>,
+        /// Persisted resource slot captured when editing began.
+        baseline: ResourceEditBaselineView,
         /// Replacement provider definition.
         provider: ProviderView,
     },
@@ -164,6 +168,10 @@ pub enum ClientCommand {
         /// Current MCP server key.
         #[serde(rename = "originalName")]
         original_name: String,
+        /// MCP server value captured when editing began.
+        original: Box<McpServerView>,
+        /// Persisted resource slot captured when editing began.
+        baseline: ResourceEditBaselineView,
         /// Replacement MCP server definition.
         server: McpServerView,
     },
@@ -460,7 +468,7 @@ pub struct CatalogMatchSuggestionSnapshot {
 }
 
 /// Stable Waltr access authentication snapshot.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct AccessSnapshot {
     /// Current Waltr access status.
@@ -822,6 +830,8 @@ impl From<&RollbackTarget> for RollbackTargetView {
 pub struct ConfigSnapshot {
     /// Last known configuration snapshot.
     pub current: Option<ConfigView>,
+    /// Resource-slot write baselines keyed by canonical path.
+    pub resource_baselines: BTreeMap<String, ResourceEditBaselineView>,
     /// Configuration load operation snapshot.
     pub load: OperationSnapshot,
     /// Configuration patch operation snapshot.
@@ -830,6 +840,20 @@ pub struct ConfigSnapshot {
     pub reset: OperationSnapshot,
     /// Configuration watch operation snapshot.
     pub watch: OperationSnapshot,
+}
+
+/// Exact resource-slot baseline captured by an edit form.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceEditBaselineView {
+    /// Canonical resource path.
+    pub path: String,
+    /// Persisted-slot entity tag.
+    pub persisted_etag: String,
+    /// Catalog-observed entity tag for an absent persisted slot.
+    pub absent_etag: String,
+    /// Exact active YAML source.
+    pub active_source: String,
 }
 
 /// Stable snapshot of status coordination state.
@@ -1596,11 +1620,15 @@ impl ClientStateStream {
             }
             ClientCommand::UpdateProvider {
                 original_name,
+                original,
+                baseline,
                 provider,
-            } => self
-                .runtime
-                .reducer
-                .update_provider(&original_name, provider.into())?,
+            } => self.runtime.reducer.update_provider(
+                &original_name,
+                (*original).into(),
+                provider.into(),
+                &baseline,
+            )?,
             ClientCommand::DeleteProvider { name } => {
                 self.runtime.reducer.delete_provider(&name)?
             }
@@ -1609,11 +1637,15 @@ impl ClientStateStream {
             }
             ClientCommand::UpdateMcpServer {
                 original_name,
+                original,
+                baseline,
                 server,
-            } => self
-                .runtime
-                .reducer
-                .update_mcp_server(&original_name, server.into())?,
+            } => self.runtime.reducer.update_mcp_server(
+                &original_name,
+                (*original).into(),
+                server.into(),
+                &baseline,
+            )?,
             ClientCommand::DeleteMcpServer { name } => {
                 self.runtime.reducer.delete_mcp_server(&name)?
             }
@@ -2290,6 +2322,37 @@ impl ClientSnapshot {
             },
             config: ConfigSnapshot {
                 current: state.config.current.clone().map(ConfigView::from),
+                resource_baselines: state
+                    .config
+                    .catalog
+                    .as_ref()
+                    .map(|catalog| {
+                        let absent_etag = catalog
+                            .resources
+                            .iter()
+                            .find(|resource| {
+                                ResourceOrigin::try_from(resource.origin)
+                                    == Ok(ResourceOrigin::Bundled)
+                            })
+                            .map(|resource| resource.persisted_etag.clone())
+                            .unwrap_or_default();
+                        catalog
+                            .resources
+                            .iter()
+                            .map(|resource| {
+                                (
+                                    resource.path.clone(),
+                                    ResourceEditBaselineView {
+                                        path: resource.path.clone(),
+                                        persisted_etag: resource.persisted_etag.clone(),
+                                        absent_etag: absent_etag.clone(),
+                                        active_source: resource.active_source.clone(),
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 load: OperationSnapshot::from_state(&state.config.load),
                 patch: OperationSnapshot::from_state(&state.config.patch),
                 reset: OperationSnapshot::from_state(&state.config.reset),
@@ -3338,9 +3401,13 @@ mod tests {
         runtime
             .reducer
             .apply(ClientEvent::Config(ConfigEvent::Loaded(
-                crate::Configuration {
+                crate::ResourceCatalog {
                     etag: "etag-1".to_owned(),
-                    ..crate::Configuration::default()
+                    effective_configuration: Some(crate::Configuration {
+                        etag: "etag-1".to_owned(),
+                        ..crate::Configuration::default()
+                    }),
+                    ..crate::ResourceCatalog::default()
                 },
             )));
         runtime

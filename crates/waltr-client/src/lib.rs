@@ -9,6 +9,7 @@ mod client;
 mod coordination;
 mod error;
 mod executor;
+mod resource;
 mod transport;
 mod view;
 
@@ -18,7 +19,7 @@ mod wasm;
 pub use client::{Client, ClientUpdate};
 pub use coordination::event::{
     AccessEvent, AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientEvent,
-    ConfigEffect, ConfigEvent, ConfigPatch, ProviderEditBaseline, SessionEffect, SessionEvent,
+    ConfigEffect, ConfigEvent, ProviderEditBaseline, ResourceWrite, SessionEffect, SessionEvent,
     StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
@@ -28,8 +29,8 @@ pub use coordination::runtime::{
     ClientRuntime, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
     McpAuthorizationContextSnapshot, OperationCollectionSnapshot, OperationSnapshot,
-    RollbackTargetView, SessionAgentCatalogSnapshot, SessionSnapshot, SessionTemplateOptionView,
-    SessionTemplateSearchSnapshot, StatusSnapshot,
+    ResourceEditBaselineView, RollbackTargetView, SessionAgentCatalogSnapshot, SessionSnapshot,
+    SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
     AccessAttemptId, AccessClientState, AccessStatus, AuthAttemptState, AuthClientState,
@@ -46,19 +47,21 @@ pub use executor::{
     ConfigChange, ConfigChangeStream, GrpcEffectExecutor, SessionChangeStream, StatusChangeStream,
 };
 pub use waltr::grpc::waltr::catalog::v1::{
-    ApplyCatalogModelDefaultsRequest, ApplyCatalogModelDefaultsResponse, CatalogDefaultField,
-    CatalogDriftField, CatalogDriftSeverity, CatalogMatch, CatalogMatchConfidence,
-    CatalogModelCapabilitySummary, CatalogModelCostSummary, CatalogModelLimitsSummary,
-    CatalogModelReasoningSummary, CatalogModelRef, CatalogModelSummary,
+    CatalogDefaultField, CatalogDriftField, CatalogDriftSeverity, CatalogMatch,
+    CatalogMatchConfidence, CatalogModelCapabilitySummary, CatalogModelCostSummary,
+    CatalogModelLimitsSummary, CatalogModelReasoningSummary, CatalogModelRef, CatalogModelSummary,
     GetModelCatalogDriftRequest, GetModelCatalogDriftResponse, SearchCatalogModelsRequest,
-    SearchCatalogModelsResponse, SetModelCatalogMatchRequest, SetModelCatalogMatchResponse,
-    SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
+    SearchCatalogModelsResponse, SuggestCatalogMatchesRequest, SuggestCatalogMatchesResponse,
 };
 pub use waltr::grpc::waltr::config::v1::{
     CatalogMatchSource, Configuration, InferenceDefaults, McpServer, McpServerType, Model,
     ModelCapabilities, ModelCatalogMatch, ModelCost, ModelLimits, ModelOptions, ModelType,
     OAuthProvider, OauthJwtMetadata, OauthTokenField, OauthTokenRequestStyle, OauthUrlParam,
     Provider, ProviderType,
+};
+pub use waltr::grpc::waltr::resource::v1::{
+    Resource, ResourceCatalog, ResourceInspection, ResourceKind, ResourceList, ResourceObject,
+    ResourceOrigin, ResourceValue,
 };
 pub use waltr::grpc::waltr::session::v1::{
     ExternalRequest, ExternalRequestKind, InferenceProviderSettings, InferenceSettings,

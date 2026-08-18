@@ -15,10 +15,10 @@ use waltr_client::{
     ConfigSnapshot, ConfigView, ExternalRequestView, McpAuthorizationContextSnapshot,
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
-    OperationSnapshot, ProviderKindView, ProviderView, SelectableAgentView,
-    SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot, SessionStatusView,
-    SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView, TimelineEventKindView,
-    TimelineEventView, TimelineStatusView, TimestampView,
+    OperationSnapshot, ProviderKindView, ProviderView, ResourceEditBaselineView,
+    SelectableAgentView, SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot,
+    SessionStatusView, SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView,
+    TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction},
@@ -78,6 +78,13 @@ pub(crate) fn patched_mcp_snapshot() -> ClientSnapshot {
             },
         );
     }
+    snapshot.config.resource_baselines.insert(
+        "mcp-servers/files.yaml".to_owned(),
+        resource_baseline(
+            "mcp-servers/files.yaml",
+            "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: files\nspec:\n  transport: stdio\n  command: fs-server\n",
+        ),
+    );
     snapshot.config.patch.status = "ready";
     snapshot
 }
@@ -788,6 +795,7 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
         },
         config: ConfigSnapshot {
             current: None,
+            resource_baselines: BTreeMap::new(),
             load: OperationSnapshot {
                 status: "idle",
                 error: None,
@@ -922,8 +930,24 @@ pub(crate) fn loaded_config_snapshot() -> ClientSnapshot {
         mcp_servers: BTreeMap::new(),
         inference_defaults: None,
     });
+    snapshot.config.resource_baselines.insert(
+        "providers/anthropic.yaml".to_owned(),
+        resource_baseline(
+            "providers/anthropic.yaml",
+            "apiVersion: waltr.dev/v1alpha1\nkind: Provider\nmetadata:\n  name: anthropic\nspec:\n  transport: anthropicMessages\n  url: https://api.anthropic.com/v1/messages\n",
+        ),
+    );
     snapshot.config.load.status = "ready";
     snapshot
+}
+
+fn resource_baseline(path: &str, active_source: &str) -> ResourceEditBaselineView {
+    ResourceEditBaselineView {
+        path: path.to_owned(),
+        persisted_etag: "form-open-etag".to_owned(),
+        absent_etag: "form-open-absent-etag".to_owned(),
+        active_source: active_source.to_owned(),
+    }
 }
 
 pub(crate) fn watched_config_snapshot() -> ClientSnapshot {

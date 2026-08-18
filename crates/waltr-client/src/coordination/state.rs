@@ -8,8 +8,8 @@ use ts_rs::TS;
 use crate::transport::SessionTimelineWatchEvent;
 use crate::{
     AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, Configuration, GenericAuthAttempt,
-    RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateOption, StreamId, SystemStatus,
-    TimelineEvent,
+    ResourceCatalog, RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateOption,
+    StreamId, SystemStatus, TimelineEvent,
 };
 
 /// Runtime-local operation identifier used by shells to track command results.
@@ -225,6 +225,8 @@ pub struct AuthAttemptState {
 /// Configuration coordination state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConfigClientState {
+    /// Last authoritative resource catalog snapshot.
+    pub catalog: Option<ResourceCatalog>,
     /// Last known configuration snapshot.
     pub current: Option<Configuration>,
     /// Configuration load operation state.
@@ -1369,8 +1371,9 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_config_load_ready(&mut self, config: Configuration) {
-        self.config.current = Some(config);
+    pub(crate) fn set_config_load_ready(&mut self, catalog: ResourceCatalog) {
+        self.config.current = effective_configuration(&catalog);
+        self.config.catalog = Some(catalog);
         self.config.load.status = OperationStatus::Ready;
         self.config.load.error = None;
     }
@@ -1394,8 +1397,7 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_config_patch_ready(&mut self, key: OperationKey, config: Configuration) {
-        self.config.current = Some(config.clone());
+    pub(crate) fn set_config_patch_ready(&mut self, key: OperationKey) {
         self.config.patch.status = OperationStatus::Ready;
         self.config.patch.error = None;
         self.config.patch.key = Some(key.clone());
@@ -1404,7 +1406,7 @@ impl ClientState {
             ClientOperationState::ConfigPatch {
                 status: OperationStatus::Ready,
                 error: None,
-                config: Some(config),
+                config: None,
             },
         );
     }
@@ -1437,8 +1439,7 @@ impl ClientState {
         );
     }
 
-    pub(crate) fn set_config_reset_ready(&mut self, key: OperationKey, config: Configuration) {
-        self.config.current = Some(config.clone());
+    pub(crate) fn set_config_reset_ready(&mut self, key: OperationKey) {
         self.config.reset.status = OperationStatus::Ready;
         self.config.reset.error = None;
         self.config.reset.key = Some(key.clone());
@@ -1447,7 +1448,7 @@ impl ClientState {
             ClientOperationState::ConfigReset {
                 status: OperationStatus::Ready,
                 error: None,
-                config: Some(config),
+                config: None,
             },
         );
     }
@@ -1510,11 +1511,12 @@ impl ClientState {
 
     pub(crate) fn set_config_watch_changed(
         &mut self,
-        config: Option<Configuration>,
+        catalog: Option<ResourceCatalog>,
         error: String,
     ) {
-        if let Some(config) = config {
-            self.config.current = Some(config);
+        if let Some(catalog) = catalog {
+            self.config.current = effective_configuration(&catalog);
+            self.config.catalog = Some(catalog);
         }
 
         if error.is_empty() {
@@ -2502,6 +2504,12 @@ impl ClientState {
     pub(crate) fn stream_mut(&mut self, stream_id: StreamId) -> &mut StreamState {
         self.streams.items.entry(stream_id).or_default()
     }
+}
+
+fn effective_configuration(catalog: &ResourceCatalog) -> Option<Configuration> {
+    let mut config = catalog.effective_configuration.clone()?;
+    config.etag.clone_from(&catalog.etag);
+    Some(config)
 }
 
 fn fail_watch_open_id_exhausted(watch: &mut WatchState) {

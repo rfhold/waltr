@@ -122,7 +122,7 @@ function providerSnapshot(kind = "oauthConfigured") {
 
 function mcpSnapshot() {
   const config = claudeConfig();
-  config.mcpServers.remote = mcpServerView({ name: "remote", kind: "sse", url: "https://mcp.example" });
+  config.mcpServers.remote = mcpServerView({ name: "remote", kind: "streamableHttp", url: "https://mcp.example" });
   const snapshot = snapshotWithConfig(config);
   snapshot.auth.statuses["mcp:remote"] = authStatus("mcpServer", "remote", "expired", {
     expiresAtMs: 1_800_000_000_000n,

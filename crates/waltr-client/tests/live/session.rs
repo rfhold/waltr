@@ -7,9 +7,8 @@ use waltr::grpc::waltr::config::v1::{
 };
 use waltr_client::{ClientCommand, ClientRuntime, ClientSnapshot, TimelineContentView};
 use waltr_server::{
-    config::ConfigStore as _,
     config_service::ConfigService,
-    test_support::{default_config_builder, setup_server_with_services, temp_root},
+    test_support::{default_catalog_loader, setup_server_with_services, temp_root},
 };
 
 use crate::support::snapshots::{dispatch_stream_command, no_sleep};
@@ -186,13 +185,12 @@ async fn next_live_snapshot_until(
 async fn setup_live_server(
     config: Configuration,
 ) -> &'static waltr_server::test_support::TestServer {
-    let config_service = ConfigService::new(temp_root(), default_config_builder())
-        .expect("config service should start");
-    config_service
-        .store()
-        .save(config)
+    drop(config);
+    let root = temp_root();
+    waltr_server::test_support::persist_test_self_mcp(&root);
+    let config_service = ConfigService::new(root, default_catalog_loader())
         .await
-        .expect("config should save");
+        .expect("config service should start");
     let server = setup_server_with_services(config_service);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     server

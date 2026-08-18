@@ -38,6 +38,35 @@ describe("mcp servers tab", () => {
 });
 
 describe("mcp servers section", () => {
+  test("keeps the form-open MCP baseline after a watched update", async () => {
+    const commands: ClientCommand[] = [];
+    const initial = snapshotWithConfig(configWithMcp());
+    let publishSnapshot: ((snapshot: typeof initial) => void) | undefined;
+    renderWithAppState(() => <ConfigRouteWithChildren />, {
+      commands,
+      snapshot: initial,
+      onSnapshotSetter: (setter) => {
+        publishSnapshot = setter;
+      },
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: "MCP Servers" }));
+    fireEvent.click(screen.getByLabelText("Edit files"));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Edit MCP server dialog" })).toBeTruthy());
+    const remote = snapshotWithConfig(configWithMcp());
+    remote.config.current!.mcpServers.files!.command = "remote-command";
+    remote.config.resourceBaselines["mcp-servers/files.yaml"]!.persistedEtag = "remote-etag";
+    publishSnapshot!(remote);
+    fireEvent.input(screen.getByLabelText("Command"), { target: { value: "draft-command" } });
+    fireEvent.submit(screen.getByLabelText("Edit MCP server"));
+
+    await waitFor(() => expect(commands.some((command) => command.type === "updateMcpServer")).toBe(true));
+    const update = commands.find((command): command is Extract<ClientCommand, { type: "updateMcpServer" }> => command.type === "updateMcpServer")!;
+    expect(update.baseline.persistedEtag).toBe(initial.config.resourceBaselines["mcp-servers/files.yaml"]!.persistedEtag);
+    expect(update.original.command).toBe("mcp-files");
+    expect(update.server.command).toBe("draft-command");
+  });
+
   test("creates edits and deletes MCP servers", async () => {
     const commands: ClientCommand[] = [];
 
@@ -120,7 +149,7 @@ describe("mcp servers section", () => {
     expect(screen.getByLabelText("Command")).toBeTruthy();
     expect(screen.queryByLabelText("URL")).toBeNull();
 
-    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "sse" } });
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "streamableHttp" } });
 
     // sse: url present, command absent.
     expect(screen.getByLabelText("URL")).toBeTruthy();
@@ -160,7 +189,7 @@ describe("mcp servers section", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
     await waitFor(() => expect(testHistory().get()).toBe("/config/mcp/create"));
     fireEvent.input(screen.getByLabelText("Name"), { target: { value: "remote" } });
-    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "sse" } });
+    fireEvent.change(screen.getByLabelText("Type"), { target: { value: "streamableHttp" } });
     fireEvent.input(screen.getByLabelText("URL"), { target: { value: "https://mcp.example.test" } });
     fireEvent.submit(screen.getByLabelText("Create MCP server"));
 
@@ -169,7 +198,7 @@ describe("mcp servers section", () => {
     const add = commands.find((command) => command.type === "addMcpServer");
     expect(add).toMatchObject({
       type: "addMcpServer",
-      server: { name: "remote", kind: "sse", url: "https://mcp.example.test" },
+      server: { name: "remote", kind: "streamableHttp", url: "https://mcp.example.test" },
     });
   });
 });

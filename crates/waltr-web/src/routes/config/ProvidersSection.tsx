@@ -27,6 +27,7 @@ import type {
   OAuthUrlParamView,
   ProviderKindView,
   ProviderView,
+  ResourceEditBaselineView,
 } from "../../generated/waltr-client";
 import { AuthStatusPanel } from "./AuthStatusPanel";
 
@@ -35,6 +36,8 @@ type FormMode = "create" | "edit";
 type ProviderForm = {
   mode: FormMode;
   originalName?: string;
+  originalProvider?: ProviderView;
+  baseline?: ResourceEditBaselineView;
   name: string;
   kind: ProviderKindView;
   url: string;
@@ -46,7 +49,7 @@ type ProviderForm = {
 
 type ActiveForm =
   | { mode: "create" }
-  | { mode: "edit"; providerName: string; provider: ProviderView };
+  | { mode: "edit"; providerName: string; provider: ProviderView; baseline: ResourceEditBaselineView };
 
 type ModelActiveForm =
   | { mode: "create" }
@@ -92,6 +95,7 @@ const ProvidersSectionContext = createContext<ProvidersSectionState>();
 
 export function ProvidersSection(props: ParentProps & {
   watchedConfig: Accessor<ConfigView | undefined>;
+  resourceBaselines?: Accessor<Record<string, ResourceEditBaselineView>>;
 }) {
   const app = useAppState();
   const location = useLocation();
@@ -112,7 +116,8 @@ export function ProvidersSection(props: ParentProps & {
 
     const name = routeProviderName();
     const provider = name ? watchedConfig()?.providers[name] : undefined;
-    return provider ? { mode: "edit", providerName: name!, provider } : undefined;
+    const baseline = name ? props.resourceBaselines?.()[`providers/${name}.yaml`] : undefined;
+    return provider && baseline ? { mode: "edit", providerName: name!, provider, baseline } : undefined;
   });
   const activeProviderFormKey = createMemo(() => {
     const active = activeProviderForm();
@@ -834,7 +839,7 @@ function initialProviderForm(form: ActiveForm): ProviderForm {
     return { mode: "create", name: "", kind: "anthropicMessages", url: "", headers: {}, oauthCompatible: false, oauthSettings: null, models: {} };
   }
 
-  return providerToForm(form.providerName, form.provider);
+  return providerToForm(form.providerName, form.provider, form.baseline);
 }
 
 function emptyOAuthSettings(): OAuthProviderView {
@@ -860,10 +865,12 @@ function splitList(value: string) {
   return value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
 }
 
-function providerToForm(providerName: string, provider: ProviderView): ProviderForm {
+function providerToForm(providerName: string, provider: ProviderView, baseline: ResourceEditBaselineView): ProviderForm {
   return {
     mode: "edit",
     originalName: providerName,
+    originalProvider: provider,
+    baseline,
     name: providerName,
     kind: provider.kind,
     url: provider.url,
@@ -882,8 +889,8 @@ async function saveProvider(
   setOperationError: (message?: string) => void,
 ) {
   const provider = formToProvider(form);
-  const command: ClientCommand = form.mode === "edit" && form.originalName
-    ? { type: "updateProvider", originalName: form.originalName, provider }
+  const command: ClientCommand = form.mode === "edit" && form.originalName && form.originalProvider && form.baseline
+    ? { type: "updateProvider", originalName: form.originalName, original: form.originalProvider, baseline: form.baseline, provider }
     : { type: "addProvider", provider };
 
   setOperationPending(true);

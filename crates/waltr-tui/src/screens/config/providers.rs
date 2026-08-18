@@ -10,7 +10,7 @@ use waltr_client::{
     AuthStatusSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot,
     ConfigView, ModelCapabilitiesView, ModelCatalogMatchView, ModelLimitsView, ModelOptionsView,
     ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenRequestStyleView,
-    OAuthUrlParamView, ProviderKindView, ProviderView,
+    OAuthUrlParamView, ProviderKindView, ProviderView, ResourceEditBaselineView,
 };
 use ratatui::{
     Frame,
@@ -46,6 +46,8 @@ pub struct ProviderForm {
     pub field: usize,
     /// Original provider name for edits.
     pub original_name: Option<String>,
+    original_provider: Option<ProviderView>,
+    baseline: Option<ResourceEditBaselineView>,
     /// Provider name draft.
     pub name: String,
     /// Provider kind draft.
@@ -75,6 +77,8 @@ impl ProviderForm {
             mode: ProviderFormMode::Create,
             field: 0,
             original_name: None,
+            original_provider: None,
+            baseline: None,
             name: String::new(),
             kind: ProviderKindView::AnthropicMessages,
             url: String::new(),
@@ -93,12 +97,17 @@ impl ProviderForm {
         }
     }
 
-    fn edit((_index, provider): (usize, &ProviderView)) -> Self {
+    fn edit(
+        (_index, provider): (usize, &ProviderView),
+        baseline: ResourceEditBaselineView,
+    ) -> Self {
         let oauth_settings = provider.oauth_settings.clone();
         Self {
             mode: ProviderFormMode::Edit,
             field: 0,
             original_name: Some(provider.name.clone()),
+            original_provider: Some(provider.clone()),
+            baseline: Some(baseline),
             name: provider.name.clone(),
             kind: provider.kind,
             url: provider.url.clone(),
@@ -606,6 +615,7 @@ pub struct ProviderSection {
     delete_provider: Option<String>,
     selected_provider: usize,
     patch: OperationTracker,
+    resource_baselines: BTreeMap<String, ResourceEditBaselineView>,
 }
 
 impl ProviderSection {
@@ -617,6 +627,7 @@ impl ProviderSection {
             delete_provider: None,
             selected_provider: 0,
             patch: OperationTracker::new(),
+            resource_baselines: BTreeMap::new(),
         }
     }
 
@@ -650,6 +661,7 @@ impl ProviderSection {
 
     /// Reconcile a submitted patch against the shared reducer operation state.
     pub fn reconcile_patch(&mut self, snapshot: &ClientSnapshot) {
+        self.resource_baselines = snapshot.config.resource_baselines.clone();
         if let Some(result) = self
             .patch
             .reconcile(&snapshot.config.patch, snapshot, |operation| {
@@ -722,7 +734,13 @@ impl ProviderSection {
 
         self.delete_provider = None;
         self.patch.clear_error();
-        self.config_form = self.selected_provider_view(config).map(ProviderForm::edit);
+        self.config_form = self.selected_provider_view(config).and_then(|selected| {
+            let path = format!("providers/{}.yaml", selected.1.name);
+            self.resource_baselines
+                .get(&path)
+                .cloned()
+                .map(|baseline| ProviderForm::edit(selected, baseline))
+        });
     }
 
     /// Open a create form. When a provider form is open this creates a model;
@@ -846,6 +864,8 @@ impl ProviderSection {
 
         let mode = form.mode;
         let original_name = form.original_name.clone();
+        let original = form.original_provider.clone();
+        let baseline = form.baseline.clone();
         let provider = form.clone().provider();
         self.patch.begin();
         match mode {
@@ -856,8 +876,13 @@ impl ProviderSection {
                 let Some(original_name) = original_name else {
                     return SectionAction::Continue;
                 };
+                let (Some(original), Some(baseline)) = (original, baseline) else {
+                    return SectionAction::Continue;
+                };
                 SectionAction::ClientCommand(ClientCommand::UpdateProvider {
                     original_name,
+                    original: Box::new(original),
+                    baseline,
                     provider,
                 })
             }
