@@ -359,6 +359,7 @@ const appSecret = new k8s.core.v1.Secret(
       WALTR_OIDC_SCOPES: "openid profile email",
       WALTR_API_OIDC_ISSUER: nativeApp.issuer,
       WALTR_API_OIDC_AUDIENCE: apiAudience,
+      WALTR_API_OIDC_CLIENT_ID: nativeApp.clientId,
       WALTR_API_REQUIRED_SCOPES: apiScope,
       WALTR_MCP_REQUIRED_SCOPES: mcpScope,
       WALTR_MCP_OAUTH_ISSUER: mcpIssuer,

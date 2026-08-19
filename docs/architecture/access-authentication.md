@@ -31,6 +31,7 @@ An access failure never creates an `AuthTarget`. Every successfully authenticate
 | `WALTR_OIDC_SCOPES` | Yes | Space-separated browser scopes; must include `openid`. |
 | `WALTR_API_OIDC_ISSUER` | No | Native Waltr API bearer issuer; falls back to `WALTR_OIDC_ISSUER`. |
 | `WALTR_API_OIDC_AUDIENCE` | Yes, unless legacy fallback is set | Native Waltr API bearer audience; falls back to `WALTR_OIDC_AUDIENCE`. |
+| `WALTR_API_OIDC_CLIENT_ID` | No | Native API client identifier. Enables provider-generic `JWT` access tokens only when their `azp` exactly matches this value. |
 | `WALTR_API_REQUIRED_SCOPES` | No | Space-separated native API bearer scopes; empty when omitted. |
 | `WALTR_MCP_REQUIRED_SCOPES` | Yes | Non-empty space-separated scopes supported and required by the local MCP resource. |
 | `WALTR_MCP_OAUTH_ISSUER` | No | Exact public deployment URL ending in `/oauth`; defaults to `WALTR_PUBLIC_URL` plus `/oauth`. |
@@ -87,11 +88,13 @@ Native gRPC uses `Authorization: Bearer`, never the browser cookie. The TUI impl
 | `WALTR_OIDC_NATIVE_AUDIENCE` | No | Adds an `audience` authorization parameter when the provider requires it. |
 | `WALTR_OIDC_NATIVE_LOOPBACK_POLICY` | No | `ephemeral` by default, producing `http://127.0.0.1:<port>/callback`, or an exact `http://127.0.0.1:<nonzero-port>` URL without query or fragment. |
 
-The TUI fetches only `/.well-known/oauth-protected-resource` from the configured server origin. It requires that document's resource to exactly match the normalized `WALTR_SERVER_ENDPOINT` scheme, host, effective port, and path before trusting its single advertised API authorization server. It sends the advertised API resource in the authorization request; it neither derives `/mcp` nor consumes MCP metadata. Server and provider metadata must use HTTPS, except HTTP on loopback for local development. Provider metadata must support code flow, PKCE S256, and public clients.
+The TUI fetches only `/.well-known/oauth-protected-resource` from the configured server origin. It requires that document's resource to exactly match the normalized `WALTR_SERVER_ENDPOINT` scheme, host, effective port, and path before trusting its single advertised API authorization server. It sends the advertised API resource in the authorization request; it neither derives `/mcp` nor consumes MCP metadata. Server and provider metadata must use HTTPS, except HTTP on loopback for local development. Provider metadata must support code flow and PKCE S256, and the configured native client must be public.
 
 The TUI binds the loopback listener before generating state, nonce, and PKCE values; opens a browser when available; always displays a copyable URL; validates callback path, host, state, and duplicate parameters; and exchanges the code without a secret. Access and refresh tokens remain in process memory. A refresh token is used shortly before access-token expiry; without one, the client expires access at the declared lifetime. Missing usable expiry, failed refresh, cancellation, logout, or process exit clears credentials and requires login again.
 
-Native provider metadata must advertise Authorization Code, PKCE `S256`, and token endpoint auth method `none`; the public native client never sends a client secret. HTTPS is required except for the single explicitly enabled loopback-HTTP mode described above.
+Native provider metadata must advertise Authorization Code and PKCE `S256`. The TUI always acts as a public PKCE client and sends no client secret; discovery may advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. HTTPS is required except for the single explicitly enabled loopback-HTTP mode described above.
+
+The external API bearer verifier accepts the exact RFC 9068 `at+jwt` JOSE type with its existing claim validation. It accepts Authentik's exact provider-generic `JWT` spelling only when `WALTR_API_OIDC_CLIENT_ID` is configured and the token's `azp` exactly matches it. Case variants, absent types, and unrelated types are rejected. Both accepted forms require an allowed asymmetric signature and key, exact issuer and API audience, lifetime, nonempty subject, and every configured API scope. Audience and scope overlap alone do not distinguish an ID token from a provider-generic access token; the additional authorized-party binding prevents that confusion.
 
 `NativeCredentialLease` generations prevent a stale login or refresh task from replacing credentials installed by a newer flow. The transport reads the current credential for every newly sent unary request or opened stream, so reconnecting a watch receives the replacement token without rebuilding shared client state.
 

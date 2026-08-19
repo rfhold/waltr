@@ -119,6 +119,7 @@ WALTR_OIDC_REDIRECT_URI=https://waltr.example/oidc/callback
 WALTR_OIDC_SCOPES=openid profile
 WALTR_API_OIDC_ISSUER=https://identity.example/application/o/waltr-native/
 WALTR_API_OIDC_AUDIENCE=waltr-api
+WALTR_API_OIDC_CLIENT_ID=waltr-native
 WALTR_API_REQUIRED_SCOPES=waltr:api
 WALTR_MCP_REQUIRED_SCOPES=mcp:use
 WALTR_MCP_OAUTH_ISSUER=https://waltr.example/oauth
@@ -138,7 +139,7 @@ The browser, native Waltr API, and inbound MCP endpoint are separate authorizati
 | Domain | Issuer | Audience | Required scopes |
 | --- | --- | --- | --- |
 | Browser login | `WALTR_OIDC_ISSUER` | ID-token audience `WALTR_OIDC_CLIENT_ID` | Browser request `WALTR_OIDC_SCOPES` |
-| Native Waltr API bearer | `WALTR_API_OIDC_ISSUER`, falling back to `WALTR_OIDC_ISSUER` | `WALTR_API_OIDC_AUDIENCE`, falling back to legacy `WALTR_OIDC_AUDIENCE` | `WALTR_API_REQUIRED_SCOPES`, empty when omitted |
+| Native Waltr API bearer | `WALTR_API_OIDC_ISSUER`, falling back to `WALTR_OIDC_ISSUER` | `WALTR_API_OIDC_AUDIENCE`, falling back to legacy `WALTR_OIDC_AUDIENCE`; generic `JWT` also requires `azp` equal to `WALTR_API_OIDC_CLIENT_ID` | `WALTR_API_REQUIRED_SCOPES`, empty when omitted |
 | Inbound MCP bearer | Local `WALTR_MCP_OAUTH_ISSUER` | Exact public `/mcp` resource | `WALTR_MCP_REQUIRED_SCOPES` |
 
 The hosted issuer is enabled only in OIDC mode. `WALTR_MCP_REQUIRED_SCOPES` and `WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE` are required. The issuer defaults to the exact `WALTR_PUBLIC_URL` path plus `/oauth`; an override must equal that same HTTPS deployment-relative URL. Token/code lifetime bounds and defaults are documented in [Access Authentication](architecture/access-authentication.md). DCR, native HTTP loopback redirects, and CIMD default off and must be enabled independently. Enabling loopback redirects permits public clients resolved through either DCR or CIMD to use them.
@@ -152,7 +153,7 @@ Private OAuth destinations are denied by default. Two optional, comma-separated 
 
 Each entry must be only `https://host[:port]`, without credentials, a path, query, or fragment. Matching includes the effective port, duplicate origins are rejected, and the lists do not grant trust across directions. Waltr automatically trusts its initialized deployment origin for hosted self-CIMD. Server-owned outbound authorization gates automatic trust to the exact initialized self-MCP resource, and the server supplies that origin to agent session refresh. The Pulumi settings `mcpOAuthCimdTrustedPrivateOrigins` and `mcpOutboundOAuthTrustedPrivateOrigins` project nonempty lists into the corresponding environment variables.
 
-`WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. It is required in every auth mode because the bundled self-MCP resource consumes it independently of access authentication. It must use HTTPS except for loopback development and is not inferred from the browser callback. Disabling access auth permits this variable but still rejects actual partial browser, API, or hosted-MCP OIDC settings. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly.
+`WALTR_PUBLIC_URL` is the externally reachable Waltr API resource identifier and may include a path prefix. It is required in every auth mode because the bundled self-MCP resource consumes it independently of access authentication. It must use HTTPS except for loopback development and is not inferred from the browser callback. Disabling access auth permits this variable but still rejects actual partial browser, API, or hosted-MCP OIDC settings. `WALTR_OIDC_AUDIENCE` is retained only as the API-audience fallback; new deployments should set `WALTR_API_OIDC_AUDIENCE` explicitly. `WALTR_API_OIDC_CLIENT_ID` enables provider-generic `JWT` access tokens by requiring their `azp` claim to exactly match the configured native client; RFC 9068 `at+jwt` access tokens remain supported without that claim.
 
 `WALTR_OIDC_CLIENT_SECRET` is optional only when browser-provider metadata supports token endpoint auth method `none`. `WALTR_AUTH_SESSION_TTL` optionally sets browser-session seconds and defaults to eight hours. `WALTR_TRUSTED_PROXIES` is optional; when set it is a comma-separated CIDR allowlist for trusting forwarded client addresses. Omit it unless a known reverse proxy overwrites forwarding headers.
 
@@ -173,7 +174,7 @@ The callback and every HTTP OIDC endpoint must then be loopback. These flags are
 
 ## Native Client Registration
 
-Register a separate public native client at the effective API authorization server. It must allow Authorization Code with PKCE S256, token endpoint auth method `none`, and the selected loopback redirects. Do not reuse or distribute the browser confidential-client secret.
+Register a separate public native client at the effective API authorization server. It must allow Authorization Code with PKCE S256 and the selected loopback redirects. The TUI always sends `client_id` and PKCE without a client secret or HTTP Basic authentication. Discovery may advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. Do not reuse or distribute the browser confidential-client secret.
 
 Configure the TUI process with:
 

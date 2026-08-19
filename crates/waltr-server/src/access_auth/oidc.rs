@@ -316,6 +316,7 @@ impl DiscoveredOidcProvider {
             issuer: self.config.issuer().to_owned(),
             client_id: self.config.client_id().to_owned(),
             api_audience: self.config.api_audience().to_owned(),
+            api_client_id: self.config.api_client_id().map(ToOwned::to_owned),
             id_token_signing_algorithms: self.id_token_signing_algorithms.clone(),
             access_token_signing_algorithms: self.access_token_signing_algorithms.clone(),
             jwks: self.jwks.clone(),
@@ -388,6 +389,7 @@ pub struct OidcVerifier {
     issuer: String,
     client_id: String,
     api_audience: String,
+    api_client_id: Option<String>,
     id_token_signing_algorithms: BTreeSet<String>,
     access_token_signing_algorithms: BTreeSet<String>,
     jwks: JwksCache,
@@ -403,6 +405,7 @@ impl OidcVerifier {
         client: AccessAuthHttpClient,
         issuer: &str,
         audience: &str,
+        api_client_id: Option<&str>,
         policy: OidcTransportPolicy,
     ) -> Result<Self, OidcError> {
         let issuer_url =
@@ -470,6 +473,7 @@ impl OidcVerifier {
             issuer: issuer.to_owned(),
             client_id: String::new(),
             api_audience: audience.to_owned(),
+            api_client_id: api_client_id.map(ToOwned::to_owned),
             id_token_signing_algorithms: BTreeSet::new(),
             access_token_signing_algorithms,
             jwks,
@@ -478,9 +482,10 @@ impl OidcVerifier {
 
     /// Rebind a verifier to another audience for the same issuer and JWKS domain.
     #[must_use]
-    pub fn for_access_audience(&self, audience: &str) -> Self {
+    pub fn for_access_audience(&self, audience: &str, api_client_id: Option<&str>) -> Self {
         let mut verifier = self.clone();
         audience.clone_into(&mut verifier.api_audience);
+        verifier.api_client_id = api_client_id.map(ToOwned::to_owned);
         verifier
     }
 
@@ -576,6 +581,16 @@ impl OidcVerifier {
         )
         .map_err(|_| OidcError::InvalidToken("access token validation failed"))?
         .claims;
+        if header.typ.as_deref() == Some("JWT")
+            && !self
+                .api_client_id
+                .as_deref()
+                .is_some_and(|client_id| claims.azp.as_deref() == Some(client_id))
+        {
+            return Err(OidcError::InvalidToken(
+                "generic JWT access token azp is invalid",
+            ));
+        }
         if claims.iss != self.issuer || claims.sub.is_empty() {
             return Err(OidcError::InvalidToken("access token identity is invalid"));
         }
@@ -624,8 +639,12 @@ impl OidcVerifier {
                     "ID token typ must be absent or JWT",
                 ));
             }
-            TokenKind::Access if header.typ.as_deref() != Some("at+jwt") => {
-                return Err(OidcError::InvalidToken("access token typ must be at+jwt"));
+            TokenKind::Access
+                if !matches!(header.typ.as_deref(), Some("at+jwt" | "JWT")) =>
+            {
+                return Err(OidcError::InvalidToken(
+                    "access token typ must be at+jwt or JWT",
+                ));
             }
             TokenKind::Id | TokenKind::Access => {}
         }
@@ -647,11 +666,18 @@ impl OidcVerifier {
     }
 
     #[cfg(test)]
-    fn fixture(issuer: &str, client_id: &str, audience: &str, jwks: JwksCache) -> Self {
+    fn fixture(
+        issuer: &str,
+        client_id: &str,
+        audience: &str,
+        api_client_id: Option<&str>,
+        jwks: JwksCache,
+    ) -> Self {
         Self {
             issuer: issuer.to_owned(),
             client_id: client_id.to_owned(),
             api_audience: audience.to_owned(),
+            api_client_id: api_client_id.map(ToOwned::to_owned),
             id_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),
             access_token_signing_algorithms: BTreeSet::from(["RS256".to_owned()]),
             jwks,
@@ -747,6 +773,8 @@ struct AccessTokenClaims {
     sub: String,
     aud: Audience,
     exp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    azp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     nbf: Option<u64>,
     #[serde(flatten)]
@@ -1099,10 +1127,15 @@ ZbAq2L8jXEetO4oBq+h/bLE=
     }
 
     fn verifier() -> OidcVerifier {
+        verifier_with_api_client_id(Some("waltr-native"))
+    }
+
+    fn verifier_with_api_client_id(api_client_id: Option<&str>) -> OidcVerifier {
         OidcVerifier::fixture(
             "https://issuer.example",
             "waltr-client",
             "waltr-api",
+            api_client_id,
             JwksCache::fixture(test_jwks("test-key")).unwrap(),
         )
     }
@@ -1370,6 +1403,7 @@ ZbAq2L8jXEetO4oBq+h/bLE=
             http_client(),
             &issuer,
             "api-audience",
+            None,
             OidcTransportPolicy::LoopbackHttp,
         )
         .await
@@ -1999,13 +2033,6 @@ ZbAq2L8jXEetO4oBq+h/bLE=
                 .await
                 .is_err()
         );
-        assert!(
-            verifier()
-                .validate_access_token(&sign(access_claims(), "JWT", "test-key"), &required)
-                .await
-                .is_err()
-        );
-
         let mut invalid_signature = valid;
         invalid_signature.replace_range(
             invalid_signature.rfind('.').unwrap() + 1..,
@@ -2042,18 +2069,80 @@ ZbAq2L8jXEetO4oBq+h/bLE=
     }
 
     #[tokio::test]
+    async fn access_token_typ_requires_native_client_binding_for_generic_jwt() {
+        verifier()
+            .validate_access_token(&sign(access_claims(), "at+jwt", "test-key"), &[])
+            .await
+            .unwrap();
+        let mut authentik_claims = access_claims();
+        authentik_claims["azp"] = json!("waltr-native");
+        verifier()
+            .validate_access_token(&sign(authentik_claims, "JWT", "test-key"), &[])
+            .await
+            .unwrap();
+
+        for typ in [
+            None,
+            Some("AT+JWT"),
+            Some("Jwt"),
+            Some("jwt"),
+            Some("application/jwt"),
+            Some("unrelated"),
+        ] {
+            let token = sign_with_typ(access_claims(), typ, "test-key");
+            assert_eq!(
+                verifier().validate_access_token(&token, &[]).await,
+                Err(OidcError::InvalidToken(
+                    "access token typ must be at+jwt or JWT"
+                ))
+            );
+        }
+
+        let mut id_shaped = id_claims();
+        id_shaped["aud"] = json!("waltr-api");
+        id_shaped["scope"] = json!("mcp:use");
+        assert_eq!(
+            verifier()
+                .validate_access_token(&sign(id_shaped, "JWT", "test-key"), &["mcp:use".to_owned()])
+                .await,
+            Err(OidcError::InvalidToken(
+                "generic JWT access token azp is invalid"
+            ))
+        );
+
+        for (configured, claimed) in [
+            (None, Some("waltr-native")),
+            (Some("waltr-native"), None),
+            (Some("waltr-native"), Some("other-native")),
+        ] {
+            let mut claims = access_claims();
+            claims["azp"] = claimed.map_or(Value::Null, |value| json!(value));
+            assert_eq!(
+                verifier_with_api_client_id(configured)
+                    .validate_access_token(&sign(claims, "JWT", "test-key"), &[])
+                    .await,
+                Err(OidcError::InvalidToken(
+                    "generic JWT access token azp is invalid"
+                ))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn access_tokens_are_rejected_across_issuer_and_audience_domains() {
         let keys = JwksCache::fixture(test_jwks("test-key")).unwrap();
         let api = OidcVerifier::fixture(
             "https://api-issuer.example",
             "browser",
             "api-audience",
+            None,
             keys.clone(),
         );
         let mcp = OidcVerifier::fixture(
             "https://mcp-issuer.example",
             "browser",
             "mcp-audience",
+            None,
             keys,
         );
         let api_token = sign(
@@ -2102,7 +2191,7 @@ ZbAq2L8jXEetO4oBq+h/bLE=
             Err(OidcError::InsufficientScope)
         ));
 
-        let same_issuer_wrong_audience = api.for_access_audience("mcp-audience");
+        let same_issuer_wrong_audience = api.for_access_audience("mcp-audience", None);
         assert!(
             same_issuer_wrong_audience
                 .validate_access_token(&api_token, &[])
