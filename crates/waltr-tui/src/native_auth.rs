@@ -131,8 +131,6 @@ struct AuthorizationServerMetadata {
     #[serde(default)]
     grant_types_supported: Vec<String>,
     #[serde(default)]
-    token_endpoint_auth_methods_supported: Vec<String>,
-    #[serde(default)]
     code_challenge_methods_supported: Vec<String>,
 }
 
@@ -697,15 +695,6 @@ fn validate_provider_metadata(
     {
         return Err(NativeAuthError(
             "authorization server does not support PKCE S256".to_owned(),
-        ));
-    }
-    if !metadata
-        .token_endpoint_auth_methods_supported
-        .iter()
-        .any(|value| value == "none")
-    {
-        return Err(NativeAuthError(
-            "authorization server does not support public clients".to_owned(),
         ));
     }
     Ok(())
@@ -1555,16 +1544,35 @@ mod tests {
     }
 
     #[test]
-    fn discovery_requires_s256_and_public_client_token_auth() {
-        let mut metadata = AuthorizationServerMetadata {
-            issuer: "https://id.example".to_owned(),
-            authorization_endpoint: "https://id.example/authorize".to_owned(),
-            token_endpoint: "https://id.example/token".to_owned(),
-            response_types_supported: vec!["code".to_owned()],
-            grant_types_supported: vec!["authorization_code".to_owned()],
-            token_endpoint_auth_methods_supported: vec!["none".to_owned()],
-            code_challenge_methods_supported: Vec::new(),
-        };
+    fn discovery_requires_code_and_s256_but_tolerates_confidential_token_auth_metadata() {
+        let mut metadata: AuthorizationServerMetadata = serde_json::from_value(serde_json::json!({
+            "issuer": "https://id.example",
+            "authorization_endpoint": "https://id.example/authorize",
+            "token_endpoint": "https://id.example/token",
+            "response_types_supported": ["token"],
+            "grant_types_supported": ["authorization_code"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+            "code_challenge_methods_supported": ["S256"]
+        }))
+        .unwrap();
+        assert!(
+            validate_provider_metadata(&metadata)
+                .unwrap_err()
+                .to_string()
+                .contains("code responses")
+        );
+
+        metadata.response_types_supported = vec!["code".to_owned()];
+        metadata.grant_types_supported = vec!["implicit".to_owned()];
+        assert!(
+            validate_provider_metadata(&metadata)
+                .unwrap_err()
+                .to_string()
+                .contains("authorization code grants")
+        );
+
+        metadata.grant_types_supported = vec!["authorization_code".to_owned()];
+        metadata.code_challenge_methods_supported.clear();
         assert!(
             validate_provider_metadata(&metadata)
                 .unwrap_err()
@@ -1573,20 +1581,7 @@ mod tests {
         );
 
         metadata.code_challenge_methods_supported = vec!["S256".to_owned()];
-        metadata.token_endpoint_auth_methods_supported.clear();
-        assert!(
-            validate_provider_metadata(&metadata)
-                .unwrap_err()
-                .to_string()
-                .contains("public clients")
-        );
-        metadata.token_endpoint_auth_methods_supported = vec!["client_secret_basic".to_owned()];
-        assert!(
-            validate_provider_metadata(&metadata)
-                .unwrap_err()
-                .to_string()
-                .contains("public clients")
-        );
+        assert!(validate_provider_metadata(&metadata).is_ok());
     }
 
     #[tokio::test]

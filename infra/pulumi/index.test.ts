@@ -150,6 +150,7 @@ describe("hosted MCP OAuth deployment", () => {
       "https://auth.example.test/application/o/waltr-test-native/",
     );
     assert.equal(appSecret.WALTR_API_OIDC_AUDIENCE, "waltr-api");
+    assert.equal(appSecret.WALTR_API_OIDC_CLIENT_ID, "waltr-test-native");
     assert.equal(appSecret.WALTR_API_REQUIRED_SCOPES, "waltr:use");
   });
 

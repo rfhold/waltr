@@ -86,12 +86,14 @@ impl AccessAuthenticator {
             })?;
         let browser_verifier = provider.verifier();
         let api_verifier = if oidc_config.api_issuer() == oidc_config.issuer() {
-            browser_verifier.for_access_audience(oidc_config.api_audience())
+            browser_verifier
+                .for_access_audience(oidc_config.api_audience(), oidc_config.api_client_id())
         } else {
             OidcVerifier::discover_access(
                 client.clone(),
                 oidc_config.api_issuer(),
                 oidc_config.api_audience(),
+                oidc_config.api_client_id(),
                 oidc_config.transport_policy(),
             )
             .await

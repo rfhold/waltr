@@ -49,6 +49,7 @@ impl AccessAuthConfig {
             "WALTR_OIDC_SCOPES",
             "WALTR_API_OIDC_ISSUER",
             "WALTR_API_OIDC_AUDIENCE",
+            "WALTR_API_OIDC_CLIENT_ID",
             "WALTR_API_REQUIRED_SCOPES",
             "WALTR_AUTH_SESSION_TTL",
             "WALTR_AUTH_ALLOW_INSECURE_COOKIE",
@@ -160,6 +161,9 @@ impl AccessAuthConfig {
                 )?;
                 config.trusted_proxies =
                     parse_trusted_proxies(value(values, "WALTR_TRUSTED_PROXIES").unwrap_or(""))?;
+                if let Some(api_client_id) = values.get("WALTR_API_OIDC_CLIENT_ID") {
+                    config = config.with_api_client_id(api_client_id)?;
+                }
                 Ok(Self::oidc(config))
             }
             _ => Err(AccessAuthConfigError::Invalid(
@@ -179,6 +183,7 @@ pub struct OidcConfig {
     public_url: String,
     api_issuer: String,
     api_audience: String,
+    api_client_id: Option<String>,
     api_required_scopes: Vec<String>,
     requested_scopes: Vec<String>,
     session_ttl: Duration,
@@ -212,6 +217,7 @@ impl fmt::Debug for OidcConfig {
             .field("public_url", &self.public_url)
             .field("api_issuer", &self.api_issuer)
             .field("api_audience", &self.api_audience)
+            .field("api_client_id", &self.api_client_id)
             .field("api_required_scopes", &self.api_required_scopes)
             .field("requested_scopes", &self.requested_scopes)
             .field("session_ttl", &self.session_ttl)
@@ -306,6 +312,7 @@ impl OidcConfig {
             // construction always replaces this through with_access_domains.
             public_url: public_resource_from_redirect(redirect_uri_raw)?,
             api_audience,
+            api_client_id: None,
             api_required_scopes: Vec::new(),
             requested_scopes,
             session_ttl,
@@ -343,6 +350,19 @@ impl OidcConfig {
         Ok(self)
     }
 
+    /// Set and validate the native API OAuth client identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client identifier is empty or contains surrounding whitespace.
+    pub fn with_api_client_id(
+        mut self,
+        api_client_id: impl Into<String>,
+    ) -> Result<Self, AccessAuthConfigError> {
+        self.api_client_id = Some(clean_required("API client ID", api_client_id.into())?);
+        Ok(self)
+    }
+
     /// Expected issuer, preserved exactly for claim comparison.
     #[must_use]
     pub fn issuer(&self) -> &str {
@@ -377,6 +397,11 @@ impl OidcConfig {
     #[must_use]
     pub fn api_audience(&self) -> &str {
         &self.api_audience
+    }
+    /// Native API OAuth client identifier used to bind provider-generic JWT access tokens.
+    #[must_use]
+    pub fn api_client_id(&self) -> Option<&str> {
+        self.api_client_id.as_deref()
     }
     /// Scopes required by the native API boundary.
     #[must_use]
@@ -644,6 +669,21 @@ mod tests {
         .unwrap()
     }
 
+    fn valid_environment_values() -> HashMap<&'static str, String> {
+        HashMap::from([
+            ("WALTR_AUTH_MODE", "oidc".to_owned()),
+            ("WALTR_PUBLIC_URL", "https://waltr.example".to_owned()),
+            ("WALTR_OIDC_ISSUER", "https://issuer.example".to_owned()),
+            ("WALTR_OIDC_CLIENT_ID", "browser".to_owned()),
+            (
+                "WALTR_OIDC_REDIRECT_URI",
+                "https://waltr.example/oidc/callback".to_owned(),
+            ),
+            ("WALTR_API_OIDC_AUDIENCE", "waltr-api".to_owned()),
+            ("WALTR_OIDC_SCOPES", "openid".to_owned()),
+        ])
+    }
+
     #[test]
     fn defaults_to_disabled() {
         assert_eq!(
@@ -683,7 +723,32 @@ mod tests {
         assert_eq!(oidc.public_url(), "https://waltr.example/api");
         assert_eq!(oidc.api_issuer(), "https://issuer.example");
         assert_eq!(oidc.api_audience(), "legacy-audience");
+        assert_eq!(oidc.api_client_id(), None);
         assert_eq!(oidc.api_required_scopes(), ["api:read"]);
+    }
+
+    #[test]
+    fn environment_retains_valid_api_client_id() {
+        let mut values = valid_environment_values();
+        values.insert("WALTR_API_OIDC_CLIENT_ID", "waltr-native".to_owned());
+
+        let config = AccessAuthConfig::from_values(&values).unwrap();
+        assert_eq!(
+            config.oidc_config().unwrap().api_client_id(),
+            Some("waltr-native")
+        );
+    }
+
+    #[test]
+    fn environment_rejects_blank_or_padded_api_client_id() {
+        for client_id in ["", " ", " waltr-native", "waltr-native "] {
+            let mut values = valid_environment_values();
+            values.insert("WALTR_API_OIDC_CLIENT_ID", client_id.to_owned());
+            assert!(
+                AccessAuthConfig::from_values(&values).is_err(),
+                "{client_id:?}"
+            );
+        }
     }
 
     #[test]
@@ -715,6 +780,7 @@ mod tests {
     fn partial_oidc_configuration_fails_while_disabled() {
         for (name, value) in [
             ("WALTR_OIDC_ISSUER", "https://issuer.example"),
+            ("WALTR_API_OIDC_CLIENT_ID", "waltr-native"),
             ("WALTR_AUTH_SESSION_TTL", "3600"),
             ("WALTR_AUTH_ALLOW_INSECURE_COOKIE", "true"),
             ("WALTR_TRUSTED_PROXIES", "10.0.0.0/8"),
