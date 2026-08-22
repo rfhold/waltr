@@ -11,6 +11,20 @@ pub struct InferenceSettings {
     pub provider: InferenceProviderSettings,
 }
 
+impl InferenceSettings {
+    /// Disable reasoning using the representation supported by the selected provider API.
+    #[must_use]
+    pub fn with_reasoning_disabled(mut self) -> Self {
+        self.provider.reasoning_effort = match self.provider.api {
+            ModelApi::OpenAiResponses | ModelApi::OpenAiResponsesWebSocket => {
+                Some("none".to_owned())
+            }
+            ModelApi::AnthropicMessages | ModelApi::OpenAiChatCompletions => None,
+        };
+        self
+    }
+}
+
 /// Provider settings needed to perform inference without consulting server config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceProviderSettings {
@@ -170,5 +184,36 @@ mod tests {
         .expect("legacy provider OAuth settings");
 
         assert!(settings.jwt_metadata.is_empty());
+    }
+
+    #[test]
+    fn disabled_reasoning_is_provider_neutral_and_preserves_settings() {
+        for (api, expected) in [
+            (ModelApi::OpenAiResponses, Some("none")),
+            (ModelApi::OpenAiResponsesWebSocket, Some("none")),
+            (ModelApi::AnthropicMessages, None),
+            (ModelApi::OpenAiChatCompletions, None),
+        ] {
+            let settings = InferenceSettings {
+                provider: InferenceProviderSettings {
+                    key: "provider-key".to_owned(),
+                    api,
+                    url: "https://provider.example/api".to_owned(),
+                    model_id: "model".to_owned(),
+                    model_cost: None,
+                    headers: BTreeMap::from([("x-test".to_owned(), "value".to_owned())]),
+                    oauth: None,
+                    reasoning_effort: Some("high".to_owned()),
+                },
+            };
+
+            let disabled = settings.clone().with_reasoning_disabled();
+
+            assert_eq!(disabled.provider.reasoning_effort.as_deref(), expected);
+            assert_eq!(disabled.provider.key, settings.provider.key);
+            assert_eq!(disabled.provider.url, settings.provider.url);
+            assert_eq!(disabled.provider.model_id, settings.provider.model_id);
+            assert_eq!(disabled.provider.headers, settings.provider.headers);
+        }
     }
 }
