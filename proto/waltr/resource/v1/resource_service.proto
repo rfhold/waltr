@@ -20,6 +20,7 @@ enum ResourceKind {
   RESOURCE_KIND_PROVIDER = 4;
   RESOURCE_KIND_MCP_SERVER = 5;
   RESOURCE_KIND_DEFAULTS = 6;
+  RESOURCE_KIND_ROUTINE = 7;
 }
 
 enum ResourceOrigin {

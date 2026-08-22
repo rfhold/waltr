@@ -40,6 +40,7 @@ pub(super) const fn proto_kind(kind: ResourceKind) -> resource_proto::ResourceKi
         ResourceKind::Provider => resource_proto::ResourceKind::Provider,
         ResourceKind::McpServer => resource_proto::ResourceKind::McpServer,
         ResourceKind::Defaults => resource_proto::ResourceKind::Defaults,
+        ResourceKind::Routine => resource_proto::ResourceKind::Routine,
     }
 }
 
