@@ -42,6 +42,8 @@ use tonic_web::GrpcWebLayer;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -129,8 +131,17 @@ impl ServerApplication {
         cancellation: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     ) -> Self {
+        Self::with_router_and_background_task_for_test(Router::new(), cancellation, task)
+    }
+
+    #[cfg(any(debug_assertions, feature = "test"))]
+    pub(crate) fn with_router_and_background_task_for_test(
+        router: Router,
+        cancellation: CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
         Self {
-            router: Router::new(),
+            router,
             definition_watcher: None,
             oauth_maintenance: None,
             test_background: Some(TestBackgroundTask { cancellation, task }),
@@ -182,14 +193,28 @@ impl ServerApplication {
             oauth_maintenance,
             test_background,
         } = self;
-        let result = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-        })
-        .await;
+        let result = {
+            let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+            let server = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                shutdown.await;
+                let _ = shutdown_started_tx.send(());
+            })
+            .into_future();
+            tokio::pin!(server);
+            tokio::select! {
+                result = &mut server => result,
+                () = async {
+                    if shutdown_started_rx.await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
+                } => Ok(()),
+            }
+        };
         shutdown_background_tasks(definition_watcher, oauth_maintenance, test_background).await;
         result
     }
@@ -875,8 +900,13 @@ async fn service_unavailable() -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
+    use axum::{body::Body, response::Response};
+    use futures_util::{StreamExt as _, stream};
     use tokio::sync::{Notify, oneshot};
 
     use super::*;
@@ -1012,5 +1042,66 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(activity.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn server_shutdown_stops_waiting_for_open_stream_then_joins_background_task() {
+        tokio::time::pause();
+        let cancellation = CancellationToken::new();
+        let cleaned_up = Arc::new(AtomicBool::new(false));
+        let task = {
+            let cancellation = cancellation.clone();
+            let cleaned_up = Arc::clone(&cleaned_up);
+            tokio::spawn(async move {
+                cancellation.cancelled().await;
+                cleaned_up.store(true, Ordering::SeqCst);
+            })
+        };
+        let router = Router::new().route(
+            "/stream",
+            get(|| async {
+                let body = stream::once(async { Ok::<_, Infallible>("open") })
+                    .chain(stream::pending::<Result<&'static str, Infallible>>());
+                Response::new(Body::from_stream(body))
+            }),
+        );
+        let app =
+            ServerApplication::with_router_and_background_task_for_test(router, cancellation, task);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_observed_tx, shutdown_observed_rx) = oneshot::channel();
+        let server = tokio::spawn(app.serve_with_shutdown(listener, async move {
+            drop(shutdown_rx.await);
+            let _ = shutdown_observed_tx.send(());
+        }));
+        let response = reqwest::get(format!("http://{address}/stream"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        shutdown_tx.send(()).unwrap();
+        shutdown_observed_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(GRACEFUL_SHUTDOWN_TIMEOUT - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!server.is_finished());
+
+        // Tokio's timer wheel may surface an exact deadline on the following millisecond tick.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        for _ in 0..10 {
+            if server.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::ZERO).await;
+        }
+        assert!(
+            server.is_finished(),
+            "server remained active at drain deadline (cleanup joined: {})",
+            cleaned_up.load(Ordering::SeqCst)
+        );
+        server.await.unwrap().unwrap();
+        assert!(cleaned_up.load(Ordering::SeqCst));
+        drop(response);
     }
 }
