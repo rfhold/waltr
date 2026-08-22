@@ -43,6 +43,7 @@ pub struct AgentRuntimeBuilder {
     explicit_permission_policy: bool,
     retry_config: ProviderRetryConfig,
     template_base_dir: Option<PathBuf>,
+    file_templates: bool,
 }
 
 impl AgentRuntimeBuilder {
@@ -73,6 +74,7 @@ impl AgentRuntimeBuilder {
             explicit_permission_policy: false,
             retry_config: ProviderRetryConfig::default(),
             template_base_dir: None,
+            file_templates: true,
         }
     }
 
@@ -264,6 +266,16 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    pub(crate) const fn without_file_templates(mut self) -> Self {
+        self.file_templates = false;
+        self
+    }
+
+    pub(crate) const fn with_file_templates(mut self) -> Self {
+        self.file_templates = true;
+        self
+    }
+
     /// Build the agent runtime configuration.
     ///
     /// Middleware assembly order is deterministic and affects provider request
@@ -278,7 +290,9 @@ impl AgentRuntimeBuilder {
             prompt_middleware = prompt_middleware.with_identity(identity);
         }
         middleware_chain.push(prompt_middleware);
-        middleware_chain.push(FileTemplateMiddleware);
+        if self.file_templates {
+            middleware_chain.push(FileTemplateMiddleware);
+        }
         middleware_chain.push(PermissionFilteredToolRegistryMiddleware::new(
             self.tools.clone(),
             self.permission_policy.clone(),
@@ -330,6 +344,7 @@ impl fmt::Debug for AgentRuntimeBuilder {
             )
             .field("retry_config", &self.retry_config)
             .field("template_base_dir", &self.template_base_dir)
+            .field("file_templates", &self.file_templates)
             .finish()
     }
 }

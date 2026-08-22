@@ -369,11 +369,14 @@ impl AgentSessionRuntimeFactory {
         mut builder: AgentRuntimeBuilder,
         definition: &ResolvedAgent,
     ) -> AgentRuntimeBuilder {
-        builder = builder.with_template_base_dir(self.root.clone());
+        builder = builder
+            .with_template_base_dir(self.root.clone())
+            .without_file_templates();
         if let Some(prompt) = definition.system_prompt.as_ref() {
             builder = builder.with_system_prompt(prompt.clone());
         }
         if let Some(filesystem) = definition.features.filesystem.as_ref() {
+            builder = builder.with_file_templates();
             let mut config = FilesystemConfig::new(self.root.clone());
             if filesystem.agents_read_context {
                 config = config.with_agents_read_context();
@@ -609,16 +612,6 @@ impl AgentSessionRuntimeFactory {
         let Some(bundle) = record.agent_definition.as_ref() else {
             return Ok(self.definition.clone());
         };
-        if self
-            .catalog
-            .as_ref()
-            .is_some_and(|catalog| catalog.resolved(&bundle.agent_name).is_none())
-        {
-            return Err(AgentSessionRuntimeError::FailedPrecondition(format!(
-                "stored session agent '{}' is not present in the current startup catalog",
-                bundle.agent_name
-            )));
-        }
         bundle.resolve().map_err(|error| {
             AgentSessionRuntimeError::FailedPrecondition(format!(
                 "stored session agent definition is invalid: {error}"
@@ -1706,7 +1699,7 @@ spec: { tools: [{ name: read, permission: allow }] }
     }
 
     #[test]
-    fn bundle_less_uses_default_but_catalog_missing_stored_name_fails_closed() {
+    fn bundle_less_uses_default_and_stored_bundle_is_independent_of_live_catalog() {
         let root = std::env::temp_dir();
         let source =
             "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: default }\nspec: {}\n";
@@ -1731,11 +1724,13 @@ spec: { tools: [{ name: read, permission: allow }] }
             "removed",
             vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: removed }\nspec: {}\n".to_owned()],
         ));
-        assert!(matches!(
-            factory.definition_for_session(&missing),
-            Err(AgentSessionRuntimeError::FailedPrecondition(message))
-                if message.contains("not present in the current startup catalog")
-        ));
+        assert_eq!(
+            factory
+                .definition_for_session(&missing)
+                .expect("stored bundle resolves from its own sources")
+                .name,
+            "removed"
+        );
     }
 
     #[test]
@@ -1855,6 +1850,27 @@ spec:
         assert!(names.contains("question"));
         assert!(!names.contains("task"));
         assert!(!names.contains("disabled_tool"));
+    }
+
+    #[test]
+    fn empty_definition_omits_feature_owned_template_providers() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let definition = empty_test_agent();
+        let factory = AgentSessionRuntimeFactory::new(
+            root.path().to_path_buf(),
+            FileCredentialStore::new(root.path().join("auth.json")),
+            definition.clone(),
+        );
+        let model = ModelRef::new(ProviderId::OpenAi, "gpt-5", ModelApi::OpenAiResponses);
+
+        let runtime = factory
+            .apply_definition(
+                AgentRuntimeBuilder::new(model, Arc::new(EmptyProvider)),
+                &definition,
+            )
+            .build();
+
+        assert_eq!(runtime.middleware_chain.len(), 2);
     }
 
     #[test]
