@@ -1,0 +1,272 @@
+syntax = "proto3";
+
+package waltr.routine.v1;
+
+service RoutineService {
+  rpc WatchManualRoutines(WatchManualRoutinesRequest) returns (stream WatchManualRoutinesResponse);
+  rpc StartManualRoutine(StartManualRoutineRequest) returns (StartManualRoutineResponse);
+  rpc ListRoutineInvocations(ListRoutineInvocationsRequest) returns (ListRoutineInvocationsResponse);
+  rpc GetRoutineInvocation(GetRoutineInvocationRequest) returns (GetRoutineInvocationResponse);
+  rpc WatchRoutineInvocations(WatchRoutineInvocationsRequest) returns (stream WatchRoutineInvocationsResponse);
+}
+
+message WatchManualRoutinesRequest {
+  // Correlation only. This ID does not provide idempotency or deduplication.
+  string request_id = 1;
+}
+
+message WatchManualRoutinesResponse {
+  string request_id = 1;
+  // Definitions preserve the server catalog's canonical Routine and trigger declaration order.
+  repeated ManualRoutineDefinition routines = 2;
+  // Stable digest of this projected definition snapshot.
+  string digest = 3;
+}
+
+message ManualRoutineDefinition {
+  string routine_name = 1;
+  string trigger_name = 2;
+  string display_name = 3;
+  string description = 4;
+  RoutineScope scope = 5;
+  // Inputs preserve trigger declaration order.
+  repeated RoutineInputDefinition inputs = 6;
+  // Results preserve Routine declaration order.
+  repeated RoutineResultDefinition results = 7;
+  string routine_revision = 8;
+}
+
+enum RoutineScope {
+  ROUTINE_SCOPE_UNSPECIFIED = 0;
+  ROUTINE_SCOPE_SESSION = 1;
+}
+
+enum RoutineValueType {
+  ROUTINE_VALUE_TYPE_UNSPECIFIED = 0;
+  ROUTINE_VALUE_TYPE_STRING = 1;
+  ROUTINE_VALUE_TYPE_BOOLEAN = 2;
+}
+
+message RoutineInputDefinition {
+  string name = 1;
+  RoutineValueType type = 2;
+  bool required = 3;
+  optional uint64 minimum_string_length = 4;
+  optional string string_pattern = 5;
+}
+
+message RoutineResultDefinition {
+  string name = 1;
+  RoutineValueType type = 2;
+}
+
+message StartManualRoutineRequest {
+  // Correlation only. This ID does not provide idempotency or deduplication.
+  string request_id = 1;
+  string routine_name = 2;
+  string trigger_name = 3;
+  string source_session_id = 4;
+  repeated RoutineInputValue inputs = 5;
+}
+
+message StartManualRoutineResponse {
+  string request_id = 1;
+  oneof outcome {
+    ManualRoutineAccepted accepted = 2;
+    RoutineValidationFailure validation_failure = 3;
+  }
+}
+
+message ManualRoutineAccepted {
+  // Server-generated durable public identity, separate from execution identity.
+  string invocation_id = 1;
+}
+
+message RoutineInputValue {
+  string name = 1;
+  RoutineValue value = 2;
+}
+
+message RoutineValue {
+  oneof value {
+    string string_value = 1;
+    bool boolean_value = 2;
+  }
+}
+
+message ListRoutineInvocationsRequest {
+  string request_id = 1;
+  uint32 page_size = 2;
+  optional uint64 before_admission_sequence = 3;
+  map<string, string> metadata_filters = 4;
+}
+
+message ListRoutineInvocationsResponse {
+  string request_id = 1;
+  repeated RoutineInvocation invocations = 2;
+  optional uint64 older_page_token = 3;
+}
+
+message GetRoutineInvocationRequest {
+  string request_id = 1;
+  string invocation_id = 2;
+}
+
+message GetRoutineInvocationResponse {
+  string request_id = 1;
+  RoutineInvocationDetail invocation = 2;
+}
+
+message WatchRoutineInvocationsRequest {
+  string request_id = 1;
+  // Omit for a bounded newest-first snapshot. Set to replay exact events after this cursor.
+  optional uint64 after_sequence = 2;
+  uint32 snapshot_size = 3;
+  map<string, string> metadata_filters = 4;
+}
+
+message WatchRoutineInvocationsResponse {
+  string request_id = 1;
+  oneof update {
+    RoutineInvocationSnapshot snapshot = 2;
+    RoutineInvocationEvent event = 3;
+  }
+}
+
+message RoutineInvocationSnapshot {
+  repeated RoutineInvocation invocations = 1;
+  uint64 through_sequence = 2;
+  optional uint64 older_page_token = 3;
+}
+
+message RoutineInvocation {
+  reserved 8;
+  reserved "source_session_id";
+  uint64 admission_sequence = 1;
+  string invocation_id = 2;
+  string routine_name = 3;
+  string routine_revision = 4;
+  string trigger_name = 5;
+  RoutineTriggerKind trigger_kind = 6;
+  string correlation_id = 7;
+  optional string source_cursor = 9;
+  RoutineInvocationStatus status = 10;
+  int64 admitted_at_ms = 11;
+  optional int64 started_at_ms = 12;
+  optional int64 completed_at_ms = 13;
+  int64 updated_at_ms = 14;
+  RoutineFailure terminal_error = 15;
+  uint64 latest_sequence = 16;
+  map<string, string> metadata = 17;
+}
+
+message RoutineInvocationDetail {
+  RoutineInvocation summary = 1;
+  repeated RoutineTask tasks = 2;
+  repeated RoutineResultValue results = 3;
+  repeated RoutineInvocationEvent events = 4;
+}
+
+message RoutineTask {
+  string name = 1;
+  string type = 2;
+  RoutineTaskStatus status = 3;
+  repeated RoutineResultValue results = 4;
+  map<string, string> session_references = 5;
+  RoutineFailure error = 6;
+}
+
+message RoutineInvocationEvent {
+  uint64 sequence = 1;
+  string invocation_id = 2;
+  RoutineEventKind kind = 3;
+  optional string task_name = 4;
+  int64 occurred_at_ms = 5;
+  RoutineFailure error = 6;
+  repeated RoutineResultValue values = 7;
+  map<string, string> session_references = 8;
+  // Present only for INVOCATION_ADMITTED and sufficient to create a client item from replay.
+  RoutineAdmission admission = 9;
+}
+
+message RoutineAdmission {
+  reserved 6;
+  reserved "source_session_id";
+  string routine_name = 1;
+  string routine_revision = 2;
+  string trigger_name = 3;
+  RoutineTriggerKind trigger_kind = 4;
+  string correlation_id = 5;
+  optional string source_cursor = 7;
+  int64 admitted_at_ms = 8;
+  repeated RoutineTaskDescriptor declared_tasks = 9;
+  // Immutable aggregate admission and pagination order, independent of journal event sequence.
+  uint64 admission_sequence = 10;
+  map<string, string> metadata = 11;
+}
+
+message RoutineTaskDescriptor {
+  string name = 1;
+  string type = 2;
+}
+
+message RoutineResultValue {
+  string name = 1;
+  RoutineValue value = 2;
+}
+
+message RoutineFailure {
+  string code = 1;
+  string message = 2;
+}
+
+enum RoutineTriggerKind {
+  ROUTINE_TRIGGER_KIND_UNSPECIFIED = 0;
+  ROUTINE_TRIGGER_KIND_MANUAL = 1;
+  ROUTINE_TRIGGER_KIND_EVENT = 2;
+}
+
+enum RoutineInvocationStatus {
+  ROUTINE_INVOCATION_STATUS_UNSPECIFIED = 0;
+  ROUTINE_INVOCATION_STATUS_ADMITTED = 1;
+  ROUTINE_INVOCATION_STATUS_RUNNING = 2;
+  ROUTINE_INVOCATION_STATUS_SUCCEEDED = 3;
+  ROUTINE_INVOCATION_STATUS_FAILED = 4;
+  ROUTINE_INVOCATION_STATUS_INTERRUPTED = 5;
+}
+
+enum RoutineTaskStatus {
+  ROUTINE_TASK_STATUS_UNSPECIFIED = 0;
+  ROUTINE_TASK_STATUS_PENDING = 1;
+  ROUTINE_TASK_STATUS_RUNNING = 2;
+  ROUTINE_TASK_STATUS_SUCCEEDED = 3;
+  ROUTINE_TASK_STATUS_SKIPPED = 4;
+  ROUTINE_TASK_STATUS_BLOCKED = 5;
+  ROUTINE_TASK_STATUS_FAILED = 6;
+  ROUTINE_TASK_STATUS_INTERRUPTED = 7;
+}
+
+enum RoutineEventKind {
+  ROUTINE_EVENT_KIND_UNSPECIFIED = 0;
+  ROUTINE_EVENT_KIND_INVOCATION_ADMITTED = 1;
+  ROUTINE_EVENT_KIND_INVOCATION_STARTED = 2;
+  ROUTINE_EVENT_KIND_TASK_STARTED = 3;
+  ROUTINE_EVENT_KIND_TASK_SUCCEEDED = 4;
+  ROUTINE_EVENT_KIND_TASK_SKIPPED = 5;
+  ROUTINE_EVENT_KIND_TASK_BLOCKED = 6;
+  ROUTINE_EVENT_KIND_TASK_FAILED = 7;
+  ROUTINE_EVENT_KIND_TASK_INTERRUPTED = 8;
+  ROUTINE_EVENT_KIND_INVOCATION_SUCCEEDED = 9;
+  ROUTINE_EVENT_KIND_INVOCATION_FAILED = 10;
+  ROUTINE_EVENT_KIND_INVOCATION_INTERRUPTED = 11;
+}
+
+message RoutineValidationFailure {
+  string message = 1;
+  repeated RoutineFieldViolation violations = 2;
+}
+
+message RoutineFieldViolation {
+  string field_path = 1;
+  string message = 2;
+}
