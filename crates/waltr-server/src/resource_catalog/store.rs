@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use super::routine::MAX_ROUTINE_SOURCE_BYTES;
 use super::state::{AgentDefinitionLoadError, ResourceKind};
 
 const ABSENT_ETAG_SEED: &[u8] = b"waltr-agent-definition-absent-slot-v1";
@@ -54,9 +55,18 @@ pub(super) fn validate_resource_source(
     source: &str,
 ) -> Result<ResourceKey, AgentDefinitionLoadError> {
     let (expected_kind, expected_name) = validate_resource_path(path)?;
+    if expected_kind == ResourceKind::Routine && source.len() > MAX_ROUTINE_SOURCE_BYTES {
+        return Err(AgentDefinitionLoadError::InvalidResourceValue {
+            path: path.to_owned(),
+            message: format!("source exceeds {MAX_ROUTINE_SOURCE_BYTES} bytes"),
+        });
+    }
     if matches!(
         expected_kind,
-        ResourceKind::Provider | ResourceKind::McpServer | ResourceKind::Defaults
+        ResourceKind::Provider
+            | ResourceKind::McpServer
+            | ResourceKind::Defaults
+            | ResourceKind::Routine
     ) {
         let header: ResourceHeader = serde_yaml_ng::from_str(source).map_err(|source| {
             AgentDefinitionLoadError::ResourceYaml {
@@ -157,6 +167,7 @@ pub(super) fn validate_resource_path(
         "providers" => ResourceKind::Provider,
         "mcp-servers" => ResourceKind::McpServer,
         "defaults" if name == "default" => ResourceKind::Defaults,
+        "routines" => ResourceKind::Routine,
         _ => {
             return Err(AgentDefinitionLoadError::InvalidResourcePath(
                 path.to_owned(),
@@ -182,6 +193,7 @@ fn parse_resource_kind(kind: &str) -> Option<ResourceKind> {
         "Provider" => Some(ResourceKind::Provider),
         "McpServer" => Some(ResourceKind::McpServer),
         "Defaults" => Some(ResourceKind::Defaults),
+        "Routine" => Some(ResourceKind::Routine),
         _ => None,
     }
 }
@@ -237,6 +249,7 @@ pub(super) fn discover_persisted_for(
                         | "providers"
                         | "mcp-servers"
                         | "defaults"
+                        | "routines"
                 )
             )
         } else {
@@ -257,6 +270,7 @@ pub(super) fn discover_persisted_for(
             "providers",
             "mcp-servers",
             "defaults",
+            "routines",
         ]
     } else {
         &["agents", "features", "permissions"]

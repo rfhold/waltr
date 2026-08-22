@@ -22,6 +22,7 @@ use super::{
         invalid_value, materialize_defaults, materialize_mcp_server, materialize_provider,
         materialized_snapshot_etag, proto_kind, proto_resource, yaml_json,
     },
+    routine::{MAX_ROUTINE_COUNT, MaterializedRoutine, materialize_routine},
     store::{
         PersistedSlotPostcondition, atomic_write, check_expected_etag, discover_persisted,
         discover_persisted_for, load_external_sources, resource_disk_path, slot_etag, source_etag,
@@ -60,7 +61,7 @@ const BUNDLED_RESOURCES: [(&str, &str); 6] = [
     ),
 ];
 
-const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 12] = [
+const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 14] = [
     BUNDLED_RESOURCES[0],
     BUNDLED_RESOURCES[1],
     BUNDLED_RESOURCES[2],
@@ -91,6 +92,14 @@ const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 12] = [
         "defaults/default.yaml",
         include_str!("../../resources/defaults/default.yaml"),
     ),
+    (
+        "routines/title.yaml",
+        include_str!("../../resources/routines/title.yaml"),
+    ),
+    (
+        "routines/fork.yaml",
+        include_str!("../../resources/routines/fork.yaml"),
+    ),
 ];
 
 /// Canonical resource kinds in the unified catalog.
@@ -108,6 +117,8 @@ pub enum ResourceKind {
     McpServer,
     /// Singleton inference defaults.
     Defaults,
+    /// Server-owned executable routine definition.
+    Routine,
 }
 
 impl fmt::Display for ResourceKind {
@@ -119,6 +130,7 @@ impl fmt::Display for ResourceKind {
             Self::Provider => "Provider",
             Self::McpServer => "McpServer",
             Self::Defaults => "Defaults",
+            Self::Routine => "Routine",
         })
     }
 }
@@ -197,6 +209,7 @@ pub struct AgentDefinitionSnapshot {
     entries: BTreeMap<String, ActiveResource>,
     persisted_fingerprint: String,
     configuration: config_proto::Configuration,
+    routines: BTreeMap<String, MaterializedRoutine>,
     etag: String,
 }
 
@@ -229,6 +242,18 @@ impl AgentDefinitionSnapshot {
     #[must_use]
     pub const fn configuration(&self) -> &config_proto::Configuration {
         &self.configuration
+    }
+
+    /// Look up one materialized routine by canonical name.
+    #[must_use]
+    pub fn routine(&self, name: &str) -> Option<&MaterializedRoutine> {
+        self.routines.get(name)
+    }
+
+    /// Iterate over materialized routines in canonical name order.
+    #[must_use]
+    pub fn routines(&self) -> impl ExactSizeIterator<Item = &MaterializedRoutine> {
+        self.routines.values()
     }
 
     /// Return the materialized aggregate snapshot `ETag`.
@@ -341,7 +366,7 @@ impl AgentDefinitionState {
         })
     }
 
-    /// Load the complete six-kind resource catalog.
+    /// Load the complete seven-kind resource catalog.
     ///
     /// # Errors
     ///
@@ -976,6 +1001,7 @@ fn build_snapshot(
     let mut entries = BTreeMap::new();
     let mut sources = Vec::new();
     let mut configuration = config_proto::Configuration::default();
+    let mut routines = BTreeMap::new();
     for (path, source) in effective {
         let key = validate_resource_source(&path, &source)?;
         if !identities.insert((key.kind, key.name.clone())) {
@@ -1012,6 +1038,27 @@ fn build_snapshot(
                 let defaults = materialize_defaults(&source, &path)?;
                 configuration.inference_defaults = Some(defaults.clone());
                 serde_json::to_value(defaults).expect("generated defaults serialize")
+            }
+            ResourceKind::Routine => {
+                if routines.len() >= MAX_ROUTINE_COUNT {
+                    return Err(invalid_value(
+                        &path,
+                        format!("routine catalog exceeds {MAX_ROUTINE_COUNT} entries"),
+                    ));
+                }
+                let definition = materialize_routine(&source, &path)?;
+                let value = serde_json::to_value(&definition)
+                    .expect("validated routine definition serializes");
+                routines.insert(
+                    key.name.clone(),
+                    MaterializedRoutine::new(
+                        key.name.clone(),
+                        path.clone(),
+                        source_etag(source.as_bytes()),
+                        definition,
+                    ),
+                );
+                value
             }
         };
         entries.insert(
@@ -1061,6 +1108,7 @@ fn build_snapshot(
         entries,
         persisted_fingerprint,
         configuration,
+        routines,
         etag,
     })
 }

@@ -3,10 +3,12 @@
 mod agent;
 mod error;
 mod materialize;
+pub(crate) mod routine;
 mod state;
 mod store;
 mod watcher;
 
+pub use routine::{MaterializedRoutine, RoutineDefinition};
 pub use state::{
     AgentDefinitionInspection, AgentDefinitionLoadError, AgentDefinitionSnapshot,
     AgentDefinitionState, DefinitionResourceDetail, DefinitionResourceSummary,
