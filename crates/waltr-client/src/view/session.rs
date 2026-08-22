@@ -6,8 +6,8 @@ use waltr::grpc::waltr::session::v1::timeline_content;
 use crate::{
     AuthenticationFailureSnapshot, InferenceProviderSettings, InferenceSettings,
     InferenceSettingsMatch, OutboundAuthenticationFailure, ProviderKindView, SessionMetrics,
-    SessionPhase, SessionStatus, SessionSummary, TimelineContent, TimelineEvent, TimelineEventKind,
-    TimelineStatus,
+    SessionPhase, SessionStatus, SessionSummary, SuspensionKind, TimelineContent, TimelineEvent,
+    TimelineEventKind, TimelineStatus,
 };
 
 /// Stable selectable session agent view shared by Waltr shells.
@@ -131,10 +131,28 @@ pub enum InferenceSettingsMatchView {
 pub struct SessionStatusView {
     /// Session phase as a shell-friendly enum.
     pub phase: SessionPhaseView,
+    /// Suspension reason when the session phase is suspended.
+    pub suspension_kind: Option<SessionSuspensionKindView>,
     /// Failure message, when phase is failed.
     pub failed_message: String,
     /// Structured outbound authentication failure, when present.
     pub authentication_failure: Option<AuthenticationFailureSnapshot>,
+}
+
+/// Stable session suspension reason shared by Waltr shells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionSuspensionKindView {
+    /// Suspension kind was omitted or intentionally unspecified.
+    Unspecified,
+    /// Session is waiting for outstanding tool results.
+    AwaitingToolResults,
+    /// Session is waiting for external input.
+    AwaitingExternalInput,
+    /// Session execution was interrupted.
+    Interrupted,
+    /// Suspension kind is unknown to this client version.
+    Unknown,
 }
 
 /// Stable session phase view shared by Waltr shells.
@@ -347,6 +365,7 @@ impl Default for SessionStatusView {
     fn default() -> Self {
         Self {
             phase: SessionPhaseView::Unspecified,
+            suspension_kind: None,
             failed_message: String::new(),
             authentication_failure: None,
         }
@@ -355,6 +374,11 @@ impl Default for SessionStatusView {
 
 impl From<SessionStatus> for SessionStatusView {
     fn from(status: SessionStatus) -> Self {
+        let is_suspended = status.phase == SessionPhase::Suspended as i32;
+        let suspension_kind = is_suspended
+            .then_some(status.suspension)
+            .flatten()
+            .map(|suspension| suspension.kind.into());
         let authentication_failure = (status.phase == SessionPhase::Failed as i32)
             .then_some(status.authentication_failure)
             .flatten()
@@ -362,8 +386,21 @@ impl From<SessionStatus> for SessionStatusView {
             .map(Into::into);
         Self {
             phase: status.phase.into(),
+            suspension_kind,
             failed_message: status.failed_message,
             authentication_failure,
+        }
+    }
+}
+
+impl From<i32> for SessionSuspensionKindView {
+    fn from(value: i32) -> Self {
+        match SuspensionKind::try_from(value) {
+            Ok(SuspensionKind::Unspecified) => Self::Unspecified,
+            Ok(SuspensionKind::AwaitingToolResults) => Self::AwaitingToolResults,
+            Ok(SuspensionKind::AwaitingExternalInput) => Self::AwaitingExternalInput,
+            Ok(SuspensionKind::Interrupted) => Self::Interrupted,
+            Err(_) => Self::Unknown,
         }
     }
 }
@@ -520,5 +557,64 @@ impl From<i32> for TimelineStatusView {
             Ok(TimelineStatus::Canceled) => Self::Canceled,
             Err(_) => Self::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use waltr::grpc::waltr::session::v1::Suspension;
+
+    #[test]
+    fn session_status_view_projects_suspension_kinds() {
+        for (kind, expected) in [
+            (
+                SuspensionKind::AwaitingToolResults as i32,
+                SessionSuspensionKindView::AwaitingToolResults,
+            ),
+            (
+                SuspensionKind::AwaitingExternalInput as i32,
+                SessionSuspensionKindView::AwaitingExternalInput,
+            ),
+            (
+                SuspensionKind::Interrupted as i32,
+                SessionSuspensionKindView::Interrupted,
+            ),
+            (
+                SuspensionKind::Unspecified as i32,
+                SessionSuspensionKindView::Unspecified,
+            ),
+            (i32::MAX, SessionSuspensionKindView::Unknown),
+        ] {
+            let view = SessionStatusView::from(SessionStatus {
+                phase: SessionPhase::Suspended as i32,
+                suspension: Some(Suspension {
+                    kind,
+                    ..Suspension::default()
+                }),
+                ..SessionStatus::default()
+            });
+
+            assert_eq!(view.suspension_kind, Some(expected));
+        }
+    }
+
+    #[test]
+    fn session_status_view_omits_suspension_kind_outside_suspended_phase() {
+        let idle = SessionStatusView::from(SessionStatus {
+            phase: SessionPhase::Idle as i32,
+            suspension: Some(Suspension {
+                kind: SuspensionKind::Interrupted as i32,
+                ..Suspension::default()
+            }),
+            ..SessionStatus::default()
+        });
+        let suspended_without_detail = SessionStatusView::from(SessionStatus {
+            phase: SessionPhase::Suspended as i32,
+            ..SessionStatus::default()
+        });
+
+        assert_eq!(idle.suspension_kind, None);
+        assert_eq!(suspended_without_detail.suspension_kind, None);
     }
 }

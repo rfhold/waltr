@@ -18,8 +18,8 @@ pub use config::{
 pub use session::{
     ExternalRequestView, InferenceProviderSettingsView, InferenceSettingsMatchView,
     InferenceSettingsView, SelectableAgentView, SessionMetricsView, SessionPhaseView,
-    SessionStatusView, SessionTimelineView, SessionView, TimelineContentView,
-    TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
+    SessionStatusView, SessionSuspensionKindView, SessionTimelineView, SessionView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
 };
 
 #[cfg(test)]
@@ -219,6 +219,7 @@ mod tests {
             CatalogSnapshot::decl(),
             TimestampView::decl(),
             SessionPhaseView::decl(),
+            SessionSuspensionKindView::decl(),
             SessionStatusView::decl(),
             InferenceSettingsMatchView::decl(),
             InferenceProviderSettingsView::decl(),
