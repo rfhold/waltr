@@ -26,6 +26,11 @@ pub mod waltr {
             include!("waltr/resource/v1/waltr.resource.v1.rs");
         }
     }
+    pub mod routine {
+        pub mod v1 {
+            include!("waltr/routine/v1/waltr.routine.v1.rs");
+        }
+    }
     pub mod status {
         pub mod v1 {
             include!("waltr/status/v1/waltr.status.v1.rs");
