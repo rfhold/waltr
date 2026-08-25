@@ -1,7 +1,7 @@
 //! Process-memory session store.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -311,6 +311,8 @@ impl SessionStore for MemorySessionStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::*;

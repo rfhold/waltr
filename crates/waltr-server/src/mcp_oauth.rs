@@ -175,7 +175,7 @@ impl McpOAuthConfig {
             "WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL",
             DEFAULT_ACCESS_TOKEN_TTL,
             Duration::from_secs(1),
-            Duration::from_days(3),
+            Duration::from_hours(72),
         )?;
         let refresh_token_ttl = duration(
             values,
@@ -1367,7 +1367,7 @@ mod tests {
         else {
             panic!("OIDC mode should enable hosted OAuth");
         };
-        assert_eq!(config.access_token_ttl, Duration::from_days(3));
+        assert_eq!(config.access_token_ttl, Duration::from_hours(72));
 
         values.insert("WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL", "259201".to_owned());
         assert!(matches!(

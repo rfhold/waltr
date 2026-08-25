@@ -9,12 +9,7 @@ mod postgresql;
 mod s3;
 mod scylla;
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    error::Error,
-    fmt,
-    future::Future,
-};
+use std::{collections::HashSet, error::Error, fmt, future::Future};
 
 pub use filesystem::FilesystemSessionStore;
 pub use memory::MemorySessionStore;
@@ -33,7 +28,7 @@ use crate::{
 use serde_json::Value;
 
 use super::{
-    SessionCreateRequest,
+    InferenceSettings, SessionCreateRequest,
     types::{
         MetadataSetCondition, MetadataSetOutcome, Revision, SessionId, SessionJournalEvent,
         SessionRecord, SessionSummary,

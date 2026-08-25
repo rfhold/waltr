@@ -1,7 +1,7 @@
 //! OpenDAL-backed session storage.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, OnceLock},
@@ -608,6 +608,7 @@ fn cas_contention(id: &SessionId, attempts: usize) -> SessionStoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use opendal::services;
