@@ -185,13 +185,15 @@ export function sessionView(overrides: Partial<SessionView> = {}): SessionView {
     id,
     agentName: "default",
     revision: 0n,
-    status: { phase: "idle", failedMessage: "", authenticationFailure: null },
+    status: { phase: "idle", suspensionKind: null, failedMessage: "", authenticationFailure: null },
     currentPrompt: null,
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),
     lastActivityAt: timestamp(1_700_000_000),
     inferenceSettings: null,
     metrics: sessionMetricsView(),
+    associations: { taskParentSessionId: null, taskDescription: null, routineInvocationId: null },
+    metadata: {},
     ...overrides,
   };
 }

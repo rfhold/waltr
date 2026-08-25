@@ -113,7 +113,7 @@ export function renderWithAppState(
         id: `session-${nextOperationId}`,
         agentName,
         revision: 0n,
-        status: { phase: "idle", failedMessage: "", authenticationFailure: null },
+        status: { phase: "idle", suspensionKind: null, failedMessage: "", authenticationFailure: null },
         currentPrompt: null,
         createdAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
         updatedAt: { seconds: 1_700_000_000n + BigInt(nextOperationId), nanos: 0 },
@@ -132,6 +132,8 @@ export function renderWithAppState(
           costCurrency: null,
           totalCostMicros: 0n,
         },
+        associations: { taskParentSessionId: null, taskDescription: null, routineInvocationId: null },
+        metadata: {},
       };
       const loading: ClientSnapshot = {
         ...current,

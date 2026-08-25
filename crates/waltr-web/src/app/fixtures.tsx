@@ -127,7 +127,7 @@ function sessionView(id: string): SessionView {
     id,
     agentName: "default",
     revision: 0n,
-    status: { phase: "suspended", failedMessage: "", authenticationFailure: null },
+    status: { phase: "suspended", suspensionKind: "awaitingExternalInput", failedMessage: "", authenticationFailure: null },
     currentPrompt: null,
     createdAt: timestamp(1_700_000_000),
     updatedAt: timestamp(1_700_000_000),
@@ -146,6 +146,8 @@ function sessionView(id: string): SessionView {
       costCurrency: null,
       totalCostMicros: 0n,
     },
+    associations: { taskParentSessionId: null, taskDescription: null, routineInvocationId: null },
+    metadata: {},
   };
 }
 

@@ -27,12 +27,14 @@ import { languageFromFilePath } from "../../web-lib/language";
 import type {
   AuthenticationFailureSnapshot,
   ClientCommand,
+  ClientRoutineInvocationSummary,
   ClientSnapshot,
   ConfigView,
   ExternalRequestView,
   ProviderView,
   SelectableAgentView,
   SessionTemplateOptionView,
+  SessionStatusView,
   SessionTimelineView,
   SessionView,
   TimestampView,
@@ -287,9 +289,10 @@ export function SessionsListRoute() {
                       class="session-row__open"
                       onClick={() => navigate(`/sessions/${encodeURIComponent(session.id)}`)}
                       aria-label={`Open session ${session.id}`}
+                      title={session.id}
                     >
                       <span>
-                        <strong>{session.id}</strong>
+                        <strong>{sessionDisplayLabel(session)}</strong>
                         <small>{formatTimestamp(session.updatedAt) ?? "No updates"}</small>
                       </span>
                       <StatusChit phase={session.status.phase} />
@@ -475,6 +478,7 @@ function SessionDetail(props: { session: SessionView }) {
   let messageTextarea: HTMLTextAreaElement | undefined;
   let highlightLayer: HTMLDivElement | undefined;
   let registeredTimelineSession: string | undefined;
+  let registeredRoutineInvocationSession: string | undefined;
   let templateSearchDebounce: number | undefined;
   let previousTimelineItemKeys: string[] = [];
   let initialScrollSession: string | undefined;
@@ -498,6 +502,8 @@ function SessionDetail(props: { session: SessionView }) {
     return new Set(lastByTurn.values());
   });
   const latestMetrics = createMemo(() => latestTurnMetrics(items()));
+  const subtasks = createMemo(() => sessions.sessions().filter((session) => session.associations?.taskParentSessionId === props.session.id));
+  const routineInvocations = createMemo(() => app.snapshot()?.routines.sessionHistories?.[props.session.id]?.recent ?? []);
   const testKeepMountedIndexes = createMemo(() => import.meta.env.MODE === "test" ? items().map((_, index) => index) : undefined);
   const working = createMemo(() => active() && !hasOpenExternalPrompt(items()));
   const importantStatus = createMemo(() => sessionImportantStatus(props.session, working(), timeline()?.watch.error));
@@ -575,6 +581,27 @@ function SessionDetail(props: { session: SessionView }) {
     })();
   });
 
+  createEffect(() => {
+    const sessionId = props.session.id;
+
+    if (!app.clientLoaded() || !app.systemReady() || registeredRoutineInvocationSession === sessionId) {
+      return;
+    }
+
+    if (registeredRoutineInvocationSession) {
+      dispatchSessionWatchCommand(app.dispatch, {
+        type: "releaseSessionRoutineInvocationWatchInterest",
+        sessionId: registeredRoutineInvocationSession,
+      });
+    }
+
+    registeredRoutineInvocationSession = sessionId;
+    untrack(() => dispatchSessionWatchCommand(app.dispatch, {
+      type: "registerSessionRoutineInvocationWatchInterest",
+      sessionId,
+    }));
+  });
+
   createEffect(on(activeResourceToken, (token) => {
     cancelTemplateSearchDebounce();
     setTemplateSearchError(undefined);
@@ -592,14 +619,19 @@ function SessionDetail(props: { session: SessionView }) {
     cancelTemplateSearchDebounce();
     cancelScheduledTimelineViewportUpdate();
     cancelScheduledHistoryShiftClear();
-    if (!registeredTimelineSession) {
-      return;
+    if (registeredTimelineSession) {
+      dispatchSessionWatchCommand(app.dispatch, {
+        type: "releaseSessionTimelineWatchInterest",
+        sessionId: registeredTimelineSession,
+      });
     }
 
-    dispatchSessionWatchCommand(app.dispatch, {
-      type: "releaseSessionTimelineWatchInterest",
-      sessionId: registeredTimelineSession,
-    });
+    if (registeredRoutineInvocationSession) {
+      dispatchSessionWatchCommand(app.dispatch, {
+        type: "releaseSessionRoutineInvocationWatchInterest",
+        sessionId: registeredRoutineInvocationSession,
+      });
+    }
   });
 
   createEffect(() => {
@@ -994,6 +1026,7 @@ function SessionDetail(props: { session: SessionView }) {
 
   return (
     <div class="sessions__detail-page">
+      <div class="sessions__detail-content">
       <div
         class="sessions__detail-main"
         ref={timelineScroll}
@@ -1148,12 +1181,18 @@ function SessionDetail(props: { session: SessionView }) {
       </form>
       <SessionDetailStatusBar
         session={props.session}
-        contextTokens={latestContextTokens(latestMetrics())}
         onEditInferenceSettings={() => setEditingInferenceSettings(true)}
         onEditAgent={() => {
           setEditingAgent(true);
           void requestAgentsIfNeeded(app);
         }}
+      />
+      </div>
+      <SessionContextSidebar
+        session={props.session}
+        contextTokens={latestContextTokens(latestMetrics())}
+        subtasks={subtasks()}
+        routineInvocations={routineInvocations()}
       />
       <Show when={editingInferenceSettings()}>
         <SessionInferenceSettingsDialog session={props.session} onClose={() => setEditingInferenceSettings(false)} />
@@ -2920,6 +2959,94 @@ type QuestionModel = {
   custom: boolean;
 };
 
+function SessionContextSidebar(props: {
+  session: SessionView;
+  contextTokens: bigint;
+  subtasks: SessionView[];
+  routineInvocations: ClientRoutineInvocationSummary[];
+}) {
+  return (
+    <aside class="sessions__context" aria-label="Session context">
+      <h2>Context</h2>
+      <section aria-labelledby="session-context-usage">
+        <h3 id="session-context-usage">Usage</h3>
+        <dl class="sessions__context-usage" aria-label="Session token and cost totals">
+          <div><dt>Ctx </dt><dd>{formatTokenCount(props.contextTokens)}</dd></div>
+          <div><dt>Cache </dt><dd>{formatCacheRate(props.session.metrics.cacheReadTokens, props.session.metrics.totalInputTokens)} / {formatCacheRate(props.session.metrics.cacheWriteTokens, props.session.metrics.totalInputTokens)}</dd></div>
+          <div><dt>Cost </dt><dd>{formatCostMicros(props.session.metrics.totalCostMicros, props.session.metrics.costCurrency)}</dd></div>
+        </dl>
+      </section>
+      <section aria-labelledby="session-context-subtasks">
+        <h3 id="session-context-subtasks">Subtasks</h3>
+        <Show when={props.subtasks.length > 0} fallback={<p class="sessions__context-empty">No subtasks.</p>}>
+          <ul class="sessions__context-list">
+            <For each={props.subtasks}>{(session) => (
+              <li>
+                <A href={`/sessions/${encodeURIComponent(session.id)}`}>{session.associations?.taskDescription || sessionDisplayLabel(session)}</A>
+                <ContextStatus tone={sessionStatusTone(session.status)} label={sessionStatusLabel(session.status)} />
+              </li>
+            )}</For>
+          </ul>
+        </Show>
+      </section>
+      <section aria-labelledby="session-context-routines">
+        <h3 id="session-context-routines">Routines</h3>
+        <Show when={props.routineInvocations.length > 0} fallback={<p class="sessions__context-empty">No Routine invocations.</p>}>
+          <ul class="sessions__context-list">
+            <For each={props.routineInvocations}>{(invocation) => (
+              <li>
+                <A href={`/routines/${encodeURIComponent(invocation.invocationId)}`}>{invocation.routineName}</A>
+                <ContextStatus tone={routineStatusTone(invocation.status)} label={humanizeStatus(invocation.status)} />
+              </li>
+            )}</For>
+          </ul>
+        </Show>
+      </section>
+    </aside>
+  );
+}
+
+function ContextStatus(props: { tone: "green" | "red" | "grey"; label: string }) {
+  return (
+    <span class="sessions__context-status">
+      <span class={`sessions__context-status-dot sessions__context-status-dot--${props.tone}`} aria-hidden="true" />
+      {props.label}
+    </span>
+  );
+}
+
+function sessionStatusTone(status: SessionStatusView): "green" | "red" | "grey" {
+  if (status.phase === "failed" || (status.phase === "suspended" && status.suspensionKind === "interrupted")) {
+    return "red";
+  }
+  if (["buildingRequest", "streamingProvider", "retryingProvider", "evaluatingToolCall", "runningTool"].includes(status.phase)
+    || (status.phase === "suspended" && ["awaitingToolResults", "awaitingExternalInput"].includes(status.suspensionKind ?? ""))) {
+    return "green";
+  }
+  return "grey";
+}
+
+function sessionStatusLabel(status: SessionStatusView) {
+  if (status.phase === "suspended" && status.suspensionKind) {
+    if (status.suspensionKind === "unspecified" || status.suspensionKind === "unknown") {
+      return `Suspended (${status.suspensionKind})`;
+    }
+    return humanizeStatus(status.suspensionKind);
+  }
+  return humanizeStatus(status.phase);
+}
+
+function routineStatusTone(status: string): "green" | "red" | "grey" {
+  if (status === "admitted" || status === "running") return "green";
+  if (status === "failed" || status === "interrupted") return "red";
+  return "grey";
+}
+
+function humanizeStatus(status: string) {
+  const words = status.replace(/([a-z])([A-Z])/g, "$1 $2");
+  return words.charAt(0).toLocaleUpperCase() + words.slice(1).toLocaleLowerCase();
+}
+
 function normalizeQuestion(value: unknown): QuestionModel {
   const record = asRecord(value) ?? {};
   return {
@@ -2939,7 +3066,6 @@ function normalizeQuestion(value: unknown): QuestionModel {
 
 function SessionDetailStatusBar(props: {
   session: SessionView;
-  contextTokens: bigint;
   onEditInferenceSettings: () => void;
   onEditAgent: () => void;
 }) {
@@ -3019,17 +3145,6 @@ function SessionDetailStatusBar(props: {
       <Show when={reasoningEffortError()}>
         {(message) => <span class="sessions__detail-status-error">{message()}</span>}
       </Show>
-      <span class="sessions__detail-metrics" aria-label="Session token and cost totals">
-        <span class="sessions__detail-status-item" title="Latest reported input + output tokens">
-          <strong>Ctx</strong> {formatTokenCount(props.contextTokens)}
-        </span>
-        <span class="sessions__detail-status-item">
-          <strong>Cache</strong> {formatCacheRate(props.session.metrics.cacheReadTokens, props.session.metrics.totalInputTokens)} / {formatCacheRate(props.session.metrics.cacheWriteTokens, props.session.metrics.totalInputTokens)}
-        </span>
-        <span class="sessions__detail-status-item">
-          <strong>Cost</strong> {formatCostMicros(props.session.metrics.totalCostMicros, props.session.metrics.costCurrency)}
-        </span>
-      </span>
       <SessionDeleteAction session={props.session} compact />
     </footer>
   );
@@ -3172,17 +3287,19 @@ function formatTokenCount(value: bigint) {
 }
 
 function formatCacheRate(part: bigint, total: bigint) {
-  if (total === 0n) {
+  const numericTotal = Number(total);
+  if (numericTotal === 0) {
     return "0%";
   }
-  return `${((Number(part) / Number(total)) * 100).toFixed(1)}%`;
+  return `${((Number(part) / numericTotal) * 100).toFixed(1)}%`;
 }
 
 function formatCostMicros(micros: bigint, currency: string | null) {
-  if (micros === 0n) {
+  const numericMicros = Number(micros);
+  if (numericMicros === 0) {
     return "-";
   }
-  const amount = Number(micros) / 1_000_000;
+  const amount = numericMicros / 1_000_000;
   return `${currency ?? "USD"} ${amount.toFixed(6)}`;
 }
 
@@ -3398,6 +3515,11 @@ function useSessionsRoute() {
 
 function sortSessionsByUpdated(sessions: readonly SessionView[]) {
   return [...sessions].sort((left, right) => timestampMillis(right.updatedAt) - timestampMillis(left.updatedAt));
+}
+
+function sessionDisplayLabel(session: SessionView) {
+  const title = session.metadata.title;
+  return typeof title === "string" && title.length > 0 ? title : session.id;
 }
 
 function timestampMillis(timestamp: TimestampView | null) {
