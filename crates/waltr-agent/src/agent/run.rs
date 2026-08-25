@@ -8,8 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::PermissionPolicy;
 
 use super::session::{
-    EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId, SessionListBroadcaster,
-    SessionStore, SessionTimelineBroadcaster,
+    EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId, SessionRunContext, SessionStore,
 };
 use super::{AgentRuntime, AgentTool, BoxAgentTimelineStream, r#loop::AgentLoopState};
 use crate::middleware::{
@@ -27,8 +26,7 @@ where
     input: ResumeInput,
     session_id: SessionId,
     session_store: S,
-    session_broadcaster: Option<SessionListBroadcaster>,
-    timeline_broadcaster: Option<SessionTimelineBroadcaster>,
+    session_run_context: Option<SessionRunContext>,
     system_prompt: SystemPromptOverride,
     extra_tools: Vec<AgentTool>,
     cancellation_token: Option<CancellationToken>,
@@ -42,8 +40,7 @@ impl AgentRunBuilder {
             input: ResumeInput::Prompt(prompt),
             session_id: SessionId::new("ephemeral"),
             session_store: MemorySessionStore::new(),
-            session_broadcaster: None,
-            timeline_broadcaster: None,
+            session_run_context: None,
             system_prompt: SystemPromptOverride::default(),
             extra_tools: Vec::new(),
             cancellation_token: None,
@@ -72,8 +69,7 @@ impl AgentRunBuilder {
             input,
             session_id,
             session_store,
-            session_broadcaster: None,
-            timeline_broadcaster: None,
+            session_run_context: None,
             system_prompt: SystemPromptOverride::default(),
             extra_tools: Vec::new(),
             cancellation_token: None,
@@ -121,19 +117,8 @@ where
         self
     }
 
-    pub(crate) fn with_timeline_broadcaster(
-        mut self,
-        timeline_broadcaster: SessionTimelineBroadcaster,
-    ) -> Self {
-        self.timeline_broadcaster = Some(timeline_broadcaster);
-        self
-    }
-
-    pub(crate) fn with_session_broadcaster(
-        mut self,
-        session_broadcaster: SessionListBroadcaster,
-    ) -> Self {
-        self.session_broadcaster = Some(session_broadcaster);
+    pub(crate) fn with_session_run_context(mut self, context: SessionRunContext) -> Self {
+        self.session_run_context = Some(context);
         self
     }
 
@@ -149,8 +134,7 @@ where
             input,
             session_id: _,
             session_store: _,
-            session_broadcaster,
-            timeline_broadcaster,
+            session_run_context,
             system_prompt,
             extra_tools,
             cancellation_token,
@@ -161,8 +145,7 @@ where
             input,
             session_id: id,
             session_store: store,
-            session_broadcaster,
-            timeline_broadcaster,
+            session_run_context,
             system_prompt,
             extra_tools,
             cancellation_token,
@@ -186,8 +169,7 @@ where
             input,
             session_id,
             session_store,
-            session_broadcaster,
-            timeline_broadcaster,
+            session_run_context,
             system_prompt,
             extra_tools,
             cancellation_token,
@@ -229,8 +211,7 @@ where
             template_base_dir,
             session_id,
             session_store,
-            session_broadcaster,
-            timeline_broadcaster,
+            session_run_context,
             cancellation_token: cancellation_token.unwrap_or_default(),
         }
     }
@@ -247,8 +228,7 @@ where
             .field("runtime", &self.runtime)
             .field("prompt", &self.prompt)
             .field("system_prompt", &self.system_prompt)
-            .field("session_broadcaster", &self.session_broadcaster.is_some())
-            .field("timeline_broadcaster", &self.timeline_broadcaster.is_some())
+            .field("session_run_context", &self.session_run_context.is_some())
             .field("cancellation_token", &self.cancellation_token.is_some())
             .finish()
     }

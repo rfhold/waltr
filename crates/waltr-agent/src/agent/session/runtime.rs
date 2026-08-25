@@ -22,21 +22,31 @@ use serde_json::Value;
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
     ExternalResponse, InferenceSettings, MetadataSetCondition, MetadataSetOutcome, PendingWork,
-    PendingWorkStatus, ResumeInput, SessionCreateRequest, SessionId, SessionJournalEvent,
-    SessionListBroadcaster, SessionListEvent, SessionRecord,
-    SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
-    SessionTimelineBroadcaster, Suspension,
+    PendingWorkStatus, ResumeInput, SessionCreateRequest, SessionId, SessionIncarnation,
+    SessionJournalEvent, SessionRecord, SessionRollbackTarget, SessionRunContext, SessionSnapshot,
+    SessionStatus, SessionStore, SessionSummary, Suspension,
 };
 
 /// Runtime facade for durable session resume operations.
-#[derive(Debug)]
 pub struct AgentSessionRuntime<'a, S>
 where
     S: SessionStore + ?Sized,
 {
     store: &'a S,
-    sessions: Option<SessionListBroadcaster>,
-    timeline: Option<SessionTimelineBroadcaster>,
+    run_context: Option<SessionRunContext>,
+    session_incarnation: Option<SessionIncarnation>,
+}
+
+impl<S> std::fmt::Debug for AgentSessionRuntime<'_, S>
+where
+    S: SessionStore + ?Sized,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentSessionRuntime")
+            .field("run_context", &self.run_context.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a, S> AgentSessionRuntime<'a, S>
@@ -47,21 +57,18 @@ where
     pub const fn new(store: &'a S) -> Self {
         Self {
             store,
-            sessions: None,
-            timeline: None,
+            run_context: None,
+            session_incarnation: None,
         }
     }
 
-    pub(crate) fn with_session_broadcaster(mut self, sessions: SessionListBroadcaster) -> Self {
-        self.sessions = Some(sessions);
-        self
-    }
-
-    pub(crate) fn with_timeline_broadcaster(
+    pub(crate) fn with_session_run_context(
         mut self,
-        timeline: SessionTimelineBroadcaster,
+        context: SessionRunContext,
+        incarnation: SessionIncarnation,
     ) -> Self {
-        self.timeline = Some(timeline);
+        self.run_context = Some(context);
+        self.session_incarnation = Some(incarnation);
         self
     }
 
@@ -83,7 +90,11 @@ where
     ///
     /// Returns an error when the session does not exist or the store fails.
     pub async fn load_session(&self, id: &SessionId) -> Result<SessionRecord> {
-        self.store.load(id).await.map_err(session_store_error)
+        let record = self.store.load(id).await.map_err(session_store_error)?;
+        if let (Some(context), Some(incarnation)) = (&self.run_context, self.session_incarnation) {
+            context.register_loaded_summary(incarnation, record.summary());
+        }
+        Ok(record)
     }
 
     /// Delete a durable session record if present.
@@ -685,8 +696,8 @@ where
             .append_timeline(&id, record.revision, events)
             .await
             .map_err(session_store_error)?;
-        if let Some(timeline) = &self.timeline {
-            timeline.publish_all(assigned);
+        if let Some(context) = &self.run_context {
+            context.timeline().publish_all(assigned);
         }
         let record = self.load_session(&id).await?;
         self.publish_session_summary(&record);
@@ -694,10 +705,11 @@ where
     }
 
     fn publish_session_summary(&self, record: &SessionRecord) {
-        if let Some(sessions) = &self.sessions {
-            sessions.publish(SessionListEvent::Upsert(record.summary()));
+        if let (Some(context), Some(incarnation)) = (&self.run_context, self.session_incarnation) {
+            context.publish_run_summary(incarnation, record.summary());
         }
     }
+
 }
 
 fn validate_permission_patterns(
