@@ -266,7 +266,7 @@ where
         summary: SessionSummary,
         config: &Configuration,
         default_agent_name: &str,
-    ) -> waltr::grpc::waltr::session::v1::SessionSummary {
+    ) -> Result<waltr::grpc::waltr::session::v1::SessionSummary, Status> {
         session_summary_to_proto(summary, config, default_agent_name)
     }
 
@@ -396,7 +396,7 @@ where
                 session.record.summary(),
                 &config,
                 &default_agent_name,
-            )),
+            )?),
         }))
     }
 
@@ -414,7 +414,7 @@ where
             .map_err(agent_error_to_status)?
             .into_iter()
             .map(|summary| Self::summary_to_proto(summary, &config, catalog.default_agent_name()))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Response::new(ListSessionsResponse { sessions }))
     }
@@ -500,7 +500,7 @@ where
                 session.record.summary(),
                 &config,
                 catalog.default_agent_name(),
-            )),
+            )?),
         }))
     }
 
@@ -530,7 +530,7 @@ where
                 session.record.summary(),
                 &config,
                 catalog.default_agent_name(),
-            )),
+            )?),
         }))
     }
 
@@ -550,7 +550,7 @@ where
             .map_err(agent_error_to_status)?
             .into_iter()
             .map(|summary| Self::summary_to_proto(summary, &config, catalog.default_agent_name()))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         let snapshot = Ok(WatchSessionsResponse {
             sequence,
             event: Some(watch_sessions_response::Event::Snapshot(
@@ -571,7 +571,7 @@ where
                             session,
                             &current_config,
                             catalog.default_agent_name(),
-                        ))
+                        )?)
                     }
                     SessionListEvent::Deleted(id) => {
                         watch_sessions_response::Event::DeletedId(id.as_str().to_owned())
@@ -892,7 +892,7 @@ where
                 session.record.summary(),
                 &config,
                 catalog.default_agent_name(),
-            )),
+            )?),
             truncation: Some(TimelineTruncation {
                 session_id: session_id.as_str().to_owned(),
                 after_cursor,

@@ -450,7 +450,8 @@ fn project_summary(
             "last_activity_at_ms": unix_millis(summary.last_activity_at)
         },
         "inference": summary.inference_settings.as_ref().map(project_inference),
-        "metrics": summary.metrics
+        "metrics": summary.metrics,
+        "metadata": &summary.metadata_values
     })
 }
 
@@ -781,6 +782,23 @@ mod tests {
             true,
             false,
         ));
+    }
+
+    #[test]
+    fn hosted_session_projection_includes_complete_metadata() {
+        let mut record = waltr_agent::SessionRecord::new("session-metadata");
+        record.set_metadata_value("title", json!("Projected title"));
+        record.set_metadata_value(
+            "unknown",
+            json!({ "null": null, "bool": true, "array": [1, "two"] }),
+        );
+
+        let summary = project_summary(&record.summary(), None);
+        let session = project_session(&record, None);
+
+        assert_eq!(summary["metadata"]["title"], "Projected title");
+        assert_eq!(summary["metadata"]["unknown"]["null"], Value::Null);
+        assert_eq!(session["metadata"], summary["metadata"]);
     }
 
     #[tokio::test]
