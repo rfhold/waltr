@@ -1,7 +1,7 @@
 //! S3-backed session storage.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex, OnceLock, Weak},
 };
 

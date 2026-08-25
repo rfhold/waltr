@@ -1766,20 +1766,6 @@ fn tool_call_timeline_event(
     PendingTimelineEvent::tool_call(session_id.clone(), turn, PendingTimelineItemId::New, call)
 }
 
-fn user_prompt_timeline_event(
-    session_id: &SessionId,
-    turn: u64,
-    _prompt_index: usize,
-    prompt: String,
-) -> PendingTimelineEvent {
-    PendingTimelineEvent::user_text_snapshot(
-        session_id.clone(),
-        turn,
-        PendingTimelineItemId::New,
-        prompt,
-    )
-}
-
 fn provider_metrics_timeline_event(
     session_id: &SessionId,
     turn: u64,

@@ -1,6 +1,6 @@
 //! Scylla-backed session storage.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use scylla::client::session::Session;
 use scylla::value::CqlValue;

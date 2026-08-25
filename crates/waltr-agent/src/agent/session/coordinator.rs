@@ -28,8 +28,8 @@ use super::{
     AgentSessionRuntime, AgentSessionRuntimeFactory, CompletedSessionCapture, ExternalResponse,
     InferenceSettings, MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy,
     RunOutcomeSender, RunResult, SessionCaptureError, SessionCaptureLimits, SessionControl,
-    SessionCreateRequest, SessionId, SessionListSubscription, SessionRunContext, SessionStore,
-    SessionSummary, SessionTimelineBroadcaster, SessionTimelineSubscription,
+    SessionCreateRequest, SessionId, SessionListSubscription, SessionRunContext, SessionStatus,
+    SessionStore, SessionSummary, SessionTimelineBroadcaster, SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};

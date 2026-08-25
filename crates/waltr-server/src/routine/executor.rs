@@ -474,15 +474,15 @@ pub(super) async fn execute_task(
         // Ownership precedes every host await that can create or submit work. Cancellation may
         // drop an ambiguous host future, but final shutdown interruption still targets this ID.
         let child = ActiveChild::register(child_id.clone(), active_children, host).await;
-        let start = captured.map_or_else(
-            || SessionStart::Fresh {
-                messages: vec![initial_message.clone()],
+        let start = match captured {
+            None => SessionStart::Fresh {
+                messages: vec![initial_message],
             },
-            |capture| SessionStart::Copy {
+            Some(capture) => SessionStart::Copy {
                 copy: capture.copy.clone(),
                 messages: vec![initial_message],
             },
-        );
+        };
         let created = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(shutdown_error("child creation")),

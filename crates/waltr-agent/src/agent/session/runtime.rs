@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use serde_json::Value;
 

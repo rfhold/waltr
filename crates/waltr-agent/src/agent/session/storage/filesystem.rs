@@ -1,7 +1,6 @@
 //! Filesystem-backed session storage.
 
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     path::PathBuf,
 };
@@ -217,7 +216,7 @@ impl SessionStore for FilesystemSessionStore {
                     let id = record.id.clone();
                     store.with_session_lock(&id, || {
                         if store.path(&id).exists() {
-                            return Err(SessionStoreError::AlreadyExists { id });
+                            return Err(SessionStoreError::AlreadyExists { id: id.clone() });
                         }
                         store.save_sync(&record)?;
                         Ok(record)
