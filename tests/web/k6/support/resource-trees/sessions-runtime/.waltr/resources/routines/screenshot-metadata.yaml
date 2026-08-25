@@ -1,0 +1,51 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: screenshot-metadata
+spec:
+  description: Apply deterministic session metadata for Routine browser screenshots.
+  triggers:
+    - name: manual
+      manual:
+        displayName: Prepare screenshot metadata
+        scope: session
+        inputs: []
+  tasks:
+    - name: mark-screenshot-ready
+      taskSpec:
+        action:
+          sessionMetadata:
+            sessionId: $(trigger.session.id)
+            mutations:
+              - operation: set
+                key: screenshotReady
+                value: $(trigger.session.id)
+                ifAbsent: true
+        results:
+          - name: metadata-added
+            type: boolean
+            value: $(action.sessionMetadata.changed)
+
+    - name: mark-layout-verified
+      runAfter:
+        - mark-screenshot-ready
+      taskSpec:
+        action:
+          sessionMetadata:
+            sessionId: $(trigger.session.id)
+            mutations:
+              - operation: set
+                key: screenshotLayout
+                value: $(trigger.session.id)
+                ifAbsent: true
+        results:
+          - name: layout-added
+            type: boolean
+            value: $(action.sessionMetadata.changed)
+  results:
+    - name: screenshot-ready
+      type: boolean
+      value: $(tasks.mark-screenshot-ready.results.metadata-added)
+    - name: layout-verified
+      type: boolean
+      value: $(tasks.mark-layout-verified.results.layout-added)

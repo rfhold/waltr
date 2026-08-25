@@ -46,8 +46,10 @@ const RESOURCE_CATEGORIES = [
   "features",
   "permissions",
   "agents",
+  "routines",
 ];
 const RESOURCE_REMOVAL_ORDER = [
+  "routines",
   "agents",
   "features",
   "permissions",
@@ -513,6 +515,9 @@ function browserScriptsForPhase(mode, live, selectedScript, phase) {
     scripts.splice(2, 0, "tests/web/k6/sessions/prompts.browser.js");
   } else if (!live && phase === "oidc") {
     scripts.push("tests/web/k6/sessions/mcp-oauth.browser.js");
+  }
+  if (!live && phase === "disabled") {
+    scripts.push("tests/web/k6/routines/routines.browser.js");
   }
   if (!live && phase === "oidc") {
     scripts.unshift(
@@ -1964,7 +1969,8 @@ function fixtureForBrowserScript(browserScript) {
 }
 
 export function fixtureNameForBrowserScript(browserScript) {
-  if (browserScript === "tests/web/k6/sessions/sessions.browser.js") {
+  if (browserScript === "tests/web/k6/sessions/sessions.browser.js"
+    || browserScript === "tests/web/k6/routines/routines.browser.js") {
     return "sessions-runtime";
   }
   if (browserScript === "tests/web/k6/sessions/mcp-oauth.browser.js") {
@@ -2088,8 +2094,8 @@ function publishResourceFile(sourcePath, targetPath, runtime) {
 const COMPOSE_RESOURCE_PUBLISH_SCRIPT = `
 source_root=$1
 target_root=/data/.waltr/resources
-categories=(providers mcp-servers defaults features permissions agents)
-removal_order=(agents features permissions defaults mcp-servers providers)
+categories=(providers mcp-servers defaults features permissions agents routines)
+removal_order=(routines agents features permissions defaults mcp-servers providers)
 shopt -s nullglob dotglob
 
 ensure_directory() {
