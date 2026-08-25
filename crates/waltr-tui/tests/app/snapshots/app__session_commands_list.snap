@@ -1,0 +1,28 @@
+---
+source: crates/waltr-tui/tests/app/sessions.rs
+expression: render_app(&app)
+---
+" N                                                                              "
+" w    Session commands                                                          "
+"                                                                                "
+"     Search commands:                                                           "
+"                                                                                "
+"     > Generic command  required: direction                                     "
+"       Runs declared work                                                       "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" ▎                                                                              "
+" ▎                                                                              "
+" ▎                                                                              "
+" ▎                                                                              "
+" ▎    Enter select  Esc close                                                   "
+"                                                                                "
+" Esc  back    Ctrl-X q  quit                                        Waltr  ready "
+"                                                                                "

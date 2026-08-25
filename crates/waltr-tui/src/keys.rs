@@ -9,6 +9,8 @@ pub enum KeyCommand {
     None,
     /// Escape was pressed.
     Escape,
+    /// Open manual commands for the active session.
+    SessionCommands,
     /// The configured leader key was pressed.
     Leader,
     /// A key was pressed while the leader was armed.
@@ -56,6 +58,10 @@ pub fn key_command(key: KeyEvent, leader_armed: bool) -> KeyCommand {
 
     if key.code == KeyCode::Esc {
         return KeyCommand::Escape;
+    }
+
+    if matches!(key.code, KeyCode::Char('p')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return KeyCommand::SessionCommands;
     }
 
     KeyCommand::None
