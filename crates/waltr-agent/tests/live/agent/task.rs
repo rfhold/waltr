@@ -61,14 +61,9 @@ async fn run_live_task_tool_visibility(
         )));
         let sessions = task_sessions(model.clone(), Arc::clone(&provider), case.max_depth);
         let session_id = SessionId::new(format!("live-task-depth-{}", case.max_depth));
-        sessions
-            .create_with_id_and_inference_settings(
-                session_id.clone(),
-                Some(inference_settings(&model)),
-                None,
-                std::collections::BTreeMap::default(),
-            )
-            .await?;
+        let mut request = waltr_agent::SessionCreateRequest::new(session_id.clone());
+        request.inference_settings = Some(inference_settings(&model));
+        sessions.create(request).await?;
         let submission = sessions
             .submit_prompt(
                 session_id,

@@ -13,7 +13,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
+        SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -151,50 +152,11 @@ impl FilesystemSessionStore {
 impl SessionStore for FilesystemSessionStore {
     fn create(
         &self,
-        id: SessionId,
+        request: SessionCreateRequest,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::new(id);
-            if store.path(&record.id).exists() {
-                return Err(SessionStoreError::AlreadyExists { id: record.id });
-            }
-            store.save_sync(&record)?;
-            Ok(record)
-        }
-    }
-
-    fn create_with_metadata_values(
-        &self,
-        id: SessionId,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_metadata_values(id, metadata_values);
-            if store.path(&record.id).exists() {
-                return Err(SessionStoreError::AlreadyExists { id: record.id });
-            }
-            store.save_sync(&record)?;
-            Ok(record)
-        }
-    }
-
-    fn create_with_inference_settings(
-        &self,
-        id: SessionId,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_inference_settings_and_metadata_values(
-                id,
-                inference_settings,
-                agent_definition,
-                metadata_values,
-            );
+            let record = request.materialize();
             if store.path(&record.id).exists() {
                 return Err(SessionStoreError::AlreadyExists { id: record.id });
             }
@@ -382,7 +344,10 @@ mod tests {
         let first = FilesystemSessionStore::new(temp.path());
         let second = FilesystemSessionStore::new(temp.path());
         let id = SessionId::new("race");
-        first.create(id.clone()).await.unwrap();
+        first
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let (append, metadata) = tokio::join!(
             first.append_journal(
@@ -412,7 +377,10 @@ mod tests {
         let store = FilesystemSessionStore::new(temp.path());
         let id = SessionId::new("session-delete");
 
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         store.delete(&id).await.unwrap();
         store.delete(&id).await.unwrap();
         store
@@ -428,7 +396,10 @@ mod tests {
     async fn wipe_removes_valid_and_invalid_raw_records_and_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let store = FilesystemSessionStore::new(temp.path());
-        store.create(SessionId::new("valid")).await.unwrap();
+        store
+            .create(SessionCreateRequest::new("valid"))
+            .await
+            .unwrap();
         fs::write(temp.path().join("legacy.json"), b"not a session record").unwrap();
 
         store.wipe().await.unwrap();
@@ -443,9 +414,15 @@ mod tests {
         let store = FilesystemSessionStore::new(temp.path());
         let first = SessionId::new("session-first");
         let second = SessionId::new("session-second");
-        let first_record = store.create(first.clone()).await.unwrap();
+        let first_record = store
+            .create(SessionCreateRequest::new(first.clone()))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        store.create(second.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(second.clone()))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         store
             .append_journal(

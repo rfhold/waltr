@@ -55,13 +55,10 @@ async fn task_tool_sync_mode_returns_child_assistant_text() -> waltr_agent::Resu
     let runs = task_sessions(provider.clone(), 1);
     let parent_id = SessionId::new("ephemeral");
     let agent_definition = task_agent_definition();
-    runs.create_with_id_and_inference_settings(
-        parent_id.clone(),
-        Some(test_inference_settings()),
-        Some(agent_definition.clone()),
-        std::collections::BTreeMap::default(),
-    )
-    .await?;
+    let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
+    request.inference_settings = Some(test_inference_settings());
+    request.agent_definition = Some(agent_definition.clone());
+    runs.create(request).await?;
 
     let run = runs
         .submit_prompt(parent_id, "spawn child", RunConflictPolicy::ReplaceActive)
@@ -165,13 +162,9 @@ async fn task_tool_default_depth_blocks_subagents_from_spawning_tasks() -> waltr
     )));
     let runs = task_sessions(provider.clone(), 1);
     let parent_id = SessionId::new("ephemeral");
-    runs.create_with_id_and_inference_settings(
-        parent_id.clone(),
-        Some(test_inference_settings()),
-        None,
-        std::collections::BTreeMap::default(),
-    )
-    .await?;
+    let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
+    request.inference_settings = Some(test_inference_settings());
+    runs.create(request).await?;
 
     let run = runs
         .submit_prompt(parent_id, "root spawn", RunConflictPolicy::ReplaceActive)
@@ -248,13 +241,9 @@ async fn task_tool_max_depth_allows_configured_nested_subagent() -> waltr_agent:
     )));
     let runs = task_sessions(provider.clone(), 2);
     let parent_id = SessionId::new("ephemeral");
-    runs.create_with_id_and_inference_settings(
-        parent_id.clone(),
-        Some(test_inference_settings()),
-        None,
-        std::collections::BTreeMap::default(),
-    )
-    .await?;
+    let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
+    request.inference_settings = Some(test_inference_settings());
+    runs.create(request).await?;
 
     let run = runs
         .submit_prompt(
@@ -288,22 +277,18 @@ async fn task_tool_async_mode_returns_generated_task_ids() -> waltr_agent::Resul
 
     let parent_id = SessionId::new("parent");
     let parent_definition = task_agent_definition();
-    runs.create_with_id_and_inference_settings(
-        parent_id.clone(),
-        Some(test_inference_settings()),
-        Some(parent_definition.clone()),
-        std::collections::BTreeMap::default(),
-    )
-    .await?;
+    let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
+    request.inference_settings = Some(test_inference_settings());
+    request.agent_definition = Some(parent_definition.clone());
+    runs.create(request).await?;
     let existing_child_id = SessionId::new("task_parent_0_task-2");
     let existing_definition = basic_agent_definition("existing");
-    runs.create_with_id_and_inference_settings(
-        existing_child_id.clone(),
-        Some(test_inference_settings()),
-        Some(existing_definition.clone()),
-        std::collections::BTreeMap::from([("existing".to_owned(), json!(true))]),
-    )
-    .await?;
+    let mut request = waltr_agent::SessionCreateRequest::new(existing_child_id.clone());
+    request.inference_settings = Some(test_inference_settings());
+    request.agent_definition = Some(existing_definition.clone());
+    request.metadata_values =
+        std::collections::BTreeMap::from([("existing".to_owned(), json!(true))]);
+    runs.create(request).await?;
     let parent_run = runs
         .submit_prompt(
             parent_id.clone(),
@@ -426,13 +411,9 @@ async fn async_task_callbacks_coalesce_while_parent_is_active() -> waltr_agent::
     let runs = task_sessions(provider.clone(), 1);
 
     let parent_id = SessionId::new("parent");
-    runs.create_with_id_and_inference_settings(
-        parent_id.clone(),
-        Some(test_inference_settings()),
-        None,
-        std::collections::BTreeMap::default(),
-    )
-    .await?;
+    let mut request = waltr_agent::SessionCreateRequest::new(parent_id.clone());
+    request.inference_settings = Some(test_inference_settings());
+    runs.create(request).await?;
     let parent_run = runs
         .submit_prompt(
             parent_id.clone(),

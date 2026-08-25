@@ -15,12 +15,14 @@ use waltr_agent::{
     CHANNEL_TOOL_RESULT, CHANNEL_USER_TEXT, CompletionEvent, CompletionReplayItem,
     CompletionRequest, ExternalRequestId, ExternalRequestKind, ExternalResponse,
     FileCredentialStore, FilesystemPromptConfig, InferenceProviderSettings, InferenceSettings,
-    LlmError, LlmStream, McpResolvedConnection, MemorySessionStore, ModelApi, ModelRef, ProviderId,
-    ProviderRetryConfig, ProviderTurnMetadata, ResumeInput, SessionCoordinator, SessionStatus,
-    SessionStore, SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
-    SkillsConfig, ThinkingBlock, ThinkingBlockKind, ThinkingDelta, TimelineContent,
-    TimelineEventKind, TimelineQuery, TimelineStatus, TokenUsage, ToolCall, ToolDefinition,
-    TurnItem, tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
+    LlmError, LlmStream, McpResolvedConnection, MemorySessionStore, ModelApi, ModelRef,
+    PendingTimelineEvent, PendingTimelineItemId, ProviderId, ProviderRetryConfig,
+    ProviderTurnMetadata, ResumeInput, SessionCoordinator, SessionCopy, SessionCreateRequest,
+    SessionId, SessionStart, SessionStartMessage, SessionStatus, SessionStore,
+    SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget, SkillsConfig, ThinkingBlock,
+    ThinkingBlockKind, ThinkingDelta, TimelineContent, TimelineEventKind, TimelineQuery,
+    TimelineStatus, TokenUsage, ToolCall, ToolDefinition, TurnItem,
+    tools::filesystem::FilesystemConfig, tools::question::QUESTION_TOOL_NAME,
     tools::question::QuestionConfig,
 };
 #[cfg(feature = "shell")]
@@ -57,12 +59,10 @@ async fn session_template_search_finds_files_and_tools() {
     });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
     let session_id = sessions
-        .create_with_inference_settings(
-            Some(test_inference_settings()),
-            None,
-            std::collections::BTreeMap::default(),
-        )
+        .create(request)
         .await
         .expect("created session")
         .id()
@@ -137,12 +137,10 @@ async fn session_template_search_clamps_oversized_limits() {
     });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
     let session_id = sessions
-        .create_with_inference_settings(
-            Some(test_inference_settings()),
-            None,
-            std::collections::BTreeMap::default(),
-        )
+        .create(request)
         .await
         .expect("created session")
         .id()
@@ -185,12 +183,10 @@ async fn session_template_search_ignores_mcp_startup_failures() {
     });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
     let session_id = sessions
-        .create_with_inference_settings(
-            Some(test_inference_settings()),
-            None,
-            std::collections::BTreeMap::default(),
-        )
+        .create(request)
         .await
         .expect("created session")
         .id()
@@ -235,12 +231,10 @@ async fn session_template_search_empty_query_returns_no_options() {
     });
     let sessions =
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
     let session_id = sessions
-        .create_with_inference_settings(
-            Some(test_inference_settings()),
-            None,
-            std::collections::BTreeMap::default(),
-        )
+        .create(request)
         .await
         .expect("created session")
         .id()
@@ -272,7 +266,7 @@ async fn durable_session_resume_continues_same_agent_loop() {
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions
-        .create()
+        .create(SessionCreateRequest::new(SessionId::generate()))
         .await
         .expect("created session")
         .id()
@@ -470,6 +464,143 @@ async fn provider_stream_failure_rolls_back_partial_output_before_retry() {
         .snapshot();
     assert_eq!(snapshot.assistant_texts().collect::<Vec<_>>(), ["final"]);
     assert!(matches!(snapshot.status, SessionStatus::Finished));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn copied_context_is_replayed_once_across_retry_and_next_turn() {
+    let sequences = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(0));
+    let provider = Arc::new(ScriptedProvider::new("copy-retry", {
+        let sequences = Arc::clone(&sequences);
+        let requests = Arc::clone(&requests);
+        move |request| {
+            sequences
+                .lock()
+                .expect("sequence lock")
+                .push(copy_replay_sequence(request));
+            let mut requests = requests.lock().expect("request lock");
+            let request = *requests;
+            *requests += 1;
+            drop(requests);
+            match request {
+                0 => vec![Err(retryable_api_error("retry copied request"))],
+                1 => vec![
+                    Ok(CompletionEvent::ToolCall(ToolCall::new(
+                        "missing-call",
+                        "missing",
+                        json!({}),
+                    ))),
+                    Ok(CompletionEvent::Finished),
+                ],
+                2 => vec![
+                    Ok(CompletionEvent::Delta("done".to_owned())),
+                    Ok(CompletionEvent::Finished),
+                ],
+                request => panic!("unexpected provider request {request}"),
+            }
+        }
+    }));
+    let agent = AgentRuntime::builder(test_model(), provider)
+        .with_provider_retry_config(test_retry_config(3))
+        .build();
+    let store = MemorySessionStore::new();
+    let sessions = SessionCoordinator::new(store.clone());
+    let source_id = SessionId::new("copy-source");
+    let mut source_request = SessionCreateRequest::new(source_id.clone());
+    source_request.start = SessionStart::Fresh {
+        messages: vec![SessionStartMessage::user("source prompt").unwrap()],
+    };
+    let source = store.create(source_request).await.unwrap();
+    store
+        .append_timeline(
+            &source_id,
+            source.revision,
+            vec![PendingTimelineEvent::assistant_text_snapshot(
+                source_id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                "source answer",
+            )],
+        )
+        .await
+        .unwrap();
+    store
+        .append_journal(
+            &source_id,
+            source.revision.next(),
+            vec![waltr_agent::SessionJournalEvent::TurnFinished { turn: 0 }],
+        )
+        .await
+        .unwrap();
+    let source = store.load(&source_id).await.unwrap();
+    let session_id = SessionId::new("copied-replay");
+    let mut create = SessionCreateRequest::new(session_id.clone());
+    create.start = SessionStart::Copy {
+        copy: SessionCopy::from_record(&source, waltr_agent::TimelineCursor::new(2)).unwrap(),
+        messages: vec![SessionStartMessage::user("destination prompt").unwrap()],
+    };
+
+    let created = store.create(create).await.expect("copied session");
+
+    assert_eq!(created.revision, waltr_agent::Revision::ZERO);
+    assert_eq!(created.timeline_cursor_high_water().get(), 3);
+    assert_eq!(
+        created.snapshot().prompts,
+        ["source prompt", "destination prompt"]
+    );
+    assert_eq!(created.snapshot().prompt_turns[1].turn, 1);
+
+    drain(
+        sessions
+            .resume(&agent, session_id.clone(), ResumeInput::Continue)
+            .stream(),
+    )
+    .await;
+
+    let sequences = sequences.lock().expect("sequence lock").clone();
+    assert_eq!(sequences.len(), 3);
+    for sequence in &sequences {
+        assert_eq!(
+            sequence
+                .iter()
+                .filter(|item| item.as_str() == "user:source prompt")
+                .count(),
+            1
+        );
+        assert_eq!(
+            sequence
+                .iter()
+                .filter(|item| item.as_str() == "assistant:source answer")
+                .count(),
+            1
+        );
+        assert_eq!(
+            sequence
+                .iter()
+                .filter(|item| item.as_str() == "user:destination prompt")
+                .count(),
+            1
+        );
+    }
+    assert_eq!(sequences[0], sequences[1]);
+    assert!(
+        sequences[2]
+            .iter()
+            .any(|item| item == "tool-call:missing-call")
+    );
+    assert!(
+        sequences[2]
+            .iter()
+            .any(|item| item == "tool-result:missing-call")
+    );
+    let snapshot = store.load(&session_id).await.unwrap().snapshot();
+    assert_eq!(snapshot.prompt_turns[0].prompt, "source prompt");
+    assert_eq!(snapshot.prompt_turns[1].prompt, "destination prompt");
+    assert_eq!(
+        snapshot.turns[0].assistant_texts().collect::<Vec<_>>(),
+        ["source answer"]
+    );
 }
 
 #[tokio::test]
@@ -1026,7 +1157,7 @@ async fn cancellation_token_stops_running_tool_without_finishing_result() {
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions
-        .create()
+        .create(SessionCreateRequest::new(SessionId::generate()))
         .await
         .expect("created session")
         .id()
@@ -1101,7 +1232,7 @@ async fn shell_cancellation_kills_running_command() {
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
     let session_id = sessions
-        .create()
+        .create(SessionCreateRequest::new(SessionId::generate()))
         .await
         .expect("created session")
         .id()
@@ -1865,7 +1996,7 @@ async fn load_skill_whole_tool_permission_precedes_middleware_execution() {
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store);
     let session_id = sessions
-        .create()
+        .create(SessionCreateRequest::new(SessionId::generate()))
         .await
         .expect("create session")
         .id()
@@ -2229,7 +2360,7 @@ where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     sessions
-        .create()
+        .create(SessionCreateRequest::new(SessionId::generate()))
         .await
         .expect("created session")
         .id()
@@ -2254,6 +2385,26 @@ where
         events.push(event.expect("agent event"));
     }
     events
+}
+
+fn copy_replay_sequence(request: &CompletionRequest<'_>) -> Vec<String> {
+    request
+        .replay_items()
+        .into_iter()
+        .map(|item| match item {
+            CompletionReplayItem::Prompt(prompt) => format!("user:{prompt}"),
+            CompletionReplayItem::Turn(TurnItem::AssistantText(text)) => {
+                format!("assistant:{text}")
+            }
+            CompletionReplayItem::Turn(TurnItem::ToolCall(call)) => {
+                format!("tool-call:{}", call.id)
+            }
+            CompletionReplayItem::Turn(TurnItem::ToolResult(result)) => {
+                format!("tool-result:{}", result.call_id)
+            }
+            CompletionReplayItem::Turn(TurnItem::Thinking(_)) => "thinking".to_owned(),
+        })
+        .collect()
 }
 
 fn assistant_text(events: &[AgentTimelineEvent]) -> String {

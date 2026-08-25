@@ -3,7 +3,7 @@
 use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_THINKING, LlmError, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, SessionCoordinator, SessionStore, TimelineContent,
+    MemorySessionStore, ModelApi, ModelRef, SessionCoordinator, SessionId, SessionStore, TimelineContent,
     TimelineEventKind, TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
@@ -83,7 +83,11 @@ async fn assert_provider_thinking(
     let agent = AgentRuntime::builder(model, std::sync::Arc::new(provider)).build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let mut stream = sessions
         .prompt(&agent, session_id.clone(),
             format!("Think briefly if supported, then answer exactly: {EXPECTED_TEXT}"),

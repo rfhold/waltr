@@ -33,7 +33,7 @@ use crate::{
 use serde_json::Value;
 
 use super::{
-    InferenceSettings,
+    SessionCreateRequest,
     types::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
 };
 
@@ -132,26 +132,10 @@ impl Error for SessionStoreError {}
 
 /// Durable agent session storage contract.
 pub trait SessionStore: Send + Sync {
-    /// Create a new empty session record.
+    /// Create a complete session record if its id is absent.
     fn create(
         &self,
-        id: SessionId,
-    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
-
-    /// Create a new session record with initial host-defined metadata values.
-    fn create_with_metadata_values(
-        &self,
-        id: SessionId,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
-
-    /// Create a new session record with initial inference settings and metadata values.
-    fn create_with_inference_settings(
-        &self,
-        id: SessionId,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
+        request: SessionCreateRequest,
     ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
 
     /// Load a session record.
@@ -254,9 +238,7 @@ pub(super) fn append_timeline_to_record(
     id: &SessionId,
     events: Vec<PendingTimelineEvent>,
 ) -> SessionStoreResult<Vec<AgentTimelineEvent>> {
-    let mut cursor = record
-        .last_timeline_cursor()
-        .unwrap_or(TimelineCursor::ZERO);
+    let mut cursor = record.timeline_cursor_high_water();
     let mut effective_item_ids = record
         .timeline_events()
         .map(|event| event.item_id.clone())
@@ -401,4 +383,50 @@ fn channel_matches(
             .as_ref()
             .is_some_and(|channel| channels.contains(channel))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::session::SessionRollbackTarget;
+
+    #[test]
+    fn timeline_allocation_uses_persisted_high_water_across_cursor_gaps() {
+        let id = SessionId::new("destination");
+        let mut record = SessionRecord::new(id.clone());
+        record.append_journal_event(SessionJournalEvent::Timeline(
+            PendingTimelineEvent::assistant_text_snapshot(
+                id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                "rolled back",
+            )
+            .with_cursor(TimelineCursor::new(9)),
+        ));
+        record.append_journal_event(SessionJournalEvent::Rollback {
+            target: SessionRollbackTarget {
+                journal_len: 0,
+                after_cursor: None,
+                next_turn: 0,
+                remove_prompt_index: None,
+            },
+        });
+        assert!(record.timeline_events().next().is_none());
+
+        let assigned = append_timeline_to_record(
+            &mut record,
+            &id,
+            vec![PendingTimelineEvent::user_text_snapshot(
+                id.clone(),
+                1,
+                PendingTimelineItemId::New,
+                "next",
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(assigned[0].cursor, TimelineCursor::new(10));
+        assert_eq!(assigned[0].item_id.as_str(), "i10");
+        assert_eq!(record.timeline_cursor_high_water(), TimelineCursor::new(10));
+    }
 }

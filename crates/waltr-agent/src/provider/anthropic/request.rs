@@ -351,6 +351,55 @@ mod tests {
     }
 
     #[test]
+    fn request_encodes_durable_history_and_current_prompt_once_in_tool_order() {
+        let mut request = CompletionRequest::new("current prompt");
+        request.prompt_turns = vec![
+            PromptTurn {
+                turn: 0,
+                prompt: "seed prompt".to_owned(),
+            },
+            PromptTurn {
+                turn: 2,
+                prompt: "current prompt".to_owned(),
+            },
+        ];
+        request.turns = vec![
+            CompletionTurn {
+                turn: 0,
+                metadata: None,
+                items: vec![
+                    TurnItem::AssistantText("seed answer".to_owned()),
+                    TurnItem::ToolCall(ToolCall::new("seed-call", "lookup", json!({}))),
+                    TurnItem::ToolResult(ToolResult::new("seed-call", "lookup", "seed result")),
+                ],
+            },
+            CompletionTurn {
+                turn: 1,
+                metadata: None,
+                items: vec![TurnItem::AssistantText("current history".to_owned())],
+            },
+        ];
+
+        let body = messages_request("claude-test", 256, None, false, &request);
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(
+            messages[0],
+            json!({ "role": "user", "content": "seed prompt" })
+        );
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["text"], "seed answer");
+        assert_eq!(messages[1]["content"][1]["id"], "seed-call");
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "seed-call");
+        assert_eq!(messages[3]["content"][0]["text"], "current history");
+        assert_eq!(
+            messages[4],
+            json!({ "role": "user", "content": "current prompt" })
+        );
+    }
+
+    #[test]
     fn request_marks_tool_and_rolling_messages_for_cache() {
         let mut request = CompletionRequest::new("current");
         request.tools = vec![crate::ToolDefinition::new(

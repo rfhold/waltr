@@ -30,14 +30,15 @@ pub use session::{
     OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult,
     OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, RequestId,
     RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
-    S3SessionWriteMode, ScyllaSessionStore, SessionCoordinator, SessionId, SessionJournalEvent,
-    SessionListEvent, SessionListSubscription, SessionListUpdate, SessionMetrics,
-    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    S3SessionWriteMode, ScyllaSessionStore, SessionCoordinator, SessionCopy, SessionCopyError,
+    SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent, SessionListSubscription,
+    SessionListUpdate,
+    SessionMetrics, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
-    SessionRecord, SessionSnapshot, SessionStatus, SessionStore, SessionStoreError,
-    SessionStoreResult, SessionSummary, SessionTimelineEvent, SessionTimelineSubscription,
-    SessionTimelineUpdate, StoredCredential, Suspension, opendal_postgresql_session_store,
-    run_postgresql_migrations,
+    SessionRecord, SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError,
+    SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
+    SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential,
+    Suspension, opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 
@@ -114,9 +115,10 @@ mod tests {
     use crate::{
         AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
         CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse,
-        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionJournalEvent,
-        SessionStore, SessionTimelineEvent, TimelineChannel, TimelineContent, TimelineEventKind,
-        TimelineQuery, ToolCall,
+        MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, Revision,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent, SessionStore,
+        SessionTimelineEvent, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery,
+        ToolCall,
         middleware::{
             AgentMiddleware, HookOutcome,
             chain::MiddlewareChain,
@@ -130,7 +132,10 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use std::sync::{Arc, Mutex};
 
-    use super::{AgentRuntime, SessionCoordinator};
+    use super::{
+        AgentRuntime, SessionCoordinator,
+        session::{SessionListBroadcaster, SessionTimelineBroadcaster},
+    };
 
     struct NoopMiddleware;
 
@@ -284,13 +289,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_creation_publishes_initial_list_and_timeline() {
+        let provider = Arc::new(TextOnlyProvider);
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = AgentRuntime::builder(model, provider).build();
+        let store = MemorySessionStore::new();
+        let session_id = SessionId::new("automatic-publication");
+        let sessions = SessionListBroadcaster::new();
+        let timeline = SessionTimelineBroadcaster::new();
+        let mut session_updates = sessions.subscribe();
+        let mut timeline_updates = timeline.subscribe(session_id.clone());
+        let mut stream = agent
+            .prompt("hello")
+            .with_session_store(store, session_id.clone())
+            .with_session_broadcaster(sessions)
+            .with_timeline_broadcaster(timeline)
+            .stream();
+
+        let output = stream
+            .next()
+            .await
+            .expect("initial run output")
+            .expect("successful initial run output");
+        let session_update = session_updates.next().await.expect("session list update");
+        let timeline_update = timeline_updates.next().await.expect("timeline update");
+
+        assert_eq!(session_update.sequence, 1);
+        assert!(matches!(
+            session_update.event,
+            SessionListEvent::Upsert(summary)
+                if summary.id == session_id && summary.revision == Revision::ZERO
+        ));
+        assert_eq!(timeline_update.sequence, 1);
+        assert_eq!(timeline_update.event, SessionTimelineEvent::Event(output));
+    }
+
+    #[tokio::test]
     async fn durable_session_publishes_user_prompt_and_final_assistant_snapshot() {
         let provider = Arc::new(TextOnlyProvider);
         let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
         let agent = AgentRuntime::builder(model, provider).build();
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -348,7 +389,7 @@ mod tests {
         let store = MemorySessionStore::new();
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -408,7 +449,7 @@ mod tests {
             .build();
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()

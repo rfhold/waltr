@@ -25,7 +25,7 @@ use super::{
     AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
     AgentSessionRuntime, AgentSessionRuntimeFactory, ExternalResponse, InferenceSettings,
-    ResumeInput, RunConflictPolicy, RunOutcomeSender, RunResult, SessionId,
+    ResumeInput, RunConflictPolicy, RunOutcomeSender, RunResult, SessionCreateRequest, SessionId,
     SessionListSubscription, SessionStatus, SessionStore, SessionSummary,
     SessionTimelineBroadcaster, SessionTimelineSubscription,
 };
@@ -114,123 +114,30 @@ where
         self
     }
 
-    /// Create a new durable session with a generated id.
+    /// Create a durable session from complete structured input.
     ///
     /// # Errors
     ///
     /// Returns an error when the session store rejects the new record.
     #[tracing::instrument(
         name = "session.store",
-        skip(self),
-        fields(operation = "create", db_system = "session_store", session_id)
-    )]
-    pub async fn create(&self) -> Result<AgentSession> {
-        self.create_with_metadata_values(BTreeMap::new()).await
-    }
-
-    /// Create a new durable session with initial host-defined metadata values.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session store rejects the new record.
-    #[tracing::instrument(
-        name = "session.store",
-        skip(self, metadata_values),
+        skip(self, request),
         fields(
-            operation = "create_with_metadata_values",
+            operation = "create",
             db_system = "session_store",
-            session_id
+            session_id = %request.id.as_str()
         )
     )]
-    pub async fn create_with_metadata_values(
-        &self,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Result<AgentSession> {
-        self.create_with_id_and_metadata_values(SessionId::generate(), metadata_values)
-            .await
-    }
-
-    /// Create a new durable session with runtime settings and generated id.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session store rejects the new record.
-    pub async fn create_with_inference_settings(
-        &self,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Result<AgentSession> {
-        self.create_with_id_and_inference_settings(
-            SessionId::generate(),
-            inference_settings,
-            agent_definition,
-            metadata_values,
-        )
-        .await
-    }
-
-    /// Create a new durable session with caller-provided id and runtime settings.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session store rejects the new record.
-    pub async fn create_with_id_and_inference_settings(
-        &self,
-        id: SessionId,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Result<AgentSession> {
+    pub async fn create(&self, request: SessionCreateRequest) -> Result<AgentSession> {
         tracing::debug!(
-            metadata_key_count = metadata_values.len(),
-            inference_configured = inference_settings.is_some(),
-            agent_definition_configured = agent_definition.is_some(),
+            metadata_key_count = request.metadata_values.len(),
+            inference_configured = request.inference_settings.is_some(),
+            agent_definition_configured = request.agent_definition.is_some(),
             "creating session record"
         );
         let runtime = AgentSessionRuntime::new(&self.store);
-        let record = runtime
-            .create_session_with_inference_settings(
-                id,
-                inference_settings,
-                agent_definition,
-                metadata_values,
-            )
-            .await?;
-        tracing::Span::current().record("session_id", record.id.as_str());
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
-        Ok(AgentSession::new(record))
-    }
-
-    /// Create a new durable session with a caller-provided id and metadata values.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session store rejects the new record.
-    #[tracing::instrument(
-        name = "session.store",
-        skip(self, metadata_values),
-        fields(
-            operation = "create_with_id_and_metadata_values",
-            db_system = "session_store",
-            session_id = %id.as_str()
-        )
-    )]
-    pub async fn create_with_id_and_metadata_values(
-        &self,
-        id: SessionId,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Result<AgentSession> {
-        tracing::debug!(
-            metadata_key_count = metadata_values.len(),
-            "creating session record"
-        );
-        let runtime = AgentSessionRuntime::new(&self.store);
-        let record = runtime
-            .create_session_with_metadata_values(id, metadata_values)
-            .await?;
-        tracing::Span::current().record("session_id", record.id.as_str());
+        let record = runtime.create(request).await?;
+        self.timeline.publish_all(record.timeline_events().cloned());
         self.sessions
             .publish(SessionListEvent::Upsert(record.summary()));
         Ok(AgentSession::new(record))
@@ -1467,8 +1374,11 @@ mod tests {
     use super::*;
     use crate::{
         BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionReplayItem,
-        CompletionRequest, ExternalRequestKind, LlmStream, ModelApi, ModelRef, PermissionLevel,
-        PermissionPattern, PermissionResponse, ProviderId, SessionRecord, SessionStatus, ToolCall,
+        CompletionRequest, ExternalRequestKind, LlmStream, ModelApi, ModelRef,
+        PendingTimelineEvent, PermissionLevel, PermissionPattern, PermissionResponse, ProviderId,
+        Revision, SessionCopy, SessionJournalEvent, SessionRecord, SessionStart,
+        SessionStartMessage, SessionStatus, SessionTimelineEvent,
+        TimelineCursor, ToolCall,
         agent::session::{
             FileCredentialStore, InferenceProviderSettings, MemorySessionStore, SessionListEvent,
         },
@@ -1588,6 +1498,18 @@ mod tests {
         }
     }
 
+    fn create_request(
+        inference_settings: Option<InferenceSettings>,
+        agent_definition: Option<AgentDefinitionBundle>,
+        metadata_values: BTreeMap<String, Value>,
+    ) -> SessionCreateRequest {
+        let mut request = SessionCreateRequest::new(SessionId::generate());
+        request.inference_settings = inference_settings;
+        request.agent_definition = agent_definition;
+        request.metadata_values = metadata_values;
+        request
+    }
+
     fn empty_test_agent() -> crate::ResolvedAgent {
         let mut registry = crate::AgentDefinitionRegistry::new();
         registry
@@ -1652,10 +1574,116 @@ spec: { mcp: {} }
     }
 
     #[tokio::test]
+    async fn fresh_create_publishes_initial_timeline_and_list_once() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let id = SessionId::new("fresh-publication");
+        let mut timeline = sessions.watch_timeline(id.clone());
+        let mut list = sessions.watch_sessions();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request.start = SessionStart::Fresh {
+            messages: vec![SessionStartMessage::user("hello").unwrap()],
+        };
+
+        let created = sessions.create(request).await.unwrap();
+
+        let update = timeline.next().await.expect("initial timeline event");
+        let SessionTimelineEvent::Event(event) = update.event else {
+            panic!("expected persisted timeline event");
+        };
+        assert_eq!(event.cursor, TimelineCursor::new(1));
+        assert_eq!(event.item_id.as_str(), "i1");
+        assert_eq!(event.session_id, id);
+        assert_eq!(created.record.revision, Revision::ZERO);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), timeline.next())
+                .await
+                .is_err()
+        );
+        let list_update = list.next().await.expect("initial list event");
+        assert!(matches!(
+            list_update.event,
+            SessionListEvent::Upsert(summary) if summary.id == created.record.id
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), list.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn copied_create_publishes_preserved_and_configured_timeline_once() {
+        let mut source = SessionRecord::new("copy-publication-source");
+        source.journal = vec![
+            SessionJournalEvent::PromptAppended {
+                prompt: "source prompt".to_owned(),
+            },
+            SessionJournalEvent::Timeline(
+                PendingTimelineEvent::user_text_snapshot(
+                    source.id.clone(),
+                    0,
+                    crate::PendingTimelineItemId::New,
+                    "source prompt",
+                )
+                .with_cursor(TimelineCursor::new(5)),
+            ),
+            SessionJournalEvent::TurnFinished { turn: 0 },
+        ];
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let id = SessionId::new("copy-publication-destination");
+        let mut timeline = sessions.watch_timeline(id.clone());
+        let mut list = sessions.watch_sessions();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request.start = SessionStart::Copy {
+            copy: SessionCopy::from_record(&source, TimelineCursor::new(5)).unwrap(),
+            messages: vec![SessionStartMessage::user("destination prompt").unwrap()],
+        };
+
+        let created = sessions.create(request).await.unwrap();
+
+        let first = timeline.next().await.expect("copied timeline event");
+        let SessionTimelineEvent::Event(first) = first.event else {
+            panic!("expected copied timeline event");
+        };
+        let second = timeline.next().await.expect("configured timeline event");
+        let SessionTimelineEvent::Event(second) = second.event else {
+            panic!("expected configured timeline event");
+        };
+        assert_eq!(first.cursor, TimelineCursor::new(5));
+        assert_eq!(first.item_id.as_str(), "i5");
+        assert_eq!(first.session_id, id);
+        assert_eq!(second.cursor, TimelineCursor::new(6));
+        assert_eq!(second.item_id.as_str(), "i6");
+        assert_eq!(second.session_id, id);
+        assert_eq!(created.record.revision, Revision::ZERO);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), timeline.next())
+                .await
+                .is_err()
+        );
+        let list_update = list.next().await.expect("initial list event");
+        assert!(matches!(
+            list_update.event,
+            SessionListEvent::Upsert(summary) if summary.id == created.record.id
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), list.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn wipe_sessions_clears_records_cached_mcp_runtimes_and_publishes_once() {
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let first = sessions.create().await.unwrap();
-        let second = sessions.create().await.unwrap();
+        let first = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap();
+        let second = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap();
         for session_id in [&first.record.id, &second.record.id] {
             let runtime = McpClientRuntime::start(
                 crate::mcp::McpConfig::new(),
@@ -1879,7 +1907,11 @@ spec: {}
         });
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .expect("create session");
         let runtime = McpClientRuntime::start(
@@ -1993,7 +2025,10 @@ spec: {}
     #[tokio::test]
     async fn metadata_update_publishes_session_upsert() {
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let session = sessions.create().await.unwrap();
+        let session = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap();
         let mut watch = sessions.watch_sessions();
 
         let updated = sessions
@@ -2036,7 +2071,7 @@ spec: {}
         );
 
         let created = sessions
-            .create_with_inference_settings(None, Some(bundle.clone()), BTreeMap::new())
+            .create(create_request(None, Some(bundle.clone()), BTreeMap::new()))
             .await
             .expect("create session with agent definition");
 
@@ -2081,7 +2116,11 @@ spec: { systemPrompt: gamma prompt }
     async fn switch_is_immediate_but_audit_waits_for_next_cycle_and_coalesces() {
         let sessions = catalog_runtime_sessions();
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let id = session.record.id;
@@ -2145,7 +2184,11 @@ spec: { systemPrompt: gamma prompt }
     async fn switch_after_capture_does_not_change_captured_cycle_bundle() {
         let sessions = catalog_runtime_sessions();
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let id = session.record.id;
@@ -2167,7 +2210,10 @@ spec: { systemPrompt: gamma prompt }
     #[tokio::test]
     async fn missing_catalog_agent_fails_without_mutating_selection() {
         let sessions = catalog_runtime_sessions();
-        let session = sessions.create().await.unwrap();
+        let session = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap();
 
         assert!(
             sessions
@@ -2252,7 +2298,11 @@ spec:
         let sessions =
             SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let id = session.record.id;
@@ -2381,7 +2431,11 @@ spec:
         let sessions =
             SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
         let parent = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let parent_id = parent.record.id;
@@ -2448,7 +2502,11 @@ spec:
     async fn mutation_gate_linearizes_runtime_record_capture() {
         let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let id = session.record.id;
@@ -2493,7 +2551,11 @@ spec:
     async fn runtime_startup_does_not_hold_mutation_gate() {
         let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let id = session.record.id;
@@ -2508,7 +2570,10 @@ spec:
     #[tokio::test]
     async fn append_timeline_publishes_session_summary_upsert() {
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let session = sessions.create().await.unwrap();
+        let session = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap();
         let mut watch = sessions.watch_sessions();
 
         sessions
@@ -2544,7 +2609,11 @@ spec:
         let provider = Arc::new(QueuedPromptProvider::new());
         let sessions = runtime_sessions(provider.clone());
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let session_id = session.record.id.clone();
@@ -2601,7 +2670,11 @@ spec:
     async fn asynchronous_provider_authentication_failure_is_durable() {
         let sessions = runtime_sessions(Arc::new(AuthenticationFailingProvider));
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let session_id = session.record.id.clone();
@@ -2666,7 +2739,11 @@ spec:
         let sessions =
             SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let session_id = session.record.id.clone();
@@ -2728,7 +2805,11 @@ spec:
         let sessions =
             SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
         let session = sessions
-            .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::new())
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
             .await
             .unwrap();
         let session_id = session.record.id.clone();
@@ -2762,7 +2843,10 @@ spec:
         let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
         let agent = AgentRuntime::builder(model, provider).build();
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
-        let session = sessions.create().await.unwrap();
+        let session = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap();
         let mut watch = sessions.watch_sessions();
 
         let mut run = sessions

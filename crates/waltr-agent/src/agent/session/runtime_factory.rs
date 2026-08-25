@@ -1272,8 +1272,8 @@ mod tests {
         FileCredentialStore, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration,
         McpOAuthRegistrationMethod, OAuthCredentialRecord, OAuthCredentialStore,
         OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult, OAuthTokenSet,
-        SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
-        SessionOAuthTokenRequestStyle,
+        SessionCreateRequest, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
+        SessionOAuthProviderSettings, SessionOAuthTokenRequestStyle,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -1542,23 +1542,20 @@ mod tests {
             ))
         });
 
-        let record = SessionRecord::with_inference_settings_and_metadata_values(
-            "provider-override",
-            Some(InferenceSettings {
-                provider: InferenceProviderSettings {
-                    key: "unused".to_owned(),
-                    api: ModelApi::OpenAiResponses,
-                    url: String::new(),
-                    model_id: "gpt-4".to_owned(),
-                    model_cost: None,
-                    headers: BTreeMap::new(),
-                    oauth: None,
-                    reasoning_effort: None,
-                },
-            }),
-            None,
-            BTreeMap::new(),
-        );
+        let mut request = SessionCreateRequest::new("provider-override");
+        request.inference_settings = Some(InferenceSettings {
+            provider: InferenceProviderSettings {
+                key: "unused".to_owned(),
+                api: ModelApi::OpenAiResponses,
+                url: String::new(),
+                model_id: "gpt-4".to_owned(),
+                model_cost: None,
+                headers: BTreeMap::new(),
+                oauth: None,
+                reasoning_effort: None,
+            },
+        });
+        let record = request.materialize();
         let runtime = factory
             .runtime_for_session(
                 &record,

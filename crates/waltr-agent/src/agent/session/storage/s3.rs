@@ -14,7 +14,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
+        SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -356,58 +357,11 @@ impl S3SessionStore {
 impl SessionStore for S3SessionStore {
     fn create(
         &self,
-        id: SessionId,
+        request: SessionCreateRequest,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::new(id);
-            let _guard = store.session_guard(&record.id).await?;
-            match store.load_record(&record.id).await {
-                Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
-                Err(SessionStoreError::NotFound { .. }) => {
-                    store.save_record(&record).await?;
-                    Ok(record)
-                }
-                Err(error) => Err(error),
-            }
-        }
-    }
-
-    fn create_with_metadata_values(
-        &self,
-        id: SessionId,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_metadata_values(id, metadata_values);
-            let _guard = store.session_guard(&record.id).await?;
-            match store.load_record(&record.id).await {
-                Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
-                Err(SessionStoreError::NotFound { .. }) => {
-                    store.save_record(&record).await?;
-                    Ok(record)
-                }
-                Err(error) => Err(error),
-            }
-        }
-    }
-
-    fn create_with_inference_settings(
-        &self,
-        id: SessionId,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_inference_settings_and_metadata_values(
-                id,
-                inference_settings,
-                agent_definition,
-                metadata_values,
-            );
+            let record = request.materialize();
             let _guard = store.session_guard(&record.id).await?;
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),

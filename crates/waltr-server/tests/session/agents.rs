@@ -3,7 +3,7 @@ use waltr::grpc::waltr::session::v1::{
     AgentSelectionRequest, CreateSessionRequest, ListAgentsRequest, ListSessionsRequest,
     UpdateSessionAgentRequest, WatchSessionsRequest, watch_sessions_response,
 };
-use waltr_agent::SessionId;
+use waltr_agent::{SessionCreateRequest, SessionId};
 use waltr_server::test_support::{setup_server, setup_server_with_sessions};
 
 #[tokio::test]
@@ -160,7 +160,9 @@ async fn switch_validation_and_missing_session_have_precise_statuses()
 async fn legacy_bundleless_summary_uses_effective_default() -> Result<(), Box<dyn std::error::Error>>
 {
     let (server, sessions) = setup_server_with_sessions();
-    let legacy = sessions.create().await?;
+    let legacy = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?;
     let mut client = session_client(server).await?;
     let listed = client
         .list_sessions(ListSessionsRequest {})

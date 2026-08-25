@@ -39,10 +39,10 @@ use waltr_agent::{
     AgentDefinitionCatalog, AgentSession, AgentSessionActiveRunState, AgentSessionRunError,
     AgentSessionRunSubmission, AgentSessionRuntimeError, AgentSessionRuntimeFactory,
     CredentialStore, ExternalRequestId, McpConnectionKind, McpConnectionResolveRequest,
-    McpResolvedConnection, ResolvedAgent, RunConflictPolicy, SessionCoordinator, SessionId,
-    SessionListEvent, SessionListUpdate, SessionStore, SessionSummary, SessionTemplateKind,
-    SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
-    SessionTimelineEvent, TimelineCursor,
+    McpResolvedConnection, ResolvedAgent, RunConflictPolicy, SessionCoordinator,
+    SessionCreateRequest, SessionId, SessionListEvent, SessionListUpdate, SessionStore,
+    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchRequest,
+    SessionTemplateSearchTarget, SessionTimelineEvent, TimelineCursor,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -284,13 +284,13 @@ where
             Some(agent_name) => Self::selected_agent_bundle(&catalog, agent_name)?,
             None => catalog.default_bundle(),
         };
+        let mut request = SessionCreateRequest::new(SessionId::generate());
+        request.inference_settings = inference_settings;
+        request.agent_definition = Some(agent_bundle);
+        request.metadata_values = BTreeMap::default();
         let session = self
             .sessions
-            .create_with_inference_settings(
-                inference_settings,
-                Some(agent_bundle),
-                BTreeMap::default(),
-            )
+            .create(request)
             .await
             .map_err(agent_error_to_status)?;
         Ok((session, config, default_agent_name))

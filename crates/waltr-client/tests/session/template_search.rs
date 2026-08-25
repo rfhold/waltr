@@ -1,6 +1,8 @@
 #![allow(clippy::default_trait_access)]
 
-use waltr_agent::{InferenceProviderSettings, InferenceSettings, ModelApi};
+use waltr_agent::{
+    InferenceProviderSettings, InferenceSettings, ModelApi, SessionCreateRequest, SessionId,
+};
 use waltr_client::{
     ClientCommand, ClientRuntime, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget,
 };
@@ -11,12 +13,9 @@ use crate::support::snapshots::{dispatch_stream_command, next_snapshot_until, no
 async fn client_runtime_returns_session_template_search_results()
 -> Result<(), Box<dyn std::error::Error>> {
     let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
-    let session_id = sessions
-        .create_with_inference_settings(Some(test_inference_settings()), None, Default::default())
-        .await?
-        .id()
-        .as_str()
-        .to_owned();
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
+    let session_id = sessions.create(request).await?.id().as_str().to_owned();
     let server = waltr_server::test_support::setup_server_with_seeded_sessions(sessions);
 
     let mut stream = ClientRuntime::for_endpoint(server.base_url()).into_state_stream(no_sleep);

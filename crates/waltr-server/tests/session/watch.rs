@@ -3,7 +3,9 @@ use waltr::grpc::waltr::session::v1::{
     CreateSessionRequest, DeleteSessionRequest, SessionPhase, WatchSessionsRequest,
     WipeSessionsRequest, watch_sessions_response,
 };
-use waltr_agent::{PendingTimelineEvent, PendingTimelineItemId};
+use waltr_agent::{
+    PendingTimelineEvent, PendingTimelineItemId, SessionCreateRequest, SessionId,
+};
 use waltr_server::test_support::{setup_server, setup_server_with_sessions};
 
 #[tokio::test]
@@ -205,7 +207,9 @@ async fn session_service_watch_emits_runtime_status_updates()
 -> Result<(), Box<dyn std::error::Error>> {
     let (server, sessions) = setup_server_with_sessions();
     let mut watch_client = session_client(server).await?;
-    let created = sessions.create().await?;
+    let created = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?;
     let session_id = created.id().clone();
     let mut watch = watch_client
         .watch_sessions(WatchSessionsRequest::default())

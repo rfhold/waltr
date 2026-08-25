@@ -17,8 +17,8 @@ use axum::{
     routing::get,
 };
 use waltr_agent::{
-    Revision, S3SessionStore, S3SessionWriteMode, SessionId, SessionRecord, SessionStore,
-    SessionStoreError,
+    Revision, S3SessionStore, S3SessionWriteMode, SessionCreateRequest, SessionId, SessionRecord,
+    SessionStore, SessionStoreError,
 };
 use serde_json::json;
 use tokio::{sync::Notify, task::JoinHandle};
@@ -28,7 +28,10 @@ async fn conditional_mode_stops_after_eight_precondition_failures() {
     let fake = FakeS3::start(true).await;
     let store = S3SessionStore::new(fake.client().await, "bucket", "sessions");
     let id = SessionId::new("bounded-conditional");
-    store.create(id.clone()).await.expect("create session");
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
     let initial_puts = fake.state.put_count.load(Ordering::SeqCst);
     fake.state
         .conflicts
@@ -60,7 +63,10 @@ async fn default_conditional_mode_sends_if_match() {
     let fake = FakeS3::start(true).await;
     let store = S3SessionStore::new(fake.client().await, "bucket", "sessions");
     let id = SessionId::new("default-conditional");
-    store.create(id.clone()).await.expect("create session");
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
 
     store
         .set_metadata_value(&id, "key".to_owned(), json!("value"))
@@ -79,7 +85,10 @@ async fn conditional_mode_rejects_a_loaded_object_without_an_etag() {
     let fake = FakeS3::start(false).await;
     let store = S3SessionStore::new(fake.client().await, "bucket", "sessions");
     let id = SessionId::new("conditional-missing-etag");
-    store.create(id.clone()).await.expect("create session");
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
     let initial_puts = fake.state.put_count.load(Ordering::SeqCst);
 
     let error = store
@@ -98,7 +107,10 @@ async fn conditional_revision_update_reports_stale_after_conflict_reload() {
     let fake = FakeS3::start(true).await;
     let store = S3SessionStore::new(fake.client().await, "bucket", "sessions");
     let id = SessionId::new("stale-after-reload");
-    store.create(id.clone()).await.expect("create session");
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
     fake.state
         .conflicts
         .lock()
@@ -125,7 +137,10 @@ async fn conditional_metadata_retry_reapplies_update_to_latest_record() {
     let fake = FakeS3::start(true).await;
     let store = S3SessionStore::new(fake.client().await, "bucket", "sessions");
     let id = SessionId::new("metadata-reapply");
-    store.create(id.clone()).await.expect("create session");
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
     fake.state
         .conflicts
         .lock()
@@ -151,7 +166,10 @@ async fn single_writer_accepts_missing_etag_and_puts_without_if_match() {
         S3SessionWriteMode::SingleWriter,
     );
     let id = SessionId::new("single-writer-no-etag");
-    store.create(id.clone()).await.expect("create session");
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
     let initial_puts = fake.state.put_count.load(Ordering::SeqCst);
 
     let record = store
@@ -192,7 +210,10 @@ async fn normalized_prefixes_share_session_lock_across_store_instances_and_clone
         S3SessionWriteMode::SingleWriter,
     );
     let id = SessionId::new("shared-process-lock");
-    first.create(id.clone()).await.expect("create session");
+    first
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
     let gate = Arc::new(PutGate::default());
     *fake.state.next_put_gate.lock().expect("gate lock") = Some(Arc::clone(&gate));
 

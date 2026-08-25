@@ -6,8 +6,8 @@ use waltr::grpc::waltr::session::v1::{
 };
 use waltr_agent::{
     CHANNEL_EXTERNAL_REQUEST, ExternalRequest, ExternalRequestId, ExternalRequestKind,
-    ExternalRequestStatus, ExternalResponse, PendingTimelineEvent, SessionId, TimelineChannel,
-    TimelineContent, TimelineEventKind, TimelineStatus,
+    ExternalRequestStatus, ExternalResponse, PendingTimelineEvent, SessionCreateRequest, SessionId,
+    TimelineChannel, TimelineContent, TimelineEventKind, TimelineStatus,
 };
 use waltr_server::test_support::{setup_server, setup_server_with_sessions};
 use tonic::Code;
@@ -47,7 +47,9 @@ async fn submit_user_message_validates_request() -> Result<(), Box<dyn std::erro
 #[tokio::test]
 async fn submit_user_message_requires_session_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let (server, sessions) = setup_server_with_sessions();
-    let session = sessions.create().await?;
+    let session = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?;
     let mut client = session_client(server).await?;
 
     let error = client

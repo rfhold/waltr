@@ -330,16 +330,11 @@ where
         );
         let inference_settings = parent_record.and_then(|record| record.inference_settings.clone());
         let agent_definition = self.agent_definition.clone();
-        match self
-            .sessions
-            .create_with_id_and_inference_settings(
-                task_id.clone(),
-                inference_settings,
-                agent_definition,
-                metadata,
-            )
-            .await
-        {
+        let mut request = crate::SessionCreateRequest::new(task_id.clone());
+        request.inference_settings = inference_settings;
+        request.agent_definition = agent_definition;
+        request.metadata_values = metadata;
+        match self.sessions.create(request).await {
             Ok(_) => Ok(()),
             Err(error) => {
                 if self.sessions.load(task_id).await.is_ok() {

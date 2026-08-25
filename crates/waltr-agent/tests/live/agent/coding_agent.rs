@@ -58,7 +58,9 @@ async fn run_live_coding_agent(
         .with_question_tool(QuestionConfig::new())
         .build();
     let sessions = SessionCoordinator::new(store.clone());
-    let session = sessions.create().await?;
+    let session = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?;
     let session_id = session.id().clone();
     let prompt = format!(
         "First use the question tool exactly once to ask whether to proceed with the durable coding-agent validation. Do not read files before the answer. After the answer says proceed, use read on project/src/task.txt. Follow every loaded AGENTS.md instruction from that read. When the context reveals the coding-style skill, use load_skill for coding-style before following its instructions. Read the skill reference and project reference files requested by that context. Then attempt to read this external file exactly once so permission middleware suspends: {}. Do not invent tokens; report only exact tokens you observed before any permission suspension.",

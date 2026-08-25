@@ -249,6 +249,59 @@ mod tests {
     }
 
     #[test]
+    fn chat_messages_encode_durable_history_and_current_prompt_once_in_tool_order() {
+        let mut request = CompletionRequest::new("current prompt");
+        request.prompt_turns = vec![
+            PromptTurn {
+                turn: 0,
+                prompt: "seed prompt".to_owned(),
+            },
+            PromptTurn {
+                turn: 2,
+                prompt: "current prompt".to_owned(),
+            },
+        ];
+        request.turns = vec![
+            CompletionTurn {
+                turn: 0,
+                metadata: None,
+                items: vec![
+                    TurnItem::AssistantText("seed answer".to_owned()),
+                    TurnItem::ToolCall(ToolCall::new("seed-call", "lookup", json!({}))),
+                    TurnItem::ToolResult(ToolResult::new("seed-call", "lookup", "seed result")),
+                ],
+            },
+            CompletionTurn {
+                turn: 1,
+                metadata: None,
+                items: vec![TurnItem::AssistantText("current history".to_owned())],
+            },
+        ];
+
+        let messages = chat_messages(&request);
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(
+            messages[0],
+            json!({ "role": "user", "content": "seed prompt" })
+        );
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "seed answer");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "seed-call");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "seed-call");
+        assert_eq!(messages[3]["content"], "current history");
+        assert_eq!(messages[4]["content"], "current prompt");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["content"] == "seed prompt")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn chat_messages_emit_tool_results_before_labeled_image_messages() {
         let mut request = CompletionRequest::new("look");
         request.turns = vec![CompletionTurn {

@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CompletionEvent,
     ExternalRequestId, ExternalRequestKind, ExternalRequestStatus, ExternalResponse, LlmStream,
-    MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionCoordinator,
+    MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, SessionCoordinator, SessionId,
     SessionStatus, SessionStore, TimelineContent, ToolCall, ToolDefinition,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
@@ -70,7 +70,11 @@ async fn question_external_request_resumes_from_durable_session() -> waltr_agent
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let mut stream = sessions
         .prompt(&agent, session_id.clone(), "ask structured questions")
