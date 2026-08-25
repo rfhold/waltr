@@ -36,7 +36,7 @@ An access failure never creates an `AuthTarget`. Every successfully authenticate
 | `WALTR_MCP_REQUIRED_SCOPES` | Yes | Non-empty space-separated scopes supported and required by the local MCP resource. |
 | `WALTR_MCP_OAUTH_ISSUER` | No | Exact public deployment URL ending in `/oauth`; defaults to `WALTR_PUBLIC_URL` plus `/oauth`. |
 | `WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE` | Yes | Read-only JSON keyring used to encrypt MCP ES256 signing keys in the MCP database. |
-| `WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL` | No | Access-token seconds, 1 through 3,600; defaults to 300. |
+| `WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL` | No | Access-token seconds, 1 through 259,200 (3 days); defaults to 300. Preview and production stack declarations set 259,200. |
 | `WALTR_MCP_OAUTH_REFRESH_TOKEN_TTL` | No | Per-generation refresh-token seconds, 60 through 2,592,000; defaults to 86,400. |
 | `WALTR_MCP_OAUTH_REFRESH_FAMILY_TTL` | No | Absolute refresh-family seconds, 60 through 31,536,000 and not shorter than the token TTL; defaults to 2,592,000. |
 | `WALTR_MCP_OAUTH_CODE_TTL` | No | Authorization-code seconds, 1 through 600; defaults to 300. |

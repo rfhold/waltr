@@ -175,7 +175,7 @@ impl McpOAuthConfig {
             "WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL",
             DEFAULT_ACCESS_TOKEN_TTL,
             Duration::from_secs(1),
-            Duration::from_hours(1),
+            Duration::from_days(3),
         )?;
         let refresh_token_ttl = duration(
             values,
@@ -1343,6 +1343,37 @@ mod tests {
                 "{name}={value}"
             );
         }
+    }
+
+    #[test]
+    fn access_token_lifetime_preserves_default_and_enforces_three_day_maximum() {
+        let mut values = HashMap::from([
+            ("WALTR_MCP_REQUIRED_SCOPES", "mcp:use".to_owned()),
+            (
+                "WALTR_MCP_OAUTH_WRAPPING_KEYS_FILE",
+                "/run/secrets/mcp-keys".to_owned(),
+            ),
+        ]);
+        let McpOAuthConfig::Enabled(config) =
+            McpOAuthConfig::from_values(&access_config(), &values).expect("default lifetime")
+        else {
+            panic!("OIDC mode should enable hosted OAuth");
+        };
+        assert_eq!(config.access_token_ttl, Duration::from_secs(300));
+
+        values.insert("WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL", "259200".to_owned());
+        let McpOAuthConfig::Enabled(config) =
+            McpOAuthConfig::from_values(&access_config(), &values).expect("three-day lifetime")
+        else {
+            panic!("OIDC mode should enable hosted OAuth");
+        };
+        assert_eq!(config.access_token_ttl, Duration::from_days(3));
+
+        values.insert("WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL", "259201".to_owned());
+        assert!(matches!(
+            McpOAuthConfig::from_values(&access_config(), &values),
+            Err(McpOAuthConfigError::Invalid(_))
+        ));
     }
 
     #[test]
