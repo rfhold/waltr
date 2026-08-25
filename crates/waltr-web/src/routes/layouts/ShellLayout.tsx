@@ -63,6 +63,14 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
           >
             Sessions
           </A>
+          <A
+            class="shell__link"
+            classList={{ active: location.pathname.startsWith("/routines") }}
+            href="/routines"
+            aria-current={location.pathname.startsWith("/routines") ? "page" : undefined}
+          >
+            Routines
+          </A>
         </nav>
         <div class="shell__sidebar-bottom">
           <A

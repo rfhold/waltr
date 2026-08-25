@@ -23,4 +23,15 @@ describe("shell routing", () => {
 
     expect(screen.getAllByRole("link", { name: "Sessions" })[0]!.classList.contains("active")).toBe(true);
   });
+
+  test("navigates to and marks the Routines route active", () => {
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/routines",
+      snapshot: snapshotWithConfig({ etag: "v1", providers: {}, mcpServers: {}, inferenceDefaults: null }),
+    });
+
+    const link = screen.getByRole("link", { name: "Routines" });
+    expect(link.classList.contains("active")).toBe(true);
+    expect(screen.getByRole("heading", { name: "Routines" })).toBeTruthy();
+  });
 });

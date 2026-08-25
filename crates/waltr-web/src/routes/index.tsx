@@ -12,6 +12,8 @@ import {
   ConfigRoute,
 } from "./config/ConfigRoute";
 import { LandingRoute } from "./landing/LandingRoute";
+import { RoutinesRoute } from "./routines/RoutinesRoute";
+import { RoutineInvocationRoute } from "./routines/RoutineInvocationRoute";
 import { SessionsDataRoute, SessionsDetailRoute, SessionsListRoute, SessionsRoute } from "./sessions/SessionsRoute";
 
 const fixtureRoutesEnabled = import.meta.env.DEV || import.meta.env.MODE === "test";
@@ -21,6 +23,8 @@ export function AppRouter() {
     <Router root={AppLayout}>
       <Route path="/" component={ShellLayout}>
         <Route path="/" component={LandingRoute} />
+        <Route path="/routines" component={RoutinesRoute} />
+        <Route path="/routines/:invocationId" component={RoutineInvocationRoute} />
         <Route path="/sessions" component={SessionsRoute}>
           <Route path="/" component={SessionsListRoute} />
           <Route path="/data" component={SessionsDataRoute} />

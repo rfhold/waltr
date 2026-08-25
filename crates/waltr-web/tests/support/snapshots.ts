@@ -35,6 +35,17 @@ export function snapshotWithConfig(
       watch: operationSnapshot("ready"),
     },
     sessions: emptySessionSnapshot(),
+    routines: emptyRoutineSnapshot(),
+  };
+}
+
+export function emptyRoutineSnapshot() {
+  return {
+    definitions: { watch: operationSnapshot("idle"), digest: "", definitions: [] },
+    history: { watch: operationSnapshot("idle"), recent: [], throughSequence: null, olderPageToken: null, pagination: operationSnapshot("idle") },
+    sessionHistories: {},
+    details: {},
+    starts: {},
   };
 }
 

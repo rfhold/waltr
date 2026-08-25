@@ -78,6 +78,13 @@ function promptFixtureSnapshot(): ClientSnapshot {
       watch: operationSnapshot("received"),
     },
     status: { ready: true, watch: operationSnapshot("ready") },
+    routines: {
+      definitions: { watch: operationSnapshot("idle"), digest: "", definitions: [] },
+      history: { watch: operationSnapshot("idle"), recent: [], throughSequence: null, olderPageToken: null, pagination: operationSnapshot("idle") },
+      sessionHistories: {},
+      details: {},
+      starts: {},
+    },
     sessions: {
       agents: { entries: [], defaultAgentName: "", load: operationSnapshot("ready") },
       current: [sessionView("permission"), sessionView("question")],
