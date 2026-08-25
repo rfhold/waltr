@@ -53,6 +53,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
                 screens::draw_sessions(frame, area, app.sessions_section(), app.client_snapshot());
             });
         }
+        AppScreen::Routines => {
+            draw_app_shell(frame, area, app, true, |frame, area| {
+                screens::draw_routines(frame, area, app.routines_section(), app.client_snapshot());
+            });
+        }
         AppScreen::SessionData => {
             draw_app_shell(frame, area, app, true, |frame, area| {
                 frame.render_widget(Clear, area);

@@ -1,0 +1,24 @@
+---
+source: crates/waltr-tui/tests/app/routines.rs
+expression: rendered
+---
+" Routines  read-only definitions and durable hi "
+"                                                "
+" > Manual definitions                           "
+"                                                "
+" error: definition offline                      "
+" Reconnecting definitions...                    "
+"                                                "
+"                                                "
+"                                                "
+"   Recent invocations                           "
+"                                                "
+" error: history reconnect                       "
+" Reconnecting history...                        "
+"                                                "
+"                                                "
+"                                                "
+"                                                "
+"                                                "
+" Esc  back    Ctrl-X q              Waltr  ready "
+"                                                "

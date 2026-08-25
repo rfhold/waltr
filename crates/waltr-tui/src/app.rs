@@ -17,8 +17,8 @@ use crate::{
     native_auth::NativeAuthAction,
     screens::{
         ConfigAuthState, ConfigResetState, ConfigTab, InferenceDefaultsSection, McpSection,
-        ProviderSection, SectionAction, SessionDataAction, SessionDataState, SessionsSection,
-        register_timeline_watch_command, targets_match,
+        ProviderSection, RoutinesSection, SectionAction, SessionDataAction, SessionDataState,
+        SessionsSection, register_timeline_watch_command, targets_match,
     },
     ui,
     ui::Notice,
@@ -75,6 +75,8 @@ pub enum AppScreen {
     Config,
     /// Server-side session list/detail view.
     Sessions,
+    /// Read-only global Routine definitions and invocation history.
+    Routines,
     /// Destructive whole-session-domain wipe view.
     SessionData,
 }
@@ -98,6 +100,7 @@ pub struct App {
     mcp_section: McpSection,
     inference_defaults_section: InferenceDefaultsSection,
     sessions_section: SessionsSection,
+    routines_section: RoutinesSection,
     session_data: SessionDataState,
     leader_armed: bool,
     notice: Option<TransientNotice>,
@@ -124,6 +127,7 @@ impl App {
             mcp_section: McpSection::new(),
             inference_defaults_section: InferenceDefaultsSection::new(),
             sessions_section: SessionsSection::new(),
+            routines_section: RoutinesSection::new(),
             session_data: SessionDataState::new(),
             leader_armed: false,
             notice: None,
@@ -179,6 +183,9 @@ impl App {
             }
             InputEvent::Key(key) if self.screen == AppScreen::Sessions => {
                 self.handle_sessions_key(key, now)
+            }
+            InputEvent::Key(key) if self.screen == AppScreen::Routines => {
+                self.handle_routines_key(key, now)
             }
             InputEvent::Key(key) if self.screen == AppScreen::SessionData => {
                 self.handle_session_data_key(key)
@@ -354,6 +361,12 @@ impl App {
     #[must_use]
     pub const fn sessions_section(&self) -> &SessionsSection {
         &self.sessions_section
+    }
+
+    /// Return the global Routines screen state.
+    #[must_use]
+    pub const fn routines_section(&self) -> &RoutinesSection {
+        &self.routines_section
     }
 
     /// Whether an explicit native logout is currently meaningful.
@@ -689,6 +702,15 @@ impl App {
                 self.armed_close = None;
                 AppAction::ClientCommand(ClientCommand::ReleaseSessionWatchInterest)
             }
+            KeyCommand::Escape if self.screen == AppScreen::Routines => {
+                self.screen = AppScreen::Landing;
+                self.leader_armed = false;
+                self.armed_close = None;
+                AppAction::ClientCommands(vec![
+                    ClientCommand::ReleaseRoutineDefinitionWatchInterest,
+                    ClientCommand::ReleaseRoutineInvocationWatchInterest,
+                ])
+            }
             KeyCommand::Escape => self.handle_close_intent(CloseIntent::Escape, now),
             KeyCommand::Leader => {
                 self.leader_armed = true;
@@ -715,6 +737,7 @@ impl App {
                 {
                     let leaving_sessions =
                         matches!(self.screen, AppScreen::Sessions | AppScreen::SessionData);
+                    let leaving_routines = self.screen == AppScreen::Routines;
                     let detail_session_id = (self.screen == AppScreen::Sessions)
                         .then(|| self.sessions_section.clear_detail_route())
                         .flatten();
@@ -727,6 +750,10 @@ impl App {
                     }
                     if leaving_sessions {
                         commands.push(ClientCommand::ReleaseSessionWatchInterest);
+                    }
+                    if leaving_routines {
+                        commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
+                        commands.push(ClientCommand::ReleaseRoutineInvocationWatchInterest);
                     }
                     commands.push(ClientCommand::RegisterConfigWatchInterest);
                     commands.push(ClientCommand::RequestAuthStatuses);
@@ -779,15 +806,18 @@ impl App {
                     .is_some_and(|snapshot| snapshot.status.ready)
                 {
                     let leaving_config = self.screen == AppScreen::Config;
+                    let leaving_routines = self.screen == AppScreen::Routines;
                     self.screen = AppScreen::Sessions;
-                    return AppAction::from_commands(if leaving_config {
-                        vec![
-                            ClientCommand::ReleaseConfigWatchInterest,
-                            ClientCommand::RegisterSessionWatchInterest,
-                        ]
-                    } else {
-                        vec![ClientCommand::RegisterSessionWatchInterest]
-                    });
+                    let mut commands = Vec::new();
+                    if leaving_config {
+                        commands.push(ClientCommand::ReleaseConfigWatchInterest);
+                    }
+                    if leaving_routines {
+                        commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
+                        commands.push(ClientCommand::ReleaseRoutineInvocationWatchInterest);
+                    }
+                    commands.push(ClientCommand::RegisterSessionWatchInterest);
+                    return AppAction::from_commands(commands);
                 }
 
                 AppAction::Continue
@@ -839,6 +869,36 @@ impl App {
                     };
                 }
                 AppAction::Continue
+            }
+            KeyCommand::LeaderCommand(LeaderCommand::Routines) => {
+                self.leader_armed = false;
+                if self.screen == AppScreen::Routines {
+                    return AppAction::Continue;
+                }
+                if !self
+                    .client_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.status.ready)
+                {
+                    return AppAction::Continue;
+                }
+
+                let mut commands = Vec::new();
+                if self.screen == AppScreen::Config {
+                    commands.push(ClientCommand::ReleaseConfigWatchInterest);
+                }
+                if matches!(self.screen, AppScreen::Sessions | AppScreen::SessionData) {
+                    if let Some(session_id) = self.sessions_section.clear_detail_route() {
+                        commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
+                            session_id: session_id.clone(),
+                        });
+                    }
+                    commands.push(ClientCommand::ReleaseSessionWatchInterest);
+                }
+                self.screen = AppScreen::Routines;
+                commands.push(ClientCommand::RegisterRoutineDefinitionWatchInterest);
+                commands.push(ClientCommand::RegisterRoutineInvocationWatchInterest);
+                AppAction::from_commands(commands)
             }
             KeyCommand::LeaderCommand(LeaderCommand::Quit) => {
                 self.leader_armed = false;
@@ -957,6 +1017,7 @@ impl App {
                     AppScreen::Landing
                     | AppScreen::Config
                     | AppScreen::Sessions
+                    | AppScreen::Routines
                     | AppScreen::SessionData => Some(self.screen),
                     AppScreen::Waiting | AppScreen::Access => None,
                 };
@@ -1000,6 +1061,7 @@ impl App {
                 });
             }
             self.session_data.reconcile(&snapshot);
+            self.routines_section.reconcile(&snapshot);
             if snapshot.sessions.delete.status != "loading"
                 && !self
                     .sessions_section
@@ -1052,6 +1114,7 @@ impl App {
         self.mcp_section = McpSection::new();
         self.inference_defaults_section = InferenceDefaultsSection::new();
         self.sessions_section = SessionsSection::new();
+        self.routines_section = RoutinesSection::new();
         self.session_data = SessionDataState::new();
         self.leader_armed = false;
         self.notice = None;
@@ -1167,6 +1230,29 @@ impl App {
                 AppAction::Continue
             }
             SessionDataAction::Confirm => AppAction::ClientCommand(ClientCommand::WipeSessions),
+        }
+    }
+
+    fn handle_routines_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        if key.code == KeyCode::Esc
+            && self
+                .routines_section
+                .dismiss_detail(self.client_snapshot.as_ref())
+        {
+            self.leader_armed = false;
+            return AppAction::Continue;
+        }
+        let command = key_command(key, self.leader_armed);
+        if !matches!(command, KeyCommand::None) {
+            return self.handle_key_command(command, now);
+        }
+        match self
+            .routines_section
+            .handle_key(key, self.client_snapshot.as_ref())
+        {
+            SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+            SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
+            SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
         }
     }
 
