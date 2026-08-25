@@ -10,6 +10,7 @@ mod coordination;
 mod error;
 mod executor;
 mod resource;
+mod routine;
 mod transport;
 mod view;
 
@@ -74,9 +75,23 @@ pub use waltr::grpc::waltr::session::v1::{
     search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
+pub use routine::{
+    ClientManualRoutineDefinition, ClientRoutineAdmission, ClientRoutineDefinitionSnapshot,
+    ClientRoutineEventKind, ClientRoutineFailure, ClientRoutineFieldViolation,
+    ClientRoutineInputDefinition, ClientRoutineInvocationDetail, ClientRoutineInvocationEvent,
+    ClientRoutineInvocationPage, ClientRoutineInvocationSnapshot, ClientRoutineInvocationStatus,
+    ClientRoutineInvocationSummary, ClientRoutineInvocationWatchUpdate, ClientRoutineResult,
+    ClientRoutineResultDefinition, ClientRoutineScope, ClientRoutineStartOutcome,
+    ClientRoutineTask, ClientRoutineTaskDescriptor, ClientRoutineTaskStatus,
+    ClientRoutineTriggerKind, ClientRoutineValidationFailure, ClientRoutineValue,
+    ClientRoutineValueType, MAX_RETAINED_ROUTINE_DETAILS, MAX_RETAINED_ROUTINE_INVOCATIONS,
+    MAX_RETAINED_ROUTINE_STARTS, ROUTINE_INVOCATION_SNAPSHOT_SIZE,
+    ROUTINE_SOURCE_SESSION_ID_METADATA_KEY, StartManualRoutineArgs,
+};
 pub use transport::{
     AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport, GenericAuthAttempt,
-    GenericAuthAttemptStatus, WaltrTransport, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
+    GenericAuthAttemptStatus, WaltrTransport, RoutineDefinitionWatchStream,
+    RoutineInvocationWatchStream, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
     SessionWatchEvent, SessionWatchUpdate,
 };
 #[cfg(not(target_arch = "wasm32"))]
