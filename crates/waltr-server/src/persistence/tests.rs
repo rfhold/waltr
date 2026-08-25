@@ -1206,12 +1206,22 @@ async fn postgres_v5_discards_credentials_and_preserves_attempts() {
         .connect(&url)
         .await
         .expect("connect PostgreSQL");
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS waltr")
+        .execute(&pool)
+        .await
+        .expect("create legacy Waltr schema");
+    let mut migration_connection = pool.acquire().await.expect("acquire migration connection");
+    sqlx::query("SET search_path TO waltr")
+        .execute(&mut *migration_connection)
+        .await
+        .expect("select legacy Waltr schema");
     sqlx::migrate::Migrator::new(legacy_migrations)
         .await
         .expect("load V4 migrations")
-        .run(&pool)
+        .run(&mut *migration_connection)
         .await
         .expect("run V4 migrations");
+    drop(migration_connection);
     sqlx::query("INSERT INTO waltr.outbound_oauth_credentials (target_key, state_json, refresh_generation, updated_at_ms) VALUES ($1, $2, $3, $4)")
         .bind("provider:legacy")
         .bind(r#"{"access":"legacy-secret"}"#)
