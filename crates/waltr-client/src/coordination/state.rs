@@ -1,15 +1,16 @@
 //! Shared client state exposed to shells.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::transport::SessionTimelineWatchEvent;
 use crate::{
-    AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, Configuration, GenericAuthAttempt,
-    ResourceCatalog, RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateOption,
-    StreamId, SystemStatus, TimelineEvent,
+    AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientManualRoutineDefinition,
+    ClientRoutineInvocationDetail, ClientRoutineInvocationSummary, ClientRoutineValidationFailure,
+    ClientRoutineValue, Configuration, GenericAuthAttempt, ResourceCatalog, RollbackTarget,
+    SelectableAgent, SessionSummary, SessionTemplateOption, StreamId, SystemStatus, TimelineEvent,
 };
 
 /// Runtime-local operation identifier used by shells to track command results.
@@ -86,6 +87,8 @@ pub struct ClientState {
     pub status: StatusClientState,
     /// Session coordination state.
     pub sessions: SessionClientState,
+    /// Global Routine coordination state.
+    pub routines: RoutineClientState,
     /// Stream coordination state.
     pub streams: StreamClientState,
     /// Command operation results by runtime-local key.
@@ -285,6 +288,102 @@ pub struct SessionClientState {
     /// Latest resource search state by session id.
     pub template_searches: BTreeMap<String, SessionTemplateSearchState>,
     pub(crate) last_sequence: u64,
+}
+
+/// Global Routine coordination state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineClientState {
+    /// Authoritative global definitions in server order.
+    pub definitions: Vec<ClientManualRoutineDefinition>,
+    /// Digest of the complete definition projection.
+    pub definition_digest: String,
+    /// Definition watch lifecycle.
+    pub definition_watch: WatchState,
+    /// Authoritative bounded invocation summaries by server identity.
+    pub invocations: BTreeMap<String, ClientRoutineInvocationSummary>,
+    /// Invocation watch lifecycle.
+    pub invocation_watch: WatchState,
+    /// Independent bounded invocation histories by source session id.
+    pub session_histories: BTreeMap<String, SessionRoutineHistoryState>,
+    /// Last successfully reduced durable event sequence.
+    pub through_sequence: Option<u64>,
+    /// Exclusive cursor for the next older page.
+    pub older_page_token: Option<u64>,
+    /// Current older-page operation.
+    pub page: RoutinePageState,
+    /// Explicitly loaded or replay-built details by server invocation identity.
+    pub details: BTreeMap<String, RoutineDetailState>,
+    /// Bounded local start operations by shell operation key.
+    pub starts: BTreeMap<OperationKey, RoutineStartOperationState>,
+    pub(crate) start_order: VecDeque<OperationKey>,
+    pub(crate) detail_order: VecDeque<String>,
+    pub(crate) force_invocation_snapshot: bool,
+}
+
+/// One independently watched source-session Routine history.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionRoutineHistoryState {
+    /// Authoritative bounded invocation summaries by server identity.
+    pub invocations: BTreeMap<String, ClientRoutineInvocationSummary>,
+    /// Watch lifecycle and interest count.
+    pub watch: WatchState,
+    /// Last successfully reduced global durable event sequence.
+    pub through_sequence: Option<u64>,
+    pub(crate) force_snapshot: bool,
+}
+
+/// Current older-history page operation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutinePageState {
+    /// Correlation-only request identity.
+    pub request_id: String,
+    /// Exclusive admission cursor submitted to the server.
+    pub before_admission_sequence: Option<u64>,
+    /// Requested page size.
+    pub page_size: u32,
+    /// Current page operation status.
+    pub status: OperationStatus,
+    /// Last page error.
+    pub error: Option<String>,
+}
+
+/// Keyed invocation-detail load state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineDetailState {
+    /// Correlation-only request identity.
+    pub request_id: String,
+    /// Current detail operation status.
+    pub status: OperationStatus,
+    /// Full invocation detail when available.
+    pub detail: Option<ClientRoutineInvocationDetail>,
+    /// Last detail error.
+    pub error: Option<String>,
+    pub(crate) future_retry_count: u8,
+}
+
+/// Bounded local state for one non-idempotent manual start command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RoutineStartOperationState {
+    /// Shell-local operation key.
+    pub operation_key: OperationKey,
+    /// Correlation-only request identity.
+    pub request_id: String,
+    /// Routine name submitted by the shell.
+    pub routine_name: String,
+    /// Trigger name submitted by the shell.
+    pub trigger_name: String,
+    /// Source session supplied only for this start.
+    pub source_session_id: String,
+    /// Original typed inputs for correction after validation failure.
+    pub inputs: BTreeMap<String, ClientRoutineValue>,
+    /// Current local command status.
+    pub status: OperationStatus,
+    /// Associated durable invocation identity after admission.
+    pub invocation_id: Option<String>,
+    /// Structured pre-admission validation failure.
+    pub validation_failure: Option<ClientRoutineValidationFailure>,
+    /// Transport failure before an invocation identity was returned.
+    pub error: Option<String>,
 }
 
 /// Selectable session agent catalog state.
@@ -760,6 +859,14 @@ impl ClientState {
         self.terminalize_loading_operations(policy);
         let config_interests = self.config.watch.interests;
         let session_interests = self.sessions.watch.interests;
+        let routine_definition_interests = self.routines.definition_watch.interests;
+        let routine_invocation_interests = self.routines.invocation_watch.interests;
+        let routine_session_interests = self
+            .routines
+            .session_histories
+            .iter()
+            .map(|(session_id, history)| (session_id.clone(), history.watch.interests))
+            .collect::<Vec<_>>();
         let timeline_interests = self
             .sessions
             .timelines
@@ -793,12 +900,32 @@ impl ClientState {
         self.status.current = None;
         self.status.watch.status = OperationStatus::Waiting;
         self.sessions = SessionClientState::default();
+        self.routines = RoutineClientState::default();
         self.sessions.watch.interests = match policy {
             ClearPolicy::TransientExpiry => session_interests,
             ClearPolicy::ExplicitLogout => 0,
         };
         if self.sessions.watch.interests > 0 {
             self.sessions.watch.status = OperationStatus::Waiting;
+        }
+        if policy == ClearPolicy::TransientExpiry {
+            self.routines.definition_watch.interests = routine_definition_interests;
+            self.routines.invocation_watch.interests = routine_invocation_interests;
+            if routine_definition_interests > 0 {
+                self.routines.definition_watch.status = OperationStatus::Waiting;
+            }
+            if routine_invocation_interests > 0 {
+                self.routines.invocation_watch.status = OperationStatus::Waiting;
+            }
+            for (session_id, interests) in routine_session_interests {
+                let history = self
+                    .routines
+                    .session_histories
+                    .entry(session_id)
+                    .or_default();
+                history.watch.interests = interests;
+                history.watch.status = OperationStatus::Waiting;
+            }
         }
         for (key, interests) in timeline_interests
             .into_iter()
@@ -2077,7 +2204,7 @@ impl ClientState {
             .is_some_and(|watch| watch.interests > 0)
     }
 
-    fn next_watch_open_id(&mut self) -> Option<u64> {
+    pub(crate) fn next_watch_open_id(&mut self) -> Option<u64> {
         let next = self.next_watch_open_id.checked_add(1)?;
         self.next_watch_open_id = next;
         Some(next)

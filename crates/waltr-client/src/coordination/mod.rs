@@ -5,6 +5,7 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod event;
+pub mod routine;
 pub mod runtime;
 pub mod session;
 pub mod state;
