@@ -1,0 +1,201 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: manage-category-context
+spec:
+  description: Re-evaluate and optionally replace one category context mask.
+  params:
+    - name: categoryKey
+      type: string
+      required: true
+    - name: operation
+      type: string
+      enum:
+        - summarize
+        - resummarize
+      required: true
+    - name: instructions
+      type: string
+      required: true
+  sourceSession:
+    from: $(trigger.session)
+    snapshot:
+      throughCursor: $(trigger.cursor)
+  tasks:
+    - name: resolve-category
+      taskSpec:
+        action:
+          sessionMetadata:
+            sessionId: $(sourceSession.session.id)
+            read:
+              - key: context.categorization
+                required: true
+                expected:
+                  path: throughCursor
+                  value: $(sourceSession.snapshot.cursor)
+        results:
+          - name: item-ids
+            type: array
+            items:
+              type: string
+              pattern: ^i[1-9][0-9]*$
+            valueFrom:
+              array: $(action.sessionMetadata.values.context.categorization.assignments)
+              where:
+                field: categoryKey
+                equals: $(params.categoryKey)
+              select: itemId
+              minItems: 1
+
+    - name: read-active-mask
+      taskSpec:
+        action:
+          sessionMask:
+            sessionId: $(sourceSession.session.id)
+            read:
+              key: context.category/$(params.categoryKey)
+              default:
+                id: null
+                replacement:
+                  text: null
+        results:
+          - name: mask
+            type: object
+            value: $(action.sessionMask.value)
+
+    - name: summarize-category
+      runAfter:
+        - resolve-category
+        - read-active-mask
+      taskSpec:
+        sessionTemplate:
+          source:
+            session: $(sourceSession.session)
+            throughCursor: $(sourceSession.snapshot.cursor)
+          masks:
+            subtract:
+              - selector:
+                  itemIds: $(tasks.resolve-category.results.item-ids)
+            add:
+              - type: truncation
+                selector:
+                  exceptItemIds: $(tasks.resolve-category.results.item-ids)
+                profile: category-context-background
+          systemPrompt:
+            mode: replace
+            text: |
+              Produce an accurate context summary for the selected category from
+              its original unmasked items. Follow the requested detail and
+              emphasis. Do not continue the source task. If the active summary
+              is already appropriate, preserve it by returning keep rather than
+              making a cosmetic edit. Keep is valid only when an active summary
+              exists. Finish with submit-summary exactly once.
+          userPrompt:
+            text: |
+              Category: $(params.categoryKey)
+              Requested operation: $(params.operation)
+              Management instructions: $(params.instructions)
+              Active category summary, or null when no mask exists:
+              $(tasks.read-active-mask.results.mask.replacement.text)
+        tools: []
+        limits:
+          maxTurns: 2
+          maxToolCalls: 1
+        captures:
+          - name: submit-summary
+            description: Replace the category mask or keep its current summary.
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - decision
+                - summary
+              properties:
+                decision:
+                  type: string
+                  enum:
+                    - keep
+                    - replace
+                summary:
+                  type: string
+            validate:
+              decisionRequiresValue:
+                decisionField: decision
+                decisionValue: keep
+                value: $(tasks.read-active-mask.results.mask.id)
+            minCalls: 1
+            maxCalls: 1
+            finishAfter: 1
+        results:
+          - name: item-ids
+            type: array
+            items:
+              type: string
+              pattern: ^i[1-9][0-9]*$
+            value: $(tasks.resolve-category.results.item-ids)
+          - name: decision
+            type: string
+            value: $(captures.submit-summary[0].decision)
+          - name: summary
+            type: string
+            value: $(captures.submit-summary[0].summary)
+
+    - name: apply-category-mask
+      runAfter:
+        - summarize-category
+      when:
+        - input: $(tasks.summarize-category.results.decision)
+          operator: In
+          values:
+            - replace
+      onSkip:
+        results:
+          - name: applied
+            type: boolean
+            value: false
+          - name: mask-id
+            type:
+              - string
+              - "null"
+            value: null
+      taskSpec:
+        action:
+          sessionMask:
+            sessionId: $(sourceSession.session.id)
+            atomic: true
+            masks:
+              replace:
+                key: context.category/$(params.categoryKey)
+                expectedMaskId: $(tasks.read-active-mask.results.mask.id)
+                type: replacement
+                selector:
+                  itemIds: $(tasks.summarize-category.results.item-ids)
+                onOverlap: reject
+                preserveSourceItems: true
+                replacement:
+                  role: user
+                  text: $(tasks.summarize-category.results.summary)
+        results:
+          - name: applied
+            type: boolean
+            value: true
+          - name: mask-id
+            type:
+              - string
+              - "null"
+            value: $(action.sessionMask.id)
+  results:
+    - name: category-key
+      type: string
+      value: $(params.categoryKey)
+    - name: decision
+      type: string
+      value: $(tasks.summarize-category.results.decision)
+    - name: applied
+      type: boolean
+      value: $(tasks.apply-category-mask.results.applied)
+    - name: mask-id
+      type:
+        - string
+        - "null"
+      value: $(tasks.apply-category-mask.results.mask-id)

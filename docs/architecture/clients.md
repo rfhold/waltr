@@ -45,6 +45,16 @@ Resource traffic uses `waltr.resource.v1.ResourceService`:
 | `ReplaceResource` | Replace one complete YAML resource. |
 | `ResetResource` | Remove one persisted override. |
 
+Manual Routine traffic uses `waltr.routine.v1.RoutineService`:
+
+| RPC | Client Use |
+| --- | --- |
+| `WatchManualRoutines` | Watch complete global typed definition snapshots and their stable digest. |
+| `StartManualRoutine` | Validate and durably admit one detached manual invocation. |
+| `ListRoutineInvocations` | Page durable invocation aggregates by admission sequence, optionally filtered by exact-AND metadata equality. |
+| `GetRoutineInvocation` | Load one durable invocation, its tasks, results, and event history. |
+| `WatchRoutineInvocations` | Load a bounded server-filtered snapshot or replay matching SQL events after a durable global cursor. |
+
 Status traffic uses the status service to watch system readiness. Catalog watch maintenance waits until the server reports ready.
 
 `crates/waltr-client/src/transport/mod.rs` defines the runtime-neutral `WaltrTransport` trait and the default transports:
@@ -57,6 +67,12 @@ Status traffic uses the status service to watch system readiness. Catalog watch 
 Transport code converts RPC messages into `ResourceCatalog`, effective `Configuration`, and `SystemStatus` values. UI code uses shared client commands instead of generated clients.
 
 Session RPCs and shared views use `InferenceSettings`, `InferenceSettingsRequest`, and `UpdateSessionInferenceSettings` for provider, model, reasoning effort, and provider match status. `ListAgents` independently returns the name-sorted startup catalog with descriptions and the configured default. Create commands select a catalog name, while the older RPC omission uses the default. `UpdateSessionAgent` switches an existing session by exact name. Session summaries expose the effective agent name. MCP selection, endpoint snapshots, drift status, and trace propagation are not separate session controls; they belong to the selected agent definition.
+
+`SessionView` preserves the complete durable metadata map from each `SessionSummary`. Metadata is public session state and must contain no credentials or secrets. Numbers must convert exactly to protobuf `double`; the server rejects a lossy projection.
+
+`SessionAssociationsView` also projects string values for `waltr.task.parent_session_id`, `waltr.task.description`, and `waltr.routine.invocation_id`. `SessionStatusView` projects an optional typed suspension kind. Shells use these typed fields for shared behavior and retain complete metadata for other consumers.
+
+Hosted MCP `sessions.list`, `sessions.get`, and `sessions.wait` expose the same complete metadata map. This feature requires no generic MCP behavior; `crates/mcp` remains unchanged.
 
 ## Reducer State Machine
 
@@ -112,7 +128,41 @@ The stream form coordinates startup and long-lived watches. It waits for status 
 
 Agent discovery follows session watch interest and status readiness. The reducer tracks a request generation, ignores stale completions, sorts returned entries, and keeps failed discovery explicit rather than substituting the current or default agent. Create waits for a ready catalog and selected name. Agent switching is an independent keyed operation, so its success or failure does not reuse create state.
 
+Routine definition and invocation watches, replay cursors, history reduction, detail loads, pagination, request identity, and stale guards belong to `waltr-client`. Routine invocation metadata is immutable normalized string admission context. The canonical source-session key is `waltr.routine.source_session_id`.
+
+The shared client interest-counts the definition watch, singleton global invocation history, and each keyed source-session history independently. Every history has its own watch lifecycle, cursor, and health; it requests a fresh snapshot after invalid replay without replacing another history's state. Global Routine list and detail flows use the empty-filter global history.
+
+Routine list and watch requests accept generic metadata maps. Every entry uses exact string equality, entries compose with AND, and an empty map selects global history. The server filters before pagination, snapshot, and replay limits. Sequence values remain positions in the global durable journal, so gaps are valid in filtered histories.
+
+Manual start acceptance associates a keyed operation with a durable invocation ID. Structured validation failures preserve submitted inputs for correction.
+
+Request IDs provide transport correlation only. A deliberate retry uses a fresh request ID and operation key. The shared client emits no automatic start retry.
+
 The runtime keeps one cancellation-safe in-flight effect slot. Command preemption does not drop or restart that future; it resumes and completes exactly once. When access is denied and queued/in-flight work is drained, the stream parks until a command or credential generation change instead of publishing an unchanged busy loop.
+
+## Session Context
+
+Each open session detail owns a read-only Context panel. Web and TUI derive the same content from shared session and timeline snapshots and the selected entry in `session_histories`.
+
+Usage metrics have two scopes. Context tokens come from the latest turn's timeline metrics. Cache read and write rates use aggregate session cache tokens over aggregate total input tokens. Cost uses the aggregate session total and currency.
+
+The subtask list includes direct children only. A child qualifies when its typed task parent session ID equals the selected session ID. The panel does not infer descendants.
+
+Routine associations come directly from `session_histories[session_id]`. This shared-client convenience projection uses a server watch filtered by `waltr.routine.source_session_id`, while the server RPC remains generic for arbitrary exact-AND metadata filters. Shells perform no additional filtering or deduplication. There is no helper-owner fallback, so a helper session sees only Routines directly sourced by that helper.
+
+Context statuses use three semantic tones with exact status text beside every dot or color:
+
+| Tone | Statuses |
+| --- | --- |
+| Green or ready | Active session phases, waiting suspension kinds, and admitted or running Routine invocations. |
+| Red or error | Failed or interrupted sessions and Routine invocations. |
+| Grey or muted | Idle, finished, succeeded, unspecified, unknown, and other inactive states. |
+
+Responsive layouts preserve this content, its links, and its metric semantics. Web places a right sidebar above 900 pixels and a bounded scrollable stacked panel at smaller widths. TUI uses a right 72/28 split at widths of at least 110 columns and a capped six-row summary below that width.
+
+The session detail registers its source-session Routine watch only while open and releases it when closed. Its timeline watch independently owns the latest-turn context source. Other session-scoped watches and the singleton global Routine history have independent interests and remain active when their consumers still need them.
+
+Session Context remains a presentation projection over shared-client state. Routine association filtering is server-owned rather than a shell-side projection.
 
 ## Access Lifecycle
 
@@ -171,6 +221,20 @@ Web and TUI implementations should follow these rules:
 - Dispatch the keyed shared session-wipe command only after local destructive confirmation. Direct success and remote session-list cleared events atomically remove session summaries, timelines, template searches, and session-scoped watch state; shells own only confirmation and presentation.
 - Load and render the shared agent catalog for session creation and switching. Do not synthesize a selection while discovery is loading or failed.
 - Treat an agent switch as applying to the next captured cycle. Active work continues with its current agent, session history remains, and the switch operation completes independently of create.
+- Replace complete metadata maps from each `SessionSummary`; do not merge client-side keys from an older summary.
+- Use a nonempty string `metadata.title` as the display label. Use the stable session ID for every other value.
+- Keep auxiliary routine sessions in normal session lists. Their `waltr.session.ephemeral` metadata does not hide them.
+- Render manual Routine forms from shared ordered definitions. Support the closed string and boolean field types.
+- Preserve exact string drafts, field errors, and server errors after a rejected start.
+- Use fresh request and operation identities for each deliberate Routine retry.
+- Treat start acceptance as durable admission, not execution completion.
+- Report pre-admission failure or durable admission success inside the session palette.
+- Offer close and direct global-detail navigation after admission.
+- Render durable task progress only on the associated global invocation detail.
+- Keep global Routine list and invocation-detail surfaces separate and read-only in both shells.
+- Register and release the selected session's scoped Routine watch with Session Context, and render `session_histories[session_id]` without client filtering, deduplication, or helper-owner fallback.
+- Launch manual Routines only from the existing session palettes.
+- Treat helper sessions as links and ordinary sessions, not Routine lifecycle authority.
 
 The TUI opens create selection with `C-x s` and switches the open session with `C-x a`. The web uses separate Create session and Switch agent dialogs. Both surfaces identify the selected agent and tell users that active work finishes with the current agent and the new choice applies on the next cycle.
 
@@ -185,5 +249,7 @@ The TUI opens create selection with `C-x s` and switches the open session with `
 | [../../crates/waltr-client/src/transport/mod.rs](../../crates/waltr-client/src/transport/mod.rs) | RPC transport boundary. |
 | [../../crates/waltr-client/src/view/mod.rs](../../crates/waltr-client/src/view/mod.rs) | Stable shell-facing view models. |
 | [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC contract. |
+| [../../proto/waltr/routine/v1/routine_service.proto](../../proto/waltr/routine/v1/routine_service.proto) | Manual Routine RPC contract. |
 | [config.md](config.md) | Unified catalog, per-slot ETag, and watch behavior. |
+| [routines.md](routines.md) | Canonical Routine lifecycle, replay, restart, and UI contract. |
 | [access-authentication.md](access-authentication.md) | Access boundaries and browser, native, and MCP authentication flows. |

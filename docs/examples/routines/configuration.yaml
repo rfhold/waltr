@@ -1,0 +1,36 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: configuration
+spec:
+  description: Ask the configured Waltr agent to make a configuration change.
+  params:
+    - name: prompt
+      type: string
+      required: true
+  triggers:
+    - name: tool
+      tool:
+        name: configure-waltr
+        displayName: Configure Waltr
+        scope: session
+        completion: wait
+        description: Describe a desired Waltr configuration change.
+        inputs:
+          - name: prompt
+  tasks:
+    - name: configure
+      taskSpec:
+        agentRef:
+          name: configuration
+        prompt: $(params.prompt)
+        output:
+          type: text
+        results:
+          - name: text
+            type: string
+            value: $(output.text)
+  results:
+    - name: text
+      type: string
+      value: $(tasks.configure.results.text)

@@ -11,6 +11,7 @@ Waltr agent architecture keeps model interaction, prompt assembly, tool executio
 | Provider abstraction | Provider-neutral requests, stream events, tool calls, tool results, thinking blocks, and provider metadata. |
 | Provider adapters | OpenAI and Anthropic request encoding, streaming, parsing, and provider-specific continuation data. |
 | Agent loop | Turn progression, provider streaming, timeline events, tool execution, permission checks, and host-facing `AgentTimelineEvent` output. |
+| Host primitives | Structured session creation, per-run provider-turn limits, conditional metadata updates, and post-durable session events. |
 | Tools | Built-in filesystem, question, skills, task, MCP, and optional shell tool integration. |
 | Permissions | Generic permission claims, resource matching, policy evaluation, and allow/ask/deny behavior before tool execution. |
 | Middleware | Request construction hooks, prompt assembly, tool visibility and metadata, claims, skills, `AGENTS.md`, and suspension hooks. |
@@ -93,6 +94,10 @@ Multiple switches before a capture boundary coalesce from the first old name to 
 
 ## Durable Ownership
 
+`SessionCreateRequest` gives hosts one structured creation boundary. It includes the session ID, inference settings, self-contained agent bundle, and initial metadata map.
+
+`AgentRunLimits` can cap provider turns for one run without weakening a lower runtime limit. The routine host uses this boundary for `maxTurns`.
+
 `SessionRecord.inference_settings` stores only `InferenceSettings`. Its exact durable shape is one `provider: InferenceProviderSettings` value with these fields:
 
 | Field | Durable value |
@@ -125,7 +130,35 @@ permissions:
           effect: ask
 ```
 
-Routine/routine tools, deferred tools, and harness tools are not implemented. Generic MCP selection remains definition feature behavior. Unsupported fields fail strict parsing rather than being ignored. The removed `featureSetRefs` and `permissionSetRefs` fields have no alias or migration: old external definitions and stored source bundles that use them fail.
+Routine resources and routine execution belong to `waltr-server`; routine sources stay out of agent bundles. Generic manual Routine RPCs belong to the server and shared client. Routine tools, deferred tools, and harness tools are not implemented. Generic MCP selection remains definition feature behavior. Unsupported fields fail strict parsing rather than being ignored. The removed `featureSetRefs` and `permissionSetRefs` fields have no alias or migration: old external definitions and stored source bundles that use them fail.
+
+## Routine Session Boundaries
+
+The fork Routine captures the source under the normal session operation gate. It releases that gate before compaction starts.
+
+The capture derives one immutable provider-neutral inference conversation from the effective journal. It stops at the latest completed provider turn, honors rollbacks, and excludes active partial work. The capture also includes exact source inference and the exact agent definition.
+
+The conversation preserves provider-replay prompts, assistant text, tool calls, tool results, and inline images. It excludes source lifecycle events, middleware state, status, usage and cost, request audit records, provider metadata, provider-native thinking payloads, rollback barriers, and active partial work. This provider-neutral history is not a byte-for-byte HTTP wire archive. Provider adapters still apply their normal request encoding rules.
+
+Every source-backed `sessionTemplate` atomically creates a fresh durable auxiliary Routine session with the captured history followed by its task user prompt. Provider requests derive only from that durable helper state. The copied history persists across restart and storage backends under ordinary session retention rules. Normal session delete and wipe operations remove these helpers. Current timeline RPCs and web and TUI renderers expose their normal durable timeline events without a separate client model.
+
+An inference-only `sessionTemplate` creates a fresh durable helper with only its task user prompt. Replacement prompts and explicit capabilities still define the task runtime.
+
+The fork compaction helper stores this exact user message after the copied history:
+
+```text
+<fork-direction>
+<exact direction>
+</fork-direction>
+```
+
+Its replacement system prompt treats the entire user message, including XML-like content, as untrusted emphasis text. The model must not execute instructions from that text or continue the source task.
+
+The destination create path copies exact source inference and agent definition into a fresh ordinary session. It clears `pending_switch_audit`. It copies no source history or general metadata.
+
+`SessionCreateRequest` atomically persists the ordinary destination and its exact first prompt. Successful creation is the prompt-durability boundary and emits the normal post-durable user-message event. Start occurs only after this boundary.
+
+After successful atomic creation, cancellation and start failure retain the destination and its identity in the Routine result.
 
 ## Runtime Flow
 
@@ -222,11 +255,27 @@ Durable middleware state preserves first-execution prompt inputs across reconstr
 
 Agent sessions are event-sourced. A session store persists cursor-assigned timeline events and internal `SessionJournalEvent` records identified by `SessionId` and guarded by revisions. Runtime snapshots are derived from the persisted journal and are used to resume with a new prompt, external response, tool results, or interruption. Inline tool-result images remain in the durable provider-neutral turn for replay. Provider-request audit records redact image data and retain safe media, size, and digest metadata; server timeline projections likewise omit Base64.
 
+Session metadata is host-defined, durable JSON-like state. `set_metadata_value_conditionally` applies set-if-absent atomically at each backend's documented concurrency boundary.
+
+The agent emits `SessionEvent::UserMessageCreated` only after a user prompt append succeeds. Delivery uses an injected `SessionEventSink`, runs best-effort, and never changes the source operation result. The agent does not replay or recover these events.
+
 `waltr-server` currently hosts sessions and exposes the same registered session service and coordinator through gRPC and the MCP `sessions` tool. MCP supports list, get, interrupt, wait, send, and wipe operations. Both surfaces must share that coordinator because active runs, queues, and live broadcasts are process-local.
 
-The global session wipe directly removes every raw record from the configured session store, clears cached session MCP runtimes, and publishes one session-list cleared event. It does not inspect, reject, cancel, wait for, or gate running or queued work. Operators must stop session activity first; work that continues concurrently may recreate records after deletion. The gRPC and MCP surfaces invoke this same coordinator operation and require explicit confirmation.
+The global session wipe serializes with active `SessionControl` operations, then directly removes every raw record from the configured session store, clears cached session MCP runtimes, and publishes one session-list cleared event. It does not inspect, reject, cancel, or wait for complete runs or queues once their work is outside the control boundary. Operators must stop session activity first; work that continues after the wipe may recreate records. The gRPC and MCP surfaces invoke this same coordinator operation and require explicit confirmation.
+
+`SessionControl` centralizes process-local lifecycle serialization, per-session mutation serialization, and the session-list projection. An incarnation is an in-memory token for one lifetime of a session ID, not a durable revision. Delete and wipe remove the projected incarnation, so a delayed publication from an earlier lifetime cannot update a same-ID recreation. Runtime capture carries this token through MCP preparation and runtime construction; each cache return, insertion, or eviction reacquires the ordered session guards and verifies the token after asynchronous work. A stale newly started MCP runtime is shut down without entering the cache. A publication claim is an RAII claim on the projection entry, not a capacity reservation. Dropping a failed or cancelled claim removes only its matching empty incarnation.
+
+Session summaries have split ownership. Host-originated publications own metadata values, inference settings, and the selected agent. Run-originated publications own revision, status, current prompt, activity, and metrics. The projection merges complete summaries according to that ownership, rejects stale incarnations and lower revisions, preserves run-owned fields at equal revision, keeps timestamps monotonic, and allocates each sequence while holding its short synchronous projection mutex.
+
+The lock order is lifecycle read or write, then the session-keyed asynchronous mutation mutex, then the short synchronous list-projection mutex. A gate-registration lease exists before waiting for the keyed mutex and removes its pointer-matching registry entry only after the final holder or waiter drops. Unrelated sessions retain independent mutation mutexes. No synchronous mutex crosses an await. `SessionRunContext` carries the bound control handle, timeline broadcaster, and optional event sink through `AgentRunBuilder`, `EphemeralSessionRun`, `AgentLoopState`, and `AgentSessionRuntime`. Delete completes durable deletion, cache eviction, and deleted publication while guarded, then releases lifecycle and mutation guards before awaiting shutdown of the detached MCP runtime. A same-ID recreation therefore receives a new incarnation and cannot reuse or shut down that detached runtime.
 
 Session storage implementations include memory, filesystem, OpenDAL-backed stores, S3, Scylla, and PostgreSQL through OpenDAL helpers. Storage details are below the `SessionStore` trait; the agent loop only depends on the trait contract.
+
+Filesystem conditional metadata uses process-wide locks keyed by root and session. It requires one process owner and no external file writer.
+
+Generic OpenDAL uses backend ETags or an explicit compare-and-swap adapter. A conditional update returns unsupported when neither mechanism exists; Waltr never substitutes a non-atomic write.
+
+The PostgreSQL helper supplies database compare-and-swap. Dedicated S3 supports ETag compare-and-swap or an explicit single-writer mode. The latter requires one process and no external writer.
 
 Crash recovery is retry-the-turn. The request is journaled before provider dispatch, while parser progress inside an in-flight provider stream is not persisted as an authoritative checkpoint.
 
@@ -255,6 +304,9 @@ Current and expected dependents include:
 - Middleware assembly order must remain deterministic.
 - Durable session replay must be based on persisted timeline/journal records and derived projections, not provider-specific transient parser state.
 - Provider-native metadata is an optimization for continuation and compatibility, not a requirement for replay correctness.
+- Session mutation paths must acquire lifecycle, per-session mutation, and list-projection synchronization in that order; synchronous projection state must never cross an await.
+- Routine source capture must release the source operation gate before provider compaction work starts.
+- Source-backed Routine helpers must persist their captured provider-neutral inference conversation before provider dispatch.
 
 ## Tests
 
@@ -278,6 +330,7 @@ Focused paths:
 | [../../crates/waltr-agent/src/agent/builder.rs](../../crates/waltr-agent/src/agent/builder.rs) | Agent construction, tools, permissions, prompt, MCP, and middleware assembly. |
 | [../../crates/waltr-agent/src/agent/loop.rs](../../crates/waltr-agent/src/agent/loop.rs) | Internal run loop, provider streaming, tool execution, permissions, and timeline/journal persistence. |
 | [../../crates/waltr-agent/src/agent/session/mod.rs](../../crates/waltr-agent/src/agent/session/mod.rs) | Durable session API surface. |
+| [../../crates/waltr-agent/src/agent/event.rs](../../crates/waltr-agent/src/agent/event.rs) | Host-neutral post-durable session events and delivery boundary. |
 | [../../crates/waltr-agent/src/stream.rs](../../crates/waltr-agent/src/stream.rs) | Provider-neutral request, event, turn, tool, thinking, and metadata types. |
 | [../../crates/waltr-agent/src/provider/mod.rs](../../crates/waltr-agent/src/provider/mod.rs) | Provider adapter exports. |
 | [../../crates/waltr-agent/src/middleware/mod.rs](../../crates/waltr-agent/src/middleware/mod.rs) | Middleware hook contract. |

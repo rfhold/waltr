@@ -40,7 +40,7 @@ Agent storage persists durable sessions for `crates/waltr-agent/`. A session is 
 
 The agent loop depends on this trait rather than a concrete backend.
 
-Metadata mutations, including inference settings and selected agent bundles, must not overwrite concurrent journal or timeline appends. Memory, filesystem, and OpenDAL backends without usable ETags provide this guarantee only among stores in the same process through shared per-session ownership locks. Independently constructed OpenDAL operators that alias the same endpoint but do not expose the same operator identity must use the same explicit mutation namespace. This is not distributed atomicity. OpenDAL uses conditional ETag writes when its service supplies an ETag. The dedicated S3 backend defaults to object ETag compare-and-swap across writers. It retries at most eight conflicting conditional PUTs before returning a backend error so unsupported `PutObject` `If-Match` behavior or sustained contention cannot spin indefinitely. Its explicit single-writer mode instead serializes each session within one process and uses unconditional PUTs; it does not protect against another process or external writer. Scylla uses lightweight transactions over revision and record content.
+Metadata mutations, including inference settings and selected agent bundles, must not overwrite concurrent journal or timeline appends. Memory and filesystem stores serialize updates through process-wide per-session locks. Filesystem safety therefore requires one process owner and no external file writer. Generic OpenDAL uses service ETags or an explicit compare-and-swap adapter. A conditional metadata update returns unsupported when neither exists; it never falls back to a non-atomic write. OpenDAL's process locks share an explicit durable mutation namespace, but they do not provide distributed atomicity. The PostgreSQL helper supplies database compare-and-swap. The dedicated S3 backend defaults to object ETag compare-and-swap across writers. It retries at most eight conflicting conditional PUTs before returning a backend error. Its explicit single-writer mode uses process-local serialization and unconditional PUTs. That mode requires one Waltr process and no external writer. Scylla uses lightweight transactions over revision and record content.
 
 The coordinator also serializes inference and agent mutations with runtime record capture. A successful agent switch is therefore immediately authoritative for cycles captured after that mutation boundary, while an already captured runtime remains unchanged.
 
@@ -72,6 +72,18 @@ Durable runs journal data before external side effects where possible:
 
 Crash recovery is retry-the-turn. The provider request is durable before dispatch, but parser progress inside an in-flight provider stream is not a durable checkpoint.
 
+For the fork Routine, `SessionCreateRequest` atomically stores the ordinary destination and its byte-exact first prompt. Successful creation is the prompt-durability boundary and emits the normal user-message event.
+
+After successful atomic creation, a start failure or caller cancellation retains the destination and its ID.
+
+A source-backed Routine helper atomically stores rollback-aware provider-neutral inference history through the latest completed source turn, followed by its task prompt. The copied history includes provider-replay prompts, assistant text, tool calls and results, and inline images. It excludes source lifecycle events, middleware state, status, usage and cost, request audit records, provider metadata, provider-native thinking payloads, rollback barriers, and active partial work.
+
+`SessionCopy` is an opaque validated projection through one exact completed-turn cursor. Materialization preserves copied cursors, item IDs, parent IDs, and tool-call IDs, rewrites each timeline event's session ID to the destination, and persists the copied cursor as the destination high-water before appending configured messages. One copy has one source; multi-source merging is unsupported.
+
+Provider requests derive only from the durable helper record. Provider adapters apply their normal encoding rules, so the record is not a byte-for-byte HTTP wire archive. The helper persists across restart and storage backends under ordinary session retention rules. Normal session delete and wipe operations apply. An inference-only task helper stores only its task prompt.
+
+The ordinary fork destination stores compaction plus the original direction. It stores no copied source history.
+
 Provider-neutral tool results may contain bounded inline images so a resumed session can replay them to the model. Request audit records do not duplicate that Base64: canonical records retain media type, decoded size, and SHA-256 digest, while projected provider requests replace native Base64 and data URLs with redacted metadata. Public server timeline conversion uses the same safe text projection and never returns inline image data.
 
 ## Resume Inputs
@@ -91,7 +103,7 @@ Question responses record the response as the linked tool result. Permission res
 
 - Session storage is an agent-library concern; server/client/UI persistence contracts are separate layers.
 - Provider-specific metadata may be stored with turns, but replay correctness should rely on provider-neutral timeline/journal data. Snapshots are derived projections, not durable source-of-truth records.
-- Session compression, automatic compaction, and auto-title generation are placeholder modules and are not implemented.
+- Session compression and automatic compaction remain unimplemented. The server implements manual fork compaction and automatic titles outside the agent storage layer.
 - SQLite, Redis, and embedded key-value store backends are not implemented.
 
 ## Tests

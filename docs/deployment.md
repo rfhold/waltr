@@ -2,7 +2,7 @@
 
 ## Persistence
 
-`WALTR_DATABASE_URL` selects the Waltr-owned database used for access-auth and outbound OAuth state. Optional `WALTR_MCP_DATABASE_URL` independently selects the database used for MCP Streamable HTTP sessions and the hosted MCP authorization server.
+`WALTR_DATABASE_URL` selects the Waltr-owned database used for access-auth, outbound OAuth, and Routine invocation history. Optional `WALTR_MCP_DATABASE_URL` independently selects the database used for the hosted MCP authorization server.
 
 | Value | Behavior |
 | --- | --- |
@@ -14,7 +14,7 @@ When `WALTR_MCP_DATABASE_URL` is absent or empty, file-backed SQLite derives sib
 
 These databases are not the agent session store configured by `WALTR_SESSION_STORE`. The Waltr database is the authoritative store for both provider and upstream-MCP OAuth credentials; the environment-owned server has no credential-file setting.
 
-Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, and outbound OAuth attempts/credentials in `waltr.sqlite3`, while MCP history, session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, `0004_outbound_oauth`, and `0005_unified_oauth_credentials`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. V5 is a hard cutover that discards existing MCP SQL credentials and stops reading legacy provider credential files; all targets must authorize again after upgrade. Legacy `auth.json` files are not deleted automatically and should be securely removed after rollback is no longer required. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
+Waltr and MCP use separate pools. SQLite keeps Waltr's standard `_sqlx_migrations` history, OIDC tables, hosted-OAuth login continuations, outbound OAuth attempts/credentials, and Routine history in `waltr.sqlite3`, while MCP history, inert session/event tables, clients, grants, token state, CIMD cache, and encrypted signing keys live in `mcp.sqlite3`. PostgreSQL uses `waltr` and `mcp` search paths for migration application, producing `waltr._sqlx_migrations` and `mcp._sqlx_migrations` in the default shared logical database. Waltr's immutable sequence is `0001_schema_ownership`, `0002_oidc_access_auth`, `0003_mcp_oauth_login_continuations`, `0004_outbound_oauth`, `0005_unified_oauth_credentials`, and `0006_routine_invocations`; MCP's is `0001_streamable_http_sessions`, `0002_oauth_authorization_server`, and `0003_oauth_client_registration`. V5 is a hard cutover that discards existing MCP SQL credentials and stops reading legacy provider credential files; all targets must authorize again after upgrade. Legacy `auth.json` files are not deleted automatically and should be securely removed after rollback is no longer required. V6 adds exactly the Routine aggregate and append-only event-journal tables, with no task table or pruning. Both owners use embedded `sqlx::migrate!()` migrators, so SQLx owns standard version and checksum validation. Applied migration files must not be edited. Both migrators complete before the server binds. Invalid URLs, unavailable databases, SQLx migration validation failures, migration application failures, missing wrapping keys, and unusable signing state fail startup; there is no memory fallback.
 
 ## Container Runtime And Local Compose
 
@@ -71,17 +71,21 @@ The session-data wipe affects only records in `WALTR_SESSION_STORE`. It does not
 
 The server embeds one YAML catalog under [`crates/waltr-server/resources`](../crates/waltr-server/resources/). Persisted overrides live under `.waltr/resources` at the server root.
 
-The catalog uses `agents`, `features`, `permissions`, `providers`, `mcp-servers`, and `defaults`. Only `defaults/default.yaml` is valid in the defaults category.
+The catalog uses `agents`, `features`, `permissions`, `providers`, `mcp-servers`, `defaults`, and `routines`. Only `defaults/default.yaml` is valid in the defaults category.
 
 Each persisted file contains one strict YAML document. Its category, `kind`, filename stem, and `metadata.name` must identify the same resource.
 
 Bundled resources supply defaults. A persisted exact-path file replaces its bundle. Reset removes the persisted override and reveals the bundle.
+
+The server always registers bundled `routines/title.yaml` and `routines/fork.yaml`. A persisted same-path file overrides either resource, and reset restores its bundled definition.
 
 Waltr validates the complete catalog before startup. Invalid YAML, identity mismatches, unresolved references, invalid models.dev selectors, and invalid environment templates fail startup.
 
 The bundled self-MCP resource requires `WALTR_PUBLIC_URL` in every access-auth mode. It consumes the variable independently of OIDC, joins `/mcp` through URL parsing, and preserves a deployment path prefix. With access auth disabled, actual partial browser, API, or hosted-MCP OIDC settings still fail startup.
 
 The server watches `.waltr/resources` after startup. An invalid reload preserves the last-known-good snapshot and exposes the reload error.
+
+Routine resources use strict YAML and stay outside durable agent-definition bundles. The Routine service exposes definitions and durable invocation history globally.
 
 Public `/mcp` actions provide resource administration:
 
@@ -103,7 +107,33 @@ Provider and MCP credentials remain in Waltr SQL. They never enter resource sour
 
 New sessions snapshot provider inference settings. They also store exact agent-definition source texts. Later resource changes do not rewrite those durable values.
 
-See [Resource Catalog](architecture/config.md) for the canonical contract. See [Agent Architecture](architecture/agent.md#agent-definitions) for agent resource syntax.
+After the first durable user prompt, the bundled title routine starts best-effort work. It has no enable setting, backfill, replay, recovery, or retry mechanism.
+
+The routine creates a visible durable auxiliary session. It copies only provider connection and model settings, disables reasoning, and runs one provider turn. It uses replacement prompts with empty feature, tool, and permission lists.
+
+The title task uses an inference-only template. Its durable helper starts with only the task prompt and receives no source history.
+
+The routine writes the exact final text to source metadata key `title` only when that key is absent. Its declared ephemeral metadata condition excludes auxiliary recursion.
+
+Event delivery and duplicate-attempt suppression before admission are process-local and bounded. Admitted event and manual invocations use one durable lifecycle recorder.
+
+Graceful shutdown stops admission, interrupts owned auxiliary children, and records unfinished work as interrupted. Startup records leftover work with `server_restart`.
+
+Fork compaction depends on one provider call. Caller or server failure can interrupt that call. Model output remains nondeterministic.
+
+The source-backed compact helper atomically stores rollback-aware provider-neutral inference history through the latest completed turn, followed by its task prompt. The history persists across restart and storage backends under ordinary session retention rules. Normal session delete and wipe operations apply.
+
+The durable helper history preserves provider-replay prompts, assistant text, tool calls and results, and inline images. It excludes lifecycle, middleware, status, usage and cost, request audit, provider metadata, provider-native thinking payloads, rollback barriers, and active partial work. Provider adapters apply their normal encoding rules. The history is not an HTTP wire archive.
+
+Fork atomically persists the ordinary destination and its exact first prompt through `SessionCreateRequest`. Successful creation is the prompt-durability boundary. The first durable prompt makes the destination title-eligible.
+
+After successful atomic creation, caller cancellation or start failure retains the destination and its ID.
+
+Fork copies exact source inference and agent definition but clears `pending_switch_audit`. The ordinary destination copies no source history or general metadata. Destination metadata contains only `waltr.session.fork.source`.
+
+Provider and upstream-MCP credentials remain host-resolved. Fork adds no database migration or new durable credential state.
+
+See [Routines](architecture/routines.md) for the canonical lifecycle and replay contract. See [Resource Catalog](architecture/config.md) for resource syntax.
 
 ## OIDC Access Domains
 
@@ -216,13 +246,17 @@ Pipelines as Code definitions under `.tekton/` are configured to build the Docke
 
 ## Startup And Operation
 
-The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
+The public `waltr_server::build_app()` reads environment-owned configuration and is async/fallible. It resolves both persistence targets and completes both standard migrators. It also validates access auth and hosted OAuth, performs OIDC discovery, and loads the initial JWKS. When hosted OAuth is active, it loads the wrapping ring and initializes the local active signer. It loads the unified resource catalog, starts its watcher and routine engine, and initializes agent session storage. The executable binds `WALTR_SERVER_ADDR` only after initialization succeeds.
 
 The bundled `mcp-servers/waltr.yaml` resource expands required `${env:WALTR_PUBLIC_URL}` and joins `/mcp`. The resource uses the normal target-scoped outbound OAuth lifecycle. When hosted MCP OAuth starts, Waltr admits its private HTTPS origin only for that exact self resource. Other private origins require explicit configuration.
 
-`/health` reports process liveness. `/ready` checks persistence, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content alone does not fail readiness while the watcher and last-known-good snapshot remain healthy.
+`/health` reports process liveness. `/ready` checks persistence, routine engine health, optional hosted OAuth maintenance, and definition watcher health. Hosted readiness also checks its store, active signer, key agreement, maintenance, and bounded revocation policy. Invalid candidate resource content alone does not fail readiness while the watcher and last-known-good snapshot remain healthy.
 
-`ServerApplication` owns the definition watcher and hosted OAuth maintenance. Graceful shutdown cancels and joins each owned task. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
+Startup interrupts unfinished Routine invocations before the engine reports ready. Waltr does not resume them.
+
+Deploy one active Routine engine for each Waltr database. Clustered Routine leases and cross-engine execution coordination are not implemented.
+
+`ServerApplication` owns the definition watcher, routine engine, and hosted OAuth maintenance. Graceful shutdown cancels and joins each owned task. Pulumi uses `/ready` only for readiness and retains `/health` for startup and liveness.
 
 Startup loads models.dev to materialize provider resource selectors. The loader uses `WALTR_MODELS_DEV_PATH` or `WALTR_MODELS_DEV_URL`, then its configured default. The disk cache can satisfy an unavailable source. Startup fails when no source or cache can materialize the complete catalog.
 
@@ -232,6 +266,6 @@ Explicit builders are intended for callers that own dependencies. They require a
 
 The bundled TUI installed with `pnpm install:bundled` includes server and web features and starts its embedded server by default. The TUI retains the embedded server's shutdown signal and task, signals shutdown after the terminal runtime exits on either success or error, and joins server completion before the process returns; MCP cleanup therefore does not depend on dropping the Tokio runtime. Use `--no-server` with `WALTR_SERVER_ENDPOINT` to connect it to an external deployment. A plain `cargo run -p waltr-tui` build has no server feature and connects to `WALTR_SERVER_ENDPOINT`, defaulting to `http://127.0.0.1:14333`.
 
-See [Access Authentication](architecture/access-authentication.md), [Server Persistence](architecture/persistence.md), and [Testing](testing.md).
+See [Access Authentication](architecture/access-authentication.md), [Server Persistence](architecture/persistence.md), [Routines](architecture/routines.md), and [Testing](testing.md).
 
 No successful production deployment, live Pulumi/Tekton deployment, database failover, or backup restoration is asserted by this document.

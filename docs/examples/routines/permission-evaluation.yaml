@@ -1,0 +1,144 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: permission-evaluation
+spec:
+  description: Review replied permission prompts and defer warranted configuration changes.
+  params:
+    - name: timeframe
+      type: string
+      default: 1d
+      validation:
+        format: duration
+    - name: skipIfEmpty
+      type: boolean
+      default: false
+  triggers:
+    - name: daily
+      cron:
+        schedule: "0 0 * * *"
+        timezone: UTC
+      params:
+        - name: timeframe
+          value: 1d
+        - name: skipIfEmpty
+          value: "true"
+
+    - name: manual
+      manual:
+        displayName: Evaluate permission prompts
+        scope: global
+        inputs:
+          - name: timeframe
+          - name: skipIfEmpty
+  concurrency:
+    key: permission-evaluation
+    policy: forbid
+  taskDefaults:
+    features:
+      harnessTools:
+        defaultPermissions: false
+      routineTools:
+        defaultPermissions: false
+      deferredTools: {}
+    permissions:
+      tools:
+        - name: waltr
+          permission:
+            fallback: deny
+            inputs:
+              - match:
+                  action: sessions.permission-prompts
+                  input:
+                    filters:
+                      status: replied
+                      timeframe: $(params.timeframe)
+                      through: $(routine.startedAt)
+                effect: allow
+        - name: defer
+          permission:
+            fallback: deny
+            inputs:
+              - match:
+                  tool: configure-waltr
+                effect: allow
+  tasks:
+    - name: count-permission-prompts
+      when:
+        - input: $(params.skipIfEmpty)
+          operator: In
+          values:
+            - "true"
+      onSkip:
+        results:
+          - name: count
+            type: integer
+            value: 0
+      taskSpec:
+        script:
+          tool:
+            name: waltr
+            arguments:
+              action: sessions.permission-prompts
+              input:
+                filters:
+                  status: replied
+                  timeframe: $(params.timeframe)
+                  through: $(routine.startedAt)
+              filter: length
+        results:
+          - name: count
+            type: integer
+            value: $(script.output)
+
+    - name: evaluate
+      runAfter:
+        - count-permission-prompts
+      when:
+        - any:
+            - input: $(params.skipIfEmpty)
+              operator: In
+              values:
+                - "false"
+            - input: $(tasks.count-permission-prompts.results.count)
+              operator: GreaterThan
+              values:
+                - "0"
+      onSkip:
+        results:
+          - name: report
+            type: string
+            value: No replied permission prompts were found in the selected timeframe.
+      taskSpec:
+        sessionTemplate:
+          systemPrompt:
+            mode: replace
+            text: |
+              Evaluate recent Waltr permission prompts and change configuration
+              only when prompts fired unnecessarily and a narrow reusable rule
+              would preserve safety. Prefer the narrowest applicable agent,
+              workspace, or global layer.
+
+              If a change is warranted, call defer with tool configure-waltr and
+              a concise, self-contained prompt argument. Include the deferred
+              request ID in your report. If no change is warranted, do not call
+              defer. Return only a concise text report.
+          userPrompt:
+            text: |
+              Replied permission prompts from the last $(params.timeframe):
+
+              @tool(waltr, {"action":"sessions.permission-prompts","input":{"filters":{"status":"replied","timeframe":"$(params.timeframe)","through":"$(routine.startedAt)"}}})
+
+              Explain whether a configuration change was deferred and why.
+        limits:
+          maxTurns: 12
+        output:
+          type: text
+        results:
+          - name: report
+            type: string
+            value: $(output.text)
+  results:
+    - name: report
+      type: string
+      value: $(tasks.evaluate.results.report)
