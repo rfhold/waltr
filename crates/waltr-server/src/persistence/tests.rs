@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, fs, path::PathBuf};
+use std::{collections::BTreeMap, ffi::OsStr, fs, path::PathBuf, time::Duration};
 
 use sqlx::postgres::PgSslMode;
 use testcontainers::{
@@ -9,6 +9,32 @@ use testcontainers::{
 use uuid::Uuid;
 
 use super::*;
+
+#[test]
+fn routine_migrations_have_matching_diagnostic_indexes() {
+    let sqlite = include_str!("../../migrations/sqlite/0006_routine_invocations.sql");
+    let postgres = include_str!("../../migrations/postgresql/0006_routine_invocations.sql");
+    for (name, columns) in [
+        (
+            "routine_invocations_routine_admission_idx",
+            "routine_name, admission_sequence DESC",
+        ),
+        (
+            "routine_invocations_correlation_admission_idx",
+            "correlation_id, admission_sequence DESC",
+        ),
+    ] {
+        for migration in [sqlite, postgres] {
+            assert!(migration.contains(&format!("CREATE INDEX {name}")));
+            assert!(migration.contains(columns));
+        }
+    }
+    for migration in [sqlite, postgres] {
+        assert!(migration.contains("CREATE INDEX routine_invocation_metadata_exact_idx"));
+        assert!(migration.contains("metadata_key, metadata_value, invocation_id"));
+        assert!(migration.contains("PRIMARY KEY (invocation_id, metadata_key)"));
+    }
+}
 
 #[test]
 fn derives_component_targets_for_supported_backends() {
@@ -467,7 +493,10 @@ async fn sqlite_files_keep_component_tables_and_histories_isolated() {
             "waltr_mcp_oauth_login_continuations",
             "waltr_oidc_login_attempts",
             "outbound_oauth_attempts",
-            "outbound_oauth_credentials"
+            "outbound_oauth_credentials",
+            "routine_invocation_events",
+            "routine_invocation_metadata",
+            "routine_invocations"
         ]
     );
     assert_eq!(
@@ -725,7 +754,7 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .fetch_one(pool)
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (5, 4));
+    assert_eq!((waltr_count, mcp_count), (6, 4));
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT to_regclass('waltr.outbound_oauth_attempts')::text"
@@ -734,6 +763,213 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
         .await
         .expect("find outbound OAuth attempts")
         .is_some()
+    );
+    let routine_tables = sqlx::query_scalar::<_, String>(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'waltr' AND table_name LIKE 'routine_invocation%' ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("inventory Routine persistence tables");
+    assert_eq!(
+        routine_tables,
+        [
+            "routine_invocation_events",
+            "routine_invocation_metadata",
+            "routine_invocations"
+        ]
+    );
+    let routine_indexes = sqlx::query_scalar::<_, String>(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = 'waltr' AND indexname LIKE 'routine_invocations_%_admission_idx' ORDER BY indexname",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("inventory Routine diagnostic indexes");
+    assert_eq!(
+        routine_indexes,
+        [
+            "routine_invocations_correlation_admission_idx",
+            "routine_invocations_routine_admission_idx",
+            "routine_invocations_status_admission_idx",
+        ]
+    );
+    let routine_store = first.routine_invocation_store();
+    let (admitted, admitted_event) = routine_store
+        .admit(routine_invocation::RoutineAdmission {
+            invocation_id: "postgres-routine".to_owned(),
+            execution_id: "shared-execution".to_owned(),
+            routine_name: "postgres".to_owned(),
+            routine_revision: "revision".to_owned(),
+            trigger_name: "manual".to_owned(),
+            trigger_kind: routine_invocation::RoutineTriggerKind::Manual,
+            correlation_id: "shared-correlation".to_owned(),
+            metadata: BTreeMap::new(),
+            source_cursor: None,
+            declared_tasks: Vec::new(),
+            admitted_at_ms: 1,
+        })
+        .await
+        .expect("admit PostgreSQL Routine invocation");
+    assert_eq!(admitted.latest_sequence, admitted_event.sequence);
+    assert_eq!(
+        routine_store
+            .list(None, 10, &BTreeMap::new())
+            .await
+            .expect("list PostgreSQL Routine invocations")[0]
+            .invocation_id,
+        "postgres-routine"
+    );
+    sqlx::query(
+        "SELECT nextval(pg_get_serial_sequence('waltr.routine_invocation_events', 'sequence'))",
+    )
+    .execute(pool)
+    .await
+    .expect("create valid PostgreSQL identity gap");
+    let started = routine_store
+        .start_invocation("postgres-routine", 2)
+        .await
+        .expect("start PostgreSQL Routine invocation");
+    assert!(started.sequence > admitted_event.sequence + 1);
+    let postgres_finished = routine_store
+        .finish_success(
+            "postgres-routine",
+            vec![
+                routine_invocation::StoredRoutineResult {
+                    name: "zeta".to_owned(),
+                    value: routine_invocation::StoredRoutineValue::String("last".to_owned()),
+                },
+                routine_invocation::StoredRoutineResult {
+                    name: "alpha".to_owned(),
+                    value: routine_invocation::StoredRoutineValue::Boolean(true),
+                },
+            ],
+            3,
+        )
+        .await
+        .expect("finish PostgreSQL Routine invocation");
+    assert_eq!(
+        postgres_finished
+            .values
+            .expect("PostgreSQL invocation result values")
+            .into_iter()
+            .map(|result| result.name)
+            .collect::<Vec<_>>(),
+        ["zeta", "alpha"]
+    );
+    assert_eq!(
+        routine_store
+            .events_after(admitted_event.sequence, 10, &BTreeMap::new())
+            .await
+            .expect("replay PostgreSQL Routine events")[0]
+            .sequence,
+        started.sequence
+    );
+    let (interruption_summary, interruption_admitted) = routine_store
+        .admit(routine_invocation::RoutineAdmission {
+            invocation_id: "postgres-interruption".to_owned(),
+            execution_id: "shared-execution".to_owned(),
+            routine_name: "postgres".to_owned(),
+            routine_revision: "revision".to_owned(),
+            trigger_name: "event".to_owned(),
+            trigger_kind: routine_invocation::RoutineTriggerKind::Event,
+            correlation_id: "shared-correlation".to_owned(),
+            metadata: BTreeMap::from([(
+                routine_invocation::SOURCE_SESSION_METADATA_KEY.to_owned(),
+                "source".to_owned(),
+            )]),
+            source_cursor: Some("cursor".to_owned()),
+            declared_tasks: ["pending", "started", "terminal"]
+                .into_iter()
+                .map(|name| routine_invocation::RoutineTaskDescriptor {
+                    name: name.to_owned(),
+                    task_type: "test".to_owned(),
+                })
+                .collect(),
+            admitted_at_ms: 4,
+        })
+        .await
+        .expect("admit PostgreSQL interrupted Routine invocation");
+    assert_ne!(
+        interruption_summary.admission_sequence,
+        interruption_admitted.sequence
+    );
+    assert_eq!(
+        interruption_admitted
+            .admission
+            .as_ref()
+            .expect("PostgreSQL admission metadata")
+            .admission_sequence,
+        interruption_summary.admission_sequence
+    );
+    routine_store
+        .start_invocation("postgres-interruption", 5)
+        .await
+        .expect("start PostgreSQL interrupted Routine invocation");
+    routine_store
+        .transition_task(
+            "postgres-interruption",
+            "started",
+            routine_invocation::RoutineTaskTransition::Started {
+                session_references: BTreeMap::new(),
+            },
+            6,
+        )
+        .await
+        .expect("start PostgreSQL Routine task");
+    routine_store
+        .transition_task(
+            "postgres-interruption",
+            "terminal",
+            routine_invocation::RoutineTaskTransition::Skipped,
+            7,
+        )
+        .await
+        .expect("terminalize PostgreSQL Routine task");
+    let interrupted = routine_store
+        .finish_interruption(
+            "postgres-interruption",
+            routine_invocation::RoutineFailure {
+                code: "restart".to_owned(),
+                message: "safe".to_owned(),
+            },
+            8,
+        )
+        .await
+        .expect("interrupt PostgreSQL Routine invocation");
+    assert_eq!(
+        interrupted
+            .iter()
+            .map(|event| (event.kind, event.task_name.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                routine_invocation::RoutineEventKind::TaskInterrupted,
+                Some("pending")
+            ),
+            (
+                routine_invocation::RoutineEventKind::TaskInterrupted,
+                Some("started")
+            ),
+            (
+                routine_invocation::RoutineEventKind::InvocationInterrupted,
+                None
+            ),
+        ]
+    );
+    let postgres_detail = routine_store
+        .detail("postgres-interruption")
+        .await
+        .expect("read consistent PostgreSQL Routine detail");
+    assert_eq!(
+        postgres_detail.events.last().unwrap().sequence,
+        postgres_detail.summary.latest_sequence
+    );
+    assert_eq!(
+        postgres_detail.events[0]
+            .admission
+            .as_ref()
+            .unwrap()
+            .admission_sequence,
+        postgres_detail.summary.admission_sequence
     );
     let outbound = first.outbound_oauth_store();
     outbound
@@ -791,6 +1027,142 @@ async fn postgres_uses_independent_pools_and_component_schemas() {
             .expect_err("reject checksum mismatch"),
         PersistenceError::Migration(DatabaseBackend::PostgreSql)
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn postgres_routine_event_sequences_follow_commit_order() {
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_exposed_port(5432.tcp())
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_USER", "waltr")
+        .with_env_var("POSTGRES_PASSWORD", "waltr")
+        .with_env_var("POSTGRES_DB", "waltr");
+    let container = image.start().await.expect("start PostgreSQL container");
+    let port = container
+        .get_host_port_ipv4(5432.tcp())
+        .await
+        .expect("read PostgreSQL port");
+    let persistence = Persistence::initialize(
+        DatabaseConfig::from_url(&format!(
+            "postgres://waltr:waltr@127.0.0.1:{port}/waltr?sslmode=disable"
+        ))
+        .expect("create config"),
+    )
+    .await
+    .expect("initialize PostgreSQL");
+    let pool = persistence.postgres_pool().expect("Waltr PostgreSQL pool");
+    let store = persistence.routine_invocation_store();
+    let admission = |invocation_id: &str, admitted_at_ms| routine_invocation::RoutineAdmission {
+        invocation_id: invocation_id.to_owned(),
+        execution_id: format!("execution-{invocation_id}"),
+        routine_name: "commit-order".to_owned(),
+        routine_revision: "revision".to_owned(),
+        trigger_name: "manual".to_owned(),
+        trigger_kind: routine_invocation::RoutineTriggerKind::Manual,
+        correlation_id: format!("correlation-{invocation_id}"),
+        metadata: BTreeMap::new(),
+        source_cursor: None,
+        declared_tasks: Vec::new(),
+        admitted_at_ms,
+    };
+
+    store
+        .admit(admission("allocator-a", 1))
+        .await
+        .expect("admit allocator A");
+    let mut allocator_a = pool.begin().await.expect("begin allocator A");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(routine_invocation::ROUTINE_EVENT_SEQUENCE_LOCK_KEY)
+        .execute(&mut *allocator_a)
+        .await
+        .expect("lock Routine event allocation");
+    let sequence_a = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO waltr.routine_invocation_events (invocation_id, event_kind, occurred_at_ms) VALUES ('allocator-a', 'invocation_started', 2) RETURNING sequence",
+    )
+    .fetch_one(&mut *allocator_a)
+    .await
+    .expect("allocate A sequence");
+    sqlx::query("UPDATE waltr.routine_invocations SET status = 'running', started_at_ms = 2, updated_at_ms = 2, latest_sequence = $1 WHERE invocation_id = 'allocator-a'")
+        .bind(sequence_a)
+        .execute(&mut *allocator_a)
+        .await
+        .expect("update allocator A aggregate");
+
+    let blocked_store = store.clone();
+    let mut allocator_b = tokio::spawn(async move {
+        blocked_store
+            .admit(admission("allocator-b", 3))
+            .await
+            .expect("admit allocator B")
+            .1
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut allocator_b)
+            .await
+            .is_err(),
+        "allocator B must wait for allocator A to commit"
+    );
+    let sequence_while_blocked = sqlx::query_scalar::<_, i64>(
+        "SELECT last_value FROM waltr.routine_invocation_events_sequence_seq",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read event identity while B is blocked");
+    assert_eq!(sequence_while_blocked, sequence_a);
+
+    allocator_a.commit().await.expect("commit allocator A");
+    let event_b = allocator_b.await.expect("join allocator B");
+    assert!(event_b.sequence > sequence_a);
+    let replay = store
+        .events_after(sequence_a - 1, 10, &BTreeMap::new())
+        .await
+        .expect("replay commit-ordered events");
+    assert_eq!(
+        replay
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        [sequence_a, event_b.sequence]
+    );
+
+    let mut lock_holder = pool.begin().await.expect("begin lifecycle lock holder");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(routine_invocation::ROUTINE_EVENT_SEQUENCE_LOCK_KEY)
+        .execute(&mut *lock_holder)
+        .await
+        .expect("hold Routine event allocation lock");
+    let sequence_before_lifecycle = sqlx::query_scalar::<_, i64>(
+        "SELECT last_value FROM waltr.routine_invocation_events_sequence_seq",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read identity before lifecycle allocation");
+    let lifecycle_store = store.clone();
+    let mut lifecycle = tokio::spawn(async move {
+        lifecycle_store
+            .start_invocation("allocator-b", 4)
+            .await
+            .expect("start allocator B invocation")
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut lifecycle)
+            .await
+            .is_err(),
+        "lifecycle allocation must wait for the transaction lock"
+    );
+    let sequence_while_lifecycle_blocked = sqlx::query_scalar::<_, i64>(
+        "SELECT last_value FROM waltr.routine_invocation_events_sequence_seq",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read identity while lifecycle is blocked");
+    assert_eq!(sequence_while_lifecycle_blocked, sequence_before_lifecycle);
+    lock_holder.commit().await.expect("release lifecycle lock");
+    let lifecycle_event = lifecycle.await.expect("join lifecycle allocator");
+    assert!(lifecycle_event.sequence > sequence_before_lifecycle);
 }
 
 #[tokio::test]
@@ -916,7 +1288,7 @@ async fn assert_component_histories(persistence: &Persistence) {
         .fetch_one(persistence.mcp_sqlite_pool().expect("MCP pool"))
         .await
         .expect("count MCP migrations");
-    assert_eq!((waltr_count, mcp_count), (5, 4));
+    assert_eq!((waltr_count, mcp_count), (6, 4));
 }
 
 async fn sqlite_tables(pool: &SqlitePool) -> Vec<String> {

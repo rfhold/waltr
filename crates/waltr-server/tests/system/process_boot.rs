@@ -510,7 +510,10 @@ async fn assert_process_database_isolation(
             "waltr_mcp_oauth_login_continuations",
             "waltr_oidc_login_attempts",
             "outbound_oauth_attempts",
-            "outbound_oauth_credentials"
+            "outbound_oauth_credentials",
+            "routine_invocation_events",
+            "routine_invocation_metadata",
+            "routine_invocations"
         ]
     );
     assert_eq!(
