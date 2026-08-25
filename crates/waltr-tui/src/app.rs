@@ -689,9 +689,14 @@ impl App {
                     if let Some(session_id) = detail_session_id
                         && self.sessions_section.detail_session_id().is_none()
                     {
-                        return AppAction::ClientCommand(
-                            ClientCommand::ReleaseSessionTimelineWatchInterest { session_id },
-                        );
+                        return AppAction::ClientCommands(vec![
+                            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                                session_id: session_id.clone(),
+                            },
+                            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                                session_id,
+                            },
+                        ]);
                     }
 
                     return AppAction::Continue;
@@ -745,8 +750,13 @@ impl App {
                     let mut commands = Vec::new();
                     if let Some(session_id) = detail_session_id {
                         commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
-                            session_id,
+                            session_id: session_id.clone(),
                         });
+                        commands.push(
+                            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                                session_id,
+                            },
+                        );
                     }
                     if leaving_sessions {
                         commands.push(ClientCommand::ReleaseSessionWatchInterest);
@@ -833,9 +843,12 @@ impl App {
                 self.screen = AppScreen::SessionData;
 
                 detail_session_id.map_or(AppAction::Continue, |session_id| {
-                    AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
-                        session_id,
-                    })
+                    AppAction::ClientCommands(vec![
+                        ClientCommand::ReleaseSessionTimelineWatchInterest {
+                            session_id: session_id.clone(),
+                        },
+                        ClientCommand::ReleaseSessionRoutineInvocationWatchInterest { session_id },
+                    ])
                 })
             }
             KeyCommand::LeaderCommand(LeaderCommand::Inference) => {
@@ -892,6 +905,11 @@ impl App {
                         commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
                             session_id: session_id.clone(),
                         });
+                        commands.push(
+                            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                                session_id,
+                            },
+                        );
                     }
                     commands.push(ClientCommand::ReleaseSessionWatchInterest);
                 }
@@ -1089,16 +1107,30 @@ impl App {
         self.client_snapshot = Some(snapshot);
 
         commands.extend(match (detail_before, detail_after) {
-            (None, Some(session_id)) => vec![register_timeline_watch_command(session_id)],
+            (None, Some(session_id)) => vec![
+                register_timeline_watch_command(session_id.clone()),
+                ClientCommand::RegisterSessionRoutineInvocationWatchInterest { session_id },
+            ],
             (Some(session_id), None) => {
-                vec![ClientCommand::ReleaseSessionTimelineWatchInterest { session_id }]
+                vec![
+                    ClientCommand::ReleaseSessionTimelineWatchInterest {
+                        session_id: session_id.clone(),
+                    },
+                    ClientCommand::ReleaseSessionRoutineInvocationWatchInterest { session_id },
+                ]
             }
             (Some(old_session_id), Some(new_session_id)) if old_session_id != new_session_id => {
                 vec![
                     ClientCommand::ReleaseSessionTimelineWatchInterest {
+                        session_id: old_session_id.clone(),
+                    },
+                    ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
                         session_id: old_session_id,
                     },
-                    register_timeline_watch_command(new_session_id),
+                    register_timeline_watch_command(new_session_id.clone()),
+                    ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
+                        session_id: new_session_id,
+                    },
                 ]
             }
             _ => Vec::new(),
@@ -1276,6 +1308,9 @@ impl App {
                     {
                         AppAction::ClientCommands(vec![
                             ClientCommand::ReleaseSessionTimelineWatchInterest {
+                                session_id: old_session_id.clone(),
+                            },
+                            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
                                 session_id: old_session_id,
                             },
                             command,

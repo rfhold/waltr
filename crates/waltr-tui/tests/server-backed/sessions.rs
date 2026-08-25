@@ -94,7 +94,8 @@ async fn client_stream_creates_opens_and_deletes_session_with_real_server() {
     assert!(rendered.contains("agent "));
     assert!(rendered.contains("(C-x a)"));
     assert!(rendered.contains("provider codex/gpt-5.6-sol (C-x p)"));
-    assert!(rendered.contains("ctx 0"));
+    assert!(rendered.contains("Session Context"));
+    assert!(rendered.contains("Usage  ctx 0  cache 0%/0%  cost $-"));
     insta::assert_snapshot!(
         "sessions_detail_real_server",
         normalize_session_render(&rendered, &session_id)
@@ -160,9 +161,14 @@ async fn session_data_screen_wipes_all_sessions_with_real_server() {
         let leave_detail = app.handle_event(&crate::support::input::escape_press(), now);
         assert_eq!(
             leave_detail,
-            AppAction::ClientCommand(
-                waltr_client::ClientCommand::ReleaseSessionTimelineWatchInterest { session_id }
-            )
+            AppAction::ClientCommands(vec![
+                waltr_client::ClientCommand::ReleaseSessionTimelineWatchInterest {
+                    session_id: session_id.clone(),
+                },
+                waltr_client::ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                    session_id,
+                },
+            ])
         );
         drop(dispatch_app_command(&mut stream, &mut app, leave_detail).await);
     }

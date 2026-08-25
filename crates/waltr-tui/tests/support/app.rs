@@ -281,12 +281,17 @@ pub(crate) fn watched_session_with_timeline(
 }
 
 pub(crate) fn expected_register_timeline_command(session_id: &str) -> AppAction {
-    AppAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest {
-        session_id: session_id.to_owned(),
-        after_cursor: None,
-        channels: timeline_channels(),
-        initial_limit: Some(64),
-    })
+    AppAction::ClientCommands(vec![
+        ClientCommand::RegisterSessionTimelineWatchInterest {
+            session_id: session_id.to_owned(),
+            after_cursor: None,
+            channels: timeline_channels(),
+            initial_limit: Some(64),
+        },
+        ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
+            session_id: session_id.to_owned(),
+        },
+    ])
 }
 
 pub(crate) fn timeline_channels() -> Vec<String> {

@@ -5,7 +5,7 @@ use waltr_client::{
 };
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Position, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -13,9 +13,8 @@ use ratatui::{
 use crate::theme::{StatusRole, THEME};
 
 use super::{
-    DETAIL_COMPOSER_MAX_INPUT_LINES, SessionsSection, cache_rate, format_compact_currency_cost,
-    format_count, panel_muted_style, panel_style, template_style::template_inline_spans,
-    timeline::accent_border_span,
+    DETAIL_COMPOSER_MAX_INPUT_LINES, SessionsSection, panel_muted_style, panel_style,
+    template_style::template_inline_spans, timeline::accent_border_span,
 };
 
 const RESOURCE_AUTOCOMPLETE_MAX_ROWS: u16 = 6;
@@ -98,7 +97,6 @@ pub(super) fn render_composer(
     section: &SessionsSection,
     snapshot: Option<&ClientSnapshot>,
     session: &SessionView,
-    context_tokens: u64,
 ) {
     frame.render_widget(Block::default().style(panel_style()), area);
 
@@ -150,7 +148,7 @@ pub(super) fn render_composer(
         Paragraph::new(Line::default()).style(panel_style()),
         spacer_area,
     );
-    render_composer_metadata(frame, metadata_area, session, context_tokens);
+    render_composer_metadata(frame, metadata_area, session);
     frame.render_widget(
         Paragraph::new(Line::default()).style(panel_style()),
         bottom_padding_area,
@@ -337,24 +335,10 @@ fn composer_input_widget(section: &SessionsSection, area: Rect) -> (Paragraph<'s
     )
 }
 
-fn render_composer_metadata(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    session: &SessionView,
-    context_tokens: u64,
-) {
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(80), Constraint::Percentage(20)]).areas(area);
-
+fn render_composer_metadata(frame: &mut Frame<'_>, area: Rect, session: &SessionView) {
     frame.render_widget(
-        Paragraph::new(composer_inference_line(session, left.width)).style(panel_style()),
-        left,
-    );
-    frame.render_widget(
-        Paragraph::new(detail_metrics_line(session, context_tokens))
-            .style(panel_style())
-            .alignment(Alignment::Right),
-        right,
+        Paragraph::new(composer_inference_line(session, area.width)).style(panel_style()),
+        area,
     );
 }
 
@@ -373,60 +357,30 @@ fn composer_inference_line(session: &SessionView, available_width: u16) -> Line<
         Span::raw(" "),
         Span::styled("(C-x p)", THEME.focus_style()),
     ];
-    let optional_spans = if let Some(thinking) =
-        provider_thinking_status_text(session.inference_settings.as_ref())
-    {
-        vec![
-            Span::raw("  "),
-            Span::styled("t ", panel_muted_style()),
-            Span::raw(thinking),
-            Span::raw(" "),
-            Span::styled("(Ctrl-T)", THEME.focus_style()),
-        ]
-    } else {
-        vec![
-            Span::raw(" "),
-            Span::styled("(Ctrl-T)", THEME.focus_style()),
-        ]
-    };
+    let optional_spans = provider_thinking_status_text(session.inference_settings.as_ref())
+        .map_or_else(
+            || {
+                vec![
+                    Span::raw(" "),
+                    Span::styled("(Ctrl-T)", THEME.focus_style()),
+                ]
+            },
+            |thinking| {
+                vec![
+                    Span::raw("  "),
+                    Span::styled("t ", panel_muted_style()),
+                    Span::raw(thinking),
+                    Span::raw(" "),
+                    Span::styled("(Ctrl-T)", THEME.focus_style()),
+                ]
+            },
+        );
     let width = spans.iter().map(Span::width).sum::<usize>();
     let optional_width = optional_spans.iter().map(Span::width).sum::<usize>();
     if width.saturating_add(optional_width) <= usize::from(available_width) {
         spans.extend(optional_spans);
     }
     Line::from(spans)
-}
-
-fn detail_metrics_line(session: &SessionView, context_tokens: u64) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("ctx ", panel_muted_style()),
-        Span::styled(format_count(context_tokens), panel_muted_style()),
-        Span::styled("  c ", panel_muted_style()),
-        Span::styled(
-            format!(
-                "{}/{}",
-                cache_rate(
-                    session.metrics.cache_read_tokens,
-                    session.metrics.total_input_tokens
-                ),
-                cache_rate(
-                    session.metrics.cache_write_tokens,
-                    session.metrics.total_input_tokens
-                )
-            ),
-            panel_muted_style(),
-        ),
-        Span::styled(
-            format!(
-                "  {}",
-                format_compact_currency_cost(
-                    session.metrics.total_cost_micros,
-                    session.metrics.cost_currency.as_deref(),
-                )
-            ),
-            panel_muted_style(),
-        ),
-    ])
 }
 
 fn provider_model_status_text(settings: Option<&InferenceSettingsView>) -> String {
@@ -459,7 +413,7 @@ mod tests {
     use super::render_composer_metadata;
 
     #[test]
-    fn narrow_metadata_never_clips_thinking_hint_into_context_metrics() {
+    fn narrow_metadata_never_clips_thinking_hint() {
         let session = session();
 
         for width in 75..=90 {
@@ -467,7 +421,7 @@ mod tests {
             let mut terminal = Terminal::new(backend).expect("test terminal");
             terminal
                 .draw(|frame| {
-                    render_composer_metadata(frame, Rect::new(0, 0, width, 1), &session, 0);
+                    render_composer_metadata(frame, Rect::new(0, 0, width, 1), &session);
                 })
                 .expect("metadata render");
             let rendered = terminal
@@ -475,19 +429,17 @@ mod tests {
                 .buffer()
                 .content
                 .iter()
-                .map(|cell| cell.symbol())
+                .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>();
-            let before_metrics = rendered.split("ctx").next().expect("metadata prefix");
-
-            assert!(!rendered.contains("tctx"), "width {width}: {rendered:?}");
             assert!(
-                !before_metrics.contains("Ctrl") || before_metrics.contains("(Ctrl-T)"),
+                !rendered.contains("Ctrl") || rendered.contains("(Ctrl-T)"),
                 "width {width}: {rendered:?}"
             );
             assert!(
-                before_metrics.contains("provider codex/gpt-5.6-sol (C-x p)"),
+                rendered.contains("provider codex/gpt-5.6-sol (C-x p)"),
                 "width {width}: {rendered:?}"
             );
+            assert!(!rendered.contains("ctx "), "width {width}: {rendered:?}");
         }
     }
 
@@ -498,6 +450,7 @@ mod tests {
             revision: 1,
             status: SessionStatusView {
                 phase: SessionPhaseView::Idle,
+                suspension_kind: None,
                 failed_message: String::new(),
                 authentication_failure: None,
             },
@@ -516,6 +469,8 @@ mod tests {
                 }),
             }),
             metrics: SessionMetricsView::default(),
+            associations: Default::default(),
+            metadata: std::collections::BTreeMap::default(),
         }
     }
 }
