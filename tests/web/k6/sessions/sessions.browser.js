@@ -10,9 +10,12 @@ const PRIMARY_PROVIDER = "k6-openai";
 const PRIMARY_MODEL = "gpt-5-nano";
 const SECONDARY_PROVIDER = "k6-anthropic";
 const SECONDARY_MODEL = "claude";
+const DESKTOP = { width: 1440, height: 900 };
+const MOBILE = { width: 390, height: 1100 };
 
 export default async function () {
   await withPage(async (page) => {
+    await page.setViewportSize(DESKTOP);
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     await waitForText(page, "#landing-title", "Waltr is ready.");
 
@@ -30,7 +33,17 @@ export default async function () {
     const createdPathname = await page.evaluate(() => window.location.pathname);
     const sessionId = decodeURIComponent(createdPathname.replace(/^\/sessions\//, ""));
     const detailTimeline = await waitForText(page, '[aria-label="Session timeline"]', "No messages yet.");
+    const sessionContext = await waitForText(page, '[aria-label="Session context"]', "No Routine invocations.");
+    const detailFillsShell = await page.evaluate(() => {
+      const shellContent = document.querySelector(".shell__content");
+      const detail = document.querySelector(".sessions--detail");
+      if (!shellContent || !detail) return false;
+      return Math.abs(shellContent.getBoundingClientRect().height - detail.getBoundingClientRect().height) < 1;
+    });
     await screenshot(page, "sessions-detail-thinking-default");
+    await page.setViewportSize(MOBILE);
+    await screenshot(page, "sessions-context-mobile");
+    await page.setViewportSize(DESKTOP);
 
     await typeAndKeepFocus(page, '[aria-label="Session message"]', "@read");
     const resourceSuggestions = await waitForText(page, '[aria-label="Resource suggestions"]', "read");
@@ -89,6 +102,8 @@ export default async function () {
     check(null, {
       "session detail route reached": () => createdPathname.startsWith("/sessions/") && sessionId.length > 0,
       "session detail shows empty timeline": () => includesText(detailTimeline, "No messages yet."),
+      "session detail shows empty context": () => includesText(sessionContext, "Usage Ctx 0 Cache 0% / 0% Cost - Subtasks No subtasks. Routines No Routine invocations."),
+      "session detail fills the scroll viewport": () => detailFillsShell,
       "session resource search shows suggestions": () => includesText(resourceSuggestions, "read"),
       "session resource search fills composer": () => resourceFilled.startsWith("@tool(") && resourceFilled !== "@read",
       "session thinking select is enabled": () => thinkingSelectEnabled,
