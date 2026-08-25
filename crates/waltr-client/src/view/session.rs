@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -53,6 +55,57 @@ pub struct SessionView {
     pub inference_settings: Option<InferenceSettingsView>,
     /// Aggregate usage and cost derived from journaled provider turns.
     pub metrics: SessionMetricsView,
+    /// Typed associations derived from known session metadata keys.
+    pub associations: SessionAssociationsView,
+    /// Complete JSON session metadata object.
+    #[ts(type = "Record<string, unknown>")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Stable associations derived from known session metadata keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAssociationsView {
+    /// Parent session that created this direct task session.
+    pub task_parent_session_id: Option<String>,
+    /// Direct task description supplied by the parent session.
+    pub task_description: Option<String>,
+    /// Routine invocation that owns this helper session.
+    pub routine_invocation_id: Option<String>,
+}
+
+impl From<&BTreeMap<String, serde_json::Value>> for SessionAssociationsView {
+    fn from(metadata: &BTreeMap<String, serde_json::Value>) -> Self {
+        let string_value = |key| {
+            metadata
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+
+        Self {
+            task_parent_session_id: string_value("waltr.task.parent_session_id"),
+            task_description: string_value("waltr.task.description"),
+            routine_invocation_id: string_value("waltr.routine.invocation_id"),
+        }
+    }
+}
+
+impl SessionView {
+    /// Return a nonempty string title from session metadata.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.metadata
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .filter(|title| !title.is_empty())
+    }
+
+    /// Return the title when present, otherwise the stable session id.
+    #[must_use]
+    pub fn display_label(&self) -> &str {
+        self.title().unwrap_or(&self.id)
+    }
 }
 
 /// Stable aggregate session metrics view shared by Waltr shells.
@@ -318,6 +371,13 @@ pub struct ExternalRequestView {
 
 impl From<SessionSummary> for SessionView {
     fn from(session: SessionSummary) -> Self {
+        let metadata = session.metadata.map_or_else(BTreeMap::new, |metadata| {
+            metadata
+                .fields
+                .into_iter()
+                .map(|(key, value)| (key, proto_value_to_json(value)))
+                .collect()
+        });
         Self {
             id: session.id,
             agent_name: session.agent_name,
@@ -333,7 +393,31 @@ impl From<SessionSummary> for SessionView {
             metrics: session
                 .metrics
                 .map_or_else(SessionMetricsView::default, Into::into),
+            associations: SessionAssociationsView::from(&metadata),
+            metadata,
         }
+    }
+}
+
+fn proto_value_to_json(value: prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+
+    match value.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(value)) => serde_json::Value::Bool(value),
+        Some(Kind::NumberValue(value)) => serde_json::Number::from_f64(value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Some(Kind::StringValue(value)) => serde_json::Value::String(value),
+        Some(Kind::ListValue(value)) => {
+            serde_json::Value::Array(value.values.into_iter().map(proto_value_to_json).collect())
+        }
+        Some(Kind::StructValue(value)) => serde_json::Value::Object(
+            value
+                .fields
+                .into_iter()
+                .map(|(key, value)| (key, proto_value_to_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -563,7 +647,129 @@ impl From<i32> for TimelineStatusView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use waltr::grpc::waltr::session::v1::Suspension;
+    use waltr::grpc::waltr::session::v1::{SessionSummary, Suspension};
+    use prost_types::value::Kind;
+
+    #[test]
+    fn session_view_preserves_metadata_and_uses_only_nonempty_string_titles() {
+        let metadata = prost_types::Struct {
+            fields: BTreeMap::from([
+                (
+                    "title".to_owned(),
+                    proto_value(Kind::StringValue("Live title".to_owned())),
+                ),
+                ("null".to_owned(), proto_value(Kind::NullValue(0))),
+                ("bool".to_owned(), proto_value(Kind::BoolValue(true))),
+                ("number".to_owned(), proto_value(Kind::NumberValue(42.0))),
+                (
+                    "array".to_owned(),
+                    proto_value(Kind::ListValue(prost_types::ListValue {
+                        values: vec![proto_value(Kind::StringValue("value".to_owned()))],
+                    })),
+                ),
+                (
+                    "object".to_owned(),
+                    proto_value(Kind::StructValue(prost_types::Struct {
+                        fields: BTreeMap::from([(
+                            "nested".to_owned(),
+                            proto_value(Kind::BoolValue(false)),
+                        )]),
+                    })),
+                ),
+            ]),
+        };
+        let view = SessionView::from(SessionSummary {
+            id: "session-id".to_owned(),
+            metadata: Some(metadata),
+            ..SessionSummary::default()
+        });
+
+        assert_eq!(view.title(), Some("Live title"));
+        assert_eq!(view.display_label(), "Live title");
+        assert_eq!(view.metadata["null"], serde_json::Value::Null);
+        assert_eq!(view.metadata["bool"], serde_json::json!(true));
+        assert_eq!(view.metadata["number"], serde_json::json!(42.0));
+        assert_eq!(view.metadata["array"], serde_json::json!(["value"]));
+        assert_eq!(
+            view.metadata["object"],
+            serde_json::json!({ "nested": false })
+        );
+
+        let mut empty_title = view;
+        empty_title
+            .metadata
+            .insert("title".to_owned(), serde_json::json!(""));
+        assert_eq!(empty_title.title(), None);
+        assert_eq!(empty_title.display_label(), "session-id");
+
+        empty_title
+            .metadata
+            .insert("title".to_owned(), serde_json::json!(false));
+        assert_eq!(empty_title.display_label(), "session-id");
+    }
+
+    #[test]
+    fn session_view_projects_known_associations_and_preserves_their_metadata() {
+        let fields = BTreeMap::from([
+            (
+                "waltr.task.parent_session_id".to_owned(),
+                proto_value(Kind::StringValue("parent-1".to_owned())),
+            ),
+            (
+                "waltr.task.description".to_owned(),
+                proto_value(Kind::StringValue("Investigate failure".to_owned())),
+            ),
+            (
+                "waltr.routine.invocation_id".to_owned(),
+                proto_value(Kind::StringValue("invocation-1".to_owned())),
+            ),
+        ]);
+
+        let view = SessionView::from(SessionSummary {
+            metadata: Some(prost_types::Struct { fields }),
+            ..SessionSummary::default()
+        });
+
+        assert_eq!(
+            view.associations,
+            SessionAssociationsView {
+                task_parent_session_id: Some("parent-1".to_owned()),
+                task_description: Some("Investigate failure".to_owned()),
+                routine_invocation_id: Some("invocation-1".to_owned()),
+            }
+        );
+        assert_eq!(
+            view.metadata["waltr.task.description"],
+            serde_json::json!("Investigate failure")
+        );
+    }
+
+    #[test]
+    fn session_view_ignores_missing_and_non_string_associations() {
+        let malformed = SessionView::from(SessionSummary {
+            metadata: Some(prost_types::Struct {
+                fields: BTreeMap::from([
+                    (
+                        "waltr.task.parent_session_id".to_owned(),
+                        proto_value(Kind::NumberValue(42.0)),
+                    ),
+                    (
+                        "waltr.task.description".to_owned(),
+                        proto_value(Kind::BoolValue(true)),
+                    ),
+                    (
+                        "waltr.routine.invocation_id".to_owned(),
+                        proto_value(Kind::NullValue(0)),
+                    ),
+                ]),
+            }),
+            ..SessionSummary::default()
+        });
+        let missing = SessionView::from(SessionSummary::default());
+
+        assert_eq!(malformed.associations, SessionAssociationsView::default());
+        assert_eq!(missing.associations, SessionAssociationsView::default());
+    }
 
     #[test]
     fn session_status_view_projects_suspension_kinds() {
@@ -616,5 +822,9 @@ mod tests {
 
         assert_eq!(idle.suspension_kind, None);
         assert_eq!(suspended_without_detail.suspension_kind, None);
+    }
+
+    fn proto_value(kind: Kind) -> prost_types::Value {
+        prost_types::Value { kind: Some(kind) }
     }
 }

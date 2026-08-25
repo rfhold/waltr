@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-wasm = ["dep:serde_json", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 
 [dependencies]
 futures-channel.workspace = true
@@ -19,7 +19,7 @@ waltr = { path = "../waltr", version = "0.1.0", default-features = false, featur
 prost-types.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 serde_yaml_ng.workspace = true
 tonic.workspace = true
 ts-rs.workspace = true
@@ -38,7 +38,6 @@ tonic-web-wasm-client.workspace = true
 hyper-util.workspace = true
 waltr-agent.workspace = true
 waltr-server = { workspace = true, features = ["test"] }
-serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 [lints]
