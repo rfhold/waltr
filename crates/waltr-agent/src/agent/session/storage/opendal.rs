@@ -2,6 +2,8 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex, OnceLock},
 };
 use tokio::sync::{Mutex, OnceCell};
@@ -14,8 +16,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
-        SessionRecord, SessionSummary,
+        InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -25,18 +27,48 @@ use crate::{
 use serde_json::Value;
 
 /// Generic `OpenDAL` implementation of [`SessionStore`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenDalSessionStore {
     operator: Operator,
     prefix: String,
     mutation_namespace: Arc<OnceCell<String>>,
     namespace_locator: String,
+    compare_and_swap: Option<Arc<dyn OpenDalCompareAndSwap>>,
+}
+
+pub(super) trait OpenDalCompareAndSwap: Send + Sync {
+    fn compare_exchange<'a>(
+        &'a self,
+        key: &'a str,
+        expected: &'a [u8],
+        replacement: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = SessionStoreResult<bool>> + Send + 'a>>;
+}
+
+impl std::fmt::Debug for OpenDalSessionStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenDalSessionStore")
+            .field("operator", &self.operator)
+            .field("prefix", &self.prefix)
+            .field("namespace_locator", &self.namespace_locator)
+            .field("compare_and_swap", &self.compare_and_swap.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 const MUTATION_NAMESPACE_OBJECT: &str = ".waltr-session-mutation-namespace";
+const OPENDAL_CAS_ATTEMPTS: usize = 8;
 type MutationKey = (String, String, SessionId);
 type MutationGuards = OnceLock<StdMutex<HashMap<MutationKey, Arc<Mutex<()>>>>>;
 type InitializationGuards = OnceLock<StdMutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+struct UpdatedRecord<'a> {
+    etag: Option<&'a str>,
+    original: &'a [u8],
+    record: &'a SessionRecord,
+    require_atomic: bool,
+}
 
 impl OpenDalSessionStore {
     /// Create an OpenDAL-backed store using `operator` and key `prefix`.
@@ -82,7 +114,16 @@ impl OpenDalSessionStore {
             prefix,
             mutation_namespace: Arc::new(mutation_namespace),
             namespace_locator,
+            compare_and_swap: None,
         }
+    }
+
+    pub(super) fn with_compare_and_swap(
+        mut self,
+        compare_and_swap: Arc<dyn OpenDalCompareAndSwap>,
+    ) -> Self {
+        self.compare_and_swap = Some(compare_and_swap);
+        self
     }
 
     fn key(&self, id: &SessionId) -> String {
@@ -92,9 +133,9 @@ impl OpenDalSessionStore {
     async fn load_record_with_etag(
         &self,
         id: &SessionId,
-    ) -> SessionStoreResult<(SessionRecord, Option<String>)> {
+    ) -> SessionStoreResult<(SessionRecord, Option<String>, Vec<u8>)> {
         let key = self.key(id);
-        loop {
+        for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
             let metadata = self.operator.stat(&key).await.map_err(|error| {
                 if error.kind() == opendal::ErrorKind::NotFound {
                     SessionStoreError::NotFound { id: id.clone() }
@@ -109,20 +150,25 @@ impl OpenDalSessionStore {
             };
             match read {
                 Ok(bytes) => {
-                    let record =
-                        serde_json::from_slice(bytes.to_bytes().as_ref()).map_err(backend_error)?;
-                    return Ok((record, etag));
+                    let bytes = bytes.to_bytes().to_vec();
+                    let record = serde_json::from_slice(&bytes).map_err(backend_error)?;
+                    return Ok((record, etag, bytes));
                 }
-                Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {}
+                Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {
+                    if attempt == OPENDAL_CAS_ATTEMPTS {
+                        return Err(cas_contention(id, attempt));
+                    }
+                }
                 Err(error) => return Err(backend_error(error)),
             }
         }
+        unreachable!("OpenDAL CAS attempts are positive")
     }
 
     async fn load_record(&self, id: &SessionId) -> SessionStoreResult<SessionRecord> {
         self.load_record_with_etag(id)
             .await
-            .map(|(record, _)| record)
+            .map(|(record, _, _)| record)
     }
 
     async fn save_record(&self, record: &SessionRecord) -> SessionStoreResult<()> {
@@ -164,8 +210,8 @@ impl OpenDalSessionStore {
     ) -> SessionStoreResult<(Revision, T)> {
         let guard = self.mutation_guard(id).await?;
         let _mutation = guard.lock().await;
-        loop {
-            let (mut record, etag) = self.load_record_with_etag(id).await?;
+        for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
+            let (mut record, etag, original) = self.load_record_with_etag(id).await?;
             if record.revision != expected_revision {
                 return Err(SessionStoreError::StaleRevision {
                     id: id.clone(),
@@ -176,22 +222,25 @@ impl OpenDalSessionStore {
             let revision = record.revision.next();
             record.revision = revision;
             let value = update(&mut record, revision)?;
-            let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
-            let write = match etag.as_deref() {
-                Some(etag) => {
-                    self.operator
-                        .write_with(&self.key(id), bytes)
-                        .if_match(etag)
-                        .await
-                }
-                None => self.operator.write(&self.key(id), bytes).await,
-            };
-            match write {
-                Ok(_) => return Ok((revision, value)),
-                Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {}
-                Err(error) => return Err(backend_error(error)),
+            if self
+                .write_updated_record(
+                    id,
+                    UpdatedRecord {
+                        etag: etag.as_deref(),
+                        original: &original,
+                        record: &record,
+                        require_atomic: false,
+                    },
+                )
+                .await?
+            {
+                return Ok((revision, value));
+            }
+            if attempt == OPENDAL_CAS_ATTEMPTS {
+                return Err(cas_contention(id, attempt));
             }
         }
+        unreachable!("OpenDAL CAS attempts are positive")
     }
 
     async fn update_metadata_record(
@@ -201,25 +250,67 @@ impl OpenDalSessionStore {
     ) -> SessionStoreResult<SessionRecord> {
         let guard = self.mutation_guard(id).await?;
         let _mutation = guard.lock().await;
-        loop {
-            let (mut record, etag) = self.load_record_with_etag(id).await?;
+        for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
+            let (mut record, etag, original) = self.load_record_with_etag(id).await?;
             update(&mut record);
-            let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
-            let write = match etag.as_deref() {
-                Some(etag) => {
-                    self.operator
-                        .write_with(&self.key(id), bytes)
-                        .if_match(etag)
-                        .await
-                }
-                None => self.operator.write(&self.key(id), bytes).await,
-            };
-            match write {
-                Ok(_) => return Ok(record),
-                Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => {}
-                Err(error) => return Err(backend_error(error)),
+            if self
+                .write_updated_record(
+                    id,
+                    UpdatedRecord {
+                        etag: etag.as_deref(),
+                        original: &original,
+                        record: &record,
+                        require_atomic: false,
+                    },
+                )
+                .await?
+            {
+                return Ok(record);
+            }
+            if attempt == OPENDAL_CAS_ATTEMPTS {
+                return Err(cas_contention(id, attempt));
             }
         }
+        unreachable!("OpenDAL CAS attempts are positive")
+    }
+
+    async fn write_updated_record(
+        &self,
+        id: &SessionId,
+        updated: UpdatedRecord<'_>,
+    ) -> SessionStoreResult<bool> {
+        let key = self.key(id);
+        let replacement = serde_json::to_vec_pretty(updated.record).map_err(backend_error)?;
+        if let Some(etag) = updated.etag {
+            return match self
+                .operator
+                .write_with(&key, replacement)
+                .if_match(etag)
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == opendal::ErrorKind::ConditionNotMatch => Ok(false),
+                Err(error) => Err(backend_error(error)),
+            };
+        }
+        if let Some(compare_and_swap) = &self.compare_and_swap {
+            return compare_and_swap
+                .compare_exchange(&key, updated.original, &replacement)
+                .await;
+        }
+        if updated.require_atomic {
+            return Err(SessionStoreError::Backend {
+                message: format!(
+                    "atomic metadata writes are unsupported for OpenDAL session {} because the backend provides neither ETags nor compare-and-swap",
+                    id.as_str()
+                ),
+            });
+        }
+        self.operator
+            .write(&key, replacement)
+            .await
+            .map_err(backend_error)?;
+        Ok(true)
     }
 
     async fn mutation_guard(&self, id: &SessionId) -> SessionStoreResult<Arc<Mutex<()>>> {
@@ -382,20 +473,45 @@ impl SessionStore for OpenDalSessionStore {
         }
     }
 
-    fn set_metadata_value(
+    fn set_metadata_value_conditionally(
         &self,
         id: &SessionId,
         key: String,
         value: Value,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        condition: MetadataSetCondition,
+    ) -> impl std::future::Future<Output = SessionStoreResult<MetadataSetOutcome>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store
-                .update_metadata_record(&id, |record| {
-                    record.set_metadata_value(key.clone(), value.clone());
-                })
-                .await
+            let guard = store.mutation_guard(&id).await?;
+            let _mutation = guard.lock().await;
+            for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
+                let (mut record, etag, original) = store.load_record_with_etag(&id).await?;
+                let changed = condition == MetadataSetCondition::Unconditional
+                    || !record.metadata.values.contains_key(&key);
+                if !changed {
+                    return Ok(MetadataSetOutcome { record, changed });
+                }
+                record.set_metadata_value(key.clone(), value.clone());
+                if store
+                    .write_updated_record(
+                        &id,
+                        UpdatedRecord {
+                            etag: etag.as_deref(),
+                            original: &original,
+                            record: &record,
+                            require_atomic: true,
+                        },
+                    )
+                    .await?
+                {
+                    return Ok(MetadataSetOutcome { record, changed });
+                }
+                if attempt == OPENDAL_CAS_ATTEMPTS {
+                    return Err(cas_contention(&id, attempt));
+                }
+            }
+            unreachable!("OpenDAL CAS attempts are positive")
         }
     }
 
@@ -481,11 +597,64 @@ fn backend_error(error: impl std::error::Error) -> SessionStoreError {
     }
 }
 
+fn cas_contention(id: &SessionId, attempts: usize) -> SessionStoreError {
+    SessionStoreError::Backend {
+        message: format!(
+            "OpenDAL compare-and-swap contention for session {} after {attempts} attempts",
+            id.as_str()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use opendal::services;
 
     use super::*;
+
+    struct TestCompareAndSwap {
+        operator: Operator,
+        rejections: Arc<AtomicUsize>,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl OpenDalCompareAndSwap for TestCompareAndSwap {
+        fn compare_exchange<'a>(
+            &'a self,
+            key: &'a str,
+            expected: &'a [u8],
+            replacement: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = SessionStoreResult<bool>> + Send + 'a>> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                if self
+                    .rejections
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                        value.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Ok(false);
+                }
+                let current = self
+                    .operator
+                    .read(key)
+                    .await
+                    .map_err(backend_error)?
+                    .to_bytes();
+                if current.as_ref() != expected {
+                    return Ok(false);
+                }
+                self.operator
+                    .write(key, replacement.to_vec())
+                    .await
+                    .map_err(backend_error)?;
+                Ok(true)
+            })
+        }
+    }
 
     #[tokio::test]
     async fn wipe_removes_valid_and_invalid_raw_objects_and_is_idempotent() {
@@ -615,6 +784,130 @@ mod tests {
             second.load(&id).await,
             Err(SessionStoreError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn tokenless_backend_rejects_atomic_metadata_write_instead_of_falling_back() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let store = OpenDalSessionStore::new(operator, "sessions");
+        let id = SessionId::new("tokenless");
+        let record = store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        let original = serde_json::to_vec_pretty(&record).unwrap();
+        let mut replacement = record;
+        replacement.set_metadata_value("key", serde_json::json!("value"));
+
+        let error = store
+            .write_updated_record(
+                &id,
+                UpdatedRecord {
+                    etag: None,
+                    original: &original,
+                    record: &replacement,
+                    require_atomic: true,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionStoreError::Backend { message }
+                if message.contains("neither ETags nor compare-and-swap")
+        ));
+        assert_eq!(store.load(&id).await.unwrap().metadata_value("key"), None);
+    }
+
+    #[tokio::test]
+    async fn repeated_compare_and_swap_rejection_is_bounded() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let rejections = Arc::new(AtomicUsize::new(usize::MAX));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions").with_compare_and_swap(
+            Arc::new(TestCompareAndSwap {
+                operator,
+                rejections,
+                attempts: Arc::clone(&attempts),
+            }),
+        );
+        let id = SessionId::new("bounded-cas");
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+
+        let error = store
+            .set_metadata_value_conditionally(
+                &id,
+                "key".to_owned(),
+                serde_json::json!("value"),
+                MetadataSetCondition::Absent,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), OPENDAL_CAS_ATTEMPTS);
+        assert!(matches!(
+            error,
+            SessionStoreError::Backend { message }
+                if message.contains("compare-and-swap contention")
+                    && message.contains("8 attempts")
+        ));
+    }
+
+    #[tokio::test]
+    async fn compare_and_swap_retry_preserves_timeline_cursor_high_water() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions").with_compare_and_swap(
+            Arc::new(TestCompareAndSwap {
+                operator,
+                rejections: Arc::clone(&rejections),
+                attempts,
+            }),
+        );
+        let id = SessionId::new("cursor-cas");
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        store
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                vec![PendingTimelineEvent::assistant_text_delta(
+                    id.clone(),
+                    0,
+                    crate::PendingTimelineItemId::New,
+                    "preserved",
+                )],
+            )
+            .await
+            .unwrap();
+        rejections.store(1, Ordering::SeqCst);
+
+        let outcome = store
+            .set_metadata_value_conditionally(
+                &id,
+                "key".to_owned(),
+                serde_json::json!("value"),
+                MetadataSetCondition::Absent,
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.changed);
+        assert_eq!(
+            outcome.record.timeline_cursor_high_water(),
+            crate::TimelineCursor::new(1)
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().timeline_cursor_high_water(),
+            crate::TimelineCursor::new(1)
+        );
     }
 
     fn inference_settings(model_id: &str) -> InferenceSettings {

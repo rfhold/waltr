@@ -11,8 +11,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
-        SessionRecord, SessionSummary,
+        InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -20,6 +20,8 @@ use crate::{
     },
 };
 use serde_json::Value;
+
+const SCYLLA_LWT_ATTEMPTS: usize = 8;
 
 /// Scylla JSON-row implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
@@ -138,7 +140,7 @@ impl ScyllaSessionStore {
         expected_revision: Revision,
         update: impl Fn(&mut SessionRecord, Revision) -> SessionStoreResult<T> + Send,
     ) -> SessionStoreResult<(Revision, T)> {
-        loop {
+        for attempt in 1..=SCYLLA_LWT_ATTEMPTS {
             let mut record = self.load_record(id).await?;
             if record.revision != expected_revision {
                 return Err(SessionStoreError::StaleRevision {
@@ -162,7 +164,11 @@ impl ScyllaSessionStore {
             if applied.0 {
                 return Ok((revision, value));
             }
+            if attempt == SCYLLA_LWT_ATTEMPTS {
+                return Err(lwt_contention(id, attempt));
+            }
         }
+        unreachable!("Scylla LWT attempts are positive")
     }
 
     async fn update_metadata_record(
@@ -170,7 +176,7 @@ impl ScyllaSessionStore {
         id: &SessionId,
         update: impl Fn(&mut SessionRecord) + Send,
     ) -> SessionStoreResult<SessionRecord> {
-        loop {
+        for attempt in 1..=SCYLLA_LWT_ATTEMPTS {
             let mut record = self.load_record(id).await?;
             let revision = record.revision;
             let original_json = serde_json::to_string(&record).map_err(backend_error)?;
@@ -185,7 +191,11 @@ impl ScyllaSessionStore {
             if applied.0 {
                 return Ok(record);
             }
+            if attempt == SCYLLA_LWT_ATTEMPTS {
+                return Err(lwt_contention(id, attempt));
+            }
         }
+        unreachable!("Scylla LWT attempts are positive")
     }
 }
 
@@ -293,20 +303,41 @@ impl SessionStore for ScyllaSessionStore {
         }
     }
 
-    fn set_metadata_value(
+    fn set_metadata_value_conditionally(
         &self,
         id: &SessionId,
         key: String,
         value: Value,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        condition: MetadataSetCondition,
+    ) -> impl std::future::Future<Output = SessionStoreResult<MetadataSetOutcome>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store
-                .update_metadata_record(&id, |record| {
-                    record.set_metadata_value(key.clone(), value.clone());
-                })
-                .await
+            for attempt in 1..=SCYLLA_LWT_ATTEMPTS {
+                let mut record = store.load_record(&id).await?;
+                let changed = condition == MetadataSetCondition::Unconditional
+                    || !record.metadata.values.contains_key(&key);
+                if !changed {
+                    return Ok(MetadataSetOutcome { record, changed });
+                }
+                let revision = record.revision;
+                let original_json = serde_json::to_string(&record).map_err(backend_error)?;
+                record.set_metadata_value(key.clone(), value.clone());
+                let json = serde_json::to_string(&record).map_err(backend_error)?;
+                let revision_i64 = i64::try_from(revision.get()).map_err(backend_error)?;
+                let applied: (bool, Option<CqlValue>, Option<CqlValue>) = store.session.query_unpaged(
+                    format!("UPDATE {} SET record_json = ? WHERE session_id = ? IF revision = ? AND record_json = ?", store.table_name()),
+                    (json, id.as_str(), revision_i64, original_json),
+                ).await.map_err(backend_error)?.into_rows_result().map_err(backend_error)?
+                    .single_row().map_err(backend_error)?;
+                if applied.0 {
+                    return Ok(MetadataSetOutcome { record, changed });
+                }
+                if attempt == SCYLLA_LWT_ATTEMPTS {
+                    return Err(lwt_contention(&id, attempt));
+                }
+            }
+            unreachable!("Scylla LWT attempts are positive")
         }
     }
 
@@ -393,5 +424,14 @@ fn quote_identifier(value: &str) -> String {
 fn backend_error(error: impl std::fmt::Display) -> SessionStoreError {
     SessionStoreError::Backend {
         message: error.to_string(),
+    }
+}
+
+fn lwt_contention(id: &SessionId, attempts: usize) -> SessionStoreError {
+    SessionStoreError::Backend {
+        message: format!(
+            "Scylla lightweight-transaction contention for session {} after {attempts} attempts",
+            id.as_str()
+        ),
     }
 }

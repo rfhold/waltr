@@ -17,8 +17,9 @@ use axum::{
     routing::get,
 };
 use waltr_agent::{
-    Revision, S3SessionStore, S3SessionWriteMode, SessionCreateRequest, SessionId, SessionRecord,
-    SessionStore, SessionStoreError,
+    MetadataSetCondition, PendingTimelineEvent, PendingTimelineItemId, Revision, S3SessionStore,
+    S3SessionWriteMode, SessionCreateRequest, SessionId, SessionRecord, SessionStore,
+    SessionStoreError, TimelineCursor,
 };
 use serde_json::json;
 use tokio::{sync::Notify, task::JoinHandle};
@@ -52,7 +53,7 @@ async fn conditional_mode_stops_after_eight_precondition_failures() {
         panic!("expected backend error");
     };
     assert!(message.contains(id.as_str()));
-    assert!(message.contains("status 412"));
+    assert!(message.contains("status 409 or 412"));
     assert!(message.contains("8 PUT attempts"));
     assert!(message.contains("may not support PutObject If-Match"));
     assert!(message.contains("contending"));
@@ -141,6 +142,19 @@ async fn conditional_metadata_retry_reapplies_update_to_latest_record() {
         .create(SessionCreateRequest::new(id.clone()))
         .await
         .expect("create session");
+    store
+        .append_timeline(
+            &id,
+            Revision::ZERO,
+            vec![PendingTimelineEvent::assistant_text_delta(
+                id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                "preserved",
+            )],
+        )
+        .await
+        .expect("seed timeline high water");
     fake.state
         .conflicts
         .lock()
@@ -154,6 +168,74 @@ async fn conditional_metadata_retry_reapplies_update_to_latest_record() {
 
     assert_eq!(record.metadata.values.get("server"), Some(&json!(true)));
     assert_eq!(record.metadata.values.get("client"), Some(&json!(true)));
+    assert_eq!(record.timeline_cursor_high_water(), TimelineCursor::new(1));
+}
+
+#[tokio::test]
+async fn conditional_metadata_retries_http_409_conflict() {
+    let fake = FakeS3::start(true).await;
+    let store = S3SessionStore::new(fake.client().await, "bucket", "sessions");
+    let id = SessionId::new("metadata-409-retry");
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
+    let initial_puts = fake.state.put_count.load(Ordering::SeqCst);
+    fake.state
+        .conflicts
+        .lock()
+        .expect("conflict lock")
+        .push_back(ConflictAction::Reject409);
+
+    let outcome = store
+        .set_metadata_value_conditionally(
+            &id,
+            "key".to_owned(),
+            json!("value"),
+            MetadataSetCondition::Absent,
+        )
+        .await
+        .expect("409 conflict should retry");
+
+    assert!(outcome.changed);
+    assert_eq!(
+        fake.state.put_count.load(Ordering::SeqCst) - initial_puts,
+        2
+    );
+}
+
+#[tokio::test]
+async fn concurrent_absent_metadata_writes_have_one_winner() {
+    let fake = FakeS3::start(true).await;
+    let client = fake.client().await;
+    let first = S3SessionStore::new(client.clone(), "bucket", "sessions");
+    let second = S3SessionStore::new(client, "bucket", "sessions");
+    let id = SessionId::new("metadata-single-winner");
+    first
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .expect("create session");
+
+    let (left, right) = tokio::join!(
+        first.set_metadata_value_conditionally(
+            &id,
+            "winner".to_owned(),
+            json!("left"),
+            MetadataSetCondition::Absent,
+        ),
+        second.set_metadata_value_conditionally(
+            &id,
+            "winner".to_owned(),
+            json!("right"),
+            MetadataSetCondition::Absent,
+        ),
+    );
+
+    assert_eq!(
+        usize::from(left.expect("left writer").changed)
+            + usize::from(right.expect("right writer").changed),
+        1
+    );
 }
 
 #[tokio::test]
@@ -260,6 +342,7 @@ async fn normalized_prefixes_share_session_lock_across_store_instances_and_clone
 #[derive(Debug, Clone, Copy)]
 enum ConflictAction {
     Reject,
+    Reject409,
     AdvanceRevision,
     AddServerMetadata,
 }
@@ -406,8 +489,9 @@ async fn put_object(
     }
     let conflict = state.conflicts.lock().expect("conflict lock").pop_front();
     if let Some(conflict) = conflict {
-        match conflict {
-            ConflictAction::Reject => {}
+        let (status, code) = match conflict {
+            ConflictAction::Reject => (StatusCode::PRECONDITION_FAILED, "PreconditionFailed"),
+            ConflictAction::Reject409 => (StatusCode::CONFLICT, "ConditionalRequestConflict"),
             ConflictAction::AdvanceRevision => {
                 let mut object = state.object.lock().expect("object lock");
                 let mut record: SessionRecord =
@@ -417,6 +501,7 @@ async fn put_object(
                 *object = Some(serde_json::to_vec_pretty(&record).expect("serialize record"));
                 drop(object);
                 state.etag_version.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::PRECONDITION_FAILED, "PreconditionFailed")
             }
             ConflictAction::AddServerMetadata => {
                 let mut object = state.object.lock().expect("object lock");
@@ -427,9 +512,10 @@ async fn put_object(
                 *object = Some(serde_json::to_vec_pretty(&record).expect("serialize record"));
                 drop(object);
                 state.etag_version.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::PRECONDITION_FAILED, "PreconditionFailed")
             }
-        }
-        return s3_error(StatusCode::PRECONDITION_FAILED, "PreconditionFailed");
+        };
+        return s3_error(status, code);
     }
     if let Some(if_match) = if_match {
         let object_exists = state.object.lock().expect("object lock").is_some();

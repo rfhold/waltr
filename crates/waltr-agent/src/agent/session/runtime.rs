@@ -21,9 +21,9 @@ use serde_json::Value;
 
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, InferenceSettings, PendingWork, PendingWorkStatus, ResumeInput,
-    SessionCreateRequest, SessionId, SessionJournalEvent, SessionListBroadcaster, SessionListEvent,
-    SessionRecord,
+    ExternalResponse, InferenceSettings, MetadataSetCondition, MetadataSetOutcome, PendingWork,
+    PendingWorkStatus, ResumeInput, SessionCreateRequest, SessionId, SessionJournalEvent,
+    SessionListBroadcaster, SessionListEvent, SessionRecord,
     SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
     SessionTimelineBroadcaster, Suspension,
 };
@@ -211,6 +211,24 @@ where
     ) -> Result<SessionRecord> {
         self.store
             .set_metadata_value(id, key, value)
+            .await
+            .map_err(session_store_error)
+    }
+
+    /// Atomically set a host-defined metadata value according to `condition`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store cannot apply the write.
+    pub async fn set_metadata_value_conditionally(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+        condition: MetadataSetCondition,
+    ) -> Result<MetadataSetOutcome> {
+        self.store
+            .set_metadata_value_conditionally(id, key, value, condition)
             .await
             .map_err(session_store_error)
     }

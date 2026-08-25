@@ -19,6 +19,24 @@ use crate::{
 
 use super::InferenceSettings;
 
+/// Condition applied by an atomic metadata set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataSetCondition {
+    /// Always replace or create the value.
+    Unconditional,
+    /// Set the value only when the key is absent, including when no JSON null is present.
+    Absent,
+}
+
+/// Result of an atomic conditional metadata set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataSetOutcome {
+    /// Complete record observed after evaluating the condition.
+    pub record: SessionRecord,
+    /// Whether the value was written.
+    pub changed: bool,
+}
+
 /// Durable session identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionId(String);

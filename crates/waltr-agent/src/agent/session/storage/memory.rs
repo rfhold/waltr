@@ -11,8 +11,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
-        SessionRecord, SessionSummary,
+        InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -187,12 +187,13 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
-    fn set_metadata_value(
+    fn set_metadata_value_conditionally(
         &self,
         id: &SessionId,
         key: String,
         value: Value,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        condition: MetadataSetCondition,
+    ) -> impl std::future::Future<Output = SessionStoreResult<MetadataSetOutcome>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
@@ -203,10 +204,14 @@ impl SessionStore for MemorySessionStore {
             let record = records
                 .get_mut(&id)
                 .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
-            record.set_metadata_value(key, value);
+            let changed = condition == MetadataSetCondition::Unconditional
+                || !record.metadata.values.contains_key(&key);
+            if changed {
+                record.set_metadata_value(key, value);
+            }
             let record = record.clone();
             drop(records);
-            Ok(record)
+            Ok(MetadataSetOutcome { record, changed })
         }
     }
 
@@ -646,6 +651,70 @@ mod tests {
         assert_eq!(
             summary.metadata_values.get("host.key"),
             Some(&json!({ "value": true }))
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_metadata_condition_treats_json_null_as_present_without_mutation() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request
+            .metadata_values
+            .insert("key".to_owned(), Value::Null);
+        store.create(request).await.unwrap();
+        let before = store.load(&id).await.unwrap();
+
+        let outcome = store
+            .set_metadata_value_conditionally(
+                &id,
+                "key".to_owned(),
+                json!("replacement"),
+                MetadataSetCondition::Absent,
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcome.changed);
+        assert_eq!(outcome.record, before);
+        assert_eq!(outcome.record.metadata_value("key"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn successful_absent_metadata_set_preserves_journal_revision_and_other_values() {
+        let store = MemorySessionStore::new();
+        let id = session_id();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request.metadata_values.insert("other".to_owned(), json!(true));
+        store.create(request).await.unwrap();
+        store
+            .append_journal(
+                &id,
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "preserved".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let outcome = store
+            .set_metadata_value_conditionally(
+                &id,
+                "new".to_owned(),
+                json!({ "opaque": [null, 1] }),
+                MetadataSetCondition::Absent,
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.changed);
+        assert_eq!(outcome.record.revision, Revision::new(1));
+        assert_eq!(outcome.record.journal.len(), 1);
+        assert_eq!(outcome.record.metadata_value("other"), Some(&json!(true)));
+        assert_eq!(
+            outcome.record.metadata_value("new"),
+            Some(&json!({ "opaque": [null, 1] }))
         );
     }
 

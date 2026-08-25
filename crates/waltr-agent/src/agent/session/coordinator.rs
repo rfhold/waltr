@@ -25,9 +25,9 @@ use super::{
     AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
     AgentSessionRuntime, AgentSessionRuntimeFactory, ExternalResponse, InferenceSettings,
-    ResumeInput, RunConflictPolicy, RunOutcomeSender, RunResult, SessionCreateRequest, SessionId,
-    SessionListSubscription, SessionStatus, SessionStore, SessionSummary,
-    SessionTimelineBroadcaster, SessionTimelineSubscription,
+    MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy, RunOutcomeSender,
+    RunResult, SessionCreateRequest, SessionId, SessionListSubscription, SessionStatus,
+    SessionStore, SessionSummary, SessionTimelineBroadcaster, SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
@@ -383,6 +383,28 @@ where
         self.sessions
             .publish(SessionListEvent::Upsert(record.summary()));
         Ok(AgentSession::new(record))
+    }
+
+    /// Atomically set metadata according to `condition` and publish only changed records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store cannot apply the write.
+    pub async fn set_metadata_value_conditionally(
+        &self,
+        id: &SessionId,
+        key: impl Into<String>,
+        value: Value,
+        condition: MetadataSetCondition,
+    ) -> Result<MetadataSetOutcome> {
+        let outcome = AgentSessionRuntime::new(&self.store)
+            .set_metadata_value_conditionally(id, key.into(), value, condition)
+            .await?;
+        if outcome.changed {
+            self.sessions
+                .publish(SessionListEvent::Upsert(outcome.record.summary()));
+        }
+        Ok(outcome)
     }
 
     /// Remove a host-defined metadata value and publish an updated session summary.
@@ -2053,6 +2075,38 @@ spec: {}
             SessionListEvent::Deleted(id) => panic!("expected upsert, got deleted {id:?}"),
             SessionListEvent::Cleared => panic!("expected upsert, got cleared"),
         }
+    }
+
+    #[tokio::test]
+    async fn unchanged_conditional_metadata_suppresses_session_upsert() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let mut request = SessionCreateRequest::new(SessionId::generate());
+        request
+            .metadata_values
+            .insert("host.key".to_owned(), json!("original"));
+        let session = sessions.create(request).await.unwrap();
+        let mut watch = sessions.watch_sessions();
+
+        let outcome = sessions
+            .set_metadata_value_conditionally(
+                &session.record.id,
+                "host.key",
+                json!("replacement"),
+                MetadataSetCondition::Absent,
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcome.changed);
+        assert_eq!(
+            outcome.record.metadata_value("host.key"),
+            Some(&json!("original"))
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), watch.next())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
