@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{collections::BTreeMap, time::SystemTime};
 
 use super::{
     error::authentication_failure_to_proto, inference_settings::inference_settings_to_proto,
@@ -22,11 +22,12 @@ pub(super) fn session_summary_to_proto(
     summary: SessionSummary,
     config: &Configuration,
     default_agent_name: &str,
-) -> ProtoSessionSummary {
+) -> Result<ProtoSessionSummary, tonic::Status> {
     let inference_settings = summary
         .inference_settings
         .map(|settings| inference_settings_to_proto(settings, config));
-    ProtoSessionSummary {
+    let metadata = metadata_to_proto(summary.metadata_values)?;
+    Ok(ProtoSessionSummary {
         id: summary.id.as_str().to_owned(),
         revision: summary.revision.get(),
         status: Some(session_status_to_proto(summary.status)),
@@ -39,7 +40,83 @@ pub(super) fn session_summary_to_proto(
         agent_name: summary
             .agent_name
             .unwrap_or_else(|| default_agent_name.to_owned()),
+        metadata: Some(metadata),
+    })
+}
+
+fn metadata_to_proto(
+    metadata: BTreeMap<String, serde_json::Value>,
+) -> Result<prost_types::Struct, tonic::Status> {
+    metadata
+        .into_iter()
+        .map(|(key, value)| json_value_to_proto(value).map(|value| (key, value)))
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map(|fields| prost_types::Struct { fields })
+}
+
+fn json_value_to_proto(value: serde_json::Value) -> Result<prost_types::Value, tonic::Status> {
+    use prost_types::value::Kind;
+
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(value) => Kind::BoolValue(value),
+        serde_json::Value::String(value) => Kind::StringValue(value),
+        serde_json::Value::Array(values) => Kind::ListValue(prost_types::ListValue {
+            values: values
+                .into_iter()
+                .map(json_value_to_proto)
+                .collect::<Result<_, _>>()?,
+        }),
+        serde_json::Value::Object(values) => Kind::StructValue(prost_types::Struct {
+            fields: values
+                .into_iter()
+                .map(|(key, value)| json_value_to_proto(value).map(|value| (key, value)))
+                .collect::<Result<_, _>>()?,
+        }),
+        serde_json::Value::Number(number) => {
+            let value = if let Some(value) = number.as_i64() {
+                if !integer_is_exact_f64(value.unsigned_abs()) {
+                    return Err(lossy_metadata_number(&number));
+                }
+                number_to_f64(&number)?
+            } else if let Some(value) = number.as_u64() {
+                if !integer_is_exact_f64(value) {
+                    return Err(lossy_metadata_number(&number));
+                }
+                number_to_f64(&number)?
+            } else {
+                number
+                    .as_f64()
+                    .ok_or_else(|| lossy_metadata_number(&number))?
+            };
+            Kind::NumberValue(value)
+        }
+    };
+    Ok(prost_types::Value { kind: Some(kind) })
+}
+
+const fn integer_is_exact_f64(magnitude: u64) -> bool {
+    const SIGNIFICAND_BITS: u32 = 53;
+
+    if magnitude == 0 {
+        return true;
     }
+    let significant_bits = u64::BITS - magnitude.leading_zeros();
+    significant_bits <= SIGNIFICAND_BITS
+        || magnitude.trailing_zeros() >= significant_bits - SIGNIFICAND_BITS
+}
+
+fn number_to_f64(number: &serde_json::Number) -> Result<f64, tonic::Status> {
+    number
+        .to_string()
+        .parse()
+        .map_err(|_| lossy_metadata_number(number))
+}
+
+fn lossy_metadata_number(number: &serde_json::Number) -> tonic::Status {
+    tonic::Status::data_loss(format!(
+        "session metadata number {number} is not losslessly representable as a protobuf double"
+    ))
 }
 
 fn session_metrics_to_proto(metrics: waltr_agent::SessionMetrics) -> ProtoSessionMetrics {
@@ -166,6 +243,7 @@ mod tests {
     use waltr::grpc::waltr::auth::v1::{
         AuthenticationDomain, AuthenticationFailureReason, auth_target,
     };
+    use serde_json::json;
 
     #[test]
     fn failed_session_status_preserves_structured_authentication_failure() {
@@ -208,5 +286,61 @@ mod tests {
         assert_eq!(context.endpoint, "https://mcp.example/rpc");
         assert_eq!(context.scope.as_deref(), Some("tools.read"));
         assert_eq!(context.error.as_deref(), Some("invalid_token"));
+    }
+
+    #[test]
+    fn session_metadata_preserves_json_values() {
+        let mut record = waltr_agent::SessionRecord::new("session-metadata");
+        record.set_metadata_value("null", serde_json::Value::Null);
+        record.set_metadata_value("bool", json!(true));
+        record.set_metadata_value("string", json!("title"));
+        record.set_metadata_value("array", json!([1, false, null, { "nested": "value" }]));
+
+        let projected =
+            session_summary_to_proto(record.summary(), &Configuration::default(), "default")
+                .expect("metadata projects");
+        let metadata = projected.metadata.expect("metadata struct");
+
+        assert!(matches!(
+            metadata.fields["null"].kind,
+            Some(prost_types::value::Kind::NullValue(_))
+        ));
+        assert!(matches!(
+            metadata.fields["bool"].kind,
+            Some(prost_types::value::Kind::BoolValue(true))
+        ));
+        assert!(
+            matches!(metadata.fields["string"].kind, Some(prost_types::value::Kind::StringValue(ref value)) if value == "title")
+        );
+        assert!(matches!(
+            metadata.fields["array"].kind,
+            Some(prost_types::value::Kind::ListValue(_))
+        ));
+    }
+
+    #[test]
+    fn session_metadata_accepts_large_exact_signed_and_unsigned_integers() {
+        for value in [json!(i64::MIN), json!(-(1_i64 << 54)), json!(1_u64 << 63)] {
+            let projected = json_value_to_proto(value).expect("exact integer projects");
+            assert!(matches!(
+                projected.kind,
+                Some(prost_types::value::Kind::NumberValue(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn session_metadata_rejects_adjacent_lossy_signed_and_unsigned_integers() {
+        for value in [
+            json!((1_i64 << 54) + 1),
+            json!(-(1_i64 << 54) - 1),
+            json!((1_u64 << 63) + 1),
+        ] {
+            let expected = value.to_string();
+            let error = json_value_to_proto(value).expect_err("lossy integer must fail");
+
+            assert_eq!(error.code(), tonic::Code::DataLoss);
+            assert!(error.message().contains(&expected));
+        }
     }
 }

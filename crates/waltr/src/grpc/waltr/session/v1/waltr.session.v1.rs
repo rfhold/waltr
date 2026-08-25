@@ -434,6 +434,8 @@ pub struct SessionSummary {
     /// Effective selected agent name. Legacy records use the current server default.
     #[prost(string, tag="10")]
     pub agent_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="11")]
+    pub metadata: ::core::option::Option<::prost_types::Struct>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionMetrics {

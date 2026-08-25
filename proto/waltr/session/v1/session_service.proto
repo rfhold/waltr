@@ -3,6 +3,7 @@ syntax = "proto3";
 package waltr.session.v1;
 
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
 import "waltr/auth/v1/auth_service.proto";
 import "waltr/config/v1/config_service.proto";
 
@@ -366,6 +367,7 @@ message SessionSummary {
   SessionMetrics metrics = 9;
   // Effective selected agent name. Legacy records use the current server default.
   string agent_name = 10;
+  google.protobuf.Struct metadata = 11;
 }
 
 message SessionMetrics {
