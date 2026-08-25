@@ -90,9 +90,10 @@ pub use view::{
     ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
     ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
-    SelectableAgentView, SessionMetricsView, SessionPhaseView, SessionStatusView,
-    SessionSuspensionKindView, SessionTimelineView, SessionView, TimelineContentView,
-    TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
+    SelectableAgentView, SessionAssociationsView, SessionMetricsView, SessionPhaseView,
+    SessionStatusView, SessionSuspensionKindView, SessionTimelineView, SessionView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
+    TimestampView,
 };
 
 #[cfg(test)]

@@ -723,6 +723,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn authoritative_summary_upsert_replaces_complete_metadata() {
+        let mut client = Client::new();
+        let summary = |revision, fields| crate::SessionSummary {
+            id: "session-1".to_owned(),
+            revision,
+            metadata: Some(prost_types::Struct { fields }),
+            ..crate::SessionSummary::default()
+        };
+        let value = |text: &str| prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(text.to_owned())),
+        };
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![summary(
+            1,
+            std::collections::BTreeMap::from([
+                ("title".to_owned(), value("Old title")),
+                ("stale".to_owned(), value("remove me")),
+            ]),
+        )])));
+
+        client.apply(ClientEvent::Session(SessionEvent::WatchChanged(
+            SessionWatchUpdate {
+                sequence: 1,
+                event: SessionWatchEvent::Upsert(summary(
+                    2,
+                    std::collections::BTreeMap::from([("title".to_owned(), value("New title"))]),
+                )),
+            },
+        )));
+
+        let stored = &client.state().sessions.current["session-1"];
+        let metadata = stored.metadata.as_ref().expect("metadata");
+        assert_eq!(metadata.fields.len(), 1);
+        assert!(!metadata.fields.contains_key("stale"));
+        assert_eq!(
+            crate::SessionView::from(stored).display_label(),
+            "New title"
+        );
+    }
+
     fn target() -> crate::AuthTarget {
         crate::AuthTarget {
             target: Some(auth_target::Target::McpServerKey("github".to_owned())),
