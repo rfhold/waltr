@@ -32,7 +32,7 @@ before(async () => {
     "waltr:apiAudience": "waltr-api",
     "waltr:apiScope": "waltr:use",
     "waltr:mcpScope": "mcp:use",
-    "waltr:mcpOAuthAccessTokenTtl": "300",
+    "waltr:mcpOAuthAccessTokenTtl": "259200",
     "waltr:mcpOAuthRefreshTokenTtl": "86400",
     "waltr:mcpOAuthRefreshFamilyTtl": "2592000",
     "waltr:mcpOAuthCodeTtl": "300",
@@ -173,6 +173,7 @@ describe("hosted MCP OAuth deployment", () => {
       "https://waltr.example.test/oauth",
     );
     assert.equal(values.WALTR_MCP_REQUIRED_SCOPES, "mcp:use");
+    assert.equal(values.WALTR_MCP_OAUTH_ACCESS_TOKEN_TTL, "259200");
     assert.equal(values.WALTR_MCP_OAUTH_ALLOW_LOOPBACK_REDIRECTS, "true");
     assert.equal(values.WALTR_OAUTH_ALLOW_PRIVATE_TEST_DESTINATIONS, undefined);
   });
@@ -458,6 +459,14 @@ describe("hosted MCP OAuth deployment", () => {
     }
     assert.match(preview, /^\s*waltr:protectData: false$/m);
     assert.match(production, /^\s*waltr:protectData: true$/m);
+    assert.match(
+      preview,
+      /^\s*waltr:mcpOAuthAccessTokenTtl: "259200"$/m,
+    );
+    assert.match(
+      production,
+      /^\s*waltr:mcpOAuthAccessTokenTtl: "259200"$/m,
+    );
   });
 });
 

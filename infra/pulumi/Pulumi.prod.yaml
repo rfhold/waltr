@@ -15,7 +15,7 @@ config:
   waltr:apiAudience: waltr-api
   waltr:apiScope: waltr:use
   waltr:mcpScope: mcp:use
-  waltr:mcpOAuthAccessTokenTtl: "300"
+  waltr:mcpOAuthAccessTokenTtl: "259200"
   waltr:mcpOAuthRefreshTokenTtl: "86400"
   waltr:mcpOAuthRefreshFamilyTtl: "2592000"
   waltr:mcpOAuthCodeTtl: "300"

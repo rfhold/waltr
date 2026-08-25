@@ -18,7 +18,7 @@ config:
   waltr:mcpOutboundOAuthTrustedPrivateOrigins:
     - https://preview-homelab-mcp.holdenitdown.net
     - https://preview-smarthome-mcp.holdenitdown.net
-  waltr:mcpOAuthAccessTokenTtl: "300"
+  waltr:mcpOAuthAccessTokenTtl: "259200"
   waltr:mcpOAuthRefreshTokenTtl: "86400"
   waltr:mcpOAuthRefreshFamilyTtl: "2592000"
   waltr:mcpOAuthCodeTtl: "300"
