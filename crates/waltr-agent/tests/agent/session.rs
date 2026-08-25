@@ -161,9 +161,9 @@ mod completion {
     use waltr_agent::{
         AgentRuntime, AgentTimelineEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi,
         ModelRef, PendingTimelineEvent, PendingTimelineItemId, ProviderId, SessionCoordinator,
-        SessionId, SessionListEvent, SessionStatus, SessionStore, SessionTimelineEvent,
-        TimelineContent, TimelineCursor, TimelineEventKind, TimelineQuery, TimelineStatus,
-        ToolCall, ToolDefinition,
+        SessionCreateRequest, SessionId, SessionListEvent, SessionStatus, SessionStore,
+        SessionTimelineEvent, TimelineContent, TimelineCursor, TimelineEventKind, TimelineQuery,
+        TimelineStatus, ToolCall, ToolDefinition,
     };
     use serde_json::json;
     use tokio::time::{Duration, timeout};
@@ -231,7 +231,10 @@ mod completion {
         let sessions = SessionCoordinator::new(store);
         let mut watch = sessions.watch_sessions();
 
-        let created = sessions.create().await.expect("created session");
+        let created = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         let update = timeout(Duration::from_secs(1), watch.next())
             .await
             .expect("session update")
@@ -252,8 +255,14 @@ mod completion {
         let sessions = SessionCoordinator::new(store);
         let mut watch = sessions.watch_sessions();
 
-        let first = sessions.create().await.expect("created first session");
-        let second = sessions.create().await.expect("created second session");
+        let first = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created first session");
+        let second = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created second session");
         let first_update = timeout(Duration::from_secs(1), watch.next())
             .await
             .expect("first update")
@@ -282,7 +291,10 @@ mod completion {
     async fn rollback_to_cursor_preserves_selected_timeline_event() {
         let store = MemorySessionStore::new();
         let sessions = SessionCoordinator::new(store);
-        let session = sessions.create().await.expect("created session");
+        let session = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         let session_id = session.id().clone();
         let seeded = sessions
             .append_timeline(
@@ -323,7 +335,10 @@ mod completion {
     async fn rollback_before_cursor_removes_selected_timeline_event_and_publishes_truncation() {
         let store = MemorySessionStore::new();
         let sessions = SessionCoordinator::new(store);
-        let session = sessions.create().await.expect("created session");
+        let session = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         let session_id = session.id().clone();
         let seeded = sessions
             .append_timeline(
@@ -389,7 +404,10 @@ mod completion {
     async fn rollback_before_first_cursor_clears_visible_timeline() {
         let store = MemorySessionStore::new();
         let sessions = SessionCoordinator::new(store);
-        let session = sessions.create().await.expect("created session");
+        let session = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         let session_id = session.id().clone();
         let seeded = sessions
             .append_timeline(
@@ -423,7 +441,10 @@ mod completion {
         let sessions_clone = sessions.clone();
         let mut watch = sessions_clone.watch_sessions();
 
-        let created = sessions.create().await.expect("created session");
+        let created = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         let update = timeout(Duration::from_secs(1), watch.next())
             .await
             .expect("session update")
@@ -442,7 +463,10 @@ mod completion {
     async fn late_watchers_use_list_for_baseline() {
         let store = MemorySessionStore::new();
         let sessions = SessionCoordinator::new(store);
-        let existing = sessions.create().await.expect("created existing session");
+        let existing = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created existing session");
         let mut watch = sessions.watch_sessions();
         let baseline = sessions.list().await.expect("listed sessions");
 
@@ -454,7 +478,10 @@ mod completion {
             "late watchers should not receive replayed session updates"
         );
 
-        let created = sessions.create().await.expect("created new session");
+        let created = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created new session");
         let update = timeout(Duration::from_secs(1), watch.next())
             .await
             .expect("session update")
@@ -471,7 +498,10 @@ mod completion {
     async fn delete_removes_session_from_list_and_is_idempotent() {
         let store = MemorySessionStore::new();
         let sessions = SessionCoordinator::new(store);
-        let created = sessions.create().await.expect("created session");
+        let created = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
 
         sessions
             .delete(created.id())
@@ -494,7 +524,10 @@ mod completion {
     async fn delete_emits_deleted_watch_event_with_monotonic_sequence() {
         let store = MemorySessionStore::new();
         let sessions = SessionCoordinator::new(store);
-        let created = sessions.create().await.expect("created session");
+        let created = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         let mut watch = sessions.watch_sessions();
 
         sessions
@@ -539,7 +572,10 @@ mod completion {
         let sessions = SessionCoordinator::new(store);
         let mut watch = sessions.watch_sessions();
 
-        let created = sessions.create().await.expect("created session");
+        let created = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         sessions
             .delete(created.id())
             .await
@@ -572,7 +608,10 @@ mod completion {
         let watch = sessions.watch_sessions();
         drop(watch);
 
-        let created = sessions.create().await.expect("created session");
+        let created = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .expect("created session");
         let listed = sessions.list().await.expect("listed sessions");
 
         assert!(listed.iter().any(|session| &session.id == created.id()));
@@ -587,7 +626,7 @@ mod completion {
             .build();
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -667,7 +706,8 @@ mod completion {
 #[cfg(test)]
 mod middleware_state {
     use waltr_agent::{
-        MemorySessionStore, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionStore,
+        MemorySessionStore, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
+        SessionRecord, SessionStore,
     };
     use serde_json::json;
 
@@ -675,7 +715,10 @@ mod middleware_state {
     async fn middleware_state_round_trips_through_memory_store() {
         let store = MemorySessionStore::new();
         let id = SessionId::new("middleware-state-session");
-        store.create(id.clone()).await.expect("created session");
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .expect("created session");
 
         store
             .append_journal(
@@ -732,8 +775,9 @@ mod tool_projection {
     use futures_util::StreamExt;
     use waltr_agent::{
         AgentRuntime, CompletionEvent, ExternalRequestId, ExternalResponse, MemorySessionStore,
-        ModelApi, ModelRef, ProviderId, ResumeInput, SessionCoordinator, TimelineContent, ToolCall,
-        question::QuestionConfig, tools::filesystem::FilesystemConfig,
+        ModelApi, ModelRef, ProviderId, ResumeInput, SessionCoordinator, SessionCreateRequest,
+        SessionId, TimelineContent, ToolCall, question::QuestionConfig,
+        tools::filesystem::FilesystemConfig,
     };
     use serde_json::json;
 
@@ -808,7 +852,7 @@ mod tool_projection {
         let agent = filesystem_agent(&first_root.path(), provider.clone());
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -895,8 +939,8 @@ mod system_prompt_state {
         AgentRuntime, AgentTimelineEvent, AgentTool, CompletionEvent, ExternalRequestId,
         ExternalResponse, MemorySessionStore, ModelApi, ModelRef, PermissionEffect,
         PermissionPolicy, PermissionToolSelector, ProviderId, ResumeInput, SessionCoordinator,
-        SessionId, SessionJournalEvent, SessionRecord, SessionStore, TimelineContent, ToolCall,
-        ToolDefinition,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionStore,
+        TimelineContent, ToolCall, ToolDefinition,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
     };
     use serde_json::json;
@@ -1002,7 +1046,7 @@ mod system_prompt_state {
         S: SessionStore + Clone + Send + Sync + 'static,
     {
         SessionCoordinator::new(store.clone())
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -1289,7 +1333,8 @@ mod agents_skills_state {
     use waltr_agent::{
         AgentRuntime, AgentTimelineEvent, AgentsPromptConfig, CompletionEvent, ExternalRequestId,
         ExternalResponse, MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput,
-        SessionCoordinator, SessionId, SkillsConfig, TimelineContent, ToolCall,
+        SessionCoordinator, SessionCreateRequest, SessionId, SessionStore, SkillsConfig,
+        TimelineContent, ToolCall,
         question::{QUESTION_TOOL_NAME, QuestionConfig},
         tools::filesystem::FilesystemConfig,
     };
@@ -1384,7 +1429,7 @@ mod agents_skills_state {
             .build();
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -1454,7 +1499,7 @@ mod agents_skills_state {
         let agent = build_agent();
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -1522,7 +1567,7 @@ mod agents_skills_state {
         let agent = build_agent();
         let sessions = SessionCoordinator::new(store.clone());
         let session_id = sessions
-            .create()
+            .create(SessionCreateRequest::new(SessionId::generate()))
             .await
             .expect("created session")
             .id()
@@ -1568,6 +1613,50 @@ mod agents_skills_state {
             !resumed_prompt.contains("extra"),
             "catalog must replay from stored state: {resumed_prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_run_materializes_initial_prompt_once_at_revision_zero() {
+        let store = MemorySessionStore::new();
+        let provider = scripted_provider(Vec::new());
+        let agent = AgentRuntime::builder(test_model(), provider).build();
+        let session_id = SessionId::new("ephemeral-initial-prompt");
+        let prompt = "  exact initial\nprompt  ";
+
+        let mut stream = agent
+            .prompt(prompt)
+            .with_session_store(store.clone(), session_id.clone())
+            .stream();
+        let event = stream
+            .next()
+            .await
+            .expect("initial timeline event")
+            .expect("successful initial timeline event");
+        assert!(matches!(
+            event.content,
+            TimelineContent::TextSnapshot { text } if text == prompt
+        ));
+
+        let record = SessionStore::load(&store, &session_id)
+            .await
+            .expect("stored session");
+        assert_eq!(record.revision, waltr_agent::Revision::ZERO);
+        assert_eq!(record.journal.len(), 2);
+        assert_eq!(record.snapshot().prompts, [prompt]);
+        assert_eq!(
+            record
+                .journal
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        waltr_agent::SessionJournalEvent::PromptAppended { .. }
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(record.timeline_events().count(), 1);
     }
 
     #[tokio::test]

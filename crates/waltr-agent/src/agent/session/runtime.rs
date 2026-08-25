@@ -21,8 +21,9 @@ use serde_json::Value;
 
 use super::{
     CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
-    ExternalResponse, InferenceSettings, PendingWork, PendingWorkStatus, ResumeInput, SessionId,
-    SessionJournalEvent, SessionListBroadcaster, SessionListEvent, SessionRecord,
+    ExternalResponse, InferenceSettings, PendingWork, PendingWorkStatus, ResumeInput,
+    SessionCreateRequest, SessionId, SessionJournalEvent, SessionListBroadcaster, SessionListEvent,
+    SessionRecord,
     SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionStore, SessionSummary,
     SessionTimelineBroadcaster, Suspension,
 };
@@ -64,50 +65,14 @@ where
         self
     }
 
-    /// Create a new durable session record.
+    /// Create a durable session from complete structured input.
     ///
     /// # Errors
     ///
     /// Returns an error when the store rejects the new record.
-    pub async fn create_session(&self, id: SessionId) -> Result<SessionRecord> {
-        self.store.create(id).await.map_err(session_store_error)
-    }
-
-    /// Create a new durable session record with initial host-defined metadata values.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the store rejects the new record.
-    pub async fn create_session_with_metadata_values(
-        &self,
-        id: SessionId,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Result<SessionRecord> {
+    pub(crate) async fn create(&self, request: SessionCreateRequest) -> Result<SessionRecord> {
         self.store
-            .create_with_metadata_values(id, metadata_values)
-            .await
-            .map_err(session_store_error)
-    }
-
-    /// Create a new durable session record with inference settings and metadata values.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the store rejects the new record.
-    pub async fn create_session_with_inference_settings(
-        &self,
-        id: SessionId,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Result<SessionRecord> {
-        self.store
-            .create_with_inference_settings(
-                id,
-                inference_settings,
-                agent_definition,
-                metadata_values,
-            )
+            .create(request)
             .await
             .map_err(session_store_error)
     }
@@ -1005,7 +970,10 @@ mod tests {
 
     async fn suspended_question_session(store: &MemorySessionStore) -> SessionId {
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         let revision = store
             .append_journal(
                 &id,
@@ -1058,11 +1026,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_persists_empty_record() {
+    async fn create_persists_empty_record() {
         let store = MemorySessionStore::new();
         let runtime = AgentSessionRuntime::new(&store);
 
-        let record = runtime.create_session(session_id()).await.unwrap();
+        let record = runtime
+            .create(SessionCreateRequest::new(session_id()))
+            .await
+            .unwrap();
 
         assert_eq!(record.id, session_id());
         assert_eq!(record.revision, Revision::ZERO);

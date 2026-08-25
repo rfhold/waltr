@@ -46,10 +46,10 @@ use super::{
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, ExternalResponse, PendingWorkStatus, RequestId,
-        RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionId, SessionJournalEvent,
-        SessionListBroadcaster, SessionListEvent, SessionRecord, SessionRollbackTarget,
-        SessionSnapshot, SessionStore, SessionStoreError, SessionTimelineBroadcaster,
-        Suspension as SessionSuspension,
+        RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionCreateRequest, SessionId,
+        SessionJournalEvent, SessionListBroadcaster, SessionListEvent, SessionRecord,
+        SessionRollbackTarget, SessionSnapshot, SessionStart, SessionStartMessage, SessionStore,
+        SessionStoreError, SessionTimelineBroadcaster, Suspension as SessionSuspension,
     },
 };
 use super::{ProviderRetryConfig, tool::ToolFuture};
@@ -1031,11 +1031,26 @@ where
             return Ok(false);
         };
         self.prompt = prompts.last().cloned().unwrap_or_default();
+        let messages = prompts
+            .iter()
+            .cloned()
+            .map(SessionStartMessage::user)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| session_store_error(error.to_string()))?;
+        let mut request = SessionCreateRequest::new(self.session_id.clone());
+        request.start = SessionStart::Fresh { messages };
         let record = self
             .session_store
-            .create(self.session_id.clone())
+            .create(request)
             .await
             .map_err(session_store_error)?;
+        let events = record.timeline_events().cloned().collect::<Vec<_>>();
+        if let Some(timeline) = &self.timeline_broadcaster {
+            timeline.publish_all(events.clone());
+        }
+        if let Some(sessions) = &self.session_broadcaster {
+            sessions.publish(SessionListEvent::Upsert(record.summary()));
+        }
         self.session_metadata_values = record.metadata.values;
         let turn = self.turn as u64;
         self.prompt_turns = prompts
@@ -1045,25 +1060,6 @@ where
                 prompt: prompt.clone(),
             })
             .collect();
-        self.append_journal_events(
-            prompts
-                .iter()
-                .cloned()
-                .map(|prompt| SessionJournalEvent::PromptAppended { prompt })
-                .collect(),
-        )
-        .await?;
-        let events = self
-            .append_timeline_events(
-                prompts
-                    .into_iter()
-                    .enumerate()
-                    .map(|(prompt_index, prompt)| {
-                        user_prompt_timeline_event(&self.session_id, turn, prompt_index, prompt)
-                    })
-                    .collect(),
-            )
-            .await?;
         self.pending.extend(events.into_iter().map(Ok));
         self.session_initialized = true;
         Ok(true)

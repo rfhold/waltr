@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, ExternalRequestId,
     ExternalResponse, FilesystemSessionStore, LlmStream, ModelApi, ModelRef, ProviderId,
-    ResumeInput, SessionCoordinator, SessionStore, TimelineContent, TimelineEventKind,
+    ResumeInput, SessionCoordinator, SessionId, SessionStore, TimelineContent, TimelineEventKind,
     TimelineStatus,
     provider::{
         AnthropicThinkingConfig, AnthropicThinkingDisplay, OpenAiReasoningConfig,
@@ -98,7 +98,11 @@ async fn assert_provider_durable_replay(
         .with_question_tool(QuestionConfig::new())
         .build();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let first = collect(
         sessions

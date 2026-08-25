@@ -184,6 +184,9 @@ pub struct SessionRecord {
     /// Self-contained agent definitions selected for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_definition: Option<AgentDefinitionBundle>,
+    /// Greatest timeline cursor ever allocated for this session.
+    #[serde(default)]
+    pub timeline_cursor_high_water: TimelineCursor,
     /// Ordered durable journal, including cursor-assigned timeline events.
     pub journal: Vec<SessionJournalEvent>,
 }
@@ -309,31 +312,9 @@ impl SessionRecord {
             metadata: SessionMetadata::now(),
             inference_settings: None,
             agent_definition: None,
+            timeline_cursor_high_water: TimelineCursor::ZERO,
             journal: Vec::new(),
         }
-    }
-
-    /// Create a session record with initial metadata values.
-    pub fn with_metadata_values(
-        id: impl Into<SessionId>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Self {
-        let mut record = Self::new(id);
-        record.metadata.values = metadata_values;
-        record
-    }
-
-    /// Create a session record with initial inference settings and metadata values.
-    pub fn with_inference_settings_and_metadata_values(
-        id: impl Into<SessionId>,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> Self {
-        let mut record = Self::with_metadata_values(id, metadata_values);
-        record.inference_settings = inference_settings;
-        record.agent_definition = agent_definition;
-        record
     }
 
     /// Set session inference settings and mark metadata as updated.
@@ -418,12 +399,17 @@ impl SessionRecord {
 
     /// Append one durable journal event to this record.
     pub fn append_journal_event(&mut self, event: SessionJournalEvent) {
+        if let SessionJournalEvent::Timeline(timeline) = &event {
+            self.timeline_cursor_high_water = self.timeline_cursor_high_water.max(timeline.cursor);
+        }
         self.journal.push(event);
     }
 
     /// Append durable journal events to this record in order.
     pub fn append_journal_events(&mut self, events: impl IntoIterator<Item = SessionJournalEvent>) {
-        self.journal.extend(events);
+        for event in events {
+            self.append_journal_event(event);
+        }
     }
 
     /// Timeline events stored in journal order.
@@ -495,6 +481,16 @@ impl SessionRecord {
     #[must_use]
     pub fn last_timeline_cursor(&self) -> Option<crate::timeline::TimelineCursor> {
         self.all_timeline_events().last().map(|event| event.cursor)
+    }
+
+    /// Greatest allocated cursor, including rolled-back or filtered timeline events.
+    #[must_use]
+    pub fn timeline_cursor_high_water(&self) -> TimelineCursor {
+        self.all_timeline_events()
+            .map(|event| event.cursor)
+            .max()
+            .unwrap_or(TimelineCursor::ZERO)
+            .max(self.timeline_cursor_high_water)
     }
 
     /// Provider request records stored in journal order.
@@ -1271,6 +1267,33 @@ mod tests {
     }
 
     #[test]
+    fn missing_cursor_high_water_falls_back_to_maximum_durable_cursor() {
+        let mut record = SessionRecord::new("legacy");
+        record.journal.push(assigned(
+            8,
+            PendingTimelineEvent::assistant_text_snapshot(
+                record.id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                "durable",
+            ),
+        ));
+        let mut serialized = serde_json::to_value(record).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("timeline_cursor_high_water");
+
+        let restored: SessionRecord = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(restored.timeline_cursor_high_water, TimelineCursor::ZERO);
+        assert_eq!(
+            restored.timeline_cursor_high_water(),
+            TimelineCursor::new(8)
+        );
+    }
+
+    #[test]
     fn runtime_settings_field_does_not_populate_inference_settings() {
         let serialized = serde_json::to_value(SessionRecord::new("session-1"))
             .expect("session record serializes");
@@ -1306,12 +1329,9 @@ mod tests {
             "selected",
             vec!["apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: selected\nspec: {}\n".to_owned()],
         );
-        let record = SessionRecord::with_inference_settings_and_metadata_values(
-            "session-1",
-            None,
-            Some(bundle.clone()),
-            BTreeMap::new(),
-        );
+        let mut request = super::super::SessionCreateRequest::new("session-1");
+        request.agent_definition = Some(bundle.clone());
+        let record = request.materialize();
 
         let restored: SessionRecord =
             serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();

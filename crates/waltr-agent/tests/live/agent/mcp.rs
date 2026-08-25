@@ -6,7 +6,7 @@ use waltr_agent::{
     AgentRuntimeProvider, AgentSessionRuntimeFactory, AgentTimelineEvent, CHANNEL_ASSISTANT_TEXT,
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_RESULT, FileCredentialStore, InferenceProviderSettings,
     InferenceSettings, LlmError, LlmStream, McpResolvedConnection, MemorySessionStore, ModelApi,
-    ModelRef, RunConflictPolicy, SessionCoordinator, TimelineContent, TimelineEventKind,
+    ModelRef, RunConflictPolicy, SessionCoordinator, SessionId, TimelineContent, TimelineEventKind,
     TimelineQuery, TimelineStatus,
 };
 use mcp::{
@@ -161,7 +161,11 @@ async fn run_session_prompt(
     sessions: &SessionCoordinator<MemorySessionStore>,
     prompt: &str,
 ) -> waltr_agent::Result<AgentTestSession> {
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;

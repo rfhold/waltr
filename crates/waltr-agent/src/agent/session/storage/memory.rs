@@ -11,7 +11,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
+        SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -69,64 +70,11 @@ impl MemorySessionStore {
 impl SessionStore for MemorySessionStore {
     fn create(
         &self,
-        id: SessionId,
+        request: SessionCreateRequest,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::new(id);
-            let mut records = store
-                .records
-                .lock()
-                .map_err(|_| SessionStoreError::LockPoisoned)?;
-
-            if records.contains_key(&record.id) {
-                return Err(SessionStoreError::AlreadyExists { id: record.id });
-            }
-
-            records.insert(record.id.clone(), record.clone());
-            drop(records);
-            Ok(record)
-        }
-    }
-
-    fn create_with_metadata_values(
-        &self,
-        id: SessionId,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_metadata_values(id, metadata_values);
-            let mut records = store
-                .records
-                .lock()
-                .map_err(|_| SessionStoreError::LockPoisoned)?;
-
-            if records.contains_key(&record.id) {
-                return Err(SessionStoreError::AlreadyExists { id: record.id });
-            }
-
-            records.insert(record.id.clone(), record.clone());
-            drop(records);
-            Ok(record)
-        }
-    }
-
-    fn create_with_inference_settings(
-        &self,
-        id: SessionId,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_inference_settings_and_metadata_values(
-                id,
-                inference_settings,
-                agent_definition,
-                metadata_values,
-            );
+            let record = request.materialize();
             let mut records = store
                 .records
                 .lock()
@@ -422,7 +370,10 @@ mod tests {
     async fn metadata_mutations_preserve_concurrent_journal_and_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         let settings = InferenceSettings {
             provider: InferenceProviderSettings {
                 key: "test".to_owned(),
@@ -500,7 +451,10 @@ mod tests {
         let store = MemorySessionStore::new();
         let id = session_id();
 
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let mut loaded = store.load(&id).await.unwrap();
         loaded.journal.push(SessionJournalEvent::PromptAppended {
@@ -534,15 +488,10 @@ mod tests {
             },
         };
 
-        let created = store
-            .create_with_inference_settings(
-                id.clone(),
-                Some(inference_settings.clone()),
-                Some(bundle.clone()),
-                BTreeMap::new(),
-            )
-            .await
-            .unwrap();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request.inference_settings = Some(inference_settings.clone());
+        request.agent_definition = Some(bundle.clone());
+        let created = store.create(request).await.unwrap();
         let loaded = store.load(&id).await.unwrap();
 
         assert_eq!(created.agent_definition, Some(bundle.clone()));
@@ -558,20 +507,13 @@ mod tests {
         let id = session_id();
         let original = AgentDefinitionBundle::new("original", Vec::new());
         let replacement = AgentDefinitionBundle::new("replacement", Vec::new());
-        store
-            .create_with_inference_settings(
-                id.clone(),
-                None,
-                Some(original.clone()),
-                BTreeMap::new(),
-            )
-            .await
-            .unwrap();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request.agent_definition = Some(original.clone());
+        store.create(request).await.unwrap();
 
-        let error = store
-            .create_with_inference_settings(id.clone(), None, Some(replacement), BTreeMap::new())
-            .await
-            .unwrap_err();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request.agent_definition = Some(replacement);
+        let error = store.create(request).await.unwrap_err();
 
         assert_eq!(error, SessionStoreError::AlreadyExists { id: id.clone() });
         assert_eq!(
@@ -585,7 +527,10 @@ mod tests {
         let store = MemorySessionStore::new();
         let id = session_id();
 
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         store.delete(&id).await.unwrap();
         store.delete(&id).await.unwrap();
         store
@@ -602,8 +547,14 @@ mod tests {
         let store = MemorySessionStore::new();
 
         store.wipe().await.unwrap();
-        store.create(SessionId::new("session-one")).await.unwrap();
-        store.create(SessionId::new("session-two")).await.unwrap();
+        store
+            .create(SessionCreateRequest::new("session-one"))
+            .await
+            .unwrap();
+        store
+            .create(SessionCreateRequest::new("session-two"))
+            .await
+            .unwrap();
         store.wipe().await.unwrap();
         store.wipe().await.unwrap();
 
@@ -615,9 +566,15 @@ mod tests {
         let store = MemorySessionStore::new();
         let first = SessionId::new("session-first");
         let second = SessionId::new("session-second");
-        store.create(first.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(first.clone()))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        store.create(second.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(second.clone()))
+            .await
+            .unwrap();
 
         let summaries = store.list().await.unwrap();
 
@@ -632,7 +589,10 @@ mod tests {
     async fn list_summary_reflects_latest_activity_and_status() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        let created = store.create(id.clone()).await.unwrap();
+        let created = store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
         store
@@ -660,7 +620,10 @@ mod tests {
     async fn metadata_values_are_stored_without_activity_bump() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        let created = store.create(id.clone()).await.unwrap();
+        let created = store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
         let updated = store
@@ -690,7 +653,10 @@ mod tests {
     async fn metadata_patch_does_not_stale_timeline_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         store
             .set_metadata_value(&id, "runtime.thinking".to_owned(), json!("high"))
@@ -715,7 +681,10 @@ mod tests {
     async fn metadata_remove_does_not_stale_timeline_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         store
             .set_metadata_value(&id, "runtime.thinking".to_owned(), json!("high"))
@@ -739,7 +708,10 @@ mod tests {
     async fn append_journal_succeeds_and_increments_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let revision = store
             .append_journal(
@@ -762,7 +734,10 @@ mod tests {
     async fn append_journal_fails_for_stale_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         store
             .append_journal(
                 &id,
@@ -800,7 +775,10 @@ mod tests {
     async fn append_timeline_fails_for_stale_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         store
             .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
             .await
@@ -825,7 +803,10 @@ mod tests {
     async fn invalid_item_reference_does_not_mutate_record() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let missing = TimelineItemId::from_first_cursor(TimelineCursor::new(99));
         let error = store
@@ -860,7 +841,10 @@ mod tests {
         let id = session_id();
         let call = tool_call("call-1");
         let result = tool_result("call-1");
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let append_revision = store
             .append_journal(
@@ -922,7 +906,10 @@ mod tests {
     async fn optimistic_revisions_advance_across_appends() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let append_revision = store
             .append_journal(
@@ -979,7 +966,10 @@ mod tests {
     async fn derived_snapshot_revision_matches_record_revision() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let revision = store
             .append_journal(
@@ -1001,7 +991,10 @@ mod tests {
     async fn request_records_preserve_insertion_order() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let revision = store
             .append_journal(
@@ -1036,7 +1029,10 @@ mod tests {
     async fn external_requests_project_insertion_order_and_cancellation_markers() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let _assigned = store
             .append_timeline(
@@ -1073,7 +1069,10 @@ mod tests {
     async fn append_timeline_assigns_stable_monotonic_cursors() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let assigned = store
             .append_timeline(
@@ -1103,7 +1102,10 @@ mod tests {
     async fn existing_item_updates_create_gaps_in_item_ids() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
 
         let first = store
             .append_timeline(&id, Revision::ZERO, vec![pending_delta(&id, 1)])
@@ -1137,7 +1139,10 @@ mod tests {
     async fn timeline_query_slices_by_direction_cursor_limit_and_channel() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         store
             .append_timeline(
                 &id,
@@ -1253,7 +1258,10 @@ mod tests {
     async fn timeline_item_text_reconstructs_text_like_content() {
         let store = MemorySessionStore::new();
         let id = session_id();
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         let item_id = TimelineItemId::from_first_cursor(TimelineCursor::new(1));
         let mut snapshot = PendingTimelineEvent::new(
             id.clone(),
@@ -1304,7 +1312,10 @@ mod tests {
         let id = session_id();
         let tool_item = TimelineItemId::from_first_cursor(TimelineCursor::new(1));
         let ref_item = TimelineItemId::from_first_cursor(TimelineCursor::new(2));
-        store.create(id.clone()).await.unwrap();
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         store
             .append_timeline(
                 &id,

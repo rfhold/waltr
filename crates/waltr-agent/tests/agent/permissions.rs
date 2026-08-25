@@ -12,7 +12,7 @@ use waltr_agent::{
     PermissionInputScalar, PermissionInputValueMatcher, PermissionJsonPointer, PermissionOperation,
     PermissionPattern, PermissionPolicy, PermissionResourcePattern, PermissionResponse,
     PermissionToolSelector, ProviderId, ResumeInput, RuntimeResumeOutput, SessionCoordinator,
-    SessionStatus, SessionStore, TimelineContent, ToolCall, ToolDefinition,
+    SessionId, SessionStatus, SessionStore, TimelineContent, ToolCall, ToolDefinition,
     tools::filesystem::{FilesystemConfig, FilesystemToolProfile},
 };
 #[cfg(feature = "shell")]
@@ -58,7 +58,11 @@ async fn nested_input_ask_persists_only_exact_tool_bound_approval() -> waltr_age
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let events = sessions
         .prompt(&agent, session_id.clone(), "run")
         .stream()
@@ -208,7 +212,11 @@ async fn approved_whole_tool_ask_does_not_bypass_post_middleware_resource_deny()
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let initial = sessions
         .prompt(&agent, session_id.clone(), "read outside")
         .stream()
@@ -280,7 +288,11 @@ async fn whole_tool_and_contextual_ask_require_exactly_two_approvals() -> waltr_
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let first = sessions
         .prompt(&agent, session_id.clone(), "read outside")
@@ -393,7 +405,11 @@ async fn contextual_approval_does_not_cross_policy_switch_for_same_call() -> wal
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let initial = sessions
         .prompt(&old_agent, session_id.clone(), "run")
         .stream()
@@ -584,7 +600,11 @@ async fn permission_external_request_resumes_from_durable_session() -> waltr_age
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let mut stream = sessions
         .prompt(&agent, session_id.clone(), "read external file")
@@ -712,7 +732,11 @@ async fn permission_resume_preserves_remaining_provider_tool_calls() -> waltr_ag
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let request_id = first_permission_request_id(
         sessions
@@ -807,7 +831,11 @@ async fn cancellation_after_permission_request_cancels_resume_path() -> waltr_ag
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let cancellation = CancellationToken::new();
 
     let mut stream = sessions
@@ -903,7 +931,11 @@ async fn permission_allow_always_patterns_resume_and_apply_to_later_calls() -> w
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let mut stream = sessions
         .prompt(&agent, session_id.clone(), "read two external files")
@@ -1013,7 +1045,11 @@ async fn permission_allow_once_does_not_apply_to_later_matching_calls() -> waltr
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let mut stream = sessions
         .prompt(&agent, session_id.clone(), "read external files once")
@@ -1110,7 +1146,11 @@ async fn permission_deny_can_return_tool_result() -> waltr_agent::Result<()> {
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let request_id = first_permission_request_id(
         sessions
             .prompt(&agent, session_id.clone(), "read denied external file")
@@ -1182,7 +1222,11 @@ async fn permission_deny_can_cancel_pending_work() -> waltr_agent::Result<()> {
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let request_id = first_permission_request_id(
         sessions
             .prompt(&agent, session_id.clone(), "read canceled external file")
@@ -1311,7 +1355,11 @@ async fn multi_claim_ask_suspends_before_execution() -> waltr_agent::Result<()> 
 
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store.clone());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let mut stream = sessions
         .prompt(&agent, session_id.clone(), "patch denied")
         .stream();
@@ -1410,7 +1458,11 @@ async fn whole_tool_ask_allow_once_executes_claim_producing_tool_without_reaskin
         .build();
     let store = MemorySessionStore::new();
     let sessions = SessionCoordinator::new(store);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
 
     let initial = sessions
         .prompt(&agent, session_id.clone(), "read once")

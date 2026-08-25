@@ -346,6 +346,59 @@ mod tests {
     }
 
     #[test]
+    fn responses_input_encodes_durable_history_and_current_prompt_once_in_tool_order() {
+        let mut request = CompletionRequest::new("current prompt");
+        request.prompt_turns = vec![
+            PromptTurn {
+                turn: 0,
+                prompt: "seed prompt".to_owned(),
+            },
+            PromptTurn {
+                turn: 2,
+                prompt: "current prompt".to_owned(),
+            },
+        ];
+        request.turns = vec![
+            CompletionTurn {
+                turn: 0,
+                metadata: None,
+                items: vec![
+                    TurnItem::AssistantText("seed answer".to_owned()),
+                    TurnItem::ToolCall(ToolCall::new("seed-call", "lookup", json!({}))),
+                    TurnItem::ToolResult(ToolResult::new("seed-call", "lookup", "seed result")),
+                ],
+            },
+            CompletionTurn {
+                turn: 1,
+                metadata: None,
+                items: vec![TurnItem::AssistantText("current history".to_owned())],
+            },
+        ];
+
+        let input = responses_input(&request);
+        let items = input.as_array().expect("input array");
+
+        assert_eq!(items.len(), 6);
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[0]["content"][0]["text"], "seed prompt");
+        assert_eq!(items[1]["role"], "assistant");
+        assert_eq!(items[1]["content"][0]["text"], "seed answer");
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[2]["call_id"], "seed-call");
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[3]["call_id"], "seed-call");
+        assert_eq!(items[4]["content"][0]["text"], "current history");
+        assert_eq!(items[5]["content"][0]["text"], "current prompt");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item["content"][0]["text"] == "seed prompt")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn responses_input_encodes_image_tool_results_as_input_content() {
         let mut request = CompletionRequest::new("look");
         request.turns = vec![CompletionTurn {

@@ -3,7 +3,9 @@ use waltr::grpc::waltr::session::v1::{
     SearchSessionTemplatesRequest, SessionTemplateKind, SessionTemplateSearchTarget,
     search_session_templates_response,
 };
-use waltr_agent::{InferenceProviderSettings, InferenceSettings, ModelApi};
+use waltr_agent::{
+    InferenceProviderSettings, InferenceSettings, ModelApi, SessionCreateRequest, SessionId,
+};
 use waltr_server::test_support::setup_server_with_sessions;
 use std::collections::BTreeMap;
 
@@ -11,12 +13,10 @@ use std::collections::BTreeMap;
 async fn search_session_templates_returns_tagged_tool_results()
 -> Result<(), Box<dyn std::error::Error>> {
     let (server, sessions) = setup_server_with_sessions();
-    let session_id = sessions
-        .create_with_inference_settings(Some(test_inference_settings()), None, BTreeMap::default())
-        .await?
-        .id()
-        .as_str()
-        .to_owned();
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
+    request.metadata_values = BTreeMap::default();
+    let session_id = sessions.create(request).await?.id().as_str().to_owned();
     let mut client = session_client(server).await?;
 
     let empty = client

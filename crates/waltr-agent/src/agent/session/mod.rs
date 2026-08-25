@@ -2,7 +2,9 @@
 
 mod compat;
 mod compression;
+mod copy;
 mod coordinator;
+mod create;
 mod run;
 mod runtime;
 mod runtime_factory;
@@ -13,7 +15,11 @@ mod types;
 mod watch;
 
 pub use compat::EphemeralSessionRun;
+pub use copy::{SessionCopy, SessionCopyError};
 pub use coordinator::SessionCoordinator;
+pub use create::{
+    SessionCreateRequest, SessionStart, SessionStartMessage, SessionStartMessageError,
+};
 pub use run::{
     AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,

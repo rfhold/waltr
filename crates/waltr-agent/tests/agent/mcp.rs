@@ -20,9 +20,10 @@ use waltr_agent::{
     CHANNEL_TOOL_CALL, CHANNEL_TOOL_PROGRESS_INFO, CHANNEL_TOOL_RESULT, CompletionEvent,
     FileCredentialStore, InferenceProviderSettings, InferenceSettings, LlmStream,
     McpConnectionKind, McpResolvedConnection, MemorySessionStore, ModelApi, ModelRef,
-    PendingWorkStatus, ProviderId, SessionCoordinator, SessionStore, SessionTemplateKind,
-    SessionTemplateSearchRequest, SessionTemplateSearchTarget, Suspension, TimelineContent,
-    TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall, ToolResultContentBlock,
+    PendingWorkStatus, ProviderId, SessionCoordinator, SessionCreateRequest, SessionId,
+    SessionStore, SessionTemplateKind, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
+    Suspension, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus, ToolCall,
+    ToolResultContentBlock,
 };
 use opentelemetry::{global, trace::TracerProvider as _};
 use opentelemetry_sdk::{
@@ -78,15 +79,9 @@ async fn mcp_definition_selection_is_forwarded_to_host_resolver() -> waltr_agent
         });
         let sessions =
             SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
-        let session_id = sessions
-            .create_with_inference_settings(
-                Some(test_inference_settings()),
-                None,
-                std::collections::BTreeMap::new(),
-            )
-            .await?
-            .id()
-            .clone();
+        let mut request = SessionCreateRequest::new(SessionId::generate());
+        request.inference_settings = Some(test_inference_settings());
+        let session_id = sessions.create(request).await?.id().clone();
         let result = sessions
             .submit_prompt(
                 session_id,
@@ -133,15 +128,9 @@ async fn mcp_include_empty_selects_none_without_calling_host_resolver() -> waltr
         Box::pin(async { Ok(Vec::new()) })
     });
     let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
-    let session_id = sessions
-        .create_with_inference_settings(
-            Some(test_inference_settings()),
-            None,
-            std::collections::BTreeMap::new(),
-        )
-        .await?
-        .id()
-        .clone();
+    let mut request = SessionCreateRequest::new(SessionId::generate());
+    request.inference_settings = Some(test_inference_settings());
+    let session_id = sessions.create(request).await?.id().clone();
     sessions
         .submit_prompt(
             session_id,
@@ -273,7 +262,11 @@ async fn mcp_streamable_http_auth_failure_is_reported_as_auth_required() -> walt
         vec![vec![CompletionEvent::Finished]],
     ));
     let sessions = mcp_sessions_with_connections(provider, vec![http_runtime_server(&http_server)]);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -339,7 +332,11 @@ async fn mcp_authentication_is_the_first_blocker_before_provider_authentication(
         Box::pin(async move { Ok(vec![connection]) })
     });
     let sessions = SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(factory);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -502,7 +499,11 @@ async fn mcp_trace_propagation_reaches_prompt_resource_and_completion_requests()
     )));
     let sessions = mcp_sessions(provider.clone());
     sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -626,7 +627,11 @@ async fn mcp_cancellation_cancels_tool_work_and_preserves_stdio_runtime() -> wal
     let store = MemorySessionStore::new();
     let sessions = mcp_sessions_with_store(store.clone(), provider);
     sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -728,7 +733,11 @@ async fn mcp_prompt_templates_are_discovered_from_stdio_server() -> waltr_agent:
     }));
     let sessions = mcp_sessions(provider);
     sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -851,7 +860,11 @@ async fn mcp_resource_templates_are_discovered_from_stdio_server() -> waltr_agen
     ));
     let sessions = mcp_sessions(provider);
     sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -891,7 +904,11 @@ async fn mcp_uri_resource_templates_are_discovered_from_stdio_server() -> waltr_
     ));
     let sessions = mcp_sessions(provider);
     sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -931,7 +948,11 @@ async fn mcp_uri_resource_template_completions_are_search_options() -> waltr_age
     ));
     let sessions = mcp_sessions(provider);
     sessions.set_connections(vec![stdio_runtime_server(&stdio_command)]);
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;
@@ -1300,7 +1321,11 @@ async fn run_session_prompt_with_current_connections(
     sessions: &TestMcpSessions,
     prompt: &str,
 ) -> waltr_agent::Result<AgentTestSession> {
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     sessions
         .set_inference_settings(&session_id, Some(test_inference_settings()))
         .await?;

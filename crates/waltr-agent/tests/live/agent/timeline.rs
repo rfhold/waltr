@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_USER_TEXT, LlmError, LlmStream,
-    MemorySessionStore, ModelRef, SessionCoordinator, SessionTimelineEvent, TimelineContent,
+    MemorySessionStore, ModelRef, SessionCoordinator, SessionId, SessionTimelineEvent, TimelineContent,
     TimelineEventKind, TimelineQuery, TimelineStatus,
 };
 
@@ -78,7 +78,11 @@ async fn assert_provider_streams_timeline_updates(
     let provider_name = provider.name();
     let agent = AgentRuntime::builder(model, Arc::new(provider)).build();
     let sessions = SessionCoordinator::new(MemorySessionStore::new());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let mut timeline = sessions.watch_timeline(session_id.clone());
 
     let run_sessions = sessions.clone();
@@ -163,7 +167,11 @@ async fn assert_provider_publishes_truncation_after_rollback(
     let provider_name = provider.name();
     let agent = AgentRuntime::builder(model, Arc::new(provider)).build();
     let sessions = SessionCoordinator::new(MemorySessionStore::new());
-    let session_id = sessions.create().await?.id().clone();
+    let session_id = sessions
+        .create(waltr_agent::SessionCreateRequest::new(SessionId::generate()))
+        .await?
+        .id()
+        .clone();
     let mut timeline = sessions.watch_timeline(session_id.clone());
     let first_prompt = "Answer with exactly: rollback live first";
     let second_prompt = "Answer with exactly: rollback live second";

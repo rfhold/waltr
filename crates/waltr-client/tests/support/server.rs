@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use waltr_agent::{
     CHANNEL_EXTERNAL_REQUEST, ExternalRequest, ExternalRequestId, ExternalRequestKind,
-    ExternalRequestStatus, ExternalResponse, PendingTimelineEvent, SessionId, TimelineChannel,
-    TimelineContent, TimelineEventKind, TimelineStatus,
+    ExternalRequestStatus, ExternalResponse, PendingTimelineEvent, SessionCreateRequest, SessionId,
+    TimelineChannel, TimelineContent, TimelineEventKind, TimelineStatus,
 };
 use waltr_client::{
     Configuration, GrpcEffectExecutor, InferenceDefaults, McpServer, McpServerType, Model,
@@ -104,7 +104,9 @@ pub async fn server_endpoint_with_seeded_timeline(
     seed_text: bool,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
-    let session = sessions.create().await?;
+    let session = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?;
     let session_id = session.id().clone();
     if seed_text {
         let events = vec![
@@ -131,7 +133,9 @@ pub async fn server_endpoint_with_seeded_timeline(
 pub async fn server_endpoint_with_rollback_timeline()
 -> Result<(String, String), Box<dyn std::error::Error>> {
     let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
-    let session = sessions.create().await?;
+    let session = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?;
     let session_id = session.id().clone();
     let events = vec![
         waltr_agent::PendingTimelineEvent::user_text_snapshot(
@@ -162,7 +166,9 @@ pub async fn server_endpoint_with_rollback_timeline()
 pub async fn server_endpoint_with_resolved_external_request()
 -> Result<(String, String), Box<dyn std::error::Error>> {
     let sessions = waltr_agent::SessionCoordinator::new(waltr_agent::MemorySessionStore::new());
-    let session = sessions.create().await?;
+    let session = sessions
+        .create(SessionCreateRequest::new(SessionId::generate()))
+        .await?;
     let session_id = session.id().clone();
     sessions
         .append_timeline(

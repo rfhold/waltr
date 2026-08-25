@@ -14,7 +14,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
+        SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -291,56 +292,11 @@ impl OpenDalSessionStore {
 impl SessionStore for OpenDalSessionStore {
     fn create(
         &self,
-        id: SessionId,
+        request: SessionCreateRequest,
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         async move {
-            let record = SessionRecord::new(id);
-            match store.load_record(&record.id).await {
-                Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
-                Err(SessionStoreError::NotFound { .. }) => {
-                    store.save_record(&record).await?;
-                    Ok(record)
-                }
-                Err(error) => Err(error),
-            }
-        }
-    }
-
-    fn create_with_metadata_values(
-        &self,
-        id: SessionId,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_metadata_values(id, metadata_values);
-            match store.load_record(&record.id).await {
-                Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
-                Err(SessionStoreError::NotFound { .. }) => {
-                    store.save_record(&record).await?;
-                    Ok(record)
-                }
-                Err(error) => Err(error),
-            }
-        }
-    }
-
-    fn create_with_inference_settings(
-        &self,
-        id: SessionId,
-        inference_settings: Option<InferenceSettings>,
-        agent_definition: Option<AgentDefinitionBundle>,
-        metadata_values: BTreeMap<String, Value>,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
-        let store = self.clone();
-        async move {
-            let record = SessionRecord::with_inference_settings_and_metadata_values(
-                id,
-                inference_settings,
-                agent_definition,
-                metadata_values,
-            );
+            let record = request.materialize();
             match store.load_record(&record.id).await {
                 Ok(_) => Err(SessionStoreError::AlreadyExists { id: record.id }),
                 Err(SessionStoreError::NotFound { .. }) => {
@@ -537,7 +493,10 @@ mod tests {
         let builder = services::Fs::default().root(temp.path().to_str().unwrap());
         let operator = Operator::new(builder).unwrap().finish();
         let store = OpenDalSessionStore::new(operator.clone(), "sessions");
-        store.create(SessionId::new("valid")).await.unwrap();
+        store
+            .create(SessionCreateRequest::new("valid"))
+            .await
+            .unwrap();
         operator
             .write("sessions/legacy-record", "not a session record")
             .await
@@ -566,7 +525,10 @@ mod tests {
         let first = OpenDalSessionStore::new(operator.clone(), "sessions");
         let second = OpenDalSessionStore::new(operator, "sessions");
         let id = SessionId::new("race");
-        first.create(id.clone()).await.unwrap();
+        first
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         let gate = first.mutation_guard(&id).await.unwrap();
         assert!(Arc::ptr_eq(
             &gate,
@@ -645,7 +607,10 @@ mod tests {
             &first.mutation_guard(&id).await.unwrap(),
             &second.mutation_guard(&id).await.unwrap()
         ));
-        first.create(id.clone()).await.unwrap();
+        first
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
         assert!(matches!(
             second.load(&id).await,
             Err(SessionStoreError::NotFound { .. })
