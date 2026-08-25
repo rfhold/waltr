@@ -164,9 +164,14 @@ fn opening_session_data_from_detail_releases_timeline_and_keeps_delete_binding_s
     drop(app.handle_event(&ctrl_x_press(), now));
     assert_eq!(
         app.handle_event(&char_press('w'), now),
-        AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
-            session_id: "one".to_owned(),
-        })
+        AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                session_id: "one".to_owned(),
+            },
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                session_id: "one".to_owned(),
+            },
+        ])
     );
     assert_eq!(app.sessions_section().detail_session_id(), None);
     assert_eq!(app.screen(), AppScreen::SessionData);
@@ -186,9 +191,14 @@ fn remote_clear_reconciles_open_detail_from_shared_snapshot() {
             &AppEvent::Client(Box::new(watched_sessions_snapshot(Vec::new()))),
             now,
         ),
-        AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
-            session_id: "one".to_owned(),
-        })
+        AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                session_id: "one".to_owned(),
+            },
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                session_id: "one".to_owned(),
+            },
+        ])
     );
     assert_eq!(app.sessions_section().detail_session_id(), None);
     assert!(render_app(&app).contains("No sessions yet."));

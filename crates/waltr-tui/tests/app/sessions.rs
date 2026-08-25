@@ -33,6 +33,45 @@ fn sessions_escape_releases_watch_interest() {
 }
 
 #[test]
+fn sessions_use_metadata_title_only_in_list() {
+    let mut session = session_view("stable-id", 1);
+    session
+        .metadata
+        .insert("title".to_owned(), serde_json::json!("Initial title"));
+    let mut app = open_sessions_app_with(watched_session_with_timeline(session, Vec::new()));
+    let now = Instant::now();
+
+    let rendered = render_app(&app);
+    assert!(rendered.contains("Initial title"), "{rendered}");
+    assert!(!rendered.contains("stable-id"), "{rendered}");
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("stable-id")
+    );
+    assert_eq!(
+        app.sessions_section().detail_session_id(),
+        Some("stable-id")
+    );
+
+    let mut updated = session_view("stable-id", 2);
+    updated
+        .metadata
+        .insert("title".to_owned(), serde_json::json!("Live title"));
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(watched_session_with_timeline(updated, Vec::new()))),
+        now,
+    ));
+
+    let rendered = render_app(&app);
+    assert!(!rendered.contains("Live title"), "{rendered}");
+    assert!(!rendered.contains("stable-id"), "{rendered}");
+    assert_eq!(
+        app.sessions_section().detail_session_id(),
+        Some("stable-id")
+    );
+}
+
+#[test]
 fn sessions_create_dispatches_and_completion_opens_detail() {
     let mut app = open_sessions_app_with(with_agents(
         watched_sessions_snapshot(Vec::new()),
@@ -83,7 +122,7 @@ fn sessions_create_dispatches_and_completion_opens_detail() {
     let rendered = render_app_with_size(&app, 120, 24);
     assert!(rendered.contains("agent default (C-x a)"));
     assert!(rendered.contains("provider none (C-x p)"));
-    assert!(rendered.contains("ctx 0"));
+    assert!(rendered.contains("Context  0"));
 }
 
 #[test]
@@ -528,9 +567,14 @@ fn sessions_detail_delete_dispatches_and_returns_to_list() {
             ))),
             now,
         ),
-        AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
-            session_id: "doomed".to_owned(),
-        })
+        AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                session_id: "doomed".to_owned(),
+            },
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                session_id: "doomed".to_owned(),
+            },
+        ])
     );
 
     assert_eq!(app.sessions_section().detail_session_id(), None);
@@ -549,9 +593,14 @@ fn sessions_detail_escape_releases_timeline_watch_interest() {
     assert_eq!(app.sessions_section().detail_session_id(), Some("one"));
     assert_eq!(
         app.handle_event(&escape_press(), now),
-        AppAction::ClientCommand(ClientCommand::ReleaseSessionTimelineWatchInterest {
-            session_id: "one".to_owned(),
-        })
+        AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                session_id: "one".to_owned(),
+            },
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                session_id: "one".to_owned(),
+            },
+        ])
     );
     assert_eq!(app.sessions_section().detail_session_id(), None);
     assert_eq!(app.screen(), AppScreen::Sessions);
@@ -621,6 +670,9 @@ fn sessions_detail_leader_c_releases_timeline_before_config_watch() {
             ClientCommand::ReleaseSessionTimelineWatchInterest {
                 session_id: "one".to_owned(),
             },
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                session_id: "one".to_owned(),
+            },
             ClientCommand::ReleaseSessionWatchInterest,
             ClientCommand::RegisterConfigWatchInterest,
             ClientCommand::RequestAuthStatuses,
@@ -672,7 +724,7 @@ fn sessions_detail_renders_timeline_from_snapshot() {
         expected_register_timeline_command("chat")
     );
 
-    let rendered = render_app(&app);
+    let rendered = render_app_with_size(&app, 80, 30);
     assert!(rendered.contains("hello"));
     assert!(rendered.contains("hi there"));
     assert!(rendered.contains("Show cwd"));
@@ -817,12 +869,17 @@ fn open_detail_section(snapshot: &ClientSnapshot) -> SessionsSection {
             Some(snapshot),
             Some(Rect::new(0, 0, 100, 30)),
         ),
-        SectionAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest {
-            session_id: "chat".to_owned(),
-            after_cursor: None,
-            channels: timeline_channels(),
-            initial_limit: Some(64),
-        })
+        SectionAction::ClientCommands(vec![
+            ClientCommand::RegisterSessionTimelineWatchInterest {
+                session_id: "chat".to_owned(),
+                after_cursor: None,
+                channels: timeline_channels(),
+                initial_limit: Some(64),
+            },
+            ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
+                session_id: "chat".to_owned(),
+            },
+        ])
     );
     section
 }
@@ -873,8 +930,8 @@ fn sessions_detail_composer_uses_latest_context_tokens() {
     );
 
     let rendered = render_app_with_size(&app, 120, 24);
-    assert!(rendered.contains("ctx 170"));
-    assert!(!rendered.contains("ctx 999"));
+    assert!(rendered.contains("Context  170"));
+    assert!(!rendered.contains("Context  999"));
 }
 
 #[test]
@@ -898,8 +955,199 @@ fn sessions_detail_composer_uses_cached_context_and_rates() {
     );
 
     let rendered = render_app_with_size(&app, 120, 24);
-    assert!(rendered.contains("ctx 230"));
-    assert!(rendered.contains("c 45.5%/9.1%"));
+    let normalized = rendered
+        .replace('"', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(rendered.contains("Context  230"));
+    assert!(normalized.contains("Cache read 45.5% write 9.1%"));
+}
+
+#[test]
+fn sessions_detail_context_is_right_on_wide_and_capped_above_composer_on_narrow() {
+    let mut session = session_view("parent", 10);
+    session.metrics.total_input_tokens = 100;
+    session.metrics.cache_read_tokens = 25;
+    session.metrics.cache_write_tokens = 10;
+    session.metrics.total_cost_micros = 12_345;
+    session.metrics.cost_currency = Some("USD".to_owned());
+    let mut snapshot = watched_session_with_timeline(
+        session,
+        vec![timeline_metrics_event(1, "parent", 1_200, 34)],
+    );
+    let mut child = session_with_phase(
+        "child",
+        1,
+        SessionPhaseView::Suspended,
+        "",
+    );
+    child.associations.task_parent_session_id = Some("parent".to_owned());
+    child.associations.task_description = Some("Wait for review".to_owned());
+    child.status.suspension_kind = Some(SessionSuspensionKindView::AwaitingExternalInput);
+    snapshot.sessions.current.push(child);
+
+    let mut app = open_sessions_app_with(snapshot);
+    assert_eq!(
+        app.handle_event(&right_press(), Instant::now()),
+        expected_register_timeline_command("parent")
+    );
+
+    let wide = render_app_with_size(&app, 140, 30);
+    let wide_context_column = wide
+        .lines()
+        .find_map(|line| line.find("Session Context"))
+        .expect("wide Context heading");
+    assert!(wide_context_column > 100, "{wide}");
+    let wide_lines = wide.lines().collect::<Vec<_>>();
+    for section in ["Usage", "Subtasks", "Routines"] {
+        let row = wide_lines
+            .iter()
+            .position(|line| line[wide_context_column..].contains(section))
+            .expect("Context section heading");
+        assert!(
+            wide_lines[row - 1][wide_context_column..]
+                .trim()
+                .trim_matches('"')
+                .is_empty(),
+            "{wide}"
+        );
+    }
+    let normalized_wide = wide
+        .replace('"', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(wide.contains("Context  1.2k"), "{wide}");
+    assert!(
+        normalized_wide.contains("Cache read 25.0% write 10.0%"),
+        "{wide}"
+    );
+    assert!(wide.contains("Cost  $0.012345"), "{wide}");
+    assert!(normalized_wide.contains("awaiting external input"), "{wide}");
+    let composer_metadata = wide
+        .lines()
+        .find(|line| line.contains("agent default"))
+        .expect("composer metadata");
+    assert!(!composer_metadata.contains("ctx"), "{wide}");
+    assert!(!composer_metadata.contains("cache"), "{wide}");
+    assert!(!composer_metadata.contains("cost"), "{wide}");
+
+    let narrow = render_app_with_size(&app, 100, 30);
+    let lines = narrow.lines().collect::<Vec<_>>();
+    let context_row = lines
+        .iter()
+        .position(|line| line.contains("Session Context"))
+        .expect("narrow Context heading");
+    let composer_row = lines
+        .iter()
+        .position(|line| line.contains("type a message"))
+        .expect("narrow composer");
+    assert!(context_row < composer_row, "{narrow}");
+    assert!(lines[context_row].find("Session Context").unwrap_or_default() < 10);
+    assert!(narrow.contains("Subtasks"), "{narrow}");
+    assert!(narrow.contains("Routines"), "{narrow}");
+}
+
+#[test]
+fn sessions_detail_context_uses_authoritative_scoped_routine_history_in_snapshot_order() {
+    let mut selected = session_view("parent", 10);
+    selected.associations.routine_invocation_id = Some("helper".to_owned());
+    let mut snapshot = watched_session_with_timeline(selected, Vec::new());
+
+    let mut described = session_with_phase("described", 3, SessionPhaseView::RunningTool, "");
+    described.associations.task_parent_session_id = Some("parent".to_owned());
+    described.associations.task_description = Some("Compile workspace".to_owned());
+    let mut fallback = session_with_phase("fallback-id", 2, SessionPhaseView::Failed, "failed");
+    fallback.associations.task_parent_session_id = Some("parent".to_owned());
+    fallback
+        .metadata
+        .insert("title".to_owned(), serde_json::json!("Fallback title"));
+    let mut indirect = session_view("indirect", 1);
+    indirect.associations.task_parent_session_id = Some("described".to_owned());
+    indirect.associations.task_description = Some("Must not render".to_owned());
+    snapshot.sessions.current.extend([described, fallback, indirect]);
+
+    let mut newest = routine_detail(
+        "source-new",
+        ClientRoutineInvocationStatus::Running,
+        Vec::new(),
+    )
+    .summary;
+    newest.routine_name = "newest".to_owned();
+    let mut unrelated = routine_detail(
+        "unrelated",
+        ClientRoutineInvocationStatus::Succeeded,
+        Vec::new(),
+    )
+    .summary;
+    unrelated.routine_name = "server-row".to_owned();
+    let mut helper = routine_detail(
+        "helper",
+        ClientRoutineInvocationStatus::Interrupted,
+        Vec::new(),
+    )
+    .summary;
+    helper.routine_name = "helper-routine".to_owned();
+    let mut duplicate = newest.clone();
+    duplicate.routine_name = "duplicate".to_owned();
+    let mut scoped_history = snapshot.routines.history.clone();
+    scoped_history.recent = vec![newest, unrelated, helper, duplicate];
+    snapshot
+        .routines
+        .session_histories
+        .insert("parent".to_owned(), scoped_history);
+
+    let mut app = open_sessions_app_with(snapshot);
+    drop(app.handle_event(&right_press(), Instant::now()));
+    let rendered = render_app_with_size(&app, 160, 36);
+
+    assert!(rendered.contains("Compile workspace"), "{rendered}");
+    assert!(rendered.contains("Fallback title"), "{rendered}");
+    assert!(!rendered.contains("Must not render"), "{rendered}");
+    assert!(rendered.contains("server-row [unrelated]"), "{rendered}");
+    assert!(rendered.contains("duplicate"), "{rendered}");
+    let newest_index = rendered.find("newest [source-new]").expect("source Routine");
+    let helper_index = rendered
+        .find("helper-routine [helper]")
+        .expect("helper Routine");
+    assert!(newest_index < helper_index, "{rendered}");
+    assert!(rendered.contains("running"), "{rendered}");
+    assert!(rendered.contains("interrupted"), "{rendered}");
+}
+
+#[test]
+fn sessions_detail_narrow_context_summarizes_association_overflow() {
+    let selected = session_view("parent", 10);
+    let mut snapshot = watched_session_with_timeline(selected, Vec::new());
+    for index in 0..5 {
+        let mut child = session_view(&format!("child-{index}"), i64::from(index));
+        child.associations.task_parent_session_id = Some("parent".to_owned());
+        child.associations.task_description = Some(format!("Task {index}"));
+        snapshot.sessions.current.push(child);
+    }
+    let mut scoped_history = snapshot.routines.history.clone();
+    for index in 0..3 {
+        let summary = routine_detail(
+            &format!("routine-{index}"),
+            ClientRoutineInvocationStatus::Succeeded,
+            Vec::new(),
+        )
+        .summary;
+        scoped_history.recent.push(summary);
+    }
+    snapshot
+        .routines
+        .session_histories
+        .insert("parent".to_owned(), scoped_history);
+
+    let mut app = open_sessions_app_with(snapshot);
+    drop(app.handle_event(&right_press(), Instant::now()));
+    let rendered = render_app_with_size(&app, 100, 30);
+    assert!(rendered.contains("Task 0"), "{rendered}");
+    assert!(rendered.contains("routine-0"), "{rendered}");
+    assert!(rendered.contains("+6 more"), "{rendered}");
+    assert!(rendered.contains("type a message"), "{rendered}");
 }
 
 #[test]
@@ -1383,10 +1631,10 @@ fn sessions_failed_status_renders_mcp_context_and_all_reason_guidance() {
             }),
         ));
         let mut app = open_sessions_app_with(watched_session_with_timeline(session, Vec::new()));
-        assert!(matches!(
+        assert_eq!(
             app.handle_event(&right_press(), Instant::now()),
-            AppAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest { .. })
-        ));
+            expected_register_timeline_command("chat")
+        );
 
         let rendered = render_app_with_size(&app, 140, 32);
         assert!(rendered.contains("MCP server github"), "{rendered}");
@@ -1629,7 +1877,7 @@ fn sessions_detail_wheel_up_requests_older_when_delta_reaches_top() {
 
     assert!(matches!(
         section.handle_key(key_event(right_press()), Some(&snapshot), Some(area)),
-        SectionAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest { .. })
+        SectionAction::ClientCommands(_)
     ));
     assert_eq!(
         section.scroll_detail(Some(&snapshot), area, 100),
@@ -1698,7 +1946,7 @@ fn sessions_detail_timeline_pins_to_bottom_until_manually_scrolled() {
 
     assert!(matches!(
         section.handle_key(key_event(right_press()), Some(&snapshot), Some(area)),
-        SectionAction::ClientCommand(ClientCommand::RegisterSessionTimelineWatchInterest { .. })
+        SectionAction::ClientCommands(_)
     ));
 
     let rendered = render_sessions_section(&section, &snapshot, area);

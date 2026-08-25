@@ -2,6 +2,7 @@
 
 mod agent_selector;
 mod composer;
+mod context;
 mod inference_editor;
 mod prompts;
 mod template_style;
@@ -37,6 +38,7 @@ use self::{
         composer_cursor_at_line_column, composer_cursor_line_column, composer_line_count,
         composer_line_end, composer_line_start, composer_visible_input_line_count, render_composer,
     },
+    context::render_session_context,
     inference_editor::{InferenceEditor, render_inference_editor},
     prompts::{
         ExternalPromptModel, PromptDraft, current_external_prompt, prompt_height, render_prompt,
@@ -61,6 +63,8 @@ const DETAIL_COMPOSER_MAX_INPUT_LINES: u16 = 20;
 const DETAIL_COMPOSER_BOTTOM_GAP: u16 = 1;
 const DETAIL_RESPONSE_TOP_GAP: u16 = 1;
 const DETAIL_TIMELINE_MIN_HEIGHT: u16 = 6;
+const DETAIL_CONTEXT_WIDE_BREAKPOINT: u16 = 110;
+const DETAIL_CONTEXT_NARROW_MAX_HEIGHT: u16 = 6;
 const DETAIL_SCROLL_WHEEL_LINES: usize = 3;
 const DETAIL_SCROLL_PAGE_LINES: usize = 12;
 const RESOURCE_SEARCH_LIMIT: u32 = 12;
@@ -703,9 +707,12 @@ impl SessionsSection {
                     }
 
                     self.detail_session_id = Some(session.id.clone());
-                    return SectionAction::ClientCommand(register_timeline_watch_command(
-                        session.id.clone(),
-                    ));
+                    return SectionAction::ClientCommands(vec![
+                        register_timeline_watch_command(session.id.clone()),
+                        ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
+                            session_id: session.id.clone(),
+                        },
+                    ]);
                 }
                 SectionAction::Continue
             }
@@ -1472,23 +1479,7 @@ impl SessionsSection {
             ])
             .areas(area);
         let prompt = current_external_prompt(snapshot, Some(id));
-        let response_height = self.detail_response_height(prompt.as_ref(), main_area.height);
-        let [
-            timeline_area,
-            _response_top_gap_area,
-            _response_area,
-            _composer_gap_area,
-        ] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(0),
-                Constraint::Length(DETAIL_RESPONSE_TOP_GAP),
-                Constraint::Length(response_height),
-                Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
-            ])
-            .areas(main_area);
-
-        Some(timeline_area)
+        Some(self.detail_areas(main_area, prompt.as_ref()).timeline)
     }
 
     fn detail_timeline_max_scroll(
@@ -1670,21 +1661,9 @@ impl SessionsSection {
 
         let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(id));
         let prompt = current_external_prompt(snapshot, Some(id));
-        let response_height = self.detail_response_height(prompt.as_ref(), main_area.height);
-        let [
-            timeline_area,
-            _response_top_gap_area,
-            response_area,
-            _composer_gap_area,
-        ] = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(0),
-                Constraint::Length(DETAIL_RESPONSE_TOP_GAP),
-                Constraint::Length(response_height),
-                Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
-            ])
-            .areas(main_area);
+        let detail_areas = self.detail_areas(main_area, prompt.as_ref());
+        let timeline_area = detail_areas.timeline;
+        let response_area = detail_areas.response;
 
         frame.render_widget(
             timeline_widget(
@@ -1699,15 +1678,17 @@ impl SessionsSection {
         if let Some(prompt) = &prompt {
             render_prompt(frame, response_area, prompt, &self.prompt_draft);
         } else {
-            render_composer(
-                frame,
-                response_area,
-                self,
-                snapshot,
-                &session,
-                latest_context_tokens(timeline),
-            );
+            render_composer(frame, response_area, self, snapshot, &session);
         }
+
+        render_session_context(
+            frame,
+            detail_areas.context,
+            snapshot,
+            &session,
+            latest_context_tokens(timeline),
+            main_area.width < DETAIL_CONTEXT_WIDE_BREAKPOINT,
+        );
 
         if status_height(snapshot, self) > 0 {
             frame.render_widget(status_widget(snapshot, self), error_area);
@@ -1744,6 +1725,60 @@ impl SessionsSection {
             .max(1);
         desired_height.min(max_height)
     }
+
+    fn detail_areas(&self, main_area: Rect, prompt: Option<&ExternalPromptModel>) -> DetailAreas {
+        if main_area.width >= DETAIL_CONTEXT_WIDE_BREAKPOINT {
+            let [left, _gap, context] = Layout::horizontal([
+                Constraint::Percentage(80),
+                Constraint::Length(1),
+                Constraint::Percentage(20),
+            ])
+            .areas(main_area);
+            let response_height = self.detail_response_height(prompt, left.height);
+            let [timeline, _gap, response, _bottom] = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(DETAIL_RESPONSE_TOP_GAP),
+                Constraint::Length(response_height),
+                Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
+            ])
+            .areas(left);
+            return DetailAreas {
+                timeline,
+                response,
+                context,
+            };
+        }
+
+        let response_height = self.detail_response_height(prompt, main_area.height);
+        let reserved = response_height
+            .saturating_add(DETAIL_RESPONSE_TOP_GAP)
+            .saturating_add(DETAIL_COMPOSER_BOTTOM_GAP)
+            .saturating_add(DETAIL_TIMELINE_MIN_HEIGHT);
+        let context_height = main_area
+            .height
+            .saturating_sub(reserved)
+            .min(DETAIL_CONTEXT_NARROW_MAX_HEIGHT);
+        let [timeline, context, _gap, response, _bottom] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(context_height),
+            Constraint::Length(DETAIL_RESPONSE_TOP_GAP),
+            Constraint::Length(response_height),
+            Constraint::Length(DETAIL_COMPOSER_BOTTOM_GAP),
+        ])
+        .areas(main_area);
+        DetailAreas {
+            timeline,
+            response,
+            context,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DetailAreas {
+    timeline: Rect,
+    response: Rect,
+    context: Rect,
 }
 
 /// Render the sessions surface.
@@ -2061,7 +2096,7 @@ fn session_line(section: &SessionsSection, session: &SessionView, selected: bool
         return Line::from(vec![
             session_option_marker(selected),
             Span::styled(" ", session_option_style(selected)),
-            session_option_title(session.id.clone(), selected),
+            session_option_title(session.display_label().to_owned(), selected),
             Span::styled("  ", session_option_style(selected)),
             session_delete_prompt_span(
                 ui::delete_prompt_text(section.delete.is_pending(), section.delete.error()),
@@ -2074,7 +2109,7 @@ fn session_line(section: &SessionsSection, session: &SessionView, selected: bool
     Line::from(vec![
         session_option_marker(selected),
         Span::styled(" ", session_option_style(selected)),
-        session_option_title(session.id.clone(), selected),
+        session_option_title(session.display_label().to_owned(), selected),
         Span::styled("  ", session_option_style(selected)),
         phase_span_with_bg(session.status.phase, selected),
         Span::styled("  ", session_option_style(selected)),
