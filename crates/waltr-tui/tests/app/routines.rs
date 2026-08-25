@@ -119,6 +119,37 @@ fn routines_route_registers_and_escape_releases_both_watches() {
 }
 
 #[test]
+fn routines_route_releases_session_ownership_and_does_not_reuse_palette_chord() {
+    let mut app =
+        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("source", 1)]));
+    let now = Instant::now();
+    assert_eq!(
+        app.handle_event(&right_press(), now),
+        expected_register_timeline_command("source")
+    );
+    drop(app.handle_event(&ctrl_x_press(), now));
+    assert_eq!(
+        app.handle_event(&char_press('u'), now),
+        AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseSessionTimelineWatchInterest {
+                session_id: "source".to_owned(),
+            },
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                session_id: "source".to_owned(),
+            },
+            ClientCommand::ReleaseSessionWatchInterest,
+            ClientCommand::RegisterRoutineDefinitionWatchInterest,
+            ClientCommand::RegisterRoutineInvocationWatchInterest,
+        ])
+    );
+    assert_eq!(app.screen(), AppScreen::Routines);
+
+    drop(app.handle_event(&ctrl_x_press(), now));
+    assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
+    assert_eq!(app.screen(), AppScreen::Routines);
+}
+
+#[test]
 fn routines_list_and_detail_are_separate_read_only_views() {
     let mut app = open_routines_app(routine_screen_snapshot());
     let now = Instant::now();
