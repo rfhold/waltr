@@ -1954,6 +1954,109 @@
   width: min(38rem, calc(100vw - 2rem));
 }
 
+.sessions__commands-dialog {
+  width: min(42rem, calc(100vw - 2rem));
+}
+
+.sessions__commands-list-view,
+.sessions__commands-form-view,
+.sessions__commands-form-view form {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.sessions__commands-list-view > p,
+.sessions__commands-form-view > p,
+.sessions__commands-form-view h3 {
+  margin: 0;
+}
+
+.sessions__commands-dialog input:not([type="checkbox"]),
+.sessions__commands-dialog textarea {
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.8rem;
+  color: var(--color-text);
+  background: var(--color-input-bg);
+  font: inherit;
+}
+
+.sessions__commands-dialog input[type="checkbox"] {
+  accent-color: var(--color-accent);
+}
+
+.sessions__commands-list {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sessions__commands-list button {
+  display: grid;
+  width: 100%;
+  gap: 0.35rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 0.8rem;
+  color: var(--color-text);
+  background: var(--color-surface-soft);
+  text-align: left;
+}
+
+.sessions__commands-list button:hover,
+.sessions__commands-list button:focus-visible {
+  border-color: var(--border-accent);
+  background: var(--color-accent-soft);
+}
+
+.sessions__commands-list span,
+.sessions__commands-form-view > p {
+  color: var(--color-text-muted);
+}
+
+.sessions__commands-list small {
+  color: var(--color-text-subtle);
+}
+
+.sessions__commands-form-view textarea {
+  min-height: 8rem;
+  resize: vertical;
+}
+
+.sessions__commands-results {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.sessions__commands-results > div:not(.sessions__commands-actions) {
+  display: grid;
+  gap: 0.3rem;
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: var(--space-3);
+}
+
+.sessions__commands-results span {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.sessions__commands-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.sessions__commands-result {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.sessions__commands-result > p {
+  margin: 0;
+}
+
 .routines {
   display: grid;
   gap: var(--space-6);
