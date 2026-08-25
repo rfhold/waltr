@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor, within } from "@solidjs/testing-library";
 import { describe, expect, test, vi } from "vitest";
 
-import type { AuthenticationFailureSnapshot, ClientCommand, ClientSnapshot, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
+import type { AuthenticationFailureSnapshot, ClientCommand, ClientRoutineInvocationSummary, ClientSnapshot, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, testHistory } from "../support/routes";
 import { emptyConfig, readySessionTimeline, sessionMetricsView, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
@@ -28,6 +28,34 @@ describe("sessions route", () => {
     expect(screen.queryByLabelText("Session breadcrumb")).toBeNull();
   });
 
+  test("uses live metadata titles without changing route identity", async () => {
+    let setSnapshot: ((snapshot: ClientSnapshot) => void) | undefined;
+    const initial = snapshotWithSessions([sessionView({ id: "stable-id" })]);
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, {
+      routePath: "/sessions",
+      snapshot: initial,
+      onSnapshotSetter: (setter) => { setSnapshot = setter; },
+    });
+
+    const updated = snapshotWithSessions([
+      sessionView({ id: "stable-id", metadata: { title: "Live title", unknown: { nested: true } } }),
+    ]);
+    updated.sessions.timelines["stable-id"] = readySessionTimeline();
+    setSnapshot!(updated);
+
+    const row = await screen.findByLabelText("Open session stable-id");
+    expect(row.textContent).toContain("Live title");
+    expect(row.getAttribute("title")).toBe("stable-id");
+    fireEvent.click(row);
+
+    await waitFor(() => expect(testHistory().get()).toBe("/sessions/stable-id"));
+    const status = screen.getByLabelText("Session status summary");
+    expect(status.textContent).not.toContain("Live title");
+    expect(status.textContent).not.toContain("stable-id");
+    expect(within(status).queryByTitle("stable-id")).toBeNull();
+  });
+
   test("selecting a session routes to its detail view", async () => {
     const commands: ClientCommand[] = [];
 
@@ -35,7 +63,7 @@ describe("sessions route", () => {
       commands,
       routePath: "/sessions",
       snapshot: snapshotWithSessions([
-        sessionView({ id: "session-b", status: { phase: "runningTool", failedMessage: "", authenticationFailure: null } }),
+        sessionView({ id: "session-b", status: { phase: "runningTool", suspensionKind: null, failedMessage: "", authenticationFailure: null } }),
       ]),
     });
 
@@ -48,6 +76,7 @@ describe("sessions route", () => {
     expect(commands.map((command) => command.type)).toEqual([
       "registerSessionWatchInterest",
       "registerSessionTimelineWatchInterest",
+      "registerSessionRoutineInvocationWatchInterest",
     ]);
   });
 
@@ -64,6 +93,8 @@ describe("sessions route", () => {
       totalTokens: 110n,
       totalInputTokens: 220n,
       contextTokens: 230n,
+      costCurrency: "USD",
+      totalCostMicros: 125_000n,
     };
     snapshot.sessions.timelines["session-cache"] = readySessionTimeline();
     snapshot.sessions.timelines["session-cache"].events = [
@@ -95,9 +126,169 @@ describe("sessions route", () => {
       snapshot,
     });
 
-    expect(screen.getByLabelText("Session token and cost totals").textContent).toContain("Ctx 230");
-    expect(screen.getByLabelText("Session token and cost totals").textContent).toContain("Cache 45.5% / 9.1%");
+    const context = screen.getByLabelText("Session context");
+    const status = screen.getByLabelText("Session status summary");
+    expect(within(context).getByLabelText("Session token and cost totals").textContent).toContain("Ctx 230");
+    expect(within(context).getByLabelText("Session token and cost totals").textContent).toContain("Cache 45.5% / 9.1%");
+    expect(within(context).getByLabelText("Session token and cost totals").textContent).toContain("Cost USD 0.125000");
+    expect(status.textContent).not.toContain("Ctx");
+    expect(status.textContent).not.toContain("Cache");
+    expect(status.textContent).not.toContain("Cost");
+    expect(within(status).getByRole("button", { name: "Edit provider/model" })).toBeTruthy();
     expect(screen.getByLabelText("Turn token metrics").textContent).toContain("230 tok");
+  });
+
+  test.each([
+    ["bigint", 0n],
+    ["runtime number", 0],
+  ])("session detail formats %s zero cache and cost values", (_, zero) => {
+    const snapshot = snapshotWithSessions([sessionView({ id: "zero-usage" })]);
+    const runtimeZero = zero as unknown as bigint;
+    snapshot.sessions.current[0]!.metrics = {
+      ...sessionMetricsView(),
+      cacheReadTokens: runtimeZero,
+      cacheWriteTokens: runtimeZero,
+      totalInputTokens: runtimeZero,
+      costCurrency: "USD",
+      totalCostMicros: runtimeZero,
+    };
+    snapshot.sessions.timelines["zero-usage"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/zero-usage", snapshot });
+
+    const usage = screen.getByLabelText("Session token and cost totals");
+    expect(usage.textContent).toContain("Cache 0% / 0%");
+    expect(usage.textContent).toContain("Cost -");
+  });
+
+  test("shows only direct subtasks with description and display-label fallbacks", () => {
+    const snapshot = snapshotWithSessions([
+      sessionView({ id: "parent" }),
+      sessionView({ id: "described", associations: associations({ taskParentSessionId: "parent", taskDescription: "Write tests" }) }),
+      sessionView({ id: "titled", metadata: { title: "Named child" }, associations: associations({ taskParentSessionId: "parent" }) }),
+      sessionView({ id: "id-fallback", associations: associations({ taskParentSessionId: "parent" }) }),
+      sessionView({ id: "grandchild", associations: associations({ taskParentSessionId: "described" }) }),
+      sessionView({ id: "other", associations: associations({ taskParentSessionId: "another-parent" }) }),
+    ]);
+    snapshot.sessions.timelines.parent = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/parent", snapshot });
+
+    const context = screen.getByLabelText("Session context");
+    expect(within(context).getByRole("link", { name: "Write tests" })).toBeTruthy();
+    expect(within(context).getByRole("link", { name: "Named child" })).toBeTruthy();
+    expect(within(context).getByRole("link", { name: "id-fallback" })).toBeTruthy();
+    expect(within(context).queryByText("grandchild")).toBeNull();
+    expect(within(context).queryByText("other")).toBeNull();
+  });
+
+  test("renders the scoped Routine collection exactly in snapshot order", () => {
+    const snapshot = snapshotWithSessions([
+      sessionView({ id: "helper", associations: associations({ routineInvocationId: "helper-invocation" }) }),
+    ]);
+    snapshot.sessions.timelines.helper = readySessionTimeline();
+    snapshot.routines.sessionHistories = {
+      helper: {
+        ...snapshot.routines.history,
+        recent: [
+          routineSummary("source-newest", "Newest source", "running", "helper"),
+          routineSummary("helper-invocation", "Owning Routine", "succeeded", "another-source"),
+          routineSummary("source-newest", "Duplicate source", "admitted", "helper"),
+        ],
+      },
+    };
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/helper", snapshot });
+
+    const routines = screen.getByRole("heading", { name: "Routines" }).closest("section")!;
+    expect(within(routines).getAllByRole("link").map((link) => link.textContent)).toEqual([
+      "Newest source",
+      "Owning Routine",
+      "Duplicate source",
+    ]);
+  });
+
+  test("projects all subtask and Routine statuses while keeping exact labels accessible", () => {
+    const subtaskStatuses: Array<[string, SessionStatusView, string, string]> = [
+      ["building", sessionStatus("buildingRequest"), "Building request", "green"],
+      ["streaming", sessionStatus("streamingProvider"), "Streaming provider", "green"],
+      ["retrying", sessionStatus("retryingProvider"), "Retrying provider", "green"],
+      ["evaluating", sessionStatus("evaluatingToolCall"), "Evaluating tool call", "green"],
+      ["tool", sessionStatus("runningTool"), "Running tool", "green"],
+      ["tool-wait", sessionStatus("suspended", "awaitingToolResults"), "Awaiting tool results", "green"],
+      ["input-wait", sessionStatus("suspended", "awaitingExternalInput"), "Awaiting external input", "green"],
+      ["failed", sessionStatus("failed"), "Failed", "red"],
+      ["interrupted", sessionStatus("suspended", "interrupted"), "Interrupted", "red"],
+      ["idle", sessionStatus("idle"), "Idle", "grey"],
+      ["finished", sessionStatus("finished"), "Finished", "grey"],
+      ["unspecified", sessionStatus("unspecified"), "Unspecified", "grey"],
+      ["unknown", sessionStatus("unknown"), "Unknown", "grey"],
+      ["suspended-none", sessionStatus("suspended", null), "Suspended", "grey"],
+      ["suspended-unspecified", sessionStatus("suspended", "unspecified"), "Suspended (unspecified)", "grey"],
+      ["suspended-unknown", sessionStatus("suspended", "unknown"), "Suspended (unknown)", "grey"],
+    ];
+    const snapshot = snapshotWithSessions([
+      sessionView({ id: "parent" }),
+      ...subtaskStatuses.map(([id, status]) => sessionView({ id, status, associations: associations({ taskParentSessionId: "parent", taskDescription: id }) })),
+    ]);
+    snapshot.sessions.timelines.parent = readySessionTimeline();
+    snapshot.routines.sessionHistories = {
+      parent: {
+        ...snapshot.routines.history,
+        recent: [
+          routineSummary("admitted", "Admitted Routine", "admitted", "parent"),
+          routineSummary("running", "Running Routine", "running", "parent"),
+          routineSummary("failed-routine", "Failed Routine", "failed", "parent"),
+          routineSummary("interrupted-routine", "Interrupted Routine", "interrupted", "parent"),
+          routineSummary("succeeded", "Succeeded Routine", "succeeded", "parent"),
+          routineSummary("unknown-routine", "Unknown Routine", "unknown" as ClientRoutineInvocationSummary["status"], "parent"),
+        ],
+      },
+    };
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/parent", snapshot });
+
+    for (const [id, , label, tone] of subtaskStatuses) {
+      const item = screen.getByRole("link", { name: id }).closest("li")!;
+      expect(within(item).getByText(label)).toBeTruthy();
+      expect(item.querySelector(`.sessions__context-status-dot--${tone}`)).toBeTruthy();
+      expect(item.querySelector(".sessions__context-status-dot")?.getAttribute("aria-hidden")).toBe("true");
+    }
+    for (const [name, label, tone] of [
+      ["Admitted Routine", "Admitted", "green"], ["Running Routine", "Running", "green"],
+      ["Failed Routine", "Failed", "red"], ["Interrupted Routine", "Interrupted", "red"],
+      ["Succeeded Routine", "Succeeded", "grey"], ["Unknown Routine", "Unknown", "grey"],
+    ]) {
+      const item = screen.getByRole("link", { name }).closest("li")!;
+      expect(within(item).getByText(label)).toBeTruthy();
+      expect(item.querySelector(`.sessions__context-status-dot--${tone}`)).toBeTruthy();
+    }
+  });
+
+  test("registers and releases scoped Routine invocation interest for the selected session", async () => {
+    const commands: ClientCommand[] = [];
+    const snapshot = snapshotWithSessions([sessionView({ id: "watched" }), sessionView({ id: "next" })]);
+    snapshot.sessions.timelines.watched = readySessionTimeline();
+    snapshot.sessions.timelines.next = readySessionTimeline();
+    const result = renderWithAppState(() => <SessionsRouteWithRouter />, { commands, routePath: "/sessions/watched", snapshot });
+
+    await waitFor(() => expect(commands).toContainEqual({ type: "registerSessionRoutineInvocationWatchInterest", sessionId: "watched" }));
+    expect(commands.map((command) => command.type)).not.toContain("registerRoutineDefinitionWatchInterest");
+    testHistory().set({ value: "/sessions/next", replace: false, scroll: false });
+    await waitFor(() => expect(commands).toContainEqual({ type: "releaseSessionRoutineInvocationWatchInterest", sessionId: "watched" }));
+    await waitFor(() => expect(commands).toContainEqual({ type: "registerSessionRoutineInvocationWatchInterest", sessionId: "next" }));
+    result.unmount();
+    await waitFor(() => expect(commands).toContainEqual({ type: "releaseSessionRoutineInvocationWatchInterest", sessionId: "next" }));
+  });
+
+  test("shows concise empty subtask and Routine sections", () => {
+    const snapshot = snapshotWithSessions([sessionView({ id: "empty-context" })]);
+    snapshot.sessions.timelines["empty-context"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/empty-context", snapshot });
+
+    expect(screen.getByText("No subtasks.")).toBeTruthy();
+    expect(screen.getByText("No Routine invocations.")).toBeTruthy();
   });
 
   test("creating a session routes to the created session", async () => {
@@ -233,7 +424,7 @@ describe("sessions route", () => {
   test("explains next-cycle behavior when switching an active session", () => {
     const snapshot = snapshotWithSessions([sessionView({
       id: "session-agent-active",
-      status: { phase: "streamingProvider", failedMessage: "", authenticationFailure: null },
+      status: { phase: "streamingProvider", suspensionKind: null, failedMessage: "", authenticationFailure: null },
     })]);
     snapshot.sessions.timelines["session-agent-active"] = readySessionTimeline();
     renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-agent-active", snapshot });
@@ -671,7 +862,7 @@ describe("sessions route", () => {
 
   test("session detail shows assistant pending state while active", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-active", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-active", { phase: "streamingProvider", suspensionKind: null, failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-active"] = readySessionTimeline();
 
@@ -685,7 +876,7 @@ describe("sessions route", () => {
 
   test("session detail treats suspended sessions as waiting", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-suspended", { phase: "suspended", failedMessage: "", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-suspended", { phase: "suspended", suspensionKind: null, failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-suspended"] = readySessionTimeline();
 
@@ -703,7 +894,7 @@ describe("sessions route", () => {
 
   test("session detail shows failed status in important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-failed", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-failed", { phase: "failed", suspensionKind: null, failedMessage: "provider unavailable", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-failed"] = readySessionTimeline();
 
@@ -727,6 +918,7 @@ describe("sessions route", () => {
     const commands: ClientCommand[] = [];
     const status: SessionStatusView = {
       phase: "failed",
+      suspensionKind: null,
       failedMessage: "safe session failure",
       authenticationFailure: authenticationFailure("mcpServer", "remote server", reason),
     };
@@ -758,7 +950,7 @@ describe("sessions route", () => {
 
   test("session detail shows timeline watch errors in the important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-timeline-error", { phase: "failed", failedMessage: "provider unavailable", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-timeline-error", { phase: "failed", suspensionKind: null, failedMessage: "provider unavailable", authenticationFailure: null }),
     ]);
     const timeline = readySessionTimeline();
     timeline.watch = { status: "failed", error: "timeline disconnected", key: null };
@@ -1829,7 +2021,7 @@ describe("sessions route", () => {
 
   test("session detail shows interrupt operation failures", async () => {
     const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-interrupt-fail", { phase: "streamingProvider", failedMessage: "", authenticationFailure: null }),
+      sessionWithInferenceSettings("session-interrupt-fail", { phase: "streamingProvider", suspensionKind: null, failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-interrupt-fail"] = readySessionTimeline();
 
@@ -2179,7 +2371,7 @@ function provider(name: string, modelIds: string[], reasoningEfforts: string[] =
   };
 }
 
-function sessionWithInferenceSettings(id: string, status: SessionStatusView = { phase: "idle", failedMessage: "", authenticationFailure: null }) {
+function sessionWithInferenceSettings(id: string, status: SessionStatusView = { phase: "idle", suspensionKind: null, failedMessage: "", authenticationFailure: null }) {
   return sessionView({
     id,
     status,
@@ -2194,6 +2386,43 @@ function sessionWithInferenceSettings(id: string, status: SessionStatusView = { 
       },
     },
   });
+}
+
+function associations(overrides: Partial<NonNullable<ReturnType<typeof sessionView>["associations"]>> = {}) {
+  return { taskParentSessionId: null, taskDescription: null, routineInvocationId: null, ...overrides };
+}
+
+function sessionStatus(
+  phase: SessionStatusView["phase"],
+  suspensionKind: SessionStatusView["suspensionKind"] = null,
+): SessionStatusView {
+  return { phase, suspensionKind, failedMessage: "", authenticationFailure: null };
+}
+
+function routineSummary(
+  invocationId: string,
+  routineName: string,
+  status: ClientRoutineInvocationSummary["status"],
+  sourceSessionId: string | null,
+): ClientRoutineInvocationSummary {
+  return {
+    admissionSequence: 1n,
+    invocationId,
+    routineName,
+    routineRevision: "revision-1",
+    triggerName: "manual",
+    triggerKind: "manual",
+    correlationId: invocationId,
+    metadata: sourceSessionId ? { "waltr.routine.source_session_id": sourceSessionId } : {},
+    sourceCursor: null,
+    status,
+    admittedAtMs: 1_700_000_000_000n,
+    startedAtMs: null,
+    completedAtMs: null,
+    updatedAtMs: 1_700_000_000_000n,
+    terminalError: null,
+    latestSequence: 1n,
+  };
 }
 
 function authenticationFailure(
