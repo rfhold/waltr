@@ -1834,6 +1834,300 @@
   width: min(38rem, calc(100vw - 2rem));
 }
 
+.routines {
+  display: grid;
+  gap: var(--space-6);
+  width: min(100%, 90rem);
+  margin: 0 auto;
+}
+
+.routines__header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: var(--space-6);
+}
+
+.routines__header h1,
+.routines__header p,
+.routines__section h2,
+.routine-detail h1,
+.routine-detail p {
+  margin: 0;
+}
+
+.routines__header > p {
+  max-width: 38rem;
+  color: var(--color-text-muted);
+  line-height: 1.5;
+}
+
+.routines__sections {
+  display: grid;
+  grid-template-columns: minmax(18rem, 0.9fr) minmax(20rem, 1.1fr);
+  gap: var(--space-8);
+  align-items: start;
+}
+
+.routines__section,
+.routine-detail {
+  min-width: 0;
+}
+
+.routines__section {
+  display: grid;
+  gap: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-4);
+}
+
+.routines__section-heading,
+.routine-detail__header,
+.routine-task summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.routines__watch-state {
+  color: var(--color-warning-text);
+  font-size: 0.82rem;
+}
+
+.routines__empty {
+  color: var(--color-text-muted);
+}
+
+.routine-definitions,
+.routine-history,
+.routine-tasks {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.routine-definitions > li,
+.routine-task {
+  min-width: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 0 var(--space-4);
+}
+
+.routine-definitions > li {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.routine-definitions > li > div:first-child {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.routine-definitions code {
+  width: fit-content;
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+}
+
+.routine-definitions h3,
+.routine-definitions p,
+.routine-definitions dl,
+.routine-definitions ul,
+.routine-definitions__none {
+  margin: 0;
+}
+
+.routine-definitions p,
+.routine-definitions span,
+.routine-definitions__none,
+.routine-task small {
+  color: var(--color-text-muted);
+}
+
+.routine-definitions dl,
+.routine-detail__metadata,
+.routine-session-references,
+.routine-results {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.routine-definitions dl > div,
+.routine-detail__metadata > div,
+.routine-session-references > div,
+.routine-results > div {
+  display: grid;
+  grid-template-columns: minmax(6rem, 0.35fr) minmax(0, 1fr);
+  gap: var(--space-3);
+}
+
+.routine-definitions dt,
+.routine-detail dt,
+.routine-results dt {
+  color: var(--color-text-subtle);
+}
+
+.routine-definitions dd,
+.routine-detail dd,
+.routine-results dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.routine-history a {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: var(--space-3) 0;
+  color: var(--color-text);
+  text-align: left;
+  text-decoration: none;
+}
+
+.routine-history a:hover,
+.routine-history a:focus-visible {
+  color: var(--color-accent);
+}
+
+.routine-history a > span {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.routine-history a > span:last-child {
+  justify-items: end;
+}
+
+.routine-history small,
+.routine-history time {
+  color: var(--color-text-muted);
+}
+
+.routines__older {
+  justify-self: start;
+}
+
+.routine-detail {
+  display: grid;
+  gap: var(--space-6);
+}
+
+.routine-status {
+  display: inline-flex;
+  width: fit-content;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0.2rem 0.5rem;
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.routine-status--running,
+.routine-status--admitted { color: var(--color-accent); }
+.routine-status--succeeded { color: var(--color-success-text); }
+.routine-status--failed,
+.routine-status--blocked,
+.routine-status--interrupted { color: var(--color-danger-text); }
+.routine-status--skipped { color: var(--color-warning-text); }
+
+.routine-task {
+  padding: 0;
+}
+
+.routine-task details {
+  min-width: 0;
+}
+
+.routine-task summary {
+  padding: var(--space-4) 0;
+  cursor: pointer;
+}
+
+.routine-task summary::marker {
+  content: "";
+}
+
+.routine-task summary::before {
+  content: "›";
+  color: var(--color-text-subtle);
+  font-size: 1.4rem;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+.routine-task details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.routine-invocation__back,
+.routine-detail a {
+  color: var(--color-accent);
+  text-underline-offset: 0.2em;
+}
+
+.routine-invocation__back::before {
+  content: "←";
+  margin-right: 0.45rem;
+  color: var(--color-text-subtle);
+}
+
+.routine-invocation__back:hover,
+.routine-invocation__back:focus-visible,
+.routine-detail a:hover,
+.routine-detail a:focus-visible {
+  color: var(--color-text);
+}
+
+.routine-task summary::before,
+.routine-task summary::marker {
+  color: var(--color-text-subtle);
+}
+
+.routine-task__identity {
+  display: grid;
+  flex: 1;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.routine-task__content {
+  display: grid;
+  gap: var(--space-4);
+  padding: 0 0 var(--space-4) var(--space-5);
+}
+
+.routine-invocation__back {
+  width: fit-content;
+}
+
+.routine-invocation__state {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-5);
+}
+
+.routine-invocation__state h1,
+.routine-invocation__state p {
+  margin: 0;
+}
+
+.routine-failure {
+  overflow-wrap: anywhere;
+  color: var(--color-danger-text);
+}
+
 .sessions__agent-selector {
   display: grid;
   gap: var(--space-4);
@@ -2601,6 +2895,30 @@
 
   .shell__content:has(.sessions--detail) {
     padding: 0;
+  }
+
+  .routines__header,
+  .routine-definitions > li > div:first-child,
+  .routine-detail__header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .routine-task summary {
+    align-items: center;
+  }
+
+  .routines__sections {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .routine-history a {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .routine-history a > span:last-child {
+    justify-items: start;
   }
 
   .provider-row {
