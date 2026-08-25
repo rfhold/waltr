@@ -783,14 +783,15 @@ pub fn setup_access_auth_server() -> AccessAuthTestServer {
                 persistence,
                 catalog_loader,
                 authenticator,
-                |routes, config, credential_store, agent_state| {
-                    session::add_sessions_service_with_agent_state(
+                |routes, config, credential_store, agent_state, event_sink| {
+                    session::add_sessions_service_with_agent_state_and_event_sink(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),
                         config,
                         credential_store,
-                        None,
+                        Vec::new(),
                         agent_state,
+                        event_sink,
                     )
                 },
             )
@@ -963,14 +964,15 @@ fn setup_server_with_listener_sessions_and_catalog_loader(
                 config_service,
                 persistence,
                 catalog_loader,
-                |routes, config, credential_store, agent_state| {
-                    session::add_sessions_service_with_agent_state(
+                |routes, config, credential_store, agent_state, event_sink| {
+                    session::add_sessions_service_with_agent_state_and_event_sink(
                         routes,
                         sessions,
                         config,
                         credential_store,
-                        None,
+                        Vec::new(),
                         agent_state,
+                        event_sink,
                     )
                 },
             )
@@ -1147,14 +1149,15 @@ END
                 catalog_loader,
                 authenticator,
                 mcp_oauth,
-                move |routes, config, credential_store, agent_state| {
-                    session::add_sessions_service_with_agent_state(
+                move |routes, config, credential_store, agent_state, event_sink| {
+                    session::add_sessions_service_with_agent_state_and_event_sink(
                         routes,
                         SessionCoordinator::new(MemorySessionStore::new()),
                         config,
                         credential_store,
-                        trusted_mcp_oauth_origin,
+                        trusted_mcp_oauth_origin.into_iter().collect(),
                         agent_state,
+                        event_sink,
                     )
                 },
             )

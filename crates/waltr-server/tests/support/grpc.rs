@@ -3,6 +3,7 @@ use waltr::grpc::waltr::config::v1::Configuration;
 use waltr::grpc::waltr::resource::v1::{
     GetResourceCatalogRequest, ResourceCatalog, resource_service_client::ResourceServiceClient,
 };
+use waltr::grpc::waltr::routine::v1::routine_service_client::RoutineServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use waltr_server::test_support::TestServer;
@@ -39,6 +40,13 @@ pub async fn session_client(
 ) -> Result<SessionServiceClient<Channel>, Box<dyn std::error::Error>> {
     let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
     Ok(SessionServiceClient::new(channel))
+}
+
+pub async fn routine_client(
+    server: &TestServer,
+) -> Result<RoutineServiceClient<Channel>, Box<dyn std::error::Error>> {
+    let channel = Endpoint::from_shared(server.base_url())?.connect().await?;
+    Ok(RoutineServiceClient::new(channel))
 }
 
 pub async fn get_catalog(

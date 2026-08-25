@@ -14,6 +14,8 @@ pub mod persistence;
 pub mod profiling;
 pub mod resource_catalog;
 pub mod resource_error;
+pub mod routine;
+pub mod routine_service;
 pub mod session;
 pub mod status_service;
 #[cfg(any(debug_assertions, feature = "test"))]

@@ -17,6 +17,8 @@ use crate::{
     mcp_service::WaltrMcpServer,
     persistence::{Persistence, PersistenceError},
     resource_error::ResourceError,
+    routine::{EngineHealth, EventBus, RoutineEngine},
+    routine_service::RoutineService,
     session,
     status_service::StatusService,
 };
@@ -31,6 +33,7 @@ use axum::{
 use waltr::grpc::waltr::auth::v1::auth_service_server::AuthServiceServer;
 use waltr::grpc::waltr::catalog::v1::catalog_service_server::CatalogServiceServer;
 use waltr::grpc::waltr::resource::v1::resource_service_server::ResourceServiceServer;
+use waltr::grpc::waltr::routine::v1::routine_service_server::RoutineServiceServer;
 use waltr::grpc::waltr::status::v1::status_service_server::StatusServiceServer;
 use serde::Serialize;
 use std::{error::Error, fmt, future::Future, io, sync::Arc, time::Duration};
@@ -54,12 +57,14 @@ struct Readiness {
     persistence: Persistence,
     oauth: Option<McpOAuthServer>,
     definitions: tokio::sync::watch::Receiver<DefinitionWatcherHealth>,
+    routines: tokio::sync::watch::Receiver<EngineHealth>,
 }
 
 impl Readiness {
     async fn response(self) -> axum::response::Response {
         let definitions_ready = definition_watcher_ready(&self.definitions);
         let ready = definitions_ready
+            && routine_engine_ready(&self.routines)
             && self.persistence.ready().await.is_ok()
             && match self.oauth {
                 Some(oauth) => oauth.ready().await.is_ok(),
@@ -79,11 +84,16 @@ fn definition_watcher_ready(
     health.has_changed().is_ok() && matches!(&*health.borrow(), DefinitionWatcherHealth::Running)
 }
 
+fn routine_engine_ready(health: &tokio::sync::watch::Receiver<EngineHealth>) -> bool {
+    health.has_changed().is_ok() && matches!(&*health.borrow(), EngineHealth::Running)
+}
+
 /// Waltr router and server-owned background work.
 pub struct ServerApplication {
     router: Router,
     definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
+    routine_engine: Option<RoutineEngine>,
     test_background: Option<TestBackgroundTask>,
 }
 
@@ -100,11 +110,13 @@ impl ServerApplication {
         router: Router,
         definition_watcher: AgentDefinitionWatcher,
         oauth: Option<McpOAuthServer>,
+        routine_engine: RoutineEngine,
     ) -> Self {
         Self {
             router,
             definition_watcher: Some(definition_watcher),
             oauth_maintenance: oauth.map(McpOAuthMaintenanceTask::spawn),
+            routine_engine: Some(routine_engine),
             test_background: None,
         }
     }
@@ -120,10 +132,17 @@ impl ServerApplication {
             router,
             definition_watcher,
             oauth_maintenance,
+            routine_engine,
             test_background,
         } = self;
         drop(router);
-        shutdown_background_tasks(definition_watcher, oauth_maintenance, test_background).await;
+        shutdown_background_tasks(
+            definition_watcher,
+            oauth_maintenance,
+            routine_engine,
+            test_background,
+        )
+        .await;
     }
 
     #[cfg(any(debug_assertions, feature = "test"))]
@@ -144,6 +163,7 @@ impl ServerApplication {
             router,
             definition_watcher: None,
             oauth_maintenance: None,
+            routine_engine: None,
             test_background: Some(TestBackgroundTask { cancellation, task }),
         }
     }
@@ -191,6 +211,7 @@ impl ServerApplication {
             router,
             definition_watcher,
             oauth_maintenance,
+            routine_engine,
             test_background,
         } = self;
         let result = {
@@ -215,7 +236,13 @@ impl ServerApplication {
                 } => Ok(()),
             }
         };
-        shutdown_background_tasks(definition_watcher, oauth_maintenance, test_background).await;
+        shutdown_background_tasks(
+            definition_watcher,
+            oauth_maintenance,
+            routine_engine,
+            test_background,
+        )
+        .await;
         result
     }
 }
@@ -223,8 +250,12 @@ impl ServerApplication {
 async fn shutdown_background_tasks(
     definition_watcher: Option<AgentDefinitionWatcher>,
     oauth_maintenance: Option<McpOAuthMaintenanceTask>,
+    routine_engine: Option<RoutineEngine>,
     test_background: Option<TestBackgroundTask>,
 ) {
+    if let Some(routine_engine) = routine_engine {
+        routine_engine.shutdown().await;
+    }
     if let Some(definition_watcher) = definition_watcher
         && let Err(error) = definition_watcher.shutdown().await
     {
@@ -445,13 +476,14 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
             outbound_private_origins.clone(),
             automatic_self_mcp_resource,
             Some(agent_state),
-            |grpc_routes, config, credential_store, agent_state| {
-                match session::add_service_from_env_with_oauth_policy_and_agent_state(
+            |grpc_routes, config, credential_store, agent_state, event_sink| {
+                match session::add_service_from_env_with_oauth_policy_agent_state_and_event_sink(
                     grpc_routes,
                     config.clone(),
                     credential_store.clone(),
                     session_private_origins,
                     agent_state.clone(),
+                    event_sink.clone(),
                 ) {
                     Ok(host) => {
                         session_storage = Some(Ok(Arc::clone(&host)));
@@ -459,11 +491,14 @@ pub async fn build_app() -> Result<ServerApplication, BuildAppError> {
                     }
                     Err(error) => {
                         session_storage = Some(Err(error));
-                        session::add_memory_service_with_agent_state(
+                        session::add_store_service_with_agent_state_and_event_sink(
                             grpc_routes,
+                            waltr_agent::MemorySessionStore::new(),
                             config,
                             credential_store,
+                            Vec::new(),
                             agent_state,
+                            event_sink,
                         )
                     }
                 }
@@ -533,6 +568,7 @@ where
         ConfigHandle,
         CredentialStore,
         AgentDefinitionState,
+        Arc<dyn waltr_agent::SessionEventSink>,
     ) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
@@ -563,6 +599,7 @@ where
         ConfigHandle,
         CredentialStore,
         AgentDefinitionState,
+        Arc<dyn waltr_agent::SessionEventSink>,
     ) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
@@ -595,6 +632,7 @@ where
         ConfigHandle,
         CredentialStore,
         AgentDefinitionState,
+        Arc<dyn waltr_agent::SessionEventSink>,
     ) -> Arc<dyn session::SessionHost>,
 {
     let catalog_loader = config_service.catalog_loader();
@@ -626,6 +664,7 @@ where
         ConfigHandle,
         CredentialStore,
         AgentDefinitionState,
+        Arc<dyn waltr_agent::SessionEventSink>,
     ) -> Arc<dyn session::SessionHost>,
 {
     build_app_with_catalog_loader_and_access_authenticator(
@@ -665,6 +704,7 @@ where
         ConfigHandle,
         CredentialStore,
         AgentDefinitionState,
+        Arc<dyn waltr_agent::SessionEventSink>,
     ) -> Arc<dyn session::SessionHost>,
 {
     build_app_with_catalog_loader_and_access_authenticator_and_mcp_oauth(
@@ -707,6 +747,7 @@ where
         ConfigHandle,
         CredentialStore,
         AgentDefinitionState,
+        Arc<dyn waltr_agent::SessionEventSink>,
     ) -> Arc<dyn session::SessionHost>,
 {
     let automatic_self_mcp_resource = mcp_oauth
@@ -750,6 +791,7 @@ where
         ConfigHandle,
         CredentialStore,
         AgentDefinitionState,
+        Arc<dyn waltr_agent::SessionEventSink>,
     ) -> Arc<dyn session::SessionHost>,
 {
     tracing::debug!("building app router");
@@ -784,20 +826,39 @@ where
         mcp_options = mcp_options.with_authorization(authorization);
     }
     let mut grpc_routes = Routes::builder();
+    let event_bus = EventBus::default();
     let session_host = add_session_service(
         &mut grpc_routes,
         config,
         credential_store,
         agent_state.clone(),
+        Arc::new(event_bus.clone()),
     );
-    let waltr_mcp = Arc::new(WaltrMcpServer::new(session_host, agent_state.clone()));
+    let waltr_mcp = Arc::new(WaltrMcpServer::new(
+        session_host.clone(),
+        agent_state.clone(),
+    ));
     let definition_watcher = agent_state
         .spawn_watcher()
         .map_err(|_| ResourceError::unavailable("resource watcher could not start"))?;
+    let routine_store = persistence.routine_invocation_store();
+    let routine_engine = RoutineEngine::start(
+        &event_bus,
+        agent_state.clone(),
+        session_host.clone(),
+        routine_store.clone(),
+    );
+    let routine_service = RoutineService::new(
+        agent_state,
+        routine_engine.manual_handle(),
+        routine_store,
+        routine_engine.lifecycle_wakeups(),
+    );
     let readiness = Readiness {
         persistence,
         oauth: mcp_oauth.clone(),
         definitions: definition_watcher.health(),
+        routines: routine_engine.health(),
     };
     let mcp_router = if access_authenticator.enabled() && mcp_oauth.is_none() {
         Router::new()
@@ -809,6 +870,7 @@ where
     grpc_routes.add_service(ResourceServiceServer::from_arc(config_service));
     grpc_routes.add_service(AuthServiceServer::from_arc(auth_service));
     grpc_routes.add_service(CatalogServiceServer::from_arc(catalog_service));
+    grpc_routes.add_service(RoutineServiceServer::new(routine_service));
     grpc_routes.add_service(StatusServiceServer::new(StatusService));
     let grpc_routes = grpc_routes.routes();
     let grpc = ServiceBuilder::new()
@@ -872,6 +934,7 @@ where
         router,
         definition_watcher,
         mcp_oauth,
+        routine_engine,
     ))
 }
 
@@ -958,13 +1021,16 @@ mod tests {
             Vec::new(),
             None,
             Some(state),
-            move |routes, config, credentials, callback_state| {
+            move |routes, config, credentials, callback_state, event_sink| {
                 assert!(Arc::ptr_eq(&expected_snapshot, &callback_state.snapshot()));
-                session::add_memory_service_with_agent_state(
+                session::add_store_service_with_agent_state_and_event_sink(
                     routes,
+                    waltr_agent::MemorySessionStore::new(),
                     config,
                     credentials,
+                    Vec::new(),
                     callback_state,
+                    event_sink,
                 )
             },
         )
@@ -1001,6 +1067,17 @@ mod tests {
             tokio::sync::watch::channel(DefinitionWatcherHealth::Running);
         drop(definition_tx);
         assert!(!definition_watcher_ready(&definition_rx));
+
+        let (routine_tx, routine_rx) = tokio::sync::watch::channel(EngineHealth::Running);
+        assert!(routine_engine_ready(&routine_rx));
+        routine_tx
+            .send(EngineHealth::Failed("worker exited".to_owned()))
+            .unwrap();
+        assert!(!routine_engine_ready(&routine_rx));
+
+        let (routine_tx, routine_rx) = tokio::sync::watch::channel(EngineHealth::Running);
+        drop(routine_tx);
+        assert!(!routine_engine_ready(&routine_rx));
     }
 
     #[tokio::test]

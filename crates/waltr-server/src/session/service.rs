@@ -36,13 +36,14 @@ use waltr::grpc::waltr::{
     },
 };
 use waltr_agent::{
-    AgentDefinitionCatalog, AgentSession, AgentSessionActiveRunState, AgentSessionRunError,
-    AgentSessionRunSubmission, AgentSessionRuntimeError, AgentSessionRuntimeFactory,
-    CredentialStore, ExternalRequestId, McpConnectionKind, McpConnectionResolveRequest,
-    McpResolvedConnection, ResolvedAgent, RunConflictPolicy, SessionCoordinator,
-    SessionCreateRequest, SessionId, SessionListEvent, SessionListUpdate, SessionStore,
-    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchRequest,
-    SessionTemplateSearchTarget, SessionTimelineEvent, TimelineCursor,
+    AgentDefinitionCatalog, AgentRunLimits, AgentSession, AgentSessionActiveRunState,
+    AgentSessionRunError, AgentSessionRunSubmission, AgentSessionRuntimeError,
+    AgentSessionRuntimeFactory, CredentialStore, ExternalRequestId, McpConnectionKind,
+    McpConnectionResolveRequest, McpResolvedConnection, MetadataSetCondition, MetadataSetOutcome,
+    ResolvedAgent, RunConflictPolicy, SessionCoordinator, SessionCreateRequest, SessionId,
+    SessionListEvent, SessionListUpdate, SessionStore, SessionSummary, SessionTemplateKind,
+    SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
+    SessionTimelineEvent, TimelineCursor,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -308,6 +309,28 @@ where
             .map(|(session, _, _)| session)
     }
 
+    async fn create_exact(
+        &self,
+        request: SessionCreateRequest,
+    ) -> Result<AgentSession, waltr_agent::LlmError> {
+        self.sessions.create(request).await
+    }
+
+    async fn capture_latest_completed(
+        &self,
+        id: &SessionId,
+    ) -> Result<waltr_agent::CompletedSessionCapture, waltr_agent::SessionCaptureError> {
+        self.sessions.capture_latest_completed(id).await
+    }
+
+    async fn start_durable_prompt(
+        &self,
+        id: SessionId,
+        limits: AgentRunLimits,
+    ) -> Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.sessions.start_durable_prompt(id, limits).await
+    }
+
     async fn list(&self) -> Result<Vec<SessionSummary>, waltr_agent::LlmError> {
         self.sessions.list().await
     }
@@ -335,6 +358,18 @@ where
     ) -> Result<AgentSessionRunSubmission, AgentSessionRunError> {
         self.sessions
             .submit_prompt(id, prompt, RunConflictPolicy::QueueIfActive)
+            .await
+    }
+
+    async fn set_metadata_value_conditionally(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: serde_json::Value,
+        condition: MetadataSetCondition,
+    ) -> Result<MetadataSetOutcome, waltr_agent::LlmError> {
+        self.sessions
+            .set_metadata_value_conditionally(id, key, value, condition)
             .await
     }
 

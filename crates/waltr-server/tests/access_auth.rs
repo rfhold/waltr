@@ -12,6 +12,7 @@ use waltr::grpc::waltr::{
         AuthenticationDomain, AuthenticationFailure, AuthenticationFailureReason,
         ListAuthStatusesRequest, auth_service_client::AuthServiceClient,
     },
+    routine::v1::{WatchManualRoutinesRequest, routine_service_client::RoutineServiceClient},
     status::v1::{WatchStatusRequest, status_service_client::StatusServiceClient},
 };
 use waltr_server::test_support::{
@@ -304,6 +305,47 @@ async fn native_grpc_requires_a_valid_bearer_with_typed_access_details()
         .await?
         .expect("status stream should emit");
     assert!(status.status.expect("status should be present").ready);
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_routine_rpc_uses_the_common_access_auth_layer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture();
+    let channel = Endpoint::from_shared(fixture.server.base_url())?
+        .connect()
+        .await?;
+    let mut client = RoutineServiceClient::new(channel);
+    let request = || WatchManualRoutinesRequest {
+        request_id: "routine-auth".to_owned(),
+    };
+
+    let missing = client
+        .watch_manual_routines(request())
+        .await
+        .expect_err("missing bearer should fail");
+    assert_eq!(missing.code(), Code::Unauthenticated);
+    assert_eq!(missing.message(), "Waltr access authentication required");
+
+    let mut authorized = Request::new(request());
+    authorized.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", fixture.access_token).parse()?,
+    );
+    let response = client
+        .watch_manual_routines(authorized)
+        .await?
+        .into_inner()
+        .message()
+        .await?
+        .expect("definition watch should emit an initial snapshot");
+    assert_eq!(response.request_id, "routine-auth");
+    assert!(
+        response
+            .routines
+            .iter()
+            .any(|routine| routine.routine_name == "fork")
+    );
     Ok(())
 }
 
