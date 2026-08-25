@@ -2859,7 +2859,7 @@ function sessionOperationAuthenticationFailure(
 ) {
   if (!snapshot || !key) return undefined;
   const operation = snapshot.operations.current[key];
-  if (!operation || operation.status !== "failed" || operation.kind !== kind || operation.sessionId !== sessionId) return undefined;
+  if (!operation || operation.kind !== kind || operation.status !== "failed" || operation.sessionId !== sessionId) return undefined;
   return operation.authenticationFailure ?? undefined;
 }
 

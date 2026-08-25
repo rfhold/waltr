@@ -669,10 +669,8 @@ mod loader_tests {
         let materializer = CatalogMaterializer {
             loaded: parse_catalog(CATALOG, false).expect("parse catalog fixture"),
         };
-        let aliases = std::collections::BTreeMap::from([(
-            "model-alias".to_owned(),
-            "model".to_owned(),
-        )]);
+        let aliases =
+            std::collections::BTreeMap::from([("model-alias".to_owned(), "model".to_owned())]);
 
         let selected = materializer
             .select_models("test", &["model".to_owned()], &aliases, "prefixed/")

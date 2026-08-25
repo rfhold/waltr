@@ -81,10 +81,7 @@ fn sessions_create_dispatches_and_completion_opens_detail() {
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    assert_eq!(
-        app.handle_event(&char_press('s'), now),
-        AppAction::Continue
-    );
+    assert_eq!(app.handle_event(&char_press('s'), now), AppAction::Continue);
     let rendered = render_app_with_size(&app, 100, 24);
     assert!(rendered.contains("Create session"));
     assert!(rendered.contains("reviewer  default"));
@@ -1133,11 +1130,16 @@ fn explicit_logout_clears_inference_editor_and_session_confirmation_state() {
     ));
     assert_eq!(app.sessions_section(), &SessionsSection::new());
 
-    let mut confirmation = open_sessions_app_with(watched_sessions_snapshot(vec![session_view(
-        "doomed", 1,
-    )]));
-    assert_eq!(confirmation.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    assert_eq!(confirmation.handle_event(&char_press('d'), now), AppAction::Continue);
+    let mut confirmation =
+        open_sessions_app_with(watched_sessions_snapshot(vec![session_view("doomed", 1)]));
+    assert_eq!(
+        confirmation.handle_event(&ctrl_x_press(), now),
+        AppAction::Continue
+    );
+    assert_eq!(
+        confirmation.handle_event(&char_press('d'), now),
+        AppAction::Continue
+    );
     assert!(render_app(&confirmation).contains("Delete?"));
     drop(confirmation.handle_event(
         &AppEvent::NativeLogin(waltr_tui::event::NativeLoginEvent::LoggedOut),
@@ -1230,7 +1232,10 @@ fn sessions_inference_editor_requests_config_then_opens_when_config_arrives() {
         AppAction::ClientCommand(ClientCommand::RequestConfig)
     );
     assert_eq!(
-        app.handle_event(&AppEvent::Client(Box::new(inference_editor_snapshot())), now),
+        app.handle_event(
+            &AppEvent::Client(Box::new(inference_editor_snapshot())),
+            now
+        ),
         AppAction::Continue
     );
 
@@ -2317,10 +2322,8 @@ fn sessions_detail_submit_failure_preserves_draft() {
 #[test]
 fn sessions_submit_auth_failure_is_actionable_without_emitting_oauth() {
     let session = session_view("chat", 1);
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
-        session.clone(),
-        Vec::new(),
-    ));
+    let mut app =
+        open_sessions_app_with(watched_session_with_timeline(session.clone(), Vec::new()));
     let now = Instant::now();
     drop(app.handle_event(&right_press(), now));
     for character in "retry me".chars() {
@@ -2384,7 +2387,10 @@ fn sessions_failed_status_renders_mcp_context_and_all_reason_guidance() {
         ("networkFailed", "authentication network request failed"),
         ("tokenExchangeFailed", "OAuth token exchange failed"),
         ("responseInvalid", "authentication response was invalid"),
-        ("configurationRequired", "authentication configuration is required"),
+        (
+            "configurationRequired",
+            "authentication configuration is required",
+        ),
     ];
 
     for (reason, expected) in reasons {
@@ -2415,7 +2421,10 @@ fn sessions_failed_status_renders_mcp_context_and_all_reason_guidance() {
         let rendered = render_app_with_size(&app, 140, 32);
         assert!(rendered.contains("MCP server github"), "{rendered}");
         assert!(rendered.contains(expected), "{rendered}");
-        assert!(rendered.contains("MCP endpoint: https://mcp.example/rpc"), "{rendered}");
+        assert!(
+            rendered.contains("MCP endpoint: https://mcp.example/rpc"),
+            "{rendered}"
+        );
         assert!(rendered.contains("MCP HTTP status: 401"), "{rendered}");
         assert!(rendered.contains("MCP scope: repo:read"), "{rendered}");
         assert!(rendered.contains("Open Config (Ctrl-X c)"), "{rendered}");
@@ -2646,10 +2655,8 @@ fn sessions_detail_wheel_up_requests_older_timeline_at_top() {
 fn sessions_detail_wheel_up_requests_older_when_delta_reaches_top() {
     let area = Rect::new(0, 0, 80, 10);
     let mut section = SessionsSection::new();
-    let snapshot = watched_session_with_timeline(
-        session_view("chat", 1),
-        timeline_message_events(1..=8),
-    );
+    let snapshot =
+        watched_session_with_timeline(session_view("chat", 1), timeline_message_events(1..=8));
 
     assert!(matches!(
         section.handle_key(key_event(right_press()), Some(&snapshot), Some(area)),
@@ -2715,10 +2722,8 @@ fn sessions_detail_page_and_wheel_scroll_clamp_at_bottom() {
 fn sessions_detail_timeline_pins_to_bottom_until_manually_scrolled() {
     let area = Rect::new(0, 0, 80, 10);
     let mut section = SessionsSection::new();
-    let snapshot = watched_session_with_timeline(
-        session_view("chat", 1),
-        timeline_message_events(1..=8),
-    );
+    let snapshot =
+        watched_session_with_timeline(session_view("chat", 1), timeline_message_events(1..=8));
 
     assert!(matches!(
         section.handle_key(key_event(right_press()), Some(&snapshot), Some(area)),
@@ -2737,10 +2742,8 @@ fn sessions_detail_timeline_pins_to_bottom_until_manually_scrolled() {
     assert!(rendered.contains("message 1"), "{rendered}");
     assert!(!rendered.contains("message 8"), "{rendered}");
 
-    let updated_snapshot = watched_session_with_timeline(
-        session_view("chat", 1),
-        timeline_message_events(1..=9),
-    );
+    let updated_snapshot =
+        watched_session_with_timeline(session_view("chat", 1), timeline_message_events(1..=9));
     let rendered = render_sessions_section(&section, &updated_snapshot, area);
     assert!(!rendered.contains("message 9"), "{rendered}");
 
@@ -2827,12 +2830,7 @@ fn inference_update_snapshot(status: &'static str, error: Option<&str>) -> Clien
     snapshot
 }
 
-fn runtime_provider(
-    kind: ProviderKindView,
-    name: &str,
-    url: &str,
-    model_id: &str,
-) -> ProviderView {
+fn runtime_provider(kind: ProviderKindView, name: &str, url: &str, model_id: &str) -> ProviderView {
     ProviderView {
         kind,
         name: name.to_owned(),
@@ -2996,8 +2994,7 @@ fn sessions_detail_permission_prompt_selectable_deny_resume_includes_message() {
             session_id: "chat".to_owned(),
             request_id: "req-1".to_owned(),
             response_json:
-                r#"{"decision":"deny","message":"not safe","mode":"return_tool_result"}"#
-                    .to_owned(),
+                r#"{"decision":"deny","message":"not safe","mode":"return_tool_result"}"#.to_owned(),
         })
     );
 }
@@ -3019,7 +3016,10 @@ fn explicit_logout_clears_prompt_draft_and_focus() {
     assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
     assert_eq!(app.handle_event(&down_press(), now), AppAction::Continue);
     for character in "private denial".chars() {
-        assert_eq!(app.handle_event(&char_press(character), now), AppAction::Continue);
+        assert_eq!(
+            app.handle_event(&char_press(character), now),
+            AppAction::Continue
+        );
     }
     assert!(render_app(&app).contains("private denial"));
     drop(app.handle_event(
@@ -3154,7 +3154,10 @@ fn sessions_detail_question_prompt_switches_multi_question_tabs() {
     assert!(rendered.contains("How fast?"));
     assert!(!rendered.contains("Pick one"));
 
-    assert_eq!(app.handle_event(&back_tab_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&back_tab_press(), now),
+        AppAction::Continue
+    );
     let rendered = render_app_with_size(&app, 100, 28);
     assert!(rendered.contains("Pick one"));
 }
@@ -3267,10 +3270,7 @@ fn sessions_create_pending_renders_snapshot() {
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    assert_eq!(
-        app.handle_event(&char_press('s'), now),
-        AppAction::Continue
-    );
+    assert_eq!(app.handle_event(&char_press('s'), now), AppAction::Continue);
     assert!(matches!(
         app.handle_event(&enter_press(), now),
         AppAction::ClientCommand(ClientCommand::CreateSession { .. })
@@ -3289,10 +3289,7 @@ fn sessions_create_error_renders_snapshot() {
     let now = Instant::now();
 
     assert_eq!(app.handle_event(&ctrl_x_press(), now), AppAction::Continue);
-    assert_eq!(
-        app.handle_event(&char_press('s'), now),
-        AppAction::Continue
-    );
+    assert_eq!(app.handle_event(&char_press('s'), now), AppAction::Continue);
     assert!(matches!(
         app.handle_event(&enter_press(), now),
         AppAction::ClientCommand(ClientCommand::CreateSession { .. })

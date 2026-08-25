@@ -639,9 +639,7 @@ impl OidcVerifier {
                     "ID token typ must be absent or JWT",
                 ));
             }
-            TokenKind::Access
-                if !matches!(header.typ.as_deref(), Some("at+jwt" | "JWT")) =>
-            {
+            TokenKind::Access if !matches!(header.typ.as_deref(), Some("at+jwt" | "JWT")) => {
                 return Err(OidcError::InvalidToken(
                     "access token typ must be at+jwt or JWT",
                 ));

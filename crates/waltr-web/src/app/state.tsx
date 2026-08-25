@@ -395,7 +395,6 @@ function settleOperationWaiter(
 
 function operationResult(snapshot: ClientSnapshot, key: string, kind: OperationKind) {
   const result = snapshot.operations.current[key];
-
   return result?.kind === kind ? result : undefined;
 }
 
