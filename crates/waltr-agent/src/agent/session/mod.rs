@@ -48,10 +48,10 @@ pub use storage::{
 };
 pub use types::{
     AgentSession, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
-    ExternalRequestStatus, ExternalResponse, PendingWork, PendingWorkStatus, RequestId,
-    RequestRecord, ResumeInput, Revision, SessionId, SessionJournalEvent, SessionMetrics,
-    SessionRecord, SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionSummary,
-    Suspension,
+    ExternalRequestStatus, ExternalResponse, MetadataSetCondition, MetadataSetOutcome, PendingWork,
+    PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, SessionId,
+    SessionJournalEvent, SessionMetrics, SessionRecord, SessionRollbackTarget, SessionSnapshot,
+    SessionStatus, SessionSummary, Suspension,
 };
 pub(super) use watch::{SessionListBroadcaster, SessionTimelineBroadcaster};
 #[allow(unused_imports)]

@@ -14,8 +14,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
-        SessionRecord, SessionSummary,
+        InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -239,9 +239,9 @@ impl S3SessionStore {
                 Ok(_) => return Ok((revision, value)),
                 Err(error)
                     if self.write_mode == S3SessionWriteMode::ConditionalEtagCas
-                        && error
-                            .raw_response()
-                            .is_some_and(|response| response.status().as_u16() == 412) =>
+                        && error.raw_response().is_some_and(|response| {
+                            is_conditional_conflict(response.status().as_u16())
+                        }) =>
                 {
                     if attempt == CONDITIONAL_PUT_ATTEMPTS {
                         return Err(conditional_put_exhausted(id, attempt));
@@ -277,9 +277,9 @@ impl S3SessionStore {
                 Ok(_) => return Ok(record),
                 Err(error)
                     if self.write_mode == S3SessionWriteMode::ConditionalEtagCas
-                        && error
-                            .raw_response()
-                            .is_some_and(|response| response.status().as_u16() == 412) =>
+                        && error.raw_response().is_some_and(|response| {
+                            is_conditional_conflict(response.status().as_u16())
+                        }) =>
                 {
                     if attempt == CONDITIONAL_PUT_ATTEMPTS {
                         return Err(conditional_put_exhausted(id, attempt));
@@ -453,20 +453,52 @@ impl SessionStore for S3SessionStore {
         }
     }
 
-    fn set_metadata_value(
+    fn set_metadata_value_conditionally(
         &self,
         id: &SessionId,
         key: String,
         value: Value,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        condition: MetadataSetCondition,
+    ) -> impl std::future::Future<Output = SessionStoreResult<MetadataSetOutcome>> + Send {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store
-                .update_metadata_record(&id, |record| {
-                    record.set_metadata_value(key.clone(), value.clone());
-                })
-                .await
+            let _guard = store.session_guard(&id).await?;
+            for attempt in 1..=store.put_attempts() {
+                let (mut record, etag) = store.load_record_with_etag(&id).await?;
+                let changed = condition == MetadataSetCondition::Unconditional
+                    || !record.metadata.values.contains_key(&key);
+                if !changed {
+                    return Ok(MetadataSetOutcome { record, changed });
+                }
+                record.set_metadata_value(key.clone(), value.clone());
+                let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
+                let if_match = store.conditional_etag(&id, etag)?;
+                let result = store
+                    .client
+                    .put_object()
+                    .bucket(&store.bucket)
+                    .key(store.key(&id))
+                    .set_if_match(if_match)
+                    .body(ByteStream::from(bytes))
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => return Ok(MetadataSetOutcome { record, changed }),
+                    Err(error)
+                        if store.write_mode == S3SessionWriteMode::ConditionalEtagCas
+                            && error.raw_response().is_some_and(|response| {
+                                is_conditional_conflict(response.status().as_u16())
+                            }) =>
+                    {
+                        if attempt == CONDITIONAL_PUT_ATTEMPTS {
+                            return Err(conditional_put_exhausted(&id, attempt));
+                        }
+                    }
+                    Err(error) => return Err(backend_error(error)),
+                }
+            }
+            unreachable!("S3 write modes always allow at least one PUT attempt")
         }
     }
 
@@ -561,10 +593,14 @@ fn backend_error(error: impl std::error::Error) -> SessionStoreError {
     }
 }
 
+const fn is_conditional_conflict(status: u16) -> bool {
+    matches!(status, 409 | 412)
+}
+
 fn conditional_put_exhausted(id: &SessionId, attempts: usize) -> SessionStoreError {
     SessionStoreError::Backend {
         message: format!(
-            "conditional S3 write for session {} failed with status 412 after {attempts} PUT attempts; the backend may not support PutObject If-Match or writers may be contending; use SingleWriter only when all writers share this process",
+            "conditional S3 write for session {} failed with status 409 or 412 after {attempts} PUT attempts; the backend may not support PutObject If-Match or writers may be contending; use SingleWriter only when all writers share this process",
             id.as_str()
         ),
     }

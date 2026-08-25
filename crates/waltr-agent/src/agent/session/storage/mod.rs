@@ -34,7 +34,10 @@ use serde_json::Value;
 
 use super::{
     SessionCreateRequest,
-    types::{Revision, SessionId, SessionJournalEvent, SessionRecord, SessionSummary},
+    types::{
+        MetadataSetCondition, MetadataSetOutcome, Revision, SessionId, SessionJournalEvent,
+        SessionRecord, SessionSummary,
+    },
 };
 
 /// Result type returned by session stores.
@@ -175,7 +178,27 @@ pub trait SessionStore: Send + Sync {
         id: &SessionId,
         key: String,
         value: Value,
-    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send;
+    ) -> impl Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        async move {
+            self.set_metadata_value_conditionally(
+                id,
+                key,
+                value,
+                MetadataSetCondition::Unconditional,
+            )
+            .await
+            .map(|outcome| outcome.record)
+        }
+    }
+
+    /// Atomically set metadata according to `condition`.
+    fn set_metadata_value_conditionally(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+        condition: MetadataSetCondition,
+    ) -> impl Future<Output = SessionStoreResult<MetadataSetOutcome>> + Send;
 
     /// Remove a host-defined metadata value and return the updated record.
     fn remove_metadata_value(

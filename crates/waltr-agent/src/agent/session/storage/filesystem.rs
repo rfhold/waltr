@@ -1,10 +1,9 @@
 //! Filesystem-backed session storage.
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    fs,
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
 };
 
 use super::{
@@ -13,8 +12,8 @@ use super::{
 };
 use crate::{
     agent::session::{
-        InferenceSettings, Revision, SessionCreateRequest, SessionId, SessionJournalEvent,
-        SessionRecord, SessionSummary,
+        InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -23,8 +22,8 @@ use crate::{
 };
 use serde_json::Value;
 
-type MutationKey = (PathBuf, SessionId);
-type MutationGuards = OnceLock<Mutex<HashMap<MutationKey, Arc<Mutex<()>>>>>;
+const LOCK_DIRECTORY: &str = ".waltr-session-locks";
+const STORE_LOCK_FILE: &str = "store.lock";
 
 /// Local JSON-file implementation of [`SessionStore`].
 #[derive(Debug, Clone)]
@@ -43,6 +42,40 @@ impl FilesystemSessionStore {
         self.root.join(format!("{}.json", id.as_str()))
     }
 
+    fn lock_file(&self, name: &str) -> SessionStoreResult<File> {
+        let directory = self.root.join(LOCK_DIRECTORY);
+        fs::create_dir_all(&directory).map_err(backend_error)?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(name))
+            .map_err(backend_error)
+    }
+
+    fn with_session_lock<T>(
+        &self,
+        id: &SessionId,
+        operation: impl FnOnce() -> SessionStoreResult<T>,
+    ) -> SessionStoreResult<T> {
+        let store_lock = self.lock_file(STORE_LOCK_FILE)?;
+        store_lock.lock_shared().map_err(backend_error)?;
+        let session_lock = self.lock_file(&format!("{}.lock", id.as_str()))?;
+        session_lock.lock().map_err(backend_error)?;
+        operation()
+    }
+
+    async fn blocking<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Self) -> SessionStoreResult<T> + Send + 'static,
+    ) -> SessionStoreResult<T> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || operation(store))
+            .await
+            .map_err(backend_error)?
+    }
+
     fn load_sync(&self, id: &SessionId) -> SessionStoreResult<SessionRecord> {
         let path = self.path(id);
         let bytes = fs::read(&path).map_err(|error| {
@@ -58,11 +91,19 @@ impl FilesystemSessionStore {
     fn save_sync(&self, record: &SessionRecord) -> SessionStoreResult<()> {
         fs::create_dir_all(&self.root).map_err(backend_error)?;
         let path = self.path(&record.id);
-        let temp_path = path.with_extension("json.tmp");
+        let temp_path = self.root.join(format!(
+            ".{}.{}.tmp",
+            record.id.as_str(),
+            uuid::Uuid::now_v7()
+        ));
         let bytes = serde_json::to_vec_pretty(record).map_err(backend_error)?;
-        fs::write(&temp_path, bytes).map_err(backend_error)?;
-        fs::rename(&temp_path, path).map_err(backend_error)?;
-        Ok(())
+        let result = fs::write(&temp_path, bytes)
+            .and_then(|()| fs::rename(&temp_path, path))
+            .map_err(backend_error);
+        if result.is_err() {
+            drop(fs::remove_file(temp_path));
+        }
+        result
     }
 
     fn list_sync(&self) -> SessionStoreResult<Vec<SessionSummary>> {
@@ -90,21 +131,21 @@ impl FilesystemSessionStore {
         expected_revision: Revision,
         update: impl FnOnce(&mut SessionRecord, Revision) -> SessionStoreResult<T>,
     ) -> SessionStoreResult<(Revision, T)> {
-        let guard = self.mutation_guard(id)?;
-        let _mutation = guard.lock().map_err(|_| SessionStoreError::LockPoisoned)?;
-        let mut record = self.load_sync(id)?;
-        if record.revision != expected_revision {
-            return Err(SessionStoreError::StaleRevision {
-                id: id.clone(),
-                expected: expected_revision,
-                actual: record.revision,
-            });
-        }
-        let revision = record.revision.next();
-        record.revision = revision;
-        let value = update(&mut record, revision)?;
-        self.save_sync(&record)?;
-        Ok((revision, value))
+        self.with_session_lock(id, || {
+            let mut record = self.load_sync(id)?;
+            if record.revision != expected_revision {
+                return Err(SessionStoreError::StaleRevision {
+                    id: id.clone(),
+                    expected: expected_revision,
+                    actual: record.revision,
+                });
+            }
+            let revision = record.revision.next();
+            record.revision = revision;
+            let value = update(&mut record, revision)?;
+            self.save_sync(&record)?;
+            Ok((revision, value))
+        })
     }
 
     fn update_metadata_sync(
@@ -112,26 +153,37 @@ impl FilesystemSessionStore {
         id: &SessionId,
         update: impl FnOnce(&mut SessionRecord),
     ) -> SessionStoreResult<SessionRecord> {
-        let guard = self.mutation_guard(id)?;
-        let _mutation = guard.lock().map_err(|_| SessionStoreError::LockPoisoned)?;
-        let mut record = self.load_sync(id)?;
-        update(&mut record);
-        self.save_sync(&record)?;
-        Ok(record)
+        self.with_session_lock(id, || {
+            let mut record = self.load_sync(id)?;
+            update(&mut record);
+            self.save_sync(&record)?;
+            Ok(record)
+        })
     }
 
-    fn mutation_guard(&self, id: &SessionId) -> SessionStoreResult<Arc<Mutex<()>>> {
-        static MUTATION_GUARDS: MutationGuards = OnceLock::new();
-        Ok(MUTATION_GUARDS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .map_err(|_| SessionStoreError::LockPoisoned)?
-            .entry((self.root.clone(), id.clone()))
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone())
+    fn set_metadata_conditionally_sync(
+        &self,
+        id: &SessionId,
+        key: String,
+        value: Value,
+        condition: MetadataSetCondition,
+    ) -> SessionStoreResult<MetadataSetOutcome> {
+        self.with_session_lock(id, || {
+            let mut record = self.load_sync(id)?;
+            let changed = condition == MetadataSetCondition::Unconditional
+                || !record.metadata.values.contains_key(&key);
+            if changed {
+                record.set_metadata_value(key, value);
+                self.save_sync(&record)?;
+            }
+            Ok(MetadataSetOutcome { record, changed })
+        })
     }
 
     fn wipe_sync(&self) -> SessionStoreResult<()> {
+        fs::create_dir_all(&self.root).map_err(backend_error)?;
+        let store_lock = self.lock_file(STORE_LOCK_FILE)?;
+        store_lock.lock().map_err(backend_error)?;
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -139,6 +191,9 @@ impl FilesystemSessionStore {
         };
         for entry in entries {
             let path = entry.map_err(backend_error)?.path();
+            if path == self.root.join(LOCK_DIRECTORY) {
+                continue;
+            }
             if path.is_dir() {
                 fs::remove_dir_all(path).map_err(backend_error)?;
             } else {
@@ -157,11 +212,18 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         async move {
             let record = request.materialize();
-            if store.path(&record.id).exists() {
-                return Err(SessionStoreError::AlreadyExists { id: record.id });
-            }
-            store.save_sync(&record)?;
-            Ok(record)
+            store
+                .blocking(move |store| {
+                    let id = record.id.clone();
+                    store.with_session_lock(&id, || {
+                        if store.path(&id).exists() {
+                            return Err(SessionStoreError::AlreadyExists { id });
+                        }
+                        store.save_sync(&record)?;
+                        Ok(record)
+                    })
+                })
+                .await
         }
     }
 
@@ -171,7 +233,7 @@ impl SessionStore for FilesystemSessionStore {
     ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
         let store = self.clone();
         let id = id.clone();
-        async move { store.load_sync(&id) }
+        async move { store.blocking(move |store| store.load_sync(&id)).await }
     }
 
     fn delete(
@@ -181,26 +243,32 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            fs::remove_file(store.path(&id)).or_else(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(backend_error(error))
-                }
-            })
+            store
+                .blocking(move |store| {
+                    store.with_session_lock(&id, || {
+                        fs::remove_file(store.path(&id)).or_else(|error| {
+                            if error.kind() == std::io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(backend_error(error))
+                            }
+                        })
+                    })
+                })
+                .await
         }
     }
 
     fn wipe(&self) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
         let store = self.clone();
-        async move { store.wipe_sync() }
+        async move { store.blocking(|store| store.wipe_sync()).await }
     }
 
     fn list(
         &self,
     ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send {
         let store = self.clone();
-        async move { store.list_sync() }
+        async move { store.blocking(|store| store.list_sync()).await }
     }
 
     fn append_timeline(
@@ -212,10 +280,15 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (_, assigned) = store.update_sync(&id, expected_revision, |record, _| {
-                append_timeline_to_record(record, &id, events)
-            })?;
-            Ok(assigned)
+            store
+                .blocking(move |store| {
+                    let (_, assigned) =
+                        store.update_sync(&id, expected_revision, |record, _| {
+                            append_timeline_to_record(record, &id, events)
+                        })?;
+                    Ok(assigned)
+                })
+                .await
         }
     }
 
@@ -228,24 +301,36 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let (revision, ()) = store.update_sync(&id, expected_revision, |record, _| {
-                record.append_journal_events(events);
-                record.touch_activity();
-                Ok(())
-            })?;
-            Ok(revision)
+            store
+                .blocking(move |store| {
+                    let (revision, ()) =
+                        store.update_sync(&id, expected_revision, |record, _| {
+                            record.append_journal_events(events);
+                            record.touch_activity();
+                            Ok(())
+                        })?;
+                    Ok(revision)
+                })
+                .await
         }
     }
 
-    fn set_metadata_value(
+    fn set_metadata_value_conditionally(
         &self,
         id: &SessionId,
         key: String,
         value: Value,
-    ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+        condition: MetadataSetCondition,
+    ) -> impl std::future::Future<Output = SessionStoreResult<MetadataSetOutcome>> + Send {
         let store = self.clone();
         let id = id.clone();
-        async move { store.update_metadata_sync(&id, |record| record.set_metadata_value(key, value)) }
+        async move {
+            store
+                .blocking(move |store| {
+                    store.set_metadata_conditionally_sync(&id, key, value, condition)
+                })
+                .await
+        }
     }
 
     fn remove_metadata_value(
@@ -256,9 +341,13 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store.update_metadata_sync(&id, |record| {
-                record.remove_metadata_value(&key);
-            })
+            store
+                .blocking(move |store| {
+                    store.update_metadata_sync(&id, |record| {
+                        record.remove_metadata_value(&key);
+                    })
+                })
+                .await
         }
     }
 
@@ -270,9 +359,13 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store.update_metadata_sync(&id, |record| {
-                record.set_inference_settings(inference_settings);
-            })
+            store
+                .blocking(move |store| {
+                    store.update_metadata_sync(&id, |record| {
+                        record.set_inference_settings(inference_settings);
+                    })
+                })
+                .await
         }
     }
 
@@ -284,9 +377,13 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            store.update_metadata_sync(&id, |record| {
-                record.set_agent_definition(agent_definition);
-            })
+            store
+                .blocking(move |store| {
+                    store.update_metadata_sync(&id, |record| {
+                        record.set_agent_definition(agent_definition);
+                    })
+                })
+                .await
         }
     }
 
@@ -298,8 +395,12 @@ impl SessionStore for FilesystemSessionStore {
         let store = self.clone();
         let id = id.clone();
         async move {
-            let record = store.load_sync(&id)?;
-            Ok(timeline_query_slice(&record, &query))
+            store
+                .blocking(move |store| {
+                    let record = store.load_sync(&id)?;
+                    Ok(timeline_query_slice(&record, &query))
+                })
+                .await
         }
     }
 
@@ -312,8 +413,12 @@ impl SessionStore for FilesystemSessionStore {
         let id = id.clone();
         let item_id = item_id.clone();
         async move {
-            let record = store.load_sync(&id)?;
-            timeline_item_text_from_record(&record, &item_id)
+            store
+                .blocking(move |store| {
+                    let record = store.load_sync(&id)?;
+                    timeline_item_text_from_record(&record, &item_id)
+                })
+                .await
         }
     }
 }
@@ -369,6 +474,121 @@ mod tests {
             record.metadata_value("key"),
             Some(&serde_json::json!("value"))
         );
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                != Some("tmp")
+        }));
+    }
+
+    #[tokio::test]
+    async fn os_lock_serializes_conditional_writers_and_preserves_timeline_high_water() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = FilesystemSessionStore::new(temp.path());
+        let second = FilesystemSessionStore::new(temp.path());
+        let id = SessionId::new("conditional-race");
+        first
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        first
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                vec![PendingTimelineEvent::assistant_text_delta(
+                    id.clone(),
+                    0,
+                    crate::PendingTimelineItemId::New,
+                    "preserved",
+                )],
+            )
+            .await
+            .unwrap();
+
+        let held = first.lock_file(&format!("{}.lock", id.as_str())).unwrap();
+        held.lock().unwrap();
+        let blocked_store = second.clone();
+        let blocked_id = id.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_store
+                .set_metadata_value_conditionally(
+                    &blocked_id,
+                    "winner".to_owned(),
+                    serde_json::json!("blocked"),
+                    MetadataSetCondition::Absent,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        drop(held);
+        assert!(blocked.await.unwrap().unwrap().changed);
+
+        let (left, right) = tokio::join!(
+            first.set_metadata_value_conditionally(
+                &id,
+                "single".to_owned(),
+                serde_json::json!("left"),
+                MetadataSetCondition::Absent,
+            ),
+            second.set_metadata_value_conditionally(
+                &id,
+                "single".to_owned(),
+                serde_json::json!("right"),
+                MetadataSetCondition::Absent,
+            ),
+        );
+        assert_eq!(
+            usize::from(left.unwrap().changed) + usize::from(right.unwrap().changed),
+            1
+        );
+        let record = first.load(&id).await.unwrap();
+        assert_eq!(
+            record.timeline_cursor_high_water(),
+            crate::TimelineCursor::new(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_waits_for_the_store_lock_before_publishing() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = FilesystemSessionStore::new(temp.path());
+        let second = FilesystemSessionStore::new(temp.path());
+        let id = SessionId::new("create-store-lock");
+        let held = first.lock_file(STORE_LOCK_FILE).unwrap();
+        held.lock().unwrap();
+
+        let blocked_id = id.clone();
+        let blocked =
+            tokio::spawn(async move { second.create(SessionCreateRequest::new(blocked_id)).await });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        assert!(!first.path(&id).exists());
+
+        drop(held);
+        blocked.await.unwrap().unwrap();
+        assert!(first.path(&id).exists());
+    }
+
+    #[test]
+    fn failed_replacement_cleans_unique_same_directory_temporary_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FilesystemSessionStore::new(temp.path());
+        let record = SessionRecord::new("cleanup");
+        fs::create_dir_all(store.path(&record.id)).unwrap();
+
+        store.save_sync(&record).unwrap_err();
+
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
 
     #[tokio::test]
@@ -405,7 +625,13 @@ mod tests {
         store.wipe().await.unwrap();
         store.wipe().await.unwrap();
 
-        assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+        assert!(!store.path(&SessionId::new("valid")).exists());
+        assert!(!temp.path().join("legacy.json").exists());
+        let entries = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from(LOCK_DIRECTORY)]);
     }
 
     #[tokio::test]

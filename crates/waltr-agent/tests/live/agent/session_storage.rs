@@ -11,9 +11,11 @@ use futures_util::StreamExt;
 use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_CALL,
     CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse, FilesystemSessionStore,
-    OpenDalSessionStore, ResumeInput, S3SessionStore, ScyllaSessionStore, SessionCoordinator,
-    SessionId, SessionStore, SessionStoreError, TimelineChannel, TimelineContent, TimelineEventKind,
-    TimelineQuery, TimelineStatus, opendal_postgresql_session_store,
+    MetadataSetCondition, OpenDalSessionStore, PendingTimelineEvent, PendingTimelineItemId,
+    ResumeInput, Revision, S3SessionStore, ScyllaSessionStore, SessionCoordinator,
+    SessionCreateRequest, SessionId, SessionJournalEvent, SessionStore, SessionStoreError,
+    TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
+    opendal_postgresql_session_store,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 use opendal::{Operator, services};
@@ -59,6 +61,94 @@ async fn scylla_session_store_resumes_from_container() -> waltr_agent::Result<()
 }
 
 #[tokio::test]
+#[ignore = "requires Docker"]
+async fn scylla_conditional_metadata_is_atomic_and_preserves_record_state() -> waltr_agent::Result<()>
+{
+    install_rustls_crypto_provider();
+    let scylla = Box::pin(ScyllaContainer::start()).await?;
+    let first =
+        ScyllaSessionStore::new(scylla.session.clone(), scylla.keyspace.clone(), "metadata");
+    let second =
+        ScyllaSessionStore::new(scylla.session.clone(), scylla.keyspace.clone(), "metadata");
+    first.create_schema().await.map_err(store_error)?;
+    let id = SessionId::new("conditional-metadata");
+    first
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .map_err(store_error)?;
+    first
+        .append_timeline(
+            &id,
+            Revision::ZERO,
+            vec![PendingTimelineEvent::assistant_text_delta(
+                id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                "preserved",
+            )],
+        )
+        .await
+        .map_err(store_error)?;
+    first
+        .set_metadata_value(&id, "unrelated".to_owned(), json!("preserved"))
+        .await
+        .map_err(store_error)?;
+    first
+        .set_metadata_value(&id, "null".to_owned(), serde_json::Value::Null)
+        .await
+        .map_err(store_error)?;
+
+    let null_outcome = second
+        .set_metadata_value_conditionally(
+            &id,
+            "null".to_owned(),
+            json!("replacement"),
+            MetadataSetCondition::Absent,
+        )
+        .await
+        .map_err(store_error)?;
+    assert!(!null_outcome.changed);
+    assert_eq!(
+        null_outcome.record.metadata_value("null"),
+        Some(&serde_json::Value::Null)
+    );
+
+    let (left, right) = tokio::join!(
+        first.set_metadata_value_conditionally(
+            &id,
+            "winner".to_owned(),
+            json!("left"),
+            MetadataSetCondition::Absent,
+        ),
+        second.set_metadata_value_conditionally(
+            &id,
+            "winner".to_owned(),
+            json!("right"),
+            MetadataSetCondition::Absent,
+        ),
+    );
+    let changed = usize::from(left.map_err(store_error)?.changed)
+        + usize::from(right.map_err(store_error)?.changed);
+    assert_eq!(changed, 1);
+
+    let record = first.load(&id).await.map_err(store_error)?;
+    assert_eq!(
+        record.metadata_value("unrelated"),
+        Some(&json!("preserved"))
+    );
+    assert_eq!(
+        record.metadata_value("null"),
+        Some(&serde_json::Value::Null)
+    );
+    assert!(
+        matches!(record.metadata_value("winner"), Some(value) if value == "left" || value == "right")
+    );
+    assert_eq!(record.timeline_cursor_high_water().get(), 1);
+    assert_eq!(record.timeline_events().count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires container/live storage integration opt-in"]
 async fn opendal_filesystem_session_store_resumes_from_temp_dir() -> waltr_agent::Result<()> {
     install_rustls_crypto_provider();
@@ -95,6 +185,70 @@ async fn opendal_postgresql_session_store_resumes_from_container() -> waltr_agen
         .await
         .map_err(store_error)?;
     assert_resume_round_trip(store, "opendal-postgresql").await
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn opendal_postgresql_compare_and_swap_preserves_concurrent_writes() -> waltr_agent::Result<()>
+{
+    let postgres = PostgresContainer::start().await?;
+    let first = opendal_postgresql_session_store(&postgres.connection_string, "cas")
+        .await
+        .map_err(store_error)?;
+    let second = opendal_postgresql_session_store(&postgres.connection_string, "cas")
+        .await
+        .map_err(store_error)?;
+    let id = SessionId::new("concurrent-journal-metadata");
+    first
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .map_err(store_error)?;
+
+    let (journal, metadata) = tokio::join!(
+        first.append_journal(
+            &id,
+            Revision::ZERO,
+            vec![SessionJournalEvent::PromptAppended {
+                prompt: "preserved".to_owned(),
+            }],
+        ),
+        second.set_metadata_value_conditionally(
+            &id,
+            "owner".to_owned(),
+            json!("metadata"),
+            MetadataSetCondition::Absent,
+        ),
+    );
+    journal.map_err(store_error)?;
+    assert!(metadata.map_err(store_error)?.changed);
+    let record = first.load(&id).await.map_err(store_error)?;
+    assert_eq!(record.revision, Revision::new(1));
+    assert_eq!(record.snapshot().prompts, ["preserved"]);
+    assert_eq!(record.metadata_value("owner"), Some(&json!("metadata")));
+
+    let absent_id = SessionId::new("concurrent-absent");
+    first
+        .create(SessionCreateRequest::new(absent_id.clone()))
+        .await
+        .map_err(store_error)?;
+    let (left, right) = tokio::join!(
+        first.set_metadata_value_conditionally(
+            &absent_id,
+            "winner".to_owned(),
+            json!("left"),
+            MetadataSetCondition::Absent,
+        ),
+        second.set_metadata_value_conditionally(
+            &absent_id,
+            "winner".to_owned(),
+            json!("right"),
+            MetadataSetCondition::Absent,
+        ),
+    );
+    let changed = usize::from(left.map_err(store_error)?.changed)
+        + usize::from(right.map_err(store_error)?.changed);
+    assert_eq!(changed, 1);
+    Ok(())
 }
 
 async fn assert_resume_round_trip<S>(store: S, label: &str) -> waltr_agent::Result<()>
