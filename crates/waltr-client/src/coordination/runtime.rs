@@ -17,16 +17,18 @@ use ts_rs::TS;
 use crate::executor::{
     ConfigWatchUpdateStream, SessionTimelineWatchUpdateStream, SessionWatchUpdateStream,
 };
-use crate::transport::SessionTimelineWatchUpdate;
+use crate::transport::{
+    RoutineDefinitionWatchStream, RoutineInvocationWatchStream, SessionTimelineWatchUpdate,
+};
 use crate::{
     AccessAttemptId, AccessStatus, AuthAttemptState, AuthStatus, AuthTarget, CatalogEffect,
     CatalogMatchView, CatalogModelSummaryView, Client, ClientEffect, ClientError, ClientEvent,
     ClientOperationState, ClientUpdate, ConfigEffect, ConfigEvent, ConfigView, GrpcEffectExecutor,
     InferenceDefaultsView, InferenceSettingsRequest, McpAuthorizationContext, McpServerView,
     OperationKey, OperationStatus, OutboundAuthenticationFailure, ProviderView, ResourceOrigin,
-    RollbackTarget, SessionEffect, SessionEvent, SessionTemplateKind, SessionTemplateOption,
-    SessionTimelineView, SessionView, StatusChangeStream, StatusEffect, StatusEvent,
-    TimelineDirection, TimelineQuery, TimelineWatchKey, rollback_target,
+    RollbackTarget, RoutineEffect, RoutineEvent, SessionEffect, SessionEvent, SessionTemplateKind,
+    SessionTemplateOption, SessionTimelineView, SessionView, StatusChangeStream, StatusEffect,
+    StatusEvent, TimelineDirection, TimelineQuery, TimelineWatchKey, rollback_target,
 };
 
 const READY_IDLE_DELAY_MS: u64 = 1_000;
@@ -184,6 +186,64 @@ pub enum ClientCommand {
     SetInferenceDefaults {
         /// Inference defaults to store, or null to clear defaults.
         defaults: Option<InferenceDefaultsView>,
+    },
+    /// Register interest in complete global manual Routine definitions.
+    RegisterRoutineDefinitionWatchInterest,
+    /// Release interest in complete global manual Routine definitions.
+    ReleaseRoutineDefinitionWatchInterest,
+    /// Register interest in durable Routine invocation history.
+    RegisterRoutineInvocationWatchInterest,
+    /// Release interest in durable Routine invocation history.
+    ReleaseRoutineInvocationWatchInterest,
+    /// Register interest in Routine invocations sourced from one session.
+    RegisterSessionRoutineInvocationWatchInterest {
+        /// Source session whose authoritative invocation history should be watched.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    /// Release interest in Routine invocations sourced from one session.
+    ReleaseSessionRoutineInvocationWatchInterest {
+        /// Source session whose watch interest should be released.
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+    /// Start one manual Routine. This command is never automatically retried.
+    StartManualRoutine {
+        /// Caller-supplied operation identity.
+        #[serde(rename = "operationKey")]
+        operation_key: OperationKey,
+        /// Correlation-only request identity.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Routine name.
+        #[serde(rename = "routineName")]
+        routine_name: String,
+        /// Trigger name.
+        #[serde(rename = "triggerName")]
+        trigger_name: String,
+        /// Source session identity.
+        #[serde(rename = "sourceSessionId")]
+        source_session_id: String,
+        /// Typed inputs keyed by declared name.
+        inputs: BTreeMap<String, crate::ClientRoutineValue>,
+    },
+    /// Load the next older invocation-history page.
+    LoadOlderRoutineInvocations {
+        /// Correlation-only request identity.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Requested page size.
+        #[serde(rename = "pageSize")]
+        page_size: u32,
+    },
+    /// Load full task-level detail for one durable invocation.
+    LoadRoutineInvocationDetail {
+        /// Correlation-only request identity.
+        #[serde(rename = "requestId")]
+        request_id: String,
+        /// Durable invocation identity.
+        #[serde(rename = "invocationId")]
+        invocation_id: String,
     },
     /// Register current interest in configuration watch updates.
     RegisterConfigWatchInterest,
@@ -419,6 +479,94 @@ pub struct ClientSnapshot {
     pub status: StatusSnapshot,
     /// Session coordination snapshot.
     pub sessions: SessionSnapshot,
+    /// Session-scoped manual Routine coordination snapshot.
+    pub routines: RoutineSnapshot,
+}
+
+/// Stable global Routine snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineSnapshot {
+    /// Global definition watch and complete ordered projection.
+    pub definitions: RoutineDefinitionSnapshot,
+    /// Durable bounded invocation history.
+    pub history: RoutineHistorySnapshot,
+    /// Authoritative bounded invocation histories by source session id.
+    pub session_histories: BTreeMap<String, RoutineHistorySnapshot>,
+    /// Bounded keyed detail loads.
+    pub details: BTreeMap<String, RoutineDetailSnapshot>,
+    /// Bounded local manual-start operations.
+    pub starts: BTreeMap<OperationKey, RoutineStartOperationView>,
+}
+
+/// Stable global manual Routine definition snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineDefinitionSnapshot {
+    /// Definition watch health.
+    pub watch: OperationSnapshot,
+    /// Stable digest of the current complete projection.
+    pub digest: String,
+    /// Definitions in canonical server order.
+    pub definitions: Vec<crate::ClientManualRoutineDefinition>,
+}
+
+/// Stable bounded durable invocation history snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineHistorySnapshot {
+    /// Invocation watch health.
+    pub watch: OperationSnapshot,
+    /// Newest-first retained invocation summaries.
+    pub recent: Vec<crate::ClientRoutineInvocationSummary>,
+    /// Last successfully reduced durable event sequence.
+    pub through_sequence: Option<u64>,
+    /// Exclusive admission cursor for another older page.
+    pub older_page_token: Option<u64>,
+    /// Current older-page operation.
+    pub pagination: OperationSnapshot,
+}
+
+/// Stable state for one keyed detail load.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineDetailSnapshot {
+    /// Current load status.
+    pub status: &'static str,
+    /// Full detail when available.
+    pub detail: Option<crate::ClientRoutineInvocationDetail>,
+    /// Last load error.
+    pub error: Option<String>,
+}
+
+/// Stable bounded local manual-start operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineStartOperationView {
+    /// Shell-local operation key.
+    pub operation_key: OperationKey,
+    /// Correlation-only request identity.
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+    /// Submitted Routine name.
+    #[serde(rename = "routineName")]
+    pub routine_name: String,
+    /// Submitted trigger name.
+    #[serde(rename = "triggerName")]
+    pub trigger_name: String,
+    /// Source session supplied at start only.
+    #[serde(rename = "sourceSessionId")]
+    pub source_session_id: String,
+    /// Submitted inputs retained for validation correction.
+    pub inputs: BTreeMap<String, crate::ClientRoutineValue>,
+    /// Stable local operation status.
+    pub status: &'static str,
+    /// Associated durable server identity after admission.
+    pub invocation_id: Option<String>,
+    /// Structured pre-admission validation failure.
+    pub validation_failure: Option<crate::ClientRoutineValidationFailure>,
+    /// Transport failure before admission identity was returned.
+    pub error: Option<String>,
 }
 
 /// Stable model catalog coordination snapshot.
@@ -969,6 +1117,9 @@ pub struct ClientRuntime {
     status_watch: Option<(u64, StatusChangeStream)>,
     config_watch: Option<ConfigWatchUpdateStream>,
     session_watch: Option<SessionWatchUpdateStream>,
+    routine_definition_watch: Option<RoutineDefinitionWatchStream>,
+    routine_invocation_watch: Option<RoutineInvocationWatchStream>,
+    session_routine_invocation_watches: BTreeMap<String, RoutineInvocationWatchStream>,
     timeline_watches: BTreeMap<TimelineWatchKey, SessionTimelineWatchUpdateStream>,
     watch_poll_offset: usize,
 }
@@ -978,6 +1129,9 @@ enum WatchCandidate {
     Status,
     Config,
     Session,
+    RoutineDefinitions,
+    RoutineInvocations,
+    SessionRoutineInvocations(String),
     Timeline(TimelineWatchKey),
 }
 
@@ -986,6 +1140,12 @@ enum WatchResult {
     Status(u64, Option<Result<crate::SystemStatus, ClientError>>),
     Config(Option<Result<crate::ConfigWatchUpdate, ClientError>>),
     Session(Option<Result<crate::SessionWatchUpdate, ClientError>>),
+    RoutineDefinitions(Option<Result<crate::ClientRoutineDefinitionSnapshot, ClientError>>),
+    RoutineInvocations(Option<Result<crate::ClientRoutineInvocationWatchUpdate, ClientError>>),
+    SessionRoutineInvocations(
+        String,
+        Option<Result<crate::ClientRoutineInvocationWatchUpdate, ClientError>>,
+    ),
     Timeline(
         TimelineWatchKey,
         Option<Result<SessionTimelineWatchUpdate, ClientError>>,
@@ -1040,6 +1200,14 @@ impl fmt::Debug for ClientRuntime {
             .field("status_watch_active", &self.status_watch.is_some())
             .field("config_watch_active", &self.config_watch.is_some())
             .field("session_watch_active", &self.session_watch.is_some())
+            .field(
+                "routine_definition_watch_active",
+                &self.routine_definition_watch.is_some(),
+            )
+            .field(
+                "routine_invocation_watch_active",
+                &self.routine_invocation_watch.is_some(),
+            )
             .field("timeline_watch_count", &self.timeline_watches.len())
             .field("watch_poll_offset", &self.watch_poll_offset)
             .finish()
@@ -1060,6 +1228,9 @@ impl ClientRuntime {
             status_watch: None,
             config_watch: None,
             session_watch: None,
+            routine_definition_watch: None,
+            routine_invocation_watch: None,
+            session_routine_invocation_watches: BTreeMap::new(),
             timeline_watches: BTreeMap::new(),
             watch_poll_offset: 0,
         }
@@ -1116,6 +1287,33 @@ impl ClientRuntime {
             candidates.push(WatchCandidate::Session);
         }
 
+        if self.reducer.state().routines.definition_watch.interests > 0
+            && self.routine_definition_watch.is_some()
+        {
+            candidates.push(WatchCandidate::RoutineDefinitions);
+        }
+        if self.reducer.state().routines.invocation_watch.interests > 0
+            && self.routine_invocation_watch.is_some()
+        {
+            candidates.push(WatchCandidate::RoutineInvocations);
+        }
+        candidates.extend(
+            self.reducer
+                .state()
+                .routines
+                .session_histories
+                .iter()
+                .filter(|(session_id, history)| {
+                    history.watch.interests > 0
+                        && self
+                            .session_routine_invocation_watches
+                            .contains_key(*session_id)
+                })
+                .map(|(session_id, _)| {
+                    WatchCandidate::SessionRoutineInvocations(session_id.clone())
+                }),
+        );
+
         candidates.extend(
             self.reducer
                 .state()
@@ -1152,6 +1350,21 @@ impl ClientRuntime {
                     .as_mut()
                     .and_then(|stream| stream.next().now_or_never())
                     .map(WatchResult::Session),
+                WatchCandidate::RoutineDefinitions => self
+                    .routine_definition_watch
+                    .as_mut()
+                    .and_then(|stream| stream.next().now_or_never())
+                    .map(WatchResult::RoutineDefinitions),
+                WatchCandidate::RoutineInvocations => self
+                    .routine_invocation_watch
+                    .as_mut()
+                    .and_then(|stream| stream.next().now_or_never())
+                    .map(WatchResult::RoutineInvocations),
+                WatchCandidate::SessionRoutineInvocations(session_id) => self
+                    .session_routine_invocation_watches
+                    .get_mut(&session_id)
+                    .and_then(|stream| stream.next().now_or_never())
+                    .map(|result| WatchResult::SessionRoutineInvocations(session_id, result)),
                 WatchCandidate::Timeline(key) => self
                     .timeline_watches
                     .get_mut(&key)
@@ -1192,6 +1405,41 @@ impl ClientRuntime {
         {
             futures.push(Box::pin(async move {
                 WatchResult::Session(stream.next().await)
+            }));
+        }
+
+        if self.reducer.state().routines.definition_watch.interests > 0
+            && let Some(stream) = &mut self.routine_definition_watch
+        {
+            futures.push(Box::pin(async move {
+                WatchResult::RoutineDefinitions(stream.next().await)
+            }));
+        }
+        if self.reducer.state().routines.invocation_watch.interests > 0
+            && let Some(stream) = &mut self.routine_invocation_watch
+        {
+            futures.push(Box::pin(async move {
+                WatchResult::RoutineInvocations(stream.next().await)
+            }));
+        }
+
+        let active_session_ids = self
+            .reducer
+            .state()
+            .routines
+            .session_histories
+            .iter()
+            .filter(|(_, history)| history.watch.interests > 0)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (session_id, stream) in self
+            .session_routine_invocation_watches
+            .iter_mut()
+            .filter(|(session_id, _)| active_session_ids.contains(*session_id))
+        {
+            let session_id = session_id.clone();
+            futures.push(Box::pin(async move {
+                WatchResult::SessionRoutineInvocations(session_id, stream.next().await)
             }));
         }
 
@@ -1256,6 +1504,45 @@ impl ClientRuntime {
                 self.session_watch = None;
                 ClientEvent::Session(SessionEvent::WatchEnded)
             }
+            WatchResult::RoutineDefinitions(Some(Ok(update))) => {
+                ClientEvent::Routine(RoutineEvent::DefinitionWatchChanged(update))
+            }
+            WatchResult::RoutineDefinitions(Some(Err(error))) => {
+                self.routine_definition_watch = None;
+                ClientEvent::Routine(RoutineEvent::DefinitionWatchFailed(error))
+            }
+            WatchResult::RoutineDefinitions(None) => {
+                self.routine_definition_watch = None;
+                ClientEvent::Routine(RoutineEvent::DefinitionWatchEnded)
+            }
+            WatchResult::RoutineInvocations(Some(Ok(update))) => {
+                ClientEvent::Routine(RoutineEvent::InvocationWatchChanged(update))
+            }
+            WatchResult::RoutineInvocations(Some(Err(error))) => {
+                self.routine_invocation_watch = None;
+                ClientEvent::Routine(RoutineEvent::InvocationWatchFailed(error))
+            }
+            WatchResult::RoutineInvocations(None) => {
+                self.routine_invocation_watch = None;
+                ClientEvent::Routine(RoutineEvent::InvocationWatchEnded)
+            }
+            WatchResult::SessionRoutineInvocations(session_id, Some(Ok(update))) => {
+                ClientEvent::Routine(RoutineEvent::SessionInvocationWatchChanged {
+                    session_id,
+                    update,
+                })
+            }
+            WatchResult::SessionRoutineInvocations(session_id, Some(Err(error))) => {
+                self.session_routine_invocation_watches.remove(&session_id);
+                ClientEvent::Routine(RoutineEvent::SessionInvocationWatchFailed {
+                    session_id,
+                    error,
+                })
+            }
+            WatchResult::SessionRoutineInvocations(session_id, None) => {
+                self.session_routine_invocation_watches.remove(&session_id);
+                ClientEvent::Routine(RoutineEvent::SessionInvocationWatchEnded { session_id })
+            }
             WatchResult::Timeline(key, Some(Ok(update))) => {
                 ClientEvent::Session(SessionEvent::TimelineWatchChanged { key, update })
             }
@@ -1277,6 +1564,9 @@ impl ClientRuntime {
         self.status_watch = None;
         self.config_watch = None;
         self.session_watch = None;
+        self.routine_definition_watch = None;
+        self.routine_invocation_watch = None;
+        self.session_routine_invocation_watches.clear();
         self.timeline_watches.clear();
     }
 }
@@ -1315,6 +1605,15 @@ enum ExecutedEffect {
     SessionWatch {
         open_id: u64,
         result: Result<SessionWatchUpdateStream, ClientError>,
+    },
+    RoutineDefinitionWatch {
+        open_id: u64,
+        result: Result<RoutineDefinitionWatchStream, ClientError>,
+    },
+    RoutineInvocationWatch {
+        open_id: u64,
+        session_id: Option<String>,
+        result: Result<RoutineInvocationWatchStream, ClientError>,
     },
     TimelineWatch {
         key: TimelineWatchKey,
@@ -1408,6 +1707,29 @@ impl ClientStateStream {
                             .runtime
                             .reducer
                             .state()
+                            .routines
+                            .definition_watch
+                            .interests
+                            == 0
+                        && self
+                            .runtime
+                            .reducer
+                            .state()
+                            .routines
+                            .invocation_watch
+                            .interests
+                            == 0
+                        && self
+                            .runtime
+                            .reducer
+                            .state()
+                            .routines
+                            .session_histories
+                            .is_empty()
+                        && self
+                            .runtime
+                            .reducer
+                            .state()
                             .timeline_watch_keys()
                             .is_empty()
                     {
@@ -1419,6 +1741,9 @@ impl ClientStateStream {
 
                     if self.runtime.config_watch.is_some()
                         || self.runtime.session_watch.is_some()
+                        || self.runtime.routine_definition_watch.is_some()
+                        || self.runtime.routine_invocation_watch.is_some()
+                        || !self.runtime.session_routine_invocation_watches.is_empty()
                         || !self.runtime.timeline_watches.is_empty()
                         || self.runtime.status_watch.is_some()
                     {
@@ -1482,6 +1807,7 @@ impl ClientStateStream {
         snapshot
     }
 
+    #[allow(clippy::too_many_lines)]
     fn begin_command(&mut self, command: ClientCommand) -> Result<(), ClientError> {
         if !self.runtime.reducer.state().permits_protected_requests()
             && !command_allowed_without_access(&command)
@@ -1526,6 +1852,17 @@ impl ClientStateStream {
             | ClientCommand::ReleaseConfigWatchInterest => self.begin_config_command(command)?,
             ClientCommand::SearchCatalogModels { .. }
             | ClientCommand::SuggestCatalogMatches { .. } => self.begin_catalog_command(command),
+            ClientCommand::RegisterRoutineDefinitionWatchInterest
+            | ClientCommand::ReleaseRoutineDefinitionWatchInterest
+            | ClientCommand::RegisterRoutineInvocationWatchInterest
+            | ClientCommand::ReleaseRoutineInvocationWatchInterest
+            | ClientCommand::RegisterSessionRoutineInvocationWatchInterest { .. }
+            | ClientCommand::ReleaseSessionRoutineInvocationWatchInterest { .. }
+            | ClientCommand::StartManualRoutine { .. }
+            | ClientCommand::LoadOlderRoutineInvocations { .. }
+            | ClientCommand::LoadRoutineInvocationDetail { .. } => {
+                self.begin_routine_command(command)
+            }
             ClientCommand::CreateSession { .. }
             | ClientCommand::RequestSessionAgents
             | ClientCommand::DeleteSession { .. }
@@ -1560,6 +1897,9 @@ impl ClientStateStream {
             self.runtime.status_watch = None;
             self.runtime.config_watch = None;
             self.runtime.session_watch = None;
+            self.runtime.routine_definition_watch = None;
+            self.runtime.routine_invocation_watch = None;
+            self.runtime.session_routine_invocation_watches.clear();
             self.runtime.timeline_watches.clear();
         }
         self.extend_effects(&update);
@@ -1708,6 +2048,132 @@ impl ClientStateStream {
                 )
             }
             _ => unreachable!("non-catalog command routed to catalog handler"),
+        }
+    }
+
+    fn begin_routine_command(&mut self, command: ClientCommand) -> ClientUpdate {
+        match command {
+            ClientCommand::RegisterRoutineDefinitionWatchInterest => self
+                .runtime
+                .reducer
+                .register_routine_definition_watch_interest(),
+            ClientCommand::ReleaseRoutineDefinitionWatchInterest => {
+                let update = self
+                    .runtime
+                    .reducer
+                    .release_routine_definition_watch_interest();
+                if self
+                    .runtime
+                    .reducer
+                    .state()
+                    .routines
+                    .definition_watch
+                    .interests
+                    == 0
+                {
+                    self.runtime.routine_definition_watch = None;
+                    self.cancel_effects(|effect| {
+                        matches!(
+                            effect,
+                            ClientEffect::Routine(RoutineEffect::WatchDefinitions { .. })
+                        )
+                    });
+                }
+                update
+            }
+            ClientCommand::RegisterRoutineInvocationWatchInterest => self
+                .runtime
+                .reducer
+                .register_routine_invocation_watch_interest(),
+            ClientCommand::ReleaseRoutineInvocationWatchInterest => {
+                let update = self
+                    .runtime
+                    .reducer
+                    .release_routine_invocation_watch_interest();
+                if self
+                    .runtime
+                    .reducer
+                    .state()
+                    .routines
+                    .invocation_watch
+                    .interests
+                    == 0
+                {
+                    self.runtime.routine_invocation_watch = None;
+                    self.cancel_effects(|effect| {
+                        matches!(
+                            effect,
+                            ClientEffect::Routine(RoutineEffect::WatchInvocations {
+                                session_id: None,
+                                ..
+                            })
+                        )
+                    });
+                }
+                update
+            }
+            ClientCommand::RegisterSessionRoutineInvocationWatchInterest { session_id } => self
+                .runtime
+                .reducer
+                .register_session_routine_invocation_watch_interest(session_id),
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest { session_id } => {
+                let update = self
+                    .runtime
+                    .reducer
+                    .release_session_routine_invocation_watch_interest(&session_id);
+                if !self
+                    .runtime
+                    .reducer
+                    .state()
+                    .routines
+                    .session_histories
+                    .contains_key(&session_id)
+                {
+                    self.runtime
+                        .session_routine_invocation_watches
+                        .remove(&session_id);
+                    self.cancel_effects(|effect| {
+                        matches!(
+                            effect,
+                            ClientEffect::Routine(RoutineEffect::WatchInvocations {
+                                session_id: Some(watched),
+                                ..
+                            }) if watched == &session_id
+                        )
+                    });
+                }
+                update
+            }
+            ClientCommand::StartManualRoutine {
+                operation_key,
+                request_id,
+                routine_name,
+                trigger_name,
+                source_session_id,
+                inputs,
+            } => self.runtime.reducer.start_manual_routine(
+                operation_key,
+                request_id,
+                routine_name,
+                trigger_name,
+                source_session_id,
+                inputs,
+            ),
+            ClientCommand::LoadOlderRoutineInvocations {
+                request_id,
+                page_size,
+            } => self
+                .runtime
+                .reducer
+                .load_older_routine_invocations(request_id, page_size),
+            ClientCommand::LoadRoutineInvocationDetail {
+                request_id,
+                invocation_id,
+            } => self
+                .runtime
+                .reducer
+                .load_routine_invocation_detail(request_id, invocation_id),
+            _ => unreachable!("non-Routine command routed to Routine handler"),
         }
     }
 
@@ -1936,6 +2402,30 @@ impl ClientStateStream {
                         result,
                     }
                 }
+                ClientEffect::Routine(RoutineEffect::WatchDefinitions {
+                    open_id,
+                    request_id,
+                }) => ExecutedEffect::RoutineDefinitionWatch {
+                    open_id,
+                    result: executor.watch_routine_definition_updates(request_id).await,
+                },
+                ClientEffect::Routine(RoutineEffect::WatchInvocations {
+                    open_id,
+                    request_id,
+                    after_sequence,
+                    metadata_filters,
+                    session_id,
+                }) => ExecutedEffect::RoutineInvocationWatch {
+                    open_id,
+                    session_id,
+                    result: executor
+                        .watch_routine_invocation_updates(
+                            request_id,
+                            after_sequence,
+                            metadata_filters,
+                        )
+                        .await,
+                },
                 effect => ExecutedEffect::Events(
                     executor
                         .execute_effect(effect, move |delay_ms| sleep(delay_ms))
@@ -2000,6 +2490,50 @@ impl ClientStateStream {
                     error,
                 })],
             },
+            ExecutedEffect::RoutineDefinitionWatch { open_id, result } => match result {
+                Ok(stream) => {
+                    self.runtime.routine_definition_watch = Some(stream);
+                    vec![ClientEvent::Routine(
+                        RoutineEvent::DefinitionWatchStartedForOpen { open_id },
+                    )]
+                }
+                Err(error) => vec![ClientEvent::Routine(
+                    RoutineEvent::DefinitionWatchOpenFailed { open_id, error },
+                )],
+            },
+            ExecutedEffect::RoutineInvocationWatch {
+                open_id,
+                session_id,
+                result,
+            } => match (session_id, result) {
+                (Some(session_id), Ok(stream)) => {
+                    self.runtime
+                        .session_routine_invocation_watches
+                        .insert(session_id.clone(), stream);
+                    vec![ClientEvent::Routine(
+                        RoutineEvent::SessionInvocationWatchStartedForOpen {
+                            session_id,
+                            open_id,
+                        },
+                    )]
+                }
+                (Some(session_id), Err(error)) => vec![ClientEvent::Routine(
+                    RoutineEvent::SessionInvocationWatchOpenFailed {
+                        session_id,
+                        open_id,
+                        error,
+                    },
+                )],
+                (None, Ok(stream)) => {
+                    self.runtime.routine_invocation_watch = Some(stream);
+                    vec![ClientEvent::Routine(
+                        RoutineEvent::InvocationWatchStartedForOpen { open_id },
+                    )]
+                }
+                (None, Err(error)) => vec![ClientEvent::Routine(
+                    RoutineEvent::InvocationWatchOpenFailed { open_id, error },
+                )],
+            },
             ExecutedEffect::TimelineWatch {
                 key,
                 open_id,
@@ -2038,6 +2572,8 @@ impl ClientStateStream {
         self.clear_session_runtime_for_event(&event);
         let update = self.runtime.reducer.apply(event);
         self.extend_effects(&update);
+        let maintenance = self.runtime.reducer.maintain_watches();
+        self.extend_effects(&maintenance);
         self.suspend_if_access_lost();
     }
 
@@ -2076,6 +2612,19 @@ impl ClientStateStream {
     }
 
     fn extend_effects(&mut self, update: &ClientUpdate) {
+        for effect in update.effects() {
+            if let ClientEffect::Routine(RoutineEffect::WatchInvocations { session_id, .. }) =
+                effect
+            {
+                if let Some(session_id) = session_id {
+                    self.runtime
+                        .session_routine_invocation_watches
+                        .remove(session_id);
+                } else {
+                    self.runtime.routine_invocation_watch = None;
+                }
+            }
+        }
         let access_generation = self.runtime.reducer.state().access_generation;
         self.effects.extend(
             update
@@ -2121,6 +2670,64 @@ impl ClientStateStream {
         executed: &ExecutedEffect,
     ) -> bool {
         match (effect, executed) {
+            (
+                ClientEffect::Routine(RoutineEffect::WatchDefinitions {
+                    open_id: effect_open_id,
+                    ..
+                }),
+                ExecutedEffect::RoutineDefinitionWatch {
+                    open_id: executed_open_id,
+                    ..
+                },
+            ) => {
+                effect_open_id == executed_open_id
+                    && self
+                        .runtime
+                        .reducer
+                        .state()
+                        .routines
+                        .definition_watch
+                        .interests
+                        > 0
+                    && self
+                        .runtime
+                        .reducer
+                        .state()
+                        .routines
+                        .definition_watch
+                        .open_id
+                        == Some(*effect_open_id)
+            }
+            (
+                ClientEffect::Routine(RoutineEffect::WatchInvocations {
+                    open_id: effect_open_id,
+                    session_id: effect_session_id,
+                    ..
+                }),
+                ExecutedEffect::RoutineInvocationWatch {
+                    open_id: executed_open_id,
+                    session_id: executed_session_id,
+                    ..
+                },
+            ) => {
+                if effect_open_id != executed_open_id || effect_session_id != executed_session_id {
+                    return false;
+                }
+                let state = self.runtime.reducer.state();
+                if let Some(session_id) = effect_session_id {
+                    state
+                        .routines
+                        .session_histories
+                        .get(session_id)
+                        .is_some_and(|history| {
+                            history.watch.interests > 0
+                                && history.watch.open_id == Some(*effect_open_id)
+                        })
+                } else {
+                    state.routines.invocation_watch.interests > 0
+                        && state.routines.invocation_watch.open_id == Some(*effect_open_id)
+                }
+            }
             (
                 ClientEffect::Config(ConfigEffect::Watch {
                     open_id: effect_open_id,
@@ -2228,6 +2835,12 @@ const fn command_allowed_without_access(command: &ClientCommand) -> bool {
             | ClientCommand::ReleaseConfigWatchInterest
             | ClientCommand::RegisterSessionWatchInterest
             | ClientCommand::ReleaseSessionWatchInterest
+            | ClientCommand::RegisterRoutineDefinitionWatchInterest
+            | ClientCommand::ReleaseRoutineDefinitionWatchInterest
+            | ClientCommand::RegisterRoutineInvocationWatchInterest
+            | ClientCommand::ReleaseRoutineInvocationWatchInterest
+            | ClientCommand::RegisterSessionRoutineInvocationWatchInterest { .. }
+            | ClientCommand::ReleaseSessionRoutineInvocationWatchInterest { .. }
             | ClientCommand::RegisterSessionTimelineWatchInterest { .. }
             | ClientCommand::ReleaseSessionTimelineWatchInterest { .. }
     )
@@ -2448,6 +3061,92 @@ impl ClientSnapshot {
                                     .collect(),
                             },
                         )
+                    })
+                    .collect(),
+            },
+            routines: RoutineSnapshot {
+                definitions: RoutineDefinitionSnapshot {
+                    watch: OperationSnapshot::from_parts(
+                        state.routines.definition_watch.status,
+                        state.routines.definition_watch.error.clone(),
+                    ),
+                    digest: state.routines.definition_digest.clone(),
+                    definitions: state.routines.definitions.clone(),
+                },
+                history: RoutineHistorySnapshot {
+                    watch: OperationSnapshot::from_parts(
+                        state.routines.invocation_watch.status,
+                        state.routines.invocation_watch.error.clone(),
+                    ),
+                    recent: {
+                        let mut recent = state
+                            .routines
+                            .invocations
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        recent.sort_by(|left, right| {
+                            (right.admission_sequence, right.latest_sequence)
+                                .cmp(&(left.admission_sequence, left.latest_sequence))
+                        });
+                        recent
+                    },
+                    through_sequence: state.routines.through_sequence,
+                    older_page_token: state.routines.older_page_token,
+                    pagination: OperationSnapshot::from_parts(
+                        state.routines.page.status,
+                        state.routines.page.error.clone(),
+                    ),
+                },
+                session_histories: state
+                    .routines
+                    .session_histories
+                    .iter()
+                    .map(|(session_id, history)| {
+                        let mut recent = history.invocations.values().cloned().collect::<Vec<_>>();
+                        recent.sort_by(|left, right| {
+                            (right.admission_sequence, right.latest_sequence)
+                                .cmp(&(left.admission_sequence, left.latest_sequence))
+                        });
+                        (
+                            session_id.clone(),
+                            RoutineHistorySnapshot {
+                                watch: OperationSnapshot::from_parts(
+                                    history.watch.status,
+                                    history.watch.error.clone(),
+                                ),
+                                recent,
+                                through_sequence: history.through_sequence,
+                                older_page_token: None,
+                                pagination: OperationSnapshot::from_parts(
+                                    OperationStatus::Idle,
+                                    None,
+                                ),
+                            },
+                        )
+                    })
+                    .collect(),
+                details: state
+                    .routines
+                    .details
+                    .iter()
+                    .map(|(id, detail)| {
+                        (
+                            id.clone(),
+                            RoutineDetailSnapshot {
+                                status: operation_status_name(detail.status),
+                                detail: detail.detail.clone(),
+                                error: detail.error.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                starts: state
+                    .routines
+                    .starts
+                    .iter()
+                    .map(|(key, start)| {
+                        (key.clone(), RoutineStartOperationView::from(start.clone()))
                     })
                     .collect(),
             },
@@ -2851,6 +3550,23 @@ impl From<ClientOperationState> for ClientOperationView {
                 target: RollbackTargetView::from(&target),
                 authentication_failure: authentication_failure.map(Into::into),
             },
+        }
+    }
+}
+
+impl From<crate::RoutineStartOperationState> for RoutineStartOperationView {
+    fn from(start: crate::RoutineStartOperationState) -> Self {
+        Self {
+            operation_key: start.operation_key,
+            request_id: start.request_id,
+            routine_name: start.routine_name,
+            trigger_name: start.trigger_name,
+            source_session_id: start.source_session_id,
+            inputs: start.inputs,
+            status: operation_status_name(start.status),
+            invocation_id: start.invocation_id,
+            validation_failure: start.validation_failure,
+            error: start.error,
         }
     }
 }
@@ -3378,6 +4094,72 @@ mod tests {
         assert_eq!(
             stream.snapshot().access.error.as_deref(),
             Some("refresh failed")
+        );
+    }
+
+    #[test]
+    fn routine_watch_ownership_commands_are_accepted_and_released_without_access() {
+        let mut stream = ready_state_stream();
+        for command in [
+            ClientCommand::RegisterRoutineDefinitionWatchInterest,
+            ClientCommand::RegisterRoutineInvocationWatchInterest,
+            ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
+                session_id: "session".to_owned(),
+            },
+        ] {
+            stream
+                .begin_command(command)
+                .expect("initial Routine interest should register");
+        }
+        stream
+            .begin_command(ClientCommand::WaltrAccessExpired {
+                error: "expired".to_owned(),
+            })
+            .expect("access expiry should be accepted");
+
+        for command in [
+            ClientCommand::RegisterRoutineDefinitionWatchInterest,
+            ClientCommand::RegisterRoutineInvocationWatchInterest,
+            ClientCommand::RegisterSessionRoutineInvocationWatchInterest {
+                session_id: "session".to_owned(),
+            },
+        ] {
+            stream
+                .begin_command(command)
+                .expect("Routine interest should register without access");
+        }
+        for command in [
+            ClientCommand::ReleaseRoutineDefinitionWatchInterest,
+            ClientCommand::ReleaseRoutineInvocationWatchInterest,
+            ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                session_id: "session".to_owned(),
+            },
+        ] {
+            stream
+                .begin_command(command.clone())
+                .expect("Routine interest should decrement without access");
+            stream
+                .begin_command(command)
+                .expect("final Routine interest should release without access");
+        }
+
+        let state = stream.runtime.reducer.state();
+        assert_eq!(state.access.status, AccessStatus::LoginRequired);
+        assert_eq!(state.routines.definition_watch.interests, 0);
+        assert_eq!(state.routines.invocation_watch.interests, 0);
+        assert!(state.routines.session_histories.is_empty());
+        assert!(
+            stream
+                .begin_command(ClientCommand::StartManualRoutine {
+                    operation_key: "denied".to_owned(),
+                    request_id: "denied".to_owned(),
+                    routine_name: "fork".to_owned(),
+                    trigger_name: "manual".to_owned(),
+                    source_session_id: "session".to_owned(),
+                    inputs: BTreeMap::new(),
+                })
+                .is_err(),
+            "Routine data mutations must remain denied without access"
         );
     }
 
