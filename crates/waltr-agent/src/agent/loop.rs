@@ -91,6 +91,8 @@ where
     system_prompt_override: Option<middleware::prompt::SystemPromptOverride>,
     cancellation_token: CancellationToken,
     template_base_dir: Option<PathBuf>,
+    max_provider_turns: Option<u64>,
+    provider_turns_dispatched: u64,
     turn_span: Option<Span>,
     assistant_item_id: Option<(u64, TimelineItemId)>,
     thinking_item_id: Option<(u64, TimelineItemId)>,
@@ -187,6 +189,8 @@ where
             system_prompt_override: run.system_prompt_override,
             cancellation_token: run.cancellation_token,
             template_base_dir: run.template_base_dir,
+            max_provider_turns: run.max_provider_turns,
+            provider_turns_dispatched: 0,
             turn_span: None,
             assistant_item_id: None,
             thinking_item_id: None,
@@ -219,6 +223,19 @@ where
                         Ok(false) => continue,
                         Err(error) => return Some((Err(error), self)),
                     }
+                    if self.provider_attempt == 1
+                        && self
+                            .max_provider_turns
+                            .is_some_and(|limit| self.provider_turns_dispatched >= limit)
+                    {
+                        match self.record_provider_turn_limit_failure().await {
+                            Ok(event) => {
+                                self.phase = AgentLoopPhase::Done;
+                                return Some((Ok(event), self));
+                            }
+                            Err(error) => return Some((Err(error), self)),
+                        }
+                    }
                     // Crash recovery is retry-the-turn: the request is journaled before
                     // dispatch and parser progress is intentionally not persisted.
                     let draft = match self.build_provider_request().await {
@@ -232,6 +249,10 @@ where
 
                     if let Err(error) = self.persist_provider_request(&draft, projected).await {
                         return Some((Err(error), self));
+                    }
+                    if self.provider_attempt == 1 {
+                        self.provider_turns_dispatched =
+                            self.provider_turns_dispatched.saturating_add(1);
                     }
                     self.retry_checkpoint = Some(retry_checkpoint);
                     let provider_span = {
@@ -1440,6 +1461,29 @@ where
         );
         event.status = Some(TimelineStatus::Finished);
         self.append_timeline_event(event).await
+    }
+
+    async fn record_provider_turn_limit_failure(&mut self) -> Result<AgentTimelineEvent> {
+        const MESSAGE: &str = "maximum provider turn limit exceeded";
+        self.append_journal_event(SessionJournalEvent::Failed {
+            message: MESSAGE.to_owned(),
+            authentication_failure: None,
+        })
+        .await?;
+        let mut event = PendingTimelineEvent::new(
+            self.session_id.clone(),
+            self.turn as u64,
+            PendingTimelineItemId::New,
+            TimelineEventKind::SessionStatusChanged,
+            None,
+            TimelineContent::TextSnapshot {
+                text: MESSAGE.to_owned(),
+            },
+        );
+        event.status = Some(TimelineStatus::Failed);
+        let event = self.append_timeline_event(event).await?;
+        self.close_turn_span("provider_turn_limit");
+        Ok(event)
     }
 
     async fn pending_failed_session_event(&mut self, error: &LlmError) {

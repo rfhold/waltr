@@ -17,8 +17,8 @@ pub mod timeline;
 pub mod tools;
 
 pub use agent::{
-    AgentRunBuilder, AgentRuntime, AgentRuntimeBuilder, AgentRuntimeProvider, AgentSession,
-    AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
+    AgentRunBuilder, AgentRunLimits, AgentRuntime, AgentRuntimeBuilder, AgentRuntimeProvider,
+    AgentSession, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
     AgentSessionRuntime, AgentSessionRuntimeError, AgentSessionRuntimeFactory, AgentTool,
     BoxAgentTimelineStream, CancelReason, CredentialRefreshCoordinator, CredentialRefreshError,
