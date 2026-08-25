@@ -508,11 +508,17 @@ nanos: number, };
 
 export type SessionPhaseView = "unspecified" | "idle" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool" | "suspended" | "finished" | "failed" | "unknown";
 
+export type SessionSuspensionKindView = "unspecified" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "unknown";
+
 export type SessionStatusView = {
 /**
  * Session phase as a shell-friendly enum.
  */
 phase: SessionPhaseView,
+/**
+ * Suspension reason when the session phase is suspended.
+ */
+suspensionKind: SessionSuspensionKindView | null,
 /**
  * Failure message, when phase is failed.
  */
@@ -612,6 +618,20 @@ name: string,
  */
 description: string | null, };
 
+export type SessionAssociationsView = {
+/**
+ * Parent session that created this direct task session.
+ */
+taskParentSessionId: string | null,
+/**
+ * Direct task description supplied by the parent session.
+ */
+taskDescription: string | null,
+/**
+ * Routine invocation that owns this helper session.
+ */
+routineInvocationId: string | null, };
+
 export type SessionView = {
 /**
  * Server-assigned session id.
@@ -652,7 +672,15 @@ inferenceSettings: InferenceSettingsView | null,
 /**
  * Aggregate usage and cost derived from journaled provider turns.
  */
-metrics: SessionMetricsView, };
+metrics: SessionMetricsView,
+/**
+ * Typed associations derived from known session metadata keys.
+ */
+associations: SessionAssociationsView,
+/**
+ * Complete JSON session metadata object.
+ */
+metadata: Record<string, unknown>, };
 
 export type TimelineEventKindView = "unspecified" | "itemStarted" | "contentDelta" | "itemUpdated" | "itemFinished" | "externalRequestOpened" | "externalRequestResolved" | "sessionStatusChanged" | "unknown";
 
@@ -1348,6 +1376,344 @@ timelines: { [key in string]?: SessionTimelineView },
  */
 templateSearches: { [key in string]?: SessionTemplateSearchSnapshot }, };
 
+export type ClientRoutineValue = { "type": "string", "value": string } | { "type": "boolean", "value": boolean };
+
+export type ClientRoutineValueType = "string" | "boolean";
+
+export type ClientRoutineScope = "session";
+
+export type ClientRoutineInputDefinition = {
+/**
+ * Input name.
+ */
+name: string,
+/**
+ * Closed input type.
+ */
+type: ClientRoutineValueType,
+/**
+ * Whether the input is required.
+ */
+required: boolean,
+/**
+ * Optional minimum string length.
+ */
+minimumStringLength: bigint | null,
+/**
+ * Optional string pattern.
+ */
+stringPattern: string | null, };
+
+export type ClientRoutineResultDefinition = {
+/**
+ * Result name.
+ */
+name: string,
+/**
+ * Closed result type.
+ */
+type: ClientRoutineValueType, };
+
+export type ClientManualRoutineDefinition = {
+/**
+ * Routine name.
+ */
+routineName: string,
+/**
+ * Manual trigger name.
+ */
+triggerName: string,
+/**
+ * Human-readable display name.
+ */
+displayName: string,
+/**
+ * Human-readable description.
+ */
+description: string,
+/**
+ * Closed scope.
+ */
+scope: ClientRoutineScope,
+/**
+ * Inputs in declaration order.
+ */
+inputs: Array<ClientRoutineInputDefinition>,
+/**
+ * Results in declaration order.
+ */
+results: Array<ClientRoutineResultDefinition>,
+/**
+ * Immutable definition revision used by new admissions.
+ */
+routineRevision: string, };
+
+export type ClientRoutineResult = {
+/**
+ * Result name.
+ */
+name: string,
+/**
+ * Typed result value.
+ */
+value: ClientRoutineValue, };
+
+export type ClientRoutineFieldViolation = {
+/**
+ * Input field path.
+ */
+fieldPath: string,
+/**
+ * Validation message.
+ */
+message: string, };
+
+export type ClientRoutineValidationFailure = {
+/**
+ * General validation message.
+ */
+message: string,
+/**
+ * Violations in server order.
+ */
+violations: Array<ClientRoutineFieldViolation>, };
+
+export type ClientRoutineFailure = {
+/**
+ * Stable failure code.
+ */
+code: string,
+/**
+ * Safe failure text.
+ */
+message: string, };
+
+export type ClientRoutineTriggerKind = "manual" | "event";
+
+export type ClientRoutineInvocationStatus = "admitted" | "running" | "succeeded" | "failed" | "interrupted";
+
+export type ClientRoutineTaskStatus = "pending" | "running" | "succeeded" | "skipped" | "blocked" | "failed" | "interrupted";
+
+export type ClientRoutineInvocationSummary = {
+/**
+ * Monotonic admission order.
+ */
+admissionSequence: bigint,
+/**
+ * Server-generated durable public identity.
+ */
+invocationId: string,
+/**
+ * Routine name pinned at admission.
+ */
+routineName: string,
+/**
+ * Routine revision pinned at admission.
+ */
+routineRevision: string,
+/**
+ * Trigger name pinned at admission.
+ */
+triggerName: string,
+/**
+ * Trigger category.
+ */
+triggerKind: ClientRoutineTriggerKind,
+/**
+ * Correlation identifier supplied by the trigger.
+ */
+correlationId: string,
+/**
+ * Immutable trigger metadata.
+ */
+metadata: { [key in string]?: string },
+/**
+ * Event source cursor when applicable.
+ */
+sourceCursor: string | null,
+/**
+ * Current durable status.
+ */
+status: ClientRoutineInvocationStatus,
+/**
+ * Admission timestamp in Unix milliseconds.
+ */
+admittedAtMs: bigint,
+/**
+ * Start timestamp in Unix milliseconds.
+ */
+startedAtMs: bigint | null,
+/**
+ * Completion timestamp in Unix milliseconds.
+ */
+completedAtMs: bigint | null,
+/**
+ * Last update timestamp in Unix milliseconds.
+ */
+updatedAtMs: bigint,
+/**
+ * Sanitized terminal failure.
+ */
+terminalError: ClientRoutineFailure | null,
+/**
+ * Latest durable event sequence represented by this summary.
+ */
+latestSequence: bigint, };
+
+export type ClientRoutineTask = {
+/**
+ * Declared task name.
+ */
+name: string,
+/**
+ * Declared task type.
+ */
+type: string,
+/**
+ * Current task status.
+ */
+status: ClientRoutineTaskStatus,
+/**
+ * Ordered task results.
+ */
+results: Array<ClientRoutineResult>,
+/**
+ * Helper or destination session references by declared key.
+ */
+sessionReferences: { [key in string]?: string },
+/**
+ * Sanitized task failure.
+ */
+error: ClientRoutineFailure | null, };
+
+export type ClientRoutineInvocationDetail = {
+/**
+ * Durable invocation summary.
+ */
+summary: ClientRoutineInvocationSummary,
+/**
+ * Tasks in declaration order.
+ */
+tasks: Array<ClientRoutineTask>,
+/**
+ * Ordered terminal invocation results.
+ */
+results: Array<ClientRoutineResult>, };
+
+export type RoutineDefinitionSnapshot = {
+/**
+ * Definition watch health.
+ */
+watch: OperationSnapshot,
+/**
+ * Stable digest of the current complete projection.
+ */
+digest: string,
+/**
+ * Definitions in canonical server order.
+ */
+definitions: Array<ClientManualRoutineDefinition>, };
+
+export type RoutineHistorySnapshot = {
+/**
+ * Invocation watch health.
+ */
+watch: OperationSnapshot,
+/**
+ * Newest-first retained invocation summaries.
+ */
+recent: Array<ClientRoutineInvocationSummary>,
+/**
+ * Last successfully reduced durable event sequence.
+ */
+throughSequence: bigint | null,
+/**
+ * Exclusive admission cursor for another older page.
+ */
+olderPageToken: bigint | null,
+/**
+ * Current older-page operation.
+ */
+pagination: OperationSnapshot, };
+
+export type RoutineDetailSnapshot = {
+/**
+ * Current load status.
+ */
+status: string,
+/**
+ * Full detail when available.
+ */
+detail: ClientRoutineInvocationDetail | null,
+/**
+ * Last load error.
+ */
+error: string | null, };
+
+export type RoutineStartOperationView = {
+/**
+ * Shell-local operation key.
+ */
+operationKey: string,
+/**
+ * Correlation-only request identity.
+ */
+requestId: string,
+/**
+ * Submitted Routine name.
+ */
+routineName: string,
+/**
+ * Submitted trigger name.
+ */
+triggerName: string,
+/**
+ * Source session supplied at start only.
+ */
+sourceSessionId: string,
+/**
+ * Submitted inputs retained for validation correction.
+ */
+inputs: { [key in string]?: ClientRoutineValue },
+/**
+ * Stable local operation status.
+ */
+status: string,
+/**
+ * Associated durable server identity after admission.
+ */
+invocationId: string | null,
+/**
+ * Structured pre-admission validation failure.
+ */
+validationFailure: ClientRoutineValidationFailure | null,
+/**
+ * Transport failure before admission identity was returned.
+ */
+error: string | null, };
+
+export type RoutineSnapshot = {
+/**
+ * Global definition watch and complete ordered projection.
+ */
+definitions: RoutineDefinitionSnapshot,
+/**
+ * Durable bounded invocation history.
+ */
+history: RoutineHistorySnapshot,
+/**
+ * Authoritative bounded invocation histories by source session id.
+ */
+sessionHistories: { [key in string]?: RoutineHistorySnapshot },
+/**
+ * Bounded keyed detail loads.
+ */
+details: { [key in string]?: RoutineDetailSnapshot },
+/**
+ * Bounded local manual-start operations.
+ */
+starts: { [key in string]?: RoutineStartOperationView }, };
+
 export type ClientSnapshot = {
 /**
  * Waltr access authentication snapshot.
@@ -1376,7 +1742,11 @@ status: StatusSnapshot,
 /**
  * Session coordination snapshot.
  */
-sessions: SessionSnapshot, };
+sessions: SessionSnapshot,
+/**
+ * Session-scoped manual Routine coordination snapshot.
+ */
+routines: RoutineSnapshot, };
 
 export type ClientSessionTemplateKind = "file" | "tool" | "resource" | "prompt";
 
@@ -1516,7 +1886,55 @@ name: string, } | { "type": "setInferenceDefaults",
 /**
  * Inference defaults to store, or null to clear defaults.
  */
-defaults: InferenceDefaultsView | null, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession",
+defaults: InferenceDefaultsView | null, } | { "type": "registerRoutineDefinitionWatchInterest" } | { "type": "releaseRoutineDefinitionWatchInterest" } | { "type": "registerRoutineInvocationWatchInterest" } | { "type": "releaseRoutineInvocationWatchInterest" } | { "type": "registerSessionRoutineInvocationWatchInterest",
+/**
+ * Source session whose authoritative invocation history should be watched.
+ */
+sessionId: string, } | { "type": "releaseSessionRoutineInvocationWatchInterest",
+/**
+ * Source session whose watch interest should be released.
+ */
+sessionId: string, } | { "type": "startManualRoutine",
+/**
+ * Caller-supplied operation identity.
+ */
+operationKey: string,
+/**
+ * Correlation-only request identity.
+ */
+requestId: string,
+/**
+ * Routine name.
+ */
+routineName: string,
+/**
+ * Trigger name.
+ */
+triggerName: string,
+/**
+ * Source session identity.
+ */
+sourceSessionId: string,
+/**
+ * Typed inputs keyed by declared name.
+ */
+inputs: { [key in string]?: ClientRoutineValue }, } | { "type": "loadOlderRoutineInvocations",
+/**
+ * Correlation-only request identity.
+ */
+requestId: string,
+/**
+ * Requested page size.
+ */
+pageSize: number, } | { "type": "loadRoutineInvocationDetail",
+/**
+ * Correlation-only request identity.
+ */
+requestId: string,
+/**
+ * Durable invocation identity.
+ */
+invocationId: string, } | { "type": "registerConfigWatchInterest" } | { "type": "releaseConfigWatchInterest" } | { "type": "createSession",
 /**
  * Exact selectable agent name.
  */
