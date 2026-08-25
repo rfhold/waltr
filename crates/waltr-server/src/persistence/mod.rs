@@ -2,8 +2,10 @@
 
 mod migrations;
 mod outbound_oauth;
+pub(crate) mod routine_invocation;
 
 pub(crate) use outbound_oauth::{DurableAttemptRecord, OutboundOAuthStore};
+use routine_invocation::RoutineInvocationStore;
 
 use std::{
     env,
@@ -364,6 +366,10 @@ impl Persistence {
 
     pub(crate) fn outbound_oauth_store(&self) -> Arc<OutboundOAuthStore> {
         Arc::new(OutboundOAuthStore::new(self.pool.clone()))
+    }
+
+    pub(crate) fn routine_invocation_store(&self) -> RoutineInvocationStore {
+        RoutineInvocationStore::new(self.pool.clone())
     }
 }
 
