@@ -17,10 +17,11 @@ pub use event::{BoxAgentTimelineStream, SessionEvent, SessionEventSink, SessionE
 pub use retry::ProviderRetryConfig;
 pub use run::AgentRunBuilder;
 pub use session::{
-    AgentRuntimeProvider, AgentSession, AgentSessionActiveRunState, AgentSessionRunDisposition,
-    AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome,
-    AgentSessionRunSubmission, AgentSessionRuntime, AgentSessionRuntimeError,
-    AgentSessionRuntimeFactory, CancelReason, CredentialRefreshCoordinator, CredentialRefreshError,
+    AgentRunLimits, AgentRuntimeProvider, AgentSession, AgentSessionActiveRunState,
+    AgentSessionRunDisposition, AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput,
+    AgentSessionRunOutcome, AgentSessionRunSubmission, AgentSessionRuntime,
+    AgentSessionRuntimeError, AgentSessionRuntimeFactory, CancelReason, CredentialRefreshCoordinator,
+    CredentialRefreshError,
     CredentialStore, ExternalRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, FileCredentialStore, FilesystemSessionStore,
     InferenceProviderSettings, InferenceSettings, McpConnectionKind, McpConnectionResolveFuture,
@@ -54,6 +55,7 @@ pub struct AgentRuntime {
     pub(super) permission_policy: PermissionPolicy,
     pub(super) retry_config: ProviderRetryConfig,
     pub(super) template_base_dir: Option<std::path::PathBuf>,
+    pub(super) max_provider_turns: Option<u64>,
 }
 
 impl AgentRuntime {
@@ -134,7 +136,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use super::{
@@ -675,6 +677,69 @@ mod tests {
                 .status,
             SessionStatus::Finished
         );
+    }
+
+    #[tokio::test]
+    async fn max_provider_turns_fails_before_the_next_logical_dispatch() {
+        struct ToolThenPanicProvider {
+            requests: AtomicUsize,
+        }
+        impl crate::LlmStream for ToolThenPanicProvider {
+            fn name(&self) -> &'static str {
+                "tool_then_panic"
+            }
+
+            fn stream_request<'a>(
+                &'a self,
+                _request: CompletionRequest<'a>,
+            ) -> BoxStreamFuture<'a> {
+                let request = self.requests.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    request, 0,
+                    "provider must not receive a second logical turn"
+                );
+                Box::pin(async move {
+                    Ok(Box::pin(stream::iter(vec![
+                        Ok(CompletionEvent::ToolCall(ToolCall::new(
+                            "call-1",
+                            "missing",
+                            json!({}),
+                        ))),
+                        Ok(CompletionEvent::Finished),
+                    ])) as BoxCompletionStream)
+                })
+            }
+        }
+
+        let provider = Arc::new(ToolThenPanicProvider {
+            requests: AtomicUsize::new(0),
+        });
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = AgentRuntime::builder(model, Arc::clone(&provider))
+            .with_max_provider_turns(1)
+            .build();
+        let store = MemorySessionStore::new();
+        let sessions = SessionCoordinator::new(store.clone());
+        let session_id = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap()
+            .id()
+            .clone();
+
+        drain(
+            sessions
+                .prompt(&agent, session_id.clone(), "use a tool")
+                .stream(),
+        )
+        .await;
+
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            store.load(&session_id).await.unwrap().snapshot().status,
+            SessionStatus::Failed { message, .. }
+                if message == "maximum provider turn limit exceeded"
+        ));
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ pub(crate) use list::{SessionIncarnation, SessionListBroadcaster, SessionPublica
 #[allow(unused_imports)]
 pub use list::{SessionListEvent, SessionListSubscription, SessionListUpdate};
 pub use run::{
-    AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
+    AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
     AgentSessionRuntimeError, RunConflictPolicy,
 };

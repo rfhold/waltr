@@ -1,6 +1,6 @@
 //! Durable session run contracts.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, num::NonZeroU64};
 
 use tokio::sync::oneshot;
 
@@ -87,6 +87,22 @@ impl Error for AgentSessionRuntimeError {
 impl From<LlmError> for AgentSessionRuntimeError {
     fn from(error: LlmError) -> Self {
         Self::Agent(error)
+    }
+}
+
+/// Optional execution limits captured for one submitted agent run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentRunLimits {
+    /// Maximum logical provider turns. Stream events and transport retries do not consume turns.
+    pub max_provider_turns: Option<NonZeroU64>,
+}
+
+impl AgentRunLimits {
+    /// Limit the run to `max_provider_turns` logical provider dispatches.
+    #[must_use]
+    pub const fn with_max_provider_turns(mut self, max_provider_turns: NonZeroU64) -> Self {
+        self.max_provider_turns = Some(max_provider_turns);
+        self
     }
 }
 

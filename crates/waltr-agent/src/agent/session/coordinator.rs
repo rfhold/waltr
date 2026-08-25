@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use super::{
-    AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
+    AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
     AgentSessionRuntime, AgentSessionRuntimeFactory, ExternalResponse, InferenceSettings,
     MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy, RunOutcomeSender,
@@ -78,6 +78,7 @@ struct QueuedSessionRun {
     id: u64,
     input: AgentSessionRunInput,
     outcome_tx: RunOutcomeSender,
+    limits: AgentRunLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,7 @@ struct SessionRunStart {
     runtime: Option<AgentRuntime>,
     input: AgentSessionRunInput,
     outcome_txs: Vec<(u64, RunOutcomeSender)>,
+    limits: AgentRunLimits,
 }
 
 struct CapturedRuntimeRecord {
@@ -561,10 +563,27 @@ where
         prompt: impl Into<String>,
         policy: RunConflictPolicy,
     ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
-        self.submit(
+        self.submit_prompt_with_limits(session_id, prompt, policy, AgentRunLimits::default())
+            .await
+    }
+
+    /// Submit a prompt run with limits captured for this submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when runtime resolution or run admission fails.
+    pub async fn submit_prompt_with_limits(
+        &self,
+        session_id: SessionId,
+        prompt: impl Into<String>,
+        policy: RunConflictPolicy,
+        limits: AgentRunLimits,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.submit_with_limits(
             session_id,
             AgentSessionRunInput::Prompt(prompt.into()),
             policy,
+            limits,
         )
         .await
     }
@@ -696,12 +715,28 @@ where
     /// # Errors
     ///
     /// Returns an error when conflict policy rejects the run or runtime resolution fails.
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub async fn submit(
         &self,
         session_id: SessionId,
         input: AgentSessionRunInput,
         policy: RunConflictPolicy,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.submit_with_limits(session_id, input, policy, AgentRunLimits::default())
+            .await
+    }
+
+    /// Submit a session run with limits captured through queueing and execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when conflict policy rejects the run or runtime resolution fails.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    pub async fn submit_with_limits(
+        &self,
+        session_id: SessionId,
+        input: AgentSessionRunInput,
+        policy: RunConflictPolicy,
+        limits: AgentRunLimits,
     ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
         let (outcome_tx, outcome_rx) = oneshot::channel();
@@ -721,6 +756,7 @@ where
                             id,
                             input,
                             outcome_tx,
+                            limits,
                         });
                         disposition = AgentSessionRunDisposition::Queued {
                             position: current.queued.len(),
@@ -746,6 +782,7 @@ where
                             runtime: None,
                             input,
                             outcome_txs: vec![(id, outcome_tx)],
+                            limits,
                         });
                         disposition = AgentSessionRunDisposition::ReplacedActive;
                     }
@@ -766,6 +803,7 @@ where
                     runtime: None,
                     input,
                     outcome_txs: vec![(id, outcome_tx)],
+                    limits,
                 });
                 disposition = AgentSessionRunDisposition::Started;
             }
@@ -833,6 +871,7 @@ where
                     start.runtime,
                     session_id.clone(),
                     start.input,
+                    start.limits,
                     start.id,
                     start.token,
                 )
@@ -867,11 +906,12 @@ where
         let token = CancellationToken::new();
         let id = queued.id;
         let mut input = queued.input;
+        let limits = queued.limits;
         let mut outcome_txs = vec![(queued.id, queued.outcome_tx)];
         if let AgentSessionRunInput::Prompt(first) = input {
             let mut prompts = vec![first];
             while let Some(next) = current.queued.front() {
-                if !matches!(next.input, AgentSessionRunInput::Prompt(_)) {
+                if !matches!(next.input, AgentSessionRunInput::Prompt(_)) || next.limits != limits {
                     break;
                 }
                 let next = current.queued.pop_front().expect("queued prompt exists");
@@ -895,6 +935,7 @@ where
             runtime: None,
             input,
             outcome_txs,
+            limits,
         })
     }
 
@@ -1330,6 +1371,7 @@ async fn drain_run<S>(
     runtime: Option<AgentRuntime>,
     session_id: SessionId,
     input: AgentSessionRunInput,
+    limits: AgentRunLimits,
     run_id: u64,
     token: CancellationToken,
 ) -> RunResult
@@ -1350,7 +1392,7 @@ where
             }
         },
     };
-    let mut stream = match input {
+    let builder = match input {
         AgentSessionRunInput::Continue => {
             coordinator.resume(&runtime, session_id.clone(), ResumeInput::Continue)
         }
@@ -1377,8 +1419,8 @@ where
             ResumeInput::ToolResults(results),
         ),
     }
-    .with_cancellation_token(token.clone())
-    .stream();
+    .with_run_limits(limits);
+    let mut stream = builder.with_cancellation_token(token.clone()).stream();
 
     let mut assistant_text = String::new();
     while let Some(event) = stream.next().await {
@@ -1481,7 +1523,13 @@ fn session_store_error(error: impl std::fmt::Display) -> crate::LlmError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::{
+        num::NonZeroU64,
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+    };
 
     use futures_util::{StreamExt as _, stream};
     use serde_json::json;
@@ -1552,6 +1600,46 @@ mod tests {
                     },
                     message: "provider rejected the configured credential".to_owned(),
                 })
+            })
+        }
+    }
+
+    struct ToolThenTextProvider {
+        requests: AtomicUsize,
+    }
+
+    impl ToolThenTextProvider {
+        const fn new() -> Self {
+            Self {
+                requests: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl LlmStream for ToolThenTextProvider {
+        fn name(&self) -> &'static str {
+            "tool_then_text_provider"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            let request = self.requests.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async move {
+                let events = match request {
+                    0 => vec![
+                        Ok(CompletionEvent::ToolCall(ToolCall::new(
+                            "call-1",
+                            "missing",
+                            json!({}),
+                        ))),
+                        Ok(CompletionEvent::Finished),
+                    ],
+                    1 => vec![
+                        Ok(CompletionEvent::Delta("finished".to_owned())),
+                        Ok(CompletionEvent::Finished),
+                    ],
+                    _ => panic!("unexpected provider request {request}"),
+                };
+                Ok(Box::pin(stream::iter(events)) as BoxCompletionStream)
             })
         }
     }
@@ -2968,6 +3056,116 @@ spec:
         let snapshot = record.snapshot();
         assert_eq!(snapshot.prompts, vec!["active", "queued one", "queued two"]);
         assert_eq!(snapshot.prompt_turns[1].turn, snapshot.prompt_turns[2].turn);
+    }
+
+    #[tokio::test]
+    async fn submitted_prompt_limit_fails_before_second_logical_dispatch() {
+        let provider = Arc::new(ToolThenTextProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let session_id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+
+        let submission = sessions
+            .submit_prompt_with_limits(
+                session_id,
+                "limited",
+                RunConflictPolicy::QueueIfActive,
+                AgentRunLimits::default()
+                    .with_max_provider_turns(NonZeroU64::new(1).expect("positive limit")),
+            )
+            .await
+            .unwrap();
+        let outcome = submission.handle.wait().await.unwrap();
+
+        assert_eq!(provider.requests.load(AtomicOrdering::SeqCst), 1);
+        assert!(matches!(
+            outcome.status,
+            SessionStatus::Failed { message, .. }
+                if message == "maximum provider turn limit exceeded"
+        ));
+    }
+
+    #[tokio::test]
+    async fn existing_unlimited_prompt_submission_still_dispatches_until_finished() {
+        let provider = Arc::new(ToolThenTextProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let session_id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+
+        let submission = sessions
+            .submit_prompt(session_id, "unlimited", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let outcome = submission.handle.wait().await.unwrap();
+
+        assert_eq!(provider.requests.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(outcome.status, SessionStatus::Finished);
+        assert_eq!(outcome.assistant_text.as_deref(), Some("finished"));
+    }
+
+    #[tokio::test]
+    async fn queued_prompts_with_different_limits_are_not_coalesced() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let session_id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+        let active = sessions
+            .submit_prompt(
+                session_id.clone(),
+                "active",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+        let limited = sessions
+            .submit_prompt_with_limits(
+                session_id.clone(),
+                "limited",
+                RunConflictPolicy::QueueIfActive,
+                AgentRunLimits::default()
+                    .with_max_provider_turns(NonZeroU64::new(1).expect("positive limit")),
+            )
+            .await
+            .unwrap();
+        let unlimited = sessions
+            .submit_prompt(session_id, "unlimited", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+
+        provider.release_active();
+        active.handle.wait().await.unwrap();
+        limited.handle.wait().await.unwrap();
+        unlimited.handle.wait().await.unwrap();
+        provider.wait_for_request_count(3).await;
+
+        let requests = provider.requests.lock().await.clone();
+        assert_eq!(requests[1].last().map(String::as_str), Some("limited"));
+        assert_eq!(requests[2].last().map(String::as_str), Some("unlimited"));
     }
 
     #[tokio::test]

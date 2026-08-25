@@ -44,6 +44,7 @@ pub struct AgentRuntimeBuilder {
     retry_config: ProviderRetryConfig,
     template_base_dir: Option<PathBuf>,
     file_templates: bool,
+    max_provider_turns: Option<u64>,
 }
 
 impl AgentRuntimeBuilder {
@@ -75,6 +76,7 @@ impl AgentRuntimeBuilder {
             retry_config: ProviderRetryConfig::default(),
             template_base_dir: None,
             file_templates: true,
+            max_provider_turns: None,
         }
     }
 
@@ -259,6 +261,13 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Limit logical provider turns for each run. Transport retries do not consume the limit.
+    #[must_use]
+    pub const fn with_max_provider_turns(mut self, max_provider_turns: u64) -> Self {
+        self.max_provider_turns = Some(max_provider_turns);
+        self
+    }
+
     /// Set the base directory used for prompt template file references.
     #[must_use]
     pub fn with_template_base_dir(mut self, path: impl Into<PathBuf>) -> Self {
@@ -317,6 +326,7 @@ impl AgentRuntimeBuilder {
             permission_policy: self.permission_policy,
             retry_config: self.retry_config,
             template_base_dir: self.template_base_dir,
+            max_provider_turns: self.max_provider_turns,
         }
     }
 }
@@ -345,6 +355,7 @@ impl fmt::Debug for AgentRuntimeBuilder {
             .field("retry_config", &self.retry_config)
             .field("template_base_dir", &self.template_base_dir)
             .field("file_templates", &self.file_templates)
+            .field("max_provider_turns", &self.max_provider_turns)
             .finish()
     }
 }

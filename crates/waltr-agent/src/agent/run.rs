@@ -1,6 +1,7 @@
 //! Per-run agent configuration.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
+use std::sync::Arc;
 
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
@@ -8,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::PermissionPolicy;
 
 use super::session::{
-    EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId, SessionRunContext, SessionStore,
+    AgentRunLimits, EphemeralSessionRun, MemorySessionStore, ResumeInput, SessionId,
+    SessionRunContext, SessionStore,
 };
 use super::{AgentRuntime, AgentTool, BoxAgentTimelineStream, r#loop::AgentLoopState};
 use crate::middleware::{
@@ -120,6 +122,20 @@ where
         self
     }
 
+    /// Apply per-run execution limits without loosening runtime-configured limits.
+    #[must_use]
+    pub fn with_run_limits(mut self, limits: AgentRunLimits) -> Self {
+        if let Some(limit) = limits.max_provider_turns {
+            let limit = limit.get();
+            self.runtime.max_provider_turns = Some(
+                self.runtime
+                    .max_provider_turns
+                    .map_or(limit, |configured| configured.min(limit)),
+            );
+        }
+        self
+    }
+
     /// Deliver post-durability semantic session events to `sink`.
     #[must_use]
     pub fn with_session_event_sink(mut self, sink: Arc<dyn crate::SessionEventSink>) -> Self {
@@ -196,6 +212,7 @@ where
             permission_policy,
             retry_config,
             template_base_dir,
+            max_provider_turns,
         } = runtime;
 
         let middleware_chain = if extra_tools.is_empty() {
@@ -222,6 +239,7 @@ where
             permission_policy,
             retry_config,
             template_base_dir,
+            max_provider_turns,
             session_id,
             session_store,
             session_run_context,
