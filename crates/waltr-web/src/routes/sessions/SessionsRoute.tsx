@@ -39,6 +39,7 @@ import type {
   SessionView,
   TimestampView,
 } from "../../generated/waltr-client";
+import { SessionCommandPalette } from "./SessionCommandPalette";
 
 const TIMELINE_CHANNELS = [
   "user_text",
@@ -3145,6 +3146,7 @@ function SessionDetailStatusBar(props: {
       <Show when={reasoningEffortError()}>
         {(message) => <span class="sessions__detail-status-error">{message()}</span>}
       </Show>
+      <SessionCommandPalette sessionId={props.session.id} />
       <SessionDeleteAction session={props.session} compact />
     </footer>
   );
