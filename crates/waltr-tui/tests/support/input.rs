@@ -19,6 +19,14 @@ pub const fn ctrl_t_press() -> AppEvent {
     )))
 }
 
+pub const fn ctrl_p_press() -> AppEvent {
+    AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
+        KeyCode::Char('p'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Press,
+    )))
+}
+
 pub const fn char_press(character: char) -> AppEvent {
     AppEvent::Input(InputEvent::Key(KeyEvent::new_with_kind(
         KeyCode::Char(character),

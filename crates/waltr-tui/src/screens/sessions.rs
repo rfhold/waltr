@@ -1,6 +1,7 @@
 //! Session list/detail surface: state, input, and rendering.
 
 mod agent_selector;
+mod command_palette;
 mod composer;
 mod context;
 mod inference_editor;
@@ -34,6 +35,7 @@ use crate::{
 
 use self::{
     agent_selector::{AgentSelector, AgentSelectorPurpose, render_agent_selector},
+    command_palette::{PaletteAction, SessionCommandPalette},
     composer::{
         composer_cursor_at_line_column, composer_cursor_line_column, composer_line_count,
         composer_line_end, composer_line_start, composer_visible_input_line_count, render_composer,
@@ -107,6 +109,8 @@ pub struct SessionsSection {
     rollback: OperationTracker,
     continue_session: OperationTracker,
     rollback_modal: Option<RollbackModal>,
+    command_palette: Option<SessionCommandPalette>,
+    routine_navigation: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -241,6 +245,8 @@ impl SessionsSection {
             rollback: OperationTracker::new(),
             continue_session: OperationTracker::new(),
             rollback_modal: None,
+            command_palette: None,
+            routine_navigation: None,
         }
     }
 
@@ -260,6 +266,20 @@ impl SessionsSection {
     #[must_use]
     pub const fn in_detail(&self) -> bool {
         self.detail_session_id.is_some()
+    }
+
+    /// Whether the active session command palette owns terminal input.
+    #[must_use]
+    pub const fn session_commands_open(&self) -> bool {
+        self.command_palette.is_some()
+    }
+
+    /// Whether an invocation from the command palette blocks dismissal.
+    #[must_use]
+    pub fn session_commands_pending(&self) -> bool {
+        self.command_palette
+            .as_ref()
+            .is_some_and(SessionCommandPalette::pending)
     }
 
     /// Return the active detail status that should override the global shell footer.
@@ -293,6 +313,9 @@ impl SessionsSection {
         reason = "operation reconciliation is one ordered snapshot transition"
     )]
     pub fn reconcile_operations(&mut self, snapshot: &ClientSnapshot) {
+        if let Some(palette) = &mut self.command_palette {
+            palette.reconcile(snapshot);
+        }
         if let Some(Ok(Some(session))) = self.create.reconcile(
             &snapshot.sessions.create,
             snapshot,
@@ -562,6 +585,13 @@ impl SessionsSection {
 
     /// Dismiss the active transient overlay. Returns true when handled.
     pub fn dismiss_overlay(&mut self) -> bool {
+        if self.command_palette.is_some() {
+            if !self.session_commands_pending() {
+                self.command_palette = None;
+            }
+            return true;
+        }
+
         if self.has_pending_operation() {
             return true;
         }
@@ -650,6 +680,36 @@ impl SessionsSection {
         request_agents_if_needed(Some(snapshot))
     }
 
+    /// Open dynamic manual commands for the active detail session.
+    pub fn open_session_commands(&mut self, _snapshot: Option<&ClientSnapshot>) -> SectionAction {
+        if self.has_pending_operation()
+            || self.command_palette.is_some()
+            || self.inference_editor.is_some()
+            || self.pending_inference_editor
+            || self.agent_selector.is_some()
+            || self.rollback_modal.is_some()
+            || self.delete_session_id.is_some()
+        {
+            return SectionAction::Continue;
+        }
+        let Some(source_session_id) = self.detail_session_id.clone() else {
+            return SectionAction::Continue;
+        };
+        let (palette, action) = SessionCommandPalette::open(source_session_id);
+        self.command_palette = Some(palette);
+        action
+    }
+
+    /// Close the palette and its exact operation tracker after access loss.
+    pub fn clear_session_commands(&mut self) -> bool {
+        self.command_palette.take().is_some()
+    }
+
+    /// Take an accepted invocation selected for global Routine navigation.
+    pub fn take_routine_navigation(&mut self) -> Option<String> {
+        self.routine_navigation.take()
+    }
+
     /// Route a key event into the sessions section.
     pub fn handle_key(
         &mut self,
@@ -657,6 +717,21 @@ impl SessionsSection {
         snapshot: Option<&ClientSnapshot>,
         area: Option<Rect>,
     ) -> SectionAction {
+        if let Some(palette) = &mut self.command_palette {
+            return match palette.handle_key(key, snapshot) {
+                PaletteAction::Handled(action) => action,
+                PaletteAction::Close(action) => {
+                    self.command_palette = None;
+                    action
+                }
+                PaletteAction::Navigate(invocation_id, action) => {
+                    self.command_palette = None;
+                    self.routine_navigation = Some(invocation_id);
+                    action
+                }
+            };
+        }
+
         if self.has_pending_operation() {
             return SectionAction::Continue;
         }
@@ -1462,6 +1537,7 @@ impl SessionsSection {
         self.continue_session.clear();
         self.agent_update.clear();
         self.rollback_modal = None;
+        self.command_palette = None;
     }
 
     fn detail_timeline_area(&self, snapshot: Option<&ClientSnapshot>, area: Rect) -> Option<Rect> {
@@ -1628,6 +1704,10 @@ impl SessionsSection {
         if self.agent_selector.is_some() {
             render_agent_selector(frame, area, self, snapshot);
         }
+
+        if let Some(palette) = &self.command_palette {
+            palette.render(frame, area, snapshot);
+        }
     }
 
     fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, snapshot: Option<&ClientSnapshot>) {
@@ -1681,14 +1761,16 @@ impl SessionsSection {
             render_composer(frame, response_area, self, snapshot, &session);
         }
 
-        render_session_context(
-            frame,
-            detail_areas.context,
-            snapshot,
-            &session,
-            latest_context_tokens(timeline),
-            main_area.width < DETAIL_CONTEXT_WIDE_BREAKPOINT,
-        );
+        if self.command_palette.is_none() {
+            render_session_context(
+                frame,
+                detail_areas.context,
+                snapshot,
+                &session,
+                latest_context_tokens(timeline),
+                main_area.width < DETAIL_CONTEXT_WIDE_BREAKPOINT,
+            );
+        }
 
         if status_height(snapshot, self) > 0 {
             frame.render_widget(status_widget(snapshot, self), error_area);
@@ -1704,6 +1786,10 @@ impl SessionsSection {
 
         if self.agent_selector.is_some() {
             render_agent_selector(frame, area, self, snapshot);
+        }
+
+        if let Some(palette) = &self.command_palette {
+            palette.render(frame, area, snapshot);
         }
     }
 

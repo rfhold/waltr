@@ -173,6 +173,12 @@ impl App {
 
     fn handle_input_event(&mut self, input: InputEvent, now: Instant) -> AppAction {
         match input {
+            InputEvent::CtrlC
+                if self.screen == AppScreen::Sessions
+                    && self.sessions_section.session_commands_pending() =>
+            {
+                AppAction::Continue
+            }
             InputEvent::CtrlC => self.handle_close_intent(CloseIntent::CtrlC, now),
             InputEvent::Key(key) if self.screen == AppScreen::Access => self.handle_access_key(key),
             InputEvent::Key(key) if self.outbound_auth_target().is_some() => {
@@ -717,6 +723,21 @@ impl App {
                 ])
             }
             KeyCommand::Escape => self.handle_close_intent(CloseIntent::Escape, now),
+            KeyCommand::SessionCommands => {
+                if self.screen == AppScreen::Sessions {
+                    return match self
+                        .sessions_section
+                        .open_session_commands(self.client_snapshot.as_ref())
+                    {
+                        SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                        SectionAction::ClientCommands(commands) => {
+                            AppAction::ClientCommands(commands)
+                        }
+                        SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+                    };
+                }
+                AppAction::Continue
+            }
             KeyCommand::Leader => {
                 self.leader_armed = true;
                 AppAction::Continue
@@ -1019,6 +1040,7 @@ impl App {
             self.config_auth.complete_attempt(&target);
         }
 
+        let palette_before = self.sessions_section.session_commands_open();
         let detail_before = self.sessions_section.detail_session_id().map(str::to_owned);
         let mut commands = Vec::new();
 
@@ -1026,6 +1048,9 @@ impl App {
             snapshot.access.status,
             AccessStatus::LoginRequired | AccessStatus::LoginFailed | AccessStatus::LoginInProgress
         ) {
+            if self.sessions_section.clear_session_commands() {
+                commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
+            }
             if snapshot.access.status == AccessStatus::LoginRequired && self.has_native_credential {
                 self.has_native_credential = false;
                 commands.push(ClientCommand::ReprobeWaltrAccess);
@@ -1103,6 +1128,12 @@ impl App {
         }
 
         let detail_after = self.sessions_section.detail_session_id().map(str::to_owned);
+        if snapshot.access.status == AccessStatus::Authenticated
+            && palette_before
+            && !self.sessions_section.session_commands_open()
+        {
+            commands.push(ClientCommand::ReleaseRoutineDefinitionWatchInterest);
+        }
 
         self.client_snapshot = Some(snapshot);
 
@@ -1289,6 +1320,40 @@ impl App {
     }
 
     fn handle_sessions_key(&mut self, key: KeyEvent, now: Instant) -> AppAction {
+        if self.sessions_section.session_commands_open() {
+            let action = self.sessions_section.handle_key(
+                key,
+                self.client_snapshot.as_ref(),
+                Some(sessions_body_area()),
+            );
+            if let Some(invocation_id) = self.sessions_section.take_routine_navigation() {
+                let detail_session_id = self.sessions_section.clear_detail_route();
+                self.screen = AppScreen::Routines;
+                let mut commands = match action {
+                    SectionAction::ClientCommand(command) => vec![command],
+                    SectionAction::ClientCommands(commands) => commands,
+                    SectionAction::Continue | SectionAction::Unhandled => Vec::new(),
+                };
+                if let Some(session_id) = detail_session_id {
+                    commands.push(ClientCommand::ReleaseSessionTimelineWatchInterest {
+                        session_id: session_id.clone(),
+                    });
+                    commands.push(
+                        ClientCommand::ReleaseSessionRoutineInvocationWatchInterest { session_id },
+                    );
+                }
+                commands.push(ClientCommand::ReleaseSessionWatchInterest);
+                commands.push(ClientCommand::RegisterRoutineDefinitionWatchInterest);
+                commands.push(ClientCommand::RegisterRoutineInvocationWatchInterest);
+                commands.push(self.routines_section.focus_invocation(invocation_id));
+                return AppAction::from_commands(commands);
+            }
+            return match action {
+                SectionAction::ClientCommand(command) => AppAction::ClientCommand(command),
+                SectionAction::ClientCommands(commands) => AppAction::ClientCommands(commands),
+                SectionAction::Continue | SectionAction::Unhandled => AppAction::Continue,
+            };
+        }
         let command = key_command(key, self.leader_armed);
         if !matches!(command, KeyCommand::None) {
             return self.handle_key_command(command, now);
@@ -1325,6 +1390,9 @@ impl App {
     }
 
     fn handle_sessions_mouse(&mut self, mouse: MouseEvent) -> AppAction {
+        if self.sessions_section.session_commands_open() {
+            return AppAction::Continue;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => self.handle_sessions_scroll(1),
             MouseEventKind::ScrollDown => self.handle_sessions_scroll(-1),
@@ -1346,6 +1414,9 @@ impl App {
     }
 
     fn handle_sessions_scroll(&mut self, delta: i32) -> AppAction {
+        if self.sessions_section.session_commands_open() {
+            return AppAction::Continue;
+        }
         let area = sessions_body_area();
         match self
             .sessions_section

@@ -271,6 +271,97 @@ fn routine_definition(
     }
 }
 
+fn string_routine_input(name: &str, required: bool) -> ClientRoutineInputDefinition {
+    ClientRoutineInputDefinition {
+        name: name.to_owned(),
+        r#type: ClientRoutineValueType::String,
+        required,
+        minimum_string_length: None,
+        string_pattern: None,
+    }
+}
+
+fn boolean_routine_input(name: &str) -> ClientRoutineInputDefinition {
+    ClientRoutineInputDefinition {
+        name: name.to_owned(),
+        r#type: ClientRoutineValueType::Boolean,
+        required: false,
+        minimum_string_length: None,
+        string_pattern: None,
+    }
+}
+
+fn routine_catalog_snapshot(
+    session_id: &str,
+    status: &'static str,
+    definitions: Vec<ClientManualRoutineDefinition>,
+    error: Option<&str>,
+) -> ClientSnapshot {
+    let mut snapshot = watched_session_with_timeline(session_view(session_id, 1), Vec::new());
+    snapshot.routines.definitions.watch.status = if status == "ready" {
+        "received"
+    } else {
+        status
+    };
+    snapshot.routines.definitions.watch.error = error.map(str::to_owned);
+    snapshot.routines.definitions.definitions = definitions;
+    snapshot
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture exposes every keyed invocation fact varied by palette tests"
+)]
+fn routine_invocation_snapshot(
+    mut snapshot: ClientSnapshot,
+    operation_key: &str,
+    request_id: &str,
+    session_id: &str,
+    status: &'static str,
+    validation_failure: Option<ClientRoutineValidationFailure>,
+    error: Option<&str>,
+    results: Vec<ClientRoutineResult>,
+) -> ClientSnapshot {
+    let invocation_id = "server-invocation".to_owned();
+    snapshot.routines.starts.insert(
+        operation_key.to_owned(),
+        RoutineStartOperationView {
+            operation_key: operation_key.to_owned(),
+            request_id: request_id.to_owned(),
+            routine_name: "generic".to_owned(),
+            trigger_name: "manual".to_owned(),
+            source_session_id: session_id.to_owned(),
+            inputs: BTreeMap::new(),
+            status,
+            invocation_id: (status == "ready").then_some(invocation_id.clone()),
+            validation_failure,
+            error: error.map(str::to_owned),
+        },
+    );
+    if status == "ready" {
+        let detail = routine_detail(
+            &invocation_id,
+            ClientRoutineInvocationStatus::Succeeded,
+            results,
+        );
+        snapshot.routines.history.watch.status = "received";
+        snapshot.routines.history.recent = vec![detail.summary.clone()];
+        snapshot.routines.session_histories.insert(
+            session_id.to_owned(),
+            snapshot.routines.history.clone(),
+        );
+        snapshot.routines.details.insert(
+            invocation_id,
+            RoutineDetailSnapshot {
+                status: "ready",
+                detail: Some(detail),
+                error: None,
+            },
+        );
+    }
+    snapshot
+}
+
 fn routine_detail(
     invocation_id: &str,
     status: ClientRoutineInvocationStatus,
@@ -312,6 +403,691 @@ fn routine_detail(
         }],
         results,
     }
+}
+
+fn open_routine_palette(app: &mut App, now: Instant) -> AppAction {
+    drop(app.handle_event(&right_press(), now));
+    app.handle_event(&ctrl_p_press(), now)
+}
+
+fn invoke_selected_string_routine(
+    app: &mut App,
+    now: Instant,
+    first_line: &str,
+    second_line: &str,
+) -> AppAction {
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+    for character in first_line.chars() {
+        drop(app.handle_event(&char_press(character), now));
+    }
+    drop(app.handle_event(&enter_press(), now));
+    for character in second_line.chars() {
+        drop(app.handle_event(&char_press(character), now));
+    }
+    drop(app.handle_event(&tab_press(), now));
+    app.handle_event(&enter_press(), now)
+}
+
+#[test]
+fn session_commands_ctrl_p_is_gated_to_unowned_session_detail_and_old_chord_is_removed() {
+    let now = Instant::now();
+    let mut landing = App::new();
+    drop(landing.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now));
+    assert_eq!(landing.handle_event(&ctrl_p_press(), now), AppAction::Continue);
+
+    let snapshot = routine_catalog_snapshot("source", "ready", Vec::new(), None);
+    let mut list = open_sessions_app_with(snapshot.clone());
+    assert_eq!(list.handle_event(&ctrl_p_press(), now), AppAction::Continue);
+    assert!(!render_app(&list).contains("Session commands"));
+
+    let mut detail = open_sessions_app_with(snapshot);
+    assert!(matches!(
+        open_routine_palette(&mut detail, now),
+        AppAction::ClientCommands(_)
+    ));
+    assert!(render_app(&detail).contains("Session commands"));
+
+    drop(detail.handle_event(&escape_press(), now));
+    drop(detail.handle_event(&ctrl_x_press(), now));
+    assert_eq!(detail.handle_event(&char_press('r'), now), AppAction::Continue);
+    assert!(!render_app(&detail).contains("Session commands"));
+
+    drop(detail.handle_event(&ctrl_x_press(), now));
+    drop(detail.handle_event(&char_press('p'), now));
+    assert_eq!(detail.handle_event(&ctrl_p_press(), now), AppAction::Continue);
+    assert!(!render_app(&detail).contains("Session commands"));
+}
+
+#[test]
+fn session_commands_definition_watch_loading_empty_and_failure() {
+    let now = Instant::now();
+    let base = watched_session_with_timeline(session_view("source", 1), Vec::new());
+    let mut app = open_sessions_app_with(base);
+    assert!(matches!(
+        open_routine_palette(&mut app, now),
+        AppAction::ClientCommands(_)
+    ));
+    assert!(render_app(&app).contains("Loading session commands..."));
+
+    let failed = routine_catalog_snapshot("source", "failed", Vec::new(), Some("offline"));
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed)), now));
+    assert!(render_app(&app).contains("offline"));
+    assert_eq!(app.handle_event(&char_press('r'), now), AppAction::Continue);
+
+    let retained = routine_catalog_snapshot(
+        "source",
+        "failed",
+        vec![routine_definition(
+            "generic",
+            "Retained command",
+            "Still available while reconnecting",
+            Vec::new(),
+        )],
+        Some("reconnecting"),
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(retained)), now),
+        AppAction::Continue
+    );
+    let rendered = render_app(&app);
+    assert!(rendered.contains("reconnecting"), "{rendered}");
+    assert!(rendered.contains("Retained command"), "{rendered}");
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            routine_name,
+            ..
+        }) if routine_name == "generic"
+    ));
+
+    let mut app = open_sessions_app_with(routine_catalog_snapshot(
+        "source",
+        "ready",
+        Vec::new(),
+        None,
+    ));
+    drop(open_routine_palette(&mut app, now));
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+
+    let empty = routine_catalog_snapshot("source", "ready", Vec::new(), None);
+    drop(app.handle_event(&AppEvent::Client(Box::new(empty)), now));
+    assert!(render_app(&app).contains("No session commands available."));
+}
+
+#[test]
+fn session_commands_searches_dynamic_definitions_and_toggles_boolean() {
+    let definitions = vec![
+        routine_definition("archive", "Archive", "Store this conversation", Vec::new()),
+        routine_definition(
+            "generic",
+            "Branch work",
+            "Continue in another session",
+            vec![boolean_routine_input("include-context")],
+        ),
+    ];
+    let mut app = open_sessions_app_with(routine_catalog_snapshot(
+        "source",
+        "ready",
+        definitions,
+        None,
+    ));
+    let now = Instant::now();
+    assert!(matches!(
+        open_routine_palette(&mut app, now),
+        AppAction::ClientCommands(_)
+    ));
+    for character in "another".chars() {
+        drop(app.handle_event(&char_press(character), now));
+    }
+    let rendered = render_app(&app);
+    assert!(rendered.contains("Branch work"), "{rendered}");
+    assert!(!rendered.contains("Archive"), "{rendered}");
+    drop(app.handle_event(&enter_press(), now));
+    assert!(render_app(&app).contains("[ ] false"));
+    drop(app.handle_event(&char_press(' '), now));
+    drop(app.handle_event(&tab_press(), now));
+    let action = app.handle_event(&enter_press(), now);
+    assert!(matches!(
+        action,
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine { inputs, .. })
+            if inputs.get("include-context") == Some(&ClientRoutineValue::Boolean(true))
+    ));
+}
+
+#[test]
+fn session_commands_validate_and_submit_exact_multiline_bytes() {
+    let definition = routine_definition(
+        "generic",
+        "Generic command",
+        "Runs declared work",
+        vec![string_routine_input("direction", true)],
+    );
+    let mut app = open_sessions_app_with(routine_catalog_snapshot(
+        "source",
+        "ready",
+        vec![definition],
+        None,
+    ));
+    let now = Instant::now();
+    assert!(matches!(
+        open_routine_palette(&mut app, now),
+        AppAction::ClientCommands(_)
+    ));
+    drop(app.handle_event(&enter_press(), now));
+    drop(app.handle_event(&char_press(' '), now));
+    drop(app.handle_event(&tab_press(), now));
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+    assert!(render_app(&app).contains("Required."));
+    drop(app.handle_event(&back_tab_press(), now));
+    drop(app.handle_event(&end_press(), now));
+    drop(app.handle_event(&char_press('a'), now));
+    drop(app.handle_event(&enter_press(), now));
+    drop(app.handle_event(&char_press('b'), now));
+    drop(app.handle_event(&char_press(' '), now));
+    drop(app.handle_event(&tab_press(), now));
+    let action = app.handle_event(&enter_press(), now);
+    assert!(matches!(
+        action,
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            source_session_id: session_id,
+            inputs,
+            ..
+        }) if session_id == "source"
+            && inputs.get("direction")
+                == Some(&ClientRoutineValue::String(" a\nb ".to_owned()))
+    ));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario proves the complete keyed invocation lifecycle"
+)]
+fn session_commands_pending_stale_failure_retry_and_result_are_isolated() {
+    let definition = routine_definition(
+        "generic",
+        "Generic command",
+        "Runs declared work",
+        vec![string_routine_input("direction", true)],
+    );
+    let base = routine_catalog_snapshot("source", "ready", vec![definition], None);
+    let mut app = open_sessions_app_with(base.clone());
+    let now = Instant::now();
+    assert!(matches!(
+        open_routine_palette(&mut app, now),
+        AppAction::ClientCommands(_)
+    ));
+    let first = invoke_selected_string_routine(&mut app, now, "keep", "draft");
+    let (first_key, first_request) = match first {
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            operation_key,
+            request_id,
+            ..
+        }) => (operation_key, request_id),
+        action => panic!("expected invocation, saw {action:?}"),
+    };
+    assert_eq!(app.handle_event(&enter_press(), now), AppAction::Continue);
+    assert_eq!(app.handle_event(&escape_press(), now), AppAction::Continue);
+    assert_eq!(
+        app.handle_event(&AppEvent::Input(InputEvent::CtrlC), now),
+        AppAction::Continue
+    );
+    assert!(render_app(&app).contains("Running command..."));
+
+    let stale = routine_invocation_snapshot(
+        base.clone(),
+        "foreign-key",
+        "foreign-request",
+        "other-source",
+        "ready",
+        None,
+        None,
+        vec![ClientRoutineResult {
+            name: "session-id".to_owned(),
+            value: ClientRoutineValue::String("foreign-result".to_owned()),
+        }],
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(stale)), now));
+    assert!(render_app(&app).contains("Running command..."));
+
+    let failed = routine_invocation_snapshot(
+        base.clone(),
+        &first_key,
+        &first_request,
+        "source",
+        "failed",
+        Some(ClientRoutineValidationFailure {
+            message: "Check command inputs.".to_owned(),
+            violations: vec![ClientRoutineFieldViolation {
+                field_path: "inputs.direction".to_owned(),
+                message: "Direction was rejected.".to_owned(),
+            }],
+        }),
+        None,
+        Vec::new(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed)), now));
+    let rendered = render_app(&app);
+    assert!(rendered.contains("keep\\ndraft"), "{rendered}");
+    assert!(rendered.contains("Direction was rejected."), "{rendered}");
+    let retry = app.handle_event(&enter_press(), now);
+    let (retry_key, retry_request) = match retry {
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            operation_key,
+            request_id,
+            ..
+        }) => (operation_key, request_id),
+        action => panic!("expected retry, saw {action:?}"),
+    };
+    assert_ne!(retry_key, first_key);
+    assert_ne!(retry_request, first_request);
+
+    let ready = routine_invocation_snapshot(
+        base,
+        &retry_key,
+        &retry_request,
+        "source",
+        "ready",
+        None,
+        None,
+        vec![ClientRoutineResult {
+            name: "session-id".to_owned(),
+            value: ClientRoutineValue::String("destination".to_owned()),
+        }],
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(ready)), now));
+    assert_eq!(app.sessions_section().detail_session_id(), Some("source"));
+    let rendered = render_app(&app);
+    assert!(rendered.contains("Command accepted"), "{rendered}");
+    assert!(rendered.contains("Invocation server-invocation"), "{rendered}");
+    assert_eq!(
+        app.handle_event(&escape_press(), now),
+        AppAction::ClientCommand(ClientCommand::ReleaseRoutineDefinitionWatchInterest)
+    );
+    assert!(!render_app(&app).contains("Session commands"));
+    assert_eq!(app.sessions_section().detail_session_id(), Some("source"));
+}
+
+#[test]
+fn session_commands_navigates_exact_accepted_id_and_loads_detail_outside_recent_history() {
+    let definition = routine_definition(
+        "generic",
+        "Generic command",
+        "Runs declared work",
+        Vec::new(),
+    );
+    let base = routine_catalog_snapshot("source", "ready", vec![definition], None);
+    let mut app = open_sessions_app_with(base.clone());
+    let now = Instant::now();
+    drop(open_routine_palette(&mut app, now));
+    drop(app.handle_event(&enter_press(), now));
+    let action = app.handle_event(&enter_press(), now);
+    let (operation_key, request_id) = match action {
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            operation_key,
+            request_id,
+            ..
+        }) => (operation_key, request_id),
+        action => panic!("expected durable start, saw {action:?}"),
+    };
+
+    let mut changed = base.clone();
+    changed.routines.definitions.definitions = vec![routine_definition(
+        "generic",
+        "Changed live command",
+        "A replacement must not mutate the open form",
+        Vec::new(),
+    )];
+    changed.routines.starts.insert(
+        operation_key.clone(),
+        RoutineStartOperationView {
+            operation_key: operation_key.clone(),
+            request_id: request_id.clone(),
+            routine_name: "generic".to_owned(),
+            trigger_name: "manual".to_owned(),
+            source_session_id: "source".to_owned(),
+            inputs: BTreeMap::new(),
+            status: "loading",
+            invocation_id: None,
+            validation_failure: None,
+            error: None,
+        },
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(changed)), now),
+        AppAction::Continue
+    );
+    let rendered = render_app(&app);
+    assert!(rendered.contains("Generic command"), "{rendered}");
+    assert!(!rendered.contains("Changed live command"), "{rendered}");
+
+    let mut running = base.clone();
+    running.routines.definitions.definitions.clear();
+    running.routines.starts.insert(
+        operation_key.clone(),
+        RoutineStartOperationView {
+            operation_key: operation_key.clone(),
+            request_id: request_id.clone(),
+            routine_name: "generic".to_owned(),
+            trigger_name: "manual".to_owned(),
+            source_session_id: "source".to_owned(),
+            inputs: BTreeMap::new(),
+            status: "ready",
+            invocation_id: Some("server-issued-id".to_owned()),
+            validation_failure: None,
+            error: None,
+        },
+    );
+    let mut detail = routine_detail(
+        "server-issued-id",
+        ClientRoutineInvocationStatus::Running,
+        Vec::new(),
+    );
+    detail.tasks = vec![
+        ClientRoutineTask {
+            name: "pending".to_owned(),
+            r#type: "action".to_owned(),
+            status: ClientRoutineTaskStatus::Pending,
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: None,
+        },
+        ClientRoutineTask {
+            name: "active".to_owned(),
+            r#type: "action".to_owned(),
+            status: ClientRoutineTaskStatus::Running,
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: None,
+        },
+    ];
+    running.routines.history.watch.status = "received";
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(running.clone())), now),
+        AppAction::Continue
+    );
+    let rendered = render_app(&app);
+    assert!(
+        rendered.contains("Invocation server-issued-id"),
+        "{rendered}"
+    );
+    let action = app.handle_event(&enter_press(), now);
+    let initial_detail_request = match &action {
+        AppAction::ClientCommands(commands) => match commands.last() {
+            Some(ClientCommand::LoadRoutineInvocationDetail { request_id, .. }) => {
+                request_id.clone()
+            }
+            command => panic!("expected initial detail request, saw {command:?}"),
+        },
+        action => panic!("expected navigation commands, saw {action:?}"),
+    };
+    assert!(matches!(
+        &action,
+        AppAction::ClientCommands(commands)
+            if commands.len() == 7
+                && commands[0] == ClientCommand::ReleaseRoutineDefinitionWatchInterest
+                && commands[1] == ClientCommand::ReleaseSessionTimelineWatchInterest {
+                    session_id: "source".to_owned(),
+                }
+                && commands[2] == ClientCommand::ReleaseSessionRoutineInvocationWatchInterest {
+                    session_id: "source".to_owned(),
+                }
+                && commands[3] == ClientCommand::ReleaseSessionWatchInterest
+                && commands[4] == ClientCommand::RegisterRoutineDefinitionWatchInterest
+                && commands[5] == ClientCommand::RegisterRoutineInvocationWatchInterest
+                && matches!(
+                    &commands[6],
+                    ClientCommand::LoadRoutineInvocationDetail { invocation_id, .. }
+                        if invocation_id == "server-issued-id"
+                )
+    ));
+    assert_eq!(app.screen(), AppScreen::Routines);
+    let rendered = render_app(&app);
+    assert!(rendered.contains("server-issued-id"), "{rendered}");
+    assert!(rendered.contains("Enter load task detail"), "{rendered}");
+
+    let mut failed = running.clone();
+    failed.routines.details.insert(
+        "server-issued-id".to_owned(),
+        RoutineDetailSnapshot {
+            status: "failed",
+            detail: None,
+            error: Some("detail unavailable".to_owned()),
+        },
+    );
+    assert_eq!(
+        app.handle_event(&AppEvent::Client(Box::new(failed)), now),
+        AppAction::Continue
+    );
+    let rendered = render_app(&app);
+    assert!(rendered.contains("detail unavailable"), "{rendered}");
+    assert!(rendered.contains("Enter retry"), "{rendered}");
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::LoadRoutineInvocationDetail {
+            request_id,
+            invocation_id,
+        }) if invocation_id == "server-issued-id" && request_id != initial_detail_request
+    ));
+
+    detail.summary.status = ClientRoutineInvocationStatus::Interrupted;
+    detail.summary.terminal_error = Some(ClientRoutineFailure {
+        code: "restart".to_owned(),
+        message: "server restart\ninterrupted work".to_owned(),
+    });
+    detail.tasks = vec![
+        ClientRoutineTask {
+            name: "done".to_owned(),
+            r#type: "action".to_owned(),
+            status: ClientRoutineTaskStatus::Succeeded,
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: None,
+        },
+        ClientRoutineTask {
+            name: "skipped".to_owned(),
+            r#type: "action".to_owned(),
+            status: ClientRoutineTaskStatus::Skipped,
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: None,
+        },
+        ClientRoutineTask {
+            name: "blocked".to_owned(),
+            r#type: "action".to_owned(),
+            status: ClientRoutineTaskStatus::Blocked,
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: Some(ClientRoutineFailure {
+                code: "blocked".to_owned(),
+                message: "dependency failed".to_owned(),
+            }),
+        },
+        ClientRoutineTask {
+            name: "failed".to_owned(),
+            r#type: "action".to_owned(),
+            status: ClientRoutineTaskStatus::Failed,
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: Some(ClientRoutineFailure {
+                code: "failed".to_owned(),
+                message: "safe failure".to_owned(),
+            }),
+        },
+        ClientRoutineTask {
+            name: "interrupted".to_owned(),
+            r#type: "action".to_owned(),
+            status: ClientRoutineTaskStatus::Interrupted,
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: None,
+        },
+    ];
+    running.routines.history.recent = vec![detail.summary.clone()];
+    running.routines.details.insert(
+        "server-issued-id".to_owned(),
+        RoutineDetailSnapshot {
+            status: "ready",
+            detail: Some(detail),
+            error: None,
+        },
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(running)), now));
+    let rendered = render_app(&app);
+    for status in ["Succeeded", "Skipped", "Blocked", "Failed", "Interrupted"] {
+        assert!(rendered.contains(status), "missing {status}: {rendered}");
+    }
+    assert!(
+        rendered.contains("server restart interrupted work"),
+        "{rendered}"
+    );
+    assert_eq!(app.handle_event(&escape_press(), now), AppAction::Continue);
+    assert_eq!(app.screen(), AppScreen::Routines);
+    assert!(render_app(&app).contains("Recent invocations"));
+    assert_eq!(
+        app.handle_event(&escape_press(), now),
+        AppAction::ClientCommands(vec![
+            ClientCommand::ReleaseRoutineDefinitionWatchInterest,
+            ClientCommand::ReleaseRoutineInvocationWatchInterest,
+        ])
+    );
+}
+
+#[test]
+fn session_commands_execution_failure_preserves_draft_and_edit_clears_error() {
+    let definition = routine_definition(
+        "generic",
+        "Generic command",
+        "Runs declared work",
+        vec![string_routine_input("direction", true)],
+    );
+    let base = routine_catalog_snapshot("source", "ready", vec![definition], None);
+    let mut app = open_sessions_app_with(base.clone());
+    let now = Instant::now();
+    drop(open_routine_palette(&mut app, now));
+    let action = invoke_selected_string_routine(&mut app, now, "keep", "draft");
+    let (key, request) = match action {
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            operation_key,
+            request_id,
+            ..
+        }) => (operation_key, request_id),
+        action => panic!("expected invocation, saw {action:?}"),
+    };
+    let failed = routine_invocation_snapshot(
+        base,
+        &key,
+        &request,
+        "source",
+        "failed",
+        None,
+        Some("transport unavailable"),
+        Vec::new(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed)), now));
+    let rendered = render_app(&app);
+    assert!(
+        rendered.contains("Unable to run session command."),
+        "{rendered}"
+    );
+    assert!(rendered.contains("keep\\ndraft"), "{rendered}");
+    drop(app.handle_event(&back_tab_press(), now));
+    drop(app.handle_event(&char_press('!'), now));
+    assert!(!render_app(&app).contains("Unable to run session command."));
+}
+
+#[test]
+fn session_commands_access_loss_clears_palette_and_tracker() {
+    let definition = routine_definition(
+        "generic",
+        "Generic command",
+        "Runs declared work",
+        vec![string_routine_input("direction", true)],
+    );
+    let mut app = open_sessions_app_with(routine_catalog_snapshot(
+        "source",
+        "ready",
+        vec![definition],
+        None,
+    ));
+    let now = Instant::now();
+    drop(open_routine_palette(&mut app, now));
+    drop(invoke_selected_string_routine(
+        &mut app, now, "pending", "work",
+    ));
+    drop(app.handle_event(
+        &AppEvent::Client(Box::new(login_required_snapshot("expired"))),
+        now,
+    ));
+    assert_eq!(app.screen(), AppScreen::Access);
+    assert!(!app.sessions_section().session_commands_open());
+    assert!(!app.sessions_section().session_commands_pending());
+}
+
+#[test]
+fn session_commands_render_list_form_pending_error_and_result_snapshots() {
+    let definition = routine_definition(
+        "generic",
+        "Generic command",
+        "Runs declared work",
+        vec![string_routine_input("direction", true)],
+    );
+    let base = routine_catalog_snapshot("source", "ready", vec![definition], None);
+    let mut app = open_sessions_app_with(base.clone());
+    let now = Instant::now();
+    drop(open_routine_palette(&mut app, now));
+    insta::assert_snapshot!("session_commands_list", render_app(&app));
+    drop(app.handle_event(&enter_press(), now));
+    insta::assert_snapshot!("session_commands_form", render_app(&app));
+    drop(app.handle_event(&char_press('x'), now));
+    drop(app.handle_event(&tab_press(), now));
+    let action = app.handle_event(&enter_press(), now);
+    let (key, request) = match action {
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            operation_key,
+            request_id,
+            ..
+        }) => (operation_key, request_id),
+        action => panic!("expected invocation, saw {action:?}"),
+    };
+    insta::assert_snapshot!("session_commands_pending", render_app(&app));
+    let failed = routine_invocation_snapshot(
+        base.clone(),
+        &key,
+        &request,
+        "source",
+        "failed",
+        None,
+        Some("offline"),
+        Vec::new(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(failed)), now));
+    insta::assert_snapshot!("session_commands_error", render_app(&app));
+    let retry = app.handle_event(&enter_press(), now);
+    let (retry_key, retry_request) = match retry {
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine {
+            operation_key,
+            request_id,
+            ..
+        }) => (operation_key, request_id),
+        action => panic!("expected retry, saw {action:?}"),
+    };
+    let ready = routine_invocation_snapshot(
+        base,
+        &retry_key,
+        &retry_request,
+        "source",
+        "ready",
+        None,
+        None,
+        vec![ClientRoutineResult {
+            name: "session-id".to_owned(),
+            value: ClientRoutineValue::String("destination".to_owned()),
+        }],
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(ready)), now));
+    insta::assert_snapshot!("session_commands_result", render_app(&app));
 }
 
 #[test]
