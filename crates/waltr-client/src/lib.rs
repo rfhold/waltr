@@ -30,8 +30,10 @@ pub use coordination::runtime::{
     ClientRuntime, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientSnapshot,
     ClientStateStream, ClientStateStreamEvent, ClientTimelineDirection, ConfigSnapshot,
     McpAuthorizationContextSnapshot, OperationCollectionSnapshot, OperationSnapshot,
-    ResourceEditBaselineView, RollbackTargetView, SessionAgentCatalogSnapshot, SessionSnapshot,
-    SessionTemplateOptionView, SessionTemplateSearchSnapshot, StatusSnapshot,
+    ResourceEditBaselineView, RollbackTargetView, RoutineDefinitionSnapshot, RoutineDetailSnapshot,
+    RoutineHistorySnapshot, RoutineSnapshot, RoutineStartOperationView,
+    SessionAgentCatalogSnapshot, SessionSnapshot, SessionTemplateOptionView,
+    SessionTemplateSearchSnapshot, StatusSnapshot,
 };
 pub use coordination::state::{
     AccessAttemptId, AccessClientState, AccessStatus, AuthAttemptState, AuthClientState,
