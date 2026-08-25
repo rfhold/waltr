@@ -617,6 +617,25 @@ where
         .await
     }
 
+    /// Start the already durable current prompt with normal continue semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when another run is active or runtime resolution fails.
+    pub async fn start_durable_prompt(
+        &self,
+        session_id: SessionId,
+        limits: AgentRunLimits,
+    ) -> std::result::Result<AgentSessionRunSubmission, AgentSessionRunError> {
+        self.submit_with_limits(
+            session_id,
+            AgentSessionRunInput::Continue,
+            RunConflictPolicy::RejectIfActive,
+            limits,
+        )
+        .await
+    }
+
     /// Submit an external-response resume run.
     ///
     /// # Errors
