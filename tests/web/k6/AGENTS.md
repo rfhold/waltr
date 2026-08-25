@@ -14,6 +14,7 @@ K6 tests should cover end-to-end browser behavior against a running server, not 
 | [access/](access/) | Real OIDC login, secure session cookie, UI logout, TLS trust, and signed-out behavior. |
 | [config/](config/) | Server-backed config provider, MCP, defaults, and watch flows. |
 | [oauth/](oauth/) | Provider/upstream-MCP credential OAuth flows, separate from Waltr access auth. |
+| [routines/](routines/) | Session-launched Routine list, detail, task disclosure, and responsive screenshot flows. |
 | [status/](status/) | Server-backed status landing flow. |
 
 # Contracts

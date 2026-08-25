@@ -192,6 +192,16 @@ test("script selection only schedules phases where the script exists", () => {
     ])),
     /selected web integration script is not enabled/,
   );
+
+  const routinesPlan = buildRunPlan(parseCliArgs([
+    "--access",
+    "both",
+    "--script",
+    "routines/routines.browser.js",
+  ]));
+  assert.equal(routinesPlan.length, 1);
+  assert.equal(routinesPlan[0].phase, "disabled");
+  assert.deepEqual(routinesPlan[0].scripts, ["tests/web/k6/routines/routines.browser.js"]);
 });
 
 test("browser scripts select complete resource-tree fixtures", () => {
@@ -202,6 +212,10 @@ test("browser scripts select complete resource-tree fixtures", () => {
   assert.equal(
     fixtureNameForBrowserScript("tests/web/k6/sessions/mcp-oauth.browser.js"),
     "mcp-oauth-runtime",
+  );
+  assert.equal(
+    fixtureNameForBrowserScript("tests/web/k6/routines/routines.browser.js"),
+    "sessions-runtime",
   );
   assert.equal(fixtureNameForBrowserScript("tests/web/k6/config/providers.browser.js"), null);
 });
@@ -217,21 +231,25 @@ test("resource fixture publication removes stale slots and atomically publishes 
   mkdirSync(join(firstFixture, "providers"), { recursive: true });
   mkdirSync(join(firstFixture, "defaults"));
   mkdirSync(join(firstFixture, "features"));
+  mkdirSync(join(firstFixture, "routines"));
   mkdirSync(join(secondFixture, "mcp-servers"), { recursive: true });
   writeFileSync(join(firstFixture, "providers", "first.yaml"), "first\n");
   writeFileSync(join(firstFixture, "defaults", "default.yaml"), "default\n");
   writeFileSync(join(firstFixture, "features", "coding.yaml"), "feature\n");
+  writeFileSync(join(firstFixture, "routines", "visual.yaml"), "routine\n");
   writeFileSync(join(secondFixture, "mcp-servers", "second.yaml"), "second\n");
 
   publishResourceFixtureTree(target, firstFixture);
   assert.deepEqual(readdirSync(join(target, "providers")), ["first.yaml"]);
   assert.deepEqual(readdirSync(join(target, "defaults")), ["default.yaml"]);
   assert.deepEqual(readdirSync(join(target, "features")), ["coding.yaml"]);
+  assert.deepEqual(readdirSync(join(target, "routines")), ["visual.yaml"]);
 
   publishResourceFixtureTree(target, secondFixture);
   assert.deepEqual(readdirSync(join(target, "providers")), []);
   assert.deepEqual(readdirSync(join(target, "defaults")), []);
   assert.deepEqual(readdirSync(join(target, "features")), []);
+  assert.deepEqual(readdirSync(join(target, "routines")), []);
   assert.deepEqual(readdirSync(join(target, "mcp-servers")), ["second.yaml"]);
   assert.equal(readFileSync(join(target, "mcp-servers", "second.yaml"), "utf8"), "second\n");
   assert.deepEqual(
