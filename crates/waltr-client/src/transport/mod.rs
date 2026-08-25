@@ -3,6 +3,7 @@
 mod auth;
 mod catalog;
 mod config;
+mod routine;
 mod session;
 mod status;
 
@@ -16,9 +17,11 @@ pub use waltr::grpc::waltr::resource::v1::ResourceCatalog as ConfigWatchUpdate;
 use waltr::grpc::waltr::resource::v1::{
     ResourceCatalog, resource_service_client::ResourceServiceClient,
 };
+use waltr::grpc::waltr::routine::v1::routine_service_client::RoutineServiceClient;
 use waltr::grpc::waltr::session::v1::session_service_client::SessionServiceClient;
 use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use prost::Message;
+pub use routine::{RoutineDefinitionWatchStream, RoutineInvocationWatchStream};
 pub use session::{
     SessionTimelineWatchEvent, SessionTimelineWatchStream, SessionTimelineWatchUpdate,
     SessionWatchEvent, SessionWatchStream, SessionWatchUpdate,
@@ -35,9 +38,10 @@ use tonic::metadata::AsciiMetadataValue;
 use tonic::service::{Interceptor, interceptor::InterceptedService};
 
 use crate::{
-    ClientError, InferenceSettingsRequest, ListAgentsResponse, ResourceWrite, RollbackTarget,
-    SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary, TimelineEvent,
-    TimelineQuery,
+    ClientError, ClientRoutineInvocationDetail, ClientRoutineInvocationPage,
+    ClientRoutineStartOutcome, InferenceSettingsRequest, ListAgentsResponse, ResourceWrite,
+    RollbackTarget, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary,
+    StartManualRoutineArgs, TimelineEvent, TimelineQuery,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -209,6 +213,43 @@ pub trait WaltrTransport {
         session_id: String,
         target: RollbackTarget,
     ) -> impl Future<Output = Result<(), ClientError>>;
+
+    /// Subscribe to complete global manual Routine definition snapshots.
+    fn watch_manual_routines(
+        &self,
+        request_id: String,
+    ) -> impl Future<Output = Result<RoutineDefinitionWatchStream, ClientError>>;
+
+    /// Start one manual Routine. Callers must not automatically retry this operation.
+    fn start_manual_routine(
+        &self,
+        args: StartManualRoutineArgs,
+    ) -> impl Future<Output = Result<ClientRoutineStartOutcome, ClientError>>;
+
+    /// Load one older invocation-history page.
+    fn list_routine_invocations(
+        &self,
+        request_id: String,
+        page_size: u32,
+        before_admission_sequence: Option<u64>,
+        metadata_filters: std::collections::BTreeMap<String, String>,
+    ) -> impl Future<Output = Result<ClientRoutineInvocationPage, ClientError>>;
+
+    /// Load full task-level detail for one invocation.
+    fn get_routine_invocation(
+        &self,
+        request_id: String,
+        invocation_id: String,
+    ) -> impl Future<Output = Result<ClientRoutineInvocationDetail, ClientError>>;
+
+    /// Subscribe to a bounded snapshot or exact event replay.
+    fn watch_routine_invocations(
+        &self,
+        request_id: String,
+        after_sequence: Option<u64>,
+        snapshot_size: u32,
+        metadata_filters: std::collections::BTreeMap<String, String>,
+    ) -> impl Future<Output = Result<RoutineInvocationWatchStream, ClientError>>;
 }
 
 trait RemoteTransport {
@@ -240,6 +281,11 @@ trait RemoteTransport {
         &self,
         credentials: &RequestCredentials,
     ) -> impl Future<Output = Result<SessionServiceClient<Self::Inner>, ClientError>>;
+
+    fn routine_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> impl Future<Output = Result<RoutineServiceClient<Self::Inner>, ClientError>>;
 }
 
 #[derive(Clone, Default)]
@@ -442,6 +488,62 @@ where
         target: RollbackTarget,
     ) -> Result<(), ClientError> {
         session::continue_session(self, session_id, target).await
+    }
+
+    async fn watch_manual_routines(
+        &self,
+        request_id: String,
+    ) -> Result<RoutineDefinitionWatchStream, ClientError> {
+        routine::watch_manual_routines(self, request_id).await
+    }
+
+    async fn start_manual_routine(
+        &self,
+        args: StartManualRoutineArgs,
+    ) -> Result<ClientRoutineStartOutcome, ClientError> {
+        routine::start_manual_routine(self, args).await
+    }
+
+    async fn list_routine_invocations(
+        &self,
+        request_id: String,
+        page_size: u32,
+        before_admission_sequence: Option<u64>,
+        metadata_filters: std::collections::BTreeMap<String, String>,
+    ) -> Result<ClientRoutineInvocationPage, ClientError> {
+        routine::list_routine_invocations(
+            self,
+            request_id,
+            page_size,
+            before_admission_sequence,
+            metadata_filters,
+        )
+        .await
+    }
+
+    async fn get_routine_invocation(
+        &self,
+        request_id: String,
+        invocation_id: String,
+    ) -> Result<ClientRoutineInvocationDetail, ClientError> {
+        routine::get_routine_invocation(self, request_id, invocation_id).await
+    }
+
+    async fn watch_routine_invocations(
+        &self,
+        request_id: String,
+        after_sequence: Option<u64>,
+        snapshot_size: u32,
+        metadata_filters: std::collections::BTreeMap<String, String>,
+    ) -> Result<RoutineInvocationWatchStream, ClientError> {
+        routine::watch_routine_invocations(
+            self,
+            request_id,
+            after_sequence,
+            snapshot_size,
+            metadata_filters,
+        )
+        .await
     }
 }
 
@@ -863,6 +965,16 @@ impl RemoteTransport for NativeGrpcTransport {
             Self::interceptor_for(credentials),
         ))
     }
+
+    async fn routine_client(
+        &self,
+        credentials: &RequestCredentials,
+    ) -> Result<RoutineServiceClient<Self::Inner>, ClientError> {
+        Ok(RoutineServiceClient::with_interceptor(
+            self.channel().await?,
+            Self::interceptor_for(credentials),
+        ))
+    }
 }
 
 /// Browser gRPC-web transport backed by `fetch`.
@@ -931,6 +1043,14 @@ impl RemoteTransport for WasmGrpcTransport {
     ) -> Result<SessionServiceClient<Self::Inner>, ClientError> {
         let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
         Ok(SessionServiceClient::new(transport))
+    }
+
+    async fn routine_client(
+        &self,
+        _: &RequestCredentials,
+    ) -> Result<RoutineServiceClient<Self::Inner>, ClientError> {
+        let transport = tonic_web_wasm_client::Client::new(self.api_base.clone());
+        Ok(RoutineServiceClient::new(transport))
     }
 }
 
