@@ -1,0 +1,197 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: context-management
+spec:
+  description: Select category compaction changes when a session changes work domains.
+  params:
+    - name: transition
+      type: string
+      default: Work focus changed.
+  triggers:
+    - name: session-tool
+      tool:
+        name: manage-context
+        displayName: Manage context
+        scope: session
+        completion: wait
+        description: Rebalance context after a phase, stage, or task transition.
+        inputs:
+          - name: transition
+  sourceSession:
+    from: $(trigger.session)
+    snapshot:
+      throughCursor: $(trigger.toolCall.cursor)
+  tasks:
+    - name: categorize-context
+      taskSpec:
+        routineRef:
+          name: context-categorization
+          completion: wait
+          trigger:
+            session: $(sourceSession.session)
+            cursor: $(sourceSession.snapshot.cursor)
+
+    - name: read-categories
+      runAfter:
+        - categorize-context
+      taskSpec:
+        action:
+          sessionMetadata:
+            sessionId: $(sourceSession.session.id)
+            read:
+              - key: context.categorization
+                required: true
+                expected:
+                  path: throughCursor
+                  value: $(sourceSession.snapshot.cursor)
+        results:
+          - name: state
+            type: object
+            value: $(action.sessionMetadata.values.context.categorization)
+
+    - name: plan-management
+      runAfter:
+        - read-categories
+      taskSpec:
+        sessionTemplate:
+          source:
+            session: $(sourceSession.session)
+            throughCursor: $(sourceSession.snapshot.cursor)
+          systemPrompt:
+            mode: replace
+            text: |
+              Decide context management for the source session in one shot.
+              Preserve context near its current work at useful detail and select
+              categories that should be summarized for the first time or
+              re-summarized at a different detail budget. Do not summarize the
+              categories yourself; each selected category will be evaluated
+              from its full original context by manage-category-context.
+
+              Return no_change when no meaningful context edit is warranted.
+              Finish by calling submit-strategy exactly once.
+          userPrompt:
+            text: |
+              Reported transition:
+              $(params.transition)
+
+              Categories and item assignments:
+              $(tasks.read-categories.results.state.categories)
+              $(tasks.read-categories.results.state.assignments)
+        tools: []
+        limits:
+          maxTurns: 1
+          maxToolCalls: 1
+        captures:
+          - name: submit-strategy
+            description: Submit category summary edits or a no-change decision.
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - decision
+                - rationale
+                - edits
+              properties:
+                decision:
+                  type: string
+                  enum:
+                    - no_change
+                    - edit
+                rationale:
+                  type: string
+                edits:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required:
+                      - categoryKey
+                      - operation
+                      - instructions
+                    properties:
+                      categoryKey:
+                        type: string
+                      operation:
+                        type: string
+                        enum:
+                          - summarize
+                          - resummarize
+                      instructions:
+                        type: string
+            validate:
+              discriminatedList:
+                decisionField: decision
+                noChangeValue: no_change
+                editValue: edit
+                itemsField: edits
+                itemKey: categoryKey
+                allowedKeys: $(tasks.read-categories.results.state.assignments[*].categoryKey)
+                requireEmptyForNoChange: true
+                requireNonEmptyForEdit: true
+                requireUniqueKeys: true
+            minCalls: 1
+            maxCalls: 1
+            finishAfter: 1
+        results:
+          - name: decision
+            type: string
+            value: $(captures.submit-strategy[0].decision)
+          - name: rationale
+            type: string
+            value: $(captures.submit-strategy[0].rationale)
+          - name: edits
+            type: array
+            value: $(captures.submit-strategy[0].edits)
+
+    - name: manage-category-context
+      runAfter:
+        - plan-management
+      when:
+        - input: $(tasks.plan-management.results.decision)
+          operator: In
+          values:
+            - edit
+      forEach:
+        items: $(tasks.plan-management.results.edits)
+        as: edit
+      taskSpec:
+        routineRef:
+          name: manage-category-context
+          completion: wait
+          trigger:
+            session: $(sourceSession.session)
+            cursor: $(sourceSession.snapshot.cursor)
+          params:
+            - name: categoryKey
+              value: $(edit.categoryKey)
+            - name: operation
+              value: $(edit.operation)
+            - name: instructions
+              value: $(edit.instructions)
+        results:
+          - name: category-key
+            type: string
+            value: $(routineRef.results.category-key)
+          - name: decision
+            type: string
+            value: $(routineRef.results.decision)
+          - name: applied
+            type: boolean
+            value: $(routineRef.results.applied)
+          - name: mask-id
+            type:
+              - string
+              - "null"
+            value: $(routineRef.results.mask-id)
+  results:
+    - name: decision
+      type: string
+      value: $(tasks.plan-management.results.decision)
+    - name: rationale
+      type: string
+      value: $(tasks.plan-management.results.rationale)
+    - name: category-results
+      type: array
+      value: $(tasks.manage-category-context.taskRuns[*].results)
+      default: []

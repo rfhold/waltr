@@ -1,0 +1,118 @@
+apiVersion: waltr.dev/v1alpha1
+kind: Routine
+metadata:
+  name: compact-and-continue
+spec:
+  description: Compact a session into one replacement message and optionally continue.
+  params:
+    - name: continue
+      type: boolean
+      default: false
+  triggers:
+    - name: manual
+      manual:
+        displayName: Compact context
+        scope: session
+        onBusy: reject
+        inputs:
+          - name: continue
+
+    - name: context-pressure
+      sessionLifecycle:
+        event: runCompleted
+        scope: session
+      when:
+        - any:
+            - input: $(trigger.context.percent)
+              operator: GreaterThanOrEqual
+              values:
+                - "80"
+            - input: $(trigger.context.tokens)
+              operator: GreaterThanOrEqual
+              values:
+                - "180000"
+      params:
+        - name: continue
+          value: "true"
+  sourceSession:
+    from: $(trigger.session)
+    pause:
+      submissions: queue
+  tasks:
+    - name: compact
+      taskSpec:
+        sessionTemplate:
+          source:
+            session: $(sourceSession.session)
+            throughCursor: $(sourceSession.pause.cursor)
+          systemPrompt:
+            mode: replace
+            text: |
+              Compact this agent session for seamless continuation.
+              Preserve user intent, instructions, decisions, completed work,
+              exact technical details, unresolved issues, blockers, and next
+              actions. Do not continue the task or call tools. Return only the
+              replacement context.
+          userPrompt:
+            text: |
+              Produce the single user message that should replace the copied
+              session context. The next assistant must be able to continue
+              directly from that message.
+        tools: []
+        limits:
+          maxTurns: 1
+        output:
+          type: text
+        results:
+          - name: summary
+            type: string
+            value: $(output.text)
+
+    - name: apply-mask
+      runAfter:
+        - compact
+      taskSpec:
+        action:
+          sessionMask:
+            sessionId: $(sourceSession.session.id)
+            atomic: true
+            masks:
+              subtract:
+                - selector:
+                    overlaps:
+                      throughCursor: $(sourceSession.pause.cursor)
+              add:
+                - type: replacement
+                  key: context.compaction-prefix
+                  selector:
+                    throughCursor: $(sourceSession.pause.cursor)
+                  onOverlap: reject
+                  preserveSourceItems: true
+                  replacement:
+                    role: user
+                    text: $(tasks.compact.results.summary)
+        results:
+          - name: mask-cursor
+            type: string
+            value: $(action.sessionMask.cursor)
+
+    - name: continue
+      runAfter:
+        - apply-mask
+      when:
+        - input: $(params.continue)
+          operator: In
+          values:
+            - "true"
+      taskSpec:
+        action:
+          sessionContinue:
+            sessionId: $(sourceSession.session.id)
+            fromCursor: $(tasks.apply-mask.results.mask-cursor)
+  results:
+    - name: summary
+      type: string
+      value: $(tasks.compact.results.summary)
+    - name: mask-cursor
+      type: string
+      value: $(tasks.apply-mask.results.mask-cursor)

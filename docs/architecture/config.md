@@ -1,6 +1,6 @@
 # Resource Catalog
 
-Waltr uses one server-owned YAML resource catalog. The catalog defines agents, features, permissions, providers, MCP servers, and inference defaults.
+Waltr uses one server-owned YAML resource catalog. The catalog defines seven kinds: agents, features, permissions, providers, MCP servers, inference defaults, and routines.
 
 ```mermaid
 flowchart LR
@@ -30,6 +30,7 @@ The persisted catalog root is `.waltr/resources`. It accepts these canonical pat
 | `providers/<name>.yaml` | `Provider` |
 | `mcp-servers/<name>.yaml` | `McpServer` |
 | `defaults/default.yaml` | `Defaults` |
+| `routines/<name>.yaml` | `Routine` |
 
 Each file contains one strict YAML document. The category fixes `kind`. The filename stem must equal `metadata.name`.
 
@@ -55,7 +56,29 @@ A provider catalog selector names a models.dev provider and an `include` list. O
 
 `Defaults` exists only at `defaults/default.yaml`. Its `spec.inference` value selects a provider, model, and optional `reasoningEffort`.
 
-The catalog materializes providers, MCP servers, and defaults into `waltr.config.v1.Configuration`. Runtime, auth, catalog search, and clients use this projection.
+`Routine` defines a server-owned event or manual workflow. Each trigger declares exactly one event or manual form. Event conditions support `In` or `NotIn` with AND semantics.
+
+Parameters use closed string or boolean scalars. String parameters support required use, `minLength`, and bounded Rust regex patterns. Manual triggers expose declared parameters with session scope.
+
+Routine tasks form a validated `runAfter` DAG, which the server executes sequentially. A task contains either a generic agent template or one implemented action.
+
+Agent tasks require replacement prompts, explicit feature, tool, and permission lists, `maxTurns`, and text output. They inherit provider settings from a source session, with reasoning disabled.
+
+Every source-backed `sessionTemplate` atomically creates a durable helper with rollback-aware provider-neutral inference history through the latest completed turn. The helper stores that history followed by its task prompt. The history preserves provider-replay prompts, assistant text, tool calls and results, and inline images. It excludes lifecycle, middleware, status, usage and cost, request audit, provider metadata, provider-native thinking payloads, rollback barriers, and active partial work.
+
+Provider requests derive only from durable helper state. The history persists across restart and storage backends under ordinary session retention rules. The history is not a byte-for-byte HTTP wire archive. Provider adapters apply their normal encoding rules. An inference-only `sessionTemplate` starts with only its task prompt.
+
+The metadata action supports one scalar `set` mutation with `ifAbsent: true`. The implemented `sessionCreate` subset requires exact inference and agent-definition inheritance, metadata, one first prompt, and immediate start.
+
+Top-level `spec.sourceSession` supports manual triggers only. Catalog validation rejects any Routine that combines `sourceSession` with an event trigger. Inference-only event Routines remain supported.
+
+`sourceSession` admits the manual source through its latest completed cursor. The admitted capture fixes exact source inference, agent definition, and effective completed-turn history for that invocation.
+
+Unsupported fields, operators, actions, task types, and substitutions fail strict validation.
+
+The server bundles [`title`](../../crates/waltr-server/resources/routines/title.yaml) and [`fork`](../../crates/waltr-server/resources/routines/fork.yaml). Their matching [documentation examples](../examples/routines/README.md) use identical source. The examples index separates the implemented subset from proposed fixture syntax.
+
+The catalog materializes providers, MCP servers, and defaults into `waltr.config.v1.Configuration`. Runtime, auth, catalog search, and clients use this projection. The server retains routines separately, so routine resources never enter agent-definition bundles.
 
 ## Environment Templates
 
@@ -101,6 +124,10 @@ Replace validates the resource and complete candidate catalog before an atomic f
 
 The public Waltr MCP server exposes equivalent `resources.inspect`, `resources.replace`, and `resources.reset` actions. These actions use canonical relative paths and persisted-slot ETags.
 
+`waltr.routine.v1.RoutineService` provides global definition snapshots, durable manual admission, history, detail, and lifecycle replay.
+
+See [Routines](routines.md) for revision pinning, validation, detached starts, persistence, replay, and restart behavior.
+
 Resource writes serialize through Waltr. They do not isolate `.waltr` from another local writer. Restrict resource-tree writes to trusted processes.
 
 ## Client Contract
@@ -125,8 +152,11 @@ Each session stores a self-contained inference snapshot. Catalog changes do not 
 | Path | Purpose |
 | --- | --- |
 | [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC messages and service contract. |
+| [../../proto/waltr/routine/v1/routine_service.proto](../../proto/waltr/routine/v1/routine_service.proto) | Generic manual Routine discovery and invocation contract. |
 | [../../proto/waltr/config/v1/config_service.proto](../../proto/waltr/config/v1/config_service.proto) | Effective configuration projection types. |
 | [../../crates/waltr-server/src/resource_catalog/](../../crates/waltr-server/src/resource_catalog/) | Catalog state, materialization, persistence, ETags, and watcher lifecycle. |
+| [../../crates/waltr-server/src/resource_catalog/routine.rs](../../crates/waltr-server/src/resource_catalog/routine.rs) | Strict Routine schema and validation. |
+| [../../crates/waltr-server/src/routine/](../../crates/waltr-server/src/routine/) | Routine event, admission, task, and lifecycle runtime. |
 | [../../crates/waltr-server/src/agent_definition.rs](../../crates/waltr-server/src/agent_definition.rs) | Agent-facing resource catalog exports. |
 | [../../crates/waltr-server/src/config_service.rs](../../crates/waltr-server/src/config_service.rs) | `ResourceService` implementation. |
 | [../../crates/waltr-server/src/mcp_service.rs](../../crates/waltr-server/src/mcp_service.rs) | Public resource administration actions. |
@@ -135,3 +165,4 @@ Each session stores a self-contained inference snapshot. Catalog changes do not 
 | [../../crates/waltr-client/src/resource.rs](../../crates/waltr-client/src/resource.rs) | Source-preserving provider, MCP server, and defaults YAML edits. |
 | [../../crates/waltr-client/src/coordination/config.rs](../../crates/waltr-client/src/coordination/config.rs) | Client catalog load and watch reducer. |
 | [clients.md](clients.md) | Shared client reducer and RPC architecture. |
+| [routines.md](routines.md) | Canonical Routine lifecycle and persistence contract. |
