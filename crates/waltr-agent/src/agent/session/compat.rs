@@ -9,6 +9,7 @@ use super::{ResumeInput, SessionId, SessionRunContext, SessionStore};
 use crate::middleware::{chain::MiddlewareChain, prompt::SystemPromptOverride};
 
 use super::super::{AgentTool, ProviderRetryConfig};
+use crate::SessionEventSink;
 
 pub struct EphemeralSessionRun<S>
 where
@@ -28,4 +29,5 @@ where
     pub session_store: S,
     pub session_run_context: Option<SessionRunContext>,
     pub cancellation_token: CancellationToken,
+    pub event_sink: Option<Arc<dyn SessionEventSink>>,
 }

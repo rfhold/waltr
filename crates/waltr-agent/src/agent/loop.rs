@@ -95,6 +95,7 @@ where
     assistant_item_id: Option<(u64, TimelineItemId)>,
     thinking_item_id: Option<(u64, TimelineItemId)>,
     tool_item_ids: HashMap<String, TimelineItemId>,
+    event_sink: Option<Arc<dyn crate::SessionEventSink>>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +191,7 @@ where
             assistant_item_id: None,
             thinking_item_id: None,
             tool_item_ids: HashMap::new(),
+            event_sink: run.event_sink,
         }
     }
 
@@ -1075,6 +1077,7 @@ where
                 prompt: prompt.clone(),
             })
             .collect();
+        self.publish_user_message_events(0, 0, &prompts);
         self.pending.extend(events.into_iter().map(Ok));
         self.session_initialized = true;
         Ok(true)
@@ -1646,7 +1649,47 @@ where
         {
             runtime = runtime.with_session_run_context(context.clone(), incarnation);
         }
-        runtime
+        if let Some(sink) = &self.event_sink {
+            runtime.with_session_event_sink(Arc::clone(sink))
+        } else {
+            runtime
+        }
+    }
+
+    fn publish_user_message_events(
+        &self,
+        first_prompt_index: usize,
+        first_journal_index: usize,
+        prompts: &[String],
+    ) {
+        let Some(sink) = self
+            .session_run_context
+            .as_ref()
+            .and_then(SessionRunContext::event_sink)
+            .or(self.event_sink.as_ref())
+        else {
+            return;
+        };
+        for (offset, text) in prompts.iter().enumerate() {
+            let prompt_index =
+                u64::try_from(first_prompt_index.saturating_add(offset)).unwrap_or(u64::MAX);
+            super::event::spawn_session_event(
+                Arc::clone(sink),
+                crate::SessionEvent::UserMessageCreated {
+                    id: super::event::user_message_event_id(
+                        &self.session_id,
+                        first_journal_index.saturating_add(offset.saturating_mul(2)),
+                    ),
+                    session_id: self.session_id.clone(),
+                    prompt_index,
+                    user_message_count: prompt_index.saturating_add(1),
+                    text: text.clone(),
+                    metadata: self.session_metadata_values.clone(),
+                    revision: self.session_revision,
+                    cursor: self.last_timeline_cursor,
+                },
+            );
+        }
     }
 
     fn publish_session_summary(&self) {

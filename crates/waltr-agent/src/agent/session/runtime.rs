@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use serde_json::Value;
 
@@ -35,6 +35,7 @@ where
     store: &'a S,
     run_context: Option<SessionRunContext>,
     session_incarnation: Option<SessionIncarnation>,
+    event_sink: Option<Arc<dyn crate::SessionEventSink>>,
 }
 
 impl<S> std::fmt::Debug for AgentSessionRuntime<'_, S>
@@ -45,6 +46,7 @@ where
         formatter
             .debug_struct("AgentSessionRuntime")
             .field("run_context", &self.run_context.is_some())
+            .field("event_sink", &self.event_sink.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -59,6 +61,7 @@ where
             store,
             run_context: None,
             session_incarnation: None,
+            event_sink: None,
         }
     }
 
@@ -72,16 +75,54 @@ where
         self
     }
 
+    /// Configure semantic event delivery for prompt appends performed by this runtime.
+    #[must_use]
+    pub fn with_session_event_sink(mut self, sink: Arc<dyn crate::SessionEventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
     /// Create a durable session from complete structured input.
     ///
     /// # Errors
     ///
     /// Returns an error when the store rejects the new record.
     pub(crate) async fn create(&self, request: SessionCreateRequest) -> Result<SessionRecord> {
-        self.store
+        let initial_messages = match &request.start {
+            super::SessionStart::Fresh { messages }
+            | super::SessionStart::Copy { messages, .. } => messages
+                .iter()
+                .map(|message| message.text().to_owned())
+                .collect::<Vec<_>>(),
+        };
+        let record = self
+            .store
             .create(request)
             .await
-            .map_err(session_store_error)
+            .map_err(session_store_error)?;
+        if !initial_messages.is_empty() {
+            let prompt_count = record.snapshot().prompts.len();
+            let first_prompt_index = prompt_count.saturating_sub(initial_messages.len());
+            let journal_indices = record
+                .journal
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    matches!(event, SessionJournalEvent::PromptAppended { .. }).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let first = journal_indices.len().saturating_sub(initial_messages.len());
+            self.publish_user_message_events(
+                &record,
+                first_prompt_index,
+                journal_indices
+                    .into_iter()
+                    .skip(first)
+                    .zip(initial_messages)
+                    .collect(),
+            );
+        }
+        Ok(record)
     }
 
     /// Load a durable session record.
@@ -455,6 +496,7 @@ where
         } else {
             snapshot.turn
         };
+        let mut created_prompts = Vec::with_capacity(prompts.len());
         for (prompt_index, prompt) in prompts.into_iter().enumerate() {
             prompt_timeline.push(user_prompt_timeline_event(
                 &record.id,
@@ -462,6 +504,7 @@ where
                 snapshot.prompts.len() + prompt_index,
                 prompt.clone(),
             ));
+            created_prompts.push((journal.len(), prompt.clone()));
             journal.push(SessionJournalEvent::PromptAppended { prompt });
         }
 
@@ -471,7 +514,12 @@ where
             self.append_timeline_and_reload(record, cancellation_timeline)
                 .await?
         };
+        let journal_start = record.journal.len();
+        for (journal_index, _) in &mut created_prompts {
+            *journal_index = journal_start.saturating_add(*journal_index);
+        }
         record = self.append_journal_and_reload(record, journal).await?;
+        self.publish_user_message_events(&record, snapshot.prompts.len(), created_prompts);
         if !prompt_timeline.is_empty() {
             record = self
                 .append_timeline_and_reload(record, prompt_timeline)
@@ -707,6 +755,39 @@ where
     fn publish_session_summary(&self, record: &SessionRecord) {
         if let (Some(context), Some(incarnation)) = (&self.run_context, self.session_incarnation) {
             context.publish_run_summary(incarnation, record.summary());
+        }
+    }
+
+    fn publish_user_message_events(
+        &self,
+        record: &SessionRecord,
+        first_prompt_index: usize,
+        prompts: Vec<(usize, String)>,
+    ) {
+        let Some(sink) = self
+            .run_context
+            .as_ref()
+            .and_then(SessionRunContext::event_sink)
+            .or(self.event_sink.as_ref())
+        else {
+            return;
+        };
+        for (offset, (journal_index, text)) in prompts.into_iter().enumerate() {
+            let prompt_index =
+                u64::try_from(first_prompt_index.saturating_add(offset)).unwrap_or(u64::MAX);
+            crate::agent::event::spawn_session_event(
+                Arc::clone(sink),
+                crate::SessionEvent::UserMessageCreated {
+                    id: crate::agent::event::user_message_event_id(&record.id, journal_index),
+                    session_id: record.id.clone(),
+                    prompt_index,
+                    user_message_count: prompt_index.saturating_add(1),
+                    text,
+                    metadata: record.metadata.values.clone(),
+                    revision: record.revision,
+                    cursor: record.last_timeline_cursor(),
+                },
+            );
         }
     }
 

@@ -1,6 +1,6 @@
 //! Per-run agent configuration.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +30,7 @@ where
     system_prompt: SystemPromptOverride,
     extra_tools: Vec<AgentTool>,
     cancellation_token: Option<CancellationToken>,
+    event_sink: Option<Arc<dyn crate::SessionEventSink>>,
 }
 
 impl AgentRunBuilder {
@@ -44,6 +45,7 @@ impl AgentRunBuilder {
             system_prompt: SystemPromptOverride::default(),
             extra_tools: Vec::new(),
             cancellation_token: None,
+            event_sink: None,
         }
     }
 
@@ -73,6 +75,7 @@ impl AgentRunBuilder {
             system_prompt: SystemPromptOverride::default(),
             extra_tools: Vec::new(),
             cancellation_token: None,
+            event_sink: None,
         }
     }
 }
@@ -117,6 +120,13 @@ where
         self
     }
 
+    /// Deliver post-durability semantic session events to `sink`.
+    #[must_use]
+    pub fn with_session_event_sink(mut self, sink: Arc<dyn crate::SessionEventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
     pub(crate) fn with_session_run_context(mut self, context: SessionRunContext) -> Self {
         self.session_run_context = Some(context);
         self
@@ -138,6 +148,7 @@ where
             system_prompt,
             extra_tools,
             cancellation_token,
+            event_sink,
         } = self;
         AgentRunBuilder {
             runtime,
@@ -149,6 +160,7 @@ where
             system_prompt,
             extra_tools,
             cancellation_token,
+            event_sink,
         }
     }
 
@@ -173,6 +185,7 @@ where
             system_prompt,
             extra_tools,
             cancellation_token,
+            event_sink,
         } = self;
         let AgentRuntime {
             provider,
@@ -213,6 +226,7 @@ where
             session_store,
             session_run_context,
             cancellation_token: cancellation_token.unwrap_or_default(),
+            event_sink,
         }
     }
 }
