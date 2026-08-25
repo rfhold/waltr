@@ -7,15 +7,16 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 
 use crate::transport::{
-    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, SessionTimelineWatchStream,
-    SessionWatchStream, StatusWatchStream,
+    ConfigWatchUpdate, DefaultGrpcTransport, WaltrTransport, RoutineDefinitionWatchStream,
+    RoutineInvocationWatchStream, SessionTimelineWatchStream, SessionWatchStream,
+    StatusWatchStream,
 };
 use crate::{
     AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientError, ClientEvent,
-    ConfigEffect, ConfigEvent, ConfigView, ResourceCatalog, ResourceWrite,
-    SearchCatalogModelsRequest, SearchSessionTemplatesRequest, SessionEffect, SessionEvent,
-    SessionSummary, StatusEffect, StatusEvent, SuggestCatalogMatchesRequest,
-    search_session_templates_response,
+    ConfigEffect, ConfigEvent, ConfigView, ResourceCatalog, ResourceWrite, RoutineEffect,
+    RoutineEvent, SearchCatalogModelsRequest, SearchSessionTemplatesRequest, SessionEffect,
+    SessionEvent, SessionSummary, StartManualRoutineArgs, StatusEffect, StatusEvent,
+    SuggestCatalogMatchesRequest, search_session_templates_response,
 };
 
 /// Stream of configuration changes observed through the gRPC executor.
@@ -203,6 +204,29 @@ impl GrpcEffectExecutor {
             .await
     }
 
+    pub(crate) async fn watch_routine_definition_updates(
+        &self,
+        request_id: String,
+    ) -> Result<RoutineDefinitionWatchStream, ClientError> {
+        self.transport.watch_manual_routines(request_id).await
+    }
+
+    pub(crate) async fn watch_routine_invocation_updates(
+        &self,
+        request_id: String,
+        after_sequence: Option<u64>,
+        metadata_filters: std::collections::BTreeMap<String, String>,
+    ) -> Result<RoutineInvocationWatchStream, ClientError> {
+        self.transport
+            .watch_routine_invocations(
+                request_id,
+                after_sequence,
+                crate::ROUTINE_INVOCATION_SNAPSHOT_SIZE,
+                metadata_filters,
+            )
+            .await
+    }
+
     /// Execute one client side-effect intent and return client events for the reducer.
     #[allow(
         clippy::future_not_send,
@@ -376,6 +400,89 @@ impl GrpcEffectExecutor {
                     })],
                     Err(error) => vec![ClientEvent::Catalog(CatalogEvent::MatchesSuggestFailed {
                         request_id,
+                        error,
+                    })],
+                },
+                ClientEffect::Routine(RoutineEffect::StartManual {
+                    operation_key,
+                    request_id,
+                    routine_name,
+                    trigger_name,
+                    source_session_id,
+                    inputs,
+                }) => match self
+                    .transport
+                    .start_manual_routine(StartManualRoutineArgs {
+                        request_id: request_id.clone(),
+                        routine_name,
+                        trigger_name,
+                        source_session_id,
+                        inputs,
+                    })
+                    .await
+                {
+                    Ok(crate::ClientRoutineStartOutcome::Accepted(invocation_id)) => {
+                        vec![ClientEvent::Routine(RoutineEvent::StartAccepted {
+                            operation_key,
+                            request_id,
+                            invocation_id,
+                        })]
+                    }
+                    Ok(crate::ClientRoutineStartOutcome::ValidationFailed(failure)) => {
+                        vec![ClientEvent::Routine(RoutineEvent::StartValidationFailed {
+                            operation_key,
+                            request_id,
+                            failure,
+                        })]
+                    }
+                    Err(error) => vec![ClientEvent::Routine(RoutineEvent::StartFailed {
+                        operation_key,
+                        request_id,
+                        error,
+                    })],
+                },
+                ClientEffect::Routine(RoutineEffect::ListInvocations {
+                    request_id,
+                    page_size,
+                    before_admission_sequence,
+                    metadata_filters,
+                }) => match self
+                    .transport
+                    .list_routine_invocations(
+                        request_id.clone(),
+                        page_size,
+                        Some(before_admission_sequence),
+                        metadata_filters,
+                    )
+                    .await
+                {
+                    Ok(page) => vec![ClientEvent::Routine(RoutineEvent::OlderPageLoaded {
+                        request_id,
+                        before_admission_sequence,
+                        page,
+                    })],
+                    Err(error) => vec![ClientEvent::Routine(RoutineEvent::OlderPageFailed {
+                        request_id,
+                        before_admission_sequence,
+                        error,
+                    })],
+                },
+                ClientEffect::Routine(RoutineEffect::GetInvocation {
+                    request_id,
+                    invocation_id,
+                }) => match self
+                    .transport
+                    .get_routine_invocation(request_id.clone(), invocation_id.clone())
+                    .await
+                {
+                    Ok(detail) => vec![ClientEvent::Routine(RoutineEvent::DetailLoaded {
+                        request_id,
+                        invocation_id,
+                        detail,
+                    })],
+                    Err(error) => vec![ClientEvent::Routine(RoutineEvent::DetailFailed {
+                        request_id,
+                        invocation_id,
                         error,
                     })],
                 },
@@ -752,6 +859,26 @@ impl GrpcEffectExecutor {
                         key,
                     })]
                 }
+                ClientEffect::Routine(RoutineEffect::SleepDefinitionReconnect { delay_ms }) => {
+                    sleep(delay_ms).await;
+                    vec![ClientEvent::Routine(RoutineEvent::DefinitionReconnectReady)]
+                }
+                ClientEffect::Routine(RoutineEffect::SleepInvocationReconnect { delay_ms }) => {
+                    sleep(delay_ms).await;
+                    vec![ClientEvent::Routine(RoutineEvent::InvocationReconnectReady)]
+                }
+                ClientEffect::Routine(RoutineEffect::SleepSessionInvocationReconnect {
+                    session_id,
+                    delay_ms,
+                }) => {
+                    sleep(delay_ms).await;
+                    vec![ClientEvent::Routine(
+                        RoutineEvent::SessionInvocationReconnectReady { session_id },
+                    )]
+                }
+                ClientEffect::Routine(
+                    RoutineEffect::WatchDefinitions { .. } | RoutineEffect::WatchInvocations { .. },
+                ) => unreachable!("Routine watches are opened by ClientStateStream"),
             }
         })
     }

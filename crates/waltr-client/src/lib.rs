@@ -20,8 +20,8 @@ mod wasm;
 pub use client::{Client, ClientUpdate};
 pub use coordination::event::{
     AccessEvent, AuthEffect, AuthEvent, CatalogEffect, CatalogEvent, ClientEffect, ClientEvent,
-    ConfigEffect, ConfigEvent, ProviderEditBaseline, ResourceWrite, SessionEffect, SessionEvent,
-    StatusEffect, StatusEvent, StreamEvent, StreamId,
+    ConfigEffect, ConfigEvent, ProviderEditBaseline, ResourceWrite, RoutineEffect, RoutineEvent,
+    SessionEffect, SessionEvent, StatusEffect, StatusEvent, StreamEvent, StreamId,
 };
 pub use coordination::runtime::{
     AccessSnapshot, AuthAttemptSnapshot, AuthSnapshot, AuthStatusSnapshot,
@@ -37,9 +37,10 @@ pub use coordination::state::{
     AccessAttemptId, AccessClientState, AccessStatus, AuthAttemptState, AuthClientState,
     CatalogClientState, CatalogMatchSuggestionState, CatalogModelSearchState, ClientOperationState,
     ClientState, ConfigClientState, OperationKey, OperationState, OperationStatus,
-    SessionAgentCatalogState, SessionClientState, SessionTemplateSearchState, StatusClientState,
-    StreamClientState, StreamState, StreamStatus, TimelineWatchKey, WatchState,
-    watch_reconnect_delay_ms,
+    RoutineClientState, RoutineDetailState, RoutinePageState, RoutineStartOperationState,
+    SessionAgentCatalogState, SessionClientState, SessionRoutineHistoryState,
+    SessionTemplateSearchState, StatusClientState, StreamClientState, StreamState, StreamStatus,
+    TimelineWatchKey, WatchState, watch_reconnect_delay_ms,
 };
 pub use error::{
     ClientError, ClientErrorKind, McpAuthorizationContext, OutboundAuthenticationFailure,

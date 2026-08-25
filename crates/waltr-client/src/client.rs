@@ -1,12 +1,13 @@
 //! Shell-neutral client reducer.
 
-use crate::coordination::{access, auth, catalog, config, session, status, stream};
+use crate::coordination::{access, auth, catalog, config, routine, session, status, stream};
 use crate::{
     AccessAttemptId, AccessEvent, AuthEvent, AuthTarget, CatalogEvent, ClientEffect, ClientError,
     ClientEvent, ClientSessionTemplateKind, ClientSessionTemplateSearchTarget, ClientState,
     ConfigEffect, ConfigEvent, Configuration, InferenceDefaults, InferenceSettingsRequest,
     McpServer, OperationKey, Provider, ProviderEditBaseline, ResourceEditBaselineView,
-    ResourceKind, ResourceOrigin, ResourceWrite, SessionEvent, StatusEvent, TimelineQuery,
+    ResourceKind, ResourceOrigin, ResourceWrite, RoutineEvent, SessionEvent, StatusEvent,
+    TimelineQuery,
 };
 
 /// Single headless client reducer used by shells.
@@ -68,6 +69,7 @@ impl Client {
             ClientEvent::Config(event) => config::reduce(&mut self.state, event),
             ClientEvent::Status(event) => status::reduce(&mut self.state, event),
             ClientEvent::Session(event) => session::reduce(&mut self.state, event),
+            ClientEvent::Routine(event) => routine::reduce(&mut self.state, event),
             ClientEvent::Stream(event) => {
                 stream::reduce(&mut self.state, event);
                 ClientUpdate::default()
@@ -296,6 +298,113 @@ impl Client {
         self.apply(ClientEvent::Session(SessionEvent::ListRequested))
     }
 
+    /// Register interest in the global manual Routine definition watch.
+    #[must_use]
+    pub fn register_routine_definition_watch_interest(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(
+            RoutineEvent::DefinitionWatchInterestRegistered,
+        ))
+    }
+
+    /// Release interest in the global manual Routine definition watch.
+    #[must_use]
+    pub fn release_routine_definition_watch_interest(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(
+            RoutineEvent::DefinitionWatchInterestReleased,
+        ))
+    }
+
+    /// Register interest in durable Routine invocation history.
+    #[must_use]
+    pub fn register_routine_invocation_watch_interest(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(
+            RoutineEvent::InvocationWatchInterestRegistered,
+        ))
+    }
+
+    /// Release interest in durable Routine invocation history.
+    #[must_use]
+    pub fn release_routine_invocation_watch_interest(&mut self) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(
+            RoutineEvent::InvocationWatchInterestReleased,
+        ))
+    }
+
+    /// Register interest in authoritative Routine history for one source session.
+    #[must_use]
+    pub fn register_session_routine_invocation_watch_interest(
+        &mut self,
+        session_id: impl Into<String>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(
+            RoutineEvent::SessionInvocationWatchInterestRegistered {
+                session_id: session_id.into(),
+            },
+        ))
+    }
+
+    /// Release interest in authoritative Routine history for one source session.
+    #[must_use]
+    pub fn release_session_routine_invocation_watch_interest(
+        &mut self,
+        session_id: impl Into<String>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(
+            RoutineEvent::SessionInvocationWatchInterestReleased {
+                session_id: session_id.into(),
+            },
+        ))
+    }
+
+    /// Start one manual Routine without automatic retry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_manual_routine(
+        &mut self,
+        operation_key: OperationKey,
+        request_id: impl Into<String>,
+        routine_name: impl Into<String>,
+        trigger_name: impl Into<String>,
+        source_session_id: impl Into<String>,
+        inputs: std::collections::BTreeMap<String, crate::ClientRoutineValue>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(RoutineEvent::StartRequested {
+            operation_key,
+            request_id: request_id.into(),
+            routine_name: routine_name.into(),
+            trigger_name: trigger_name.into(),
+            source_session_id: source_session_id.into(),
+            inputs,
+        }))
+    }
+
+    /// Load the next bounded older-history page when a server cursor is available.
+    pub fn load_older_routine_invocations(
+        &mut self,
+        request_id: impl Into<String>,
+        page_size: u32,
+    ) -> ClientUpdate {
+        let Some(before_admission_sequence) = self.state.routines.older_page_token else {
+            return ClientUpdate::default();
+        };
+        self.apply(ClientEvent::Routine(RoutineEvent::OlderPageRequested {
+            request_id: request_id.into(),
+            page_size,
+            before_admission_sequence,
+        }))
+    }
+
+    /// Load full task-level detail for one durable invocation.
+    pub fn load_routine_invocation_detail(
+        &mut self,
+        request_id: impl Into<String>,
+        invocation_id: impl Into<String>,
+    ) -> ClientUpdate {
+        self.apply(ClientEvent::Routine(RoutineEvent::DetailRequested {
+            request_id: request_id.into(),
+            invocation_id: invocation_id.into(),
+        }))
+    }
+
     /// Request that a session timeline page be loaded.
     pub fn request_session_timeline(
         &mut self,
@@ -515,6 +624,35 @@ impl Client {
 
         if self.state.sessions.watch.interests > 0 {
             let update = session::maintain_watch(&mut self.state);
+            if !update.is_empty() {
+                return update;
+            }
+        }
+
+        if self.state.routines.definition_watch.interests > 0 {
+            let update = routine::maintain_definition_watch(&mut self.state);
+            if !update.is_empty() {
+                return update;
+            }
+        }
+
+        if self.state.routines.invocation_watch.interests > 0 {
+            let update = routine::maintain_invocation_watch(&mut self.state);
+            if !update.is_empty() {
+                return update;
+            }
+        }
+
+        let session_ids = self
+            .state
+            .routines
+            .session_histories
+            .iter()
+            .filter(|(_, history)| history.watch.interests > 0)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            let update = routine::maintain_session_invocation_watch(&mut self.state, &session_id);
             if !update.is_empty() {
                 return update;
             }
@@ -1212,6 +1350,14 @@ fn event_is_current(state: &ClientState, event: &ClientEvent) -> bool {
             SessionEvent::WatchStartedForOpen { open_id }
             | SessionEvent::WatchOpenFailed { open_id, .. },
         ) => state.sessions.watch.open_id == Some(*open_id),
+        ClientEvent::Routine(
+            RoutineEvent::DefinitionWatchStartedForOpen { open_id }
+            | RoutineEvent::DefinitionWatchOpenFailed { open_id, .. },
+        ) => state.routines.definition_watch.open_id == Some(*open_id),
+        ClientEvent::Routine(
+            RoutineEvent::InvocationWatchStartedForOpen { open_id }
+            | RoutineEvent::InvocationWatchOpenFailed { open_id, .. },
+        ) => state.routines.invocation_watch.open_id == Some(*open_id),
         ClientEvent::Session(
             SessionEvent::TimelineWatchStartedForOpen { key, open_id }
             | SessionEvent::TimelineWatchOpenFailed { key, open_id, .. },
@@ -1287,6 +1433,15 @@ fn waltr_login_error(event: &ClientEvent) -> Option<String> {
             | SessionEvent::ContinueFailed { error, .. }
             | SessionEvent::WatchFailed(error)
             | SessionEvent::WatchOpenFailed { error, .. },
+        )
+        | ClientEvent::Routine(
+            RoutineEvent::DefinitionWatchOpenFailed { error, .. }
+            | RoutineEvent::DefinitionWatchFailed(error)
+            | RoutineEvent::InvocationWatchOpenFailed { error, .. }
+            | RoutineEvent::InvocationWatchFailed(error)
+            | RoutineEvent::StartFailed { error, .. }
+            | RoutineEvent::OlderPageFailed { error, .. }
+            | RoutineEvent::DetailFailed { error, .. },
         ) => error,
         _ => return None,
     };

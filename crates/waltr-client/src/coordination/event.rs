@@ -3,6 +3,8 @@
 use crate::transport::{ConfigWatchUpdate, SessionTimelineWatchUpdate, SessionWatchUpdate};
 use crate::{
     AccessAttemptId, AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientError,
+    ClientRoutineDefinitionSnapshot, ClientRoutineInvocationDetail, ClientRoutineInvocationPage,
+    ClientRoutineInvocationWatchUpdate, ClientRoutineValidationFailure, ClientRoutineValue,
     GenericAuthAttempt, GenericAuthAttemptStatus, InferenceSettingsRequest, OperationKey, Provider,
     ResourceCatalog, RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateKind,
     SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus, TimelineEvent, TimelineQuery,
@@ -28,8 +30,123 @@ pub enum ClientEvent {
     Status(StatusEvent),
     /// Session coordination event.
     Session(SessionEvent),
+    /// Manual Routine coordination event.
+    Routine(RoutineEvent),
     /// A model or tool stream coordination event.
     Stream(StreamEvent),
+}
+
+/// Manual Routine coordination event applied to the reducer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum RoutineEvent {
+    DefinitionWatchInterestRegistered,
+    DefinitionWatchInterestReleased,
+    DefinitionWatchStartedForOpen {
+        open_id: u64,
+    },
+    DefinitionWatchOpenFailed {
+        open_id: u64,
+        error: ClientError,
+    },
+    DefinitionWatchChanged(ClientRoutineDefinitionSnapshot),
+    DefinitionWatchFailed(ClientError),
+    DefinitionWatchEnded,
+    DefinitionReconnectReady,
+    InvocationWatchInterestRegistered,
+    InvocationWatchInterestReleased,
+    InvocationWatchStartedForOpen {
+        open_id: u64,
+    },
+    InvocationWatchOpenFailed {
+        open_id: u64,
+        error: ClientError,
+    },
+    InvocationWatchChanged(ClientRoutineInvocationWatchUpdate),
+    InvocationWatchFailed(ClientError),
+    InvocationWatchEnded,
+    InvocationReconnectReady,
+    SessionInvocationWatchInterestRegistered {
+        session_id: String,
+    },
+    SessionInvocationWatchInterestReleased {
+        session_id: String,
+    },
+    SessionInvocationWatchStartedForOpen {
+        session_id: String,
+        open_id: u64,
+    },
+    SessionInvocationWatchOpenFailed {
+        session_id: String,
+        open_id: u64,
+        error: ClientError,
+    },
+    SessionInvocationWatchChanged {
+        session_id: String,
+        update: ClientRoutineInvocationWatchUpdate,
+    },
+    SessionInvocationWatchFailed {
+        session_id: String,
+        error: ClientError,
+    },
+    SessionInvocationWatchEnded {
+        session_id: String,
+    },
+    SessionInvocationReconnectReady {
+        session_id: String,
+    },
+    StartRequested {
+        operation_key: OperationKey,
+        request_id: String,
+        routine_name: String,
+        trigger_name: String,
+        source_session_id: String,
+        inputs: std::collections::BTreeMap<String, ClientRoutineValue>,
+    },
+    StartAccepted {
+        operation_key: OperationKey,
+        request_id: String,
+        invocation_id: String,
+    },
+    StartValidationFailed {
+        operation_key: OperationKey,
+        request_id: String,
+        failure: ClientRoutineValidationFailure,
+    },
+    StartFailed {
+        operation_key: OperationKey,
+        request_id: String,
+        error: ClientError,
+    },
+    OlderPageRequested {
+        request_id: String,
+        page_size: u32,
+        before_admission_sequence: u64,
+    },
+    OlderPageLoaded {
+        request_id: String,
+        before_admission_sequence: u64,
+        page: ClientRoutineInvocationPage,
+    },
+    OlderPageFailed {
+        request_id: String,
+        before_admission_sequence: u64,
+        error: ClientError,
+    },
+    DetailRequested {
+        request_id: String,
+        invocation_id: String,
+    },
+    DetailLoaded {
+        request_id: String,
+        invocation_id: String,
+        detail: ClientRoutineInvocationDetail,
+    },
+    DetailFailed {
+        request_id: String,
+        invocation_id: String,
+        error: ClientError,
+    },
 }
 
 /// Model catalog coordination event applied to the reducer.
@@ -775,6 +892,53 @@ pub enum ClientEffect {
     Status(StatusEffect),
     /// Session side-effect intent.
     Session(SessionEffect),
+    /// Manual Routine side-effect intent.
+    Routine(RoutineEffect),
+}
+
+/// Manual Routine side-effect intent emitted by the client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum RoutineEffect {
+    WatchDefinitions {
+        open_id: u64,
+        request_id: String,
+    },
+    WatchInvocations {
+        open_id: u64,
+        request_id: String,
+        after_sequence: Option<u64>,
+        metadata_filters: std::collections::BTreeMap<String, String>,
+        session_id: Option<String>,
+    },
+    StartManual {
+        operation_key: OperationKey,
+        request_id: String,
+        routine_name: String,
+        trigger_name: String,
+        source_session_id: String,
+        inputs: std::collections::BTreeMap<String, ClientRoutineValue>,
+    },
+    ListInvocations {
+        request_id: String,
+        page_size: u32,
+        before_admission_sequence: u64,
+        metadata_filters: std::collections::BTreeMap<String, String>,
+    },
+    GetInvocation {
+        request_id: String,
+        invocation_id: String,
+    },
+    SleepDefinitionReconnect {
+        delay_ms: u64,
+    },
+    SleepInvocationReconnect {
+        delay_ms: u64,
+    },
+    SleepSessionInvocationReconnect {
+        session_id: String,
+        delay_ms: u64,
+    },
 }
 
 /// Model catalog side-effect intent emitted by the client.
