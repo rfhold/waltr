@@ -1031,6 +1031,25 @@ test("screenshot update replaces stale snapshots and validation compares generat
   );
 });
 
+test("selected screenshot update and validation preserve unrelated baselines", (context) => {
+  const root = mkdtempSync(join(tmpdir(), "waltr-selected-screenshot-validation-"));
+  context.after(() => rmSync(root, { force: true, recursive: true }));
+  const actual = join(root, "actual");
+  const expected = join(root, "expected");
+  mkdirSync(actual);
+  mkdirSync(expected);
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  writeFileSync(join(actual, "selected.png"), png);
+  writeFileSync(join(expected, "unrelated.png"), png);
+
+  validateScreenshots(actual, expected, { update: true, partial: true, logger: silentLogger });
+  assert.deepEqual(readdirSync(expected).sort(), ["selected.png", "unrelated.png"]);
+  validateScreenshots(actual, expected, { update: false, partial: true, logger: silentLogger });
+});
+
 test("screenshot snapshot update preserves the complete baseline across copy and swap failures", (context) => {
   const root = mkdtempSync(join(tmpdir(), "waltr-screenshot-snapshot-transaction-"));
   context.after(() => rmSync(root, { force: true, recursive: true }));
@@ -1455,6 +1474,55 @@ test("Compose startup failure captures diagnostics before teardown", async () =>
   assert.equal(result.cleanupFailed, false);
   assert.equal(state.composeRunning, false);
   assert.deepEqual([...state.diagnosticsCaptured], ["disabled"]);
+});
+
+test("Compose forwards selected-script screenshot validation as partial", async () => {
+  const validations = [];
+  const runtime = createHarnessRuntime({
+    logger: silentLogger,
+    commandRunner: () => commandResult(),
+    validateScreenshots(actualDir, expectedDir, options) {
+      validations.push({ actualDir, expectedDir, options });
+    },
+  });
+  const plan = [{
+    phase: "disabled",
+    profile: "test",
+    waltrService: "waltr-test",
+    k6Service: "k6",
+    upServices: ["waltr-test"],
+    scripts: [],
+  }];
+
+  for (const [script, updateScreenshots] of [
+    ["sessions/sessions.browser.js", true],
+    ["sessions/sessions.browser.js", false],
+    [null, false],
+  ]) {
+    const state = testState({
+      runtime,
+      plan,
+      screenshotsDir: "/tmp/waltr-compose-screenshots",
+      options: screenshotOptions({ script, updateScreenshots }),
+    });
+    assert.deepEqual(await executeComposeHarness(state), { testExitCode: 0, cleanupFailed: false });
+  }
+
+  assert.deepEqual(validations.map(({ actualDir, options }) => ({ actualDir, options })), [
+    {
+      actualDir: "/tmp/waltr-compose-screenshots",
+      options: { update: true, partial: true },
+    },
+    {
+      actualDir: "/tmp/waltr-compose-screenshots",
+      options: { update: false, partial: true },
+    },
+    {
+      actualDir: "/tmp/waltr-compose-screenshots",
+      options: { update: false, partial: false },
+    },
+  ]);
+  assert.equal(validations.every(({ expectedDir }) => expectedDir.endsWith("/tests/web/k6/snapshots/screenshots")), true);
 });
 
 test("stopCompose captures diagnostics and stops children before one retry", async () => {
