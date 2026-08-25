@@ -1,5 +1,7 @@
 //! Internal agent loop.
 
+#![allow(clippy::significant_drop_tightening)]
+
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt::Write as _,
@@ -47,9 +49,10 @@ use super::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, ExternalResponse, PendingWorkStatus, RequestId,
         RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionCreateRequest, SessionId,
-        SessionJournalEvent, SessionListBroadcaster, SessionListEvent, SessionRecord,
-        SessionRollbackTarget, SessionSnapshot, SessionStart, SessionStartMessage, SessionStore,
-        SessionStoreError, SessionTimelineBroadcaster, Suspension as SessionSuspension,
+        SessionIncarnation, SessionJournalEvent, SessionOperation, SessionRecord,
+        SessionRollbackTarget, SessionRunContext, SessionSnapshot, SessionStart,
+        SessionStartMessage, SessionStore, SessionStoreError,
+        Suspension as SessionSuspension,
     },
 };
 use super::{ProviderRetryConfig, tool::ToolFuture};
@@ -76,9 +79,12 @@ where
     retry_checkpoint: Option<RetryCheckpoint>,
     session_id: SessionId,
     session_revision: Revision,
+    session_journal_len: u64,
+    last_timeline_cursor: Option<crate::timeline::TimelineCursor>,
     session_store: S,
-    session_broadcaster: Option<SessionListBroadcaster>,
-    timeline_broadcaster: Option<SessionTimelineBroadcaster>,
+    session_record: Option<SessionRecord>,
+    session_run_context: Option<SessionRunContext>,
+    session_incarnation: Option<SessionIncarnation>,
     session_initialized: bool,
     session_metadata_values: BTreeMap<String, Value>,
     middleware_state: MiddlewareStateLog,
@@ -168,9 +174,12 @@ where
             retry_checkpoint: None,
             session_id: run.session_id,
             session_revision: Revision::ZERO,
+            session_journal_len: 0,
+            last_timeline_cursor: None,
             session_store: run.session_store,
-            session_broadcaster: run.session_broadcaster,
-            timeline_broadcaster: run.timeline_broadcaster,
+            session_record: None,
+            session_run_context: run.session_run_context,
+            session_incarnation: None,
             session_initialized: false,
             session_metadata_values: BTreeMap::new(),
             middleware_state: MiddlewareStateLog::default(),
@@ -217,16 +226,7 @@ where
                     };
                     let request = completion_request_from_draft(&draft);
                     let projected = self.provider.project_request(&request);
-                    let retry_checkpoint = match Self::retry_checkpoint(
-                        self.session_store.clone(),
-                        self.session_id.clone(),
-                        self.turn as u64,
-                    )
-                    .await
-                    {
-                        Ok(checkpoint) => checkpoint,
-                        Err(error) => return Some((Err(error), self)),
-                    };
+                    let retry_checkpoint = self.retry_checkpoint();
 
                     if let Err(error) = self.persist_provider_request(&draft, projected).await {
                         return Some((Err(error), self));
@@ -995,13 +995,24 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn initialize_session(&mut self) -> Result<bool> {
         if self.session_initialized {
             return Ok(true);
         }
 
+        let operation = match &self.session_run_context {
+            Some(context) => Some(context.operation().await),
+            None => None,
+        };
+        let incarnation = operation.as_ref().map(SessionOperation::incarnation);
+
         match self.session_store.load(&self.session_id).await {
             Ok(record) => {
+                if let Some(operation) = &operation {
+                    operation.register_loaded_summary(record.summary());
+                }
+                self.session_incarnation = incarnation;
                 let continue_start_turn = self.apply_resume_input(record).await?;
                 self.session_initialized = true;
                 return Ok(continue_start_turn);
@@ -1044,14 +1055,18 @@ where
             .create(request)
             .await
             .map_err(session_store_error)?;
+        if let Some(operation) = &operation {
+            operation.publish_created(record.summary());
+        }
+        self.session_incarnation = incarnation;
+        self.session_metadata_values = record.metadata.values.clone();
+        self.session_journal_len = record.journal.len() as u64;
+        self.last_timeline_cursor = record.timeline_events().last().map(|event| event.cursor);
         let events = record.timeline_events().cloned().collect::<Vec<_>>();
-        if let Some(timeline) = &self.timeline_broadcaster {
-            timeline.publish_all(events.clone());
+        if let Some(context) = &self.session_run_context {
+            context.timeline().publish_all(events.clone());
         }
-        if let Some(sessions) = &self.session_broadcaster {
-            sessions.publish(SessionListEvent::Upsert(record.summary()));
-        }
-        self.session_metadata_values = record.metadata.values;
+        self.session_record = Some(record.clone());
         let turn = self.turn as u64;
         self.prompt_turns = prompts
             .iter()
@@ -1170,6 +1185,9 @@ where
         self.turns = snapshot.turns;
         self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
+        self.session_journal_len = record.journal.len() as u64;
+        self.last_timeline_cursor = record.timeline_events().last().map(|event| event.cursor);
+        self.session_record = Some(record.clone());
         let current_turn = self.turn as u64;
         self.assistant_item_id = None;
         self.thinking_item_id = None;
@@ -1255,17 +1273,20 @@ where
         if events.is_empty() {
             return Ok(());
         }
+        let event_count = events.len() as u64;
+        let projected_events = events.clone();
         self.session_revision = self
             .session_store
             .append_journal(&self.session_id, self.session_revision, events)
             .await
             .map_err(session_store_error)?;
-        Self::publish_session_summary(
-            self.session_store.clone(),
-            self.session_id.clone(),
-            self.session_broadcaster.clone(),
-        )
-        .await?;
+        self.session_journal_len = self.session_journal_len.saturating_add(event_count);
+        if let Some(record) = &mut self.session_record {
+            record.revision = self.session_revision;
+            record.append_journal_events(projected_events);
+            record.touch_activity();
+        }
+        self.publish_session_summary();
         Ok(())
     }
 
@@ -1306,16 +1327,24 @@ where
             .append_timeline(&self.session_id, self.session_revision, events)
             .await
             .map_err(session_store_error)?;
-        if let Some(timeline) = &self.timeline_broadcaster {
-            timeline.publish_all(assigned.clone());
+        if let Some(context) = &self.session_run_context {
+            context.timeline().publish_all(assigned.clone());
         }
         self.session_revision = self.session_revision.next();
-        Self::publish_session_summary(
-            self.session_store.clone(),
-            self.session_id.clone(),
-            self.session_broadcaster.clone(),
-        )
-        .await?;
+        self.session_journal_len = self
+            .session_journal_len
+            .saturating_add(assigned.len() as u64);
+        self.last_timeline_cursor = assigned
+            .last()
+            .map(|event| event.cursor)
+            .or(self.last_timeline_cursor);
+        if let Some(record) = &mut self.session_record {
+            record.revision = self.session_revision;
+            record
+                .append_journal_events(assigned.iter().cloned().map(SessionJournalEvent::Timeline));
+            record.touch_activity();
+        }
+        self.publish_session_summary();
         Ok(assigned)
     }
 
@@ -1448,20 +1477,12 @@ where
         Ok(())
     }
 
-    async fn retry_checkpoint(
-        session_store: S,
-        session_id: SessionId,
-        turn: u64,
-    ) -> Result<RetryCheckpoint> {
-        let record = session_store
-            .load(&session_id)
-            .await
-            .map_err(session_store_error)?;
-        Ok(RetryCheckpoint {
-            journal_len: record.journal.len() as u64,
-            after_cursor: record.timeline_events().last().map(|event| event.cursor),
-            turn,
-        })
+    const fn retry_checkpoint(&self) -> RetryCheckpoint {
+        RetryCheckpoint {
+            journal_len: self.session_journal_len,
+            after_cursor: self.last_timeline_cursor,
+            turn: self.turn as u64,
+        }
     }
 
     async fn rollback_to_retry_checkpoint(&mut self, checkpoint: RetryCheckpoint) -> Result<()> {
@@ -1473,8 +1494,10 @@ where
         };
         self.append_journal_event(SessionJournalEvent::Rollback { target })
             .await?;
-        if let Some(timeline) = &self.timeline_broadcaster {
-            timeline.publish_truncation(self.session_id.clone(), checkpoint.after_cursor);
+        if let Some(context) = &self.session_run_context {
+            context
+                .timeline()
+                .publish_truncation(self.session_id.clone(), checkpoint.after_cursor);
         }
         let record = self
             .session_store
@@ -1618,27 +1641,23 @@ where
 
     fn session_runtime(&self) -> AgentSessionRuntime<'_, S> {
         let mut runtime = AgentSessionRuntime::new(&self.session_store);
-        if let Some(sessions) = &self.session_broadcaster {
-            runtime = runtime.with_session_broadcaster(sessions.clone());
+        if let (Some(context), Some(incarnation)) =
+            (&self.session_run_context, self.session_incarnation)
+        {
+            runtime = runtime.with_session_run_context(context.clone(), incarnation);
         }
-        if let Some(timeline) = &self.timeline_broadcaster {
-            runtime.with_timeline_broadcaster(timeline.clone())
-        } else {
-            runtime
-        }
+        runtime
     }
 
-    async fn publish_session_summary(
-        store: S,
-        session_id: SessionId,
-        sessions: Option<SessionListBroadcaster>,
-    ) -> Result<()> {
-        let Some(sessions) = sessions else {
-            return Ok(());
+    fn publish_session_summary(&self) {
+        let (Some(context), Some(incarnation), Some(record)) = (
+            &self.session_run_context,
+            self.session_incarnation,
+            &self.session_record,
+        ) else {
+            return;
         };
-        let record = store.load(&session_id).await.map_err(session_store_error)?;
-        sessions.publish(SessionListEvent::Upsert(record.summary()));
-        Ok(())
+        context.publish_run_summary(incarnation, record.summary());
     }
 }
 

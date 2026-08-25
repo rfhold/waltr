@@ -2,9 +2,11 @@
 
 mod compat;
 mod compression;
+mod control;
 mod copy;
 mod coordinator;
 mod create;
+mod list;
 mod run;
 mod runtime;
 mod runtime_factory;
@@ -15,11 +17,17 @@ mod types;
 mod watch;
 
 pub use compat::EphemeralSessionRun;
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) use control::{SessionControl, SessionOperation, SessionRunContext};
 pub use copy::{SessionCopy, SessionCopyError};
 pub use coordinator::SessionCoordinator;
 pub use create::{
     SessionCreateRequest, SessionStart, SessionStartMessage, SessionStartMessageError,
 };
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) use list::{SessionIncarnation, SessionListBroadcaster, SessionPublicationClaim};
+#[allow(unused_imports)]
+pub use list::{SessionListEvent, SessionListSubscription, SessionListUpdate};
 pub use run::{
     AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
@@ -50,12 +58,8 @@ pub use types::{
     AgentSession, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, MetadataSetCondition, MetadataSetOutcome, PendingWork,
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, SessionId,
-    SessionJournalEvent, SessionMetrics, SessionRecord, SessionRollbackTarget, SessionSnapshot,
-    SessionStatus, SessionSummary, Suspension,
+    SessionJournalEvent, SessionMetrics, SessionRecord,
+    SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionSummary, Suspension,
 };
-pub(super) use watch::{SessionListBroadcaster, SessionTimelineBroadcaster};
-#[allow(unused_imports)]
-pub use watch::{
-    SessionListEvent, SessionListSubscription, SessionListUpdate, SessionTimelineEvent,
-    SessionTimelineSubscription, SessionTimelineUpdate,
-};
+pub(super) use watch::SessionTimelineBroadcaster;
+pub use watch::{SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate};

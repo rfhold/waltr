@@ -1,5 +1,7 @@
 //! Durable agent session coordinator.
 
+#![allow(clippy::significant_drop_tightening)]
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
@@ -20,20 +22,19 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
-use super::watch::{SessionListBroadcaster, SessionListEvent};
 use super::{
     AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
     AgentSessionRuntime, AgentSessionRuntimeFactory, ExternalResponse, InferenceSettings,
     MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy, RunOutcomeSender,
-    RunResult, SessionCreateRequest, SessionId, SessionListSubscription, SessionStatus,
-    SessionStore, SessionSummary, SessionTimelineBroadcaster, SessionTimelineSubscription,
+    RunResult, SessionControl, SessionCreateRequest, SessionId, SessionListSubscription,
+    SessionRunContext, SessionStore, SessionSummary, SessionTimelineBroadcaster,
+    SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
 
 type McpPreparationGuards = Arc<StdMutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>;
-type SessionMutationGates = Arc<StdMutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>;
 
 /// Durable session coordinator bound to a store.
 #[derive(Debug, Clone)]
@@ -42,13 +43,12 @@ where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
     store: S,
-    sessions: SessionListBroadcaster,
+    control: SessionControl,
     timeline: SessionTimelineBroadcaster,
     runtime_factory: Option<AgentSessionRuntimeFactory>,
     mcp_sessions: Arc<StdMutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
     mcp_preparation_guards: McpPreparationGuards,
     active_runs: Arc<Mutex<BTreeMap<SessionId, ActiveSessionRun>>>,
-    mutation_gates: SessionMutationGates,
     next_run_id: Arc<AtomicU64>,
 }
 
@@ -88,6 +88,11 @@ struct SessionRunStart {
     outcome_txs: Vec<(u64, RunOutcomeSender)>,
 }
 
+struct CapturedRuntimeRecord {
+    record: super::SessionRecord,
+    incarnation: super::SessionIncarnation,
+}
+
 impl<S> SessionCoordinator<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
@@ -96,13 +101,12 @@ where
     pub fn new(store: S) -> Self {
         Self {
             store,
-            sessions: SessionListBroadcaster::new(),
+            control: SessionControl::new(),
             timeline: SessionTimelineBroadcaster::new(),
             runtime_factory: None,
             mcp_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
             mcp_preparation_guards: Arc::new(StdMutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
-            mutation_gates: Arc::new(StdMutex::new(BTreeMap::new())),
             next_run_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -135,11 +139,11 @@ where
             agent_definition_configured = request.agent_definition.is_some(),
             "creating session record"
         );
+        let operation = self.control.session(request.id.clone()).operation().await;
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime.create(request).await?;
         self.timeline.publish_all(record.timeline_events().cloned());
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
+        operation.publish_created(record.summary());
         Ok(AgentSession::new(record))
     }
 
@@ -158,6 +162,7 @@ where
         fields(operation = "delete", db_system = "session_store", session_id = %id.as_str())
     )]
     pub async fn delete(&self, id: &SessionId) -> Result<()> {
+        let operation = self.control.session(id.clone()).deletion().await;
         AgentSessionRuntime::new(&self.store)
             .delete_session(id)
             .await?;
@@ -170,15 +175,12 @@ where
             .lock()
             .expect("MCP preparation guard map lock poisoned")
             .remove(id);
-        self.mutation_gates
-            .lock()
-            .expect("session mutation gate map lock poisoned")
-            .remove(id);
+        operation.publish_deleted();
+        drop(operation);
         let shutdown = match runtime {
             Some(runtime) => shutdown_when_unused(runtime.runtime).await,
             None => Ok(()),
         };
-        self.sessions.publish(SessionListEvent::Deleted(id.clone()));
         shutdown?;
         Ok(())
     }
@@ -198,6 +200,7 @@ where
         fields(operation = "wipe", db_system = "session_store")
     )]
     pub async fn wipe_sessions(&self) -> Result<()> {
+        let lifecycle = self.control.exclusive().await;
         self.store.wipe().await.map_err(session_store_error)?;
         let runtimes = std::mem::take(
             &mut *self
@@ -209,11 +212,7 @@ where
             .lock()
             .expect("MCP preparation guard map lock poisoned")
             .clear();
-        self.mutation_gates
-            .lock()
-            .expect("session mutation gate map lock poisoned")
-            .clear();
-        self.sessions.publish(SessionListEvent::Cleared);
+        lifecycle.publish_cleared();
         drop(tokio::spawn(async move {
             for (session_id, cached) in runtimes {
                 if shutdown_when_unused(cached.runtime).await.is_err() {
@@ -230,7 +229,7 @@ where
     /// Watch newly created or updated sessions.
     #[must_use]
     pub fn watch_sessions(&self) -> SessionListSubscription {
-        self.sessions.subscribe()
+        self.control.subscribe()
     }
 
     /// Load an existing durable session by id.
@@ -275,9 +274,9 @@ where
     )]
     pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
         self.interrupt_active_run(id).await;
+        let operation = self.control.session(id.clone()).operation().await;
         let record = AgentSessionRuntime::new(&self.store)
-            .with_session_broadcaster(self.sessions.clone())
-            .with_timeline_broadcaster(self.timeline.clone())
+            .with_session_run_context(self.run_context(id), operation.incarnation())
             .interrupt(id)
             .await?;
         Ok(AgentSession::new(record))
@@ -319,7 +318,9 @@ where
         id: &SessionId,
         events: Vec<PendingTimelineEvent>,
     ) -> Result<Vec<AgentTimelineEvent>> {
+        let operation = self.control.session(id.clone()).operation().await;
         let record = self.load(id).await?;
+        operation.register_loaded_summary(record.record.summary());
         let assigned = self
             .store
             .append_timeline(id, record.revision(), events)
@@ -327,8 +328,7 @@ where
             .map_err(session_store_error)?;
         self.timeline.publish_all(assigned.clone());
         let record = self.load(id).await?;
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.record.summary()));
+        operation.publish_run_summary(record.record.summary());
         Ok(assigned)
     }
 
@@ -375,13 +375,13 @@ where
         key: impl Into<String>,
         value: Value,
     ) -> Result<AgentSession> {
+        let operation = self.control.session(id.clone()).operation().await;
         let key = key.into();
         tracing::debug!(metadata_key = %key, "setting session metadata value");
         let record = AgentSessionRuntime::new(&self.store)
             .set_metadata_value(id, key, value)
             .await?;
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
+        operation.publish_host_summary(record.summary());
         Ok(AgentSession::new(record))
     }
 
@@ -397,12 +397,12 @@ where
         value: Value,
         condition: MetadataSetCondition,
     ) -> Result<MetadataSetOutcome> {
+        let operation = self.control.session(id.clone()).operation().await;
         let outcome = AgentSessionRuntime::new(&self.store)
             .set_metadata_value_conditionally(id, key.into(), value, condition)
             .await?;
         if outcome.changed {
-            self.sessions
-                .publish(SessionListEvent::Upsert(outcome.record.summary()));
+            operation.publish_host_summary(outcome.record.summary());
         }
         Ok(outcome)
     }
@@ -422,13 +422,13 @@ where
         id: &SessionId,
         key: impl Into<String>,
     ) -> Result<AgentSession> {
+        let operation = self.control.session(id.clone()).operation().await;
         let key = key.into();
         tracing::debug!(metadata_key = %key, "removing session metadata value");
         let record = AgentSessionRuntime::new(&self.store)
             .remove_metadata_value(id, key)
             .await?;
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
+        operation.publish_host_summary(record.summary());
         Ok(AgentSession::new(record))
     }
 
@@ -442,13 +442,11 @@ where
         id: &SessionId,
         inference_settings: Option<InferenceSettings>,
     ) -> Result<AgentSession> {
-        let gate = self.mutation_gate(id);
-        let _mutation = gate.lock().await;
+        let operation = self.control.session(id.clone()).operation().await;
         let record = AgentSessionRuntime::new(&self.store)
             .set_inference_settings(id, inference_settings)
             .await?;
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
+        operation.publish_host_summary(record.summary());
         Ok(AgentSession::new(record))
     }
 
@@ -462,13 +460,11 @@ where
         id: &SessionId,
         agent_definition: Option<AgentDefinitionBundle>,
     ) -> Result<AgentSession> {
-        let gate = self.mutation_gate(id);
-        let _mutation = gate.lock().await;
+        let operation = self.control.session(id.clone()).operation().await;
         let record = AgentSessionRuntime::new(&self.store)
             .set_agent_definition(id, agent_definition)
             .await?;
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
+        operation.publish_host_summary(record.summary());
         Ok(AgentSession::new(record))
     }
 
@@ -491,8 +487,7 @@ where
             )
         })?;
         let mut bundle = factory.bundle_for_agent(agent_name)?;
-        let gate = self.mutation_gate(id);
-        let _mutation = gate.lock().await;
+        let operation = self.control.session(id.clone()).operation().await;
         let current = self.load(id).await?.record;
         let old_name = current
             .agent_definition
@@ -526,8 +521,7 @@ where
         let record = AgentSessionRuntime::new(&self.store)
             .set_agent_definition(id, Some(bundle))
             .await?;
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
+        operation.publish_host_summary(record.summary());
         Ok(AgentSession::new(record))
     }
 
@@ -580,8 +574,9 @@ where
     /// Returns an error when the checkpoint is invalid or persistence fails.
     pub async fn rollback_to_turn(&self, session_id: SessionId, turn: u64) -> Result<AgentSession> {
         self.interrupt_active_run(&session_id).await;
+        let operation = self.control.session(session_id.clone()).operation().await;
         let output = AgentSessionRuntime::new(&self.store)
-            .with_session_broadcaster(self.sessions.clone())
+            .with_session_run_context(self.run_context(&session_id), operation.incarnation())
             .rollback_to_turn(&session_id, turn)
             .await?;
         self.timeline
@@ -600,8 +595,9 @@ where
         cursor: crate::timeline::TimelineCursor,
     ) -> Result<AgentSession> {
         self.interrupt_active_run(&session_id).await;
+        let operation = self.control.session(session_id.clone()).operation().await;
         let output = AgentSessionRuntime::new(&self.store)
-            .with_session_broadcaster(self.sessions.clone())
+            .with_session_run_context(self.run_context(&session_id), operation.incarnation())
             .rollback_to_cursor(&session_id, cursor)
             .await?;
         self.timeline
@@ -620,8 +616,9 @@ where
         cursor: crate::timeline::TimelineCursor,
     ) -> Result<AgentSession> {
         self.interrupt_active_run(&session_id).await;
+        let operation = self.control.session(session_id.clone()).operation().await;
         let output = AgentSessionRuntime::new(&self.store)
-            .with_session_broadcaster(self.sessions.clone())
+            .with_session_run_context(self.run_context(&session_id), operation.incarnation())
             .rollback_before_cursor(&session_id, cursor)
             .await?;
         self.timeline
@@ -883,11 +880,11 @@ where
         session_id: SessionId,
         prompt: impl Into<String>,
     ) -> AgentRunBuilder<S> {
+        let context = self.run_context(&session_id);
         runtime
             .prompt(prompt)
             .with_session_store(self.store.clone(), session_id)
-            .with_session_broadcaster(self.sessions.clone())
-            .with_timeline_broadcaster(self.timeline.clone())
+            .with_session_run_context(context)
     }
 
     /// Resume an existing durable session with explicit input.
@@ -897,9 +894,9 @@ where
         session_id: SessionId,
         input: ResumeInput,
     ) -> AgentRunBuilder<S> {
+        let context = self.run_context(&session_id);
         AgentRunBuilder::resume(runtime, session_id, self.store.clone(), input)
-            .with_session_broadcaster(self.sessions.clone())
-            .with_timeline_broadcaster(self.timeline.clone())
+            .with_session_run_context(context)
     }
 
     /// Return the session store used by this coordinator.
@@ -927,25 +924,32 @@ where
             })?
             .root
             .clone();
-        let (runtime, middleware_state) =
+        let (runtime, middleware_state, incarnation) =
             self.resolve_runtime_for_template_search(session_id).await?;
-        Ok(crate::resource::search_session_templates_with_state(
+        let templates = crate::resource::search_session_templates_with_state(
             &root,
             &runtime,
             &request,
             Some(&middleware_state),
         )
-        .await?)
+        .await;
+        let _operation = self.validate_incarnation(session_id, incarnation).await?;
+        Ok(templates?)
     }
 
     async fn resolve_runtime_for_template_search(
         &self,
         session_id: &SessionId,
     ) -> std::result::Result<
-        (AgentRuntime, crate::middleware::context::MiddlewareStateLog),
+        (
+            AgentRuntime,
+            crate::middleware::context::MiddlewareStateLog,
+            super::SessionIncarnation,
+        ),
         AgentSessionRunError,
     > {
-        let record = self.capture_runtime_record(session_id).await?;
+        let captured = self.capture_runtime_record(session_id).await?;
+        let record = &captured.record;
         let middleware_state =
             crate::middleware::context::MiddlewareStateLog::from_snapshot(&record.snapshot());
         record.inference_settings.as_ref().ok_or_else(|| {
@@ -959,21 +963,26 @@ where
             )
         })?;
         let mcp_runtime = self
-            .ensure_mcp_runtime(session_id, &record, factory)
+            .ensure_mcp_runtime(session_id, record, captured.incarnation, factory)
             .await
             .ok()
             .flatten();
         let runtime = factory
-            .runtime_for_session(&record, self.clone(), mcp_runtime)
+            .runtime_for_session(record, self.clone(), mcp_runtime)
+            .await;
+        let _operation = self
+            .validate_incarnation(session_id, captured.incarnation)
             .await?;
-        Ok((runtime, middleware_state))
+        let runtime = runtime?;
+        Ok((runtime, middleware_state, captured.incarnation))
     }
 
     pub(crate) async fn resolve_runtime(
         &self,
         session_id: &SessionId,
     ) -> std::result::Result<AgentRuntime, AgentSessionRunError> {
-        let record = self.capture_runtime_record_for_cycle(session_id).await?;
+        let captured = self.capture_runtime_record_for_cycle(session_id).await?;
+        let record = &captured.record;
         record.inference_settings.as_ref().ok_or_else(|| {
             super::AgentSessionRuntimeError::FailedPrecondition(
                 "session runtime settings are required before prompting".to_owned(),
@@ -985,35 +994,47 @@ where
             )
         })?;
         let mcp_runtime = self
-            .ensure_mcp_runtime(session_id, &record, factory)
+            .ensure_mcp_runtime(session_id, record, captured.incarnation, factory)
             .await?;
-        Ok(factory
-            .runtime_for_session(&record, self.clone(), mcp_runtime)
-            .await?)
+        let runtime = factory
+            .runtime_for_session(record, self.clone(), mcp_runtime)
+            .await;
+        let _operation = self
+            .validate_incarnation(session_id, captured.incarnation)
+            .await?;
+        Ok(runtime?)
     }
 
-    pub(crate) async fn capture_runtime_record(
+    async fn capture_runtime_record(
         &self,
         session_id: &SessionId,
-    ) -> std::result::Result<super::SessionRecord, AgentSessionRunError> {
-        let gate = self.mutation_gate(session_id);
-        let _capture = gate.lock().await;
-        Ok(self.load(session_id).await?.record)
+    ) -> std::result::Result<CapturedRuntimeRecord, AgentSessionRunError> {
+        let operation = self.control.session(session_id.clone()).operation().await;
+        let record = self.load(session_id).await?.record;
+        operation.register_loaded_summary(record.summary());
+        Ok(CapturedRuntimeRecord {
+            record,
+            incarnation: operation.incarnation(),
+        })
     }
 
     async fn capture_runtime_record_for_cycle(
         &self,
         session_id: &SessionId,
-    ) -> std::result::Result<super::SessionRecord, AgentSessionRunError> {
-        let gate = self.mutation_gate(session_id);
-        let _capture = gate.lock().await;
+    ) -> std::result::Result<CapturedRuntimeRecord, AgentSessionRunError> {
+        let operation = self.control.session(session_id.clone()).operation().await;
         let mut record = self.load(session_id).await?.record;
+        operation.register_loaded_summary(record.summary());
+        let incarnation = operation.incarnation();
         let Some(audit) = record
             .agent_definition
             .as_ref()
             .and_then(|bundle| bundle.pending_switch_audit.clone())
         else {
-            return Ok(record);
+            return Ok(CapturedRuntimeRecord {
+                record,
+                incarnation,
+            });
         };
         let already_appended = record.timeline_events().any(|event| {
             matches!(
@@ -1053,18 +1074,30 @@ where
                 .set_agent_definition(session_id, Some(bundle))
                 .await?;
         }
-        self.sessions
-            .publish(SessionListEvent::Upsert(record.summary()));
-        Ok(record)
+        operation.publish_host_summary(record.summary());
+        Ok(CapturedRuntimeRecord {
+            record,
+            incarnation,
+        })
     }
 
-    fn mutation_gate(&self, session_id: &SessionId) -> Arc<Mutex<()>> {
-        self.mutation_gates
-            .lock()
-            .expect("session mutation gate map lock poisoned")
-            .entry(session_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn run_context(&self, session_id: &SessionId) -> SessionRunContext {
+        SessionRunContext::new(
+            self.control.session(session_id.clone()),
+            self.timeline.clone(),
+        )
+    }
+
+    async fn validate_incarnation(
+        &self,
+        session_id: &SessionId,
+        expected: super::SessionIncarnation,
+    ) -> std::result::Result<super::SessionOperation, super::AgentSessionRuntimeError> {
+        self.control
+            .session(session_id.clone())
+            .operation_for_incarnation(expected)
+            .await
+            .ok_or_else(stale_runtime_resolution)
     }
 
     async fn preflight_authentication(
@@ -1083,18 +1116,20 @@ where
         message: String,
         failure: crate::AuthenticationFailure,
     ) -> Result<()> {
+        let operation = self.control.session(session_id.clone()).operation().await;
         AgentSessionRuntime::new(&self.store)
-            .with_session_broadcaster(self.sessions.clone())
-            .with_timeline_broadcaster(self.timeline.clone())
+            .with_session_run_context(self.run_context(session_id), operation.incarnation())
             .fail_authentication(session_id, message, failure)
             .await?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn ensure_mcp_runtime(
         &self,
         session_id: &SessionId,
         record: &super::SessionRecord,
+        incarnation: super::SessionIncarnation,
         factory: &AgentSessionRuntimeFactory,
     ) -> std::result::Result<Option<Arc<McpClientRuntime>>, super::AgentSessionRuntimeError> {
         let preparation_guard = self
@@ -1106,10 +1141,14 @@ where
             .clone();
         let _preparation = preparation_guard.lock().await;
         let Some(feature) = factory.mcp_feature_for_session(record)? else {
+            let _operation = self.validate_incarnation(session_id, incarnation).await?;
             self.evict_mcp_runtime(session_id);
             return Ok(None);
         };
-        let Some(prepared) = factory.prepare_mcp_runtime(&feature).await? else {
+        let prepared = factory.prepare_mcp_runtime(&feature).await;
+        let operation = self.validate_incarnation(session_id, incarnation).await?;
+        let prepared = prepared?;
+        let Some(prepared) = prepared else {
             self.evict_mcp_runtime(session_id);
             return Ok(None);
         };
@@ -1119,24 +1158,46 @@ where
             .expect("MCP runtime cache lock poisoned")
             .get(session_id)
             .cloned();
+        drop(operation);
         if let Some(cached) = cached
             && cached.can_reuse(&prepared)
         {
-            factory
+            let preflight = factory
                 .preflight_cached_mcp_authentication(
                     &prepared.connections,
                     &cached.credentialed_servers,
                 )
-                .await?;
+                .await;
+            let _operation = self.validate_incarnation(session_id, incarnation).await?;
+            preflight?;
+            let still_cached = self
+                .mcp_sessions
+                .lock()
+                .expect("MCP runtime cache lock poisoned")
+                .get(session_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.runtime, &cached.runtime));
+            if !still_cached {
+                return Err(stale_runtime_resolution());
+            }
             return Ok(Some(cached.runtime));
         }
-        let runtime = McpClientRuntime::start(
+        let started = McpClientRuntime::start(
             prepared.config,
             factory.mcp_root_uri(),
             CancellationToken::new(),
         )
         .await
-        .map_err(|error| mcp_start_error(error.server_key, error.error, &prepared.connections))?;
+        .map_err(|error| mcp_start_error(error.server_key, error.error, &prepared.connections));
+        let operation = match self.validate_incarnation(session_id, incarnation).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                if let Ok(runtime) = started {
+                    drop(runtime.shutdown().await);
+                }
+                return Err(error);
+            }
+        };
+        let runtime = started?;
         let replaced = self
             .mcp_sessions
             .lock()
@@ -1149,6 +1210,7 @@ where
                     credentialed_servers: prepared.credentialed_servers,
                 },
             );
+        drop(operation);
         if let Some(replaced) = replaced {
             spawn_runtime_shutdown(replaced.runtime);
         }
@@ -1165,6 +1227,12 @@ where
             spawn_runtime_shutdown(evicted.runtime);
         }
     }
+}
+
+fn stale_runtime_resolution() -> super::AgentSessionRuntimeError {
+    super::AgentSessionRuntimeError::FailedPrecondition(
+        "session changed during runtime resolution".to_owned(),
+    )
 }
 
 fn mcp_start_error(
@@ -1399,8 +1467,7 @@ mod tests {
         CompletionRequest, ExternalRequestKind, LlmStream, ModelApi, ModelRef,
         PendingTimelineEvent, PermissionLevel, PermissionPattern, PermissionResponse, ProviderId,
         Revision, SessionCopy, SessionJournalEvent, SessionRecord, SessionStart,
-        SessionStartMessage, SessionStatus, SessionTimelineEvent,
-        TimelineCursor, ToolCall,
+        SessionStartMessage, SessionStatus, SessionTimelineEvent, TimelineCursor, ToolCall,
         agent::session::{
             FileCredentialStore, InferenceProviderSettings, MemorySessionStore, SessionListEvent,
         },
@@ -1584,6 +1651,19 @@ spec: { mcp: {} }
         });
 
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment)
+    }
+
+    async fn establish_incarnation(
+        sessions: &SessionCoordinator<MemorySessionStore>,
+        record: &SessionRecord,
+    ) -> crate::agent::session::SessionIncarnation {
+        let operation = sessions
+            .control
+            .session(record.id.clone())
+            .operation()
+            .await;
+        operation.register_loaded_summary(record.summary());
+        operation.incarnation()
     }
 
     fn authentication_runtime_error() -> crate::AgentSessionRuntimeError {
@@ -1779,9 +1859,10 @@ spec: {}
         );
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let record = SessionRecord::new("no-mcp-session");
+        let incarnation = establish_incarnation(&sessions, &record).await;
 
         let runtime = sessions
-            .ensure_mcp_runtime(&record.id, &record, &factory)
+            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
             .await
             .expect("disabled MCP should skip invalid configuration");
 
@@ -1806,6 +1887,7 @@ spec: {}
         .with_mcp_connection_resolver(|_| Box::pin(async { Ok(Vec::new()) }));
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let record = SessionRecord::new("empty-eviction");
+        let incarnation = establish_incarnation(&sessions, &record).await;
         let runtime = McpClientRuntime::start(
             crate::mcp::McpConfig::new(),
             "file:///tmp".to_owned(),
@@ -1831,7 +1913,7 @@ spec: {}
             );
 
         let resolved = sessions
-            .ensure_mcp_runtime(&record.id, &record, &factory)
+            .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
             .await
             .expect("empty resolution succeeds");
 
@@ -1867,6 +1949,7 @@ spec: {}
         });
         let sessions = SessionCoordinator::new(MemorySessionStore::new());
         let record = SessionRecord::new("failed-replacement");
+        let incarnation = establish_incarnation(&sessions, &record).await;
         let old = McpClientRuntime::start(
             crate::mcp::McpConfig::new(),
             "file:///tmp".to_owned(),
@@ -1892,7 +1975,7 @@ spec: {}
 
         assert!(
             sessions
-                .ensure_mcp_runtime(&record.id, &record, &factory)
+                .ensure_mcp_runtime(&record.id, &record, incarnation, &factory)
                 .await
                 .is_err(),
             "failed reconstruction must not return stale tools"
@@ -1988,8 +2071,9 @@ spec: {}
             .await
             .expect("load updated session")
             .record;
+        let incarnation = establish_incarnation(&sessions, &current_record).await;
         let reused = sessions
-            .ensure_mcp_runtime(&session.record.id, &current_record, &factory)
+            .ensure_mcp_runtime(&session.record.id, &current_record, incarnation, &factory)
             .await
             .expect("reconstruct MCP runtime")
             .expect("MCP runtime remains selected");
@@ -2195,11 +2279,17 @@ spec: { systemPrompt: gamma prompt }
             .await
             .unwrap();
         assert_eq!(
-            captured.agent_definition.as_ref().unwrap().agent_name,
+            captured
+                .record
+                .agent_definition
+                .as_ref()
+                .unwrap()
+                .agent_name,
             "gamma"
         );
         assert!(
             captured
+                .record
                 .agent_definition
                 .as_ref()
                 .unwrap()
@@ -2253,12 +2343,12 @@ spec: { systemPrompt: gamma prompt }
 
         sessions.switch_agent(&id, "beta").await.unwrap();
 
-        assert!(before.agent_definition.is_none());
+        assert!(before.record.agent_definition.is_none());
         let after = sessions
             .capture_runtime_record_for_cycle(&id)
             .await
             .unwrap();
-        assert_eq!(after.agent_definition.unwrap().agent_name, "beta");
+        assert_eq!(after.record.agent_definition.unwrap().agent_name, "beta");
     }
 
     #[tokio::test]
@@ -2564,8 +2654,7 @@ spec:
             .await
             .unwrap();
         let id = session.record.id;
-        let gate = sessions.mutation_gate(&id);
-        let held = gate.lock().await;
+        let held = sessions.control.session(id.clone()).operation().await;
         let capture_sessions = sessions.clone();
         let capture_id = id.clone();
         let capture = tokio::spawn(async move {
@@ -2590,13 +2679,23 @@ spec:
         let captured = capture.await.unwrap();
         update.await.unwrap();
         assert_eq!(
-            captured.inference_settings.unwrap().provider.model_id,
+            captured
+                .record
+                .inference_settings
+                .unwrap()
+                .provider
+                .model_id,
             "test-model"
         );
 
         let captured_after = sessions.capture_runtime_record(&id).await.unwrap();
         assert_eq!(
-            captured_after.inference_settings.unwrap().provider.model_id,
+            captured_after
+                .record
+                .inference_settings
+                .unwrap()
+                .provider
+                .model_id,
             "new-model"
         );
     }
@@ -2615,10 +2714,12 @@ spec:
         let id = session.record.id;
 
         let _runtime = sessions.resolve_runtime(&id).await.unwrap();
-        let gate = sessions.mutation_gate(&id);
-        let _guard = tokio::time::timeout(std::time::Duration::from_millis(100), gate.lock())
-            .await
-            .expect("runtime startup must release the mutation gate");
+        let _guard = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sessions.control.session(id).operation(),
+        )
+        .await
+        .expect("runtime startup must release the mutation gate");
     }
 
     #[tokio::test]

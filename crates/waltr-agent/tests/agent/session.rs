@@ -155,18 +155,22 @@ fn report_tool_errors_enabled() -> bool {
 
 #[cfg(test)]
 mod completion {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use futures_util::StreamExt;
     use waltr_agent::{
-        AgentRuntime, AgentTimelineEvent, AgentTool, CompletionEvent, MemorySessionStore, ModelApi,
-        ModelRef, PendingTimelineEvent, PendingTimelineItemId, ProviderId, SessionCoordinator,
+        AgentRuntime, AgentTimelineEvent, AgentTool, BoxCompletionStream, BoxStreamFuture,
+        CompletionEvent, CompletionRequest, LlmStream, MemorySessionStore, ModelApi, ModelRef,
+        PendingTimelineEvent, PendingTimelineItemId, ProviderId, SessionCoordinator,
         SessionCreateRequest, SessionId, SessionListEvent, SessionStatus, SessionStore,
         SessionTimelineEvent, TimelineContent, TimelineCursor, TimelineEventKind, TimelineQuery,
         TimelineStatus, ToolCall, ToolDefinition,
     };
     use serde_json::json;
-    use tokio::time::{Duration, timeout};
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
 
     use crate::scripted_provider::{CapturingProvider, ScriptedProvider};
 
@@ -206,6 +210,78 @@ mod completion {
                 CompletionEvent::Finished,
             ],
         ]
+    }
+
+    #[derive(Default)]
+    struct GatedProvider {
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl LlmStream for GatedProvider {
+        fn name(&self) -> &'static str {
+            "gated_provider"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(CompletionEvent::Delta("done".to_owned())),
+                    Ok(CompletionEvent::Finished),
+                ])) as BoxCompletionStream)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_run_does_not_publish_after_delete_and_same_id_recreate() {
+        let sessions = SessionCoordinator::new(MemorySessionStore::new());
+        let id = SessionId::new("recreated-publication");
+        let mut old = SessionCreateRequest::new(id.clone());
+        old.metadata_values = BTreeMap::from([("owner".to_owned(), json!("old"))]);
+        sessions.create(old).await.expect("create old incarnation");
+        let mut watch = sessions.watch_sessions();
+        let provider = Arc::new(GatedProvider::default());
+        let agent = AgentRuntime::builder(test_model(), Arc::clone(&provider)).build();
+        let run_sessions = sessions.clone();
+        let run_id = id.clone();
+        let run = tokio::spawn(async move {
+            run_sessions
+                .prompt(&agent, run_id, "run")
+                .stream()
+                .collect::<Vec<_>>()
+                .await
+        });
+        provider.entered.notified().await;
+
+        sessions.delete(&id).await.expect("delete old incarnation");
+        let mut replacement = SessionCreateRequest::new(id.clone());
+        replacement.metadata_values = BTreeMap::from([("owner".to_owned(), json!("new"))]);
+        sessions
+            .create(replacement)
+            .await
+            .expect("create replacement incarnation");
+        provider.release.notify_one();
+        drop(run.await.expect("run task"));
+
+        let mut updates = Vec::new();
+        while let Ok(Some(update)) = timeout(Duration::from_millis(25), watch.next()).await {
+            updates.push(update);
+        }
+        let deleted = updates
+            .iter()
+            .position(|update| update.event == SessionListEvent::Deleted(id.clone()))
+            .expect("delete publication");
+        assert!(updates[deleted + 1..].iter().all(|update| {
+            !matches!(
+                &update.event,
+                SessionListEvent::Upsert(summary)
+                    if summary.id == id
+                        && summary.metadata_values.get("owner") == Some(&json!("old"))
+            )
+        }));
     }
 
     async fn saw_finished_status<S>(mut stream: S) -> bool

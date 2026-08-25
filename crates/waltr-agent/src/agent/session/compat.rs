@@ -5,8 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{LlmStream, ModelCost, ModelRef, PermissionPolicy};
 use tokio_util::sync::CancellationToken;
 
-use super::watch::{SessionListBroadcaster, SessionTimelineBroadcaster};
-use super::{ResumeInput, SessionId, SessionStore};
+use super::{ResumeInput, SessionId, SessionRunContext, SessionStore};
 use crate::middleware::{chain::MiddlewareChain, prompt::SystemPromptOverride};
 
 use super::super::{AgentTool, ProviderRetryConfig};
@@ -27,7 +26,6 @@ where
     pub template_base_dir: Option<PathBuf>,
     pub session_id: SessionId,
     pub session_store: S,
-    pub session_broadcaster: Option<SessionListBroadcaster>,
-    pub timeline_broadcaster: Option<SessionTimelineBroadcaster>,
+    pub session_run_context: Option<SessionRunContext>,
     pub cancellation_token: CancellationToken,
 }

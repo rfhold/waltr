@@ -10,6 +10,8 @@ Agent code should not depend on client, server, TUI, or web layers.
 
 Agent code may depend on the generic `mcp` crate. The `mcp` crate must not depend back on `waltr-agent`.
 
+Session lifecycle and list projection are centralized in `src/agent/session/control.rs` and `src/agent/session/list.rs`. Acquire lifecycle before the per-session mutation gate, and enter the synchronous list projection only after both; never hold a synchronous mutex across an await. Pass coordinator-owned run services through `SessionRunContext` rather than adding independent gates or broadcasters to the run loop.
+
 # Hints
 
 Use the agent-modification skill when modifying the isolated agent library.
