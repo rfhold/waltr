@@ -12,6 +12,8 @@ Agent code may depend on the generic `mcp` crate. The `mcp` crate must not depen
 
 Session lifecycle and list projection are centralized in `src/agent/session/control.rs` and `src/agent/session/list.rs`. Acquire lifecycle before the per-session mutation gate, and enter the synchronous list projection only after both; never hold a synchronous mutex across an await. Pass coordinator-owned run services through `SessionRunContext` rather than adding independent gates or broadcasters to the run loop.
 
+Source-backed Routine helpers persist rollback-aware provider-neutral inference history through the latest completed turn, followed by the task prompt. Provider requests derive only from durable helper state. Preserve replay prompts, assistant text, tool calls and results, and images. Exclude lifecycle, middleware, status, usage and cost, request audit, provider metadata, provider-native thinking payloads, rollback barriers, and active partial work. Provider adapters retain normal encoding rules.
+
 # Hints
 
 Use the agent-modification skill when modifying the isolated agent library.

@@ -25,11 +25,11 @@ use tracing::Instrument as _;
 use super::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
-    AgentSessionRuntime, AgentSessionRuntimeFactory, ExternalResponse, InferenceSettings,
-    MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy, RunOutcomeSender,
-    RunResult, SessionControl, SessionCreateRequest, SessionId, SessionListSubscription,
-    SessionRunContext, SessionStore, SessionSummary, SessionTimelineBroadcaster,
-    SessionTimelineSubscription,
+    AgentSessionRuntime, AgentSessionRuntimeFactory, CompletedSessionCapture, ExternalResponse,
+    InferenceSettings, MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy,
+    RunOutcomeSender, RunResult, SessionCaptureError, SessionCaptureLimits, SessionControl,
+    SessionCreateRequest, SessionId, SessionListSubscription, SessionRunContext, SessionStore,
+    SessionSummary, SessionTimelineBroadcaster, SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
@@ -273,6 +273,35 @@ where
         let runtime = AgentSessionRuntime::new(&self.store);
         let record = runtime.load_session(id).await?;
         Ok(AgentSession::new(record))
+    }
+
+    /// Capture the source conversation through its latest effective completed turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed precondition, exhaustion, or storage failure.
+    pub async fn capture_latest_completed(
+        &self,
+        id: &SessionId,
+    ) -> std::result::Result<CompletedSessionCapture, SessionCaptureError> {
+        self.capture_latest_completed_with_limits(id, SessionCaptureLimits::default())
+            .await
+    }
+
+    /// Capture the latest completed turn under explicit projection bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed precondition, exhaustion, or storage failure.
+    pub async fn capture_latest_completed_with_limits(
+        &self,
+        id: &SessionId,
+        limits: SessionCaptureLimits,
+    ) -> std::result::Result<CompletedSessionCapture, SessionCaptureError> {
+        let operation = self.control.session(id.clone()).operation().await;
+        let record = self.store.load(id).await?;
+        operation.register_loaded_summary(record.summary());
+        super::capture::capture_record(&record, limits)
     }
 
     /// List durable sessions, newest activity first.

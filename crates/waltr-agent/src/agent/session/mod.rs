@@ -1,5 +1,6 @@
 //! Durable agent session support.
 
+mod capture;
 mod compat;
 mod compression;
 mod control;
@@ -16,6 +17,7 @@ mod title;
 mod types;
 mod watch;
 
+pub use capture::{CompletedSessionCapture, SessionCaptureError, SessionCaptureLimits};
 pub use compat::EphemeralSessionRun;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) use control::{SessionControl, SessionOperation, SessionRunContext};
