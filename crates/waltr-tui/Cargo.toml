@@ -22,7 +22,7 @@ waltr-client.workspace = true
 waltr-server = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
 rand.workspace = true
-ratatui = { workspace = true, features = ["palette", "scrolling-regions"] }
+ratatui = { workspace = true, features = ["palette", "scrolling-regions", "unstable-rendered-line-info"] }
 reqwest = { workspace = true, features = ["form", "rustls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

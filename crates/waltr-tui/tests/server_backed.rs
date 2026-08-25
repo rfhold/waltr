@@ -15,3 +15,6 @@ mod sessions;
 
 #[path = "server-backed/oauth.rs"]
 mod oauth;
+
+#[path = "server-backed/routines.rs"]
+mod routines;

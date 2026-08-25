@@ -1,17 +1,24 @@
 //! App-level rendering and input tests.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use waltr_client::{
     AuthAttemptSnapshot, AuthenticationFailureSnapshot, CatalogMatchSourceView, ClientAuthTarget,
-    ClientCommand, ClientOperationView, ClientSnapshot, ClientTimelineDirection, ConfigView,
+    ClientCommand, ClientManualRoutineDefinition, ClientOperationView, ClientRoutineFailure,
+    ClientRoutineInputDefinition, ClientRoutineInvocationDetail, ClientRoutineInvocationStatus,
+    ClientRoutineInvocationSummary, ClientRoutineResult, ClientRoutineResultDefinition,
+    ClientRoutineScope, ClientRoutineTask, ClientRoutineTaskStatus, ClientRoutineTriggerKind,
+    ClientRoutineValue, ClientRoutineValueType, ClientSnapshot, ClientTimelineDirection, ConfigView,
     InferenceProviderSettingsView, InferenceSettingsMatchView, InferenceSettingsView,
     McpAuthorizationContextSnapshot, McpServerTypeView, McpServerView, ModelCapabilitiesView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OAuthJwtMetadataView,
     OAuthProviderView, OAuthTokenFieldView, OAuthTokenRequestStyleView, OAuthUrlParamView,
-    OperationSnapshot, ProviderKindView, ProviderView, RollbackTargetView, SessionPhaseView,
-    SessionTimelineView, TimelineContentView, TimelineEventKindView, TimelineEventView,
-    TimelineStatusView,
+    OperationSnapshot, ProviderKindView, ProviderView, RollbackTargetView, RoutineDetailSnapshot,
+    SessionPhaseView, SessionTimelineView, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelineStatusView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},
@@ -33,5 +40,6 @@ use support::app::*;
 
 include!("app/basic.rs");
 include!("app/sessions.rs");
+include!("app/routines.rs");
 include!("app/session_data.rs");
 include!("app/config.rs");

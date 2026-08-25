@@ -16,9 +16,10 @@ use waltr_client::{
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
     OperationSnapshot, ProviderKindView, ProviderView, ResourceEditBaselineView,
-    SelectableAgentView, SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot,
-    SessionStatusView, SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView,
-    TimelineEventKindView, TimelineEventView, TimelineStatusView, TimestampView,
+    RoutineDefinitionSnapshot, RoutineHistorySnapshot, RoutineSnapshot, SelectableAgentView,
+    SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot, SessionStatusView,
+    SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelineStatusView, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction},
@@ -720,6 +721,7 @@ pub(crate) fn session_with_phase(
         revision: 1,
         status: SessionStatusView {
             phase,
+            suspension_kind: None,
             failed_message: failed_message.to_owned(),
             authentication_failure: None,
         },
@@ -729,6 +731,8 @@ pub(crate) fn session_with_phase(
         last_activity_at: None,
         inference_settings: None,
         metrics: Default::default(),
+        associations: Default::default(),
+        metadata: Default::default(),
     }
 }
 
@@ -898,6 +902,35 @@ pub(crate) const fn ready_snapshot() -> ClientSnapshot {
             },
             timelines: BTreeMap::new(),
             template_searches: BTreeMap::new(),
+        },
+        routines: RoutineSnapshot {
+            definitions: RoutineDefinitionSnapshot {
+                watch: OperationSnapshot {
+                    status: "idle",
+                    error: None,
+                    key: None,
+                },
+                digest: String::new(),
+                definitions: Vec::new(),
+            },
+            history: RoutineHistorySnapshot {
+                watch: OperationSnapshot {
+                    status: "idle",
+                    error: None,
+                    key: None,
+                },
+                recent: Vec::new(),
+                through_sequence: None,
+                older_page_token: None,
+                pagination: OperationSnapshot {
+                    status: "idle",
+                    error: None,
+                    key: None,
+                },
+            },
+            session_histories: BTreeMap::new(),
+            details: BTreeMap::new(),
+            starts: BTreeMap::new(),
         },
     }
 }

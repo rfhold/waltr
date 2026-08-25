@@ -28,6 +28,8 @@ pub enum LeaderCommand {
     Inference,
     /// Switch the agent for the active session.
     Agent,
+    /// Open the global read-only Routines screen.
+    Routines,
     /// Quit the app immediately.
     Quit,
     /// Clear in-memory Waltr credentials.
@@ -78,6 +80,10 @@ fn leader_command(key: KeyEvent) -> LeaderCommand {
 
     if matches!(key.code, KeyCode::Char('a')) {
         return LeaderCommand::Agent;
+    }
+
+    if matches!(key.code, KeyCode::Char('u')) {
+        return LeaderCommand::Routines;
     }
 
     if matches!(key.code, KeyCode::Char('q')) {

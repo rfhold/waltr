@@ -211,6 +211,70 @@ fn sessions_active_agent_switch_explains_next_cycle_and_escape_focus() {
     assert!(!app.session_interrupt_armed());
 }
 
+fn routine_definition(
+    routine_name: &str,
+    display_name: &str,
+    description: &str,
+    inputs: Vec<ClientRoutineInputDefinition>,
+) -> ClientManualRoutineDefinition {
+    ClientManualRoutineDefinition {
+        routine_name: routine_name.to_owned(),
+        trigger_name: "manual".to_owned(),
+        display_name: display_name.to_owned(),
+        description: description.to_owned(),
+        scope: ClientRoutineScope::Session,
+        inputs,
+        results: vec![ClientRoutineResultDefinition {
+            name: "session-id".to_owned(),
+            r#type: ClientRoutineValueType::String,
+        }],
+        routine_revision: "revision-1".to_owned(),
+    }
+}
+
+fn routine_detail(
+    invocation_id: &str,
+    status: ClientRoutineInvocationStatus,
+    results: Vec<ClientRoutineResult>,
+) -> ClientRoutineInvocationDetail {
+    ClientRoutineInvocationDetail {
+        summary: ClientRoutineInvocationSummary {
+            admission_sequence: 1,
+            invocation_id: invocation_id.to_owned(),
+            routine_name: "generic".to_owned(),
+            routine_revision: "revision-1".to_owned(),
+            trigger_name: "manual".to_owned(),
+            trigger_kind: ClientRoutineTriggerKind::Manual,
+            correlation_id: "request".to_owned(),
+            metadata: BTreeMap::from([(
+                waltr_client::ROUTINE_SOURCE_SESSION_ID_METADATA_KEY.to_owned(),
+                "source".to_owned(),
+            )]),
+            source_cursor: None,
+            status,
+            admitted_at_ms: 1,
+            started_at_ms: Some(2),
+            completed_at_ms: status.is_terminal().then_some(3),
+            updated_at_ms: 3,
+            terminal_error: None,
+            latest_sequence: 3,
+        },
+        tasks: vec![ClientRoutineTask {
+            name: "create".to_owned(),
+            r#type: "sessionCreate".to_owned(),
+            status: if status.is_terminal() {
+                ClientRoutineTaskStatus::Succeeded
+            } else {
+                ClientRoutineTaskStatus::Running
+            },
+            results: Vec::new(),
+            session_references: BTreeMap::new(),
+            error: None,
+        }],
+        results,
+    }
+}
+
 #[test]
 fn sessions_inference_editor_renders_layered_snapshot() {
     let mut app = open_sessions_app_with(inference_editor_snapshot());

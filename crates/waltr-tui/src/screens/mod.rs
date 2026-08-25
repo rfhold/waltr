@@ -5,6 +5,7 @@ mod config;
 mod inference_selector;
 mod landing;
 mod operation;
+mod routines;
 mod session_data;
 mod sessions;
 mod splash;
@@ -17,6 +18,7 @@ pub use config::{
 };
 pub use landing::draw_landing;
 pub use operation::{OperationResult, OperationTracker, SectionAction};
+pub use routines::{RoutinesSection, draw_routines};
 pub(crate) use session_data::{SessionDataAction, SessionDataState, draw_session_data};
 pub(crate) use sessions::register_timeline_watch_command;
 pub use sessions::{SessionsSection, draw_sessions};
