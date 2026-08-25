@@ -1,13 +1,10 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    "grafana-query@git+ssh://git@git.holdenitdown.net/rfhold/grafana-query.git#opencode/v0.2.1"
-  ],
   "mcp": {
     "waltr-local": {
       "type": "remote",
       "url": "http://127.0.0.1:14333/mcp",
-      "enabled": true
+      "enabled": false
     },
     "waltr-preview": {
       "type": "remote",
