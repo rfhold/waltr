@@ -37,7 +37,7 @@ use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
 type McpPreparationGuards = Arc<StdMutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>;
 
 /// Durable session coordinator bound to a store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionCoordinator<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
@@ -50,6 +50,20 @@ where
     mcp_preparation_guards: McpPreparationGuards,
     active_runs: Arc<Mutex<BTreeMap<SessionId, ActiveSessionRun>>>,
     next_run_id: Arc<AtomicU64>,
+    event_sink: Option<Arc<dyn crate::SessionEventSink>>,
+}
+
+impl<S> std::fmt::Debug for SessionCoordinator<S>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionCoordinator")
+            .field("runtime_factory", &self.runtime_factory)
+            .field("event_sink", &self.event_sink.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -108,6 +122,7 @@ where
             mcp_preparation_guards: Arc::new(StdMutex::new(BTreeMap::new())),
             active_runs: Arc::new(Mutex::new(BTreeMap::new())),
             next_run_id: Arc::new(AtomicU64::new(0)),
+            event_sink: None,
         }
     }
 
@@ -115,6 +130,13 @@ where
     #[must_use]
     pub fn with_runtime_factory(mut self, factory: AgentSessionRuntimeFactory) -> Self {
         self.runtime_factory = Some(factory);
+        self
+    }
+
+    /// Configure fire-and-forget semantic session event delivery.
+    #[must_use]
+    pub fn with_session_event_sink(mut self, sink: Arc<dyn crate::SessionEventSink>) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 
@@ -140,7 +162,10 @@ where
             "creating session record"
         );
         let operation = self.control.session(request.id.clone()).operation().await;
-        let runtime = AgentSessionRuntime::new(&self.store);
+        let mut runtime = AgentSessionRuntime::new(&self.store);
+        if let Some(sink) = &self.event_sink {
+            runtime = runtime.with_session_event_sink(Arc::clone(sink));
+        }
         let record = runtime.create(request).await?;
         self.timeline.publish_all(record.timeline_events().cloned());
         operation.publish_created(record.summary());
@@ -1085,6 +1110,7 @@ where
         SessionRunContext::new(
             self.control.session(session_id.clone()),
             self.timeline.clone(),
+            self.event_sink.clone(),
         )
     }
 
@@ -1455,7 +1481,7 @@ fn session_store_error(error: impl std::fmt::Display) -> crate::LlmError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use futures_util::{StreamExt as _, stream};
     use serde_json::json;
@@ -1474,6 +1500,25 @@ mod tests {
     };
 
     struct TextOnlyProvider;
+
+    struct RecordingEventSink {
+        events: StdMutex<Vec<crate::SessionEvent>>,
+        fail: bool,
+    }
+
+    impl crate::SessionEventSink for RecordingEventSink {
+        fn send(&self, event: crate::SessionEvent) -> crate::SessionEventSinkFuture {
+            self.events.lock().expect("event sink lock").push(event);
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    Err("injected event failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
 
     impl LlmStream for TextOnlyProvider {
         fn name(&self) -> &'static str {
@@ -1773,6 +1818,110 @@ spec: { mcp: {} }
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn copy_start_publishes_only_new_post_durable_semantic_event() {
+        let sink = Arc::new(RecordingEventSink {
+            events: StdMutex::new(Vec::new()),
+            fail: false,
+        });
+        let sessions = SessionCoordinator::new(MemorySessionStore::new())
+            .with_session_event_sink(sink.clone());
+        let id = SessionId::new("atomic-initial");
+        let mut source = SessionRecord::new("copy-source");
+        source.journal = vec![
+            SessionJournalEvent::PromptAppended {
+                prompt: "copied source prompt".to_owned(),
+            },
+            SessionJournalEvent::Timeline(
+                PendingTimelineEvent::user_text_snapshot(
+                    source.id.clone(),
+                    0,
+                    crate::PendingTimelineItemId::New,
+                    "copied source prompt",
+                )
+                .with_cursor(TimelineCursor::new(1)),
+            ),
+            SessionJournalEvent::TurnFinished { turn: 0 },
+        ];
+        let text = "configured destination prompt".to_owned();
+        let mut request = SessionCreateRequest::new(id.clone());
+        request
+            .metadata_values
+            .insert("host.key".to_owned(), json!("value"));
+        request.start = SessionStart::Copy {
+            copy: SessionCopy::from_record(&source, TimelineCursor::new(1)).unwrap(),
+            messages: vec![SessionStartMessage::user(text.clone()).unwrap()],
+        };
+
+        let session = sessions.create(request).await.unwrap();
+
+        for _ in 0..10 {
+            if sink.events.lock().expect("event sink lock").len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let events = sink.events.lock().expect("event sink lock");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            crate::SessionEvent::UserMessageCreated {
+                id: "user-message:atomic-initial:j3".to_owned(),
+                session_id: id,
+                prompt_index: 1,
+                user_message_count: 2,
+                text,
+                metadata: session.record.metadata.values.clone(),
+                revision: session.record.revision,
+                cursor: Some(TimelineCursor::new(2)),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_creation_never_publishes_copied_prompts_or_failed_start_messages() {
+        let sink = Arc::new(RecordingEventSink {
+            events: StdMutex::new(Vec::new()),
+            fail: false,
+        });
+        let sessions = SessionCoordinator::new(MemorySessionStore::new())
+            .with_session_event_sink(sink.clone());
+        let id = SessionId::new("seed-only");
+        let mut source = SessionRecord::new("copy-source");
+        source.journal = vec![
+            SessionJournalEvent::PromptAppended {
+                prompt: "copied source prompt".to_owned(),
+            },
+            SessionJournalEvent::Timeline(
+                PendingTimelineEvent::user_text_snapshot(
+                    source.id.clone(),
+                    0,
+                    crate::PendingTimelineItemId::New,
+                    "copied source prompt",
+                )
+                .with_cursor(TimelineCursor::new(1)),
+            ),
+            SessionJournalEvent::TurnFinished { turn: 0 },
+        ];
+        let mut request = SessionCreateRequest::new(id.clone());
+        request.start = SessionStart::Copy {
+            copy: SessionCopy::from_record(&source, TimelineCursor::new(1)).unwrap(),
+            messages: Vec::new(),
+        };
+        sessions.create(request).await.unwrap();
+
+        let mut duplicate = SessionCreateRequest::new(id);
+        duplicate.start = SessionStart::Fresh {
+            messages: vec![SessionStartMessage::user("must not publish").unwrap()],
+        };
+        assert!(sessions.create(duplicate).await.is_err());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sink.events.lock().expect("event sink lock").is_empty());
     }
 
     #[tokio::test]

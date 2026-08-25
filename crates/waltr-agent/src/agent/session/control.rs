@@ -263,6 +263,7 @@ impl SessionLifecycleGuard {
 pub(crate) struct SessionRunContext {
     session: SessionHandle,
     timeline: SessionTimelineBroadcaster,
+    event_sink: Option<Arc<dyn crate::SessionEventSink>>,
 }
 
 impl std::fmt::Debug for SessionRunContext {
@@ -270,6 +271,7 @@ impl std::fmt::Debug for SessionRunContext {
         formatter
             .debug_struct("SessionRunContext")
             .field("session_id", self.session.id())
+            .field("event_sink", &self.event_sink.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -278,8 +280,13 @@ impl SessionRunContext {
     pub(crate) fn new(
         session: SessionHandle,
         timeline: SessionTimelineBroadcaster,
+        event_sink: Option<Arc<dyn crate::SessionEventSink>>,
     ) -> Self {
-        Self { session, timeline }
+        Self {
+            session,
+            timeline,
+            event_sink,
+        }
     }
 
     pub(crate) async fn operation(&self) -> SessionOperation {
@@ -310,6 +317,10 @@ impl SessionRunContext {
 
     pub(crate) const fn timeline(&self) -> &SessionTimelineBroadcaster {
         &self.timeline
+    }
+
+    pub(crate) fn event_sink(&self) -> Option<&Arc<dyn crate::SessionEventSink>> {
+        self.event_sink.as_ref()
     }
 }
 

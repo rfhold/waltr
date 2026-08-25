@@ -13,7 +13,7 @@ pub mod session;
 mod tool;
 
 pub use builder::AgentRuntimeBuilder;
-pub use event::BoxAgentTimelineStream;
+pub use event::{BoxAgentTimelineStream, SessionEvent, SessionEventSink, SessionEventSinkFuture};
 pub use retry::ProviderRetryConfig;
 pub use run::AgentRunBuilder;
 pub use session::{
@@ -117,7 +117,8 @@ mod tests {
         AgentTimelineEvent, BoxCompletionStream, BoxStreamFuture, CHANNEL_ASSISTANT_TEXT,
         CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse,
         MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent, SessionStore,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent, SessionRecord,
+        SessionStatus, SessionStore,
         SessionTimelineEvent, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery,
         ToolCall,
         middleware::{
@@ -131,12 +132,218 @@ mod tests {
         },
     };
     use futures_util::{StreamExt, stream};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use super::{
         AgentRuntime, SessionCoordinator,
         session::{SessionListBroadcaster, SessionTimelineBroadcaster},
     };
+
+    struct RecordingEventSink {
+        store: MemorySessionStore,
+        tx: tokio::sync::mpsc::UnboundedSender<(crate::SessionEvent, SessionRecord)>,
+        fail: bool,
+    }
+
+    #[derive(Clone)]
+    struct FailAfterPromptAppendStore {
+        inner: MemorySessionStore,
+        fail_next_load: Arc<AtomicBool>,
+    }
+
+    impl FailAfterPromptAppendStore {
+        fn new() -> Self {
+            Self {
+                inner: MemorySessionStore::new(),
+                fail_next_load: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl SessionStore for FailAfterPromptAppendStore {
+        fn create(
+            &self,
+            request: crate::SessionCreateRequest,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<SessionRecord>> + Send
+        {
+            let inner = self.inner.clone();
+            let fail = Arc::clone(&self.fail_next_load);
+            async move {
+                let has_prompt = match &request.start {
+                    crate::SessionStart::Fresh { messages }
+                    | crate::SessionStart::Copy { messages, .. } => !messages.is_empty(),
+                };
+                let record = inner.create(request).await?;
+                if has_prompt {
+                    fail.store(true, Ordering::SeqCst);
+                }
+                Ok(record)
+            }
+        }
+
+        fn load(
+            &self,
+            id: &crate::SessionId,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<SessionRecord>> + Send
+        {
+            let inner = self.inner.clone();
+            let id = id.clone();
+            let fail = Arc::clone(&self.fail_next_load);
+            async move {
+                if fail.swap(false, Ordering::SeqCst) {
+                    Err(crate::SessionStoreError::Backend {
+                        message: "injected post-append load failure".to_owned(),
+                    })
+                } else {
+                    inner.load(&id).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            id: &crate::SessionId,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<()>> + Send {
+            self.inner.delete(id)
+        }
+
+        fn wipe(&self) -> impl std::future::Future<Output = crate::SessionStoreResult<()>> + Send {
+            self.inner.wipe()
+        }
+
+        fn list(
+            &self,
+        ) -> impl std::future::Future<
+            Output = crate::SessionStoreResult<Vec<crate::SessionSummary>>,
+        > + Send {
+            self.inner.list()
+        }
+
+        fn append_timeline(
+            &self,
+            id: &crate::SessionId,
+            expected_revision: crate::Revision,
+            events: Vec<crate::PendingTimelineEvent>,
+        ) -> impl std::future::Future<
+            Output = crate::SessionStoreResult<Vec<crate::AgentTimelineEvent>>,
+        > + Send {
+            self.inner.append_timeline(id, expected_revision, events)
+        }
+
+        fn append_journal(
+            &self,
+            id: &crate::SessionId,
+            expected_revision: crate::Revision,
+            events: Vec<crate::SessionJournalEvent>,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<crate::Revision>> + Send
+        {
+            let inner = self.inner.clone();
+            let id = id.clone();
+            let fail = Arc::clone(&self.fail_next_load);
+            async move {
+                let prompt_appended = events.iter().any(|event| {
+                    matches!(event, crate::SessionJournalEvent::PromptAppended { .. })
+                });
+                let revision = inner.append_journal(&id, expected_revision, events).await?;
+                if prompt_appended {
+                    fail.store(true, Ordering::SeqCst);
+                }
+                Ok(revision)
+            }
+        }
+
+        fn set_metadata_value_conditionally(
+            &self,
+            id: &crate::SessionId,
+            key: String,
+            value: serde_json::Value,
+            condition: crate::MetadataSetCondition,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<crate::MetadataSetOutcome>> + Send
+        {
+            self.inner
+                .set_metadata_value_conditionally(id, key, value, condition)
+        }
+
+        fn remove_metadata_value(
+            &self,
+            id: &crate::SessionId,
+            key: String,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<SessionRecord>> + Send
+        {
+            self.inner.remove_metadata_value(id, key)
+        }
+
+        fn set_inference_settings(
+            &self,
+            id: &crate::SessionId,
+            inference_settings: Option<crate::InferenceSettings>,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<SessionRecord>> + Send
+        {
+            self.inner.set_inference_settings(id, inference_settings)
+        }
+
+        fn set_agent_definition(
+            &self,
+            id: &crate::SessionId,
+            agent_definition: Option<crate::AgentDefinitionBundle>,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<SessionRecord>> + Send
+        {
+            self.inner.set_agent_definition(id, agent_definition)
+        }
+
+        fn timeline(
+            &self,
+            id: &crate::SessionId,
+            query: crate::TimelineQuery,
+        ) -> impl std::future::Future<
+            Output = crate::SessionStoreResult<Vec<crate::AgentTimelineEvent>>,
+        > + Send {
+            self.inner.timeline(id, query)
+        }
+
+        fn timeline_item_text(
+            &self,
+            id: &crate::SessionId,
+            item_id: &crate::TimelineItemId,
+        ) -> impl std::future::Future<Output = crate::SessionStoreResult<crate::TimelineItemText>> + Send
+        {
+            self.inner.timeline_item_text(id, item_id)
+        }
+    }
+
+    struct EventOnlySink(tokio::sync::mpsc::UnboundedSender<crate::SessionEvent>);
+
+    impl crate::SessionEventSink for EventOnlySink {
+        fn send(&self, event: crate::SessionEvent) -> crate::SessionEventSinkFuture {
+            let tx = self.0.clone();
+            Box::pin(async move { tx.send(event).map_err(|error| error.to_string()) })
+        }
+    }
+
+    impl crate::SessionEventSink for RecordingEventSink {
+        fn send(&self, event: crate::SessionEvent) -> crate::SessionEventSinkFuture {
+            let store = self.store.clone();
+            let tx = self.tx.clone();
+            let fail = self.fail;
+            Box::pin(async move {
+                let crate::SessionEvent::UserMessageCreated { session_id, .. } = &event;
+                let record = store
+                    .load(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                tx.send((event, record))
+                    .map_err(|error| error.to_string())?;
+                if fail {
+                    Err("injected sink failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
 
     struct NoopMiddleware;
 
@@ -373,6 +580,101 @@ mod tests {
             .await
             .expect("timeline read");
         assert_eq!(timeline, watched);
+    }
+
+    #[tokio::test]
+    async fn user_message_event_is_post_durability_and_sink_failure_is_non_fatal() {
+        let store = MemorySessionStore::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = Arc::new(RecordingEventSink {
+            store: store.clone(),
+            tx,
+            fail: true,
+        });
+        let sessions = SessionCoordinator::new(store.clone()).with_session_event_sink(sink);
+        let session_id = sessions
+            .create(SessionCreateRequest::new(SessionId::generate()))
+            .await
+            .unwrap()
+            .id()
+            .clone();
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = AgentRuntime::builder(model, Arc::new(TextOnlyProvider)).build();
+
+        drain(
+            sessions
+                .prompt(&agent, session_id.clone(), "hello")
+                .stream(),
+        )
+        .await;
+
+        let (event, loaded_when_delivered) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("semantic event timeout")
+                .expect("semantic event");
+        let crate::SessionEvent::UserMessageCreated {
+            id,
+            prompt_index,
+            user_message_count,
+            text,
+            metadata,
+            revision,
+            ..
+        } = event;
+        assert_eq!(id, format!("user-message:{}:j0", session_id.as_str()));
+        assert_eq!(prompt_index, 0);
+        assert_eq!(user_message_count, 1);
+        assert_eq!(text, "hello");
+        assert!(metadata.is_empty());
+        assert!(loaded_when_delivered.revision >= revision);
+        assert_eq!(loaded_when_delivered.snapshot().prompts, ["hello"]);
+        assert_eq!(
+            store.load(&session_id).await.unwrap().snapshot().status,
+            SessionStatus::Finished
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_create_does_not_read_after_prompt_append_to_prepare_event() {
+        let store = FailAfterPromptAppendStore::new();
+        let session_id = crate::SessionId::new("auto-create-load-failure");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let model = ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses);
+        let agent = AgentRuntime::builder(model, Arc::new(TextOnlyProvider)).build();
+
+        drain(
+            agent
+                .prompt("hello")
+                .with_session_store(store.clone(), session_id.clone())
+                .with_session_event_sink(Arc::new(EventOnlySink(tx)))
+                .stream(),
+        )
+        .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("user message event");
+        assert!(matches!(
+            event,
+            crate::SessionEvent::UserMessageCreated { text, .. } if text == "hello"
+        ));
+        assert!(matches!(
+            store.load(&session_id).await,
+            Err(crate::SessionStoreError::Backend { message })
+                if message == "injected post-append load failure"
+        ));
+        assert_eq!(
+            store
+                .inner
+                .load(&session_id)
+                .await
+                .unwrap()
+                .snapshot()
+                .status,
+            SessionStatus::Finished
+        );
     }
 
     #[tokio::test]
