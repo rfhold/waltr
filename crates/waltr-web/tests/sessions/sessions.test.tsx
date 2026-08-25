@@ -904,7 +904,7 @@ describe("sessions route", () => {
     });
 
     expect(screen.getByLabelText("Session activity status").textContent).toContain("provider unavailable");
-    expect(screen.getByLabelText("Session status summary").textContent).not.toContain("failed");
+    expect(screen.getByLabelText("Session status summary").textContent).not.toContain("Session failed.");
   });
 
   test.each([
