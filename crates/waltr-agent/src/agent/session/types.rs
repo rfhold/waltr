@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-use super::InferenceSettings;
+use super::{ActiveSessionMask, InferenceSettings, SessionMask, SessionMaskId};
 
 /// Condition applied by an atomic metadata set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,8 +417,15 @@ impl SessionRecord {
 
     /// Append one durable journal event to this record.
     pub fn append_journal_event(&mut self, event: SessionJournalEvent) {
-        if let SessionJournalEvent::Timeline(timeline) = &event {
-            self.timeline_cursor_high_water = self.timeline_cursor_high_water.max(timeline.cursor);
+        match &event {
+            SessionJournalEvent::Timeline(timeline) => {
+                self.timeline_cursor_high_water =
+                    self.timeline_cursor_high_water.max(timeline.cursor);
+            }
+            SessionJournalEvent::MasksMutated { cursor, .. } => {
+                self.timeline_cursor_high_water = self.timeline_cursor_high_water.max(*cursor);
+            }
+            _ => {}
         }
         self.journal.push(event);
     }
@@ -448,6 +455,7 @@ impl SessionRecord {
                 | SessionJournalEvent::Interrupted
                 | SessionJournalEvent::TurnInterrupted { .. }
                 | SessionJournalEvent::TurnFinished { .. }
+                | SessionJournalEvent::MasksMutated { .. }
                 | SessionJournalEvent::Rollback { .. }
                 | SessionJournalEvent::Finished
                 | SessionJournalEvent::Failed { .. } => None,
@@ -470,6 +478,7 @@ impl SessionRecord {
             | SessionJournalEvent::Interrupted
             | SessionJournalEvent::TurnInterrupted { .. }
             | SessionJournalEvent::TurnFinished { .. }
+            | SessionJournalEvent::MasksMutated { .. }
             | SessionJournalEvent::Rollback { .. }
             | SessionJournalEvent::Finished
             | SessionJournalEvent::Failed { .. } => None,
@@ -504,8 +513,13 @@ impl SessionRecord {
     /// Greatest allocated cursor, including rolled-back or filtered timeline events.
     #[must_use]
     pub fn timeline_cursor_high_water(&self) -> TimelineCursor {
-        self.all_timeline_events()
-            .map(|event| event.cursor)
+        self.journal
+            .iter()
+            .filter_map(|event| match event {
+                SessionJournalEvent::Timeline(event) => Some(event.cursor),
+                SessionJournalEvent::MasksMutated { cursor, .. } => Some(*cursor),
+                _ => None,
+            })
             .max()
             .unwrap_or(TimelineCursor::ZERO)
             .max(self.timeline_cursor_high_water)
@@ -529,10 +543,41 @@ impl SessionRecord {
                 | SessionJournalEvent::Interrupted
                 | SessionJournalEvent::TurnInterrupted { .. }
                 | SessionJournalEvent::TurnFinished { .. }
+                | SessionJournalEvent::MasksMutated { .. }
                 | SessionJournalEvent::Rollback { .. }
                 | SessionJournalEvent::Finished
                 | SessionJournalEvent::Failed { .. } => None,
             })
+    }
+
+    /// Derive active masks from rollback-effective journal history.
+    #[must_use]
+    pub fn active_masks(&self) -> Vec<SessionMask> {
+        self.active_session_masks()
+            .into_iter()
+            .map(|active| active.mask)
+            .collect()
+    }
+
+    /// Derive active masks and their administrative activation cursors.
+    #[must_use]
+    pub fn active_session_masks(&self) -> Vec<ActiveSessionMask> {
+        let mut active = Vec::<ActiveSessionMask>::new();
+        for event in self.effective_journal_events() {
+            if let SessionJournalEvent::MasksMutated {
+                cursor,
+                removed_mask_ids,
+                added_masks,
+            } = event
+            {
+                active.retain(|active| !removed_mask_ids.contains(&active.mask.id));
+                active.extend(added_masks.iter().cloned().map(|mask| ActiveSessionMask {
+                    mask,
+                    mutation_cursor: *cursor,
+                }));
+            }
+        }
+        active
     }
 }
 
@@ -693,6 +738,7 @@ impl SessionSnapshot {
                 self.turn = self.turn.max(turn + 1);
                 self.status = SessionStatus::Idle;
             }
+            SessionJournalEvent::MasksMutated { .. } => {}
             SessionJournalEvent::Rollback { .. } => {}
             SessionJournalEvent::Finished => {
                 self.status = SessionStatus::Finished;
@@ -971,6 +1017,12 @@ pub enum SessionJournalEvent {
     TurnInterrupted { turn: u64 },
     /// Provider turn finished.
     TurnFinished { turn: u64 },
+    /// Persistent replacement masks were atomically removed and added.
+    MasksMutated {
+        cursor: TimelineCursor,
+        removed_mask_ids: Vec<SessionMaskId>,
+        added_masks: Vec<SessionMask>,
+    },
     /// Session state was logically rolled back to an earlier checkpoint.
     Rollback { target: SessionRollbackTarget },
     /// Session completed normally.

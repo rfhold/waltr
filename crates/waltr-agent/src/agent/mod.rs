@@ -17,31 +17,35 @@ pub use event::{BoxAgentTimelineStream, SessionEvent, SessionEventSink, SessionE
 pub use retry::ProviderRetryConfig;
 pub use run::AgentRunBuilder;
 pub use session::{
-    AgentRunLimits, AgentRuntimeProvider, AgentSession, AgentSessionActiveRunState,
+    ActiveSessionMask, AgentRunLimits, AgentRuntimeProvider, AgentSession, AgentSessionActiveRunState,
     AgentSessionRunDisposition, AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput,
     AgentSessionRunOutcome, AgentSessionRunSubmission, AgentSessionRuntime,
     AgentSessionRuntimeError, AgentSessionRuntimeFactory, CancelReason, CompletedSessionCapture,
     CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore, ExternalRequest,
     ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, FileCredentialStore, FilesystemSessionStore,
-    InferenceProviderSettings, InferenceSettings, McpConnectionKind, McpConnectionResolveFuture,
+    InferenceProviderSettings, InferenceSettings, MAX_ACTIVE_SESSION_MASKS,
+    MAX_SESSION_MASK_KEY_BYTES, MAX_SESSION_MASK_MUTATION_ITEMS,
+    MAX_SESSION_MASK_REPLACEMENT_BYTES, McpConnectionKind, McpConnectionResolveFuture,
     McpConnectionResolveRequest, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration,
     McpOAuthRegistrationMethod, McpResolvedConnection, MemorySessionStore, MetadataSetCondition,
     MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext,
     OAuthCredentialRecord,
     OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult,
-    OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, RequestId,
+    OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode,
+    ReplacementUserContent, RequestId,
     RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
     S3SessionWriteMode, ScyllaSessionStore, SessionCaptureError, SessionCaptureLimits,
     SessionCoordinator, SessionCopy, SessionCopyError, SessionCreateRequest, SessionId,
-    SessionJournalEvent, SessionListEvent, SessionListSubscription,
-    SessionListUpdate,
-    SessionMetrics, SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionJournalEvent, SessionListEvent, SessionListSubscription, SessionListUpdate, SessionMask,
+    SessionMaskAddition, SessionMaskError, SessionMaskId, SessionMaskMutation,
+    SessionMaskMutationOutcome, SessionMaskSubtraction, SessionMetrics, SessionOAuthJwtMetadata,
+    SessionOAuthJwtToken, SessionOAuthProviderSettings,
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
     SessionRecord, SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
     SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential,
-    Suspension, opendal_postgresql_session_store, run_postgresql_migrations,
+    Suspension, ThroughCursor, opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 
@@ -256,6 +260,16 @@ mod tests {
                 }
                 Ok(revision)
             }
+        }
+
+        fn mutate_masks(
+            &self,
+            id: &crate::SessionId,
+            mutation: crate::SessionMaskMutation,
+        ) -> impl std::future::Future<
+            Output = crate::SessionStoreResult<crate::SessionMaskMutationOutcome>,
+        > + Send {
+            self.inner.mutate_masks(id, mutation)
         }
 
         fn set_metadata_value_conditionally(

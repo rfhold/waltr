@@ -8,6 +8,7 @@ mod copy;
 mod coordinator;
 mod create;
 mod list;
+mod mask;
 mod run;
 mod runtime;
 mod runtime_factory;
@@ -29,6 +30,12 @@ pub use create::{
 pub(crate) use list::{SessionIncarnation, SessionListBroadcaster, SessionPublicationClaim};
 #[allow(unused_imports)]
 pub use list::{SessionListEvent, SessionListSubscription, SessionListUpdate};
+pub use mask::{
+    ActiveSessionMask, MAX_ACTIVE_SESSION_MASKS, MAX_SESSION_MASK_KEY_BYTES,
+    MAX_SESSION_MASK_MUTATION_ITEMS, MAX_SESSION_MASK_REPLACEMENT_BYTES, ReplacementUserContent,
+    SessionMask, SessionMaskAddition, SessionMaskError, SessionMaskId, SessionMaskMutation,
+    SessionMaskMutationOutcome, SessionMaskSubtraction, ThroughCursor,
+};
 pub use run::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,

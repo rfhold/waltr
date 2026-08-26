@@ -12,12 +12,14 @@ use opendal::Operator;
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
+    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
+        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -301,7 +303,7 @@ impl OpenDalSessionStore {
         if updated.require_atomic {
             return Err(SessionStoreError::Backend {
                 message: format!(
-                    "atomic metadata writes are unsupported for OpenDAL session {} because the backend provides neither ETags nor compare-and-swap",
+                    "atomic session writes are unsupported for OpenDAL session {} because the backend provides neither ETags nor compare-and-swap",
                     id.as_str()
                 ),
             });
@@ -470,6 +472,44 @@ impl SessionStore for OpenDalSessionStore {
                 })
                 .await?;
             Ok(revision)
+        }
+    }
+
+    fn mutate_masks(
+        &self,
+        id: &SessionId,
+        mutation: SessionMaskMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+    {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let guard = store.mutation_guard(&id).await?;
+            let _mutation_guard = guard.lock().await;
+            for attempt in 1..=OPENDAL_CAS_ATTEMPTS {
+                let (mut record, etag, original) = store.load_record_with_etag(&id).await?;
+                let revision = record.revision.next();
+                record.revision = revision;
+                let outcome = mutate_masks_on_record(&mut record, revision, &mutation)?;
+                if store
+                    .write_updated_record(
+                        &id,
+                        UpdatedRecord {
+                            etag: etag.as_deref(),
+                            original: &original,
+                            record: &record,
+                            require_atomic: true,
+                        },
+                    )
+                    .await?
+                {
+                    return Ok(outcome);
+                }
+                if attempt == OPENDAL_CAS_ATTEMPTS {
+                    return Err(cas_contention(&id, attempt));
+                }
+            }
+            unreachable!("OpenDAL CAS attempts are positive")
         }
     }
 
@@ -819,6 +859,69 @@ mod tests {
                 if message.contains("neither ETags nor compare-and-swap")
         ));
         assert_eq!(store.load(&id).await.unwrap().metadata_value("key"), None);
+    }
+
+    #[tokio::test]
+    async fn tokenless_backend_rejects_atomic_mask_mutation_without_persisting_it() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let store = OpenDalSessionStore::new(operator, "sessions");
+        let id = SessionId::new("tokenless-mask");
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        store
+            .append_timeline(
+                &id,
+                Revision::ZERO,
+                vec![crate::PendingTimelineEvent::assistant_text_snapshot(
+                    id.clone(),
+                    0,
+                    crate::PendingTimelineItemId::New,
+                    "answer",
+                )],
+            )
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                &id,
+                Revision::new(1),
+                vec![SessionJournalEvent::TurnFinished { turn: 0 }],
+            )
+            .await
+            .unwrap();
+        let mut mutation = SessionMaskMutation::new(Some(crate::TimelineCursor::new(1)));
+        mutation.add.push(crate::SessionMaskAddition::new(
+            "summary",
+            crate::ThroughCursor::new(crate::TimelineCursor::new(1)),
+            crate::ReplacementUserContent::new("compacted"),
+        ));
+
+        let error = store.mutate_masks(&id, mutation).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionStoreError::Backend { message }
+                if message.contains("neither ETags nor compare-and-swap")
+        ));
+        let record = store.load(&id).await.unwrap();
+        assert_eq!(record.revision, Revision::new(2));
+        assert!(record.active_masks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replacement_masks_follow_successful_compare_and_swap_contract() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let store = OpenDalSessionStore::new(operator.clone(), "sessions").with_compare_and_swap(
+            Arc::new(TestCompareAndSwap {
+                operator,
+                rejections: Arc::new(AtomicUsize::new(0)),
+                attempts: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        super::super::assert_mask_store_contract(store, "opendal-cas").await;
     }
 
     #[tokio::test]

@@ -12,10 +12,11 @@ use waltr_agent::{
     AgentRuntime, CHANNEL_ASSISTANT_TEXT, CHANNEL_EXTERNAL_REQUEST, CHANNEL_TOOL_CALL,
     CHANNEL_TOOL_RESULT, ExternalRequestId, ExternalResponse, FilesystemSessionStore,
     MetadataSetCondition, OpenDalSessionStore, PendingTimelineEvent, PendingTimelineItemId,
-    ResumeInput, Revision, S3SessionStore, ScyllaSessionStore, SessionCoordinator,
-    SessionCreateRequest, SessionId, SessionJournalEvent, SessionStore, SessionStoreError,
-    TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery, TimelineStatus,
-    opendal_postgresql_session_store,
+    ReplacementUserContent, ResumeInput, Revision, S3SessionStore, ScyllaSessionStore,
+    SessionCoordinator, SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskAddition,
+    SessionMaskError, SessionMaskMutation, SessionStore, SessionStoreError, ThroughCursor,
+    TimelineChannel, TimelineContent, TimelineCursor, TimelineEventKind, TimelineQuery,
+    TimelineStatus, opendal_postgresql_session_store,
     tools::question::{QUESTION_TOOL_NAME, QuestionConfig},
 };
 use opendal::{Operator, services};
@@ -46,6 +47,7 @@ async fn s3_session_store_resumes_from_garage_container() -> waltr_agent::Result
     install_rustls_crypto_provider();
     let garage = GarageContainer::start().await?;
     let store = S3SessionStore::new(garage.s3_client().await, garage.bucket.clone(), "sessions");
+    assert_mask_store_contract(store.clone(), "s3-garage").await?;
     assert_resume_round_trip(store, "s3-garage").await
 }
 
@@ -57,6 +59,7 @@ async fn scylla_session_store_resumes_from_container() -> waltr_agent::Result<()
     let store =
         ScyllaSessionStore::new(scylla.session.clone(), scylla.keyspace.clone(), "sessions");
     store.create_schema().await.map_err(store_error)?;
+    assert_mask_store_contract(store.clone(), "scylla").await?;
     assert_resume_round_trip(store, "scylla").await
 }
 
@@ -184,6 +187,7 @@ async fn opendal_postgresql_session_store_resumes_from_container() -> waltr_agen
     let store = opendal_postgresql_session_store(&postgres.connection_string, "sessions")
         .await
         .map_err(store_error)?;
+    assert_mask_store_contract(store.clone(), "opendal-postgresql").await?;
     assert_resume_round_trip(store, "opendal-postgresql").await
 }
 
@@ -327,6 +331,95 @@ where
         matches!(error, SessionStoreError::NotFound { .. }),
         "{label}: deleted session should not load: {error:?}"
     );
+    Ok(())
+}
+
+async fn assert_mask_store_contract<S>(store: S, label: &str) -> waltr_agent::Result<()>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    let id = SessionId::new(format!("mask-contract-{label}"));
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .map_err(store_error)?;
+    store
+        .append_timeline(
+            &id,
+            Revision::ZERO,
+            vec![PendingTimelineEvent::assistant_text_snapshot(
+                id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                "answer",
+            )],
+        )
+        .await
+        .map_err(store_error)?;
+    store
+        .append_journal(
+            &id,
+            Revision::new(1),
+            vec![SessionJournalEvent::TurnFinished { turn: 0 }],
+        )
+        .await
+        .map_err(store_error)?;
+    let mut add = SessionMaskMutation::new(Some(TimelineCursor::new(1)));
+    add.add.push(SessionMaskAddition::new(
+        "summary",
+        ThroughCursor::new(TimelineCursor::new(1)),
+        ReplacementUserContent::new("compacted"),
+    ));
+    let outcome = store.mutate_masks(&id, add).await.map_err(store_error)?;
+    let persisted = store.load(&id).await.map_err(store_error)?;
+    assert_eq!(outcome.revision, persisted.revision, "{label}");
+    assert_eq!(
+        outcome.cursor,
+        persisted.timeline_cursor_high_water(),
+        "{label}"
+    );
+    assert_eq!(persisted.active_masks(), outcome.added_masks, "{label}");
+
+    let unchanged = persisted.clone();
+    let error = store
+        .mutate_masks(&id, SessionMaskMutation::new(None))
+        .await
+        .expect_err("stale mask boundary must fail");
+    assert!(matches!(
+        error,
+        SessionStoreError::MaskMutation {
+            error: SessionMaskError::BoundaryMismatch { .. }
+        }
+    ));
+    assert_eq!(
+        store.load(&id).await.map_err(store_error)?,
+        unchanged,
+        "{label}"
+    );
+
+    let mut subtract = SessionMaskMutation::new(Some(TimelineCursor::new(1)));
+    subtract.subtract.keys.push("summary".to_owned());
+    let subtracted = store
+        .mutate_masks(&id, subtract)
+        .await
+        .map_err(store_error)?;
+    let persisted = store.load(&id).await.map_err(store_error)?;
+    assert_eq!(subtracted.revision, persisted.revision, "{label}");
+    assert!(persisted.active_masks().is_empty(), "{label}");
+    let assigned = store
+        .append_timeline(
+            &id,
+            persisted.revision,
+            vec![PendingTimelineEvent::assistant_text_snapshot(
+                id.clone(),
+                1,
+                PendingTimelineItemId::New,
+                "after mask",
+            )],
+        )
+        .await
+        .map_err(store_error)?;
+    assert_eq!(assigned[0].cursor, subtracted.cursor.next(), "{label}");
     Ok(())
 }
 

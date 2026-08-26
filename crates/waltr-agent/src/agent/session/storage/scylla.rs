@@ -7,12 +7,14 @@ use scylla::value::CqlValue;
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
+    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
+        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -300,6 +302,41 @@ impl SessionStore for ScyllaSessionStore {
                 })
                 .await?;
             Ok(revision)
+        }
+    }
+
+    fn mutate_masks(
+        &self,
+        id: &SessionId,
+        mutation: SessionMaskMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+    {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            for attempt in 1..=SCYLLA_LWT_ATTEMPTS {
+                let mut record = store.load_record(&id).await?;
+                let original_revision = record.revision;
+                let original_json = serde_json::to_string(&record).map_err(backend_error)?;
+                let revision = original_revision.next();
+                record.revision = revision;
+                let outcome = mutate_masks_on_record(&mut record, revision, &mutation)?;
+                let json = serde_json::to_string(&record).map_err(backend_error)?;
+                let expected = i64::try_from(original_revision.get()).map_err(backend_error)?;
+                let next = i64::try_from(revision.get()).map_err(backend_error)?;
+                let applied: (bool, Option<CqlValue>, Option<CqlValue>) = store.session.query_unpaged(
+                    format!("UPDATE {} SET revision = ?, record_json = ? WHERE session_id = ? IF revision = ? AND record_json = ?", store.table_name()),
+                    (next, json, id.as_str(), expected, original_json),
+                ).await.map_err(backend_error)?.into_rows_result().map_err(backend_error)?
+                    .single_row().map_err(backend_error)?;
+                if applied.0 {
+                    return Ok(outcome);
+                }
+                if attempt == SCYLLA_LWT_ATTEMPTS {
+                    return Err(lwt_contention(&id, attempt));
+                }
+            }
+            unreachable!("Scylla LWT attempts are positive")
         }
     }
 
