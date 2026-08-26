@@ -46,10 +46,13 @@ pub use agent::{
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
     SessionRecord, SessionSnapshot,
     SessionStart, SessionStartMessage, SessionStartMessageError, SessionStatus, SessionStore,
-    SessionStoreError, SessionStoreResult, SessionSummary, SessionTimelineEvent,
-    SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential, Suspension, ThroughCursor,
-    ToolExecutionContext, ToolProgressSink, opendal_postgresql_session_store,
-    run_postgresql_migrations,
+    SessionStoreError, SessionStoreResult, SessionSummary, SessionSyntheticTimelineEvent,
+    SessionTimelineEvent, SessionTimelineMode, SessionTimelinePage, SessionTimelinePresentation,
+    SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    SessionTimelineProjectionSubscription, SessionTimelineProjectionUpdate,
+    SessionTimelineProjectionUpdateEvent, SessionTimelineSubscription, SessionTimelineUpdate,
+    StoredCredential, Suspension, ThroughCursor, ToolExecutionContext, ToolProgressSink,
+    opendal_postgresql_session_store, run_postgresql_migrations,
 };
 pub use auth::{
     AuthTarget, AuthenticationFailure, AuthenticationFailureReason, McpAuthorizationContext,

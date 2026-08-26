@@ -10,6 +10,7 @@ mod create;
 mod list;
 mod mask;
 mod materialize;
+mod projection;
 mod run;
 mod runtime;
 mod runtime_factory;
@@ -38,6 +39,10 @@ pub use mask::{
     SessionMaskMutationOutcome, SessionMaskSubtraction, ThroughCursor,
 };
 pub use materialize::{SessionContextMode, SessionMaterializedContext};
+pub use projection::{
+    SessionSyntheticTimelineEvent, SessionTimelineMode, SessionTimelinePage,
+    SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+};
 pub use run::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
@@ -72,4 +77,7 @@ pub use types::{
     SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionSummary, Suspension,
 };
 pub(super) use watch::SessionTimelineBroadcaster;
-pub use watch::{SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate};
+pub use watch::{
+    SessionTimelineEvent, SessionTimelineProjectionSubscription, SessionTimelineProjectionUpdate,
+    SessionTimelineProjectionUpdateEvent, SessionTimelineSubscription, SessionTimelineUpdate,
+};

@@ -29,7 +29,8 @@ use super::{
     InferenceSettings, MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy,
     RunOutcomeSender, RunResult, SessionCaptureError, SessionCaptureLimits, SessionControl,
     SessionCreateRequest, SessionId, SessionListSubscription, SessionRunContext, SessionStatus,
-    SessionStore, SessionSummary, SessionTimelineBroadcaster, SessionTimelineSubscription,
+    SessionStore, SessionSummary, SessionTimelineBroadcaster, SessionTimelineMode,
+    SessionTimelinePage, SessionTimelineProjectionSubscription, SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
@@ -359,6 +360,23 @@ where
             .map_err(session_store_error)
     }
 
+    /// Read one explicit raw or mask-effective timeline projection page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the store fails.
+    pub async fn timeline_projection(
+        &self,
+        id: &SessionId,
+        mode: SessionTimelineMode,
+        query: TimelineQuery,
+    ) -> Result<SessionTimelinePage> {
+        let operation = self.control.session(id.clone()).operation().await;
+        let record = self.store.load(id).await.map_err(session_store_error)?;
+        operation.register_loaded_summary(record.summary());
+        Ok(super::projection::project_timeline(&record, mode, query))
+    }
+
     /// Append timeline events to an existing durable session and publish the assigned events.
     ///
     /// # Errors
@@ -413,6 +431,15 @@ where
     #[must_use]
     pub fn watch_timeline(&self, id: SessionId) -> SessionTimelineSubscription {
         self.timeline.subscribe(id)
+    }
+
+    /// Watch raw appends and authoritative invalidations for an effective projection.
+    #[must_use]
+    pub fn watch_timeline_projection(
+        &self,
+        id: SessionId,
+    ) -> SessionTimelineProjectionSubscription {
+        self.timeline.subscribe_projection(id)
     }
 
     /// Set a host-defined metadata value and publish an updated session summary.
@@ -673,6 +700,8 @@ where
             .await?;
         self.timeline
             .publish_truncation(session_id.clone(), output.after_cursor);
+        self.timeline
+            .publish_projection_invalidation(session_id.clone(), output.record.revision);
         Ok(AgentSession::new(output.record))
     }
 
@@ -694,6 +723,8 @@ where
             .await?;
         self.timeline
             .publish_truncation(session_id.clone(), output.after_cursor);
+        self.timeline
+            .publish_projection_invalidation(session_id.clone(), output.record.revision);
         Ok(AgentSession::new(output.record))
     }
 
@@ -715,6 +746,8 @@ where
             .await?;
         self.timeline
             .publish_truncation(session_id.clone(), output.after_cursor);
+        self.timeline
+            .publish_projection_invalidation(session_id.clone(), output.record.revision);
         Ok(AgentSession::new(output.record))
     }
 
@@ -3425,5 +3458,62 @@ spec:
 
         assert!(saw_streaming, "expected streaming summary update");
         assert!(saw_finished, "expected finished summary update");
+    }
+
+    #[tokio::test]
+    async fn effective_projection_watch_invalidates_after_rollback() {
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let session = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                None,
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap();
+        let id = session.record.id;
+        sessions
+            .submit_prompt(id.clone(), "seed", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap()
+            .handle
+            .wait()
+            .await
+            .unwrap();
+        let initial = sessions
+            .timeline_projection(
+                &id,
+                SessionTimelineMode::Effective,
+                TimelineQuery::forward(None, 64),
+            )
+            .await
+            .unwrap();
+        assert!(!initial.events.is_empty());
+        let mut effective_watch = sessions.watch_timeline_projection(id.clone());
+        let mut raw_watch = sessions.watch_timeline(id.clone());
+
+        let rolled_back = sessions.rollback_to_turn(id.clone(), 0).await.unwrap();
+
+        assert!(matches!(
+            effective_watch.next().await.unwrap().event,
+            crate::SessionTimelineProjectionUpdateEvent::Invalidated {
+                projection_revision,
+                ..
+            } if projection_revision == rolled_back.revision()
+                && projection_revision > initial.projection_revision
+        ));
+        assert!(matches!(
+            raw_watch.next().await.unwrap().event,
+            SessionTimelineEvent::Truncated { .. }
+        ));
+        let current = sessions
+            .timeline_projection(
+                &id,
+                SessionTimelineMode::Effective,
+                TimelineQuery::forward(None, 64),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.projection_revision, rolled_back.revision());
     }
 }
