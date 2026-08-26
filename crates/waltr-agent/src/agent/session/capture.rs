@@ -2,10 +2,10 @@
 
 use std::{error::Error, fmt};
 
-use crate::{CompletionTurn, TimelineContent, TimelineCursor};
+use crate::{TimelineContent, TimelineCursor};
 
 use super::{
-    InferenceSettings, SessionCopy, SessionId, SessionJournalEvent, SessionRecord, SessionSnapshot,
+    InferenceSettings, SessionCopy, SessionId, SessionJournalEvent, SessionRecord,
     SessionStoreError,
 };
 use crate::definition::AgentDefinitionBundle;
@@ -93,6 +93,22 @@ pub(super) fn capture_record(
     record: &SessionRecord,
     limits: SessionCaptureLimits,
 ) -> Result<CompletedSessionCapture, SessionCaptureError> {
+    capture_record_mode(record, limits, false)
+}
+
+pub(super) fn capture_record_effective(
+    record: &SessionRecord,
+    limits: SessionCaptureLimits,
+) -> Result<CompletedSessionCapture, SessionCaptureError> {
+    capture_record_mode(record, limits, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn capture_record_mode(
+    record: &SessionRecord,
+    limits: SessionCaptureLimits,
+    effective_context: bool,
+) -> Result<CompletedSessionCapture, SessionCaptureError> {
     check_bound(
         record.journal.len(),
         limits.max_journal_events,
@@ -119,44 +135,31 @@ pub(super) fn capture_record(
             "completed conversation contains an unresolved durable content reference".to_owned(),
         ));
     }
-    let journal = selected
+    let through_cursor = selected
         .iter()
-        .map(|event| (*event).clone())
-        .collect::<Vec<_>>();
-    let snapshot = SessionSnapshot::from_journal(record.id.clone(), &journal);
-    let prompt_turns = snapshot.prompt_turns;
-    let turns = snapshot
-        .turns
-        .into_iter()
-        .map(|turn| CompletionTurn {
-            turn: turn.turn,
-            items: turn.items,
-            metadata: None,
+        .rev()
+        .find_map(|event| match event {
+            SessionJournalEvent::Timeline(event) => Some(event.cursor),
+            _ => None,
         })
-        .collect::<Vec<_>>();
-    check_bound(
-        prompt_turns.len().saturating_add(turns.len()),
-        limits.max_turns,
-        "projected turns",
-    )?;
-    check_bound(
-        prompt_turns
-            .len()
-            .saturating_add(turns.iter().map(|turn| turn.items.len()).sum::<usize>()),
-        limits.max_items,
-        "projected items",
-    )?;
-    let through_cursor = selected.iter().rev().find_map(|event| match event {
-        SessionJournalEvent::Timeline(event) => Some(event.cursor),
-        _ => None,
-    }).ok_or_else(|| SessionCaptureError::FailedPrecondition(
-        "completed conversation has no exact timeline cursor boundary".to_owned(),
-    ))?;
-    let copy = SessionCopy::from_record(record, through_cursor).map_err(|error| {
+        .ok_or_else(|| {
+            SessionCaptureError::FailedPrecondition(
+                "completed conversation has no exact timeline cursor boundary".to_owned(),
+            )
+        })?;
+    let copy = if effective_context {
+        SessionCopy::from_record_effective(record, through_cursor)
+    } else {
+        SessionCopy::from_record(record, through_cursor)
+    }
+    .map_err(|error| {
         SessionCaptureError::FailedPrecondition(format!(
             "completed conversation cannot be copied: {error}"
         ))
     })?;
+    let (projected_turns, projected_items) = copy.context_counts();
+    check_bound(projected_turns, limits.max_turns, "projected turns")?;
+    check_bound(projected_items, limits.max_items, "projected items")?;
     let encoded_len = copy.encoded_len().map_err(|error| {
         SessionCaptureError::FailedPrecondition(format!(
             "completed conversation cannot be encoded: {error}"
@@ -279,7 +282,7 @@ mod tests {
             copy: capture.copy.clone(),
             messages: Vec::new(),
         };
-        SessionRecord::from_create_request(request)
+        request.materialize()
     }
 
     #[test]
@@ -390,9 +393,7 @@ mod tests {
             ["first", "valid retry"]
         );
         assert_eq!(
-            snapshot.turns[1]
-                .assistant_texts()
-                .collect::<Vec<_>>(),
+            snapshot.turns[1].assistant_texts().collect::<Vec<_>>(),
             ["valid"]
         );
     }
@@ -441,5 +442,59 @@ mod tests {
             materialize(&capture).snapshot().prompt_turns[0].prompt,
             "original"
         );
+    }
+
+    #[test]
+    fn effective_capture_limits_measure_masked_projection() {
+        let mut record = record();
+        record.journal = vec![
+            SessionJournalEvent::PromptAppended {
+                prompt: "first".to_owned(),
+            },
+            assistant(&record.id, 0, 1, "first answer"),
+            SessionJournalEvent::TurnFinished { turn: 0 },
+            SessionJournalEvent::PromptAppended {
+                prompt: "second".to_owned(),
+            },
+            assistant(&record.id, 1, 2, "second answer"),
+            SessionJournalEvent::TurnFinished { turn: 1 },
+        ];
+        let mut mutation = super::super::SessionMaskMutation::new(Some(TimelineCursor::new(2)));
+        mutation.add.push(super::super::SessionMaskAddition::new(
+            "summary",
+            super::super::ThroughCursor::new(TimelineCursor::new(2)),
+            super::super::ReplacementUserContent::new("compact summary"),
+        ));
+        super::super::mask::mutate_record_masks(
+            &mut record,
+            super::super::Revision::new(1),
+            &mutation,
+        )
+        .unwrap();
+        let limits = SessionCaptureLimits {
+            max_turns: 1,
+            max_items: 1,
+            ..SessionCaptureLimits::default()
+        };
+
+        assert!(matches!(
+            capture_record(&record, limits),
+            Err(SessionCaptureError::ResourceExhausted(_))
+        ));
+        let capture = capture_record_effective(&record, limits).unwrap();
+        assert_eq!(
+            materialize(&capture).snapshot().prompts,
+            ["compact summary"]
+        );
+        assert!(matches!(
+            capture_record_effective(
+                &record,
+                SessionCaptureLimits {
+                    max_encoded_bytes: 0,
+                    ..limits
+                }
+            ),
+            Err(SessionCaptureError::ResourceExhausted(_))
+        ));
     }
 }

@@ -400,8 +400,8 @@ mod tests {
     use super::*;
     use crate::agent::session::SessionRollbackTarget;
     use crate::{
-        MemorySessionStore, PendingTimelineEvent, PendingTimelineItemId, SessionCreateRequest,
-        SessionStore, SessionStoreError, TimelineContent,
+        MemorySessionStore, PendingTimelineEvent, PendingTimelineItemId, SessionContextMode,
+        SessionCreateRequest, SessionStore, SessionStoreError, TimelineContent,
     };
 
     fn completed_record() -> SessionRecord {
@@ -459,10 +459,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [TimelineCursor::new(1), TimelineCursor::new(2)]
         );
+        let raw = record.materialize_context(SessionContextMode::Raw);
+        assert_eq!(raw.prompt_turns[0].prompt, "original question");
         assert!(matches!(
             &record.timeline_events().last().unwrap().content,
             TimelineContent::TextSnapshot { text } if text == "original answer"
         ));
+        let effective = record.materialize_context(SessionContextMode::Effective);
+        assert_eq!(effective.prompt_turns[0].prompt, "summary");
+        assert!(effective.turns.is_empty());
 
         record.append_journal_event(SessionJournalEvent::Rollback {
             target: SessionRollbackTarget {

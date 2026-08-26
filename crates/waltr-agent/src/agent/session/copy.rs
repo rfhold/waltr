@@ -7,7 +7,7 @@ use crate::timeline::{
     CHANNEL_USER_TEXT, TimelineContent, TimelineCursor, TimelineEventKind, TimelineItemId,
 };
 
-use super::{SessionId, SessionJournalEvent, SessionRecord};
+use super::{SessionId, SessionJournalEvent, SessionRecord, materialize::completed_turn_at};
 
 /// Opaque, validated context copied through an exact completed-turn boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,17 +76,44 @@ impl SessionCopy {
             ));
         }
 
-        let projected_journal = project_journal(
-            &record.id,
-            &effective[..=selected_index],
-            completed_turn,
-        )?;
+        let projected_journal =
+            project_journal(&record.id, &effective[..=selected_index], completed_turn)?;
         Ok(Self {
             source_id: record.id.clone(),
             boundary,
             completed_turn,
             projected_journal,
         })
+    }
+
+    /// Project mask-effective replayable context through an exact completed-turn cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::from_record`].
+    pub fn from_record_effective(
+        record: &SessionRecord,
+        boundary: TimelineCursor,
+    ) -> Result<Self, SessionCopyError> {
+        let mut copy = Self::from_record(record, boundary)?;
+        for mask in record
+            .active_masks()
+            .into_iter()
+            .filter(|mask| mask.selector.cursor <= boundary)
+        {
+            let selected_turn =
+                completed_turn_at(record, mask.selector.cursor).ok_or_else(|| {
+                    SessionCopyError::InvalidSource(
+                        "active mask has no effective completed-turn boundary".to_owned(),
+                    )
+                })?;
+            apply_prefix_replacement(
+                &mut copy.projected_journal,
+                selected_turn,
+                &mask.replacement.text,
+            );
+        }
+        Ok(copy)
     }
 
     /// Source cursor copied through by this projection.
@@ -120,6 +147,54 @@ impl SessionCopy {
     pub(crate) fn encoded_len(&self) -> Result<usize, serde_json::Error> {
         serde_json::to_vec(&self.projected_journal).map(|encoded| encoded.len())
     }
+
+    pub(crate) fn context_counts(&self) -> (usize, usize) {
+        let snapshot =
+            super::SessionSnapshot::from_journal(self.source_id.clone(), &self.projected_journal);
+        let turns = snapshot
+            .prompt_turns
+            .len()
+            .saturating_add(snapshot.turns.len());
+        let items = snapshot.prompt_turns.len().saturating_add(
+            snapshot
+                .turns
+                .iter()
+                .map(|turn| turn.items.len())
+                .sum::<usize>(),
+        );
+        (turns, items)
+    }
+}
+
+fn apply_prefix_replacement(
+    journal: &mut Vec<SessionJournalEvent>,
+    selected_turn: u64,
+    replacement: &str,
+) {
+    let mut projected = Vec::with_capacity(journal.len());
+    let mut turn = 0_u64;
+    let mut inserted = false;
+    for event in journal.drain(..) {
+        let selected = match &event {
+            SessionJournalEvent::PromptAppended { .. } => turn <= selected_turn,
+            SessionJournalEvent::Timeline(event) => event.turn <= selected_turn,
+            _ => false,
+        };
+        if selected {
+            if !inserted {
+                projected.push(SessionJournalEvent::PromptAppended {
+                    prompt: replacement.to_owned(),
+                });
+                inserted = true;
+            }
+        } else {
+            projected.push(event.clone());
+        }
+        if let SessionJournalEvent::TurnFinished { turn: finished } = event {
+            turn = turn.max(finished.saturating_add(1));
+        }
+    }
+    *journal = projected;
 }
 
 /// Failure to derive a session copy from durable history.
@@ -155,7 +230,11 @@ impl fmt::Display for SessionCopyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BoundaryNotFound { boundary } => {
-                write!(formatter, "timeline cursor {} is not effective", boundary.get())
+                write!(
+                    formatter,
+                    "timeline cursor {} is not effective",
+                    boundary.get()
+                )
             }
             Self::IncompleteBoundary { boundary } => write!(
                 formatter,
@@ -242,7 +321,10 @@ fn project_journal(
                 }
                 match &timeline.content {
                     TimelineContent::ToolCall { call } => {
-                        if tool_calls.insert(call.id.clone(), timeline.item_id.clone()).is_some() {
+                        if tool_calls
+                            .insert(call.id.clone(), timeline.item_id.clone())
+                            .is_some()
+                        {
                             return Err(SessionCopyError::InvalidSource(
                                 "copied tool-call ids must be unique".to_owned(),
                             ));
@@ -304,12 +386,11 @@ fn replayable_timeline(event: &AgentTimelineEvent) -> bool {
         return false;
     }
     match &event.content {
-        TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. } => event
-            .channel
-            .as_ref()
-            .is_some_and(|channel| {
+        TimelineContent::TextDelta { .. } | TimelineContent::TextSnapshot { .. } => {
+            event.channel.as_ref().is_some_and(|channel| {
                 matches!(channel.as_str(), CHANNEL_USER_TEXT | CHANNEL_ASSISTANT_TEXT)
-            }),
+            })
+        }
         TimelineContent::ToolCall { .. } => event
             .channel
             .as_ref()
@@ -455,14 +536,24 @@ mod tests {
         assert_eq!(record.revision, super::super::Revision::ZERO);
         assert_eq!(record.timeline_cursor_high_water(), TimelineCursor::new(11));
         assert_eq!(
-            timeline.iter().map(|event| event.cursor.get()).collect::<Vec<_>>(),
+            timeline
+                .iter()
+                .map(|event| event.cursor.get())
+                .collect::<Vec<_>>(),
             [1, 4, 7, 9, 11]
         );
         assert_eq!(
-            timeline.iter().map(|event| event.item_id.as_str()).collect::<Vec<_>>(),
+            timeline
+                .iter()
+                .map(|event| event.item_id.as_str())
+                .collect::<Vec<_>>(),
             ["i1", "i4", "i7", "i9", "i11"]
         );
-        assert!(timeline.iter().all(|event| event.session_id.as_str() == "destination"));
+        assert!(
+            timeline
+                .iter()
+                .all(|event| event.session_id.as_str() == "destination")
+        );
         assert_eq!(timeline[3].parent_id.as_ref(), Some(&timeline[2].item_id));
         let TimelineContent::ToolResult { result } = &timeline[3].content else {
             panic!("copied tool result");
@@ -640,6 +731,107 @@ mod tests {
                 .unwrap()
                 .boundary(),
             TimelineCursor::new(14)
+        );
+    }
+
+    #[test]
+    fn effective_copy_replaces_selected_prefix_without_changing_raw_copy() {
+        let mut source = completed_source();
+        let mut mutation = super::super::SessionMaskMutation::new(Some(TimelineCursor::new(11)));
+        mutation.add.push(super::super::SessionMaskAddition::new(
+            "context.compaction-prefix",
+            super::super::ThroughCursor::new(TimelineCursor::new(10)),
+            super::super::ReplacementUserContent::new("compact summary"),
+        ));
+        super::super::mask::mutate_record_masks(
+            &mut source,
+            super::super::Revision::new(1),
+            &mutation,
+        )
+        .unwrap();
+
+        let raw = SessionCopy::from_record(&source, TimelineCursor::new(10)).unwrap();
+        let effective =
+            SessionCopy::from_record_effective(&source, TimelineCursor::new(10)).unwrap();
+        let mut raw_request = SessionCreateRequest::new("raw-destination");
+        raw_request.start = SessionStart::Copy {
+            copy: raw,
+            messages: Vec::new(),
+        };
+        let mut effective_request = SessionCreateRequest::new("effective-destination");
+        effective_request.start = SessionStart::Copy {
+            copy: effective,
+            messages: Vec::new(),
+        };
+
+        assert_eq!(raw_request.materialize().snapshot().prompts, ["question"]);
+        let effective_snapshot = effective_request.materialize().snapshot();
+        assert_eq!(effective_snapshot.prompts, ["compact summary"]);
+        assert!(effective_snapshot.turns.is_empty());
+    }
+
+    #[test]
+    fn effective_copy_ignores_masks_newer_than_requested_boundary() {
+        let mut source = SessionRecord::new("boundary-source");
+        source.journal = vec![
+            SessionJournalEvent::PromptAppended {
+                prompt: "first question".to_owned(),
+            },
+            assigned(
+                1,
+                PendingTimelineEvent::assistant_text_snapshot(
+                    source.id.clone(),
+                    0,
+                    PendingTimelineItemId::New,
+                    "first answer",
+                ),
+            ),
+            SessionJournalEvent::TurnFinished { turn: 0 },
+            SessionJournalEvent::PromptAppended {
+                prompt: "second question".to_owned(),
+            },
+            assigned(
+                2,
+                PendingTimelineEvent::assistant_text_snapshot(
+                    source.id.clone(),
+                    1,
+                    PendingTimelineItemId::New,
+                    "second answer",
+                ),
+            ),
+            SessionJournalEvent::TurnFinished { turn: 1 },
+        ];
+        let mut mutation = super::super::SessionMaskMutation::new(Some(TimelineCursor::new(2)));
+        mutation.add.push(super::super::SessionMaskAddition::new(
+            "later-summary",
+            super::super::ThroughCursor::new(TimelineCursor::new(2)),
+            super::super::ReplacementUserContent::new("future-derived summary"),
+        ));
+        super::super::mask::mutate_record_masks(
+            &mut source,
+            super::super::Revision::new(1),
+            &mutation,
+        )
+        .unwrap();
+
+        let copy = SessionCopy::from_record_effective(&source, TimelineCursor::new(1)).unwrap();
+        let mut request = SessionCreateRequest::new("earlier-destination");
+        request.start = SessionStart::Copy {
+            copy,
+            messages: Vec::new(),
+        };
+        let snapshot = request.materialize().snapshot();
+
+        assert_eq!(snapshot.prompts, ["first question"]);
+        assert_eq!(
+            snapshot.turns[0].assistant_texts().collect::<Vec<_>>(),
+            ["first answer"]
+        );
+        assert!(
+            !snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.contains("future-derived"))
         );
     }
 }
