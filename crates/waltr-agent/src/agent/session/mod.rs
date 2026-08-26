@@ -9,6 +9,7 @@ mod coordinator;
 mod create;
 mod list;
 mod mask;
+mod materialize;
 mod run;
 mod runtime;
 mod runtime_factory;
@@ -36,6 +37,7 @@ pub use mask::{
     SessionMask, SessionMaskAddition, SessionMaskError, SessionMaskId, SessionMaskMutation,
     SessionMaskMutationOutcome, SessionMaskSubtraction, ThroughCursor,
 };
+pub use materialize::{SessionContextMode, SessionMaterializedContext};
 pub use run::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,

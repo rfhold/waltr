@@ -48,11 +48,10 @@ use super::{
     session::{
         AgentSessionRuntime, EphemeralSessionRun, ExternalRequest, ExternalRequestId,
         ExternalRequestKind, ExternalRequestStatus, ExternalResponse, PendingWorkStatus, RequestId,
-        RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionCreateRequest, SessionId,
-        SessionIncarnation, SessionJournalEvent, SessionOperation, SessionRecord,
-        SessionRollbackTarget, SessionRunContext, SessionSnapshot, SessionStart,
-        SessionStartMessage, SessionStore, SessionStoreError,
-        Suspension as SessionSuspension,
+        RequestRecord, ResumeInput, Revision, RuntimeResumeOutput, SessionContextMode,
+        SessionCreateRequest, SessionId, SessionIncarnation, SessionJournalEvent, SessionOperation,
+        SessionRecord, SessionRollbackTarget, SessionRunContext, SessionSnapshot, SessionStart,
+        SessionStartMessage, SessionStore, SessionStoreError, Suspension as SessionSuspension,
     },
 };
 use super::{ProviderRetryConfig, tool::ToolFuture};
@@ -1202,11 +1201,12 @@ where
 
     fn hydrate_from_record(&mut self, record: &SessionRecord) {
         let snapshot = record.snapshot();
+        let context = record.materialize_context(SessionContextMode::Effective);
         self.middleware_state = MiddlewareStateLog::from_snapshot(&snapshot);
         self.session_metadata_values = record.metadata.values.clone();
-        self.prompt = snapshot.current_prompt.unwrap_or_default();
-        self.prompt_turns = snapshot.prompt_turns;
-        self.turns = snapshot.turns;
+        self.prompt = context.current_prompt.unwrap_or_default();
+        self.prompt_turns = context.prompt_turns;
+        self.turns = context.turns;
         self.turn = usize::try_from(snapshot.turn).unwrap_or(usize::MAX);
         self.session_revision = record.revision;
         self.session_journal_len = record.journal.len() as u64;

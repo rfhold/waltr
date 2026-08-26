@@ -36,11 +36,11 @@ pub use session::{
     ReplacementUserContent, RequestId,
     RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
     S3SessionWriteMode, ScyllaSessionStore, SessionCaptureError, SessionCaptureLimits,
-    SessionCoordinator, SessionCopy, SessionCopyError, SessionCreateRequest, SessionId,
-    SessionJournalEvent, SessionListEvent, SessionListSubscription, SessionListUpdate, SessionMask,
-    SessionMaskAddition, SessionMaskError, SessionMaskId, SessionMaskMutation,
-    SessionMaskMutationOutcome, SessionMaskSubtraction, SessionMetrics, SessionOAuthJwtMetadata,
-    SessionOAuthJwtToken, SessionOAuthProviderSettings,
+    SessionContextMode, SessionCoordinator, SessionCopy, SessionCopyError, SessionCreateRequest,
+    SessionId, SessionJournalEvent, SessionListEvent, SessionListSubscription, SessionListUpdate,
+    SessionMask, SessionMaskAddition, SessionMaskError, SessionMaskId, SessionMaskMutation,
+    SessionMaskMutationOutcome, SessionMaskSubtraction, SessionMaterializedContext, SessionMetrics,
+    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
     SessionRecord, SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
@@ -513,6 +513,32 @@ mod tests {
         }
     }
 
+    struct EffectiveContextProvider(AtomicBool);
+
+    impl crate::LlmStream for EffectiveContextProvider {
+        fn name(&self) -> &'static str {
+            "effective_context_provider"
+        }
+
+        fn stream_request<'a>(&'a self, request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            let prompts = request
+                .replay_items()
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::CompletionReplayItem::Prompt(prompt) => Some(prompt),
+                    crate::CompletionReplayItem::Turn(_) => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(prompts, ["compact summary"]);
+            assert!(request.turns.is_empty());
+            self.0.store(true, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Box::pin(stream::iter(vec![Ok(CompletionEvent::Finished)]))
+                    as BoxCompletionStream)
+            })
+        }
+    }
+
     #[tokio::test]
     async fn automatic_creation_publishes_initial_list_and_timeline() {
         let provider = Arc::new(TextOnlyProvider);
@@ -547,6 +573,77 @@ mod tests {
         ));
         assert_eq!(timeline_update.sequence, 1);
         assert_eq!(timeline_update.event, SessionTimelineEvent::Event(output));
+    }
+
+    #[tokio::test]
+    async fn ordinary_resume_hydrates_provider_from_effective_context() {
+        let store = MemorySessionStore::new();
+        let id = SessionId::new("effective-hydration");
+        store
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                &id,
+                Revision::ZERO,
+                vec![SessionJournalEvent::PromptAppended {
+                    prompt: "original question".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
+        store
+            .append_timeline(
+                &id,
+                Revision::new(1),
+                vec![
+                    crate::PendingTimelineEvent::user_text_snapshot(
+                        id.clone(),
+                        0,
+                        crate::PendingTimelineItemId::New,
+                        "original question",
+                    ),
+                    crate::PendingTimelineEvent::assistant_text_snapshot(
+                        id.clone(),
+                        0,
+                        crate::PendingTimelineItemId::New,
+                        "original answer",
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .append_journal(
+                &id,
+                Revision::new(2),
+                vec![SessionJournalEvent::TurnFinished { turn: 0 }],
+            )
+            .await
+            .unwrap();
+        let mut mutation = crate::SessionMaskMutation::new(Some(crate::TimelineCursor::new(2)));
+        mutation.add.push(crate::SessionMaskAddition::new(
+            "context.compaction-prefix",
+            crate::ThroughCursor::new(crate::TimelineCursor::new(2)),
+            crate::ReplacementUserContent::new("compact summary"),
+        ));
+        store.mutate_masks(&id, mutation).await.unwrap();
+
+        let provider = Arc::new(EffectiveContextProvider(AtomicBool::new(false)));
+        let agent = AgentRuntime::builder(
+            ModelRef::new(ProviderId::OpenAi, "test-model", ModelApi::OpenAiResponses),
+            Arc::clone(&provider),
+        )
+        .build();
+        drain(
+            SessionCoordinator::new(store)
+                .resume(&agent, id, ResumeInput::Continue)
+                .stream(),
+        )
+        .await;
+
+        assert!(provider.0.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
