@@ -44,8 +44,12 @@ pub use session::{
     SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
     SessionRecord, SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
-    SessionTimelineEvent, SessionTimelineSubscription, SessionTimelineUpdate, StoredCredential,
-    Suspension, ThroughCursor, opendal_postgresql_session_store, run_postgresql_migrations,
+    SessionSyntheticTimelineEvent, SessionTimelineEvent, SessionTimelineMode, SessionTimelinePage,
+    SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    SessionTimelineProjectionSubscription, SessionTimelineProjectionUpdate,
+    SessionTimelineProjectionUpdateEvent, SessionTimelineSubscription, SessionTimelineUpdate,
+    StoredCredential, Suspension, ThroughCursor, opendal_postgresql_session_store,
+    run_postgresql_migrations,
 };
 pub use tool::{AgentTool, ToolExecutionContext, ToolProgressSink};
 
