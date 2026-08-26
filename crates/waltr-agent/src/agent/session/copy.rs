@@ -284,6 +284,7 @@ fn project_journal(
             | SessionJournalEvent::WorkCanceled { .. }
             | SessionJournalEvent::Interrupted
             | SessionJournalEvent::TurnInterrupted { .. }
+            | SessionJournalEvent::MasksMutated { .. }
             | SessionJournalEvent::Rollback { .. }
             | SessionJournalEvent::Finished
             | SessionJournalEvent::Failed { .. } => {}

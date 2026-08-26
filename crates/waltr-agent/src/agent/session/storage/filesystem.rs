@@ -7,12 +7,14 @@ use std::{
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
+    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
+        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -314,6 +316,30 @@ impl SessionStore for FilesystemSessionStore {
         }
     }
 
+    fn mutate_masks(
+        &self,
+        id: &SessionId,
+        mutation: SessionMaskMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+    {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            store
+                .blocking(move |store| {
+                    store.with_session_lock(&id, || {
+                        let mut record = store.load_sync(&id)?;
+                        let revision = record.revision.next();
+                        record.revision = revision;
+                        let outcome = mutate_masks_on_record(&mut record, revision, &mutation)?;
+                        store.save_sync(&record)?;
+                        Ok(outcome)
+                    })
+                })
+                .await
+        }
+    }
+
     fn set_metadata_value_conditionally(
         &self,
         id: &SessionId,
@@ -431,6 +457,16 @@ fn backend_error(error: impl std::error::Error) -> SessionStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replacement_masks_follow_store_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        super::super::assert_mask_store_contract(
+            FilesystemSessionStore::new(temp.path()),
+            "filesystem",
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn list_missing_root_is_empty() {

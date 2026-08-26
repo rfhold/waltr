@@ -10,12 +10,14 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
+    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
+        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -450,6 +452,51 @@ impl SessionStore for S3SessionStore {
                 })
                 .await?;
             Ok(revision)
+        }
+    }
+
+    fn mutate_masks(
+        &self,
+        id: &SessionId,
+        mutation: SessionMaskMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+    {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let _guard = store.session_guard(&id).await?;
+            for attempt in 1..=store.put_attempts() {
+                let (mut record, etag) = store.load_record_with_etag(&id).await?;
+                let revision = record.revision.next();
+                record.revision = revision;
+                let outcome = mutate_masks_on_record(&mut record, revision, &mutation)?;
+                let bytes = serde_json::to_vec_pretty(&record).map_err(backend_error)?;
+                let if_match = store.conditional_etag(&id, etag)?;
+                let result = store
+                    .client
+                    .put_object()
+                    .bucket(&store.bucket)
+                    .key(store.key(&id))
+                    .set_if_match(if_match)
+                    .body(ByteStream::from(bytes))
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => return Ok(outcome),
+                    Err(error)
+                        if store.write_mode == S3SessionWriteMode::ConditionalEtagCas
+                            && error.raw_response().is_some_and(|response| {
+                                is_conditional_conflict(response.status().as_u16())
+                            }) =>
+                    {
+                        if attempt == CONDITIONAL_PUT_ATTEMPTS {
+                            return Err(conditional_put_exhausted(&id, attempt));
+                        }
+                    }
+                    Err(error) => return Err(backend_error(error)),
+                }
+            }
+            unreachable!("S3 write modes always allow at least one PUT attempt")
         }
     }
 

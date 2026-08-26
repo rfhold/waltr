@@ -28,7 +28,8 @@ use crate::{
 use serde_json::Value;
 
 use super::{
-    InferenceSettings, SessionCreateRequest,
+    InferenceSettings, SessionCreateRequest, SessionMaskError, SessionMaskMutation,
+    SessionMaskMutationOutcome,
     types::{
         MetadataSetCondition, MetadataSetOutcome, Revision, SessionId, SessionJournalEvent,
         SessionRecord, SessionSummary,
@@ -76,6 +77,8 @@ pub enum SessionStoreError {
         /// Human-readable reason.
         reason: String,
     },
+    /// A mask mutation failed validation or its pinned timeline precondition.
+    MaskMutation { error: SessionMaskError },
 }
 
 impl fmt::Display for SessionStoreError {
@@ -122,11 +125,27 @@ impl fmt::Display for SessionStoreError {
                 id.as_str(),
                 item_id.as_str()
             ),
+            Self::MaskMutation { error } => {
+                write!(formatter, "session mask mutation failed: {error}")
+            }
         }
     }
 }
 
-impl Error for SessionStoreError {}
+impl Error for SessionStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MaskMutation { error } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<SessionMaskError> for SessionStoreError {
+    fn from(error: SessionMaskError) -> Self {
+        Self::MaskMutation { error }
+    }
+}
 
 /// Durable agent session storage contract.
 pub trait SessionStore: Send + Sync {
@@ -166,6 +185,13 @@ pub trait SessionStore: Send + Sync {
         expected_revision: Revision,
         events: Vec<SessionJournalEvent>,
     ) -> impl Future<Output = SessionStoreResult<Revision>> + Send;
+
+    /// Atomically subtract and add persistent replacement masks.
+    fn mutate_masks(
+        &self,
+        id: &SessionId,
+        mutation: SessionMaskMutation,
+    ) -> impl Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send;
 
     /// Set a host-defined metadata value and return the updated record.
     fn set_metadata_value(
@@ -249,6 +275,14 @@ pub trait SessionStore: Send + Sync {
     ) -> impl Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send {
         self.timeline(id, TimelineQuery::backward(cursor, limit))
     }
+}
+
+pub(super) fn mutate_masks_on_record(
+    record: &mut SessionRecord,
+    revision: Revision,
+    mutation: &SessionMaskMutation,
+) -> SessionStoreResult<SessionMaskMutationOutcome> {
+    super::mask::mutate_record_masks(record, revision, mutation).map_err(Into::into)
 }
 
 pub(super) fn append_timeline_to_record(
@@ -401,6 +435,125 @@ fn channel_matches(
             .as_ref()
             .is_some_and(|channel| channels.contains(channel))
     })
+}
+
+#[cfg(test)]
+pub(super) async fn assert_mask_store_contract<S>(store: S, label: &str)
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    let id = SessionId::new(format!("mask-contract-{label}"));
+    store
+        .create(SessionCreateRequest::new(id.clone()))
+        .await
+        .unwrap();
+    store
+        .append_timeline(
+            &id,
+            Revision::ZERO,
+            vec![PendingTimelineEvent::assistant_text_snapshot(
+                id.clone(),
+                0,
+                PendingTimelineItemId::New,
+                "answer",
+            )],
+        )
+        .await
+        .unwrap();
+    store
+        .append_journal(
+            &id,
+            Revision::new(1),
+            vec![SessionJournalEvent::TurnFinished { turn: 0 }],
+        )
+        .await
+        .unwrap();
+    let rollback_len = store.load(&id).await.unwrap().journal.len() as u64;
+    let addition = || {
+        crate::SessionMaskAddition::new(
+            "summary",
+            crate::ThroughCursor::new(TimelineCursor::new(1)),
+            crate::ReplacementUserContent::new("compacted"),
+        )
+    };
+    let mut add = SessionMaskMutation::new(Some(TimelineCursor::new(1)));
+    add.add.push(addition());
+    let added = store.mutate_masks(&id, add).await.unwrap();
+    let mask_id = added.added_masks[0].id.clone();
+    let persisted = store.load(&id).await.unwrap();
+    assert_eq!(added.revision, persisted.revision);
+    assert_eq!(added.cursor, persisted.timeline_cursor_high_water());
+    assert_eq!(persisted.active_masks(), added.added_masks);
+
+    let before_failure = persisted.clone();
+    let error = store
+        .mutate_masks(&id, SessionMaskMutation::new(None))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SessionStoreError::MaskMutation {
+            error: crate::SessionMaskError::BoundaryMismatch { .. }
+        }
+    ));
+    assert_eq!(store.load(&id).await.unwrap(), before_failure);
+
+    store
+        .append_journal(
+            &id,
+            added.revision,
+            vec![SessionJournalEvent::Rollback {
+                target: super::SessionRollbackTarget {
+                    journal_len: rollback_len,
+                    after_cursor: Some(TimelineCursor::new(1)),
+                    next_turn: 1,
+                    remove_prompt_index: None,
+                },
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(store.load(&id).await.unwrap().active_masks().is_empty());
+
+    let mut subtract_absent = SessionMaskMutation::new(Some(TimelineCursor::new(1)));
+    subtract_absent.subtract.ids.push(mask_id);
+    let absent = store.mutate_masks(&id, subtract_absent).await.unwrap();
+    assert!(absent.removed_mask_ids.is_empty());
+    assert!(store.load(&id).await.unwrap().active_masks().is_empty());
+
+    let mut readd = SessionMaskMutation::new(Some(TimelineCursor::new(1)));
+    readd.add.push(addition());
+    let readded = store.mutate_masks(&id, readd).await.unwrap();
+    let mut subtract = SessionMaskMutation::new(Some(TimelineCursor::new(1)));
+    subtract.subtract.keys.push("summary".to_owned());
+    let subtracted = store.mutate_masks(&id, subtract).await.unwrap();
+    assert_eq!(
+        subtracted.removed_mask_ids,
+        [readded.added_masks[0].id.clone()]
+    );
+    let persisted = store.load(&id).await.unwrap();
+    assert_eq!(subtracted.revision, persisted.revision);
+    assert_eq!(subtracted.cursor, persisted.timeline_cursor_high_water());
+    assert!(persisted.active_masks().is_empty());
+
+    let assigned = store
+        .append_timeline(
+            &id,
+            persisted.revision,
+            vec![PendingTimelineEvent::assistant_text_snapshot(
+                id.clone(),
+                1,
+                PendingTimelineItemId::New,
+                "after masks",
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(assigned[0].cursor, subtracted.cursor.next());
+    assert_eq!(
+        store.load(&id).await.unwrap().timeline_cursor_high_water(),
+        assigned[0].cursor
+    );
 }
 
 #[cfg(test)]

@@ -7,12 +7,14 @@ use std::{
 
 use super::{
     SessionStore, SessionStoreError, SessionStoreResult, append_timeline_to_record,
-    sorted_session_summaries, timeline_item_text_from_record, timeline_query_slice,
+    mutate_masks_on_record, sorted_session_summaries, timeline_item_text_from_record,
+    timeline_query_slice,
 };
 use crate::{
     agent::session::{
         InferenceSettings, MetadataSetCondition, MetadataSetOutcome, Revision,
-        SessionCreateRequest, SessionId, SessionJournalEvent, SessionRecord, SessionSummary,
+        SessionCreateRequest, SessionId, SessionJournalEvent, SessionMaskMutation,
+        SessionMaskMutationOutcome, SessionRecord, SessionSummary,
     },
     definition::AgentDefinitionBundle,
     timeline::{
@@ -187,6 +189,31 @@ impl SessionStore for MemorySessionStore {
         }
     }
 
+    fn mutate_masks(
+        &self,
+        id: &SessionId,
+        mutation: SessionMaskMutation,
+    ) -> impl std::future::Future<Output = SessionStoreResult<SessionMaskMutationOutcome>> + Send
+    {
+        let store = self.clone();
+        let id = id.clone();
+        async move {
+            let mut records = store
+                .records
+                .lock()
+                .map_err(|_| SessionStoreError::LockPoisoned)?;
+            let current = records
+                .get(&id)
+                .ok_or_else(|| SessionStoreError::NotFound { id: id.clone() })?;
+            let revision = current.revision.next();
+            let mut updated = current.clone();
+            updated.revision = revision;
+            let outcome = mutate_masks_on_record(&mut updated, revision, &mutation)?;
+            records.insert(id, updated);
+            Ok(outcome)
+        }
+    }
+
     fn set_metadata_value_conditionally(
         &self,
         id: &SessionId,
@@ -316,6 +343,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn replacement_masks_follow_store_contract() {
+        super::super::assert_mask_store_contract(MemorySessionStore::new(), "memory").await;
+    }
+
     use crate::PendingTimelineItemId;
     use crate::agent::session::{
         CancelReason, ExternalRequest, ExternalRequestKind, ExternalRequestStatus, RequestId,
