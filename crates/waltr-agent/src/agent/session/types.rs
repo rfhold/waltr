@@ -17,7 +17,9 @@ use crate::{
     },
 };
 
-use super::{ActiveSessionMask, InferenceSettings, SessionMask, SessionMaskId};
+use super::{
+    ActiveSessionMask, InferenceSettings, SessionCoordinationState, SessionMask, SessionMaskId,
+};
 
 /// Condition applied by an atomic metadata set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +268,9 @@ pub struct SessionSummary {
     /// Host-defined durable metadata values.
     #[serde(default)]
     pub metadata_values: BTreeMap<String, Value>,
+    /// Process-local run, barrier, pause, queue, and continuation facts.
+    #[serde(default)]
+    pub coordination: SessionCoordinationState,
 }
 
 /// Durable usage and cost totals for a session.
@@ -401,6 +406,7 @@ impl SessionRecord {
                 .as_ref()
                 .map(|bundle| bundle.agent_name.clone()),
             metadata_values: self.metadata.values.clone(),
+            coordination: SessionCoordinationState::default(),
         }
     }
 
@@ -578,6 +584,13 @@ impl SessionRecord {
             }
         }
         active
+    }
+}
+
+impl SessionSummary {
+    /// Replace process-local coordination.
+    pub(crate) fn set_coordination(&mut self, coordination: SessionCoordinationState) {
+        self.coordination = coordination;
     }
 }
 
@@ -1334,6 +1347,19 @@ mod tests {
 
         assert!(serialized.get("inference_settings").is_some());
         assert!(serialized.get("runtime_settings").is_none());
+    }
+
+    #[test]
+    fn durable_record_summary_defaults_to_ready_coordination() {
+        let summary = SessionRecord::new("session-1").summary();
+        assert_eq!(
+            summary.coordination,
+            crate::SessionCoordinationState::default()
+        );
+        assert_eq!(
+            summary.coordination.phase,
+            crate::SessionCoordinationPhase::Ready
+        );
     }
 
     #[test]

@@ -28,9 +28,12 @@ use super::{
     AgentSessionRuntime, AgentSessionRuntimeFactory, CompletedSessionCapture, ExternalResponse,
     InferenceSettings, MetadataSetCondition, MetadataSetOutcome, ResumeInput, RunConflictPolicy,
     RunOutcomeSender, RunResult, SessionCaptureError, SessionCaptureLimits, SessionControl,
-    SessionCreateRequest, SessionId, SessionListSubscription, SessionRunContext, SessionStatus,
-    SessionStore, SessionSummary, SessionTimelineBroadcaster, SessionTimelineMode,
-    SessionTimelinePage, SessionTimelineProjectionSubscription, SessionTimelineSubscription,
+    SessionCoordinationPhase, SessionCoordinationReason, SessionCoordinationState,
+    SessionCreateRequest, SessionId, SessionListSubscription, SessionMaskMutation,
+    SessionMaskMutationOutcome, SessionPauseError, SessionPauseId, SessionPauseLease,
+    SessionRunContext, SessionStatus, SessionStore, SessionSummary, SessionTimelineBroadcaster,
+    SessionTimelineMode, SessionTimelinePage, SessionTimelineProjectionSubscription,
+    SessionTimelineSubscription,
 };
 use crate::agent::{AgentRunBuilder, AgentRuntime, AgentSession};
 use crate::resource::{SessionTemplateOption, SessionTemplateSearchRequest};
@@ -49,9 +52,14 @@ where
     runtime_factory: Option<AgentSessionRuntimeFactory>,
     mcp_sessions: Arc<StdMutex<BTreeMap<SessionId, CachedMcpRuntime>>>,
     mcp_preparation_guards: McpPreparationGuards,
-    active_runs: Arc<Mutex<BTreeMap<SessionId, ActiveSessionRun>>>,
+    active_runs: Arc<Mutex<RunCoordination>>,
     next_run_id: Arc<AtomicU64>,
+    next_pause_id: Arc<AtomicU64>,
     event_sink: Option<Arc<dyn crate::SessionEventSink>>,
+    shutdown_token: CancellationToken,
+    #[cfg(test)]
+    list_registration_barrier:
+        Arc<StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
 }
 
 impl<S> std::fmt::Debug for SessionCoordinator<S>
@@ -71,7 +79,52 @@ where
 struct ActiveSessionRun {
     id: u64,
     token: CancellationToken,
+}
+
+#[derive(Debug, Default)]
+struct RunCoordination {
+    sessions: BTreeMap<SessionId, SessionRunState>,
+    wiping: bool,
+    shutdown: bool,
+}
+
+#[derive(Debug, Default)]
+struct SessionRunState {
+    active: Option<ActiveSessionRun>,
+    pause: Option<OwnedSessionPause>,
     queued: VecDeque<QueuedSessionRun>,
+    blocked: bool,
+}
+
+#[derive(Debug)]
+struct OwnedSessionPause {
+    id: SessionPauseId,
+    source_cursor: crate::TimelineCursor,
+    timeline_boundary: crate::TimelineCursor,
+    mutation_cursor: Option<crate::TimelineCursor>,
+    continuation: Option<QueuedSessionRun>,
+    reason: SessionCoordinationReason,
+}
+
+impl SessionRunState {
+    fn coordination(&self) -> SessionCoordinationState {
+        let (phase, reason) = if let Some(pause) = &self.pause {
+            (SessionCoordinationPhase::Paused, Some(pause.reason.clone()))
+        } else if self.active.is_some() {
+            (SessionCoordinationPhase::Running, None)
+        } else {
+            (SessionCoordinationPhase::Ready, None)
+        };
+        SessionCoordinationState {
+            phase,
+            reason,
+            queued_count: self.queued.len(),
+            continuation_armed: self
+                .pause
+                .as_ref()
+                .is_some_and(|pause| pause.continuation.is_some()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -80,6 +133,7 @@ struct QueuedSessionRun {
     input: AgentSessionRunInput,
     outcome_tx: RunOutcomeSender,
     limits: AgentRunLimits,
+    runtime: Option<AgentRuntime>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,9 +177,13 @@ where
             runtime_factory: None,
             mcp_sessions: Arc::new(StdMutex::new(BTreeMap::new())),
             mcp_preparation_guards: Arc::new(StdMutex::new(BTreeMap::new())),
-            active_runs: Arc::new(Mutex::new(BTreeMap::new())),
+            active_runs: Arc::new(Mutex::new(RunCoordination::default())),
             next_run_id: Arc::new(AtomicU64::new(0)),
+            next_pause_id: Arc::new(AtomicU64::new(0)),
             event_sink: None,
+            shutdown_token: CancellationToken::new(),
+            #[cfg(test)]
+            list_registration_barrier: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -170,6 +228,7 @@ where
             runtime = runtime.with_session_event_sink(Arc::clone(sink));
         }
         let record = runtime.create(request).await?;
+        self.active_runs.lock().await.sessions.remove(&record.id);
         self.timeline.publish_all(record.timeline_events().cloned());
         operation.publish_created(record.summary());
         Ok(AgentSession::new(record))
@@ -191,9 +250,14 @@ where
     )]
     pub async fn delete(&self, id: &SessionId) -> Result<()> {
         let operation = self.control.session(id.clone()).deletion().await;
-        AgentSessionRuntime::new(&self.store)
+        self.block_session(id, "session deleted").await;
+        if let Err(error) = AgentSessionRuntime::new(&self.store)
             .delete_session(id)
-            .await?;
+            .await
+        {
+            self.unblock_session(id).await;
+            return Err(error);
+        }
         let runtime = self
             .mcp_sessions
             .lock()
@@ -229,7 +293,12 @@ where
     )]
     pub async fn wipe_sessions(&self) -> Result<()> {
         let lifecycle = self.control.exclusive().await;
-        self.store.wipe().await.map_err(session_store_error)?;
+        self.begin_wipe().await;
+        let wipe = self.store.wipe().await.map_err(session_store_error);
+        if wipe.is_err() {
+            self.end_wipe().await;
+            return wipe;
+        }
         let runtimes = std::mem::take(
             &mut *self
                 .mcp_sessions
@@ -241,6 +310,7 @@ where
             .expect("MCP preparation guard map lock poisoned")
             .clear();
         lifecycle.publish_cleared();
+        self.end_wipe().await;
         drop(tokio::spawn(async move {
             for (session_id, cached) in runtimes {
                 if shutdown_when_unused(cached.runtime).await.is_err() {
@@ -252,6 +322,23 @@ where
             }
         }));
         Ok(())
+    }
+
+    /// Permanently stop new run admission and cancel process-local coordinated work.
+    pub async fn shutdown(&self) {
+        self.shutdown_token.cancel();
+        let mut coordination = self.active_runs.lock().await;
+        coordination.shutdown = true;
+        for (session_id, state) in &mut coordination.sessions {
+            cancel_session_state(session_id, state, "session coordinator shut down");
+            state.blocked = true;
+        }
+        let invalidated = coordination.sessions.keys().cloned().collect::<Vec<_>>();
+        drop(coordination);
+        for session_id in invalidated {
+            self.control
+                .publish_coordination(&session_id, SessionCoordinationState::default());
+        }
     }
 
     /// Watch newly created or updated sessions.
@@ -305,6 +392,353 @@ where
         super::capture::capture_record(&record, limits)
     }
 
+    /// Capture mask-effective source context through its latest completed turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed precondition, exhaustion, or storage failure.
+    pub async fn capture_latest_completed_effective(
+        &self,
+        id: &SessionId,
+    ) -> std::result::Result<CompletedSessionCapture, SessionCaptureError> {
+        self.capture_latest_completed_effective_with_limits(id, SessionCaptureLimits::default())
+            .await
+    }
+
+    /// Capture mask-effective context under explicit projection bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed precondition, exhaustion, or storage failure.
+    pub async fn capture_latest_completed_effective_with_limits(
+        &self,
+        id: &SessionId,
+        limits: SessionCaptureLimits,
+    ) -> std::result::Result<CompletedSessionCapture, SessionCaptureError> {
+        let operation = self.control.session(id.clone()).operation().await;
+        let record = self.store.load(id).await?;
+        operation.register_loaded_summary(record.summary());
+        super::capture::capture_record_effective(&record, limits)
+    }
+
+    /// Acquire an owned process-local pause without waiting for conflicting work.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed busy, boundary, capture, or storage error.
+    pub async fn acquire_pause_reject_busy(
+        &self,
+        id: &SessionId,
+        reason: SessionCoordinationReason,
+    ) -> std::result::Result<SessionPauseLease, SessionPauseError> {
+        {
+            let coordination = self.active_runs.lock().await;
+            if coordination.shutdown || coordination.wiping {
+                return Err(SessionPauseError::Unavailable {
+                    session_id: id.clone(),
+                });
+            }
+            if let Some(state) = coordination.sessions.get(id) {
+                if state.blocked {
+                    return Err(SessionPauseError::Unavailable {
+                        session_id: id.clone(),
+                    });
+                }
+                if state.active.is_some() {
+                    return Err(SessionPauseError::Active {
+                        session_id: id.clone(),
+                    });
+                }
+                if state.pause.is_some() {
+                    return Err(SessionPauseError::Paused {
+                        session_id: id.clone(),
+                    });
+                }
+            }
+        }
+        let operation = self
+            .control
+            .session(id.clone())
+            .try_operation()
+            .ok_or_else(|| SessionPauseError::LifecycleBusy {
+                session_id: id.clone(),
+            })?;
+        let record = self
+            .store
+            .load(id)
+            .await
+            .map_err(SessionCaptureError::from)?;
+        operation.register_loaded_summary(record.summary());
+        if !record
+            .effective_journal_events()
+            .iter()
+            .any(|event| matches!(event, super::SessionJournalEvent::TurnFinished { .. }))
+        {
+            return Err(SessionPauseError::CompletedBoundaryRequired {
+                session_id: id.clone(),
+            });
+        }
+        let capture =
+            super::capture::capture_record_effective(&record, SessionCaptureLimits::default())?;
+        let timeline_boundary = record
+            .timeline_events()
+            .last()
+            .map(|event| event.cursor)
+            .ok_or_else(|| SessionPauseError::CompletedBoundaryRequired {
+                session_id: id.clone(),
+            })?;
+
+        let pause_id = SessionPauseId::new(self.next_pause_id.fetch_add(1, Ordering::Relaxed));
+        let mut coordination = self.active_runs.lock().await;
+        if coordination.shutdown || coordination.wiping {
+            return Err(SessionPauseError::Unavailable {
+                session_id: id.clone(),
+            });
+        }
+        let state = coordination.sessions.entry(id.clone()).or_default();
+        if state.blocked {
+            return Err(SessionPauseError::Unavailable {
+                session_id: id.clone(),
+            });
+        }
+        if state.active.is_some() {
+            return Err(SessionPauseError::Active {
+                session_id: id.clone(),
+            });
+        }
+        if state.pause.is_some() {
+            return Err(SessionPauseError::Paused {
+                session_id: id.clone(),
+            });
+        }
+        state.pause = Some(OwnedSessionPause {
+            id: pause_id,
+            source_cursor: capture.through_cursor,
+            timeline_boundary,
+            mutation_cursor: None,
+            continuation: None,
+            reason,
+        });
+        let projected = state.coordination();
+        drop(coordination);
+        self.control.publish_coordination(id, projected);
+        Ok(SessionPauseLease::new(
+            id.clone(),
+            pause_id,
+            capture.through_cursor,
+            timeline_boundary,
+        ))
+    }
+
+    /// Capture effective completed context while the matching pause remains live.
+    pub async fn capture_paused_effective(
+        &self,
+        lease: &SessionPauseLease,
+    ) -> std::result::Result<CompletedSessionCapture, SessionPauseError> {
+        self.capture_paused_effective_with_limits(lease, SessionCaptureLimits::default())
+            .await
+    }
+
+    /// Capture effective completed context under explicit projection bounds.
+    pub async fn capture_paused_effective_with_limits(
+        &self,
+        lease: &SessionPauseLease,
+        limits: SessionCaptureLimits,
+    ) -> std::result::Result<CompletedSessionCapture, SessionPauseError> {
+        let operation = self
+            .control
+            .session(lease.session_id.clone())
+            .operation()
+            .await;
+        self.validate_pause_owner(lease).await?;
+        let record = self
+            .store
+            .load(&lease.session_id)
+            .await
+            .map_err(SessionCaptureError::from)?;
+        operation.register_loaded_summary(record.summary());
+        validate_pause_boundary(lease, &record)?;
+        let capture = super::capture::capture_record_effective(&record, limits)?;
+        if capture.through_cursor != lease.source_cursor {
+            return Err(SessionPauseError::BoundaryChanged {
+                session_id: lease.session_id.clone(),
+                expected: lease.source_cursor,
+                actual: Some(capture.through_cursor),
+            });
+        }
+        Ok(capture)
+    }
+
+    /// Atomically apply a mask mutation at the matching pause's pinned boundary.
+    pub async fn apply_paused_mask_mutation(
+        &self,
+        lease: &SessionPauseLease,
+        mut mutation: SessionMaskMutation,
+    ) -> std::result::Result<SessionMaskMutationOutcome, SessionPauseError> {
+        let operation = self
+            .control
+            .session(lease.session_id.clone())
+            .operation()
+            .await;
+        self.validate_pause_owner(lease).await?;
+        mutation.expected_timeline_boundary = Some(lease.timeline_boundary);
+        let outcome = self
+            .store
+            .mutate_masks(&lease.session_id, mutation)
+            .await
+            .map_err(|error| pause_store_error(lease, error))?;
+        let record = self
+            .store
+            .load(&lease.session_id)
+            .await
+            .map_err(SessionPauseError::Store)?;
+        operation.publish_run_summary(record.summary());
+        self.timeline
+            .publish_projection_invalidation(lease.session_id.clone(), record.revision);
+        let mut coordination = self.active_runs.lock().await;
+        let pause = matching_pause_mut(&mut coordination, lease)?;
+        pause.mutation_cursor = Some(outcome.cursor);
+        Ok(outcome)
+    }
+
+    /// Arm a mask-aware continuation that will run before queued user work on release.
+    pub async fn arm_paused_continuation(
+        &self,
+        lease: &SessionPauseLease,
+        mutation_cursor: crate::TimelineCursor,
+        limits: AgentRunLimits,
+    ) -> std::result::Result<AgentSessionRunSubmission, SessionPauseError> {
+        {
+            let _operation = self
+                .control
+                .session(lease.session_id.clone())
+                .operation()
+                .await;
+            self.validate_pause_owner(lease).await?;
+            let record = self
+                .store
+                .load(&lease.session_id)
+                .await
+                .map_err(SessionPauseError::Store)?;
+            validate_pause_boundary(lease, &record)?;
+        }
+        let runtime = self
+            .resolve_runtime(&lease.session_id)
+            .await
+            .map_err(SessionPauseError::Run)?;
+        let _operation = self
+            .control
+            .session(lease.session_id.clone())
+            .operation()
+            .await;
+        let record = self
+            .store
+            .load(&lease.session_id)
+            .await
+            .map_err(SessionPauseError::Store)?;
+        validate_pause_boundary(lease, &record)?;
+        let mut coordination = self.active_runs.lock().await;
+        let pause = matching_pause_mut(&mut coordination, lease)?;
+        if pause.mutation_cursor != Some(mutation_cursor) {
+            return Err(SessionPauseError::ContinuationCursorMismatch {
+                session_id: lease.session_id.clone(),
+                expected: pause.mutation_cursor,
+                actual: mutation_cursor,
+            });
+        }
+        if pause.continuation.is_some() {
+            return Err(SessionPauseError::ContinuationAlreadyArmed {
+                session_id: lease.session_id.clone(),
+            });
+        }
+        let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        pause.continuation = Some(QueuedSessionRun {
+            id,
+            input: AgentSessionRunInput::Continue,
+            outcome_tx,
+            limits,
+            runtime: Some(runtime),
+        });
+        let projected = coordination.sessions[&lease.session_id].coordination();
+        drop(coordination);
+        self.control
+            .publish_coordination(&lease.session_id, projected);
+        Ok(AgentSessionRunSubmission {
+            session_id: lease.session_id.clone(),
+            run_id: id,
+            disposition: AgentSessionRunDisposition::Queued { position: 1 },
+            handle: AgentSessionRunHandle::new(lease.session_id.clone(), id, outcome_rx),
+        })
+    }
+
+    /// Release the matching pause, starting continuation or queued work when present.
+    pub async fn release_pause(
+        &self,
+        lease: &SessionPauseLease,
+    ) -> std::result::Result<(), SessionPauseError> {
+        if lease.is_released() {
+            return Ok(());
+        }
+        let operation = self
+            .control
+            .session(lease.session_id.clone())
+            .operation()
+            .await;
+        let mut coordination = self.active_runs.lock().await;
+        let lifecycle_blocked = coordination.shutdown || coordination.wiping;
+        let Some(state) = coordination.sessions.get_mut(&lease.session_id) else {
+            return Err(SessionPauseError::OwnershipLost {
+                session_id: lease.session_id.clone(),
+            });
+        };
+        if !state
+            .pause
+            .as_ref()
+            .is_some_and(|pause| pause.id == lease.id)
+        {
+            return Err(SessionPauseError::OwnershipLost {
+                session_id: lease.session_id.clone(),
+            });
+        }
+        let pause = state.pause.take().expect("matching pause exists");
+        let start = if state.blocked || lifecycle_blocked {
+            if let Some(continuation) = pause.continuation {
+                cancel_queued(
+                    &lease.session_id,
+                    VecDeque::from([continuation]),
+                    "session lifecycle canceled paused work",
+                );
+            }
+            cancel_queued(
+                &lease.session_id,
+                std::mem::take(&mut state.queued),
+                "session lifecycle canceled paused work",
+            );
+            None
+        } else if let Some(continuation) = pause.continuation {
+            Some(start_queued(state, continuation))
+        } else {
+            pop_next_start(state)
+        };
+        if state.active.is_none() && state.queued.is_empty() && !state.blocked {
+            coordination.sessions.remove(&lease.session_id);
+        }
+        let projected = coordination.sessions.get(&lease.session_id).map_or_else(
+            SessionCoordinationState::default,
+            SessionRunState::coordination,
+        );
+        drop(coordination);
+        self.control
+            .publish_coordination(&lease.session_id, projected);
+        drop(operation);
+        lease.mark_released();
+        if let Some(start) = start {
+            self.spawn_run(lease.session_id.clone(), start);
+        }
+        Ok(())
+    }
+
     /// List durable sessions, newest activity first.
     ///
     /// # Errors
@@ -316,7 +750,43 @@ where
         fields(operation = "list", db_system = "session_store")
     )]
     pub async fn list(&self) -> Result<Vec<SessionSummary>> {
-        AgentSessionRuntime::new(&self.store).list_sessions().await
+        let summaries = AgentSessionRuntime::new(&self.store)
+            .list_sessions()
+            .await?;
+        let mut registered = summaries
+            .into_iter()
+            .map(|summary| {
+                let incarnation = self.control.register_listed_summary(summary.clone());
+                (incarnation, summary)
+            })
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.wait_at_list_registration_barrier().await;
+
+        let coordination = self.active_runs.lock().await;
+        let mut summaries = Vec::with_capacity(registered.len());
+        for (incarnation, mut summary) in registered.drain(..) {
+            if let Some(state) = coordination.sessions.get(&summary.id) {
+                summary.set_coordination(state.coordination());
+            }
+            if let Some(summary) = self.control.reconcile_listed_summary(incarnation, summary) {
+                summaries.push(summary);
+            }
+        }
+        Ok(summaries)
+    }
+
+    #[cfg(test)]
+    async fn wait_at_list_registration_barrier(&self) {
+        let barrier = self
+            .list_registration_barrier
+            .lock()
+            .expect("list registration barrier lock poisoned")
+            .clone();
+        if let Some((entered, release)) = barrier {
+            entered.notify_one();
+            release.notified().await;
+        }
     }
 
     /// Persist an interruption for an existing durable session.
@@ -330,8 +800,8 @@ where
         fields(operation = "interrupt", db_system = "session_store", session_id = %id.as_str())
     )]
     pub async fn interrupt(&self, id: &SessionId) -> Result<AgentSession> {
-        self.interrupt_active_run(id).await;
         let operation = self.control.session(id.clone()).operation().await;
+        self.interrupt_active_run(id).await;
         let record = AgentSessionRuntime::new(&self.store)
             .with_session_run_context(self.run_context(id), operation.incarnation())
             .interrupt(id)
@@ -692,8 +1162,8 @@ where
     ///
     /// Returns an error when the checkpoint is invalid or persistence fails.
     pub async fn rollback_to_turn(&self, session_id: SessionId, turn: u64) -> Result<AgentSession> {
-        self.interrupt_active_run(&session_id).await;
         let operation = self.control.session(session_id.clone()).operation().await;
+        self.interrupt_active_run(&session_id).await;
         let output = AgentSessionRuntime::new(&self.store)
             .with_session_run_context(self.run_context(&session_id), operation.incarnation())
             .rollback_to_turn(&session_id, turn)
@@ -715,8 +1185,8 @@ where
         session_id: SessionId,
         cursor: crate::timeline::TimelineCursor,
     ) -> Result<AgentSession> {
-        self.interrupt_active_run(&session_id).await;
         let operation = self.control.session(session_id.clone()).operation().await;
+        self.interrupt_active_run(&session_id).await;
         let output = AgentSessionRuntime::new(&self.store)
             .with_session_run_context(self.run_context(&session_id), operation.incarnation())
             .rollback_to_cursor(&session_id, cursor)
@@ -738,8 +1208,8 @@ where
         session_id: SessionId,
         cursor: crate::timeline::TimelineCursor,
     ) -> Result<AgentSession> {
-        self.interrupt_active_run(&session_id).await;
         let operation = self.control.session(session_id.clone()).operation().await;
+        self.interrupt_active_run(&session_id).await;
         let output = AgentSessionRuntime::new(&self.store)
             .with_session_run_context(self.run_context(&session_id), operation.incarnation())
             .rollback_before_cursor(&session_id, cursor)
@@ -824,10 +1294,36 @@ where
         let handle = AgentSessionRunHandle::new(session_id.clone(), id, outcome_rx);
         let mut start = None;
         let disposition;
+        let projected;
 
         {
-            let mut active = self.active_runs.lock().await;
-            if let Some(current) = active.get_mut(&session_id) {
+            let mut coordination = self.active_runs.lock().await;
+            if coordination.shutdown || coordination.wiping {
+                return Err(AgentSessionRunError::Unavailable { session_id });
+            }
+            let current = coordination.sessions.entry(session_id.clone()).or_default();
+            if current.blocked {
+                return Err(AgentSessionRunError::Unavailable { session_id });
+            }
+            if current.pause.is_some() {
+                match policy {
+                    RunConflictPolicy::QueueIfActive => {
+                        current.queued.push_back(QueuedSessionRun {
+                            id,
+                            input,
+                            outcome_tx,
+                            limits,
+                            runtime: None,
+                        });
+                        disposition = AgentSessionRunDisposition::Queued {
+                            position: current.queued.len(),
+                        };
+                    }
+                    RunConflictPolicy::RejectIfActive | RunConflictPolicy::ReplaceActive => {
+                        return Err(AgentSessionRunError::Paused { session_id });
+                    }
+                }
+            } else if let Some(active_run) = current.active.as_ref() {
                 match policy {
                     RunConflictPolicy::RejectIfActive => {
                         return Err(AgentSessionRunError::AlreadyRunning { session_id });
@@ -838,6 +1334,7 @@ where
                             input,
                             outcome_tx,
                             limits,
+                            runtime: None,
                         });
                         disposition = AgentSessionRunDisposition::Queued {
                             position: current.queued.len(),
@@ -845,18 +1342,16 @@ where
                     }
                     RunConflictPolicy::ReplaceActive => {
                         let token = CancellationToken::new();
-                        let previous = active.insert(
-                            session_id.clone(),
-                            ActiveSessionRun {
-                                id,
-                                token: token.clone(),
-                                queued: VecDeque::new(),
-                            },
+                        active_run.token.cancel();
+                        cancel_queued(
+                            &session_id,
+                            std::mem::take(&mut current.queued),
+                            "replaced by a new run",
                         );
-                        if let Some(previous) = previous {
-                            previous.token.cancel();
-                            cancel_queued(&session_id, previous.queued, "replaced by a new run");
-                        }
+                        current.active = Some(ActiveSessionRun {
+                            id,
+                            token: token.clone(),
+                        });
                         start = Some(SessionRunStart {
                             id,
                             token,
@@ -870,14 +1365,10 @@ where
                 }
             } else {
                 let token = CancellationToken::new();
-                active.insert(
-                    session_id.clone(),
-                    ActiveSessionRun {
-                        id,
-                        token: token.clone(),
-                        queued: VecDeque::new(),
-                    },
-                );
+                current.active = Some(ActiveSessionRun {
+                    id,
+                    token: token.clone(),
+                });
                 start = Some(SessionRunStart {
                     id,
                     token,
@@ -888,13 +1379,20 @@ where
                 });
                 disposition = AgentSessionRunDisposition::Started;
             }
+            projected = current.coordination();
         }
+        self.control.publish_coordination(&session_id, projected);
 
         if let Some(mut start) = start {
             match self.resolve_runtime(&session_id).await {
-                Ok(runtime) => start.runtime = Some(runtime),
+                Ok(runtime) => {
+                    start.runtime = Some(runtime);
+                }
                 Err(error) => {
-                    self.active_runs.lock().await.remove(&session_id);
+                    let next = self.fail_active_start(&session_id, start.id).await;
+                    if let Some(next) = next {
+                        self.spawn_run(session_id.clone(), next);
+                    }
                     return Err(error);
                 }
             }
@@ -915,21 +1413,41 @@ where
         self.active_runs
             .lock()
             .await
+            .sessions
             .get(session_id)
-            .map(|active| AgentSessionActiveRunState {
+            .and_then(|state| state.active.as_ref().map(|active| (state, active)))
+            .map(|(state, active)| AgentSessionActiveRunState {
                 run_id: active.id,
-                queued_count: active.queued.len(),
+                queued_count: state.queued.len(),
             })
     }
 
     async fn interrupt_active_run(&self, id: &SessionId) {
-        let active = self.active_runs.lock().await.remove(id);
-        if let Some(active) = active {
-            active.token.cancel();
-            tracing::info!(session_id = %id.as_str(), run_id = active.id, "active session run cancellation requested");
-            cancel_queued(id, active.queued, "session interrupted");
+        let mut coordination = self.active_runs.lock().await;
+        let state = coordination.sessions.remove(id);
+        let coordination_changed = state
+            .as_ref()
+            .is_some_and(|state| state.coordination() != SessionCoordinationState::default());
+        if let Some(mut state) = state {
+            if let Some(pause) = state.pause.take()
+                && let Some(continuation) = pause.continuation
+            {
+                cancel_queued(id, VecDeque::from([continuation]), "session interrupted");
+            }
+            cancel_queued(id, state.queued, "session interrupted");
+            if let Some(active) = state.active {
+                active.token.cancel();
+                tracing::info!(session_id = %id.as_str(), run_id = active.id, "active session run cancellation requested");
+            } else {
+                tracing::debug!(session_id = %id.as_str(), "no active session run to cancel");
+            }
         } else {
             tracing::debug!(session_id = %id.as_str(), "no active session run to cancel");
+        }
+        drop(coordination);
+        if coordination_changed {
+            self.control
+                .publish_coordination(id, SessionCoordinationState::default());
         }
     }
 
@@ -960,8 +1478,9 @@ where
                 let terminal_state = terminal_state(&outcome);
                 tracing::Span::current().record("terminal_state", terminal_state);
                 tracing::info!(session_id = %session_id.as_str(), run_id, terminal_state, "session run completed");
+                let next = coordinator.finish_active_run(&session_id, run_id).await;
                 send_run_outcome(start.outcome_txs, outcome);
-                if let Some(next) = coordinator.finish_active_run(&session_id, run_id).await {
+                if let Some(next) = next {
                     coordinator.spawn_run(session_id, next);
                 }
             }
@@ -975,49 +1494,53 @@ where
         session_id: &SessionId,
         run_id: u64,
     ) -> Option<SessionRunStart> {
-        let mut active = self.active_runs.lock().await;
-        let current = active.get_mut(session_id)?;
-        if current.id != run_id {
+        let mut coordination = self.active_runs.lock().await;
+        let current = coordination.sessions.get_mut(session_id)?;
+        if current.active.as_ref()?.id != run_id {
             return None;
         }
-        let Some(queued) = current.queued.pop_front() else {
-            active.remove(session_id);
+        current.active = None;
+        if current.pause.is_some() || current.blocked {
+            let projected = current.coordination();
+            drop(coordination);
+            self.control.publish_coordination(session_id, projected);
             return None;
-        };
-        let token = CancellationToken::new();
-        let id = queued.id;
-        let mut input = queued.input;
-        let limits = queued.limits;
-        let mut outcome_txs = vec![(queued.id, queued.outcome_tx)];
-        if let AgentSessionRunInput::Prompt(first) = input {
-            let mut prompts = vec![first];
-            while let Some(next) = current.queued.front() {
-                if !matches!(next.input, AgentSessionRunInput::Prompt(_)) || next.limits != limits {
-                    break;
-                }
-                let next = current.queued.pop_front().expect("queued prompt exists");
-                let AgentSessionRunInput::Prompt(prompt) = next.input else {
-                    unreachable!("front input was checked as prompt");
-                };
-                prompts.push(prompt);
-                outcome_txs.push((next.id, next.outcome_tx));
-            }
-            input = if prompts.len() == 1 {
-                AgentSessionRunInput::Prompt(prompts.pop().expect("single prompt exists"))
-            } else {
-                AgentSessionRunInput::Prompts(prompts)
-            };
         }
-        current.id = id;
-        current.token = token.clone();
-        Some(SessionRunStart {
-            id,
-            token,
-            runtime: None,
-            input,
-            outcome_txs,
-            limits,
-        })
+        let next = pop_next_start(current);
+        if next.is_none() {
+            coordination.sessions.remove(session_id);
+        }
+        let projected = coordination.sessions.get(session_id).map_or_else(
+            SessionCoordinationState::default,
+            SessionRunState::coordination,
+        );
+        drop(coordination);
+        self.control.publish_coordination(session_id, projected);
+        next
+    }
+
+    async fn fail_active_start(
+        &self,
+        session_id: &SessionId,
+        run_id: u64,
+    ) -> Option<SessionRunStart> {
+        let mut coordination = self.active_runs.lock().await;
+        let state = coordination.sessions.get_mut(session_id)?;
+        if state.active.as_ref()?.id != run_id {
+            return None;
+        }
+        state.active = None;
+        let next = pop_next_start(state);
+        if next.is_none() && state.pause.is_none() && !state.blocked {
+            coordination.sessions.remove(session_id);
+        }
+        let projected = coordination.sessions.get(session_id).map_or_else(
+            SessionCoordinationState::default,
+            SessionRunState::coordination,
+        );
+        drop(coordination);
+        self.control.publish_coordination(session_id, projected);
+        next
     }
 
     /// Start a durable session turn from a user prompt.
@@ -1375,6 +1898,197 @@ where
             spawn_runtime_shutdown(evicted.runtime);
         }
     }
+
+    async fn validate_pause_owner(
+        &self,
+        lease: &SessionPauseLease,
+    ) -> std::result::Result<(), SessionPauseError> {
+        let coordination = self.active_runs.lock().await;
+        let pause = coordination
+            .sessions
+            .get(&lease.session_id)
+            .and_then(|state| state.pause.as_ref());
+        if pause.is_some_and(|pause| {
+            pause.id == lease.id
+                && pause.source_cursor == lease.source_cursor
+                && pause.timeline_boundary == lease.timeline_boundary
+        }) {
+            Ok(())
+        } else {
+            Err(SessionPauseError::OwnershipLost {
+                session_id: lease.session_id.clone(),
+            })
+        }
+    }
+
+    async fn block_session(&self, session_id: &SessionId, reason: &'static str) {
+        let mut coordination = self.active_runs.lock().await;
+        let state = coordination.sessions.entry(session_id.clone()).or_default();
+        let coordination_changed = state.coordination() != SessionCoordinationState::default();
+        cancel_session_state(session_id, state, reason);
+        state.blocked = true;
+        drop(coordination);
+        if coordination_changed {
+            self.control
+                .publish_coordination(session_id, SessionCoordinationState::default());
+        }
+    }
+
+    async fn unblock_session(&self, session_id: &SessionId) {
+        let mut coordination = self.active_runs.lock().await;
+        if coordination.sessions.get(session_id).is_some_and(|state| {
+            state.blocked
+                && state.active.is_none()
+                && state.pause.is_none()
+                && state.queued.is_empty()
+        }) {
+            coordination.sessions.remove(session_id);
+        }
+    }
+
+    async fn begin_wipe(&self) {
+        let mut coordination = self.active_runs.lock().await;
+        coordination.wiping = true;
+        for (session_id, state) in &mut coordination.sessions {
+            cancel_session_state(session_id, state, "session store wiped");
+            state.blocked = true;
+        }
+        let invalidated = coordination.sessions.keys().cloned().collect::<Vec<_>>();
+        drop(coordination);
+        for session_id in invalidated {
+            self.control
+                .publish_coordination(&session_id, SessionCoordinationState::default());
+        }
+    }
+
+    async fn end_wipe(&self) {
+        let mut coordination = self.active_runs.lock().await;
+        coordination.wiping = false;
+        coordination.sessions.clear();
+    }
+}
+
+fn matching_pause_mut<'a>(
+    coordination: &'a mut RunCoordination,
+    lease: &SessionPauseLease,
+) -> std::result::Result<&'a mut OwnedSessionPause, SessionPauseError> {
+    coordination
+        .sessions
+        .get_mut(&lease.session_id)
+        .and_then(|state| state.pause.as_mut())
+        .filter(|pause| {
+            pause.id == lease.id
+                && pause.source_cursor == lease.source_cursor
+                && pause.timeline_boundary == lease.timeline_boundary
+        })
+        .ok_or_else(|| SessionPauseError::OwnershipLost {
+            session_id: lease.session_id.clone(),
+        })
+}
+
+fn validate_pause_boundary(
+    lease: &SessionPauseLease,
+    record: &super::SessionRecord,
+) -> std::result::Result<(), SessionPauseError> {
+    let actual = record.timeline_events().last().map(|event| event.cursor);
+    if actual == Some(lease.timeline_boundary) {
+        Ok(())
+    } else {
+        Err(SessionPauseError::BoundaryChanged {
+            session_id: lease.session_id.clone(),
+            expected: lease.timeline_boundary,
+            actual,
+        })
+    }
+}
+
+fn pause_store_error(
+    lease: &SessionPauseLease,
+    error: super::SessionStoreError,
+) -> SessionPauseError {
+    match error {
+        super::SessionStoreError::MaskMutation {
+            error: super::SessionMaskError::BoundaryMismatch { actual, .. },
+        } => SessionPauseError::BoundaryChanged {
+            session_id: lease.session_id.clone(),
+            expected: lease.timeline_boundary,
+            actual,
+        },
+        error => SessionPauseError::Store(error),
+    }
+}
+
+fn start_queued(state: &mut SessionRunState, queued: QueuedSessionRun) -> SessionRunStart {
+    let token = CancellationToken::new();
+    let id = queued.id;
+    state.active = Some(ActiveSessionRun {
+        id,
+        token: token.clone(),
+    });
+    SessionRunStart {
+        id,
+        token,
+        runtime: queued.runtime,
+        input: queued.input,
+        outcome_txs: vec![(queued.id, queued.outcome_tx)],
+        limits: queued.limits,
+    }
+}
+
+fn pop_next_start(state: &mut SessionRunState) -> Option<SessionRunStart> {
+    let queued = state.queued.pop_front()?;
+    let token = CancellationToken::new();
+    let id = queued.id;
+    let mut input = queued.input;
+    let limits = queued.limits;
+    let runtime = queued.runtime;
+    let mut outcome_txs = vec![(queued.id, queued.outcome_tx)];
+    if let AgentSessionRunInput::Prompt(first) = input {
+        let mut prompts = vec![first];
+        while let Some(next) = state.queued.front() {
+            if !matches!(next.input, AgentSessionRunInput::Prompt(_))
+                || next.limits != limits
+                || next.runtime.is_some()
+            {
+                break;
+            }
+            let next = state.queued.pop_front().expect("queued prompt exists");
+            let AgentSessionRunInput::Prompt(prompt) = next.input else {
+                unreachable!("front input was checked as prompt");
+            };
+            prompts.push(prompt);
+            outcome_txs.push((next.id, next.outcome_tx));
+        }
+        input = if prompts.len() == 1 {
+            AgentSessionRunInput::Prompt(prompts.pop().expect("single prompt exists"))
+        } else {
+            AgentSessionRunInput::Prompts(prompts)
+        };
+    }
+    state.active = Some(ActiveSessionRun {
+        id,
+        token: token.clone(),
+    });
+    Some(SessionRunStart {
+        id,
+        token,
+        runtime,
+        input,
+        outcome_txs,
+        limits,
+    })
+}
+
+fn cancel_session_state(session_id: &SessionId, state: &mut SessionRunState, reason: &'static str) {
+    if let Some(active) = state.active.take() {
+        active.token.cancel();
+    }
+    if let Some(pause) = state.pause.take()
+        && let Some(continuation) = pause.continuation
+    {
+        cancel_queued(session_id, VecDeque::from([continuation]), reason);
+    }
+    cancel_queued(session_id, std::mem::take(&mut state.queued), reason);
 }
 
 fn stale_runtime_resolution() -> super::AgentSessionRuntimeError {
@@ -1459,68 +2173,71 @@ async fn drain_run<S>(
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
-    let runtime = match runtime {
-        Some(runtime) => runtime,
-        None => match coordinator.resolve_runtime(&session_id).await {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                if let Some(failure) = error.authentication_failure() {
-                    coordinator
-                        .persist_authentication_failure(&session_id, error.to_string(), failure)
-                        .await?;
+    async {
+        let runtime = match runtime {
+            Some(runtime) => runtime,
+            None => match coordinator.resolve_runtime(&session_id).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    if let Some(failure) = error.authentication_failure() {
+                        coordinator
+                            .persist_authentication_failure(&session_id, error.to_string(), failure)
+                            .await?;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+            },
+        };
+        let builder = match input {
+            AgentSessionRunInput::Continue => {
+                coordinator.resume(&runtime, session_id.clone(), ResumeInput::Continue)
             }
-        },
-    };
-    let builder = match input {
-        AgentSessionRunInput::Continue => {
-            coordinator.resume(&runtime, session_id.clone(), ResumeInput::Continue)
-        }
-        AgentSessionRunInput::Prompt(prompt) => {
-            coordinator.prompt(&runtime, session_id.clone(), prompt)
-        }
-        AgentSessionRunInput::Prompts(prompts) => {
-            coordinator.resume(&runtime, session_id.clone(), ResumeInput::Prompts(prompts))
-        }
-        AgentSessionRunInput::ExternalResponse {
-            request_id,
-            response,
-        } => coordinator.resume(
-            &runtime,
-            session_id.clone(),
-            ResumeInput::ExternalResponse {
+            AgentSessionRunInput::Prompt(prompt) => {
+                coordinator.prompt(&runtime, session_id.clone(), prompt)
+            }
+            AgentSessionRunInput::Prompts(prompts) => {
+                coordinator.resume(&runtime, session_id.clone(), ResumeInput::Prompts(prompts))
+            }
+            AgentSessionRunInput::ExternalResponse {
                 request_id,
                 response,
-            },
-        ),
-        AgentSessionRunInput::ToolResults(results) => coordinator.resume(
-            &runtime,
-            session_id.clone(),
-            ResumeInput::ToolResults(results),
-        ),
-    }
-    .with_run_limits(limits);
-    let mut stream = builder.with_cancellation_token(token.clone()).stream();
-
-    let mut assistant_text = String::new();
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        if is_assistant_text_delta(&event)
-            && let TimelineContent::TextDelta { delta } = &event.content
-        {
-            assistant_text.push_str(delta);
+            } => coordinator.resume(
+                &runtime,
+                session_id.clone(),
+                ResumeInput::ExternalResponse {
+                    request_id,
+                    response,
+                },
+            ),
+            AgentSessionRunInput::ToolResults(results) => coordinator.resume(
+                &runtime,
+                session_id.clone(),
+                ResumeInput::ToolResults(results),
+            ),
         }
-    }
+        .with_run_limits(limits);
+        let mut stream = builder.with_cancellation_token(token.clone()).stream();
 
-    let session = coordinator.load(&session_id).await?;
-    let status = session.record.summary().status;
-    Ok(AgentSessionRunOutcome {
-        session_id,
-        run_id,
-        status,
-        assistant_text: (!assistant_text.is_empty()).then_some(assistant_text),
-    })
+        let mut assistant_text = String::new();
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            if is_assistant_text_delta(&event)
+                && let TimelineContent::TextDelta { delta } = &event.content
+            {
+                assistant_text.push_str(delta);
+            }
+        }
+
+        let session = coordinator.load(&session_id).await?;
+        let status = session.record.summary().status;
+        Ok(AgentSessionRunOutcome {
+            session_id,
+            run_id,
+            status,
+            assistant_text: (!assistant_text.is_empty()).then_some(assistant_text),
+        })
+    }
+    .await
 }
 
 fn is_assistant_text_delta(event: &AgentTimelineEvent) -> bool {
@@ -1588,6 +2305,8 @@ const fn terminal_state(outcome: &RunResult) -> &'static str {
         Err(AgentSessionRunError::Canceled { .. }) => "interrupted",
         Err(
             AgentSessionRunError::AlreadyRunning { .. }
+            | AgentSessionRunError::Paused { .. }
+            | AgentSessionRunError::Unavailable { .. }
             | AgentSessionRunError::OutcomeDropped { .. }
             | AgentSessionRunError::Runtime(_)
             | AgentSessionRunError::Agent(_),
@@ -1610,6 +2329,7 @@ mod tests {
             Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         },
+        time::Duration,
     };
 
     use futures_util::{StreamExt as _, stream};
@@ -1627,6 +2347,15 @@ mod tests {
             FileCredentialStore, InferenceProviderSettings, MemorySessionStore, SessionListEvent,
         },
     };
+
+    fn pause_reason() -> SessionCoordinationReason {
+        SessionCoordinationReason::new(
+            "host-operation",
+            Some("agent-test".to_owned()),
+            Some("manual".to_owned()),
+        )
+        .unwrap()
+    }
 
     struct TextOnlyProvider;
 
@@ -1769,7 +2498,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 self.requests.lock().await.push(prompts.clone());
-                if prompts.as_slice() == ["active"] {
+                if prompts.last().is_some_and(|prompt| prompt == "active") {
                     let release_active = self.release_active.clone();
                     let stream = stream::once(async move {
                         release_active.notified().await;
@@ -1865,6 +2594,67 @@ spec: { mcp: {} }
         });
 
         SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(environment)
+    }
+
+    async fn completed_session(sessions: &SessionCoordinator<MemorySessionStore>) -> SessionId {
+        let source = r"
+apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata: { name: test }
+spec: {}
+";
+        let session = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                Some(AgentDefinitionBundle::new("test", vec![source.to_owned()])),
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap();
+        let id = session.record.id;
+        sessions
+            .submit_prompt(id.clone(), "seed", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap()
+            .handle
+            .wait()
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn next_coordination(
+        watch: &mut SessionListSubscription,
+        phase: SessionCoordinationPhase,
+    ) -> SessionSummary {
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(1), watch.next())
+                .await
+                .expect("coordination update timeout")
+                .expect("coordination update");
+            if let SessionListEvent::Upsert(summary) = update.event
+                && summary.coordination.phase == phase
+            {
+                return summary;
+            }
+        }
+    }
+
+    async fn next_coordination_matching(
+        watch: &mut SessionListSubscription,
+        predicate: impl Fn(&SessionCoordinationState) -> bool,
+    ) -> SessionSummary {
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(1), watch.next())
+                .await
+                .expect("coordination update timeout")
+                .expect("coordination update");
+            if let SessionListEvent::Upsert(summary) = update.event
+                && predicate(&summary.coordination)
+            {
+                return summary;
+            }
+        }
     }
 
     async fn establish_incarnation(
@@ -3140,6 +3930,422 @@ spec:
     }
 
     #[tokio::test]
+    async fn pause_acquisition_is_exclusive_rejects_active_and_requires_completed_boundary() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let id = completed_session(&sessions).await;
+
+        let (left, right) = tokio::join!(
+            sessions.acquire_pause_reject_busy(&id, pause_reason()),
+            sessions.acquire_pause_reject_busy(&id, pause_reason())
+        );
+        let lease = match (left, right) {
+            (Ok(lease), Err(SessionPauseError::Paused { .. }))
+            | (Err(SessionPauseError::Paused { .. }), Ok(lease)) => lease,
+            outcomes => panic!("unexpected acquisition race outcomes: {outcomes:?}"),
+        };
+        sessions.release_pause(&lease).await.unwrap();
+
+        let active = sessions
+            .submit_prompt(id.clone(), "active", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        provider.wait_for_request_count(2).await;
+        assert!(matches!(
+            sessions
+                .acquire_pause_reject_busy(&id, pause_reason())
+                .await,
+            Err(SessionPauseError::Active { .. })
+        ));
+        provider.release_active();
+        active.handle.wait().await.unwrap();
+
+        let held = sessions.control.session(id.clone()).operation().await;
+        assert!(matches!(
+            sessions
+                .acquire_pause_reject_busy(&id, pause_reason())
+                .await,
+            Err(SessionPauseError::LifecycleBusy { .. })
+        ));
+        drop(held);
+
+        let incomplete = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                Some(AgentDefinitionBundle::new(
+                    "test",
+                    vec![
+                        r"apiVersion: waltr.dev/v1alpha1
+kind: Agent
+metadata: { name: test }
+spec: {}"
+                            .to_owned(),
+                    ],
+                )),
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            sessions
+                .acquire_pause_reject_busy(&incomplete.record.id, pause_reason())
+                .await,
+            Err(SessionPauseError::CompletedBoundaryRequired { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn paused_prompts_queue_coalesce_and_release_is_idempotent() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let id = completed_session(&sessions).await;
+        let lease = sessions
+            .acquire_pause_reject_busy(&id, pause_reason())
+            .await
+            .unwrap();
+
+        let first = sessions
+            .submit_prompt(id.clone(), "queued one", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let second = sessions
+            .submit_prompt(id.clone(), "queued two", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        assert!(matches!(
+            sessions
+                .submit_prompt(id.clone(), "reject", RunConflictPolicy::RejectIfActive)
+                .await,
+            Err(AgentSessionRunError::Paused { .. })
+        ));
+        assert!(matches!(
+            sessions
+                .submit_prompt(id.clone(), "replace", RunConflictPolicy::ReplaceActive)
+                .await,
+            Err(AgentSessionRunError::Paused { .. })
+        ));
+        assert_eq!(provider.requests.lock().await.len(), 1);
+
+        sessions.release_pause(&lease).await.unwrap();
+        sessions.release_pause(&lease).await.unwrap();
+        first.handle.wait().await.unwrap();
+        second.handle.wait().await.unwrap();
+        provider.wait_for_request_count(2).await;
+        let requests = provider.requests.lock().await.clone();
+        assert_eq!(
+            &requests[1][requests[1].len() - 2..],
+            ["queued one", "queued two"]
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_mask_mutation_accepts_metadata_but_rejects_timeline_change() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(provider);
+        let id = completed_session(&sessions).await;
+        let lease = sessions
+            .acquire_pause_reject_busy(&id, pause_reason())
+            .await
+            .unwrap();
+        sessions
+            .set_metadata_value(&id, "routine", json!("running"))
+            .await
+            .unwrap();
+
+        let mut mutation = SessionMaskMutation::new(None);
+        mutation.add.push(crate::SessionMaskAddition::new(
+            "context.compaction-prefix",
+            crate::ThroughCursor::new(lease.source_cursor()),
+            crate::ReplacementUserContent::new("compact summary"),
+        ));
+        let outcome = sessions
+            .apply_paused_mask_mutation(&lease, mutation)
+            .await
+            .unwrap();
+        let capture = sessions.capture_paused_effective(&lease).await.unwrap();
+        assert_eq!(capture.through_cursor, lease.source_cursor());
+        let effective = sessions
+            .load(&id)
+            .await
+            .unwrap()
+            .record
+            .materialize_context(crate::SessionContextMode::Effective);
+        assert_eq!(effective.current_prompt.as_deref(), Some("compact summary"));
+        assert!(outcome.cursor > lease.source_cursor());
+
+        sessions
+            .append_timeline(
+                &id,
+                vec![PendingTimelineEvent::assistant_text_delta(
+                    id.clone(),
+                    1,
+                    crate::PendingTimelineItemId::New,
+                    "late",
+                )],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            sessions
+                .apply_paused_mask_mutation(&lease, SessionMaskMutation::new(None))
+                .await,
+            Err(SessionPauseError::BoundaryChanged { .. })
+        ));
+        sessions.release_pause(&lease).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn effective_watch_invalidates_for_mask_add_subtract_and_rollback() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(provider);
+        let id = completed_session(&sessions).await;
+        let lease = sessions
+            .acquire_pause_reject_busy(&id, pause_reason())
+            .await
+            .unwrap();
+        let mut effective_watch = sessions.watch_timeline_projection(id.clone());
+        let mut raw_watch = sessions.watch_timeline(id.clone());
+        let initial = sessions
+            .timeline_projection(
+                &id,
+                SessionTimelineMode::Effective,
+                TimelineQuery::forward(None, 64),
+            )
+            .await
+            .unwrap();
+
+        let mut addition = SessionMaskMutation::new(None);
+        addition.add.push(crate::SessionMaskAddition::new(
+            "summary",
+            crate::ThroughCursor::new(lease.source_cursor()),
+            crate::ReplacementUserContent::new("compact summary"),
+        ));
+        let added = sessions
+            .apply_paused_mask_mutation(&lease, addition)
+            .await
+            .unwrap();
+        let add_update = effective_watch.next().await.unwrap();
+        assert!(matches!(
+            add_update.event,
+            crate::SessionTimelineProjectionUpdateEvent::Invalidated {
+                projection_revision,
+                ..
+            } if projection_revision == added.revision && projection_revision > initial.projection_revision
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), raw_watch.next())
+                .await
+                .is_err(),
+            "mask addition must not enter the raw watch"
+        );
+        let added_page = sessions
+            .timeline_projection(
+                &id,
+                SessionTimelineMode::Effective,
+                TimelineQuery::forward(None, 64),
+            )
+            .await
+            .unwrap();
+        assert!(added_page.events.iter().any(|event| matches!(
+            event.presentation,
+            crate::SessionTimelinePresentation::MaskReplacement { .. }
+        )));
+
+        let mut subtraction = SessionMaskMutation::new(None);
+        subtraction
+            .subtract
+            .ids
+            .push(added.added_masks[0].id.clone());
+        let subtracted = sessions
+            .apply_paused_mask_mutation(&lease, subtraction)
+            .await
+            .unwrap();
+        let subtract_update = effective_watch.next().await.unwrap();
+        assert!(matches!(
+            subtract_update.event,
+            crate::SessionTimelineProjectionUpdateEvent::Invalidated {
+                projection_revision,
+                ..
+            } if projection_revision == subtracted.revision && projection_revision > added.revision
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), raw_watch.next())
+                .await
+                .is_err(),
+            "mask subtraction must not enter the raw watch"
+        );
+
+        let mut readdition = SessionMaskMutation::new(None);
+        readdition.add.push(crate::SessionMaskAddition::new(
+            "summary",
+            crate::ThroughCursor::new(lease.source_cursor()),
+            crate::ReplacementUserContent::new("compact summary"),
+        ));
+        let readded = sessions
+            .apply_paused_mask_mutation(&lease, readdition)
+            .await
+            .unwrap();
+        drop(effective_watch.next().await.unwrap());
+        sessions.release_pause(&lease).await.unwrap();
+
+        let rolled_back = sessions.rollback_to_turn(id.clone(), 0).await.unwrap();
+        let rollback_update = effective_watch.next().await.unwrap();
+        assert!(matches!(
+            rollback_update.event,
+            crate::SessionTimelineProjectionUpdateEvent::Invalidated {
+                projection_revision,
+                ..
+            } if projection_revision == rolled_back.revision() && projection_revision > readded.revision
+        ));
+        assert!(matches!(
+            raw_watch.next().await.unwrap().event,
+            SessionTimelineEvent::Truncated { .. }
+        ));
+        let rollback_page = sessions
+            .timeline_projection(
+                &id,
+                SessionTimelineMode::Effective,
+                TimelineQuery::forward(None, 64),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollback_page.projection_revision, rolled_back.revision());
+        assert!(rollback_page.events.iter().all(|event| !matches!(
+            event.presentation,
+            crate::SessionTimelinePresentation::MaskReplacement { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn armed_continuation_runs_before_queued_prompts_without_rollback() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let id = completed_session(&sessions).await;
+        let lease = sessions
+            .acquire_pause_reject_busy(&id, pause_reason())
+            .await
+            .unwrap();
+        let queued = sessions
+            .submit_prompt(
+                id.clone(),
+                "after continuation",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        let mut mutation = SessionMaskMutation::new(None);
+        mutation.add.push(crate::SessionMaskAddition::new(
+            "context.compaction-prefix",
+            crate::ThroughCursor::new(lease.source_cursor()),
+            crate::ReplacementUserContent::new("compact summary"),
+        ));
+        let mutation = sessions
+            .apply_paused_mask_mutation(&lease, mutation)
+            .await
+            .unwrap();
+        let continuation = sessions
+            .arm_paused_continuation(&lease, mutation.cursor, AgentRunLimits::default())
+            .await
+            .unwrap();
+
+        sessions.release_pause(&lease).await.unwrap();
+        continuation.handle.wait().await.unwrap();
+        queued.handle.wait().await.unwrap();
+        provider.wait_for_request_count(3).await;
+        let requests = provider.requests.lock().await.clone();
+        assert_eq!(requests[1], ["compact summary"]);
+        assert_eq!(
+            requests[2].last().map(String::as_str),
+            Some("after continuation")
+        );
+        let record = sessions.load(&id).await.unwrap().record;
+        assert!(
+            !record
+                .journal
+                .iter()
+                .any(|event| matches!(event, SessionJournalEvent::Rollback { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_wipe_and_shutdown_invalidate_pauses_and_cancel_queues() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(provider);
+
+        let deleted_id = completed_session(&sessions).await;
+        let deleted_lease = sessions
+            .acquire_pause_reject_busy(&deleted_id, pause_reason())
+            .await
+            .unwrap();
+        let deleted_queue = sessions
+            .submit_prompt(
+                deleted_id.clone(),
+                "deleted",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        sessions.delete(&deleted_id).await.unwrap();
+        assert!(matches!(
+            deleted_queue.handle.wait().await,
+            Err(AgentSessionRunError::Canceled { .. })
+        ));
+        assert!(matches!(
+            sessions.release_pause(&deleted_lease).await,
+            Err(SessionPauseError::OwnershipLost { .. })
+        ));
+
+        let wiped_id = completed_session(&sessions).await;
+        let wiped_lease = sessions
+            .acquire_pause_reject_busy(&wiped_id, pause_reason())
+            .await
+            .unwrap();
+        let wiped_queue = sessions
+            .submit_prompt(wiped_id.clone(), "wiped", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        sessions.wipe_sessions().await.unwrap();
+        assert!(matches!(
+            wiped_queue.handle.wait().await,
+            Err(AgentSessionRunError::Canceled { .. })
+        ));
+        assert!(matches!(
+            sessions.release_pause(&wiped_lease).await,
+            Err(SessionPauseError::OwnershipLost { .. })
+        ));
+
+        let shutdown_sessions = runtime_sessions(Arc::new(QueuedPromptProvider::new()));
+        let shutdown_id = completed_session(&shutdown_sessions).await;
+        let shutdown_lease = shutdown_sessions
+            .acquire_pause_reject_busy(&shutdown_id, pause_reason())
+            .await
+            .unwrap();
+        let shutdown_queue = shutdown_sessions
+            .submit_prompt(
+                shutdown_id.clone(),
+                "shutdown",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        shutdown_sessions.shutdown().await;
+        assert!(matches!(
+            shutdown_queue.handle.wait().await,
+            Err(AgentSessionRunError::Canceled { .. })
+        ));
+        assert!(matches!(
+            shutdown_sessions
+                .submit_prompt(shutdown_id, "late", RunConflictPolicy::QueueIfActive)
+                .await,
+            Err(AgentSessionRunError::Unavailable { .. })
+        ));
+        assert!(matches!(
+            shutdown_sessions.release_pause(&shutdown_lease).await,
+            Err(SessionPauseError::OwnershipLost { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn submitted_prompt_limit_fails_before_second_logical_dispatch() {
         let provider = Arc::new(ToolThenTextProvider::new());
         let sessions = runtime_sessions(Arc::clone(&provider));
@@ -3461,59 +4667,204 @@ spec:
     }
 
     #[tokio::test]
-    async fn effective_projection_watch_invalidates_after_rollback() {
+    async fn list_registration_seam_converges_with_pause_publication() {
         let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
-        let session = sessions
-            .create(create_request(
-                Some(test_inference_settings()),
-                None,
-                BTreeMap::new(),
-            ))
+        let id = completed_session(&sessions).await;
+        let mut watch = sessions.watch_sessions();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *sessions
+            .list_registration_barrier
+            .lock()
+            .expect("list registration barrier lock") =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+
+        let listing = {
+            let sessions = sessions.clone();
+            tokio::spawn(async move { sessions.list().await.unwrap() })
+        };
+        entered.notified().await;
+        let reason = pause_reason();
+        let lease = sessions
+            .acquire_pause_reject_busy(&id, reason.clone())
             .await
             .unwrap();
-        let id = session.record.id;
-        sessions
-            .submit_prompt(id.clone(), "seed", RunConflictPolicy::QueueIfActive)
+        *sessions
+            .list_registration_barrier
+            .lock()
+            .expect("list registration barrier lock") = None;
+        release.notify_one();
+
+        let snapshot = listing
             .await
             .unwrap()
-            .handle
-            .wait()
-            .await
+            .into_iter()
+            .find(|summary| summary.id == id)
             .unwrap();
-        let initial = sessions
-            .timeline_projection(
-                &id,
-                SessionTimelineMode::Effective,
-                TimelineQuery::forward(None, 64),
-            )
-            .await
-            .unwrap();
-        assert!(!initial.events.is_empty());
-        let mut effective_watch = sessions.watch_timeline_projection(id.clone());
-        let mut raw_watch = sessions.watch_timeline(id.clone());
+        let live = next_coordination(&mut watch, SessionCoordinationPhase::Paused).await;
+        assert_eq!(snapshot, live);
+        assert_eq!(snapshot.coordination.reason.as_ref(), Some(&reason));
 
-        let rolled_back = sessions.rollback_to_turn(id.clone(), 0).await.unwrap();
+        let reconciled = sessions
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap();
+        assert_eq!(reconciled, snapshot);
+        sessions.release_pause(&lease).await.unwrap();
+    }
 
-        assert!(matches!(
-            effective_watch.next().await.unwrap().event,
-            crate::SessionTimelineProjectionUpdateEvent::Invalidated {
-                projection_revision,
-                ..
-            } if projection_revision == rolled_back.revision()
-                && projection_revision > initial.projection_revision
-        ));
-        assert!(matches!(
-            raw_watch.next().await.unwrap().event,
-            SessionTimelineEvent::Truncated { .. }
-        ));
-        let current = sessions
-            .timeline_projection(
-                &id,
-                SessionTimelineMode::Effective,
-                TimelineQuery::forward(None, 64),
-            )
+    #[tokio::test]
+    async fn pause_queue_continuation_and_restart_projection_are_process_local() {
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let id = completed_session(&sessions).await;
+        let mut watch = sessions.watch_sessions();
+        let reason = pause_reason();
+        let lease = sessions
+            .acquire_pause_reject_busy(&id, reason.clone())
             .await
             .unwrap();
-        assert_eq!(current.projection_revision, rolled_back.revision());
+        let paused = next_coordination(&mut watch, SessionCoordinationPhase::Paused).await;
+        assert_eq!(paused.coordination.reason.as_ref(), Some(&reason));
+
+        let first = sessions
+            .submit_prompt(id.clone(), "queued one", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let one = next_coordination(&mut watch, SessionCoordinationPhase::Paused).await;
+        assert_eq!(one.coordination.queued_count, 1);
+        let second = sessions
+            .submit_prompt(id.clone(), "queued two", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let two = next_coordination(&mut watch, SessionCoordinationPhase::Paused).await;
+        assert_eq!(two.coordination.queued_count, 2);
+
+        let mut mutation = SessionMaskMutation::new(None);
+        mutation.add.push(crate::SessionMaskAddition::new(
+            "coordination-test",
+            crate::ThroughCursor::new(lease.source_cursor()),
+            crate::ReplacementUserContent::new("summary"),
+        ));
+        let mutation = sessions
+            .apply_paused_mask_mutation(&lease, mutation)
+            .await
+            .unwrap();
+        let continuation = sessions
+            .arm_paused_continuation(&lease, mutation.cursor, AgentRunLimits::default())
+            .await
+            .unwrap();
+        let armed = next_coordination_matching(&mut watch, |coordination| {
+            coordination.phase == SessionCoordinationPhase::Paused
+                && coordination.continuation_armed
+        })
+        .await;
+        assert_eq!(armed.coordination.queued_count, 2);
+        assert!(armed.coordination.continuation_armed);
+
+        let restarted = SessionCoordinator::new(sessions.store.clone());
+        let restarted_summary = restarted
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap();
+        assert_eq!(
+            restarted_summary.coordination,
+            SessionCoordinationState::default()
+        );
+
+        sessions.release_pause(&lease).await.unwrap();
+        let continuation_running = next_coordination_matching(&mut watch, |coordination| {
+            coordination.phase == SessionCoordinationPhase::Running
+                && coordination.queued_count == 2
+        })
+        .await;
+        assert!(!continuation_running.coordination.continuation_armed);
+        continuation.handle.wait().await.unwrap();
+        let coalesced_running = next_coordination_matching(&mut watch, |coordination| {
+            coordination.phase == SessionCoordinationPhase::Running
+                && coordination.queued_count == 0
+        })
+        .await;
+        assert_eq!(coalesced_running.coordination.queued_count, 0);
+        first.handle.wait().await.unwrap();
+        second.handle.wait().await.unwrap();
+        let ready = sessions
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap();
+        assert_eq!(ready.coordination, SessionCoordinationState::default());
+    }
+
+    #[tokio::test]
+    async fn interrupt_delete_wipe_and_shutdown_remove_stale_coordination() {
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+
+        let interrupted_id = completed_session(&sessions).await;
+        let interrupted_pause = sessions
+            .acquire_pause_reject_busy(&interrupted_id, pause_reason())
+            .await
+            .unwrap();
+        let mut interrupted_watch = sessions.watch_sessions();
+        sessions.interrupt(&interrupted_id).await.unwrap();
+        let interrupted =
+            next_coordination(&mut interrupted_watch, SessionCoordinationPhase::Ready).await;
+        assert_eq!(
+            interrupted.coordination,
+            SessionCoordinationState::default()
+        );
+        assert!(matches!(
+            sessions.release_pause(&interrupted_pause).await,
+            Err(SessionPauseError::OwnershipLost { .. })
+        ));
+
+        let deleted_id = completed_session(&sessions).await;
+        let _deleted_pause = sessions
+            .acquire_pause_reject_busy(&deleted_id, pause_reason())
+            .await
+            .unwrap();
+        let mut deleted_watch = sessions.watch_sessions();
+        sessions.delete(&deleted_id).await.unwrap();
+        loop {
+            if matches!(deleted_watch.next().await.unwrap().event, SessionListEvent::Deleted(ref id) if id == &deleted_id)
+            {
+                break;
+            }
+        }
+
+        let wiped_id = completed_session(&sessions).await;
+        let _wiped_pause = sessions
+            .acquire_pause_reject_busy(&wiped_id, pause_reason())
+            .await
+            .unwrap();
+        let mut wiped_watch = sessions.watch_sessions();
+        sessions.wipe_sessions().await.unwrap();
+        loop {
+            if matches!(
+                wiped_watch.next().await.unwrap().event,
+                SessionListEvent::Cleared
+            ) {
+                break;
+            }
+        }
+
+        let shutdown_sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let shutdown_id = completed_session(&shutdown_sessions).await;
+        let _shutdown_pause = shutdown_sessions
+            .acquire_pause_reject_busy(&shutdown_id, pause_reason())
+            .await
+            .unwrap();
+        let mut shutdown_watch = shutdown_sessions.watch_sessions();
+        shutdown_sessions.shutdown().await;
+        let shutdown =
+            next_coordination(&mut shutdown_watch, SessionCoordinationPhase::Ready).await;
+        assert_eq!(shutdown.coordination, SessionCoordinationState::default());
     }
 }

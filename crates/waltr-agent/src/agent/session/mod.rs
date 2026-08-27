@@ -4,8 +4,8 @@ mod capture;
 mod compat;
 mod compression;
 mod control;
-mod copy;
 mod coordinator;
+mod copy;
 mod create;
 mod list;
 mod mask;
@@ -23,8 +23,8 @@ pub use capture::{CompletedSessionCapture, SessionCaptureError, SessionCaptureLi
 pub use compat::EphemeralSessionRun;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) use control::{SessionControl, SessionOperation, SessionRunContext};
-pub use copy::{SessionCopy, SessionCopyError};
 pub use coordinator::SessionCoordinator;
+pub use copy::{SessionCopy, SessionCopyError};
 pub use create::{
     SessionCreateRequest, SessionStart, SessionStartMessage, SessionStartMessageError,
 };
@@ -46,7 +46,10 @@ pub use projection::{
 pub use run::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
-    AgentSessionRuntimeError, RunConflictPolicy,
+    AgentSessionRuntimeError, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
+    MAX_SESSION_COORDINATION_REASON_CODE_BYTES, RunConflictPolicy, SessionCoordinationPhase,
+    SessionCoordinationReason, SessionCoordinationReasonError, SessionCoordinationState,
+    SessionPauseError, SessionPauseId, SessionPauseLease,
 };
 pub(super) use run::{RunOutcomeSender, RunResult};
 pub use runtime::{AgentSessionRuntime, RuntimeResumeOutput};
@@ -73,8 +76,8 @@ pub use types::{
     AgentSession, CancelReason, ExternalRequest, ExternalRequestId, ExternalRequestKind,
     ExternalRequestStatus, ExternalResponse, MetadataSetCondition, MetadataSetOutcome, PendingWork,
     PendingWorkStatus, RequestId, RequestRecord, ResumeInput, Revision, SessionId,
-    SessionJournalEvent, SessionMetrics, SessionRecord,
-    SessionRollbackTarget, SessionSnapshot, SessionStatus, SessionSummary, Suspension,
+    SessionJournalEvent, SessionMetrics, SessionRecord, SessionRollbackTarget, SessionSnapshot,
+    SessionStatus, SessionSummary, Suspension,
 };
 pub(super) use watch::SessionTimelineBroadcaster;
 pub use watch::{

@@ -222,6 +222,10 @@ where
                         Ok(false) => continue,
                         Err(error) => return Some((Err(error), self)),
                     }
+                    if !self.pending.is_empty() {
+                        self.phase = AgentLoopPhase::StartTurn;
+                        continue;
+                    }
                     if self.provider_attempt == 1
                         && self
                             .max_provider_turns
