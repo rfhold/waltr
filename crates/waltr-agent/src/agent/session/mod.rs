@@ -47,9 +47,11 @@ pub use run::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
     AgentSessionRuntimeError, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
-    MAX_SESSION_COORDINATION_REASON_CODE_BYTES, RunConflictPolicy, SessionCoordinationPhase,
-    SessionCoordinationReason, SessionCoordinationReasonError, SessionCoordinationState,
-    SessionPauseError, SessionPauseId, SessionPauseLease,
+    MAX_SESSION_COORDINATION_REASON_CODE_BYTES, RunConflictPolicy,
+    SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
+    SessionCompletionCoordinationPreparation, SessionCoordinationPhase, SessionCoordinationReason,
+    SessionCoordinationReasonError, SessionCoordinationState, SessionPauseError, SessionPauseId,
+    SessionPauseLease,
 };
 pub(super) use run::{RunOutcomeSender, RunResult};
 pub use runtime::{AgentSessionRuntime, RuntimeResumeOutput};

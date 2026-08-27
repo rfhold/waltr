@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, future::Future, pin::Pin};
 use futures_util::Stream;
 use serde_json::Value;
 
-use crate::{AgentTimelineEvent, Result, SessionId, TimelineCursor};
+use crate::{AgentTimelineEvent, Result, SessionId, SessionPauseLease, TimelineCursor};
 
 /// Boxed stream of cursor-assigned agent timeline events.
 pub type BoxAgentTimelineStream<'a> =
@@ -43,6 +43,67 @@ pub type SessionEventSinkFuture =
 pub trait SessionEventSink: Send + Sync {
     /// Deliver one event. Delivery failure never changes the source session operation.
     fn send(&self, event: SessionEvent) -> SessionEventSinkFuture;
+}
+
+/// Immutable provider-neutral facts for one durably terminal session run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRunCompletionSnapshot {
+    /// Completed session.
+    pub session_id: SessionId,
+    /// Stable identity for this process-local submitted run.
+    pub run_id: String,
+    /// Last durable timeline cursor written by the terminal run.
+    pub terminal_cursor: TimelineCursor,
+    /// Latest completed provider turn's full context usage, when reported.
+    pub context_tokens: Option<u64>,
+    /// Host-defined session purpose, when present.
+    pub purpose: Option<String>,
+    /// Effective configured provider key used by the completed run.
+    pub provider_key: String,
+    /// Effective configured model identity used by the completed run.
+    pub model_id: String,
+}
+
+/// Detached work started only after the coordinator accepts a claimed pause.
+pub type SessionCompletionWorkerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Bounded future preparing completion admission before any pause is claimed.
+pub type SessionCompletionPreparationFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<SessionCompletionPreparation, String>> + Send>>;
+
+/// Result of bounded completion preparation.
+pub enum SessionCompletionPreparation {
+    /// Continue ordinary queue draining.
+    Continue,
+    /// Atomically claim the barrier, then run this authoritative finalizer.
+    Claim(Box<dyn SessionCompletionAdmissionFinalizer>),
+}
+
+impl std::fmt::Debug for SessionCompletionPreparation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Continue => formatter.write_str("Continue"),
+            Self::Claim(_) => formatter.write_str("Claim(..)"),
+        }
+    }
+}
+
+/// Non-abortable future finalizing durable admission after an atomic pause claim.
+pub type SessionCompletionFinalizationFuture = Pin<
+    Box<dyn Future<Output = std::result::Result<SessionCompletionWorkerFuture, String>> + Send>,
+>;
+
+/// Host-owned authoritative admission performed only after the coordinator claims a pause.
+pub trait SessionCompletionAdmissionFinalizer: Send {
+    /// Complete durable admission and transfer the lease into detached work.
+    fn finalize(self: Box<Self>, lease: SessionPauseLease) -> SessionCompletionFinalizationFuture;
+}
+
+/// Host callback synchronously consulted before queued work drains after completion.
+pub trait SessionCompletionAdmissionHandler: Send + Sync {
+    /// Prepare optional admission without claiming or mutating coordinator ownership.
+    fn prepare(&self, snapshot: SessionRunCompletionSnapshot)
+    -> SessionCompletionPreparationFuture;
 }
 
 pub(super) fn user_message_event_id(session_id: &SessionId, journal_index: usize) -> String {
