@@ -1396,6 +1396,10 @@ type: ClientRoutineValueType,
  */
 required: boolean,
 /**
+ * Optional typed initial value supplied by the definition.
+ */
+defaultValue: ClientRoutineValue | null,
+/**
  * Optional minimum string length.
  */
 minimumStringLength: bigint | null,

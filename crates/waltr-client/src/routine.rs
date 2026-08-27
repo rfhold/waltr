@@ -119,6 +119,8 @@ pub struct ClientRoutineInputDefinition {
     pub r#type: ClientRoutineValueType,
     /// Whether the input is required.
     pub required: bool,
+    /// Optional typed initial value supplied by the definition.
+    pub default_value: Option<ClientRoutineValue>,
     /// Optional minimum string length.
     pub minimum_string_length: Option<u64>,
     /// Optional string pattern.

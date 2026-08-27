@@ -315,10 +315,30 @@ fn convert_definition(
                     "Routine definition has an empty or duplicate input",
                 ));
             }
+            let r#type = convert_value_type(input.r#type)?;
+            let default_value = input
+                .default_value
+                .map(|value| convert_value(Some(value)))
+                .transpose()?;
+            if default_value.as_ref().is_some_and(|value| {
+                !matches!(
+                    (r#type, value),
+                    (
+                        ClientRoutineValueType::String,
+                        ClientRoutineValue::String(_)
+                    ) | (
+                        ClientRoutineValueType::Boolean,
+                        ClientRoutineValue::Boolean(_)
+                    )
+                )
+            }) {
+                return Err(data_loss("Routine input default has the wrong type"));
+            }
             Ok(ClientRoutineInputDefinition {
                 name: input.name,
-                r#type: convert_value_type(input.r#type)?,
+                r#type,
                 required: input.required,
+                default_value,
                 minimum_string_length: input.minimum_string_length,
                 string_pattern: input.string_pattern,
             })
