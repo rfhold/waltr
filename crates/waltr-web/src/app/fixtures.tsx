@@ -211,7 +211,14 @@ function timelineEvent(sessionId: string, requestId: string, kind: 1 | 2, payloa
 }
 
 function timeline(event: TimelineEventView): SessionTimelineView {
-  return { events: [event], load: operationSnapshot("ready"), watch: operationSnapshot("opened") };
+  return {
+    events: [{ entryKind: "durable", identity: event.itemId, presentation: "durable", event }],
+    projectionRevision: null,
+    rawPageBoundary: null,
+    hasMore: false,
+    load: operationSnapshot("ready"),
+    watch: operationSnapshot("opened"),
+  };
 }
 
 function operationSnapshot(status: string): OperationSnapshot {

@@ -9,7 +9,8 @@ use super::{
     error::{agent_error_to_status, session_run_error_to_status},
     inference_settings::{resolve_inference_settings, resolve_inference_settings_for_create},
     timeline_convert::{
-        catchup_query, channel_matches, initial_query, query_from_proto, timeline_event_to_proto,
+        catchup_query, channel_matches, initial_query, projected_timeline_event_to_proto,
+        query_from_proto, timeline_event_to_proto, timeline_page_to_proto,
     },
 };
 use waltr::grpc::waltr::{
@@ -26,7 +27,8 @@ use waltr::grpc::waltr::{
         SessionTemplateOption as ProtoSessionTemplateOption, SessionTemplateOptions,
         SessionTemplateSearchError,
         SessionTemplateSearchTarget as ProtoSessionTemplateSearchTarget, SubmitUserMessageRequest,
-        SubmitUserMessageResponse, TimelineTruncation, UpdateSessionAgentRequest,
+        SubmitUserMessageResponse, TimelineProjectionMode as ProtoTimelineProjectionMode,
+        TimelineProjectionReset, TimelineTruncation, UpdateSessionAgentRequest,
         UpdateSessionAgentResponse, UpdateSessionInferenceSettingsRequest,
         UpdateSessionInferenceSettingsResponse, WatchSessionsRequest, WatchSessionsResponse,
         WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest, WipeSessionsResponse,
@@ -43,7 +45,9 @@ use waltr_agent::{
     ResolvedAgent, RunConflictPolicy, SessionCoordinator, SessionCreateRequest, SessionId,
     SessionListEvent, SessionListUpdate, SessionStore, SessionSummary, SessionTemplateKind,
     SessionTemplateOption, SessionTemplateSearchRequest, SessionTemplateSearchTarget,
-    SessionTimelineEvent, TimelineCursor,
+    SessionTimelineEvent, SessionTimelineMode, SessionTimelinePresentation,
+    SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    SessionTimelineProjectionUpdateEvent, TimelineCursor,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_stream::{Stream, StreamExt as _};
@@ -686,20 +690,38 @@ where
     ) -> Result<Response<GetTimelineResponse>, Status> {
         let request = request.into_inner();
         let session_id = required_session_id(&request.session_id)?;
-        self.sessions
-            .load(&session_id)
+        let mode = timeline_mode_from_proto(request.projection_mode)?;
+        let page = self
+            .sessions
+            .timeline_projection(&session_id, mode, query_from_proto(request.query))
             .await
             .map_err(agent_error_to_status)?;
-        let events = self
-            .sessions
-            .timeline(&session_id, query_from_proto(request.query))
-            .await
-            .map_err(agent_error_to_status)?
-            .into_iter()
-            .map(timeline_event_to_proto)
-            .collect::<Result<Vec<_>, _>>()?;
+        let (projected_events, projection) = timeline_page_to_proto(page)?;
+        let (events, projected_events) = match mode {
+            SessionTimelineMode::Raw => (
+                projected_events
+                    .into_iter()
+                    .map(|event| match event.event {
+                        Some(
+                            waltr::grpc::waltr::session::v1::projected_timeline_event::Event::Durable(
+                                event,
+                            ),
+                        ) => Ok(event),
+                        _ => Err(Status::internal(
+                            "raw timeline projection returned a synthetic event",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                Vec::new(),
+            ),
+            SessionTimelineMode::Effective => (Vec::new(), projected_events),
+        };
 
-        Ok(Response::new(GetTimelineResponse { events }))
+        Ok(Response::new(GetTimelineResponse {
+            events,
+            projected_events,
+            projection: Some(projection),
+        }))
     }
 
     #[tracing::instrument(
@@ -713,11 +735,15 @@ where
     ) -> Result<Response<Self::WatchTimelineStream>, Status> {
         let request = request.into_inner();
         let session_id = required_session_id(&request.session_id)?;
+        let mode = timeline_mode_from_proto(request.projection_mode)?;
         tracing::Span::current().record("session_id", session_id.as_str());
         self.sessions
             .load(&session_id)
             .await
             .map_err(agent_error_to_status)?;
+        if mode == SessionTimelineMode::Effective {
+            return effective_timeline_watch(&self.sessions, session_id, request).await;
+        }
         let subscription = self.sessions.watch_timeline(session_id.clone());
         let initial_sequence = subscription.initial_sequence();
         let channels = request.channels.clone();
@@ -1032,6 +1058,141 @@ fn required_session_id(value: &str) -> Result<SessionId, Status> {
     } else {
         Ok(SessionId::new(value.to_owned()))
     }
+}
+
+fn timeline_mode_from_proto(value: i32) -> Result<SessionTimelineMode, Status> {
+    match ProtoTimelineProjectionMode::try_from(value) {
+        Ok(ProtoTimelineProjectionMode::Unspecified | ProtoTimelineProjectionMode::Raw) => {
+            Ok(SessionTimelineMode::Raw)
+        }
+        Ok(ProtoTimelineProjectionMode::Effective) => Ok(SessionTimelineMode::Effective),
+        Err(_) => Err(Status::invalid_argument(
+            "timeline projection mode is invalid",
+        )),
+    }
+}
+
+async fn effective_timeline_watch<S>(
+    sessions: &SessionCoordinator<S>,
+    session_id: SessionId,
+    request: WatchTimelineRequest,
+) -> Result<
+    Response<Pin<Box<dyn Stream<Item = Result<WatchTimelineResponse, Status>> + Send>>>,
+    Status,
+>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+{
+    const REQUERY_LIMIT: usize = 1000;
+
+    // Subscribe before querying so mutations racing initial projection cannot be missed.
+    let subscription = sessions.watch_timeline_projection(session_id.clone());
+    let initial_sequence = subscription.initial_sequence();
+    let query = if let Some(after_cursor) = request.after_cursor {
+        catchup_query(Some(after_cursor), REQUERY_LIMIT, &request.channels)
+    } else {
+        initial_query(request.initial_limit.unwrap_or(100), &request.channels)
+    };
+    let page = sessions
+        .timeline_projection(&session_id, SessionTimelineMode::Effective, query.clone())
+        .await
+        .map_err(agent_error_to_status)?;
+    let revision = page.projection_revision;
+    let highest_cursor = projection_highest_cursor(&page);
+    let (events, projection) = timeline_page_to_proto(page)?;
+    let initial = Ok(WatchTimelineResponse {
+        sequence: initial_sequence,
+        update: Some(watch_timeline_response::Update::ProjectionReset(
+            TimelineProjectionReset {
+                events,
+                projection: Some(projection),
+            },
+        )),
+    });
+
+    let sessions = sessions.clone();
+    let channels = request.channels;
+    let live = futures_util::stream::unfold(
+        (subscription, revision, highest_cursor),
+        move |(mut subscription, mut revision, mut highest_cursor)| {
+            let sessions = sessions.clone();
+            let session_id = session_id.clone();
+            let query = query.clone();
+            let channels = channels.clone();
+            async move {
+                loop {
+                    let update = subscription.next().await?;
+                    let response = match update.event {
+                        SessionTimelineProjectionUpdateEvent::Event(event) => {
+                            let cursor = event.cursor.get();
+                            if cursor <= highest_cursor || !channel_matches(&event, &channels) {
+                                continue;
+                            }
+                            highest_cursor = cursor;
+                            projected_timeline_event_to_proto(SessionTimelineProjectionEvent {
+                                event: SessionTimelineProjectedEvent::Durable(event),
+                                presentation: SessionTimelinePresentation::Durable,
+                            })
+                            .map(|event| WatchTimelineResponse {
+                                sequence: update.sequence,
+                                update: Some(watch_timeline_response::Update::ProjectedEvent(
+                                    event,
+                                )),
+                            })
+                        }
+                        SessionTimelineProjectionUpdateEvent::Invalidated {
+                            projection_revision,
+                            ..
+                        } if projection_revision <= revision => continue,
+                        SessionTimelineProjectionUpdateEvent::Invalidated { .. }
+                        | SessionTimelineProjectionUpdateEvent::ResetRequired { .. } => {
+                            match sessions
+                                .timeline_projection(
+                                    &session_id,
+                                    SessionTimelineMode::Effective,
+                                    query.clone(),
+                                )
+                                .await
+                                .map_err(agent_error_to_status)
+                            {
+                                Ok(page) => {
+                                    revision = page.projection_revision;
+                                    highest_cursor = projection_highest_cursor(&page);
+                                    timeline_page_to_proto(page).map(|(events, projection)| {
+                                        WatchTimelineResponse {
+                                            sequence: update.sequence,
+                                            update: Some(
+                                                watch_timeline_response::Update::ProjectionReset(
+                                                    TimelineProjectionReset {
+                                                        events,
+                                                        projection: Some(projection),
+                                                    },
+                                                ),
+                                            ),
+                                        }
+                                    })
+                                }
+                                Err(status) => Err(status),
+                            }
+                        }
+                    };
+                    return Some((response, (subscription, revision, highest_cursor)));
+                }
+            }
+        },
+    );
+    Ok(Response::new(Box::pin(
+        tokio_stream::once(initial).chain(live),
+    )))
+}
+
+fn projection_highest_cursor(page: &waltr_agent::SessionTimelinePage) -> u64 {
+    page.events
+        .iter()
+        .map(SessionTimelineProjectionEvent::cursor)
+        .chain(page.raw_page_boundary)
+        .max()
+        .map_or(0, TimelineCursor::get)
 }
 
 fn session_load_error_to_status(error: waltr_agent::LlmError) -> Status {

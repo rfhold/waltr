@@ -345,10 +345,10 @@ fn routine_invocation_snapshot(
         );
         snapshot.routines.history.watch.status = "received";
         snapshot.routines.history.recent = vec![detail.summary.clone()];
-        snapshot.routines.session_histories.insert(
-            session_id.to_owned(),
-            snapshot.routines.history.clone(),
-        );
+        snapshot
+            .routines
+            .session_histories
+            .insert(session_id.to_owned(), snapshot.routines.history.clone());
         snapshot.routines.details.insert(
             invocation_id,
             RoutineDetailSnapshot {
@@ -432,7 +432,10 @@ fn session_commands_ctrl_p_is_gated_to_unowned_session_detail_and_old_chord_is_r
     let now = Instant::now();
     let mut landing = App::new();
     drop(landing.handle_event(&AppEvent::Client(Box::new(ready_snapshot())), now));
-    assert_eq!(landing.handle_event(&ctrl_p_press(), now), AppAction::Continue);
+    assert_eq!(
+        landing.handle_event(&ctrl_p_press(), now),
+        AppAction::Continue
+    );
 
     let snapshot = routine_catalog_snapshot("source", "ready", Vec::new(), None);
     let mut list = open_sessions_app_with(snapshot.clone());
@@ -448,12 +451,18 @@ fn session_commands_ctrl_p_is_gated_to_unowned_session_detail_and_old_chord_is_r
 
     drop(detail.handle_event(&escape_press(), now));
     drop(detail.handle_event(&ctrl_x_press(), now));
-    assert_eq!(detail.handle_event(&char_press('r'), now), AppAction::Continue);
+    assert_eq!(
+        detail.handle_event(&char_press('r'), now),
+        AppAction::Continue
+    );
     assert!(!render_app(&detail).contains("Session commands"));
 
     drop(detail.handle_event(&ctrl_x_press(), now));
     drop(detail.handle_event(&char_press('p'), now));
-    assert_eq!(detail.handle_event(&ctrl_p_press(), now), AppAction::Continue);
+    assert_eq!(
+        detail.handle_event(&ctrl_p_press(), now),
+        AppAction::Continue
+    );
     assert!(!render_app(&detail).contains("Session commands"));
 }
 
@@ -728,7 +737,10 @@ fn session_commands_pending_stale_failure_retry_and_result_are_isolated() {
     assert_eq!(app.sessions_section().detail_session_id(), Some("source"));
     let rendered = render_app(&app);
     assert!(rendered.contains("Command accepted"), "{rendered}");
-    assert!(rendered.contains("Invocation server-invocation"), "{rendered}");
+    assert!(
+        rendered.contains("Invocation server-invocation"),
+        "{rendered}"
+    );
     assert_eq!(
         app.handle_event(&escape_press(), now),
         AppAction::ClientCommand(ClientCommand::ReleaseRoutineDefinitionWatchInterest)
@@ -1520,7 +1532,13 @@ fn sessions_detail_renders_timeline_from_snapshot() {
                     "done",
                     false,
                 ),
-            ],
+            ]
+            .into_iter()
+            .map(durable_timeline_entry)
+            .collect(),
+            projection_revision: Some(4),
+            raw_page_boundary: Some(1),
+            has_more: true,
             load: idle_operation(),
             watch: OperationSnapshot {
                 status: "received",
@@ -1542,6 +1560,66 @@ fn sessions_detail_renders_timeline_from_snapshot() {
     assert!(rendered.contains("Show cwd"));
     assert!(rendered.contains("$ pwd"));
     assert!(rendered.contains("done"));
+}
+
+#[test]
+fn sessions_detail_renders_projected_replacement_without_source_actions() {
+    let mut snapshot = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![
+            timeline_text_event(12, "chat", "assistant_text", "later assistant"),
+            timeline_text_event(13, "chat", "user_text", "later durable"),
+        ],
+    );
+    let timeline = snapshot
+        .sessions
+        .timelines
+        .get_mut("chat")
+        .expect("timeline");
+    timeline.events.insert(
+        0,
+        mask_replacement_entry(
+            "mask:stable",
+            11,
+            "chat",
+            1,
+            "**Projected summary** with `Markdown`",
+        ),
+    );
+    let mut section = open_detail_section(&snapshot);
+    let area = Rect::new(0, 0, 100, 30);
+
+    let rendered = render_section(&section, &snapshot, area);
+    assert!(rendered.contains("Projected summary"), "{rendered}");
+    assert!(rendered.contains("Markdown"), "{rendered}");
+    assert!(rendered.contains("later assistant"), "{rendered}");
+    assert!(rendered.contains("later durable"), "{rendered}");
+    assert!(!rendered.contains("hidden source prefix"), "{rendered}");
+    assert_eq!(THEME.mask_replacement(), Color::Rgb(45, 212, 191));
+
+    assert_eq!(
+        section.handle_detail_click(Some(&snapshot), area, 1, 0),
+        SectionAction::Continue
+    );
+    assert!(!render_section(&section, &snapshot, area).contains("actions"));
+
+    let mut durable_section = None;
+    for row in 2..15 {
+        let mut candidate = open_detail_section(&snapshot);
+        drop(candidate.handle_detail_click(Some(&snapshot), area, 1, row));
+        if render_section(&candidate, &snapshot, area).contains("Message actions") {
+            durable_section = Some(candidate);
+            break;
+        }
+    }
+    let mut section = durable_section.expect("later durable user message remains actionable");
+    assert_eq!(
+        section.handle_key(KeyEvent::from(KeyCode::Enter), Some(&snapshot), Some(area)),
+        SectionAction::ClientCommand(ClientCommand::ContinueSessionFromCursor {
+            session_id: "chat".to_owned(),
+            cursor: 13,
+        })
+    );
 }
 
 #[test]
@@ -1836,7 +1914,10 @@ fn sessions_detail_context_is_right_on_wide_and_capped_above_composer_on_narrow(
         "{wide}"
     );
     assert!(wide.contains("Cost  $0.012345"), "{wide}");
-    assert!(normalized_wide.contains("awaiting external input"), "{wide}");
+    assert!(
+        normalized_wide.contains("awaiting external input"),
+        "{wide}"
+    );
     let composer_metadata = wide
         .lines()
         .find(|line| line.contains("agent default"))
@@ -1856,7 +1937,12 @@ fn sessions_detail_context_is_right_on_wide_and_capped_above_composer_on_narrow(
         .position(|line| line.contains("type a message"))
         .expect("narrow composer");
     assert!(context_row < composer_row, "{narrow}");
-    assert!(lines[context_row].find("Session Context").unwrap_or_default() < 10);
+    assert!(
+        lines[context_row]
+            .find("Session Context")
+            .unwrap_or_default()
+            < 10
+    );
     assert!(narrow.contains("Subtasks"), "{narrow}");
     assert!(narrow.contains("Routines"), "{narrow}");
 }
@@ -1878,7 +1964,10 @@ fn sessions_detail_context_uses_authoritative_scoped_routine_history_in_snapshot
     let mut indirect = session_view("indirect", 1);
     indirect.associations.task_parent_session_id = Some("described".to_owned());
     indirect.associations.task_description = Some("Must not render".to_owned());
-    snapshot.sessions.current.extend([described, fallback, indirect]);
+    snapshot
+        .sessions
+        .current
+        .extend([described, fallback, indirect]);
 
     let mut newest = routine_detail(
         "source-new",
@@ -1919,7 +2008,9 @@ fn sessions_detail_context_uses_authoritative_scoped_routine_history_in_snapshot
     assert!(!rendered.contains("Must not render"), "{rendered}");
     assert!(rendered.contains("server-row [unrelated]"), "{rendered}");
     assert!(rendered.contains("duplicate"), "{rendered}");
-    let newest_index = rendered.find("newest [source-new]").expect("source Routine");
+    let newest_index = rendered
+        .find("newest [source-new]")
+        .expect("source Routine");
     let helper_index = rendered
         .find("helper-routine [helper]")
         .expect("helper Routine");
@@ -2665,6 +2756,39 @@ fn sessions_detail_page_up_requests_older_timeline() {
 }
 
 #[test]
+fn sessions_detail_page_up_uses_projected_raw_boundary_not_synthetic_cursor() {
+    let mut snapshot = watched_session_with_timeline(
+        session_view("chat", 1),
+        vec![timeline_text_event(50, "chat", "assistant_text", "later")],
+    );
+    let timeline = snapshot
+        .sessions
+        .timelines
+        .get_mut("chat")
+        .expect("timeline");
+    timeline.events.insert(
+        0,
+        mask_replacement_entry("mask:page", 5, "chat", 1, "replacement"),
+    );
+    timeline.raw_page_boundary = Some(42);
+    timeline.has_more = true;
+    let mut app = open_sessions_app_with(snapshot);
+    let now = Instant::now();
+    drop(app.handle_event(&right_press(), now));
+
+    assert_eq!(
+        app.handle_event(&page_up_press(), now),
+        AppAction::ClientCommand(ClientCommand::RequestSessionTimeline {
+            session_id: "chat".to_owned(),
+            direction: ClientTimelineDirection::Backward,
+            cursor: Some(42),
+            limit: 64,
+            channels: timeline_channels(),
+        })
+    );
+}
+
+#[test]
 fn sessions_detail_wheel_up_requests_older_timeline_at_top() {
     let mut app = open_sessions_app_with(watched_session_with_timeline(
         session_view("chat", 1),
@@ -2979,6 +3103,7 @@ fn sessions_detail_permission_prompt_allows_once() {
     let rendered = render_app(&app);
     assert!(rendered.contains("Permission required"));
     assert!(rendered.contains("Allow once"));
+    assert!(rendered.contains("Deny and interrupt"));
     assert!(!rendered.contains("type a message"));
     assert!(!rendered.contains("provider none"));
 
@@ -3062,7 +3187,7 @@ fn explicit_logout_clears_prompt_draft_and_focus() {
 }
 
 #[test]
-fn sessions_detail_permission_prompt_deny_interrupts() {
+fn sessions_detail_permission_prompt_deny_interrupts_without_standalone_capability() {
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
     let mut app = open_sessions_app_with(watched_session_with_timeline(
         session_view("chat", 1),
@@ -3076,6 +3201,9 @@ fn sessions_detail_permission_prompt_deny_interrupts() {
         app.handle_event(&right_press(), now),
         expected_register_timeline_command("chat")
     );
+    let rendered = render_app(&app);
+    assert!(rendered.contains("Deny and interrupt"), "{rendered}");
+    assert!(!rendered.contains("Esc Esc interrupt"), "{rendered}");
     assert_eq!(
         app.handle_event(&char_press('x'), now),
         AppAction::ClientCommands(vec![
@@ -3093,7 +3221,7 @@ fn sessions_detail_permission_prompt_deny_interrupts() {
 }
 
 #[test]
-fn sessions_detail_permission_prompt_deny_interrupt_includes_message() {
+fn sessions_detail_permission_prompt_deny_interrupt_enter_works_without_standalone_capability() {
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
     let mut app = open_sessions_app_with(watched_session_with_timeline(
         session_view("chat", 1),

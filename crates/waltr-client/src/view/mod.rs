@@ -17,10 +17,11 @@ pub use config::{
 };
 pub use session::{
     ExternalRequestView, InferenceProviderSettingsView, InferenceSettingsMatchView,
-    InferenceSettingsView, SelectableAgentView, SessionAssociationsView, SessionMetricsView,
-    SessionPhaseView, SessionStatusView, SessionSuspensionKindView, SessionTimelineView,
-    SessionView, TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
-    TimestampView,
+    InferenceSettingsView, ProjectedTimelineEntryView, SelectableAgentView,
+    SessionAssociationsView, SessionMetricsView, SessionPhaseView, SessionStatusView,
+    SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
+    TimelineStatusView, TimestampView,
 };
 
 #[cfg(test)]
@@ -241,6 +242,9 @@ mod tests {
             ExternalRequestView::decl(),
             TimelineContentView::decl(),
             TimelineEventView::decl(),
+            TimelinePresentationView::decl(),
+            SyntheticTimelineEventView::decl(),
+            ProjectedTimelineEntryView::decl(),
             SessionTimelineView::decl(),
             SessionTemplateOptionView::decl(),
             SessionTemplateSearchSnapshot::decl(),

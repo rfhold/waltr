@@ -294,7 +294,13 @@ impl SessionsSection {
 
         if let Some(status) = session_important_status(&session, timeline, prompt.as_ref()) {
             let error = timeline
-                .and_then(|timeline| timeline.watch.error.as_ref())
+                .and_then(|timeline| {
+                    timeline
+                        .watch
+                        .error
+                        .as_ref()
+                        .or(timeline.load.error.as_ref())
+                })
                 .is_some()
                 || session.status.phase == SessionPhaseView::Failed;
             return Some(SessionDetailFooterStatus {
@@ -1494,7 +1500,10 @@ impl SessionsSection {
         if timeline.load.status == "loading" {
             return SectionAction::Continue;
         }
-        let Some(cursor) = timeline.events.first().map(|event| event.cursor) else {
+        if !timeline.has_more {
+            return SectionAction::Continue;
+        }
+        let Some(cursor) = timeline.raw_page_boundary else {
             return SectionAction::Continue;
         };
 
@@ -2584,7 +2593,13 @@ fn session_important_status(
     timeline: Option<&SessionTimelineView>,
     prompt: Option<&ExternalPromptModel>,
 ) -> Option<String> {
-    if let Some(error) = timeline.and_then(|timeline| timeline.watch.error.as_ref()) {
+    if let Some(error) = timeline.and_then(|timeline| {
+        timeline
+            .watch
+            .error
+            .as_ref()
+            .or(timeline.load.error.as_ref())
+    }) {
         return Some(error.clone());
     }
 

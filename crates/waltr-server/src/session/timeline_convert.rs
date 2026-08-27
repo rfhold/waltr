@@ -1,14 +1,19 @@
 use waltr::grpc::waltr::session::v1::{
     ContentRefTimelineContent, EmptyTimelineContent, ExternalRequestTimelineContent,
-    JsonTimelineContent, TextDeltaTimelineContent, TextSnapshotTimelineContent,
-    TimelineContent as ProtoTimelineContent, TimelineDirection as ProtoTimelineDirection,
-    TimelineEvent as ProtoTimelineEvent, TimelineEventKind as ProtoTimelineEventKind,
+    JsonTimelineContent, ProjectedTimelineEvent as ProtoProjectedTimelineEvent,
+    SyntheticTimelineEvent as ProtoSyntheticTimelineEvent, TextDeltaTimelineContent,
+    TextSnapshotTimelineContent, TimelineContent as ProtoTimelineContent,
+    TimelineDirection as ProtoTimelineDirection, TimelineEvent as ProtoTimelineEvent,
+    TimelineEventKind as ProtoTimelineEventKind, TimelinePresentation as ProtoTimelinePresentation,
+    TimelineProjectionMetadata as ProtoTimelineProjectionMetadata,
     TimelineQuery as ProtoTimelineQuery, TimelineStatus as ProtoTimelineStatus,
-    ToolCallTimelineContent, ToolResultTimelineContent, timeline_content,
+    ToolCallTimelineContent, ToolResultTimelineContent, projected_timeline_event, timeline_content,
 };
 use waltr_agent::{
-    AgentTimelineEvent, TimelineChannel, TimelineContent, TimelineCursor,
-    TimelineDirection as AgentTimelineDirection, TimelineEventKind, TimelineQuery, TimelineStatus,
+    AgentTimelineEvent, SessionSyntheticTimelineEvent, SessionTimelinePage,
+    SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,
+    TimelineChannel, TimelineContent, TimelineCursor, TimelineDirection as AgentTimelineDirection,
+    TimelineEventKind, TimelineQuery, TimelineStatus,
 };
 use tonic::Status;
 
@@ -84,6 +89,67 @@ pub(super) fn timeline_event_to_proto(
             .map(|status| timeline_status_to_proto(status) as i32),
         metadata_json: serde_json::to_string(&event.metadata)
             .map_err(|error| Status::internal(error.to_string()))?,
+    })
+}
+
+pub(super) fn timeline_page_to_proto(
+    page: SessionTimelinePage,
+) -> Result<
+    (
+        Vec<ProtoProjectedTimelineEvent>,
+        ProtoTimelineProjectionMetadata,
+    ),
+    Status,
+> {
+    let events = page
+        .events
+        .into_iter()
+        .map(projected_timeline_event_to_proto)
+        .collect::<Result<_, _>>()?;
+    let metadata = ProtoTimelineProjectionMetadata {
+        revision: page.projection_revision.get(),
+        raw_page_boundary: page.raw_page_boundary.map(TimelineCursor::get),
+        has_more: page.has_more,
+    };
+    Ok((events, metadata))
+}
+
+pub(super) fn projected_timeline_event_to_proto(
+    projected: SessionTimelineProjectionEvent,
+) -> Result<ProtoProjectedTimelineEvent, Status> {
+    let event = match projected.event {
+        SessionTimelineProjectedEvent::Durable(event) => {
+            projected_timeline_event::Event::Durable(timeline_event_to_proto(event)?)
+        }
+        SessionTimelineProjectedEvent::Synthetic(event) => {
+            projected_timeline_event::Event::Synthetic(synthetic_timeline_event_to_proto(event)?)
+        }
+    };
+    let (presentation, mask_id) = match projected.presentation {
+        SessionTimelinePresentation::Durable => (ProtoTimelinePresentation::Durable, None),
+        SessionTimelinePresentation::MaskReplacement { mask_id } => (
+            ProtoTimelinePresentation::MaskReplacement,
+            Some(mask_id.as_str().to_owned()),
+        ),
+    };
+    Ok(ProtoProjectedTimelineEvent {
+        event: Some(event),
+        presentation: presentation as i32,
+        mask_id,
+    })
+}
+
+fn synthetic_timeline_event_to_proto(
+    event: SessionSyntheticTimelineEvent,
+) -> Result<ProtoSyntheticTimelineEvent, Status> {
+    Ok(ProtoSyntheticTimelineEvent {
+        cursor: event.cursor.get(),
+        session_id: event.session_id.as_str().to_owned(),
+        turn: event.turn,
+        kind: timeline_kind_to_proto(event.kind) as i32,
+        channel: event.channel.as_str().to_owned(),
+        content: Some(timeline_content_to_proto(event.content)?),
+        status: timeline_status_to_proto(event.status) as i32,
     })
 }
 

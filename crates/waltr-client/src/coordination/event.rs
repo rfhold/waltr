@@ -7,7 +7,7 @@ use crate::{
     ClientRoutineInvocationWatchUpdate, ClientRoutineValidationFailure, ClientRoutineValue,
     GenericAuthAttempt, GenericAuthAttemptStatus, InferenceSettingsRequest, OperationKey, Provider,
     ResourceCatalog, RollbackTarget, SelectableAgent, SessionSummary, SessionTemplateKind,
-    SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus, TimelineEvent, TimelineQuery,
+    SessionTemplateOption, SessionTemplateSearchTarget, SystemStatus, TimelineQuery,
     TimelineWatchKey,
 };
 
@@ -632,18 +632,32 @@ pub enum SessionEvent {
         session_id: String,
         /// Timeline query to submit.
         query: Option<TimelineQuery>,
+        /// Projection mode to request.
+        projection_mode: crate::SessionTimelineProjectionMode,
     },
     /// A session timeline page loaded successfully.
     TimelineLoaded {
         /// Session id whose timeline loaded.
         session_id: String,
-        /// Timeline events returned by the server.
-        events: Vec<TimelineEvent>,
+        /// Reducer-owned request identity.
+        request_id: u64,
+        /// Projection mode cached when the request started.
+        baseline_mode: crate::SessionTimelineProjectionMode,
+        /// Projection revision cached when the request started.
+        baseline_revision: Option<u64>,
+        /// Timeline page returned by the server.
+        page: crate::SessionTimelinePage,
     },
     /// A session timeline page failed to load.
     TimelineLoadFailed {
         /// Session id whose timeline failed to load.
         session_id: String,
+        /// Reducer-owned request identity.
+        request_id: u64,
+        /// Projection mode cached when the request started.
+        baseline_mode: crate::SessionTimelineProjectionMode,
+        /// Projection revision cached when the request started.
+        baseline_revision: Option<u64>,
         /// Failure returned by the load effect.
         error: ClientError,
     },
@@ -692,6 +706,8 @@ pub enum SessionEvent {
         channels: Vec<String>,
         /// Optional initial history batch size.
         initial_limit: Option<u32>,
+        /// Projection mode to request.
+        projection_mode: crate::SessionTimelineProjectionMode,
     },
     /// A caller released interest in timeline updates for one session.
     TimelineWatchInterestReleased {
@@ -1142,8 +1158,16 @@ pub enum SessionEffect {
     GetTimeline {
         /// Session id whose timeline should load.
         session_id: String,
+        /// Reducer-owned request identity.
+        request_id: u64,
+        /// Projection mode cached when the request started.
+        baseline_mode: crate::SessionTimelineProjectionMode,
+        /// Projection revision cached when the request started.
+        baseline_revision: Option<u64>,
         /// Timeline query to submit.
         query: Option<TimelineQuery>,
+        /// Projection mode to request.
+        projection_mode: crate::SessionTimelineProjectionMode,
     },
     /// Search templates visible to one session.
     SearchTemplates {

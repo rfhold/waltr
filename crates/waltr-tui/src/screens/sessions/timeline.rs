@@ -3,8 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use waltr_client::{
-    ClientCommand, ExternalRequestView, SessionTimelineView, TimelineContentView,
-    TimelineEventKindView, TimelineEventView, TimelineStatusView,
+    ClientCommand, ExternalRequestView, ProjectedTimelineEntryView, SessionTimelineView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
+    TimelineStatusView,
 };
 use ratatui::{
     style::{Modifier, Style},
@@ -39,6 +40,8 @@ enum TimelineItemModel {
         label: &'static str,
         text: String,
         status: Option<TimelineStatusView>,
+        mask_replacement: bool,
+        durable_actions: bool,
     },
     Tool {
         id: String,
@@ -212,30 +215,35 @@ pub(super) fn timeline_click_target_at_row(
     row: usize,
     expanded_shell_tools: &BTreeSet<String>,
 ) -> Option<TimelineClickTarget> {
-    timeline_item_at_row(timeline, width, row, expanded_shell_tools).map(|item| match item {
+    timeline_item_at_row(timeline, width, row, expanded_shell_tools).and_then(|item| match item {
         TimelineItemModel::Text {
             cursor,
             text,
             label: "user",
+            durable_actions: true,
             ..
-        } => TimelineClickTarget::UserMessage { cursor, text },
+        } => Some(TimelineClickTarget::UserMessage { cursor, text }),
         TimelineItemModel::External {
             open_cursor,
             request,
             resolved: true,
             ..
-        } => TimelineClickTarget::ExternalRequest {
+        } => Some(TimelineClickTarget::ExternalRequest {
             cursor: open_cursor,
             label: request.as_ref().map_or_else(
                 || "external request".to_owned(),
                 |request| external_request_kind_label(request.kind).to_owned(),
             ),
-        },
+        }),
+        TimelineItemModel::Text {
+            durable_actions: false,
+            ..
+        } => None,
         TimelineItemModel::Text { turn, .. }
         | TimelineItemModel::Tool { turn, .. }
         | TimelineItemModel::External { turn, .. }
         | TimelineItemModel::Metrics { turn, .. }
-        | TimelineItemModel::Event { turn, .. } => TimelineClickTarget::Turn { turn },
+        | TimelineItemModel::Event { turn, .. } => Some(TimelineClickTarget::Turn { turn }),
     })
 }
 
@@ -282,7 +290,8 @@ pub(super) fn latest_context_tokens(timeline: Option<&SessionTimelineView>) -> u
         .unwrap_or_default()
 }
 
-fn context_tokens_from_metrics_event(event: &TimelineEventView) -> Option<u64> {
+fn context_tokens_from_metrics_event(entry: &ProjectedTimelineEntryView) -> Option<u64> {
+    let event = entry.durable_event()?;
     if event.channel.as_deref() != Some("metrics") {
         return None;
     }
@@ -313,11 +322,31 @@ fn context_tokens_from_metrics_event(event: &TimelineEventView) -> Option<u64> {
     Some(input + output)
 }
 
-fn timeline_items(events: &[TimelineEventView]) -> Vec<TimelineItemModel> {
+fn timeline_items(events: &[ProjectedTimelineEntryView]) -> Vec<TimelineItemModel> {
     let mut items = Vec::new();
     let mut tool_id_by_item_id = BTreeMap::new();
 
-    for event in events {
+    for entry in events {
+        let ProjectedTimelineEntryView::Durable { event, .. } = entry else {
+            if let ProjectedTimelineEntryView::Synthetic {
+                identity,
+                presentation: TimelinePresentationView::MaskReplacement,
+                event,
+            } = entry
+            {
+                items.push(TimelineItemModel::Text {
+                    item_id: identity.clone(),
+                    cursor: event.ordering_cursor,
+                    turn: event.turn,
+                    label: "user",
+                    text: event_text_content(&event.content),
+                    status: Some(event.status),
+                    mask_replacement: true,
+                    durable_actions: false,
+                });
+            }
+            continue;
+        };
         match event.channel.as_deref() {
             Some("user_text" | "assistant_text" | "thinking") => {
                 upsert_text_item(&mut items, event);
@@ -395,11 +424,17 @@ fn upsert_text_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEventVie
         turn,
         text,
         status,
+        mask_replacement,
+        durable_actions,
         ..
     }) = items.iter_mut().find(|item| {
         matches!(
             item,
-            TimelineItemModel::Text { item_id, .. } if item_id == &event.item_id
+            TimelineItemModel::Text {
+                item_id,
+                durable_actions: true,
+                ..
+            } if item_id == &event.item_id
         )
     }) {
         *cursor = event.cursor;
@@ -409,6 +444,8 @@ fn upsert_text_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEventVie
             _ => text.push_str(&content),
         }
         *status = event.status;
+        *mask_replacement = false;
+        *durable_actions = true;
         return;
     }
 
@@ -419,6 +456,8 @@ fn upsert_text_item(items: &mut Vec<TimelineItemModel>, event: &TimelineEventVie
         label,
         text: content,
         status: event.status,
+        mask_replacement: false,
+        durable_actions: true,
     });
 }
 
@@ -682,8 +721,9 @@ fn append_timeline_item_lines(
             label,
             text,
             status,
+            mask_replacement,
             ..
-        } => append_text_item_lines(lines, label, &text, status, width),
+        } => append_text_item_lines(lines, label, &text, status, width, mask_replacement),
         TimelineItemModel::Tool {
             id,
             cursor: _,
@@ -746,11 +786,16 @@ fn append_text_item_lines(
     text: &str,
     status: Option<TimelineStatusView>,
     width: Option<u16>,
+    mask_replacement: bool,
 ) {
     match label {
-        "user" => append_markdown_text_lines(lines, text, MarkdownTone::User, width),
-        "assistant" => append_markdown_text_lines(lines, text, MarkdownTone::Assistant, width),
-        "thinking" => append_markdown_text_lines(lines, text, MarkdownTone::Thinking, width),
+        "user" => {
+            append_markdown_text_lines(lines, text, MarkdownTone::User, width, mask_replacement)
+        }
+        "assistant" => {
+            append_markdown_text_lines(lines, text, MarkdownTone::Assistant, width, false)
+        }
+        "thinking" => append_markdown_text_lines(lines, text, MarkdownTone::Thinking, width, false),
         _ => {
             lines.push(label_line(label, status));
             append_indented_text_lines(lines, text, THEME.text_style());
@@ -763,9 +808,10 @@ fn append_markdown_text_lines(
     text: &str,
     tone: MarkdownTone,
     width: Option<u16>,
+    mask_replacement: bool,
 ) {
     if has_template_markers(text) {
-        append_template_text_lines(lines, text, tone, width);
+        append_template_text_lines(lines, text, tone, width, mask_replacement);
         return;
     }
 
@@ -794,7 +840,7 @@ fn append_markdown_text_lines(
     };
     let rendered = markdown::render_markdown(text, options);
     if tone == MarkdownTone::User {
-        append_user_message_lines(lines, rendered, width);
+        append_user_message_lines(lines, rendered, width, mask_replacement);
     } else {
         lines.extend(rendered);
     }
@@ -805,11 +851,12 @@ fn append_template_text_lines(
     text: &str,
     tone: MarkdownTone,
     width: Option<u16>,
+    mask_replacement: bool,
 ) {
     let rendered = template_text_lines(text, tone);
 
     if tone == MarkdownTone::User {
-        append_user_message_lines(lines, rendered, width);
+        append_user_message_lines(lines, rendered, width, mask_replacement);
     } else {
         lines.extend(rendered);
     }
@@ -872,18 +919,29 @@ fn append_user_message_lines(
     lines: &mut Vec<Line<'static>>,
     rendered: Vec<Line<'static>>,
     width: Option<u16>,
+    mask_replacement: bool,
 ) {
-    lines.push(user_message_line(Vec::new(), width));
+    lines.push(user_message_line(Vec::new(), width, mask_replacement));
     for line in rendered {
-        let mut spans = vec![accent_border_span(), Span::styled("  ", panel_style())];
+        let mut spans = vec![
+            accent_border_span(mask_replacement),
+            Span::styled("  ", panel_style()),
+        ];
         spans.extend(line.spans.into_iter().map(span_with_panel_bg));
         lines.push(user_message_line_with_prefix(spans, width));
     }
-    lines.push(user_message_line(Vec::new(), width));
+    lines.push(user_message_line(Vec::new(), width, mask_replacement));
 }
 
-fn user_message_line(mut spans: Vec<Span<'static>>, width: Option<u16>) -> Line<'static> {
-    let mut line_spans = vec![accent_border_span(), Span::styled("  ", panel_style())];
+fn user_message_line(
+    mut spans: Vec<Span<'static>>,
+    width: Option<u16>,
+    mask_replacement: bool,
+) -> Line<'static> {
+    let mut line_spans = vec![
+        accent_border_span(mask_replacement),
+        Span::styled("  ", panel_style()),
+    ];
     line_spans.append(&mut spans);
     user_message_line_with_prefix(line_spans, width)
 }
@@ -902,8 +960,13 @@ fn user_message_line_with_prefix(
     Line::from(spans).style(panel_style())
 }
 
-pub(super) fn accent_border_span() -> Span<'static> {
-    Span::styled("▎", Style::default().fg(THEME.accent()))
+pub(super) fn accent_border_span(mask_replacement: bool) -> Span<'static> {
+    let color = if mask_replacement {
+        THEME.mask_replacement()
+    } else {
+        THEME.accent()
+    };
+    Span::styled("▎", Style::default().fg(color))
 }
 
 const fn span_with_panel_bg(mut span: Span<'static>) -> Span<'static> {
@@ -1584,7 +1647,11 @@ fn metrics_item_line(metrics: &str, width: Option<u16>) -> Line<'static> {
 }
 
 fn event_text(event: &TimelineEventView) -> String {
-    match &event.content {
+    event_text_content(&event.content)
+}
+
+fn event_text_content(content: &TimelineContentView) -> String {
+    match content {
         TimelineContentView::Empty => String::new(),
         TimelineContentView::TextDelta { delta } => delta.clone(),
         TimelineContentView::TextSnapshot { text } => text.clone(),
@@ -1673,6 +1740,74 @@ fn top_level_input_entries(input: &Value) -> Vec<ToolInputEntry> {
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.key.cmp(&right.key));
     entries
+}
+
+#[cfg(test)]
+mod projected_tests {
+    use waltr_client::{
+        OperationSnapshot, ProjectedTimelineEntryView, SessionTimelineView,
+        SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
+        TimelinePresentationView, TimelineStatusView,
+    };
+
+    use super::*;
+
+    #[test]
+    fn mask_replacement_uses_user_markdown_turquoise_marker_and_no_action_identity() {
+        let entry = ProjectedTimelineEntryView::Synthetic {
+            identity: "mask:stable".to_owned(),
+            presentation: TimelinePresentationView::MaskReplacement,
+            event: SyntheticTimelineEventView {
+                ordering_cursor: 7,
+                session_id: "chat".to_owned(),
+                turn: 2,
+                kind: TimelineEventKindView::ItemFinished,
+                channel: "user_text".to_owned(),
+                content: TimelineContentView::TextSnapshot {
+                    text: "**Projected summary**".to_owned(),
+                },
+                status: TimelineStatusView::Finished,
+            },
+        };
+        let timeline = SessionTimelineView {
+            events: vec![entry],
+            projection_revision: Some(7),
+            raw_page_boundary: Some(6),
+            has_more: true,
+            load: operation(),
+            watch: operation(),
+        };
+
+        let items = timeline_items(&timeline.events);
+        assert!(matches!(
+            &items[0],
+            TimelineItemModel::Text {
+                item_id,
+                mask_replacement: true,
+                durable_actions: false,
+                ..
+            } if item_id == "mask:stable"
+        ));
+        let lines = timeline_lines(Some(&timeline), Some(60), &BTreeSet::new());
+        assert_eq!(lines[0].spans[0].content, "▎");
+        assert_eq!(lines[0].spans[0].style.fg, Some(THEME.mask_replacement()));
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains("Projected summary")
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert_eq!(
+            timeline_click_target_at_row(&timeline, 60, 1, &BTreeSet::new()),
+            None
+        );
+    }
+
+    const fn operation() -> OperationSnapshot {
+        OperationSnapshot {
+            status: "received",
+            error: None,
+            key: None,
+        }
+    }
 }
 
 fn format_tool_input_value(value: &Value) -> String {

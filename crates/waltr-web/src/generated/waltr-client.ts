@@ -732,11 +732,33 @@ status: TimelineStatusView | null,
  */
 metadataJson: string, };
 
+export type TimelinePresentationView = "unspecified" | "durable" | "maskReplacement" | "unknown";
+
+export type SyntheticTimelineEventView = {
+/**
+ * Server ordering position; this is not a durable action cursor.
+ */
+orderingCursor: bigint, sessionId: string, turn: bigint, kind: TimelineEventKindView, channel: string, content: TimelineContentView, status: TimelineStatusView, };
+
+export type ProjectedTimelineEntryView = { "entryKind": "durable", identity: string, presentation: TimelinePresentationView, event: TimelineEventView, } | { "entryKind": "synthetic", identity: string, presentation: TimelinePresentationView, event: SyntheticTimelineEventView, };
+
 export type SessionTimelineView = {
 /**
- * Persisted timeline events ordered by cursor.
+ * Already-projected timeline entries ordered by server cursor.
  */
-events: Array<TimelineEventView>,
+events: Array<ProjectedTimelineEntryView>,
+/**
+ * Revision of the current effective projection.
+ */
+projectionRevision: bigint | null,
+/**
+ * Raw page boundary for the next effective backward request.
+ */
+rawPageBoundary: bigint | null,
+/**
+ * Whether another effective backward page is available.
+ */
+hasMore: boolean,
 /**
  * Timeline page load operation snapshot.
  */

@@ -411,9 +411,24 @@ impl Client {
         session_id: impl Into<String>,
         query: Option<TimelineQuery>,
     ) -> ClientUpdate {
+        self.request_session_timeline_with_projection(
+            session_id,
+            query,
+            crate::SessionTimelineProjectionMode::Raw,
+        )
+    }
+
+    /// Request a timeline page with an explicit server projection.
+    pub fn request_session_timeline_with_projection(
+        &mut self,
+        session_id: impl Into<String>,
+        query: Option<TimelineQuery>,
+        projection_mode: crate::SessionTimelineProjectionMode,
+    ) -> ClientUpdate {
         self.apply(ClientEvent::Session(SessionEvent::TimelineRequested {
             session_id: session_id.into(),
             query,
+            projection_mode,
         }))
     }
 
@@ -438,12 +453,32 @@ impl Client {
         channels: Vec<String>,
         initial_limit: Option<u32>,
     ) -> ClientUpdate {
+        self.register_session_timeline_watch_interest_with_projection(
+            session_id,
+            after_cursor,
+            channels,
+            initial_limit,
+            crate::SessionTimelineProjectionMode::Raw,
+        )
+    }
+
+    /// Request a timeline watch with an explicit server projection.
+    #[must_use]
+    pub fn register_session_timeline_watch_interest_with_projection(
+        &mut self,
+        session_id: impl Into<String>,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+        projection_mode: crate::SessionTimelineProjectionMode,
+    ) -> ClientUpdate {
         self.apply(ClientEvent::Session(
             SessionEvent::TimelineWatchInterestRegistered {
                 session_id: session_id.into(),
                 after_cursor,
                 channels,
                 initial_limit,
+                projection_mode,
             },
         ))
     }
@@ -2776,10 +2811,11 @@ mod tests {
                 event: SessionTimelineWatchEvent::Event(timeline_event(10)),
             },
         }));
-        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
-            session_id: "session".to_owned(),
-            events: vec![timeline_event(8), timeline_event(9)],
-        }));
+        complete_timeline_page(
+            &mut client,
+            "session",
+            timeline_page(vec![timeline_event(8), timeline_event(9)]),
+        );
 
         let timeline = client
             .state()
@@ -2788,11 +2824,250 @@ mod tests {
             .get("session")
             .expect("timeline exists");
         assert_eq!(
-            timeline.events.keys().copied().collect::<Vec<_>>(),
-            vec![8, 9, 10]
+            timeline
+                .entries
+                .values()
+                .filter_map(|entry| match entry.event.as_ref() {
+                    Some(crate::projected_timeline_event::Event::Durable(event)) => {
+                        Some(event.cursor)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![10, 8, 9]
         );
         assert_eq!(timeline.load.status, OperationStatus::Ready);
         assert_eq!(timeline.watch.status, OperationStatus::Received);
+    }
+
+    #[test]
+    fn effective_timeline_projection_replaces_then_appends_and_dedupes() {
+        let mut client = Client::new();
+        let key = crate::TimelineWatchKey::new_with_projection(
+            "session".to_owned(),
+            None,
+            Vec::new(),
+            None,
+            crate::SessionTimelineProjectionMode::Effective,
+        );
+        drop(
+            client.register_session_timeline_watch_interest_with_projection(
+                "session",
+                None,
+                Vec::new(),
+                None,
+                crate::SessionTimelineProjectionMode::Effective,
+            ),
+        );
+        client.apply(ClientEvent::Session(SessionEvent::TimelineWatchChanged {
+            key: key.clone(),
+            update: SessionTimelineWatchUpdate {
+                sequence: 1,
+                event: SessionTimelineWatchEvent::ProjectionReset {
+                    entries: vec![synthetic_timeline_event("mask-1", 5)],
+                    projection: Some(crate::TimelineProjectionMetadata {
+                        revision: 7,
+                        raw_page_boundary: Some(3),
+                        has_more: true,
+                    }),
+                },
+            },
+        }));
+        for sequence in [2, 3] {
+            client.apply(ClientEvent::Session(SessionEvent::TimelineWatchChanged {
+                key: key.clone(),
+                update: SessionTimelineWatchUpdate {
+                    sequence,
+                    event: SessionTimelineWatchEvent::ProjectedEvent(durable_projection(
+                        timeline_event(6),
+                    )),
+                },
+            }));
+        }
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.entries.len(), 2);
+        assert_eq!(timeline.projection_revision, Some(7));
+        assert_eq!(timeline.raw_page_boundary, Some(3));
+        assert!(timeline.has_more);
+
+        client.apply(ClientEvent::Session(SessionEvent::TimelineWatchChanged {
+            key,
+            update: SessionTimelineWatchUpdate {
+                sequence: 4,
+                event: SessionTimelineWatchEvent::ProjectionReset {
+                    entries: vec![synthetic_timeline_event("mask-2", 8)],
+                    projection: Some(crate::TimelineProjectionMetadata {
+                        revision: 8,
+                        raw_page_boundary: None,
+                        has_more: false,
+                    }),
+                },
+            },
+        }));
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.entries.len(), 1);
+        assert!(timeline.entries.contains_key("mask:mask-2"));
+        assert_eq!(timeline.projection_revision, Some(8));
+        assert_eq!(timeline.raw_page_boundary, None);
+        assert!(!timeline.has_more);
+    }
+
+    #[test]
+    fn timeline_effects_preserve_raw_and_allow_explicit_effective_mode() {
+        let mut client = Client::new();
+        let raw = client.request_session_timeline("session", None);
+        assert!(matches!(
+            raw.effects(),
+            [ClientEffect::Session(SessionEffect::GetTimeline {
+                projection_mode: crate::SessionTimelineProjectionMode::Raw,
+                ..
+            })]
+        ));
+        let effective = client.request_session_timeline_with_projection(
+            "session",
+            None,
+            crate::SessionTimelineProjectionMode::Effective,
+        );
+        assert!(matches!(
+            effective.effects(),
+            [ClientEffect::Session(SessionEffect::GetTimeline {
+                projection_mode: crate::SessionTimelineProjectionMode::Effective,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn effective_reset_before_page_completion_discards_stale_page() {
+        let mut client = Client::new();
+        apply_projection_reset(&mut client, 5, "mask-5", 5);
+        let request = begin_effective_page(&mut client);
+        apply_projection_reset(&mut client, 6, "mask-6", 6);
+
+        apply_effective_page(&mut client, request, 5, Some(2), 4);
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.projection_revision, Some(6));
+        assert_eq!(timeline.raw_page_boundary, None);
+        assert!(!timeline.has_more);
+        assert_eq!(timeline.entries.len(), 1);
+        assert!(timeline.entries.contains_key("mask:mask-6"));
+    }
+
+    #[test]
+    fn effective_page_before_reset_is_replaced_by_authoritative_reset() {
+        let mut client = Client::new();
+        apply_projection_reset(&mut client, 5, "mask-5", 5);
+        let request = begin_effective_page(&mut client);
+
+        apply_effective_page(&mut client, request, 5, Some(2), 4);
+        assert!(
+            client.state().sessions.timelines["session"]
+                .entries
+                .contains_key("durable:4:i4")
+        );
+        apply_projection_reset(&mut client, 6, "mask-6", 6);
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.projection_revision, Some(6));
+        assert_eq!(timeline.entries.len(), 1);
+        assert!(timeline.entries.contains_key("mask:mask-6"));
+    }
+
+    #[test]
+    fn overlapping_timeline_page_responses_accept_only_latest_request() {
+        let mut client = Client::new();
+        apply_projection_reset(&mut client, 5, "mask-5", 5);
+        let older = begin_effective_page(&mut client);
+        let latest = begin_effective_page(&mut client);
+
+        apply_effective_page(&mut client, older, 5, Some(3), 3);
+        assert_eq!(
+            client.state().sessions.timelines["session"].entries.len(),
+            1
+        );
+        assert_eq!(
+            client.state().sessions.timelines["session"].load.status,
+            OperationStatus::Loading
+        );
+        apply_effective_page(&mut client, latest, 5, Some(2), 4);
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.entries.len(), 2);
+        assert!(timeline.entries.contains_key("durable:4:i4"));
+        assert_eq!(timeline.raw_page_boundary, Some(2));
+    }
+
+    #[test]
+    fn effective_page_completion_never_regresses_projection_revision() {
+        let mut client = Client::new();
+        apply_projection_reset(&mut client, 5, "mask-5", 5);
+        let request = begin_effective_page(&mut client);
+
+        apply_effective_page(&mut client, request, 4, Some(1), 3);
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.projection_revision, Some(5));
+        assert_eq!(timeline.raw_page_boundary, None);
+        assert_eq!(timeline.entries.len(), 1);
+        assert!(!timeline.entries.contains_key("durable:3:i3"));
+    }
+
+    #[test]
+    fn reset_before_old_timeline_failure_preserves_authoritative_state() {
+        let mut client = Client::new();
+        apply_projection_reset(&mut client, 5, "mask-5", 5);
+        let request = begin_effective_page(&mut client);
+        apply_projection_reset(&mut client, 6, "mask-6", 6);
+
+        apply_timeline_failure(&mut client, request, "old request failed");
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.load.status, OperationStatus::Ready);
+        assert_eq!(timeline.load.error, None);
+        assert_eq!(timeline.load_request_id, None);
+        assert_eq!(timeline.projection_revision, Some(6));
+        assert_eq!(timeline.raw_page_boundary, None);
+        assert!(!timeline.has_more);
+        assert_eq!(timeline.entries.len(), 1);
+        assert!(timeline.entries.contains_key("mask:mask-6"));
+    }
+
+    #[test]
+    fn superseding_timeline_request_ignores_old_failure() {
+        let mut client = Client::new();
+        apply_projection_reset(&mut client, 5, "mask-5", 5);
+        let old = begin_effective_page(&mut client);
+        let current = begin_effective_page(&mut client);
+
+        apply_timeline_failure(&mut client, old, "old request failed");
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.load.status, OperationStatus::Loading);
+        assert_eq!(timeline.load.error, None);
+        assert_eq!(timeline.load_request_id, Some(current.0));
+        assert_eq!(timeline.projection_revision, Some(5));
+        assert_eq!(timeline.entries.len(), 1);
+    }
+
+    #[test]
+    fn current_timeline_failure_sets_failed_operation_state() {
+        let mut client = Client::new();
+        apply_projection_reset(&mut client, 5, "mask-5", 5);
+        let request = begin_effective_page(&mut client);
+
+        apply_timeline_failure(&mut client, request, "current request failed");
+
+        let timeline = &client.state().sessions.timelines["session"];
+        assert_eq!(timeline.load.status, OperationStatus::Failed);
+        assert_eq!(
+            timeline.load.error.as_deref(),
+            Some("current request failed")
+        );
+        assert_eq!(timeline.load_request_id, None);
+        assert_eq!(timeline.projection_revision, Some(5));
+        assert_eq!(timeline.entries.len(), 1);
     }
 
     #[test]
@@ -2960,10 +3235,7 @@ mod tests {
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
         )])));
-        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
-            session_id: "one".to_owned(),
-            events: vec![timeline_event(1)],
-        }));
+        complete_timeline_page(&mut client, "one", timeline_page(vec![timeline_event(1)]));
         client.search_session_templates(
             "search-one",
             "one",
@@ -3010,10 +3282,7 @@ mod tests {
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
         )])));
-        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
-            session_id: "one".to_owned(),
-            events: vec![timeline_event(1)],
-        }));
+        complete_timeline_page(&mut client, "one", timeline_page(vec![timeline_event(1)]));
         client.search_session_templates(
             "search-one",
             "one",
@@ -3059,10 +3328,7 @@ mod tests {
         client.apply(ClientEvent::Session(SessionEvent::Listed(vec![session(
             "one",
         )])));
-        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
-            session_id: "one".to_owned(),
-            events: vec![timeline_event(1)],
-        }));
+        complete_timeline_page(&mut client, "one", timeline_page(vec![timeline_event(1)]));
         client.search_session_templates(
             "search-one",
             "one",
@@ -3622,7 +3888,165 @@ mod tests {
         TimelineEvent {
             cursor,
             session_id: "session".to_owned(),
+            item_id: format!("i{cursor}"),
             ..TimelineEvent::default()
+        }
+    }
+
+    fn timeline_page(events: Vec<TimelineEvent>) -> crate::SessionTimelinePage {
+        crate::SessionTimelinePage {
+            projection_mode: crate::SessionTimelineProjectionMode::Raw,
+            entries: events
+                .into_iter()
+                .map(|event| crate::ProjectedTimelineEvent {
+                    presentation: crate::TimelinePresentation::Durable as i32,
+                    mask_id: None,
+                    event: Some(crate::projected_timeline_event::Event::Durable(event)),
+                })
+                .collect(),
+            projection: None,
+        }
+    }
+
+    fn complete_timeline_page(
+        client: &mut Client,
+        session_id: &str,
+        page: crate::SessionTimelinePage,
+    ) {
+        let update =
+            client.request_session_timeline_with_projection(session_id, None, page.projection_mode);
+        let [
+            ClientEffect::Session(SessionEffect::GetTimeline {
+                request_id,
+                baseline_mode,
+                baseline_revision,
+                ..
+            }),
+        ] = update.effects()
+        else {
+            panic!("timeline page effect")
+        };
+        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
+            session_id: session_id.to_owned(),
+            request_id: *request_id,
+            baseline_mode: *baseline_mode,
+            baseline_revision: *baseline_revision,
+            page,
+        }));
+    }
+
+    fn begin_effective_page(
+        client: &mut Client,
+    ) -> (u64, crate::SessionTimelineProjectionMode, Option<u64>) {
+        let update = client.request_session_timeline_with_projection(
+            "session",
+            None,
+            crate::SessionTimelineProjectionMode::Effective,
+        );
+        let [
+            ClientEffect::Session(SessionEffect::GetTimeline {
+                request_id,
+                baseline_mode,
+                baseline_revision,
+                ..
+            }),
+        ] = update.effects()
+        else {
+            panic!("effective timeline page effect")
+        };
+        (*request_id, *baseline_mode, *baseline_revision)
+    }
+
+    fn apply_effective_page(
+        client: &mut Client,
+        (request_id, baseline_mode, baseline_revision): (
+            u64,
+            crate::SessionTimelineProjectionMode,
+            Option<u64>,
+        ),
+        revision: u64,
+        raw_page_boundary: Option<u64>,
+        event_cursor: u64,
+    ) {
+        client.apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
+            session_id: "session".to_owned(),
+            request_id,
+            baseline_mode,
+            baseline_revision,
+            page: crate::SessionTimelinePage {
+                projection_mode: crate::SessionTimelineProjectionMode::Effective,
+                entries: vec![durable_projection(timeline_event(event_cursor))],
+                projection: Some(crate::TimelineProjectionMetadata {
+                    revision,
+                    raw_page_boundary,
+                    has_more: raw_page_boundary.is_some(),
+                }),
+            },
+        }));
+    }
+
+    fn apply_timeline_failure(
+        client: &mut Client,
+        (request_id, baseline_mode, baseline_revision): (
+            u64,
+            crate::SessionTimelineProjectionMode,
+            Option<u64>,
+        ),
+        message: &str,
+    ) {
+        client.apply(ClientEvent::Session(SessionEvent::TimelineLoadFailed {
+            session_id: "session".to_owned(),
+            request_id,
+            baseline_mode,
+            baseline_revision,
+            error: ClientError::new(message),
+        }));
+    }
+
+    fn apply_projection_reset(client: &mut Client, revision: u64, mask_id: &str, cursor: u64) {
+        let key = crate::TimelineWatchKey::new_with_projection(
+            "session".to_owned(),
+            None,
+            Vec::new(),
+            None,
+            crate::SessionTimelineProjectionMode::Effective,
+        );
+        client.apply(ClientEvent::Session(SessionEvent::TimelineWatchChanged {
+            key,
+            update: SessionTimelineWatchUpdate {
+                sequence: revision,
+                event: SessionTimelineWatchEvent::ProjectionReset {
+                    entries: vec![synthetic_timeline_event(mask_id, cursor)],
+                    projection: Some(crate::TimelineProjectionMetadata {
+                        revision,
+                        raw_page_boundary: None,
+                        has_more: false,
+                    }),
+                },
+            },
+        }));
+    }
+
+    fn durable_projection(event: TimelineEvent) -> crate::ProjectedTimelineEvent {
+        crate::ProjectedTimelineEvent {
+            presentation: crate::TimelinePresentation::Durable as i32,
+            mask_id: None,
+            event: Some(crate::projected_timeline_event::Event::Durable(event)),
+        }
+    }
+
+    fn synthetic_timeline_event(mask_id: &str, cursor: u64) -> crate::ProjectedTimelineEvent {
+        crate::ProjectedTimelineEvent {
+            presentation: crate::TimelinePresentation::MaskReplacement as i32,
+            mask_id: Some(mask_id.to_owned()),
+            event: Some(crate::projected_timeline_event::Event::Synthetic(
+                waltr::grpc::waltr::session::v1::SyntheticTimelineEvent {
+                    cursor,
+                    session_id: "session".to_owned(),
+                    turn: 1,
+                    ..Default::default()
+                },
+            )),
         }
     }
 

@@ -5,13 +5,16 @@ use std::collections::{BTreeMap, VecDeque};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::transport::SessionTimelineWatchEvent;
+use crate::transport::{
+    SessionTimelinePage, SessionTimelineProjectionMode, SessionTimelineWatchEvent,
+};
 use crate::{
     AuthStatus, AuthTarget, CatalogMatch, CatalogModelSummary, ClientManualRoutineDefinition,
     ClientRoutineInvocationDetail, ClientRoutineInvocationSummary, ClientRoutineValidationFailure,
     ClientRoutineValue, Configuration, GenericAuthAttempt, ResourceCatalog, RollbackTarget,
-    SelectableAgent, SessionSummary, SessionTemplateOption, StreamId, SystemStatus, TimelineEvent,
+    SelectableAgent, SessionSummary, SessionTemplateOption, StreamId, SystemStatus,
 };
+use waltr::grpc::waltr::session::v1::ProjectedTimelineEvent;
 
 /// Runtime-local operation identifier used by shells to track command results.
 pub type OperationKey = String;
@@ -20,7 +23,12 @@ pub type OperationKey = String;
 pub type AccessAttemptId = String;
 
 /// Lifecycle-defining request parameters for one timeline watch.
-pub type TimelineWatchRequest = (Option<u64>, Vec<String>, Option<u32>);
+pub type TimelineWatchRequest = (
+    Option<u64>,
+    Vec<String>,
+    Option<u32>,
+    SessionTimelineProjectionMode,
+);
 
 /// Stable identity for one timeline watch stream.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -33,6 +41,8 @@ pub struct TimelineWatchKey {
     pub channels: Vec<String>,
     /// Optional initial history batch size.
     pub initial_limit: Option<u32>,
+    /// Server projection requested for this stream.
+    pub projection_mode: SessionTimelineProjectionMode,
 }
 
 impl TimelineWatchKey {
@@ -44,18 +54,42 @@ impl TimelineWatchKey {
         channels: Vec<String>,
         initial_limit: Option<u32>,
     ) -> Self {
+        Self::new_with_projection(
+            session_id,
+            after_cursor,
+            channels,
+            initial_limit,
+            SessionTimelineProjectionMode::Raw,
+        )
+    }
+
+    /// Create a watch key with an explicit server projection.
+    #[must_use]
+    pub const fn new_with_projection(
+        session_id: String,
+        after_cursor: Option<u64>,
+        channels: Vec<String>,
+        initial_limit: Option<u32>,
+        projection_mode: SessionTimelineProjectionMode,
+    ) -> Self {
         Self {
             session_id,
             after_cursor,
             channels,
             initial_limit,
+            projection_mode,
         }
     }
 
     /// Return the request parameters represented by this key.
     #[must_use]
     pub fn request(&self) -> TimelineWatchRequest {
-        (self.after_cursor, self.channels.clone(), self.initial_limit)
+        (
+            self.after_cursor,
+            self.channels.clone(),
+            self.initial_limit,
+            self.projection_mode,
+        )
     }
 }
 
@@ -96,6 +130,7 @@ pub struct ClientState {
     next_access_attempt_generation: u64,
     next_status_watch_epoch: u64,
     next_watch_open_id: u64,
+    next_timeline_load_id: u64,
     next_operation_id: u64,
     next_auth_poll_generation: u64,
 }
@@ -418,14 +453,65 @@ pub struct SessionTemplateSearchState {
 /// Timeline coordination state for one session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionTimelineState {
-    /// Last known persisted timeline events by cursor.
-    pub events: BTreeMap<u64, TimelineEvent>,
+    /// Projection represented by the cached entries.
+    pub projection_mode: SessionTimelineProjectionMode,
+    /// Last known already-projected timeline entries by stable identity.
+    pub entries: BTreeMap<String, ProjectedTimelineEvent>,
+    /// Revision of the current effective projection.
+    pub projection_revision: Option<u64>,
+    /// Raw cursor boundary to use for the next effective backward page.
+    pub raw_page_boundary: Option<u64>,
+    /// Whether another effective backward page is available.
+    pub has_more: bool,
     /// Timeline page load operation state.
     pub load: OperationState,
+    pub(crate) load_request_id: Option<u64>,
+    pub(crate) load_baseline_mode: SessionTimelineProjectionMode,
+    pub(crate) load_baseline_revision: Option<u64>,
     /// Timeline watch operation state.
     pub watch: WatchState,
     pub(crate) last_sequence: u64,
     pub(crate) watches: BTreeMap<TimelineWatchKey, WatchState>,
+}
+
+fn durable_projected_event(event: crate::TimelineEvent) -> ProjectedTimelineEvent {
+    ProjectedTimelineEvent {
+        presentation: waltr::grpc::waltr::session::v1::TimelinePresentation::Durable as i32,
+        mask_id: None,
+        event: Some(waltr::grpc::waltr::session::v1::projected_timeline_event::Event::Durable(event)),
+    }
+}
+
+fn projected_entry_identity(entry: &ProjectedTimelineEvent) -> Option<String> {
+    use waltr::grpc::waltr::session::v1::projected_timeline_event::Event;
+
+    match entry.event.as_ref()? {
+        Event::Durable(event) => Some(format!("durable:{}:{}", event.cursor, event.item_id)),
+        Event::Synthetic(_) => entry
+            .mask_id
+            .as_ref()
+            .map(|mask_id| format!("mask:{mask_id}")),
+    }
+}
+
+fn projected_entry_cursor(entry: &ProjectedTimelineEvent) -> u64 {
+    use waltr::grpc::waltr::session::v1::projected_timeline_event::Event;
+
+    match entry.event.as_ref() {
+        Some(Event::Durable(event)) => event.cursor,
+        Some(Event::Synthetic(event)) => event.cursor,
+        None => 0,
+    }
+}
+
+fn projected_entry_session_id(entry: &ProjectedTimelineEvent) -> String {
+    use waltr::grpc::waltr::session::v1::projected_timeline_event::Event;
+
+    match entry.event.as_ref() {
+        Some(Event::Durable(event)) => event.session_id.clone(),
+        Some(Event::Synthetic(event)) => event.session_id.clone(),
+        None => String::new(),
+    }
 }
 
 /// Stream coordination state.
@@ -1970,29 +2056,101 @@ impl ClientState {
         self.sessions.list.error = Some(message);
     }
 
-    pub(crate) fn set_session_timeline_load_loading(&mut self, session_id: &str) {
+    pub(crate) fn set_session_timeline_load_loading(
+        &mut self,
+        session_id: &str,
+    ) -> (u64, SessionTimelineProjectionMode, Option<u64>) {
+        let request_id = self.next_timeline_load_id;
+        self.next_timeline_load_id = self.next_timeline_load_id.saturating_add(1);
         let timeline = self.session_timeline_mut(session_id);
         timeline.load.status = OperationStatus::Loading;
         timeline.load.error = None;
+        timeline.load_request_id = Some(request_id);
+        timeline.load_baseline_mode = timeline.projection_mode;
+        timeline.load_baseline_revision = timeline.projection_revision;
+        (
+            request_id,
+            timeline.load_baseline_mode,
+            timeline.load_baseline_revision,
+        )
     }
 
     pub(crate) fn set_session_timeline_load_ready(
         &mut self,
         session_id: &str,
-        events: Vec<TimelineEvent>,
+        request_id: u64,
+        baseline_mode: SessionTimelineProjectionMode,
+        baseline_revision: Option<u64>,
+        page: SessionTimelinePage,
     ) {
         let timeline = self.session_timeline_mut(session_id);
+        if timeline.load_request_id != Some(request_id) {
+            return;
+        }
+        timeline.load_request_id = None;
+        if timeline.load_baseline_mode != baseline_mode
+            || timeline.load_baseline_revision != baseline_revision
+            || timeline.projection_mode != baseline_mode
+            || timeline.projection_revision != baseline_revision
+            || page.projection.as_ref().is_some_and(|projection| {
+                timeline
+                    .projection_revision
+                    .is_some_and(|revision| projection.revision < revision)
+            })
+        {
+            timeline.load.status = OperationStatus::Ready;
+            timeline.load.error = None;
+            return;
+        }
+        if timeline.projection_mode != page.projection_mode {
+            timeline.entries.clear();
+            timeline.projection_revision = None;
+            timeline.raw_page_boundary = None;
+            timeline.has_more = false;
+            timeline.projection_mode = page.projection_mode;
+        }
         timeline
-            .events
-            .extend(events.into_iter().map(|event| (event.cursor, event)));
+            .entries
+            .extend(page.entries.into_iter().filter_map(|entry| {
+                projected_entry_identity(&entry).map(|identity| (identity, entry))
+            }));
+        if let Some(projection) = page.projection {
+            timeline.projection_revision = Some(projection.revision);
+            timeline.raw_page_boundary = projection.raw_page_boundary;
+            timeline.has_more = projection.has_more;
+        }
         timeline.load.status = OperationStatus::Ready;
         timeline.load.error = None;
     }
 
-    pub(crate) fn set_session_timeline_load_failed(&mut self, session_id: &str, message: String) {
+    pub(crate) fn set_session_timeline_load_failed(
+        &mut self,
+        session_id: &str,
+        request_id: u64,
+        baseline_mode: SessionTimelineProjectionMode,
+        baseline_revision: Option<u64>,
+        message: String,
+    ) {
         let timeline = self.session_timeline_mut(session_id);
+        if timeline.load_request_id != Some(request_id) {
+            return;
+        }
+        if timeline.load_baseline_mode != baseline_mode
+            || timeline.load_baseline_revision != baseline_revision
+        {
+            return;
+        }
+        if timeline.projection_mode != baseline_mode
+            || timeline.projection_revision != baseline_revision
+        {
+            timeline.load.status = OperationStatus::Ready;
+            timeline.load.error = None;
+            timeline.load_request_id = None;
+            return;
+        }
         timeline.load.status = OperationStatus::Failed;
         timeline.load.error = Some(message);
+        timeline.load_request_id = None;
     }
 
     pub(crate) fn set_session_template_search_loading(
@@ -2131,16 +2289,59 @@ impl ClientState {
         let session_id = match &event {
             SessionTimelineWatchEvent::Event(event) => event.session_id.clone(),
             SessionTimelineWatchEvent::Truncated(truncation) => truncation.session_id.clone(),
+            SessionTimelineWatchEvent::ProjectedEvent(event) => projected_entry_session_id(event),
+            SessionTimelineWatchEvent::ProjectionReset { entries, .. } => entries
+                .first()
+                .map_or_else(|| key.session_id.clone(), projected_entry_session_id),
         };
         let timeline = self.session_timeline_mut(&session_id);
+        if timeline.projection_mode != key.projection_mode {
+            timeline.entries.clear();
+            timeline.projection_revision = None;
+            timeline.raw_page_boundary = None;
+            timeline.has_more = false;
+            timeline.projection_mode = key.projection_mode;
+        }
         timeline.last_sequence = sequence;
         match event {
             SessionTimelineWatchEvent::Event(event) => {
-                timeline.events.insert(event.cursor, event);
+                let entry = durable_projected_event(event);
+                if let Some(identity) = projected_entry_identity(&entry) {
+                    timeline.entries.insert(identity, entry);
+                }
             }
             SessionTimelineWatchEvent::Truncated(truncation) => {
-                let after_cursor = truncation.after_cursor.unwrap_or(0);
-                timeline.events.retain(|cursor, _| *cursor <= after_cursor);
+                if key.projection_mode == SessionTimelineProjectionMode::Raw {
+                    let after_cursor = truncation.after_cursor.unwrap_or(0);
+                    timeline
+                        .entries
+                        .retain(|_, entry| projected_entry_cursor(entry) <= after_cursor);
+                }
+            }
+            SessionTimelineWatchEvent::ProjectedEvent(entry) => {
+                if key.projection_mode == SessionTimelineProjectionMode::Effective
+                    && let Some(identity) = projected_entry_identity(&entry)
+                {
+                    timeline.entries.insert(identity, entry);
+                }
+            }
+            SessionTimelineWatchEvent::ProjectionReset {
+                entries,
+                projection,
+            } => {
+                if key.projection_mode == SessionTimelineProjectionMode::Effective {
+                    timeline.entries = entries
+                        .into_iter()
+                        .filter_map(|entry| {
+                            projected_entry_identity(&entry).map(|identity| (identity, entry))
+                        })
+                        .collect();
+                    timeline.projection_revision = projection.as_ref().map(|value| value.revision);
+                    timeline.raw_page_boundary = projection
+                        .as_ref()
+                        .and_then(|value| value.raw_page_boundary);
+                    timeline.has_more = projection.is_some_and(|value| value.has_more);
+                }
             }
         }
         if let Some(watch) = timeline.watches.get_mut(key) {

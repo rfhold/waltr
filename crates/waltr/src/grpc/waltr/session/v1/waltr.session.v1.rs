@@ -122,11 +122,19 @@ pub struct GetTimelineRequest {
     pub session_id: ::prost::alloc::string::String,
     #[prost(message, optional, tag="2")]
     pub query: ::core::option::Option<TimelineQuery>,
+    #[prost(enumeration="TimelineProjectionMode", tag="3")]
+    pub projection_mode: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetTimelineResponse {
+    /// Populated for raw requests for compatibility with existing clients.
     #[prost(message, repeated, tag="1")]
     pub events: ::prost::alloc::vec::Vec<TimelineEvent>,
+    /// Populated for effective requests. Synthetic entries have no durable item identity.
+    #[prost(message, repeated, tag="2")]
+    pub projected_events: ::prost::alloc::vec::Vec<ProjectedTimelineEvent>,
+    #[prost(message, optional, tag="3")]
+    pub projection: ::core::option::Option<TimelineProjectionMetadata>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchTimelineRequest {
@@ -141,23 +149,82 @@ pub struct WatchTimelineRequest {
     /// Optional backward history batch emitted before catch-up and live updates.
     #[prost(uint32, optional, tag="4")]
     pub initial_limit: ::core::option::Option<u32>,
+    #[prost(enumeration="TimelineProjectionMode", tag="5")]
+    pub projection_mode: i32,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WatchTimelineResponse {
     #[prost(uint64, tag="1")]
     pub sequence: u64,
-    #[prost(oneof="watch_timeline_response::Update", tags="2, 3")]
+    #[prost(oneof="watch_timeline_response::Update", tags="2, 3, 4, 5")]
     pub update: ::core::option::Option<watch_timeline_response::Update>,
 }
 /// Nested message and enum types in `WatchTimelineResponse`.
 pub mod watch_timeline_response {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Update {
         #[prost(message, tag="2")]
         Event(super::TimelineEvent),
         #[prost(message, tag="3")]
         Truncation(super::TimelineTruncation),
+        #[prost(message, tag="4")]
+        ProjectedEvent(super::ProjectedTimelineEvent),
+        #[prost(message, tag="5")]
+        ProjectionReset(super::TimelineProjectionReset),
     }
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TimelineProjectionMetadata {
+    #[prost(uint64, tag="1")]
+    pub revision: u64,
+    #[prost(uint64, optional, tag="2")]
+    pub raw_page_boundary: ::core::option::Option<u64>,
+    #[prost(bool, tag="3")]
+    pub has_more: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ProjectedTimelineEvent {
+    #[prost(enumeration="TimelinePresentation", tag="3")]
+    pub presentation: i32,
+    /// Opaque mask identity for a replacement presentation.
+    #[prost(string, optional, tag="4")]
+    pub mask_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(oneof="projected_timeline_event::Event", tags="1, 2")]
+    pub event: ::core::option::Option<projected_timeline_event::Event>,
+}
+/// Nested message and enum types in `ProjectedTimelineEvent`.
+pub mod projected_timeline_event {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag="1")]
+        Durable(super::TimelineEvent),
+        #[prost(message, tag="2")]
+        Synthetic(super::SyntheticTimelineEvent),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SyntheticTimelineEvent {
+    #[prost(uint64, tag="1")]
+    pub cursor: u64,
+    #[prost(string, tag="2")]
+    pub session_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag="3")]
+    pub turn: u64,
+    #[prost(enumeration="TimelineEventKind", tag="4")]
+    pub kind: i32,
+    #[prost(string, tag="5")]
+    pub channel: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="6")]
+    pub content: ::core::option::Option<TimelineContent>,
+    #[prost(enumeration="TimelineStatus", tag="7")]
+    pub status: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TimelineProjectionReset {
+    #[prost(message, repeated, tag="1")]
+    pub events: ::prost::alloc::vec::Vec<ProjectedTimelineEvent>,
+    #[prost(message, optional, tag="2")]
+    pub projection: ::core::option::Option<TimelineProjectionMetadata>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TimelineTruncation {
@@ -537,6 +604,64 @@ pub struct ExternalRequest {
     /// JSON payload encoded as UTF-8 JSON until request payload protos stabilize.
     #[prost(string, tag="5")]
     pub payload_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TimelineProjectionMode {
+    Unspecified = 0,
+    Raw = 1,
+    Effective = 2,
+}
+impl TimelineProjectionMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIMELINE_PROJECTION_MODE_UNSPECIFIED",
+            Self::Raw => "TIMELINE_PROJECTION_MODE_RAW",
+            Self::Effective => "TIMELINE_PROJECTION_MODE_EFFECTIVE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIMELINE_PROJECTION_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIMELINE_PROJECTION_MODE_RAW" => Some(Self::Raw),
+            "TIMELINE_PROJECTION_MODE_EFFECTIVE" => Some(Self::Effective),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TimelinePresentation {
+    Unspecified = 0,
+    Durable = 1,
+    MaskReplacement = 2,
+}
+impl TimelinePresentation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIMELINE_PRESENTATION_UNSPECIFIED",
+            Self::Durable => "TIMELINE_PRESENTATION_DURABLE",
+            Self::MaskReplacement => "TIMELINE_PRESENTATION_MASK_REPLACEMENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIMELINE_PRESENTATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIMELINE_PRESENTATION_DURABLE" => Some(Self::Durable),
+            "TIMELINE_PRESENTATION_MASK_REPLACEMENT" => Some(Self::MaskReplacement),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

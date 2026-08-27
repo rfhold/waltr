@@ -111,7 +111,7 @@ pub(super) fn render_composer(
     ])
     .areas(area);
     let border_lines = (0..border_area.height)
-        .map(|_| Line::from(accent_border_span()))
+        .map(|_| Line::from(accent_border_span(false)))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(border_lines).style(panel_style()),

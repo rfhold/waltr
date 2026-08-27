@@ -120,6 +120,7 @@ async fn assert_provider_watch_timeline_reconnects_with_cursor(
     let mut watch = client
         .watch_timeline(waltr::grpc::waltr::session::v1::WatchTimelineRequest {
             session_id: session.id,
+            projection_mode: 0,
             after_cursor: Some(after_cursor),
             channels: vec!["assistant_text".to_owned()],
             initial_limit: None,
@@ -275,6 +276,7 @@ async fn wait_for_assistant_event(
         let events = client
             .get_timeline(GetTimelineRequest {
                 session_id: session_id.to_owned(),
+                projection_mode: 0,
                 query: Some(TimelineQuery {
                     direction: TimelineDirection::Forward as i32,
                     cursor: None,

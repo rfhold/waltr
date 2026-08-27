@@ -148,6 +148,7 @@ async fn submit_and_assert_timeline_text(
                 timeline
                     .events
                     .iter()
+                    .filter_map(waltr_client::ProjectedTimelineEntryView::durable_event)
                     .any(|event| matches(timeline_text(&event.content)))
             })
     })

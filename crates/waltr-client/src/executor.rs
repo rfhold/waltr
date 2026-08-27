@@ -198,9 +198,16 @@ impl GrpcEffectExecutor {
         after_cursor: Option<u64>,
         channels: Vec<String>,
         initial_limit: Option<u32>,
+        projection_mode: crate::SessionTimelineProjectionMode,
     ) -> Result<SessionTimelineWatchUpdateStream, ClientError> {
         self.transport
-            .watch_timeline(session_id, after_cursor, channels, initial_limit)
+            .watch_timeline(
+                session_id,
+                after_cursor,
+                channels,
+                initial_limit,
+                projection_mode,
+            )
             .await
     }
 
@@ -667,15 +674,32 @@ impl GrpcEffectExecutor {
                         Err(error) => vec![ClientEvent::Session(SessionEvent::ListFailed(error))],
                     }
                 }
-                ClientEffect::Session(SessionEffect::GetTimeline { session_id, query }) => {
-                    match self.transport.get_timeline(session_id.clone(), query).await {
-                        Ok(events) => vec![ClientEvent::Session(SessionEvent::TimelineLoaded {
+                ClientEffect::Session(SessionEffect::GetTimeline {
+                    session_id,
+                    request_id,
+                    baseline_mode,
+                    baseline_revision,
+                    query,
+                    projection_mode,
+                }) => {
+                    match self
+                        .transport
+                        .get_timeline(session_id.clone(), query, projection_mode)
+                        .await
+                    {
+                        Ok(page) => vec![ClientEvent::Session(SessionEvent::TimelineLoaded {
                             session_id,
-                            events,
+                            request_id,
+                            baseline_mode,
+                            baseline_revision,
+                            page,
                         })],
                         Err(error) => {
                             vec![ClientEvent::Session(SessionEvent::TimelineLoadFailed {
                                 session_id,
+                                request_id,
+                                baseline_mode,
+                                baseline_revision,
                                 error,
                             })]
                         }
@@ -750,6 +774,7 @@ impl GrpcEffectExecutor {
                             key.after_cursor,
                             key.channels.clone(),
                             key.initial_limit,
+                            key.projection_mode,
                         )
                         .await
                     {

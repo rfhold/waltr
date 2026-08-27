@@ -15,11 +15,12 @@ use waltr_client::{
     ConfigSnapshot, ConfigView, ExternalRequestView, McpAuthorizationContextSnapshot,
     McpServerTypeView, McpServerView, ModelCapabilitiesView, ModelCatalogMatchView,
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
-    OperationSnapshot, ProviderKindView, ProviderView, ResourceEditBaselineView,
-    RoutineDefinitionSnapshot, RoutineHistorySnapshot, RoutineSnapshot, SelectableAgentView,
-    SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot, SessionStatusView,
-    SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView, TimelineEventKindView,
-    TimelineEventView, TimelineStatusView, TimestampView,
+    OperationSnapshot, ProjectedTimelineEntryView, ProviderKindView, ProviderView,
+    ResourceEditBaselineView, RoutineDefinitionSnapshot, RoutineHistorySnapshot, RoutineSnapshot,
+    SelectableAgentView, SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot,
+    SessionStatusView, SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView,
+    TimelineEventKindView, TimelineEventView, TimelinePresentationView, TimelineStatusView,
+    TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction},
@@ -268,7 +269,10 @@ pub(crate) fn watched_session_with_timeline(
     snapshot.sessions.timelines.insert(
         session_id,
         SessionTimelineView {
-            events,
+            raw_page_boundary: events.first().map(|event| event.cursor),
+            has_more: !events.is_empty(),
+            events: events.into_iter().map(durable_timeline_entry).collect(),
+            projection_revision: Some(1),
             load: idle_operation(),
             watch: OperationSnapshot {
                 status: "received",
@@ -278,6 +282,38 @@ pub(crate) fn watched_session_with_timeline(
         },
     );
     snapshot
+}
+
+pub(crate) fn durable_timeline_entry(event: TimelineEventView) -> ProjectedTimelineEntryView {
+    ProjectedTimelineEntryView::Durable {
+        identity: format!("durable:{}", event.cursor),
+        presentation: TimelinePresentationView::Durable,
+        event,
+    }
+}
+
+pub(crate) fn mask_replacement_entry(
+    identity: &str,
+    cursor: u64,
+    session_id: &str,
+    turn: u64,
+    text: &str,
+) -> ProjectedTimelineEntryView {
+    ProjectedTimelineEntryView::Synthetic {
+        identity: identity.to_owned(),
+        presentation: TimelinePresentationView::MaskReplacement,
+        event: waltr_client::SyntheticTimelineEventView {
+            ordering_cursor: cursor,
+            session_id: session_id.to_owned(),
+            turn,
+            kind: TimelineEventKindView::ItemFinished,
+            channel: "user_text".to_owned(),
+            content: TimelineContentView::TextSnapshot {
+                text: text.to_owned(),
+            },
+            status: TimelineStatusView::Finished,
+        },
+    }
 }
 
 pub(crate) fn expected_register_timeline_command(session_id: &str) -> AppAction {
