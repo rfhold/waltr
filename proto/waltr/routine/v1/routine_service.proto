@@ -53,6 +53,7 @@ message RoutineInputDefinition {
   bool required = 3;
   optional uint64 minimum_string_length = 4;
   optional string string_pattern = 5;
+  optional RoutineValue default_value = 6;
 }
 
 message RoutineResultDefinition {

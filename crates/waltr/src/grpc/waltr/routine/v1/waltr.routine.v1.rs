@@ -50,6 +50,8 @@ pub struct RoutineInputDefinition {
     pub minimum_string_length: ::core::option::Option<u64>,
     #[prost(string, optional, tag="5")]
     pub string_pattern: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag="6")]
+    pub default_value: ::core::option::Option<RoutineValue>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RoutineResultDefinition {

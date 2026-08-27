@@ -1,6 +1,6 @@
 use super::*;
 use crate::resource_catalog::materialize::materialize_url;
-use crate::resource_catalog::routine::{RoutineCondition, RoutineConditionOperator};
+use crate::resource_catalog::routine::{RoutineCondition, RoutineConditionOperator, RoutineScalar};
 use std::{
     process,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -260,6 +260,71 @@ fn routine_parameter_schema_rejects_duplicates_and_type_incompatible_validation(
             .to_string()
             .contains("supported only for string")
     );
+}
+
+#[test]
+fn compact_and_continue_contract_materializes_strictly() {
+    let source = include_str!("../../../resources/routines/compact-and-continue.yaml");
+    assert_eq!(
+        source,
+        include_str!("../../../../../docs/examples/routines/compact-and-continue.yaml")
+    );
+    let routine = materialize_routine(source, "routines/compact-and-continue.yaml").unwrap();
+    assert_eq!(
+        routine.spec.params[0].default,
+        Some(RoutineScalar::Boolean(false))
+    );
+    assert!(routine.spec.triggers[1].session_lifecycle.is_some());
+    assert!(
+        routine
+            .spec
+            .source_session
+            .as_ref()
+            .unwrap()
+            .pause
+            .is_some()
+    );
+    assert_eq!(
+        routine.spec.tasks[0].task_spec.features.as_deref(),
+        Some([].as_slice())
+    );
+    assert_eq!(
+        routine.spec.tasks[0].task_spec.permissions.as_deref(),
+        Some([].as_slice())
+    );
+    assert!(
+        routine.spec.tasks[1]
+            .task_spec
+            .action
+            .as_ref()
+            .unwrap()
+            .session_mask
+            .is_some()
+    );
+    assert!(
+        routine.spec.tasks[2]
+            .task_spec
+            .action
+            .as_ref()
+            .unwrap()
+            .session_continue
+            .is_some()
+    );
+
+    for invalid in [
+        source.replace("      default: false", "      default: compact"),
+        source.replace("      default: false", "      required: true\n      default: false"),
+        source.replace("    pause:\n      submissions: queue", "    snapshot:\n      throughCursor: $(trigger.session.latestCompletedCursor)\n    pause:\n      submissions: queue"),
+        source.replace("      submissions: queue", "      submissions: reject"),
+        source.replace("            atomic: true", "            atomic: false"),
+        source.replace("                  onOverlap: reject", "                  onOverlap: merge"),
+        source.replace("            fromCursor: $(tasks.apply-mask.results.mask-cursor)", "            fromCursor: $(action.sessionMask.cursor)"),
+    ] {
+        assert!(
+            materialize_routine(&invalid, "routines/compact-and-continue.yaml").is_err(),
+            "invalid compact-and-continue variant materialized:\n{invalid}"
+        );
+    }
 }
 
 fn mixed_trigger_routine() -> &'static str {

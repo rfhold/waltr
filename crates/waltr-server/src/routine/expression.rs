@@ -20,57 +20,92 @@ pub(super) fn conditions_match(
     context: &RoutineInvocationContext,
     task_results: &BTreeMap<String, BTreeMap<String, Value>>,
 ) -> bool {
-    conditions.iter().all(|condition| {
-        let (input, operator, values) = match condition {
-            RoutineCondition::Input(condition) => {
-                let input = match substitute_scalar(
-                    &condition.input,
-                    context,
-                    task_results,
-                    None,
-                    None,
-                ) {
-                    Ok(value) if scalar(&value) => value,
-                    Ok(_) | Err(_) => {
-                        tracing::debug!(
-                            error_class = "condition_input",
-                            "routine condition did not resolve to a scalar"
-                        );
-                        return false;
-                    }
-                };
-                (input, condition.operator, &condition.values)
-            }
-            RoutineCondition::Metadata(condition) => {
-                let Some(metadata) = context
-                    .event
-                    .as_ref()
-                    .and_then(|event| event.data.get("session"))
-                    .and_then(|session| session.get("metadata"))
-                    .and_then(Value::as_object)
-                else {
+    conditions
+        .iter()
+        .all(|condition| condition_matches(condition, context, task_results))
+}
+
+fn condition_matches(
+    condition: &RoutineCondition,
+    context: &RoutineInvocationContext,
+    task_results: &BTreeMap<String, BTreeMap<String, Value>>,
+) -> bool {
+    if let RoutineCondition::Any(condition) = condition {
+        return condition
+            .any
+            .iter()
+            .any(|condition| condition_matches(condition, context, task_results));
+    }
+    let (input, operator, values) = match condition {
+        RoutineCondition::Input(condition) => {
+            let input = match substitute_scalar(&condition.input, context, task_results, None, None)
+            {
+                Ok(value) if scalar(&value) => value,
+                Ok(_) | Err(_) => {
+                    tracing::debug!(
+                        error_class = "condition_input",
+                        "routine condition did not resolve to a scalar"
+                    );
                     return false;
-                };
-                (
-                    metadata
-                        .get(&condition.metadata.key)
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                    condition.metadata.operator,
-                    &condition.metadata.values,
-                )
-            }
+                }
+            };
+            (input, condition.operator, &condition.values)
+        }
+        RoutineCondition::Metadata(condition) => {
+            let Some(metadata) = context
+                .event
+                .as_ref()
+                .and_then(|event| event.data.get("session"))
+                .and_then(|session| session.get("metadata"))
+                .and_then(Value::as_object)
+            else {
+                return false;
+            };
+            (
+                metadata
+                    .get(&condition.metadata.key)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                condition.metadata.operator,
+                &condition.metadata.values,
+            )
+        }
+        RoutineCondition::Any(_) => unreachable!("handled above"),
+    };
+    if operator == RoutineConditionOperator::GreaterThanOrEqual {
+        let Some(input) = numeric_value(&input) else {
+            return false;
         };
-        let found = values.iter().any(|candidate| {
+        return values.first().is_some_and(|candidate| {
             substitute_scalar(candidate, context, task_results, None, None)
                 .ok()
-                .is_some_and(|candidate| scalar_equal(&input, &candidate))
+                .and_then(|candidate| numeric_value(&candidate))
+                .is_some_and(|candidate| input >= candidate)
         });
-        match operator {
-            RoutineConditionOperator::In => found,
-            RoutineConditionOperator::NotIn => !found,
+    }
+    let found = values.iter().any(|candidate| {
+        substitute_scalar(candidate, context, task_results, None, None)
+            .ok()
+            .is_some_and(|candidate| scalar_equal(&input, &candidate))
+    });
+    match operator {
+        RoutineConditionOperator::In => found,
+        RoutineConditionOperator::NotIn => !found,
+        RoutineConditionOperator::GreaterThanOrEqual => unreachable!("handled above"),
+    }
+}
+
+fn numeric_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(value) => value.as_u64(),
+        Value::String(value)
+            if value == "0"
+                || (!value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit())) =>
+        {
+            value.parse().ok()
         }
-    })
+        _ => None,
+    }
 }
 
 fn scalar_equal(left: &Value, right: &Value) -> bool {
@@ -104,6 +139,7 @@ pub(super) fn substitute_scalar(
 ) -> Result<Value, InvocationError> {
     let value = match scalar {
         RoutineScalar::Boolean(value) => Ok(Value::Bool(*value)),
+        RoutineScalar::Integer(value) => Ok(Value::Number((*value).into())),
         RoutineScalar::String(value) => whole_expression(value).map_or_else(
             || {
                 if value.contains("$(") {
@@ -261,6 +297,9 @@ fn resolve_reference(
     if let Some(path) = expression.strip_prefix("trigger.session.") {
         return resolve_path(&context.trigger["session"], path, expression);
     }
+    if let Some(path) = expression.strip_prefix("trigger.context.") {
+        return resolve_path(&context.trigger["context"], path, expression);
+    }
     if let Some(name) = expression.strip_prefix("params.") {
         return context.params.get(name).cloned().ok_or_else(|| {
             InvocationError::new("substitution", format!("missing parameter `{name}`"))
@@ -328,4 +367,65 @@ pub(super) fn scalar_string(value: &Value, description: &str) -> Result<String, 
             format!("{description} must be a string"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource_catalog::routine::{RoutineAnyCondition, RoutineInputCondition};
+    use serde_json::json;
+
+    fn context(percent: Value) -> RoutineInvocationContext {
+        RoutineInvocationContext {
+            event: None,
+            trigger: json!({"context": {"percent": percent}}),
+            params: BTreeMap::new(),
+            source: None,
+            source_values: Value::Null,
+        }
+    }
+
+    fn threshold(value: RoutineScalar) -> RoutineCondition {
+        RoutineCondition::Input(RoutineInputCondition {
+            input: RoutineScalar::String("$(trigger.context.percent)".to_owned()),
+            operator: RoutineConditionOperator::GreaterThanOrEqual,
+            values: vec![value],
+        })
+    }
+
+    #[test]
+    fn nested_any_and_numeric_comparison_are_strict() {
+        let condition = RoutineCondition::Any(RoutineAnyCondition {
+            any: vec![
+                threshold(RoutineScalar::String("80".to_owned())),
+                threshold(RoutineScalar::Integer(90)),
+            ],
+        });
+        let results = BTreeMap::new();
+        assert!(conditions_match(
+            &[condition.clone()],
+            &context(json!(80)),
+            &results
+        ));
+        assert!(conditions_match(
+            &[condition.clone()],
+            &context(json!("90")),
+            &results
+        ));
+        assert!(!conditions_match(
+            &[condition.clone()],
+            &context(Value::Null),
+            &results
+        ));
+        assert!(!conditions_match(
+            &[condition.clone()],
+            &context(json!("080")),
+            &results
+        ));
+        assert!(!conditions_match(
+            &[condition],
+            &context(json!("18446744073709551616")),
+            &results
+        ));
+    }
 }
