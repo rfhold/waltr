@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use waltr::grpc::waltr::session::v1::timeline_content;
+use waltr::grpc::waltr::session::v1::{
+    ProjectedTimelineEvent, SyntheticTimelineEvent, TimelinePresentation, projected_timeline_event,
+    timeline_content,
+};
 
 use crate::{
     AuthenticationFailureSnapshot, InferenceProviderSettings, InferenceSettings,
@@ -250,12 +253,92 @@ pub struct TimestampView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTimelineView {
-    /// Persisted timeline events ordered by cursor.
-    pub events: Vec<TimelineEventView>,
+    /// Already-projected timeline entries ordered by server cursor.
+    pub events: Vec<ProjectedTimelineEntryView>,
+    /// Revision of the current effective projection.
+    pub projection_revision: Option<u64>,
+    /// Raw page boundary for the next effective backward request.
+    pub raw_page_boundary: Option<u64>,
+    /// Whether another effective backward page is available.
+    pub has_more: bool,
     /// Timeline page load operation snapshot.
     pub load: crate::OperationSnapshot,
     /// Timeline watch operation snapshot.
     pub watch: crate::OperationSnapshot,
+}
+
+/// Stable already-projected timeline entry.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "entryKind", rename_all = "camelCase")]
+pub enum ProjectedTimelineEntryView {
+    /// Durable timeline entry retaining the existing action-capable view.
+    Durable {
+        identity: String,
+        presentation: TimelinePresentationView,
+        event: TimelineEventView,
+    },
+    /// Synthetic projected entry without durable item or action identity.
+    Synthetic {
+        identity: String,
+        presentation: TimelinePresentationView,
+        event: SyntheticTimelineEventView,
+    },
+}
+
+impl ProjectedTimelineEntryView {
+    /// Return the server ordering cursor without implying durable action support.
+    #[must_use]
+    pub const fn ordering_cursor(&self) -> u64 {
+        match self {
+            Self::Durable { event, .. } => event.cursor,
+            Self::Synthetic { event, .. } => event.ordering_cursor,
+        }
+    }
+
+    /// Return the durable action-capable event, when this entry is durable.
+    #[must_use]
+    pub const fn durable_event(&self) -> Option<&TimelineEventView> {
+        match self {
+            Self::Durable { event, .. } => Some(event),
+            Self::Synthetic { .. } => None,
+        }
+    }
+
+    /// Return the synthetic presentation-only event, when projected by the server.
+    #[must_use]
+    pub const fn synthetic_event(&self) -> Option<&SyntheticTimelineEventView> {
+        match self {
+            Self::Durable { .. } => None,
+            Self::Synthetic { event, .. } => Some(event),
+        }
+    }
+}
+
+/// Stable presentation selected by the server projection.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum TimelinePresentationView {
+    Unspecified,
+    Durable,
+    MaskReplacement,
+    Unknown,
+}
+
+/// Stable synthetic event without durable action fields.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SyntheticTimelineEventView {
+    /// Server ordering position; this is not a durable action cursor.
+    pub ordering_cursor: u64,
+    pub session_id: String,
+    pub turn: u64,
+    pub kind: TimelineEventKindView,
+    pub channel: String,
+    pub content: TimelineContentView,
+    pub status: TimelineStatusView,
 }
 
 /// Stable timeline event view shared by Waltr shells.
@@ -566,6 +649,51 @@ impl From<TimelineEvent> for TimelineEventView {
     }
 }
 
+impl TryFrom<ProjectedTimelineEvent> for ProjectedTimelineEntryView {
+    type Error = ();
+
+    fn try_from(entry: ProjectedTimelineEvent) -> Result<Self, Self::Error> {
+        let presentation = TimelinePresentationView::from(entry.presentation);
+        match entry.event.ok_or(())? {
+            projected_timeline_event::Event::Durable(event) => Ok(Self::Durable {
+                identity: format!("durable:{}:{}", event.cursor, event.item_id),
+                presentation,
+                event: event.into(),
+            }),
+            projected_timeline_event::Event::Synthetic(event) => Ok(Self::Synthetic {
+                identity: format!("mask:{}", entry.mask_id.ok_or(())?),
+                presentation,
+                event: event.into(),
+            }),
+        }
+    }
+}
+
+impl From<i32> for TimelinePresentationView {
+    fn from(value: i32) -> Self {
+        match TimelinePresentation::try_from(value) {
+            Ok(TimelinePresentation::Unspecified) => Self::Unspecified,
+            Ok(TimelinePresentation::Durable) => Self::Durable,
+            Ok(TimelinePresentation::MaskReplacement) => Self::MaskReplacement,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<SyntheticTimelineEvent> for SyntheticTimelineEventView {
+    fn from(event: SyntheticTimelineEvent) -> Self {
+        Self {
+            ordering_cursor: event.cursor,
+            session_id: event.session_id,
+            turn: event.turn,
+            kind: event.kind.into(),
+            channel: event.channel,
+            content: event.content.map_or(TimelineContentView::Empty, Into::into),
+            status: event.status.into(),
+        }
+    }
+}
+
 impl From<TimelineContent> for TimelineContentView {
     fn from(content: TimelineContent) -> Self {
         match content.content {
@@ -822,6 +950,39 @@ mod tests {
 
         assert_eq!(idle.suspension_kind, None);
         assert_eq!(suspended_without_detail.suspension_kind, None);
+    }
+
+    #[test]
+    fn synthetic_projection_has_distinct_identity_and_no_durable_action_event() {
+        let entry = ProjectedTimelineEntryView::try_from(ProjectedTimelineEvent {
+            presentation: TimelinePresentation::MaskReplacement as i32,
+            mask_id: Some("mask-42".to_owned()),
+            event: Some(projected_timeline_event::Event::Synthetic(
+                SyntheticTimelineEvent {
+                    cursor: 9,
+                    session_id: "session".to_owned(),
+                    turn: 2,
+                    channel: "user_text".to_owned(),
+                    ..SyntheticTimelineEvent::default()
+                },
+            )),
+        })
+        .expect("valid synthetic projection");
+
+        assert!(entry.durable_event().is_none());
+        assert_eq!(entry.ordering_cursor(), 9);
+        assert!(matches!(
+            entry,
+            ProjectedTimelineEntryView::Synthetic {
+                identity,
+                presentation: TimelinePresentationView::MaskReplacement,
+                ..
+            } if identity == "mask:mask-42"
+        ));
+        assert_eq!(
+            TimelinePresentationView::from(i32::MAX),
+            TimelinePresentationView::Unknown
+        );
     }
 
     fn proto_value(kind: Kind) -> prost_types::Value {

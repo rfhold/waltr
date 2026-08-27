@@ -138,6 +138,9 @@ export function operationSnapshot(status: string): OperationSnapshot {
 export function readySessionTimeline(): SessionTimelineView {
   return {
     events: [],
+    projectionRevision: null,
+    rawPageBoundary: null,
+    hasMore: false,
     load: operationSnapshot("ready"),
     watch: operationSnapshot("opened"),
   };

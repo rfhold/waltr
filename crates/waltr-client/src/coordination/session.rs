@@ -147,19 +147,52 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             state.set_session_list_failed(error.to_string());
             ClientUpdate::default()
         }
-        SessionEvent::TimelineRequested { session_id, query } => {
-            state.set_session_timeline_load_loading(&session_id);
+        SessionEvent::TimelineRequested {
+            session_id,
+            query,
+            projection_mode,
+        } => {
+            let (request_id, baseline_mode, baseline_revision) =
+                state.set_session_timeline_load_loading(&session_id);
             ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::GetTimeline {
                 session_id,
+                request_id,
+                baseline_mode,
+                baseline_revision,
                 query,
+                projection_mode,
             }))
         }
-        SessionEvent::TimelineLoaded { session_id, events } => {
-            state.set_session_timeline_load_ready(&session_id, events);
+        SessionEvent::TimelineLoaded {
+            session_id,
+            request_id,
+            baseline_mode,
+            baseline_revision,
+            page,
+        } => {
+            state.set_session_timeline_load_ready(
+                &session_id,
+                request_id,
+                baseline_mode,
+                baseline_revision,
+                page,
+            );
             ClientUpdate::default()
         }
-        SessionEvent::TimelineLoadFailed { session_id, error } => {
-            state.set_session_timeline_load_failed(&session_id, error.to_string());
+        SessionEvent::TimelineLoadFailed {
+            session_id,
+            request_id,
+            baseline_mode,
+            baseline_revision,
+            error,
+        } => {
+            state.set_session_timeline_load_failed(
+                &session_id,
+                request_id,
+                baseline_mode,
+                baseline_revision,
+                error.to_string(),
+            );
             ClientUpdate::default()
         }
         SessionEvent::TemplatesSearchRequested {
@@ -237,8 +270,15 @@ pub fn reduce(state: &mut ClientState, event: SessionEvent) -> ClientUpdate {
             after_cursor,
             channels,
             initial_limit,
+            projection_mode,
         } => {
-            let key = TimelineWatchKey::new(session_id, after_cursor, channels, initial_limit);
+            let key = TimelineWatchKey::new_with_projection(
+                session_id,
+                after_cursor,
+                channels,
+                initial_limit,
+                projection_mode,
+            );
             state.configure_session_timeline_watch(key.clone());
             maintain_timeline_watch(state, &key)
         }
@@ -496,7 +536,8 @@ pub fn maintain_timeline_watch(state: &mut ClientState, key: &TimelineWatchKey) 
         return ClientUpdate::default();
     }
 
-    let Some((after_cursor, channels, initial_limit)) = state.session_timeline_watch_request(key)
+    let Some((after_cursor, channels, initial_limit, projection_mode)) =
+        state.session_timeline_watch_request(key)
     else {
         return ClientUpdate::default();
     };
@@ -505,11 +546,12 @@ pub fn maintain_timeline_watch(state: &mut ClientState, key: &TimelineWatchKey) 
         return ClientUpdate::default();
     };
     ClientUpdate::with_effect(ClientEffect::Session(SessionEffect::WatchTimeline {
-        key: TimelineWatchKey::new(
+        key: TimelineWatchKey::new_with_projection(
             key.session_id.clone(),
             after_cursor,
             channels,
             initial_limit,
+            projection_mode,
         ),
         open_id,
     }))

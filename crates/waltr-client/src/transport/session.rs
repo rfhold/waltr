@@ -5,9 +5,10 @@ use futures_util::StreamExt;
 use waltr::grpc::waltr::session::v1::{
     AgentSelectionRequest, ContinueSessionRequest, CreateSessionRequest, DeleteSessionRequest,
     GetTimelineRequest, InferenceSettingsRequest, InterruptSessionRequest, ListAgentsRequest,
-    ListAgentsResponse, ListSessionsRequest, RespondExternalRequestRequest, RollbackSessionRequest,
-    RollbackTarget, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary,
-    SubmitUserMessageRequest, TimelineEvent, TimelineQuery, TimelineTruncation,
+    ListAgentsResponse, ListSessionsRequest, ProjectedTimelineEvent, RespondExternalRequestRequest,
+    RollbackSessionRequest, RollbackTarget, SearchSessionTemplatesRequest,
+    SearchSessionTemplatesResponse, SessionSummary, SubmitUserMessageRequest, TimelineEvent,
+    TimelineProjectionMetadata, TimelineProjectionMode, TimelineQuery, TimelineTruncation,
     UpdateSessionAgentRequest, UpdateSessionInferenceSettingsRequest, WatchSessionsRequest,
     WatchSessionsResponse, WatchTimelineRequest, WatchTimelineResponse, WipeSessionsRequest,
     watch_sessions_response, watch_timeline_response,
@@ -23,6 +24,36 @@ pub type SessionWatchStream = Pin<Box<dyn Stream<Item = Result<SessionWatchUpdat
 /// Stream returned by timeline watch transports.
 pub type SessionTimelineWatchStream =
     Pin<Box<dyn Stream<Item = Result<SessionTimelineWatchUpdate, ClientError>>>>;
+
+/// Timeline projection mode requested from the server.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SessionTimelineProjectionMode {
+    /// Preserve the durable timeline contract.
+    #[default]
+    Raw,
+    /// Request the server-projected provider-visible timeline.
+    Effective,
+}
+
+impl From<SessionTimelineProjectionMode> for i32 {
+    fn from(mode: SessionTimelineProjectionMode) -> Self {
+        match mode {
+            SessionTimelineProjectionMode::Raw => TimelineProjectionMode::Raw as Self,
+            SessionTimelineProjectionMode::Effective => TimelineProjectionMode::Effective as Self,
+        }
+    }
+}
+
+/// One timeline page returned by the transport.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionTimelinePage {
+    /// Projection mode represented by this page.
+    pub projection_mode: SessionTimelineProjectionMode,
+    /// Already-projected entries in server order.
+    pub entries: Vec<ProjectedTimelineEvent>,
+    /// Projection metadata supplied for effective requests.
+    pub projection: Option<TimelineProjectionMetadata>,
+}
 
 /// Internal session watch update from the transport layer.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +95,15 @@ pub enum SessionTimelineWatchEvent {
     Event(TimelineEvent),
     /// Visible timeline events after this cursor were removed.
     Truncated(TimelineTruncation),
+    /// One event in an effective projection.
+    ProjectedEvent(ProjectedTimelineEvent),
+    /// Authoritative replacement of the effective projection.
+    ProjectionReset {
+        /// Complete replacement entries.
+        entries: Vec<ProjectedTimelineEvent>,
+        /// Projection revision and pagination state.
+        projection: Option<TimelineProjectionMetadata>,
+    },
 }
 
 #[allow(
@@ -319,7 +359,8 @@ pub(super) async fn get_timeline<T>(
     transport: &T,
     session_id: String,
     query: Option<TimelineQuery>,
-) -> Result<Vec<TimelineEvent>, ClientError>
+    projection_mode: SessionTimelineProjectionMode,
+) -> Result<SessionTimelinePage, ClientError>
 where
     T: RemoteTransport,
     T::Inner: tonic::client::GrpcService<tonic::body::Body>,
@@ -333,12 +374,34 @@ where
     let response = transport
         .session_client(&credentials)
         .await?
-        .get_timeline(GetTimelineRequest { session_id, query })
+        .get_timeline(GetTimelineRequest {
+            session_id,
+            query,
+            projection_mode: projection_mode.into(),
+        })
         .await
         .map_err(|error| status_error(&error, &credentials))?
         .into_inner();
 
-    Ok(response.events)
+    let entries = match projection_mode {
+        SessionTimelineProjectionMode::Raw => response
+            .events
+            .into_iter()
+            .map(|event| ProjectedTimelineEvent {
+                presentation: waltr::grpc::waltr::session::v1::TimelinePresentation::Durable as i32,
+                mask_id: None,
+                event: Some(
+                    waltr::grpc::waltr::session::v1::projected_timeline_event::Event::Durable(event),
+                ),
+            })
+            .collect(),
+        SessionTimelineProjectionMode::Effective => response.projected_events,
+    };
+    Ok(SessionTimelinePage {
+        projection_mode,
+        entries,
+        projection: response.projection,
+    })
 }
 
 #[allow(
@@ -351,6 +414,7 @@ pub(super) async fn watch_timeline<T>(
     after_cursor: Option<u64>,
     channels: Vec<String>,
     initial_limit: Option<u32>,
+    projection_mode: SessionTimelineProjectionMode,
 ) -> Result<SessionTimelineWatchStream, ClientError>
 where
     T: RemoteTransport,
@@ -371,6 +435,7 @@ where
             after_cursor,
             channels,
             initial_limit,
+            projection_mode: projection_mode.into(),
         })
         .await
         .map_err(|error| status_error(&error, &credentials))?
@@ -614,6 +679,15 @@ fn timeline_watch_update(
         }
         Some(watch_timeline_response::Update::Truncation(truncation)) => {
             SessionTimelineWatchEvent::Truncated(truncation)
+        }
+        Some(watch_timeline_response::Update::ProjectedEvent(event)) => {
+            SessionTimelineWatchEvent::ProjectedEvent(event)
+        }
+        Some(watch_timeline_response::Update::ProjectionReset(reset)) => {
+            SessionTimelineWatchEvent::ProjectionReset {
+                entries: reset.events,
+                projection: reset.projection,
+            }
         }
         None => {
             return Err(tonic::Status::data_loss(

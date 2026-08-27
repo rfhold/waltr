@@ -827,6 +827,10 @@
   border-left-color: var(--color-accent);
 }
 
+.sessions__timeline-item--mask-replacement {
+  border-left-color: var(--color-success);
+}
+
 .sessions__timeline-item--thinking {
   color: var(--color-text-subtle);
 }

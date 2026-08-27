@@ -2309,15 +2309,47 @@ impl ClientStateStream {
                 cursor,
                 limit,
                 channels,
-            } => self.runtime.reducer.request_session_timeline(
-                session_id,
-                Some(TimelineQuery {
-                    direction: timeline_direction(direction) as i32,
-                    cursor,
-                    limit,
-                    channels,
-                }),
-            ),
+            } => {
+                let timeline = self
+                    .runtime
+                    .reducer
+                    .state()
+                    .sessions
+                    .timelines
+                    .get(&session_id);
+                if direction == ClientTimelineDirection::Backward
+                    && timeline.is_some_and(|timeline| {
+                        timeline.projection_mode == crate::SessionTimelineProjectionMode::Effective
+                            && timeline.projection_revision.is_some()
+                            && !timeline.has_more
+                    })
+                {
+                    return ClientUpdate::default();
+                }
+                let cursor = if direction == ClientTimelineDirection::Backward {
+                    match timeline.filter(|timeline| {
+                        timeline.projection_mode == crate::SessionTimelineProjectionMode::Effective
+                            && timeline.projection_revision.is_some()
+                    }) {
+                        Some(timeline) => timeline.raw_page_boundary,
+                        None => cursor,
+                    }
+                } else {
+                    cursor
+                };
+                self.runtime
+                    .reducer
+                    .request_session_timeline_with_projection(
+                        session_id.clone(),
+                        Some(TimelineQuery {
+                            direction: timeline_direction(direction) as i32,
+                            cursor,
+                            limit,
+                            channels,
+                        }),
+                        crate::SessionTimelineProjectionMode::Effective,
+                    )
+            }
             ClientCommand::RegisterSessionTimelineWatchInterest {
                 session_id,
                 after_cursor,
@@ -2326,11 +2358,12 @@ impl ClientStateStream {
             } => self
                 .runtime
                 .reducer
-                .register_session_timeline_watch_interest(
+                .register_session_timeline_watch_interest_with_projection(
                     session_id,
                     after_cursor,
                     channels,
                     initial_limit,
+                    crate::SessionTimelineProjectionMode::Effective,
                 ),
             ClientCommand::ReleaseSessionTimelineWatchInterest { session_id } => {
                 let update = self
@@ -2394,6 +2427,7 @@ impl ClientStateStream {
                             key.after_cursor,
                             key.channels.clone(),
                             key.initial_limit,
+                            key.projection_mode,
                         )
                         .await;
                     ExecutedEffect::TimelineWatch {
@@ -3030,7 +3064,19 @@ impl ClientSnapshot {
                         (
                             session_id.clone(),
                             SessionTimelineView {
-                                events: timeline.events.values().cloned().map(Into::into).collect(),
+                                events: {
+                                    let mut entries = timeline
+                                        .entries
+                                        .values()
+                                        .cloned()
+                                        .filter_map(|entry| entry.try_into().ok())
+                                        .collect::<Vec<crate::ProjectedTimelineEntryView>>();
+                                    entries.sort_by_key(|entry| entry.ordering_cursor());
+                                    entries
+                                },
+                                projection_revision: timeline.projection_revision,
+                                raw_page_boundary: timeline.raw_page_boundary,
+                                has_more: timeline.has_more,
                                 load: OperationSnapshot::from_state(&timeline.load),
                                 watch: OperationSnapshot::from_parts(
                                     timeline.watch.status,
@@ -3910,6 +3956,7 @@ mod tests {
                 after_cursor: key.after_cursor,
                 channels: key.channels.clone(),
                 initial_limit: key.initial_limit,
+                projection_mode: key.projection_mode,
             },
         ));
         runtime
@@ -3990,8 +4037,8 @@ mod tests {
             .get("session")
             .expect("timeline should exist");
 
-        assert!(timeline.events.contains_key(&1));
-        assert!(timeline.events.contains_key(&100));
+        assert!(timeline.entries.contains_key("durable:1:i1"));
+        assert!(timeline.entries.contains_key("durable:100:i100"));
     }
 
     #[tokio::test]
@@ -4392,7 +4439,11 @@ mod tests {
                 access_generation: 0,
                 effect: ClientEffect::Session(SessionEffect::GetTimeline {
                     session_id: "session".to_owned(),
+                    request_id: 0,
+                    baseline_mode: crate::SessionTimelineProjectionMode::Raw,
+                    baseline_revision: None,
                     query: None,
+                    projection_mode: crate::SessionTimelineProjectionMode::Raw,
                 }),
             },
             QueuedEffect {
@@ -4819,11 +4870,12 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn timeline_interest_replacement_cancels_old_open_and_queues_only_new_key() {
         let mut stream = ready_state_stream();
-        let old_key = TimelineWatchKey::new(
+        let old_key = TimelineWatchKey::new_with_projection(
             "session".to_owned(),
             Some(1),
             vec!["old".to_owned()],
             Some(5),
+            crate::SessionTimelineProjectionMode::Effective,
         );
         stream
             .begin_command(ClientCommand::RegisterSessionTimelineWatchInterest {
@@ -4960,7 +5012,11 @@ mod tests {
 
         assert!(matches!(
             update.effects(),
-            [ClientEffect::Session(SessionEffect::GetTimeline { query, .. })]
+            [ClientEffect::Session(SessionEffect::GetTimeline {
+                query,
+                projection_mode: crate::SessionTimelineProjectionMode::Effective,
+                ..
+            })]
                 if query.as_ref().is_some_and(|query| {
                     query.direction == TimelineDirection::Backward as i32
                         && query.cursor == Some(42)
@@ -4968,6 +5024,76 @@ mod tests {
                         && query.channels == ["tool_result"]
                 })
         ));
+
+        runtime
+            .runtime
+            .reducer
+            .apply(ClientEvent::Session(SessionEvent::TimelineLoaded {
+                session_id: "session".to_owned(),
+                request_id: 0,
+                baseline_mode: crate::SessionTimelineProjectionMode::Raw,
+                baseline_revision: None,
+                page: crate::SessionTimelinePage {
+                    projection_mode: crate::SessionTimelineProjectionMode::Effective,
+                    entries: Vec::new(),
+                    projection: Some(crate::TimelineProjectionMetadata {
+                        revision: 2,
+                        raw_page_boundary: Some(7),
+                        has_more: true,
+                    }),
+                },
+            }));
+        let update = runtime.begin_timeline_command(ClientCommand::RequestSessionTimeline {
+            session_id: "session".to_owned(),
+            direction: ClientTimelineDirection::Backward,
+            cursor: Some(1),
+            limit: 25,
+            channels: Vec::new(),
+        });
+        assert!(matches!(
+            update.effects(),
+            [ClientEffect::Session(SessionEffect::GetTimeline { query, .. })]
+                if query.as_ref().is_some_and(|query| query.cursor == Some(7))
+        ));
+    }
+
+    #[test]
+    fn overlapping_runtime_timeline_pages_get_distinct_identity_and_same_baseline() {
+        let mut runtime = ClientStateStream {
+            runtime: ClientRuntime::for_endpoint("http://127.0.0.1:0"),
+            phase: ClientStateStreamPhase::Ready,
+            effects: Vec::new(),
+            in_flight: None,
+            sleep: Rc::new(|delay_ms| Box::pin(no_sleep(delay_ms))),
+        };
+        let command = || ClientCommand::RequestSessionTimeline {
+            session_id: "session".to_owned(),
+            direction: ClientTimelineDirection::Backward,
+            cursor: None,
+            limit: 25,
+            channels: Vec::new(),
+        };
+
+        let first = runtime.begin_timeline_command(command());
+        let second = runtime.begin_timeline_command(command());
+        let descriptor = |update: &ClientUpdate| match update.effects() {
+            [
+                ClientEffect::Session(SessionEffect::GetTimeline {
+                    request_id,
+                    baseline_mode,
+                    baseline_revision,
+                    ..
+                }),
+            ] => (*request_id, *baseline_mode, *baseline_revision),
+            effects => panic!("unexpected timeline effects: {effects:?}"),
+        };
+        let first = descriptor(&first);
+        let second = descriptor(&second);
+
+        assert!(second.0 > first.0);
+        assert_eq!(first.1, crate::SessionTimelineProjectionMode::Raw);
+        assert_eq!(first.1, second.1);
+        assert_eq!(first.2, second.2);
     }
 
     async fn no_sleep(_: u64) {}
@@ -5019,6 +5145,7 @@ mod tests {
                 after_cursor: key.after_cursor,
                 channels: key.channels.clone(),
                 initial_limit: key.initial_limit,
+                projection_mode: key.projection_mode,
             },
         ));
         runtime

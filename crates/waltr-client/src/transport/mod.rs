@@ -23,8 +23,9 @@ use waltr::grpc::waltr::status::v1::status_service_client::StatusServiceClient;
 use prost::Message;
 pub use routine::{RoutineDefinitionWatchStream, RoutineInvocationWatchStream};
 pub use session::{
-    SessionTimelineWatchEvent, SessionTimelineWatchStream, SessionTimelineWatchUpdate,
-    SessionWatchEvent, SessionWatchStream, SessionWatchUpdate,
+    SessionTimelinePage, SessionTimelineProjectionMode, SessionTimelineWatchEvent,
+    SessionTimelineWatchStream, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchStream,
+    SessionWatchUpdate,
 };
 pub use status::StatusWatchStream;
 use tonic::Code;
@@ -41,7 +42,7 @@ use crate::{
     ClientError, ClientRoutineInvocationDetail, ClientRoutineInvocationPage,
     ClientRoutineStartOutcome, InferenceSettingsRequest, ListAgentsResponse, ResourceWrite,
     RollbackTarget, SearchSessionTemplatesRequest, SearchSessionTemplatesResponse, SessionSummary,
-    StartManualRoutineArgs, TimelineEvent, TimelineQuery,
+    StartManualRoutineArgs, TimelineQuery,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -162,7 +163,8 @@ pub trait WaltrTransport {
         &self,
         session_id: String,
         query: Option<TimelineQuery>,
-    ) -> impl Future<Output = Result<Vec<TimelineEvent>, ClientError>>;
+        projection_mode: SessionTimelineProjectionMode,
+    ) -> impl Future<Output = Result<SessionTimelinePage, ClientError>>;
 
     /// Subscribe to timeline changes for one session.
     fn watch_timeline(
@@ -171,6 +173,7 @@ pub trait WaltrTransport {
         after_cursor: Option<u64>,
         channels: Vec<String>,
         initial_limit: Option<u32>,
+        projection_mode: SessionTimelineProjectionMode,
     ) -> impl Future<Output = Result<SessionTimelineWatchStream, ClientError>>;
 
     /// Search session templates visible to one session.
@@ -432,8 +435,9 @@ where
         &self,
         session_id: String,
         query: Option<TimelineQuery>,
-    ) -> Result<Vec<TimelineEvent>, ClientError> {
-        session::get_timeline(self, session_id, query).await
+        projection_mode: SessionTimelineProjectionMode,
+    ) -> Result<SessionTimelinePage, ClientError> {
+        session::get_timeline(self, session_id, query, projection_mode).await
     }
 
     async fn watch_timeline(
@@ -442,8 +446,17 @@ where
         after_cursor: Option<u64>,
         channels: Vec<String>,
         initial_limit: Option<u32>,
+        projection_mode: SessionTimelineProjectionMode,
     ) -> Result<SessionTimelineWatchStream, ClientError> {
-        session::watch_timeline(self, session_id, after_cursor, channels, initial_limit).await
+        session::watch_timeline(
+            self,
+            session_id,
+            after_cursor,
+            channels,
+            initial_limit,
+            projection_mode,
+        )
+        .await
     }
 
     async fn search_session_templates(

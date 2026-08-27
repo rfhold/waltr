@@ -112,10 +112,15 @@ message SessionListCleared {}
 message GetTimelineRequest {
   string session_id = 1;
   TimelineQuery query = 2;
+  TimelineProjectionMode projection_mode = 3;
 }
 
 message GetTimelineResponse {
+  // Populated for raw requests for compatibility with existing clients.
   repeated TimelineEvent events = 1;
+  // Populated for effective requests. Synthetic entries have no durable item identity.
+  repeated ProjectedTimelineEvent projected_events = 2;
+  TimelineProjectionMetadata projection = 3;
 }
 
 message WatchTimelineRequest {
@@ -129,6 +134,8 @@ message WatchTimelineRequest {
 
   // Optional backward history batch emitted before catch-up and live updates.
   optional uint32 initial_limit = 4;
+
+  TimelineProjectionMode projection_mode = 5;
 }
 
 message WatchTimelineResponse {
@@ -136,7 +143,52 @@ message WatchTimelineResponse {
   oneof update {
     TimelineEvent event = 2;
     TimelineTruncation truncation = 3;
+    ProjectedTimelineEvent projected_event = 4;
+    TimelineProjectionReset projection_reset = 5;
   }
+}
+
+enum TimelineProjectionMode {
+  TIMELINE_PROJECTION_MODE_UNSPECIFIED = 0;
+  TIMELINE_PROJECTION_MODE_RAW = 1;
+  TIMELINE_PROJECTION_MODE_EFFECTIVE = 2;
+}
+
+message TimelineProjectionMetadata {
+  uint64 revision = 1;
+  optional uint64 raw_page_boundary = 2;
+  bool has_more = 3;
+}
+
+enum TimelinePresentation {
+  TIMELINE_PRESENTATION_UNSPECIFIED = 0;
+  TIMELINE_PRESENTATION_DURABLE = 1;
+  TIMELINE_PRESENTATION_MASK_REPLACEMENT = 2;
+}
+
+message ProjectedTimelineEvent {
+  oneof event {
+    TimelineEvent durable = 1;
+    SyntheticTimelineEvent synthetic = 2;
+  }
+  TimelinePresentation presentation = 3;
+  // Opaque mask identity for a replacement presentation.
+  optional string mask_id = 4;
+}
+
+message SyntheticTimelineEvent {
+  uint64 cursor = 1;
+  string session_id = 2;
+  uint64 turn = 3;
+  TimelineEventKind kind = 4;
+  string channel = 5;
+  TimelineContent content = 6;
+  TimelineStatus status = 7;
+}
+
+message TimelineProjectionReset {
+  repeated ProjectedTimelineEvent events = 1;
+  TimelineProjectionMetadata projection = 2;
 }
 
 message TimelineTruncation {

@@ -16,6 +16,7 @@ const SURFACE: Color = Color::Rgb(15, 12, 23);
 const PANEL: Color = Color::Rgb(24, 20, 34);
 const FOOTER: Color = Color::Rgb(30, 20, 46);
 const FOCUS: Color = Color::Cyan;
+const MASK_REPLACEMENT: Color = Color::Rgb(45, 212, 191);
 
 /// Named status states that use semantic theme roles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +102,12 @@ impl Theme {
     #[must_use]
     pub const fn focus(self) -> Color {
         FOCUS
+    }
+
+    /// Turquoise-green accent for server-projected mask replacement messages.
+    #[must_use]
+    pub const fn mask_replacement(self) -> Color {
+        MASK_REPLACEMENT
     }
 
     /// Brand accent style.

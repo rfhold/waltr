@@ -234,6 +234,7 @@ async fn rollback_before_cursor_publishes_timeline_truncation()
     let mut watch = watch_client
         .watch_timeline(WatchTimelineRequest {
             session_id: session.id.clone(),
+            projection_mode: 0,
             after_cursor: Some(0),
             channels: Vec::new(),
             initial_limit: None,

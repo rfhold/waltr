@@ -483,8 +483,8 @@ function SessionDetail(props: { session: SessionView }) {
   let templateSearchDebounce: number | undefined;
   let previousTimelineItemKeys: string[] = [];
   let initialScrollSession: string | undefined;
-  let pendingHistoryCursor: SessionTimelineView["events"][number]["cursor"] | undefined;
-  let exhaustedHistoryCursor: SessionTimelineView["events"][number]["cursor"] | undefined;
+  let pendingHistoryCursor: bigint | undefined;
+  let exhaustedHistoryCursor: bigint | undefined;
   let followTail = true;
   let lastTimelineScrollTop: number | undefined;
   let viewportUpdateFrame: number | undefined;
@@ -498,7 +498,9 @@ function SessionDetail(props: { session: SessionView }) {
   const turnFooterItemIds = createMemo(() => {
     const lastByTurn = new Map<string, string>();
     for (const item of items()) {
-      lastByTurn.set(item.turn.toString(), item.id);
+      if (!isMaskReplacement(item)) {
+        lastByTurn.set(item.turn.toString(), item.id);
+      }
     }
     return new Set(lastByTurn.values());
   });
@@ -771,7 +773,7 @@ function SessionDetail(props: { session: SessionView }) {
       return;
     }
 
-    if (currentTimeline.events[0]?.cursor === requestedCursor) {
+    if (currentTimeline.rawPageBoundary === requestedCursor) {
       exhaustedHistoryCursor = requestedCursor;
     }
     scheduleHistoryShiftClear();
@@ -780,9 +782,9 @@ function SessionDetail(props: { session: SessionView }) {
   const loadOlderTimeline = async (options: { preserveAnchor: boolean } = { preserveAnchor: true }) => {
     const scroller = timelineScroll;
     const currentTimeline = timeline();
-    const earliestCursor = currentTimeline?.events[0]?.cursor;
+    const earliestCursor = currentTimeline?.rawPageBoundary ?? undefined;
 
-    if (!scroller || !currentTimeline || earliestCursor === undefined || pendingHistoryCursor !== undefined || exhaustedHistoryCursor === earliestCursor || currentTimeline.load.status === "loading") {
+    if (!scroller || !currentTimeline || !currentTimeline.hasMore || earliestCursor === undefined || pendingHistoryCursor !== undefined || exhaustedHistoryCursor === earliestCursor || currentTimeline.load.status === "loading") {
       return;
     }
 
@@ -1073,7 +1075,7 @@ function SessionDetail(props: { session: SessionView }) {
             }}
           >
             {(item) => (
-              <div class={`sessions__timeline-item sessions__timeline-item--${item.kind}`} data-timeline-item-key={timelineItemKey(item)}>
+              <div class={`sessions__timeline-item sessions__timeline-item--${item.kind}${isMaskReplacement(item) ? " sessions__timeline-item--mask-replacement" : ""}`} data-timeline-item-key={timelineItemKey(item)}>
                 <TimelineItem
                   item={item}
                   expandedShellOutputs={expandedShellOutputs()}
@@ -1211,7 +1213,7 @@ type TimelineItemModel =
   | TurnMetricsTimelineItem
   | ExternalPromptTimelineItem;
 
-type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string };
+type TextTimelineItem = { id: string; turn: bigint; cursor: bigint; kind: "user" | "assistant" | "thinking"; text: string; maskReplacement?: boolean };
 type TemplateTextPart = TemplatePlainTextPart | TemplateResultPart | TemplateErrorPart;
 type TemplatePlainTextPart = { kind: "text"; text: string };
 type TemplateResultPart = {
@@ -1674,7 +1676,7 @@ function TimelineItemActions(props: {
   onEditUserMessage: (item: TextTimelineItem) => Promise<void>;
 }) {
   const canReAnswer = () => isExternalPromptItem(props.item) && props.item.resolved && (props.item.kind === "permission" || props.item.kind === "question");
-  const userItem = () => (props.item.kind === "user" ? props.item : undefined);
+  const userItem = () => (props.item.kind === "user" && !isMaskReplacement(props.item) ? props.item : undefined);
 
   return (
     <Show when={props.showTurnActions || canReAnswer() || userItem()}>
@@ -1709,6 +1711,10 @@ function TimelineItemActions(props: {
       </footer>
     </Show>
   );
+}
+
+function isMaskReplacement(item: TimelineItemModel): item is TextTimelineItem & { maskReplacement: true } {
+  return item.kind === "user" && item.maskReplacement === true;
 }
 
 function TurnMetricsTimelineItemView(props: { item: TurnMetricsTimelineItem }) {
@@ -2207,7 +2213,23 @@ function timelineItems(timeline: SessionTimelineView | undefined): TimelineItemM
   const externalById = new Map<string, ExternalPromptTimelineItem>();
   const metricItems: TurnMetricsTimelineItem[] = [];
 
-  for (const event of timeline?.events ?? []) {
+  for (const entry of timeline?.events ?? []) {
+    if (entry.entryKind === "synthetic") {
+      const event = entry.event;
+      if (entry.presentation === "maskReplacement" && (event.content.kind === "textDelta" || event.content.kind === "textSnapshot")) {
+        items.push({
+          id: entry.identity,
+          turn: event.turn,
+          cursor: event.orderingCursor,
+          kind: "user",
+          text: event.content.kind === "textSnapshot" ? event.content.text : event.content.delta,
+          maskReplacement: true,
+        });
+      }
+      continue;
+    }
+
+    const event = entry.event;
     const channel = event.channel ?? "";
     switch (event.content.kind) {
       case "textDelta":

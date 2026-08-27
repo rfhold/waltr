@@ -49,10 +49,16 @@ async fn request_session_timeline_loads_seeded_events_through_client_state() {
         .expect("timeline should be present");
 
     assert_eq!(timeline.load.error, None);
-    assert_eq!(timeline.events[0].item_id, "i1");
-    assert_eq!(text_snapshot(&timeline.events[0].content), "hello");
-    assert_eq!(timeline.events[1].item_id, "i2");
-    assert_eq!(text_snapshot(&timeline.events[1].content), "hi there");
+    assert_eq!(durable(&timeline.events[0]).item_id, "i1");
+    assert_eq!(
+        text_snapshot(&durable(&timeline.events[0]).content),
+        "hello"
+    );
+    assert_eq!(durable(&timeline.events[1]).item_id, "i2");
+    assert_eq!(
+        text_snapshot(&durable(&timeline.events[1]).content),
+        "hi there"
+    );
 }
 
 #[tokio::test]
@@ -82,7 +88,10 @@ async fn timeline_watch_replays_seeded_events_through_client_state() {
             .get(&session_id)
             .is_some_and(|timeline| {
                 timeline.watch.status == "received"
-                    && timeline.events.iter().any(|event| event.item_id == "i2")
+                    && timeline
+                        .events
+                        .iter()
+                        .any(|entry| durable(entry).item_id == "i2")
             })
     })
     .await;
@@ -94,8 +103,11 @@ async fn timeline_watch_replays_seeded_events_through_client_state() {
 
     assert_eq!(timeline.watch.error, None);
     assert_eq!(timeline.events.len(), 1);
-    assert_eq!(timeline.events[0].item_id, "i2");
-    assert_eq!(text_snapshot(&timeline.events[0].content), "hi there");
+    assert_eq!(durable(&timeline.events[0]).item_id, "i2");
+    assert_eq!(
+        text_snapshot(&durable(&timeline.events[0]).content),
+        "hi there"
+    );
 
     let released = dispatch_stream_command(
         &mut stream,
@@ -113,7 +125,7 @@ async fn timeline_watch_replays_seeded_events_through_client_state() {
 }
 
 #[tokio::test]
-async fn timeline_watch_keeps_distinct_request_params_active() {
+async fn effective_timeline_watch_reset_is_authoritative_across_request_params() {
     let (endpoint, session_id) = server_endpoint_with_seeded_timeline(true)
         .await
         .expect("seeded server should start");
@@ -136,7 +148,12 @@ async fn timeline_watch_keeps_distinct_request_params_active() {
             .sessions
             .timelines
             .get(&session_id)
-            .is_some_and(|timeline| timeline.events.iter().any(|event| event.item_id == "i2"))
+            .is_some_and(|timeline| {
+                timeline
+                    .events
+                    .iter()
+                    .any(|entry| durable(entry).item_id == "i2")
+            })
     })
     .await;
 
@@ -158,8 +175,9 @@ async fn timeline_watch_keeps_distinct_request_params_active() {
             .timelines
             .get(&session_id)
             .is_some_and(|timeline| {
-                timeline.events.iter().any(|event| event.item_id == "i2")
-                    && timeline.events.iter().any(|event| event.item_id == "i1")
+                timeline.watch.status == "received"
+                    && timeline.events.len() == 1
+                    && durable(&timeline.events[0]).item_id == "i1"
             })
     })
     .await;
@@ -169,7 +187,7 @@ async fn timeline_watch_keeps_distinct_request_params_active() {
         .get(&session_id)
         .expect("timeline should be present");
 
-    assert_eq!(timeline.events.len(), 2);
+    assert_eq!(timeline.events.len(), 1);
     assert_eq!(timeline.watch.error, None);
 }
 
@@ -217,7 +235,7 @@ async fn rollback_before_cursor_truncates_timeline_through_client_state() {
             .timelines
             .get(&session_id)
             .is_some_and(|timeline| {
-                timeline.events.len() == 1 && timeline.events[0].item_id == "i1"
+                timeline.events.len() == 1 && durable(&timeline.events[0]).item_id == "i1"
             })
             && snapshot.operations.current.values().any(|operation| {
                 matches!(
@@ -237,8 +255,11 @@ async fn rollback_before_cursor_truncates_timeline_through_client_state() {
         .expect("timeline should be present");
 
     assert_eq!(timeline.watch.error, None);
-    assert_eq!(timeline.events[0].cursor, 1);
-    assert_eq!(text_snapshot(&timeline.events[0].content), "first prompt");
+    assert_eq!(durable(&timeline.events[0]).cursor, 1);
+    assert_eq!(
+        text_snapshot(&durable(&timeline.events[0]).content),
+        "first prompt"
+    );
 }
 
 #[tokio::test]
@@ -287,8 +308,9 @@ async fn rollback_to_open_external_request_restores_unresolved_prompt_through_cl
                 .get(&session_id)
                 .is_some_and(|timeline| {
                     timeline.events.len() == 1
-                        && timeline.events[0].kind == TimelineEventKindView::ExternalRequestOpened
-                        && timeline.events[0].status == Some(TimelineStatusView::Pending)
+                        && durable(&timeline.events[0]).kind
+                            == TimelineEventKindView::ExternalRequestOpened
+                        && durable(&timeline.events[0]).status == Some(TimelineStatusView::Pending)
                 });
         let session_suspended = snapshot.sessions.current.iter().any(|session| {
             session.id == session_id && session.status.phase == SessionPhaseView::Suspended
@@ -303,9 +325,9 @@ async fn rollback_to_open_external_request_restores_unresolved_prompt_through_cl
         .expect("timeline should be present");
 
     assert_eq!(timeline.watch.error, None);
-    assert_eq!(timeline.events[0].cursor, 1);
+    assert_eq!(durable(&timeline.events[0]).cursor, 1);
     assert!(matches!(
-        timeline.events[0].content,
+        durable(&timeline.events[0]).content,
         TimelineContentView::ExternalRequest { .. }
     ));
 }
@@ -355,4 +377,8 @@ fn text_snapshot(content: &TimelineContentView) -> &str {
         panic!("expected text snapshot content: {content:?}");
     };
     text
+}
+
+fn durable(entry: &waltr_client::ProjectedTimelineEntryView) -> &waltr_client::TimelineEventView {
+    entry.durable_event().expect("durable timeline entry")
 }

@@ -3,7 +3,7 @@ source: crates/waltr-tui/tests/server-backed/sessions.rs
 expression: "normalize_session_render(&rendered, &session_id)"
 ---
 " No timeline events yet.                                                        "
-" watch opened                                                                   "
+" watch received                                                                 "
 "                                                                                "
 "                                                                                "
 "                                                                                "

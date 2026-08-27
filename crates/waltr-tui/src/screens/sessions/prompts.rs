@@ -558,7 +558,7 @@ pub(super) fn render_prompt(
     ])
     .areas(area);
     let border_lines = (0..border_area.height)
-        .map(|_| Line::from(accent_border_span()))
+        .map(|_| Line::from(accent_border_span(false)))
         .collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(border_lines).style(panel_style()),
@@ -1011,7 +1011,10 @@ pub(super) fn current_external_prompt(
     let timeline = snapshot?.sessions.timelines.get(session_id?)?;
     let mut prompt = None;
 
-    for event in &timeline.events {
+    for entry in &timeline.events {
+        let Some(event) = entry.durable_event() else {
+            continue;
+        };
         if event.channel.as_deref() != Some("external_request") {
             continue;
         }

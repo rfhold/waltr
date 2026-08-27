@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor, within } from "@solidjs/testing-library";
 import { describe, expect, test, vi } from "vitest";
 
-import type { AuthenticationFailureSnapshot, ClientCommand, ClientRoutineInvocationSummary, ClientSnapshot, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
+import type { AuthenticationFailureSnapshot, ClientCommand, ClientRoutineInvocationSummary, ClientSnapshot, ProjectedTimelineEntryView, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, testHistory } from "../support/routes";
 import { emptyConfig, readySessionTimeline, sessionMetricsView, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
@@ -904,6 +904,7 @@ describe("sessions route", () => {
     });
 
     expect(screen.getByLabelText("Session activity status").textContent).toContain("provider unavailable");
+    expect(screen.getByLabelText("Session activity status").textContent).not.toContain("Paused");
     expect(screen.getByLabelText("Session status summary").textContent).not.toContain("Session failed.");
   });
 
@@ -1052,6 +1053,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-history"),
     ]);
     snapshot.sessions.timelines["session-history"] = readySessionTimeline();
+    snapshot.sessions.timelines["session-history"].rawPageBoundary = 10n;
+    snapshot.sessions.timelines["session-history"].hasMore = true;
     snapshot.sessions.timelines["session-history"].events = [
       timelineEvent({ cursor: 10n, sessionId: "session-history", itemId: "first", channel: "assistant_text", content: { kind: "textSnapshot", text: "first" } }),
     ];
@@ -1084,6 +1087,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-fast-top"),
     ]);
     snapshot.sessions.timelines["session-fast-top"] = readySessionTimeline();
+    snapshot.sessions.timelines["session-fast-top"].rawPageBoundary = 10n;
+    snapshot.sessions.timelines["session-fast-top"].hasMore = true;
     snapshot.sessions.timelines["session-fast-top"].events = [
       timelineEvent({ cursor: 10n, sessionId: "session-fast-top", itemId: "first", channel: "assistant_text", content: { kind: "textSnapshot", text: "first" } }),
     ];
@@ -1116,6 +1121,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-short-history"),
     ]);
     snapshot.sessions.timelines["session-short-history"] = readySessionTimeline();
+    snapshot.sessions.timelines["session-short-history"].rawPageBoundary = 10n;
+    snapshot.sessions.timelines["session-short-history"].hasMore = true;
     snapshot.sessions.timelines["session-short-history"].events = [
       timelineEvent({ cursor: 10n, sessionId: "session-short-history", itemId: "first", channel: "assistant_text", content: { kind: "textSnapshot", text: "first" } }),
     ];
@@ -1146,6 +1153,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-prepend"),
     ]);
     snapshot.sessions.timelines["session-prepend"] = readySessionTimeline();
+    snapshot.sessions.timelines["session-prepend"].rawPageBoundary = 10n;
+    snapshot.sessions.timelines["session-prepend"].hasMore = true;
     snapshot.sessions.timelines["session-prepend"].events = [
       timelineEvent({ cursor: 10n, sessionId: "session-prepend", itemId: "anchor", channel: "assistant_text", content: { kind: "textSnapshot", text: "anchor" } }),
       timelineEvent({ cursor: 11n, sessionId: "session-prepend", itemId: "below", channel: "assistant_text", content: { kind: "textSnapshot", text: "below" } }),
@@ -1189,6 +1198,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-top-chain"),
     ]);
     snapshot.sessions.timelines["session-top-chain"] = readySessionTimeline();
+    snapshot.sessions.timelines["session-top-chain"].rawPageBoundary = 10n;
+    snapshot.sessions.timelines["session-top-chain"].hasMore = true;
     snapshot.sessions.timelines["session-top-chain"].events = [
       timelineEvent({ cursor: 10n, sessionId: "session-top-chain", itemId: "anchor", channel: "assistant_text", content: { kind: "textSnapshot", text: "anchor" } }),
       timelineEvent({ cursor: 11n, sessionId: "session-top-chain", itemId: "below", channel: "assistant_text", content: { kind: "textSnapshot", text: "below" } }),
@@ -1259,6 +1270,34 @@ describe("sessions route", () => {
     expect(timelineRegion.querySelector(".sessions__code-block")?.textContent).toContain("pnpm test");
     expect(timelineRegion.querySelectorAll(".sessions__code-block")[1]?.textContent).toContain("typescript");
     expect(timelineRegion.querySelectorAll(".sessions__code-block")[1]?.textContent).toContain("const label = 'ok';");
+  });
+
+  test("session detail renders projected mask replacement as non-actionable user Markdown", () => {
+    const hiddenPrefix = "Original hidden source prefix";
+    const snapshot = snapshotWithSessions([sessionWithInferenceSettings("session-mask")]);
+    const timeline = readySessionTimeline();
+    timeline.events = [
+      syntheticMaskReplacement("mask:opaque:7", 7n, 1n, "## Compacted context\n\nKeep `this` summary."),
+      timelineEvent({ cursor: 8n, sessionId: "session-mask", turn: 2n, itemId: "assistant-after", channel: "assistant_text", content: { kind: "textSnapshot", text: "Later assistant" } }),
+      timelineEvent({ cursor: 9n, sessionId: "session-mask", turn: 3n, itemId: "user-after", channel: "user_text", content: { kind: "textSnapshot", text: "Later user" } }),
+    ];
+    snapshot.sessions.timelines["session-mask"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-mask", snapshot });
+
+    const timelineRegion = screen.getByLabelText("Session timeline");
+    const replacement = timelineItemElement("mask:opaque:7");
+    expect(within(replacement).getByRole("heading", { name: "Compacted context" })).toBeTruthy();
+    expect(replacement.querySelector("code")?.textContent).toBe("this");
+    expect(replacement.classList.contains("sessions__timeline-item--user")).toBe(true);
+    expect(replacement.classList.contains("sessions__timeline-item--mask-replacement")).toBe(true);
+    expect(within(replacement).queryByRole("button")).toBeNull();
+    expect(timelineRegion.textContent).not.toContain(hiddenPrefix);
+    expect(timelineRegion.textContent?.indexOf("Compacted context")).toBeLessThan(timelineRegion.textContent?.indexOf("Later assistant") ?? -1);
+    expect(timelineRegion.textContent?.indexOf("Later assistant")).toBeLessThan(timelineRegion.textContent?.indexOf("Later user") ?? -1);
+    const laterUser = timelineItemElement("user-after");
+    expect(within(laterUser).getByRole("button", { name: "Rerun" })).toBeTruthy();
+    expect(within(laterUser).getByRole("button", { name: "Edit" })).toBeTruthy();
   });
 
   test("session detail renders template results like composer resource text", () => {
@@ -2237,7 +2276,7 @@ describe("sessions route", () => {
 function snapshotWithTimelineEvents(
   snapshot: ClientSnapshot,
   sessionId: string,
-  events: TimelineEventView[],
+  events: ProjectedTimelineEntryView[],
 ): ClientSnapshot {
   const timeline = snapshot.sessions.timelines[sessionId];
   if (!timeline) {
@@ -2443,8 +2482,8 @@ function isOAuthCommand(command: ClientCommand) {
   return ["beginAuth", "completeAuth", "cancelAuth", "refreshAuth", "logoutAuth"].includes(command.type);
 }
 
-function timelineEvent(overrides: Partial<TimelineEventView> = {}): TimelineEventView {
-  return {
+function timelineEvent(overrides: Partial<TimelineEventView> = {}): ProjectedTimelineEntryView {
+  const event: TimelineEventView = {
     cursor: 1n,
     sessionId: "session-tools",
     turn: 1n,
@@ -2457,6 +2496,24 @@ function timelineEvent(overrides: Partial<TimelineEventView> = {}): TimelineEven
     metadataJson: "{}",
     ...overrides,
   };
+  return { entryKind: "durable", identity: event.itemId, presentation: "durable", event };
+}
+
+function syntheticMaskReplacement(identity: string, orderingCursor: bigint, turn: bigint, text: string): ProjectedTimelineEntryView {
+  return {
+    entryKind: "synthetic",
+    identity,
+    presentation: "maskReplacement",
+    event: {
+      orderingCursor,
+      sessionId: "session-mask",
+      turn,
+      kind: "itemFinished",
+      channel: "user_text",
+      content: { kind: "textSnapshot", text },
+      status: "finished",
+    },
+  };
 }
 
 function externalRequestOpenEvent(options: {
@@ -2464,7 +2521,7 @@ function externalRequestOpenEvent(options: {
   requestId: string;
   kind: 1 | 2;
   payload: unknown;
-}): TimelineEventView {
+}): ProjectedTimelineEntryView {
   return timelineEvent({
     sessionId: options.sessionId,
     itemId: "i1",

@@ -70,11 +70,12 @@ pub use waltr::grpc::waltr::resource::v1::{
 pub use waltr::grpc::waltr::session::v1::{
     ExternalRequest, ExternalRequestKind, InferenceProviderSettings, InferenceSettings,
     InferenceSettingsMatch, InferenceSettingsRequest, ListAgentsResponse, PendingWork,
-    PendingWorkStatus, RollbackTarget, SearchSessionTemplatesRequest,
+    PendingWorkStatus, ProjectedTimelineEvent, RollbackTarget, SearchSessionTemplatesRequest,
     SearchSessionTemplatesResponse, SelectableAgent, SessionMetrics, SessionPhase, SessionStatus,
     SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
     Suspension, SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent,
-    TimelineEventKind, TimelineQuery, TimelineStatus, TimelineTruncation, rollback_target,
+    TimelineEventKind, TimelinePresentation, TimelineProjectionMetadata, TimelineQuery,
+    TimelineStatus, TimelineTruncation, projected_timeline_event, rollback_target,
     search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
@@ -94,8 +95,8 @@ pub use routine::{
 pub use transport::{
     AuthStatus, AuthTarget, ConfigWatchUpdate, DefaultGrpcTransport, GenericAuthAttempt,
     GenericAuthAttemptStatus, WaltrTransport, RoutineDefinitionWatchStream,
-    RoutineInvocationWatchStream, SessionTimelineWatchEvent, SessionTimelineWatchUpdate,
-    SessionWatchEvent, SessionWatchUpdate,
+    RoutineInvocationWatchStream, SessionTimelinePage, SessionTimelineProjectionMode,
+    SessionTimelineWatchEvent, SessionTimelineWatchUpdate, SessionWatchEvent, SessionWatchUpdate,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{NativeCredentialLease, NativeCredentialProvider, NativeGrpcTransport};
@@ -107,11 +108,11 @@ pub use view::{
     InferenceSettingsMatchView, InferenceSettingsView, McpServerTypeView, McpServerView,
     ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
     ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
-    OAuthTokenRequestStyleView, OAuthUrlParamView, ProviderKindView, ProviderView,
-    SelectableAgentView, SessionAssociationsView, SessionMetricsView, SessionPhaseView,
-    SessionStatusView, SessionSuspensionKindView, SessionTimelineView, SessionView,
-    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
-    TimestampView,
+    OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
+    ProviderView, SelectableAgentView, SessionAssociationsView, SessionMetricsView,
+    SessionPhaseView, SessionStatusView, SessionSuspensionKindView, SessionTimelineView,
+    SessionView, SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView,
 };
 
 #[cfg(test)]
