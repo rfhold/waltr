@@ -805,6 +805,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn summary_upsert_and_list_reconciliation_replace_process_projection_directly() {
+        let mut client = Client::new();
+        let summary = |phase, queued_count| crate::SessionSummary {
+            id: "session-1".to_owned(),
+            coordination: Some(crate::SessionCoordinationState {
+                phase,
+                queued_count,
+                ..crate::SessionCoordinationState::default()
+            }),
+            progress: Some(crate::SessionProgress {
+                phase: phase,
+                queued_count: queued_count.into(),
+                running: queued_count > 0,
+                ..crate::SessionProgress::default()
+            }),
+            capabilities: Some(crate::SessionCapabilities {
+                prompt_disposition: if queued_count > 0 {
+                    crate::SessionPromptDisposition::Queued as i32
+                } else {
+                    crate::SessionPromptDisposition::Immediate as i32
+                },
+                can_respond_external_request: queued_count == 0,
+                can_interrupt: queued_count > 0,
+            }),
+            ..crate::SessionSummary::default()
+        };
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![summary(
+            crate::SessionCoordinationPhase::Paused as i32,
+            2,
+        )])));
+        client.apply(ClientEvent::Session(SessionEvent::WatchChanged(
+            SessionWatchUpdate {
+                sequence: 1,
+                event: SessionWatchEvent::Upsert(summary(
+                    crate::SessionCoordinationPhase::Running as i32,
+                    1,
+                )),
+            },
+        )));
+        assert_eq!(
+            client.state().sessions.current["session-1"]
+                .coordination
+                .as_ref()
+                .unwrap()
+                .phase,
+            crate::SessionCoordinationPhase::Running as i32
+        );
+
+        client.apply(ClientEvent::Session(SessionEvent::Listed(vec![summary(
+            crate::SessionCoordinationPhase::Ready as i32,
+            0,
+        )])));
+        let coordination = client.state().sessions.current["session-1"]
+            .coordination
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            coordination.phase,
+            crate::SessionCoordinationPhase::Ready as i32
+        );
+        assert_eq!(coordination.queued_count, 0);
+        let stored = &client.state().sessions.current["session-1"];
+        let progress = stored.progress.as_ref().unwrap();
+        assert_eq!(
+            progress.phase,
+            crate::SessionCoordinationPhase::Ready as i32
+        );
+        assert_eq!(progress.queued_count, 0);
+        assert!(!progress.running);
+        let capabilities = stored.capabilities.as_ref().unwrap();
+        assert_eq!(
+            capabilities.prompt_disposition,
+            crate::SessionPromptDisposition::Immediate as i32
+        );
+        assert!(capabilities.can_respond_external_request);
+        assert!(!capabilities.can_interrupt);
+    }
+
     fn target() -> crate::AuthTarget {
         crate::AuthTarget {
             target: Some(auth_target::Target::McpServerKey("github".to_owned())),

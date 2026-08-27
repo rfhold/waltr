@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use crate::{screens::SectionAction, theme::THEME, ui};
 
 use super::{
-    PERMISSION_REQUEST_KIND, QUESTION_REQUEST_KIND, SessionsSection, panel_muted_style,
-    panel_style, timeline::accent_border_span,
+    PERMISSION_REQUEST_KIND, QUESTION_REQUEST_KIND, SessionsSection,
+    current_respondable_external_prompt, panel_muted_style, panel_style,
+    timeline::accent_border_span,
 };
 
 const PROMPT_MAX_HEIGHT: u16 = 14;
@@ -336,7 +337,8 @@ impl SessionsSection {
         let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
             return SectionAction::Continue;
         };
-        let Some(prompt) = current_external_prompt(snapshot, Some(session_id.as_str())) else {
+        let Some(prompt) = current_respondable_external_prompt(snapshot, Some(session_id.as_str()))
+        else {
             return SectionAction::Continue;
         };
 

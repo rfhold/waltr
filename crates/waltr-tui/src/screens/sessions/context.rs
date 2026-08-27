@@ -2,7 +2,7 @@
 
 use waltr_client::{
     ClientRoutineInvocationStatus, ClientRoutineInvocationSummary, ClientSnapshot,
-    SessionPhaseView, SessionSuspensionKindView, SessionView,
+    SessionProgressPhaseView, SessionRunStageView, SessionView,
 };
 use ratatui::{
     Frame,
@@ -16,6 +16,7 @@ use crate::theme::{StatusRole, THEME};
 
 use super::{
     cache_rate, format_compact_currency_cost, format_count, panel_muted_style, panel_style,
+    progress_coordination_status,
 };
 
 pub(super) fn render_session_context(
@@ -230,53 +231,40 @@ fn subtask_line(session: &SessionView) -> Line<'static> {
     ])
 }
 
-fn subtask_status(session: &SessionView) -> (&'static str, Style) {
-    if session.status.phase == SessionPhaseView::Suspended {
-        return match session.status.suspension_kind {
-            Some(SessionSuspensionKindView::AwaitingToolResults) => (
-                "awaiting tool results",
-                THEME.status_style(StatusRole::Ready),
-            ),
-            Some(SessionSuspensionKindView::AwaitingExternalInput) => (
-                "awaiting external input",
-                THEME.status_style(StatusRole::Ready),
-            ),
-            Some(SessionSuspensionKindView::Interrupted) => {
-                ("interrupted", THEME.status_style(StatusRole::Error))
-            }
-            Some(SessionSuspensionKindView::Unspecified) => {
-                ("suspended (unspecified)", panel_muted_style())
-            }
-            Some(SessionSuspensionKindView::Unknown) => {
-                ("suspended (unknown)", panel_muted_style())
-            }
-            None => ("suspended", panel_muted_style()),
-        };
+fn subtask_status(session: &SessionView) -> (String, Style) {
+    if let Some(status) = progress_coordination_status(session) {
+        return (status, THEME.status_style(StatusRole::Loading));
     }
-
-    let text = match session.status.phase {
-        SessionPhaseView::Unspecified => "unspecified",
-        SessionPhaseView::Idle => "idle",
-        SessionPhaseView::BuildingRequest => "building request",
-        SessionPhaseView::StreamingProvider => "streaming provider",
-        SessionPhaseView::RetryingProvider => "retrying provider",
-        SessionPhaseView::EvaluatingToolCall => "evaluating tool call",
-        SessionPhaseView::RunningTool => "running tool",
-        SessionPhaseView::Suspended => unreachable!("handled above"),
-        SessionPhaseView::Finished => "finished",
-        SessionPhaseView::Failed => "failed",
-        SessionPhaseView::Unknown => "unknown",
+    let text = match session.progress.phase {
+        SessionProgressPhaseView::Unknown => "unknown",
+        SessionProgressPhaseView::Idle => "idle",
+        SessionProgressPhaseView::Running => match session.progress.run_stage {
+            Some(SessionRunStageView::BuildingRequest) => "building request",
+            Some(SessionRunStageView::StreamingProvider) => "streaming provider",
+            Some(SessionRunStageView::RetryingProvider) => "retrying provider",
+            Some(SessionRunStageView::EvaluatingToolCall) => "evaluating tool call",
+            Some(SessionRunStageView::RunningTool) => "running tool",
+            Some(SessionRunStageView::Unknown) | None => "running",
+        },
+        SessionProgressPhaseView::AwaitingToolResults => "awaiting tool results",
+        SessionProgressPhaseView::AwaitingExternalInput => "awaiting external input",
+        SessionProgressPhaseView::Interrupted => "interrupted",
+        SessionProgressPhaseView::Finished => "finished",
+        SessionProgressPhaseView::Failed => "failed",
+        SessionProgressPhaseView::CompletionBarrier | SessionProgressPhaseView::Paused => {
+            unreachable!("coordination progress handled above")
+        }
     };
-    let style = match session.status.phase {
-        SessionPhaseView::BuildingRequest
-        | SessionPhaseView::StreamingProvider
-        | SessionPhaseView::RetryingProvider
-        | SessionPhaseView::EvaluatingToolCall
-        | SessionPhaseView::RunningTool => THEME.status_style(StatusRole::Ready),
-        SessionPhaseView::Failed => THEME.status_style(StatusRole::Error),
+    let style = match session.progress.phase {
+        SessionProgressPhaseView::Running
+        | SessionProgressPhaseView::AwaitingToolResults
+        | SessionProgressPhaseView::AwaitingExternalInput => THEME.status_style(StatusRole::Ready),
+        SessionProgressPhaseView::Failed | SessionProgressPhaseView::Interrupted => {
+            THEME.status_style(StatusRole::Error)
+        }
         _ => panel_muted_style(),
     };
-    (text, style)
+    (text.to_owned(), style)
 }
 
 fn associated_routines<'a>(
@@ -324,42 +312,39 @@ fn empty_line(text: &'static str) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use waltr_client::{SessionAssociationsView, SessionMetricsView, SessionStatusView};
+    use waltr_client::{
+        SessionAssociationsView, SessionCapabilitiesView, SessionCoordinationView,
+        SessionMetricsView, SessionPhaseView, SessionProgressView, SessionStatusView,
+    };
 
     use super::*;
 
     #[test]
     fn subtask_status_projects_exact_suspension_labels_and_semantic_colors() {
-        for (kind, label, color) in [
+        for (phase, label, color) in [
             (
-                Some(SessionSuspensionKindView::AwaitingToolResults),
+                SessionProgressPhaseView::AwaitingToolResults,
                 "awaiting tool results",
                 THEME.success(),
             ),
             (
-                Some(SessionSuspensionKindView::AwaitingExternalInput),
+                SessionProgressPhaseView::AwaitingExternalInput,
                 "awaiting external input",
                 THEME.success(),
             ),
             (
-                Some(SessionSuspensionKindView::Interrupted),
+                SessionProgressPhaseView::Interrupted,
                 "interrupted",
                 THEME.danger(),
             ),
             (
-                Some(SessionSuspensionKindView::Unspecified),
-                "suspended (unspecified)",
+                SessionProgressPhaseView::Unknown,
+                "unknown",
                 THEME.muted_text(),
             ),
-            (
-                Some(SessionSuspensionKindView::Unknown),
-                "suspended (unknown)",
-                THEME.muted_text(),
-            ),
-            (None, "suspended", THEME.muted_text()),
         ] {
             let mut session = session(SessionPhaseView::Suspended);
-            session.status.suspension_kind = kind;
+            session.progress.phase = phase;
             let (actual_label, style) = subtask_status(&session);
             assert_eq!(actual_label, label);
             assert_eq!(style.fg, Some(color));
@@ -429,6 +414,19 @@ mod tests {
                 failed_message: String::new(),
                 authentication_failure: None,
             },
+            coordination: SessionCoordinationView::default(),
+            progress: SessionProgressView {
+                phase: match phase {
+                    SessionPhaseView::RunningTool => SessionProgressPhaseView::Running,
+                    SessionPhaseView::Finished => SessionProgressPhaseView::Finished,
+                    SessionPhaseView::Failed => SessionProgressPhaseView::Failed,
+                    _ => SessionProgressPhaseView::Unknown,
+                },
+                run_stage: (phase == SessionPhaseView::RunningTool)
+                    .then_some(SessionRunStageView::RunningTool),
+                ..Default::default()
+            },
+            capabilities: SessionCapabilitiesView::default(),
             current_prompt: None,
             created_at: None,
             updated_at: None,

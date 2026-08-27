@@ -1,12 +1,13 @@
 use crate::support::grpc::session_client;
 use waltr::grpc::waltr::session::v1::{
-    CreateSessionRequest, DeleteSessionRequest, SessionPhase, WatchSessionsRequest,
-    WipeSessionsRequest, watch_sessions_response,
+    CreateSessionRequest, DeleteSessionRequest, ListSessionsRequest, SessionCoordinationPhase,
+    SessionPhase, SessionProgressPhase, SessionPromptDisposition, SubmitUserMessageRequest,
+    WatchSessionsRequest, WipeSessionsRequest, watch_sessions_response,
 };
-use waltr_agent::{
-    PendingTimelineEvent, PendingTimelineItemId, SessionCreateRequest, SessionId,
+use waltr_agent::{PendingTimelineEvent, PendingTimelineItemId, SessionCreateRequest, SessionId};
+use waltr_server::test_support::{
+    setup_server, setup_server_with_seeded_sessions, setup_server_with_sessions,
 };
-use waltr_server::test_support::{setup_server, setup_server_with_sessions};
 
 #[tokio::test]
 async fn session_service_watch_emits_created_sessions() -> Result<(), Box<dyn std::error::Error>> {
@@ -276,6 +277,143 @@ async fn session_service_watch_emits_one_cleared_event_for_wipe()
         "wipe should publish exactly one cleared event"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn list_and_watch_sessions_project_pause_queue_and_release_coordination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (sessions, session_id) = super::timeline::seeded_completed_session().await?;
+    let server = setup_server_with_seeded_sessions(sessions.clone());
+    let mut client = session_client(server).await?;
+    let created_id = session_id.as_str().to_owned();
+    let reason = waltr_agent::SessionCoordinationReason::new(
+        "context-compaction",
+        Some("compact-and-continue".to_owned()),
+        Some("manual".to_owned()),
+    )?;
+    let pause = sessions
+        .acquire_pause_reject_busy(&session_id, reason.clone())
+        .await?;
+
+    let listed = client
+        .list_sessions(ListSessionsRequest {})
+        .await?
+        .into_inner()
+        .sessions
+        .into_iter()
+        .find(|summary| summary.id == created_id)
+        .expect("listed session");
+    assert_coordination(
+        &listed,
+        SessionCoordinationPhase::Paused,
+        0,
+        Some(("context-compaction", "compact-and-continue", "manual")),
+    );
+
+    let mut watch_client = session_client(server).await?;
+    let mut watch = watch_client
+        .watch_sessions(WatchSessionsRequest {})
+        .await?
+        .into_inner();
+    let snapshot = next_watch_message(&mut watch).await?;
+    let watch_sessions_response::Event::Snapshot(snapshot) = snapshot.event.unwrap() else {
+        panic!("initial session snapshot expected")
+    };
+    let watched = snapshot
+        .sessions
+        .iter()
+        .find(|summary| summary.id == created_id)
+        .expect("paused session in snapshot");
+    assert_coordination(watched, SessionCoordinationPhase::Paused, 0, None);
+
+    sessions.release_pause(&pause).await?;
+    let ready =
+        next_coordination(&mut watch, &created_id, SessionCoordinationPhase::Ready, 0).await?;
+    assert_coordination(&ready, SessionCoordinationPhase::Ready, 0, None);
+
+    let pause = sessions
+        .acquire_pause_reject_busy(&session_id, reason)
+        .await?;
+    drop(next_coordination(&mut watch, &created_id, SessionCoordinationPhase::Paused, 0).await?);
+    client
+        .submit_user_message(SubmitUserMessageRequest {
+            session_id: created_id.clone(),
+            text: "queued while paused".to_owned(),
+        })
+        .await?;
+    let queued =
+        next_coordination(&mut watch, &created_id, SessionCoordinationPhase::Paused, 1).await?;
+    assert_coordination(&queued, SessionCoordinationPhase::Paused, 1, None);
+
+    sessions.interrupt(&session_id).await?;
+    let cleared =
+        next_coordination(&mut watch, &created_id, SessionCoordinationPhase::Ready, 0).await?;
+    assert_coordination(&cleared, SessionCoordinationPhase::Ready, 0, None);
+    drop(pause);
+    Ok(())
+}
+
+async fn next_coordination(
+    watch: &mut tonic::Streaming<waltr::grpc::waltr::session::v1::WatchSessionsResponse>,
+    session_id: &str,
+    phase: SessionCoordinationPhase,
+    queued_count: u32,
+) -> Result<waltr::grpc::waltr::session::v1::SessionSummary, Box<dyn std::error::Error>> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let update = watch.message().await?.expect("session coordination update");
+            if let Some(watch_sessions_response::Event::Session(summary)) = update.event {
+                let matches = summary.id == session_id
+                    && summary.coordination.as_ref().is_some_and(|coordination| {
+                        coordination.phase == phase as i32
+                            && coordination.queued_count == queued_count
+                    });
+                if matches {
+                    return Ok::<_, tonic::Status>(summary);
+                }
+            }
+        }
+    })
+    .await?
+    .map_err(Into::into)
+}
+
+fn assert_coordination(
+    summary: &waltr::grpc::waltr::session::v1::SessionSummary,
+    phase: SessionCoordinationPhase,
+    queued_count: u32,
+    reason: Option<(&str, &str, &str)>,
+) {
+    let coordination = summary.coordination.as_ref().expect("coordination state");
+    assert_eq!(coordination.phase, phase as i32);
+    assert_eq!(coordination.queued_count, queued_count);
+    assert!(!coordination.continuation_armed);
+    let progress = summary.progress.as_ref().expect("session progress");
+    let expected_progress = match phase {
+        SessionCoordinationPhase::Ready => SessionProgressPhase::Idle,
+        SessionCoordinationPhase::Paused => SessionProgressPhase::Paused,
+        SessionCoordinationPhase::Running => SessionProgressPhase::Running,
+        SessionCoordinationPhase::CompletionBarrier => SessionProgressPhase::CompletionBarrier,
+        SessionCoordinationPhase::Unspecified => SessionProgressPhase::Unspecified,
+    };
+    assert_eq!(progress.phase, expected_progress as i32);
+    assert_eq!(progress.queued_count, u64::from(queued_count));
+    assert_eq!(progress.running, phase != SessionCoordinationPhase::Ready);
+    let capabilities = summary.capabilities.as_ref().expect("session capabilities");
+    assert_eq!(
+        capabilities.prompt_disposition,
+        if phase == SessionCoordinationPhase::Ready {
+            SessionPromptDisposition::Immediate
+        } else {
+            SessionPromptDisposition::Queued
+        } as i32
+    );
+    if let Some((code, source, trigger)) = reason {
+        let actual = coordination.reason.as_ref().expect("coordination reason");
+        assert_eq!(actual.code, code);
+        assert_eq!(actual.source.as_deref(), Some(source));
+        assert_eq!(actual.trigger.as_deref(), Some(trigger));
+    }
 }
 
 async fn next_watch_message(

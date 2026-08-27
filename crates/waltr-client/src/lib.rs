@@ -71,11 +71,13 @@ pub use waltr::grpc::waltr::session::v1::{
     ExternalRequest, ExternalRequestKind, InferenceProviderSettings, InferenceSettings,
     InferenceSettingsMatch, InferenceSettingsRequest, ListAgentsResponse, PendingWork,
     PendingWorkStatus, ProjectedTimelineEvent, RollbackTarget, SearchSessionTemplatesRequest,
-    SearchSessionTemplatesResponse, SelectableAgent, SessionMetrics, SessionPhase, SessionStatus,
-    SessionSummary, SessionTemplateKind, SessionTemplateOption, SessionTemplateSearchTarget,
-    Suspension, SuspensionKind, TimelineContent, TimelineDirection, TimelineEvent,
-    TimelineEventKind, TimelinePresentation, TimelineProjectionMetadata, TimelineQuery,
-    TimelineStatus, TimelineTruncation, projected_timeline_event, rollback_target,
+    SearchSessionTemplatesResponse, SelectableAgent, SessionCapabilities, SessionCoordinationPhase,
+    SessionCoordinationReason, SessionCoordinationState, SessionMetrics, SessionPhase,
+    SessionProgress, SessionProgressPhase, SessionPromptDisposition, SessionRunStage,
+    SessionStatus, SessionSummary, SessionTemplateKind, SessionTemplateOption,
+    SessionTemplateSearchTarget, Suspension, SuspensionKind, TimelineContent, TimelineDirection,
+    TimelineEvent, TimelineEventKind, TimelinePresentation, TimelineProjectionMetadata,
+    TimelineQuery, TimelineStatus, TimelineTruncation, projected_timeline_event, rollback_target,
     search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
@@ -109,10 +111,13 @@ pub use view::{
     ModelCapabilitiesView, ModelCatalogMatchView, ModelCostView, ModelLimitsView, ModelOptionsView,
     ModelTypeView, ModelView, OAuthJwtMetadataView, OAuthProviderView, OAuthTokenFieldView,
     OAuthTokenRequestStyleView, OAuthUrlParamView, ProjectedTimelineEntryView, ProviderKindView,
-    ProviderView, SelectableAgentView, SessionAssociationsView, SessionMetricsView,
-    SessionPhaseView, SessionStatusView, SessionSuspensionKindView, SessionTimelineView,
-    SessionView, SyntheticTimelineEventView, TimelineContentView, TimelineEventKindView,
-    TimelineEventView, TimelinePresentationView, TimelineStatusView, TimestampView,
+    ProviderView, SelectableAgentView, SessionAssociationsView, SessionCapabilitiesView,
+    SessionCoordinationPhaseView, SessionCoordinationReasonView, SessionCoordinationView,
+    SessionMetricsView, SessionPhaseView, SessionProgressPhaseView, SessionProgressView,
+    SessionPromptDispositionView, SessionRunStageView, SessionStatusView,
+    SessionSuspensionKindView, SessionTimelineView, SessionView, SyntheticTimelineEventView,
+    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelinePresentationView,
+    TimelineStatusView, TimestampView,
 };
 
 #[cfg(test)]

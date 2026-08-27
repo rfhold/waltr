@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor, within } from "@solidjs/testing-library";
 import { describe, expect, test, vi } from "vitest";
 
-import type { AuthenticationFailureSnapshot, ClientCommand, ClientRoutineInvocationSummary, ClientSnapshot, ProjectedTimelineEntryView, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
+import type { AuthenticationFailureSnapshot, ClientCommand, ClientRoutineInvocationSummary, ClientSnapshot, ProjectedTimelineEntryView, SessionCapabilitiesView, SessionProgressView, SessionTemplateOptionView, SessionStatusView, TimelineEventView } from "../../src/generated/waltr-client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, testHistory } from "../support/routes";
 import { emptyConfig, readySessionTimeline, sessionMetricsView, sessionView, snapshotWithConfig, snapshotWithSessions, timestamp } from "../support/snapshots";
@@ -209,27 +209,23 @@ describe("sessions route", () => {
   });
 
   test("projects all subtask and Routine statuses while keeping exact labels accessible", () => {
-    const subtaskStatuses: Array<[string, SessionStatusView, string, string]> = [
-      ["building", sessionStatus("buildingRequest"), "Building request", "green"],
-      ["streaming", sessionStatus("streamingProvider"), "Streaming provider", "green"],
-      ["retrying", sessionStatus("retryingProvider"), "Retrying provider", "green"],
-      ["evaluating", sessionStatus("evaluatingToolCall"), "Evaluating tool call", "green"],
-      ["tool", sessionStatus("runningTool"), "Running tool", "green"],
-      ["tool-wait", sessionStatus("suspended", "awaitingToolResults"), "Awaiting tool results", "green"],
-      ["input-wait", sessionStatus("suspended", "awaitingExternalInput"), "Awaiting external input", "green"],
-      ["failed", sessionStatus("failed"), "Failed", "red"],
-      ["interrupted", sessionStatus("suspended", "interrupted"), "Interrupted", "red"],
-      ["idle", sessionStatus("idle"), "Idle", "grey"],
-      ["finished", sessionStatus("finished"), "Finished", "grey"],
-      ["unspecified", sessionStatus("unspecified"), "Unspecified", "grey"],
-      ["unknown", sessionStatus("unknown"), "Unknown", "grey"],
-      ["suspended-none", sessionStatus("suspended", null), "Suspended", "grey"],
-      ["suspended-unspecified", sessionStatus("suspended", "unspecified"), "Suspended (unspecified)", "grey"],
-      ["suspended-unknown", sessionStatus("suspended", "unknown"), "Suspended (unknown)", "grey"],
+    const subtaskStatuses: Array<[string, SessionProgressView, string, string]> = [
+      ["building", progress("running", "buildingRequest"), "Building request", "green"],
+      ["streaming", progress("running", "streamingProvider"), "Streaming provider", "green"],
+      ["retrying", progress("running", "retryingProvider"), "Retrying provider", "green"],
+      ["evaluating", progress("running", "evaluatingToolCall"), "Evaluating tool call", "green"],
+      ["tool", progress("running", "runningTool"), "Running tool", "green"],
+      ["tool-wait", progress("awaitingToolResults"), "Awaiting tool results", "green"],
+      ["input-wait", progress("awaitingExternalInput"), "Awaiting external input", "green"],
+      ["failed", progress("failed"), "Failed", "red"],
+      ["interrupted", progress("interrupted"), "Interrupted", "red"],
+      ["idle", progress("idle"), "Idle", "grey"],
+      ["finished", progress("finished"), "Finished", "grey"],
+      ["unknown", progress("unknown"), "Unknown", "grey"],
     ];
     const snapshot = snapshotWithSessions([
       sessionView({ id: "parent" }),
-      ...subtaskStatuses.map(([id, status]) => sessionView({ id, status, associations: associations({ taskParentSessionId: "parent", taskDescription: id }) })),
+      ...subtaskStatuses.map(([id, projected]) => sessionView({ id, progress: projected, associations: associations({ taskParentSessionId: "parent", taskDescription: id }) })),
     ]);
     snapshot.sessions.timelines.parent = readySessionTimeline();
     snapshot.routines.sessionHistories = {
@@ -425,6 +421,7 @@ describe("sessions route", () => {
     const snapshot = snapshotWithSessions([sessionView({
       id: "session-agent-active",
       status: { phase: "streamingProvider", suspensionKind: null, failedMessage: "", authenticationFailure: null },
+      progress: progress("running", "streamingProvider", { running: true }),
     })]);
     snapshot.sessions.timelines["session-agent-active"] = readySessionTimeline();
     renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-agent-active", snapshot });
@@ -865,6 +862,7 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-active", { phase: "streamingProvider", suspensionKind: null, failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-active"] = readySessionTimeline();
+    snapshot.sessions.current[0]!.progress = progress("running", "streamingProvider", { running: true });
 
     renderWithAppState(() => <SessionsRouteWithRouter />, {
       routePath: "/sessions/session-active",
@@ -872,6 +870,74 @@ describe("sessions route", () => {
     });
 
     expect(screen.getByText("Working...")).toBeTruthy();
+  });
+
+  test.each([
+    ["barrier without queue", progress("completionBarrier", null, { running: true }), "Checking post-run automation"],
+    ["compaction with one queued message", progress("paused", null, { reason: { code: "context-compaction", source: "compact-and-continue", trigger: null }, queuedCount: 1n, continuationArmed: true, running: true }), "Paused: compacting context · 1 message queued"],
+    ["Routine pause with multiple queued messages", progress("paused", null, { reason: { code: "routine-claim", source: "Nightly cleanup", trigger: null }, queuedCount: 3n, running: true }), "Paused by Routine: Nightly cleanup · 3 messages queued"],
+    ["unknown pause reason", progress("paused", null, { reason: { code: "future-pause", source: null, trigger: null }, running: true }), "Paused: future-pause"],
+    ["host-operation Routine source", progress("paused", null, { reason: { code: "host-operation", source: "maintenance", trigger: null }, running: true }), "Paused by Routine: maintenance"],
+  ] as const)("session detail renders %s", (_, projected, expected) => {
+    const snapshot = snapshotWithSessions([sessionView({
+      id: "session-coordination",
+      status: sessionStatus("finished"),
+      progress: projected,
+    })]);
+    snapshot.sessions.timelines["session-coordination"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-coordination", snapshot });
+
+    expect(screen.getByLabelText("Session activity status").textContent).toContain(expected);
+    const stopButton = screen.getByText("Stop").closest("button");
+    expect(stopButton?.hasAttribute("disabled")).toBe(true);
+    expect(stopButton?.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  test("finished progress clears important status", () => {
+    const snapshot = snapshotWithSessions([sessionView({
+      id: "session-coordination-clear",
+      status: sessionStatus("finished"),
+      progress: progress("finished"),
+    })]);
+    snapshot.sessions.timelines["session-coordination-clear"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-coordination-clear", snapshot });
+
+    expect(screen.getByLabelText("Session activity status").textContent?.trim()).toBe("");
+  });
+
+  test("interrupt capability controls Stop independently of paused progress", () => {
+    const snapshot = snapshotWithSessions([sessionView({
+      id: "session-coordination-active",
+      status: sessionStatus("streamingProvider"),
+      progress: progress("paused", null, { reason: { code: "routine-claim", source: "Active Routine", trigger: null }, running: true }),
+      capabilities: capabilities({ promptDisposition: "queued", canInterrupt: true }),
+    })]);
+    snapshot.sessions.timelines["session-coordination-active"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-coordination-active", snapshot });
+
+    expect(screen.getByLabelText("Session activity status").textContent).toContain("Paused by Routine: Active Routine");
+    expect((screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  test("recent sessions and subtask context use projected progress", () => {
+    const snapshot = snapshotWithSessions([
+      sessionView({ id: "parent" }),
+      sessionView({ id: "paused-child", status: sessionStatus("finished"), progress: progress("paused", null, { reason: { code: "routine-claim", source: "Child Routine", trigger: null }, running: true }), associations: associations({ taskParentSessionId: "parent", taskDescription: "Paused child" }) }),
+      sessionView({ id: "barrier", status: sessionStatus("idle"), progress: progress("completionBarrier", null, { queuedCount: 2n, running: true }) }),
+    ]);
+    snapshot.sessions.timelines.parent = readySessionTimeline();
+
+    const result = renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions", snapshot });
+    expect(screen.getByLabelText("Open session barrier").textContent).toContain("Checking post-run automation · 2 messages queued");
+
+    result.unmount();
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/parent", snapshot });
+    const child = screen.getByRole("link", { name: "Paused child" }).closest("li")!;
+    expect(within(child).getByText("Paused by Routine: Child Routine")).toBeTruthy();
+    expect(child.querySelector(".sessions__context-status-dot--green")).toBeTruthy();
   });
 
   test("session detail treats suspended sessions as waiting", () => {
@@ -892,9 +958,72 @@ describe("sessions route", () => {
     expect(stopButton?.getAttribute("aria-hidden")).toBe("true");
   });
 
+  test("durable active after restart stays working but is not interruptible", () => {
+    const snapshot = snapshotWithSessions([sessionView({
+      id: "session-restarted-active",
+      status: sessionStatus("streamingProvider"),
+      progress: progress("running", "streamingProvider", { running: true }),
+      capabilities: capabilities({ promptDisposition: "immediate", canInterrupt: false }),
+    })]);
+    snapshot.sessions.timelines["session-restarted-active"] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-restarted-active", snapshot });
+
+    expect(screen.getByText("Working...")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
+  test.each([
+    ["immediate", false],
+    ["queued", false],
+    ["supersedeSuspension", false],
+    ["unknown", true],
+  ] as const)("prompt disposition %s controls Send conservatively", (promptDisposition, disabled) => {
+    const snapshot = snapshotWithSessions([sessionView({
+      id: `session-prompt-${promptDisposition}`,
+      capabilities: capabilities({ promptDisposition }),
+    })]);
+    snapshot.sessions.timelines[`session-prompt-${promptDisposition}`] = readySessionTimeline();
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: `/sessions/session-prompt-${promptDisposition}`, snapshot });
+    fireEvent.input(screen.getByLabelText("Session message"), { target: { value: "hello" } });
+
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(disabled);
+  });
+
+  test("unknown projection does not fall back to legacy status or an open external request", () => {
+    const snapshot = snapshotWithSessions([sessionView({
+      id: "session-unknown-projection",
+      status: sessionStatus("streamingProvider"),
+      progress: progress("unknown"),
+      capabilities: capabilities({ promptDisposition: "unknown" }),
+    })]);
+    const timeline = readySessionTimeline();
+    timeline.events = [externalRequestOpenEvent({
+      sessionId: "session-unknown-projection",
+      requestId: "permission-unknown",
+      kind: 1,
+      payload: { tool_call: { name: "read", arguments: {} }, patterns: [] },
+    })];
+    snapshot.sessions.timelines["session-unknown-projection"] = timeline;
+
+    renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/session-unknown-projection", snapshot });
+    fireEvent.input(screen.getByLabelText("Session message"), { target: { value: "hello" } });
+
+    expect(screen.getByLabelText("Session activity status").textContent?.trim()).toBe("");
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((within(screen.getByLabelText("Permission prompt")).getByText("Allow once") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Commands" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   test("session detail shows failed status in important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-failed", { phase: "failed", suspensionKind: null, failedMessage: "provider unavailable", authenticationFailure: null }),
+      sessionView({
+        ...sessionWithInferenceSettings("session-failed", { phase: "failed", suspensionKind: null, failedMessage: "provider unavailable", authenticationFailure: null }),
+        coordination: { phase: "paused", reason: { code: "context-compaction", source: null, trigger: null }, queuedCount: 1, continuationArmed: true },
+        progress: progress("failed", null, { reason: { code: "context-compaction", source: null, trigger: null }, queuedCount: 1n, continuationArmed: true }),
+      }),
     ]);
     snapshot.sessions.timelines["session-failed"] = readySessionTimeline();
 
@@ -951,7 +1080,10 @@ describe("sessions route", () => {
 
   test("session detail shows timeline watch errors in the important status area", () => {
     const snapshot = snapshotWithSessions([
-      sessionWithInferenceSettings("session-timeline-error", { phase: "failed", suspensionKind: null, failedMessage: "provider unavailable", authenticationFailure: null }),
+      sessionView({
+        ...sessionWithInferenceSettings("session-timeline-error", { phase: "failed", suspensionKind: null, failedMessage: "provider unavailable", authenticationFailure: null }),
+        progress: progress("paused", null, { reason: { code: "context-compaction", source: null, trigger: null }, running: true }),
+      }),
     ]);
     const timeline = readySessionTimeline();
     timeline.watch = { status: "failed", error: "timeline disconnected", key: null };
@@ -1988,6 +2120,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-permission"),
     ]);
     const timeline = readySessionTimeline();
+    snapshot.sessions.current[0]!.progress = progress("awaitingExternalInput");
+    snapshot.sessions.current[0]!.capabilities = capabilities({ promptDisposition: "supersedeSuspension", canRespondExternalRequest: true });
     timeline.events = [externalRequestOpenEvent({
       sessionId: "session-permission",
       requestId: "permission-1",
@@ -2032,6 +2166,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-permission-fail"),
     ]);
     const timeline = readySessionTimeline();
+    snapshot.sessions.current[0]!.progress = progress("awaitingExternalInput");
+    snapshot.sessions.current[0]!.capabilities = capabilities({ promptDisposition: "supersedeSuspension", canRespondExternalRequest: true });
     timeline.events = [externalRequestOpenEvent({
       sessionId: "session-permission-fail",
       requestId: "permission-1",
@@ -2063,6 +2199,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-interrupt-fail", { phase: "streamingProvider", suspensionKind: null, failedMessage: "", authenticationFailure: null }),
     ]);
     snapshot.sessions.timelines["session-interrupt-fail"] = readySessionTimeline();
+    snapshot.sessions.current[0]!.progress = progress("running", "streamingProvider", { running: true });
+    snapshot.sessions.current[0]!.capabilities = capabilities({ promptDisposition: "queued", canInterrupt: true });
 
     renderWithAppState(() => <SessionsRouteWithRouter />, {
       routePath: "/sessions/session-interrupt-fail",
@@ -2081,6 +2219,8 @@ describe("sessions route", () => {
       sessionWithInferenceSettings("session-question"),
     ]);
     const timeline = readySessionTimeline();
+    snapshot.sessions.current[0]!.progress = progress("awaitingExternalInput");
+    snapshot.sessions.current[0]!.capabilities = capabilities({ promptDisposition: "supersedeSuspension", canRespondExternalRequest: true });
     timeline.events = [externalRequestOpenEvent({
       sessionId: "session-question",
       requestId: "question-1",
@@ -2513,6 +2653,31 @@ function syntheticMaskReplacement(identity: string, orderingCursor: bigint, turn
       content: { kind: "textSnapshot", text },
       status: "finished",
     },
+  };
+}
+
+function progress(
+  phase: SessionProgressView["phase"],
+  runStage: SessionProgressView["runStage"] = null,
+  overrides: Partial<SessionProgressView> = {},
+): SessionProgressView {
+  return {
+    phase,
+    runStage,
+    reason: null,
+    queuedCount: 0n,
+    continuationArmed: false,
+    running: false,
+    ...overrides,
+  };
+}
+
+function capabilities(overrides: Partial<SessionCapabilitiesView> = {}): SessionCapabilitiesView {
+  return {
+    promptDisposition: "immediate",
+    canRespondExternalRequest: false,
+    canInterrupt: false,
+    ...overrides,
   };
 }
 

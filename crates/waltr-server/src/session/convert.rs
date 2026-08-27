@@ -8,14 +8,23 @@ use waltr::grpc::waltr::{
     session::v1::{
         ExternalRequest as ProtoExternalRequest, ExternalRequestKind as ProtoExternalRequestKind,
         PendingWork as ProtoPendingWork, PendingWorkStatus as ProtoPendingWorkStatus,
+        SessionCapabilities as ProtoSessionCapabilities,
+        SessionCoordinationPhase as ProtoSessionCoordinationPhase,
+        SessionCoordinationReason as ProtoSessionCoordinationReason,
+        SessionCoordinationState as ProtoSessionCoordinationState,
         SessionMetrics as ProtoSessionMetrics, SessionPhase as ProtoSessionPhase,
-        SessionStatus as ProtoSessionStatus, SessionSummary as ProtoSessionSummary,
-        Suspension as ProtoSuspension, SuspensionKind as ProtoSuspensionKind,
+        SessionProgress as ProtoSessionProgress, SessionProgressPhase as ProtoSessionProgressPhase,
+        SessionPromptDisposition as ProtoSessionPromptDisposition,
+        SessionRunStage as ProtoSessionRunStage, SessionStatus as ProtoSessionStatus,
+        SessionSummary as ProtoSessionSummary, Suspension as ProtoSuspension,
+        SuspensionKind as ProtoSuspensionKind,
     },
 };
 use waltr_agent::{
-    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, SessionStatus,
-    SessionSummary, Suspension,
+    ExternalRequest, ExternalRequestKind, PendingWork, PendingWorkStatus, SessionCapabilities,
+    SessionCoordinationPhase, SessionCoordinationReason, SessionCoordinationState, SessionProgress,
+    SessionProgressPhase, SessionPromptDisposition, SessionRunStage, SessionStatus, SessionSummary,
+    Suspension,
 };
 
 pub(super) fn session_summary_to_proto(
@@ -41,7 +50,82 @@ pub(super) fn session_summary_to_proto(
             .agent_name
             .unwrap_or_else(|| default_agent_name.to_owned()),
         metadata: Some(metadata),
+        coordination: Some(session_coordination_to_proto(summary.coordination)),
+        progress: Some(session_progress_to_proto(summary.progress)),
+        capabilities: Some(session_capabilities_to_proto(summary.capabilities)),
     })
+}
+
+fn session_progress_to_proto(progress: SessionProgress) -> ProtoSessionProgress {
+    ProtoSessionProgress {
+        phase: match progress.phase {
+            SessionProgressPhase::Unknown => ProtoSessionProgressPhase::Unspecified,
+            SessionProgressPhase::Idle => ProtoSessionProgressPhase::Idle,
+            SessionProgressPhase::Running => ProtoSessionProgressPhase::Running,
+            SessionProgressPhase::CompletionBarrier => ProtoSessionProgressPhase::CompletionBarrier,
+            SessionProgressPhase::Paused => ProtoSessionProgressPhase::Paused,
+            SessionProgressPhase::AwaitingToolResults => {
+                ProtoSessionProgressPhase::AwaitingToolResults
+            }
+            SessionProgressPhase::AwaitingExternalInput => {
+                ProtoSessionProgressPhase::AwaitingExternalInput
+            }
+            SessionProgressPhase::Interrupted => ProtoSessionProgressPhase::Interrupted,
+            SessionProgressPhase::Finished => ProtoSessionProgressPhase::Finished,
+            SessionProgressPhase::Failed => ProtoSessionProgressPhase::Failed,
+        } as i32,
+        run_stage: progress.run_stage.map(|stage| match stage {
+            SessionRunStage::BuildingRequest => ProtoSessionRunStage::BuildingRequest as i32,
+            SessionRunStage::StreamingProvider => ProtoSessionRunStage::StreamingProvider as i32,
+            SessionRunStage::RetryingProvider => ProtoSessionRunStage::RetryingProvider as i32,
+            SessionRunStage::EvaluatingToolCall => ProtoSessionRunStage::EvaluatingToolCall as i32,
+            SessionRunStage::RunningTool => ProtoSessionRunStage::RunningTool as i32,
+        }),
+        reason: progress.reason.map(session_coordination_reason_to_proto),
+        queued_count: u64::try_from(progress.queued_count).unwrap_or(u64::MAX),
+        continuation_armed: progress.continuation_armed,
+        running: progress.running,
+    }
+}
+
+fn session_capabilities_to_proto(capabilities: SessionCapabilities) -> ProtoSessionCapabilities {
+    ProtoSessionCapabilities {
+        prompt_disposition: match capabilities.prompt_disposition {
+            SessionPromptDisposition::Immediate => ProtoSessionPromptDisposition::Immediate,
+            SessionPromptDisposition::Queued => ProtoSessionPromptDisposition::Queued,
+            SessionPromptDisposition::SupersedeSuspension => {
+                ProtoSessionPromptDisposition::SupersedeSuspension
+            }
+        } as i32,
+        can_respond_external_request: capabilities.can_respond_external_request,
+        can_interrupt: capabilities.can_interrupt,
+    }
+}
+
+fn session_coordination_to_proto(state: SessionCoordinationState) -> ProtoSessionCoordinationState {
+    ProtoSessionCoordinationState {
+        phase: match state.phase {
+            SessionCoordinationPhase::Ready => ProtoSessionCoordinationPhase::Ready,
+            SessionCoordinationPhase::Running => ProtoSessionCoordinationPhase::Running,
+            SessionCoordinationPhase::CompletionBarrier => {
+                ProtoSessionCoordinationPhase::CompletionBarrier
+            }
+            SessionCoordinationPhase::Paused => ProtoSessionCoordinationPhase::Paused,
+        } as i32,
+        reason: state.reason.map(session_coordination_reason_to_proto),
+        queued_count: u32::try_from(state.queued_count).unwrap_or(u32::MAX),
+        continuation_armed: state.continuation_armed,
+    }
+}
+
+fn session_coordination_reason_to_proto(
+    reason: SessionCoordinationReason,
+) -> ProtoSessionCoordinationReason {
+    ProtoSessionCoordinationReason {
+        code: reason.code().to_owned(),
+        source: reason.source().map(str::to_owned),
+        trigger: reason.trigger().map(str::to_owned),
+    }
 }
 
 fn metadata_to_proto(
@@ -244,6 +328,115 @@ mod tests {
         AuthenticationDomain, AuthenticationFailureReason, auth_target,
     };
     use serde_json::json;
+
+    #[test]
+    fn progress_and_capabilities_preserve_every_agent_value() {
+        let phases = [
+            (
+                SessionProgressPhase::Unknown,
+                ProtoSessionProgressPhase::Unspecified,
+            ),
+            (SessionProgressPhase::Idle, ProtoSessionProgressPhase::Idle),
+            (
+                SessionProgressPhase::Running,
+                ProtoSessionProgressPhase::Running,
+            ),
+            (
+                SessionProgressPhase::CompletionBarrier,
+                ProtoSessionProgressPhase::CompletionBarrier,
+            ),
+            (
+                SessionProgressPhase::Paused,
+                ProtoSessionProgressPhase::Paused,
+            ),
+            (
+                SessionProgressPhase::AwaitingToolResults,
+                ProtoSessionProgressPhase::AwaitingToolResults,
+            ),
+            (
+                SessionProgressPhase::AwaitingExternalInput,
+                ProtoSessionProgressPhase::AwaitingExternalInput,
+            ),
+            (
+                SessionProgressPhase::Interrupted,
+                ProtoSessionProgressPhase::Interrupted,
+            ),
+            (
+                SessionProgressPhase::Finished,
+                ProtoSessionProgressPhase::Finished,
+            ),
+            (
+                SessionProgressPhase::Failed,
+                ProtoSessionProgressPhase::Failed,
+            ),
+        ];
+        for (phase, expected) in phases {
+            let projected = session_progress_to_proto(SessionProgress {
+                phase,
+                running: true,
+                queued_count: 4,
+                continuation_armed: true,
+                ..SessionProgress::default()
+            });
+            assert_eq!(projected.phase, expected as i32);
+            assert!(projected.running);
+            assert_eq!(projected.queued_count, 4);
+            assert!(projected.continuation_armed);
+        }
+
+        for (stage, expected) in [
+            (
+                SessionRunStage::BuildingRequest,
+                ProtoSessionRunStage::BuildingRequest,
+            ),
+            (
+                SessionRunStage::StreamingProvider,
+                ProtoSessionRunStage::StreamingProvider,
+            ),
+            (
+                SessionRunStage::RetryingProvider,
+                ProtoSessionRunStage::RetryingProvider,
+            ),
+            (
+                SessionRunStage::EvaluatingToolCall,
+                ProtoSessionRunStage::EvaluatingToolCall,
+            ),
+            (
+                SessionRunStage::RunningTool,
+                ProtoSessionRunStage::RunningTool,
+            ),
+        ] {
+            let projected = session_progress_to_proto(SessionProgress {
+                run_stage: Some(stage),
+                ..SessionProgress::default()
+            });
+            assert_eq!(projected.run_stage, Some(expected as i32));
+        }
+
+        for (disposition, expected) in [
+            (
+                SessionPromptDisposition::Immediate,
+                ProtoSessionPromptDisposition::Immediate,
+            ),
+            (
+                SessionPromptDisposition::Queued,
+                ProtoSessionPromptDisposition::Queued,
+            ),
+            (
+                SessionPromptDisposition::SupersedeSuspension,
+                ProtoSessionPromptDisposition::SupersedeSuspension,
+            ),
+        ] {
+            let projected = session_capabilities_to_proto(SessionCapabilities {
+                prompt_disposition: disposition,
+                can_respond_external_request: true,
+                can_interrupt: true,
+            });
+            assert_eq!(projected.prompt_disposition, expected as i32);
+            assert!(projected.can_respond_external_request);
+            assert!(projected.can_interrupt);
+        }
+    }
 
     #[test]
     fn failed_session_status_preserves_structured_authentication_failure() {

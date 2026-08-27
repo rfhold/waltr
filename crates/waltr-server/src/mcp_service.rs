@@ -13,8 +13,10 @@ use futures_util::StreamExt as _;
 use jaq_interpret::{Ctx, FilterT as _, ParseCtx, RcIter, Val};
 use waltr_agent::{
     AgentSessionRunDisposition, AuthTarget, ExternalRequest, ExternalRequestKind,
-    ExternalRequestStatus, InferenceSettings, PendingWork, PendingWorkStatus, SessionId,
-    SessionStatus, SessionSummary, Suspension,
+    ExternalRequestStatus, InferenceSettings, PendingWork, PendingWorkStatus, SessionCapabilities,
+    SessionCoordinationPhase, SessionCoordinationState, SessionId, SessionProgress,
+    SessionProgressPhase, SessionPromptDisposition, SessionRunStage, SessionStatus, SessionSummary,
+    Suspension,
 };
 use mcp::server::{ServerError, ServerResult};
 use schemars::JsonSchema;
@@ -128,8 +130,16 @@ impl WaltrMcpServer {
 
     async fn session_projection(&self, id: &SessionId) -> ServerResult<Value> {
         let session = self.sessions.load(id).await.map_err(session_error)?;
+        let summary = self
+            .sessions
+            .list()
+            .await
+            .map_err(session_error)?
+            .into_iter()
+            .find(|summary| &summary.id == id)
+            .unwrap_or_else(|| session.record.summary());
         let active = self.sessions.active_state(id).await;
-        Ok(project_session(&session.record, active))
+        Ok(project_session(&session.record, &summary, active))
     }
 }
 
@@ -358,7 +368,7 @@ impl WaltrMcpServer {
             if outputs.iter().any(jq_truthy) {
                 return Ok(wait_result("condition_met", &projection, &evaluated_output));
             }
-            if !projection["running"].as_bool().unwrap_or(false) {
+            if !projection_running(&projection) {
                 return Ok(wait_result(
                     "session_not_running",
                     &projection,
@@ -372,7 +382,7 @@ impl WaltrMcpServer {
                     let outputs = evaluate_jq(&filter, &projection)?;
                     let reason = if outputs.iter().any(jq_truthy) {
                         "condition_met"
-                    } else if !projection["running"].as_bool().unwrap_or(false) {
+                    } else if !projection_running(&projection) {
                         "session_not_running"
                     } else {
                         "timeout"
@@ -396,13 +406,17 @@ fn required_session_id(value: String) -> ServerResult<SessionId> {
     }
 }
 
+fn projection_running(projection: &Value) -> bool {
+    projection["running"].as_bool().unwrap_or(false)
+}
+
 fn project_session(
     record: &waltr_agent::SessionRecord,
+    summary: &SessionSummary,
     active: Option<waltr_agent::AgentSessionActiveRunState>,
 ) -> Value {
     let snapshot = record.snapshot();
-    let summary = record.summary();
-    let mut value = project_summary(&summary, active);
+    let mut value = project_summary(summary, active);
     let object = value
         .as_object_mut()
         .expect("session projection is an object");
@@ -429,16 +443,18 @@ fn project_summary(
     summary: &SessionSummary,
     active: Option<waltr_agent::AgentSessionActiveRunState>,
 ) -> Value {
-    let (status, durably_running, suspension, failure, retry) = project_status(&summary.status);
-    let running = session_is_running(&summary.status, durably_running, active.is_some());
+    let (status, suspension, failure, retry) = project_status(&summary.status);
     json!({
         "id": summary.id.as_str(),
         "revision": summary.revision.get(),
         "status": status,
-        "running": running,
+        "running": summary.progress.running,
         "suspension": suspension,
         "failure": failure,
         "retry": retry,
+        "coordination": project_coordination(&summary.coordination),
+        "progress": project_progress(&summary.progress),
+        "capabilities": project_capabilities(&summary.capabilities),
         "active_run": active.map(|state| json!({
             "run_id": state.run_id,
             "queued_count": state.queued_count
@@ -455,31 +471,81 @@ fn project_summary(
     })
 }
 
-const fn session_is_running(
-    status: &SessionStatus,
-    durably_running: bool,
-    has_active_run: bool,
-) -> bool {
-    durably_running || (has_active_run && !matches!(status, SessionStatus::Suspended(_)))
+fn project_coordination(coordination: &SessionCoordinationState) -> Value {
+    let phase = match coordination.phase {
+        SessionCoordinationPhase::Ready => "ready",
+        SessionCoordinationPhase::Running => "running",
+        SessionCoordinationPhase::CompletionBarrier => "completion_barrier",
+        SessionCoordinationPhase::Paused => "paused",
+    };
+    json!({
+        "phase": phase,
+        "reason": coordination.reason.as_ref().map(|reason| json!({
+            "code": reason.code(),
+            "source": reason.source(),
+            "trigger": reason.trigger(),
+        })),
+        "queued_count": coordination.queued_count,
+        "continuation_armed": coordination.continuation_armed,
+    })
 }
 
-fn project_status(status: &SessionStatus) -> (&'static str, bool, Value, Value, Value) {
+fn project_progress(progress: &SessionProgress) -> Value {
+    let phase = match progress.phase {
+        SessionProgressPhase::Unknown => "unknown",
+        SessionProgressPhase::Idle => "idle",
+        SessionProgressPhase::Running => "running",
+        SessionProgressPhase::CompletionBarrier => "completion_barrier",
+        SessionProgressPhase::Paused => "paused",
+        SessionProgressPhase::AwaitingToolResults => "awaiting_tool_results",
+        SessionProgressPhase::AwaitingExternalInput => "awaiting_external_input",
+        SessionProgressPhase::Interrupted => "interrupted",
+        SessionProgressPhase::Finished => "finished",
+        SessionProgressPhase::Failed => "failed",
+    };
+    let run_stage = progress.run_stage.map(|stage| match stage {
+        SessionRunStage::BuildingRequest => "building_request",
+        SessionRunStage::StreamingProvider => "streaming_provider",
+        SessionRunStage::RetryingProvider => "retrying_provider",
+        SessionRunStage::EvaluatingToolCall => "evaluating_tool_call",
+        SessionRunStage::RunningTool => "running_tool",
+    });
+    json!({
+        "phase": phase,
+        "run_stage": run_stage,
+        "reason": progress.reason.as_ref().map(|reason| json!({
+            "code": reason.code(),
+            "source": reason.source(),
+            "trigger": reason.trigger(),
+        })),
+        "queued_count": progress.queued_count,
+        "continuation_armed": progress.continuation_armed,
+        "running": progress.running,
+    })
+}
+
+fn project_capabilities(capabilities: &SessionCapabilities) -> Value {
+    let prompt_disposition = match capabilities.prompt_disposition {
+        SessionPromptDisposition::Immediate => "immediate",
+        SessionPromptDisposition::Queued => "queued",
+        SessionPromptDisposition::SupersedeSuspension => "supersede_suspension",
+    };
+    json!({
+        "prompt_disposition": prompt_disposition,
+        "can_respond_external_request": capabilities.can_respond_external_request,
+        "can_interrupt": capabilities.can_interrupt,
+    })
+}
+
+fn project_status(status: &SessionStatus) -> (&'static str, Value, Value, Value) {
     match status {
-        SessionStatus::Idle => ("idle", false, Value::Null, Value::Null, Value::Null),
-        SessionStatus::BuildingRequest => (
-            "building_request",
-            true,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ),
-        SessionStatus::StreamingProvider => (
-            "streaming_provider",
-            true,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ),
+        SessionStatus::Idle => ("idle", Value::Null, Value::Null, Value::Null),
+        SessionStatus::BuildingRequest => {
+            ("building_request", Value::Null, Value::Null, Value::Null)
+        }
+        SessionStatus::StreamingProvider => {
+            ("streaming_provider", Value::Null, Value::Null, Value::Null)
+        }
         SessionStatus::RetryingProvider {
             attempt,
             max_attempts,
@@ -487,7 +553,6 @@ fn project_status(status: &SessionStatus) -> (&'static str, bool, Value, Value, 
             message,
         } => (
             "retrying_provider",
-            true,
             Value::Null,
             Value::Null,
             json!({
@@ -499,26 +564,23 @@ fn project_status(status: &SessionStatus) -> (&'static str, bool, Value, Value, 
         ),
         SessionStatus::EvaluatingToolCall => (
             "evaluating_tool_call",
-            true,
             Value::Null,
             Value::Null,
             Value::Null,
         ),
-        SessionStatus::RunningTool => ("running_tool", true, Value::Null, Value::Null, Value::Null),
+        SessionStatus::RunningTool => ("running_tool", Value::Null, Value::Null, Value::Null),
         SessionStatus::Suspended(suspension) => (
             "suspended",
-            false,
             project_suspension(suspension),
             Value::Null,
             Value::Null,
         ),
-        SessionStatus::Finished => ("finished", false, Value::Null, Value::Null, Value::Null),
+        SessionStatus::Finished => ("finished", Value::Null, Value::Null, Value::Null),
         SessionStatus::Failed {
             message,
             authentication_failure,
         } => (
             "failed",
-            false,
             Value::Null,
             json!({
                 "message": message,
@@ -722,7 +784,7 @@ mod tests {
     use futures_util::Stream;
     use waltr_agent::{
         AgentSession, AgentSessionActiveRunState, AgentSessionRunError, AgentSessionRunSubmission,
-        LlmError, SessionListUpdate, SessionStatus, Suspension,
+        LlmError, SessionListUpdate,
     };
     use std::{io, path::PathBuf, pin::Pin};
     use tower::ServiceExt as _;
@@ -864,19 +926,92 @@ mod tests {
     }
 
     #[test]
-    fn active_run_bridges_pre_journal_status_without_overriding_suspension() {
-        assert!(session_is_running(&SessionStatus::Idle, false, true));
-        assert!(session_is_running(&SessionStatus::Finished, false, true));
-        assert!(!session_is_running(
-            &SessionStatus::Suspended(Suspension::AwaitingToolResults { work: Vec::new() }),
-            false,
-            true,
-        ));
-        assert!(session_is_running(
-            &SessionStatus::StreamingProvider,
-            true,
-            false,
-        ));
+    fn mcp_activity_uses_agent_progress_for_every_wait_state() {
+        for (phase, running) in [
+            (SessionProgressPhase::Running, true),
+            (SessionProgressPhase::CompletionBarrier, true),
+            (SessionProgressPhase::Paused, true),
+            (SessionProgressPhase::AwaitingToolResults, false),
+            (SessionProgressPhase::AwaitingExternalInput, false),
+            (SessionProgressPhase::Interrupted, false),
+            (SessionProgressPhase::Failed, false),
+        ] {
+            let record = waltr_agent::SessionRecord::new("session-activity");
+            let mut summary = record.summary();
+            summary.progress.phase = phase;
+            summary.progress.running = running;
+            let projected = project_summary(&summary, None);
+            assert_eq!(projected["running"], running, "{phase:?}");
+            assert_eq!(projected["progress"]["running"], running, "{phase:?}");
+            assert_eq!(projection_running(&projected), running, "{phase:?}");
+        }
+
+        let mut summary = waltr_agent::SessionRecord::new("no-recombination").summary();
+        summary.status = SessionStatus::StreamingProvider;
+        summary.coordination.phase = SessionCoordinationPhase::Paused;
+        summary.progress.running = false;
+        assert_eq!(project_summary(&summary, None)["running"], false);
+
+        let mut summary = waltr_agent::SessionRecord::new("suspended-active").summary();
+        summary.status = SessionStatus::Suspended(Suspension::Interrupted { work: Vec::new() });
+        summary.coordination.phase = SessionCoordinationPhase::Running;
+        summary.progress = SessionProgress::from_state(&summary.status, &summary.coordination);
+        summary.capabilities =
+            SessionCapabilities::from_state(&summary.status, &summary.coordination);
+        let projected = project_summary(&summary, None);
+        assert_eq!(projected["running"], false);
+        assert_eq!(projected["progress"]["running"], false);
+        assert!(!projection_running(&projected));
+    }
+
+    #[test]
+    fn mcp_projects_structured_agent_coordination_without_active_run_derivation() {
+        let record = waltr_agent::SessionRecord::new("session-paused");
+        let mut summary = record.summary();
+        summary.coordination = waltr_agent::SessionCoordinationState {
+            phase: SessionCoordinationPhase::Paused,
+            reason: Some(
+                waltr_agent::SessionCoordinationReason::new(
+                    "context-compaction",
+                    Some("compact-and-continue".to_owned()),
+                    Some("run-completed".to_owned()),
+                )
+                .unwrap(),
+            ),
+            queued_count: 2,
+            continuation_armed: true,
+        };
+        summary.progress = waltr_agent::SessionProgress {
+            phase: SessionProgressPhase::Paused,
+            reason: summary.coordination.reason.clone(),
+            queued_count: 2,
+            continuation_armed: true,
+            running: true,
+            ..waltr_agent::SessionProgress::default()
+        };
+        summary.capabilities = SessionCapabilities {
+            prompt_disposition: SessionPromptDisposition::Queued,
+            can_respond_external_request: false,
+            can_interrupt: false,
+        };
+
+        let projected = project_summary(&summary, None);
+        assert_eq!(projected["running"], true);
+        assert_eq!(projected["coordination"]["phase"], "paused");
+        assert_eq!(
+            projected["coordination"]["reason"]["code"],
+            "context-compaction"
+        );
+        assert_eq!(projected["coordination"]["queued_count"], 2);
+        assert_eq!(projected["coordination"]["continuation_armed"], true);
+        assert_eq!(projected["progress"]["phase"], "paused");
+        assert_eq!(
+            projected["progress"]["reason"]["code"],
+            "context-compaction"
+        );
+        assert_eq!(projected["capabilities"]["prompt_disposition"], "queued");
+        assert_eq!(projected["status"], "idle");
+        assert!(projected["active_run"].is_null());
     }
 
     #[test]
@@ -889,7 +1024,8 @@ mod tests {
         );
 
         let summary = project_summary(&record.summary(), None);
-        let session = project_session(&record, None);
+        let record_summary = record.summary();
+        let session = project_session(&record, &record_summary, None);
 
         assert_eq!(summary["metadata"]["title"], "Projected title");
         assert_eq!(summary["metadata"]["unknown"]["null"], Value::Null);
