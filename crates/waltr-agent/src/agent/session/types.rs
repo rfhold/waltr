@@ -18,7 +18,8 @@ use crate::{
 };
 
 use super::{
-    ActiveSessionMask, InferenceSettings, SessionCoordinationState, SessionMask, SessionMaskId,
+    ActiveSessionMask, InferenceSettings, SessionCapabilities, SessionCoordinationState,
+    SessionMask, SessionMaskId, SessionProgress,
 };
 
 /// Condition applied by an atomic metadata set.
@@ -271,6 +272,12 @@ pub struct SessionSummary {
     /// Process-local run, barrier, pause, queue, and continuation facts.
     #[serde(default)]
     pub coordination: SessionCoordinationState,
+    /// Unified durable and process-local progress projection.
+    #[serde(default)]
+    pub progress: SessionProgress,
+    /// Actions authorized by the current durable and process-local state.
+    #[serde(default)]
+    pub capabilities: SessionCapabilities,
 }
 
 /// Durable usage and cost totals for a session.
@@ -391,7 +398,7 @@ impl SessionRecord {
     pub fn summary(&self) -> SessionSummary {
         let snapshot = self.snapshot();
         let metrics = snapshot.metrics();
-        SessionSummary {
+        let mut summary = SessionSummary {
             id: self.id.clone(),
             revision: self.revision,
             status: snapshot.status,
@@ -407,7 +414,11 @@ impl SessionRecord {
                 .map(|bundle| bundle.agent_name.clone()),
             metadata_values: self.metadata.values.clone(),
             coordination: SessionCoordinationState::default(),
-        }
+            progress: SessionProgress::default(),
+            capabilities: SessionCapabilities::default(),
+        };
+        summary.set_coordination(SessionCoordinationState::default());
+        summary
     }
 
     /// Mark this record as having user-visible activity now.
@@ -588,8 +599,10 @@ impl SessionRecord {
 }
 
 impl SessionSummary {
-    /// Replace process-local coordination.
+    /// Replace process-local coordination and recompute its derived projections together.
     pub(crate) fn set_coordination(&mut self, coordination: SessionCoordinationState) {
+        self.progress = SessionProgress::from_state(&self.status, &coordination);
+        self.capabilities = SessionCapabilities::from_state(&self.status, &coordination);
         self.coordination = coordination;
     }
 }
@@ -1360,6 +1373,14 @@ mod tests {
             summary.coordination.phase,
             crate::SessionCoordinationPhase::Ready
         );
+        assert_eq!(summary.progress.phase, crate::SessionProgressPhase::Idle);
+        assert!(!summary.progress.running);
+        assert_eq!(
+            summary.capabilities.prompt_disposition,
+            crate::SessionPromptDisposition::Immediate
+        );
+        assert!(!summary.capabilities.can_respond_external_request);
+        assert!(!summary.capabilities.can_interrupt);
     }
 
     #[test]
