@@ -26,7 +26,7 @@ describe("Routines route", () => {
       definitions: [{
         routineName: "fork", triggerName: "manual", displayName: "Fork session", description: "Create a branch.",
         scope: "session", routineRevision: "rev-1",
-        inputs: [{ name: "Direction", type: "string", required: true, minimumStringLength: 3n, stringPattern: null }],
+        inputs: [{ name: "Direction", type: "string", required: true, defaultValue: null, minimumStringLength: 3n, stringPattern: null }],
         results: [{ name: "session-id", type: "string" }],
       }],
     };

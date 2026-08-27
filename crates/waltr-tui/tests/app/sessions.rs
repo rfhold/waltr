@@ -273,6 +273,7 @@ fn string_routine_input(name: &str, required: bool) -> ClientRoutineInputDefinit
         name: name.to_owned(),
         r#type: ClientRoutineValueType::String,
         required,
+        default_value: None,
         minimum_string_length: None,
         string_pattern: None,
     }
@@ -283,6 +284,7 @@ fn boolean_routine_input(name: &str) -> ClientRoutineInputDefinition {
         name: name.to_owned(),
         r#type: ClientRoutineValueType::Boolean,
         required: false,
+        default_value: None,
         minimum_string_length: None,
         string_pattern: None,
     }
@@ -549,6 +551,35 @@ fn session_commands_searches_dynamic_definitions_and_toggles_boolean() {
         action,
         AppAction::ClientCommand(ClientCommand::StartManualRoutine { inputs, .. })
             if inputs.get("include-context") == Some(&ClientRoutineValue::Boolean(true))
+    ));
+}
+
+#[test]
+fn session_commands_initialize_defaults_and_preserve_edits() {
+    let mut input = boolean_routine_input("continue");
+    input.default_value = Some(ClientRoutineValue::Boolean(true));
+    let definition = routine_definition(
+        "generic",
+        "Compact context",
+        "Compact and optionally continue",
+        vec![input],
+    );
+    let mut app = open_sessions_app_with(routine_catalog_snapshot(
+        "source",
+        "ready",
+        vec![definition],
+        None,
+    ));
+    let now = Instant::now();
+    drop(open_routine_palette(&mut app, now));
+    drop(app.handle_event(&enter_press(), now));
+    assert!(render_app(&app).contains("[x] true"));
+    drop(app.handle_event(&char_press(' '), now));
+    drop(app.handle_event(&tab_press(), now));
+    assert!(matches!(
+        app.handle_event(&enter_press(), now),
+        AppAction::ClientCommand(ClientCommand::StartManualRoutine { inputs, .. })
+            if inputs.get("continue") == Some(&ClientRoutineValue::Boolean(false))
     ));
 }
 

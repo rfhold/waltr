@@ -108,7 +108,7 @@ export function SessionCommandPalette(props: { sessionId: string }) {
 
   const selectDefinition = (definition: ClientManualRoutineDefinition) => {
     setSelected(definition);
-    setDrafts(Object.fromEntries(definition.inputs.map((input) => [input.name, input.type === "boolean" ? false : ""])));
+    setDrafts(Object.fromEntries(definition.inputs.map((input) => [input.name, input.defaultValue?.value ?? (input.type === "boolean" ? false : "")])));
     setLocalErrors({});
     setClearedServerErrors({});
     setOperationKey(undefined);

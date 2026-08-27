@@ -12,7 +12,7 @@ const definition: ClientManualRoutineDefinition = {
   displayName: "Fork session",
   description: "Create a new session from this point.",
   scope: "session",
-  inputs: [{ name: "Direction", type: "string", required: true, minimumStringLength: 3n, stringPattern: "[a-z]+" }],
+  inputs: [{ name: "Direction", type: "string", required: true, defaultValue: null, minimumStringLength: 3n, stringPattern: "[a-z]+" }],
   results: [{ name: "session-id", type: "string" }],
   routineRevision: "revision-1",
 };
@@ -105,6 +105,18 @@ describe("session commands palette", () => {
     expect(retry.inputs.Direction).toEqual({ type: "string", value: "south" });
   });
 
+  test("initializes server defaults and preserves user edits", () => {
+    const withDefault: ClientManualRoutineDefinition = {
+      ...definition,
+      inputs: [{ ...definition.inputs[0]!, required: false, defaultValue: { type: "string", value: "north" } }],
+    };
+    renderSession({ snapshot: sessionSnapshot(withDefault) });
+    openAndSelect();
+    expect((screen.getByLabelText("Direction") as HTMLTextAreaElement).value).toBe("north");
+    fireEvent.input(screen.getByLabelText("Direction"), { target: { value: "south" } });
+    expect((screen.getByLabelText("Direction") as HTMLTextAreaElement).value).toBe("south");
+  });
+
   test("shows immediate admission success without eager progress and Close stays on the source session", async () => {
     const commands: ClientCommand[] = [];
     let publish!: (snapshot: ClientSnapshot) => void;
@@ -146,10 +158,10 @@ function renderSession(options: Parameters<typeof renderWithAppState>[1] = {}) {
   return renderWithAppState(() => <SessionsRouteWithRouter />, { routePath: "/sessions/source", snapshot: sessionSnapshot(), ...options });
 }
 
-function sessionSnapshot() {
+function sessionSnapshot(routineDefinition = definition) {
   const snapshot = snapshotWithSessions([sessionView({ id: "source" })]);
   snapshot.sessions.timelines.source = readySessionTimeline();
-  snapshot.routines.definitions = { watch: operationSnapshot("received"), digest: "definitions-1", definitions: [definition] };
+  snapshot.routines.definitions = { watch: operationSnapshot("received"), digest: "definitions-1", definitions: [routineDefinition] };
   snapshot.routines.history.watch = operationSnapshot("received");
   return snapshot;
 }

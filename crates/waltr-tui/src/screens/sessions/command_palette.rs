@@ -458,12 +458,21 @@ impl SessionCommandPalette {
             .iter()
             .map(|input| InputDraft {
                 name: input.name.clone(),
-                value: match input.r#type {
-                    ClientRoutineValueType::String => InputValueDraft::String {
+                value: match (&input.r#type, &input.default_value) {
+                    (ClientRoutineValueType::String, Some(ClientRoutineValue::String(value))) => {
+                        InputValueDraft::String {
+                            value: value.clone(),
+                            cursor: value.len(),
+                        }
+                    }
+                    (ClientRoutineValueType::String, _) => InputValueDraft::String {
                         value: String::new(),
                         cursor: 0,
                     },
-                    ClientRoutineValueType::Boolean => InputValueDraft::Boolean(false),
+                    (ClientRoutineValueType::Boolean, Some(ClientRoutineValue::Boolean(value))) => {
+                        InputValueDraft::Boolean(*value)
+                    }
+                    (ClientRoutineValueType::Boolean, _) => InputValueDraft::Boolean(false),
                 },
             })
             .collect();

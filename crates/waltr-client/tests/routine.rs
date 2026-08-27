@@ -16,11 +16,11 @@ use waltr::grpc::waltr::{
         RoutineInputDefinition, RoutineInvocation, RoutineInvocationDetail,
         RoutineInvocationSnapshot, RoutineInvocationStatus, RoutineResultDefinition, RoutineScope,
         RoutineTask, RoutineTaskStatus, RoutineTriggerKind, RoutineValidationFailure,
-        RoutineValueType, StartManualRoutineRequest, StartManualRoutineResponse,
-        WatchManualRoutinesRequest, WatchManualRoutinesResponse, WatchRoutineInvocationsRequest,
-        WatchRoutineInvocationsResponse,
+        RoutineValue as ProtoRoutineValue, RoutineValueType, StartManualRoutineRequest,
+        StartManualRoutineResponse, WatchManualRoutinesRequest, WatchManualRoutinesResponse,
+        WatchRoutineInvocationsRequest, WatchRoutineInvocationsResponse,
         routine_service_server::{RoutineService, RoutineServiceServer},
-        start_manual_routine_response, watch_routine_invocations_response,
+        routine_value, start_manual_routine_response, watch_routine_invocations_response,
     },
     status::v1::{
         SystemStatus, WatchStatusRequest, WatchStatusResponse,
@@ -228,6 +228,10 @@ async fn multiple_interests_share_one_physical_stream_per_routine_watch() {
     let definition = &snapshot.routines.definitions.definitions[0];
     assert_eq!(definition.routine_revision, "revision-1");
     assert_eq!(definition.inputs[0].r#type, ClientRoutineValueType::String);
+    assert_eq!(
+        definition.inputs[0].default_value,
+        Some(ClientRoutineValue::String("north".to_owned()))
+    );
     assert_eq!(snapshot.routines.history.through_sequence, Some(1));
     task.abort();
 }
@@ -503,6 +507,9 @@ fn definition(revision: &str) -> ManualRoutineDefinition {
             name: "direction".to_owned(),
             r#type: RoutineValueType::String as i32,
             required: true,
+            default_value: Some(ProtoRoutineValue {
+                value: Some(routine_value::Value::StringValue("north".to_owned())),
+            }),
             ..RoutineInputDefinition::default()
         }],
         results: vec![RoutineResultDefinition {
