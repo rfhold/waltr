@@ -61,7 +61,7 @@ const BUNDLED_RESOURCES: [(&str, &str); 6] = [
     ),
 ];
 
-const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 14] = [
+const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 15] = [
     BUNDLED_RESOURCES[0],
     BUNDLED_RESOURCES[1],
     BUNDLED_RESOURCES[2],
@@ -95,6 +95,10 @@ const UNIFIED_BUNDLED_RESOURCES: [(&str, &str); 14] = [
     (
         "routines/title.yaml",
         include_str!("../../resources/routines/title.yaml"),
+    ),
+    (
+        "routines/compact-and-continue.yaml",
+        include_str!("../../resources/routines/compact-and-continue.yaml"),
     ),
     (
         "routines/fork.yaml",

@@ -1,8 +1,45 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::host::{
+    PauseCaptureFuture, PauseFuture, PauseMaskFuture, PauseUnitFuture, RoutinePause,
+    RoutinePauseGuard,
+};
 use super::*;
 
 type SubmittedRun = (String, NonZeroU64);
+
+struct AutomaticUsageProvider;
+
+impl waltr_agent::LlmStream for AutomaticUsageProvider {
+    fn name(&self) -> &'static str {
+        "automatic_usage_provider"
+    }
+
+    fn stream_request<'a>(
+        &'a self,
+        _request: waltr_agent::CompletionRequest<'a>,
+    ) -> waltr_agent::BoxStreamFuture<'a> {
+        Box::pin(async move {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(waltr_agent::CompletionEvent::Delta("complete".to_owned())),
+                Ok(waltr_agent::CompletionEvent::ProviderMetadata(
+                    waltr_agent::ProviderTurnMetadata {
+                        provider: "test".to_owned(),
+                        url: String::new(),
+                        model: "test-model".to_owned(),
+                        usage: Some(waltr_agent::TokenUsage {
+                            input_tokens: Some(180_000),
+                            ..waltr_agent::TokenUsage::default()
+                        }),
+                        cost: None,
+                        resume: Value::Null,
+                    },
+                )),
+                Ok(waltr_agent::CompletionEvent::Finished),
+            ])) as waltr_agent::BoxCompletionStream)
+        })
+    }
+}
 
 #[derive(Default)]
 struct FakeHost {
@@ -38,6 +75,16 @@ struct FakeHost {
     fail_destination: AtomicBool,
     panic_destination: AtomicBool,
     fail_start: AtomicBool,
+    paused: AtomicBool,
+    pause_reasons: Mutex<Vec<waltr_agent::SessionCoordinationReason>>,
+    pause_captures: AtomicUsize,
+    pause_releases: AtomicUsize,
+    mask_mutations: Mutex<Vec<waltr_agent::SessionMaskMutation>>,
+    continuations: Mutex<Vec<waltr_agent::TimelineCursor>>,
+    fail_mask: AtomicBool,
+    fail_continue: AtomicBool,
+    block_release_once: AtomicBool,
+    release_entered: tokio::sync::Notify,
 }
 
 impl FakeHost {
@@ -63,11 +110,7 @@ impl FakeHost {
         });
         let source_id = SessionId::new("source-session");
         let call = waltr_agent::ToolCall::new("call-0", "source-tool-0", json!({"turn": 0}));
-        let result = waltr_agent::ToolResult::new(
-            "call-0",
-            "source-tool-0",
-            "source result 0",
-        );
+        let result = waltr_agent::ToolResult::new("call-0", "source-tool-0", "source result 0");
         let mut source = waltr_agent::SessionRecord::new(source_id.clone());
         source.journal = vec![
             waltr_agent::SessionJournalEvent::PromptAppended {
@@ -145,11 +188,9 @@ impl FakeHost {
             }),
             waltr_agent::SessionJournalEvent::TurnFinished { turn: 0 },
         ];
-        let copy = waltr_agent::SessionCopy::from_record(
-            &source,
-            waltr_agent::TimelineCursor::new(4),
-        )
-        .expect("valid source copy");
+        let copy =
+            waltr_agent::SessionCopy::from_record(&source, waltr_agent::TimelineCursor::new(4))
+                .expect("valid source copy");
         Self {
             capture: Mutex::new(Some(waltr_agent::CompletedSessionCapture {
                 source_id,
@@ -189,6 +230,93 @@ impl RoutineHost for FakeHost {
                     "capture unavailable".to_owned(),
                 )
             })
+        })
+    }
+
+    fn acquire_pause<'a>(
+        &'a self,
+        id: &'a SessionId,
+        reason: waltr_agent::SessionCoordinationReason,
+    ) -> PauseFuture<'a> {
+        Box::pin(async move {
+            if self.paused.swap(true, Ordering::SeqCst) {
+                return Err(waltr_agent::SessionPauseError::Paused {
+                    session_id: id.clone(),
+                });
+            }
+            self.pause_reasons.lock().unwrap().push(reason);
+            let cursor = self
+                .capture
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("pause test capture")
+                .through_cursor;
+            Ok(RoutinePause::for_test(id.clone(), cursor))
+        })
+    }
+
+    fn capture_paused_effective<'a>(&'a self, _pause: &'a RoutinePause) -> PauseCaptureFuture<'a> {
+        Box::pin(async move {
+            self.pause_captures.fetch_add(1, Ordering::SeqCst);
+            self.capture.lock().unwrap().clone().ok_or_else(|| {
+                waltr_agent::SessionPauseError::CompletedBoundaryRequired {
+                    session_id: SessionId::new("source-session"),
+                }
+            })
+        })
+    }
+
+    fn apply_paused_mask<'a>(
+        &'a self,
+        pause: &'a RoutinePause,
+        mutation: waltr_agent::SessionMaskMutation,
+    ) -> PauseMaskFuture<'a> {
+        Box::pin(async move {
+            if self.fail_mask.load(Ordering::SeqCst) {
+                return Err(waltr_agent::SessionPauseError::BoundaryChanged {
+                    session_id: pause.session_id().clone(),
+                    expected: pause.source_cursor(),
+                    actual: None,
+                });
+            }
+            self.mask_mutations.lock().unwrap().push(mutation);
+            Ok(waltr_agent::SessionMaskMutationOutcome {
+                revision: waltr_agent::Revision::new(1),
+                cursor: pause.source_cursor().next(),
+                removed_mask_ids: Vec::new(),
+                added_masks: Vec::new(),
+            })
+        })
+    }
+
+    fn arm_paused_continuation<'a>(
+        &'a self,
+        pause: &'a RoutinePause,
+        cursor: waltr_agent::TimelineCursor,
+    ) -> PauseUnitFuture<'a> {
+        Box::pin(async move {
+            if self.fail_continue.load(Ordering::SeqCst) {
+                return Err(waltr_agent::SessionPauseError::ContinuationCursorMismatch {
+                    session_id: pause.session_id().clone(),
+                    expected: None,
+                    actual: cursor,
+                });
+            }
+            self.continuations.lock().unwrap().push(cursor);
+            Ok(())
+        })
+    }
+
+    fn release_pause<'a>(&'a self, _pause: &'a RoutinePause) -> PauseUnitFuture<'a> {
+        Box::pin(async move {
+            if self.block_release_once.swap(false, Ordering::SeqCst) {
+                self.release_entered.notify_waiters();
+                std::future::pending::<()>().await;
+            }
+            self.paused.store(false, Ordering::SeqCst);
+            self.pause_releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         })
     }
 
@@ -330,6 +458,211 @@ async fn state() -> AgentDefinitionState {
     AgentDefinitionState::load_unified(root, materializer).unwrap()
 }
 
+async fn compact_state() -> AgentDefinitionState {
+    let loader = crate::test_support::default_catalog_loader();
+    let materializer = crate::catalog::CatalogMaterializer::load(&loader)
+        .await
+        .unwrap();
+    let root = crate::test_support::temp_root();
+    let resources = root.join(".waltr/resources");
+    std::fs::create_dir_all(resources.join("mcp-servers")).unwrap();
+    std::fs::create_dir_all(resources.join("routines")).unwrap();
+    std::fs::write(
+        resources.join("mcp-servers/waltr.yaml"),
+        "apiVersion: waltr.dev/v1alpha1\nkind: McpServer\nmetadata:\n  name: waltr\nspec:\n  transport: streamableHttp\n  url: https://waltr.example/base\n  path: /mcp\n",
+    )
+    .unwrap();
+    std::fs::write(
+        resources.join("routines/compact-and-continue.yaml"),
+        include_str!("../../../../docs/examples/routines/compact-and-continue.yaml"),
+    )
+    .unwrap();
+    AgentDefinitionState::load_unified(root, materializer).unwrap()
+}
+
+fn completion_snapshot(
+    provider_key: &str,
+    model_id: &str,
+    tokens: Option<u64>,
+    purpose: Option<&str>,
+) -> waltr_agent::SessionRunCompletionSnapshot {
+    waltr_agent::SessionRunCompletionSnapshot {
+        session_id: SessionId::new("source-session"),
+        run_id: "session-run:source-session:r7".to_owned(),
+        terminal_cursor: waltr_agent::TimelineCursor::new(9),
+        context_tokens: tokens,
+        purpose: purpose.map(ToOwned::to_owned),
+        provider_key: provider_key.to_owned(),
+        model_id: model_id.to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn automatic_completion_pressure_selection_is_strict_and_deterministic() {
+    let state = compact_state().await;
+    let catalog = state.snapshot();
+    let (provider_key, model_id, limit) = catalog
+        .configuration()
+        .providers
+        .iter()
+        .find_map(|(provider_key, provider)| {
+            provider.models.iter().find_map(|(model_id, model)| {
+                model
+                    .limits
+                    .and_then(|limits| limits.context)
+                    .map(|limit| (provider_key.as_str(), model_id.as_str(), u64::from(limit)))
+            })
+        })
+        .expect("test catalog model with context limit");
+    let percentage_threshold = u64::try_from((u128::from(limit) * 80).div_ceil(100)).unwrap();
+    let below_both = 179_999_u64.min(percentage_threshold.saturating_sub(1));
+
+    assert!(
+        engine::select_automatic_invocation(
+            &catalog,
+            &completion_snapshot(provider_key, model_id, Some(below_both), None),
+        )
+        .unwrap()
+        .is_none()
+    );
+    let (_, trigger, context) = engine::select_automatic_invocation(
+        &catalog,
+        &completion_snapshot(provider_key, model_id, Some(percentage_threshold), None),
+    )
+    .unwrap()
+    .expect("80 percent pressure must match");
+    assert_eq!(trigger, "context-pressure");
+    assert_eq!(context.params["continue"], json!(true));
+    assert!(
+        engine::select_automatic_invocation(
+            &catalog,
+            &completion_snapshot("unknown", "unknown", Some(180_000), None),
+        )
+        .unwrap()
+        .is_some(),
+        "absolute pressure must work without a known model limit"
+    );
+    assert!(
+        engine::select_automatic_invocation(
+            &catalog,
+            &completion_snapshot(provider_key, model_id, None, None),
+        )
+        .unwrap()
+        .is_none(),
+        "missing provider usage must not match"
+    );
+    assert!(
+        engine::select_automatic_invocation(
+            &catalog,
+            &completion_snapshot(provider_key, model_id, Some(u64::MAX), Some("routine-task"),),
+        )
+        .unwrap()
+        .is_none(),
+        "Routine helper sessions must be excluded"
+    );
+}
+
+#[tokio::test]
+async fn automatic_failed_durable_admission_fails_open_without_history_or_pause() {
+    let catalog = compact_state().await;
+    let persistence = crate::persistence::Persistence::initialize(
+        crate::persistence::DatabaseConfig::for_tests().unwrap(),
+    )
+    .await
+    .unwrap();
+    let store = persistence.routine_invocation_store();
+    sqlx::query(
+        "CREATE TRIGGER fail_automatic_admission BEFORE INSERT ON routine_invocations BEGIN SELECT RAISE(ABORT, 'injected admission failure'); END",
+    )
+    .execute(persistence.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let host = Arc::new(FakeHost::with_capture("unused"));
+    let bus = EventBus::new(8);
+    let engine = RoutineEngine::start_with_host_and_store(
+        bus.subscribe(),
+        catalog,
+        host.clone(),
+        store.clone(),
+    );
+    while !matches!(&*engine.health().borrow(), EngineHealth::Running) {
+        tokio::task::yield_now().await;
+    }
+
+    let mut registry = waltr_agent::AgentDefinitionRegistry::new();
+    let source = "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n";
+    registry.load_yaml(source).unwrap();
+    let runtime_factory = waltr_agent::AgentSessionRuntimeFactory::new(
+        std::env::temp_dir(),
+        waltr_agent::FileCredentialStore::new(
+            std::env::temp_dir().join("waltr-automatic-admission-auth.json"),
+        ),
+        registry.resolve_agent("test").unwrap(),
+    )
+    .with_runtime_provider(|_| {
+        Ok(waltr_agent::AgentRuntimeProvider::new(
+            waltr_agent::ModelRef::new(
+                waltr_agent::ProviderId::OpenAi,
+                "test-model",
+                waltr_agent::ModelApi::OpenAiResponses,
+            ),
+            Arc::new(AutomaticUsageProvider),
+        ))
+    });
+    let sessions =
+        SessionCoordinator::new(MemorySessionStore::new()).with_runtime_factory(runtime_factory);
+    sessions.set_completion_admission_handler(engine.completion_handler_for_test());
+    let mut request = SessionCreateRequest::new(SessionId::new("source-session"));
+    request.inference_settings = Some(test_inference());
+    request.agent_definition = Some(waltr_agent::AgentDefinitionBundle::new(
+        "test",
+        vec![source.to_owned()],
+    ));
+    sessions.create(request).await.unwrap();
+
+    sessions
+        .submit_prompt(
+            SessionId::new("source-session"),
+            "pressure",
+            waltr_agent::RunConflictPolicy::QueueIfActive,
+        )
+        .await
+        .unwrap()
+        .handle
+        .wait()
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .list(None, 10, &BTreeMap::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        sessions
+            .active_state(&SessionId::new("source-session"))
+            .await
+            .is_none()
+    );
+    let pause = sessions
+        .acquire_pause_reject_busy(
+            &SessionId::new("source-session"),
+            waltr_agent::SessionCoordinationReason::new(
+                "host-operation",
+                Some("test".to_owned()),
+                Some("manual".to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("failed admission must release the coordinator pause");
+    sessions.release_pause(&pause).await.unwrap();
+    assert_eq!(host.pause_captures.load(Ordering::SeqCst), 1);
+    engine.shutdown().await;
+}
+
 fn event(id: &str, ephemeral: bool) -> EventEnvelope {
     let metadata = ephemeral
         .then(|| json!({"waltr.session.ephemeral": true}))
@@ -380,6 +713,171 @@ fn manual_invocation(request_id: &str) -> ManualRoutineInvocation {
             RoutineValue::String("continue".to_owned()),
         )]),
     }
+}
+
+fn compact_invocation(request_id: &str, continue_after: Option<bool>) -> ManualRoutineInvocation {
+    ManualRoutineInvocation {
+        request_id: request_id.to_owned(),
+        routine_name: "compact-and-continue".to_owned(),
+        trigger_name: "manual".to_owned(),
+        session_id: SessionId::new("source-session"),
+        inputs: continue_after
+            .map(|value| BTreeMap::from([("continue".to_owned(), RoutineValue::Boolean(value))]))
+            .unwrap_or_default(),
+    }
+}
+
+#[tokio::test]
+async fn manual_compaction_defaults_false_uses_effective_pause_and_translates_mask() {
+    let host = Arc::new(FakeHost::with_capture("compact summary"));
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, host.clone());
+
+    let results = engine
+        .manual_handle()
+        .invoke_for_test(compact_invocation("compact-default", None))
+        .await
+        .unwrap();
+
+    assert_eq!(host.pause_captures.load(Ordering::SeqCst), 1);
+    assert_eq!(host.pause_releases.load(Ordering::SeqCst), 1);
+    let reasons = host.pause_reasons.lock().unwrap();
+    assert_eq!(reasons.len(), 1);
+    assert_eq!(reasons[0].code(), "context-compaction");
+    assert_eq!(reasons[0].source(), Some("compact-and-continue"));
+    assert_eq!(reasons[0].trigger(), Some("manual"));
+    drop(reasons);
+    assert!(host.continuations.lock().unwrap().is_empty());
+    let mutations = host.mask_mutations.lock().unwrap();
+    assert_eq!(mutations.len(), 1);
+    assert_eq!(mutations[0].subtract.overlaps[0].cursor.get(), 4);
+    assert_eq!(mutations[0].add[0].selector.cursor.get(), 4);
+    assert_eq!(mutations[0].add[0].key, "context.compaction-prefix");
+    assert_eq!(mutations[0].add[0].replacement.text, "compact summary");
+    assert!(matches!(
+        host.children.lock().unwrap()[0].start,
+        SessionStart::Copy { .. }
+    ));
+    assert_eq!(
+        results,
+        vec![
+            RoutineInvocationResult {
+                name: "summary".to_owned(),
+                value: RoutineValue::String("compact summary".to_owned()),
+            },
+            RoutineInvocationResult {
+                name: "mask-cursor".to_owned(),
+                value: RoutineValue::String("5".to_owned()),
+            },
+        ]
+    );
+    drop(mutations);
+    engine.shutdown().await;
+}
+
+#[test]
+fn automatic_compaction_claim_uses_selected_routine_reason() {
+    let reason = super::engine::routine_pause_reason("compact-and-continue", "run-completed")
+        .expect("valid automatic compaction reason");
+    assert_eq!(reason.code(), "context-compaction");
+    assert_eq!(reason.source(), Some("compact-and-continue"));
+    assert_eq!(reason.trigger(), Some("run-completed"));
+}
+
+#[tokio::test]
+async fn manual_compaction_explicit_true_arms_exact_mask_cursor_before_release() {
+    let host = Arc::new(FakeHost::with_capture("compact summary"));
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, host.clone());
+
+    engine
+        .manual_handle()
+        .invoke_for_test(compact_invocation("compact-continue", Some(true)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *host.continuations.lock().unwrap(),
+        [waltr_agent::TimelineCursor::new(5)]
+    );
+    assert_eq!(host.pause_releases.load(Ordering::SeqCst), 1);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn manual_compaction_busy_rejects_before_execution() {
+    let host = Arc::new(FakeHost::with_capture("compact summary"));
+    host.paused.store(true, Ordering::SeqCst);
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, host.clone());
+
+    let error = engine
+        .manual_handle()
+        .invoke_for_test(compact_invocation("compact-busy", None))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.class, "source_precondition");
+    assert!(host.children.lock().unwrap().is_empty());
+    assert!(host.mask_mutations.lock().unwrap().is_empty());
+    assert_eq!(host.pause_releases.load(Ordering::SeqCst), 0);
+    host.paused.store(false, Ordering::SeqCst);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn continuation_failure_releases_pause_without_compensating_mask() {
+    let host = Arc::new(FakeHost::with_capture("compact summary"));
+    host.fail_continue.store(true, Ordering::SeqCst);
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, host.clone());
+
+    let error = engine
+        .manual_handle()
+        .invoke_for_test(compact_invocation("continue-fails", Some(true)))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.class, "continue_action");
+    assert_eq!(host.mask_mutations.lock().unwrap().len(), 1);
+    assert_eq!(host.pause_releases.load(Ordering::SeqCst), 1);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn helper_and_mask_failures_release_the_owned_pause() {
+    let helper_host = Arc::new(FakeHost::with_capture("unused"));
+    *helper_host.response.lock().unwrap() = Some(Err("provider failed".to_owned()));
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, helper_host.clone());
+    let error = engine
+        .manual_handle()
+        .invoke_for_test(compact_invocation("helper-fails", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.class, "provider");
+    assert_eq!(helper_host.pause_releases.load(Ordering::SeqCst), 1);
+    assert!(helper_host.mask_mutations.lock().unwrap().is_empty());
+    engine.shutdown().await;
+
+    let mask_host = Arc::new(FakeHost::with_capture("compact summary"));
+    mask_host.fail_mask.store(true, Ordering::SeqCst);
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, mask_host.clone());
+    let error = engine
+        .manual_handle()
+        .invoke_for_test(compact_invocation("mask-fails", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.class, "mask_action");
+    assert_eq!(mask_host.pause_releases.load(Ordering::SeqCst), 1);
+    engine.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -944,7 +1442,10 @@ async fn manual_fork_seeds_durable_helper_history_and_creates_exact_ordinary_des
         );
         assert_eq!(snapshot.turns.len(), 1);
         assert_eq!(
-            snapshot.turns[0].tool_calls().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            snapshot.turns[0]
+                .tool_calls()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
             ["call-0"]
         );
     }
@@ -976,10 +1477,11 @@ async fn manual_fork_seeds_durable_helper_history_and_creates_exact_ordinary_des
                 Value::String("source-session".to_owned())
             )])
         );
-        assert_eq!(messages[0].text(), "  compacted context\n\n\nOriginal user message:\nbranch\nexact");
-        assert!(
-            !messages[0].text().ends_with('\n')
+        assert_eq!(
+            messages[0].text(),
+            "  compacted context\n\n\nOriginal user message:\nbranch\nexact"
         );
+        assert!(!messages[0].text().ends_with('\n'));
     }
     assert_eq!(host.starts.load(Ordering::SeqCst), 1);
     engine.shutdown().await;
@@ -1226,6 +1728,7 @@ async fn oversized_event_prompt_and_task_result_fail_before_downstream_side_effe
         context: event_context(event("oversized-result", false)),
         identity: "oversized-result-invocation".to_owned(),
         correlation_id: "oversized-result".to_owned(),
+        pause: None,
     };
     let results = BTreeMap::from([(
         "generate-title".to_owned(),
@@ -1266,6 +1769,7 @@ async fn metadata_serialized_bound_rejects_oversize_and_accepts_boundary_value()
         context: event_context(event("metadata-bound", false)),
         identity: "metadata-bound-invocation".to_owned(),
         correlation_id: "metadata-bound".to_owned(),
+        pause: None,
     };
     let active_children = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
     let child_admission = Arc::new(AtomicBool::new(false));
@@ -1490,6 +1994,199 @@ async fn durable_manual_start_returns_after_registration_and_finishes_detached()
         1
     );
     engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_paused_admission_persists_cursor_and_busy_rejection_creates_no_history() {
+    let persistence = crate::persistence::Persistence::initialize(
+        crate::persistence::DatabaseConfig::for_tests().unwrap(),
+    )
+    .await
+    .unwrap();
+    let store = persistence.routine_invocation_store();
+    let host = Arc::new(FakeHost::with_capture("compact summary"));
+    let bus = EventBus::new(8);
+    let engine = RoutineEngine::start_with_host_and_store(
+        bus.subscribe(),
+        compact_state().await,
+        host.clone(),
+        store.clone(),
+    );
+    while !matches!(&*engine.health().borrow(), EngineHealth::Running) {
+        tokio::task::yield_now().await;
+    }
+
+    host.paused.store(true, Ordering::SeqCst);
+    let error = engine
+        .manual_handle()
+        .start(compact_invocation("durable-busy", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.class, "source_precondition");
+    assert!(
+        store
+            .list(None, 10, &BTreeMap::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    host.paused.store(false, Ordering::SeqCst);
+    let invocation_id = engine
+        .manual_handle()
+        .start(compact_invocation("durable-paused", None))
+        .await
+        .unwrap();
+    let summary = store.get(&invocation_id).await.unwrap().unwrap();
+    assert_eq!(summary.source_cursor.as_deref(), Some("4"));
+    wait_for(|| host.pause_releases.load(Ordering::SeqCst) == 1).await;
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn paused_admission_and_lifecycle_persistence_failures_release_without_unmasking() {
+    let persistence = crate::persistence::Persistence::initialize(
+        crate::persistence::DatabaseConfig::for_tests().unwrap(),
+    )
+    .await
+    .unwrap();
+    let store = persistence.routine_invocation_store();
+    sqlx::query(
+        "CREATE TRIGGER fail_paused_admission BEFORE INSERT ON routine_invocations BEGIN SELECT RAISE(ABORT, 'injected admission failure'); END",
+    )
+    .execute(persistence.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let admission_host = Arc::new(FakeHost::with_capture("compact summary"));
+    let bus = EventBus::new(8);
+    let engine = RoutineEngine::start_with_host_and_store(
+        bus.subscribe(),
+        compact_state().await,
+        admission_host.clone(),
+        store.clone(),
+    );
+    while !matches!(&*engine.health().borrow(), EngineHealth::Running) {
+        tokio::task::yield_now().await;
+    }
+    let error = engine
+        .manual_handle()
+        .start(compact_invocation("admission-fails", None))
+        .await
+        .unwrap_err();
+    assert_eq!(error.class, "routine_persistence");
+    assert_eq!(admission_host.pause_releases.load(Ordering::SeqCst), 1);
+    assert!(
+        store
+            .list(None, 10, &BTreeMap::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    engine.shutdown().await;
+
+    let persistence = crate::persistence::Persistence::initialize(
+        crate::persistence::DatabaseConfig::for_tests().unwrap(),
+    )
+    .await
+    .unwrap();
+    let store = persistence.routine_invocation_store();
+    sqlx::query(
+        "CREATE TRIGGER fail_mask_lifecycle BEFORE INSERT ON routine_invocation_events WHEN NEW.event_kind = 'task_succeeded' AND NEW.task_name = 'apply-mask' BEGIN SELECT RAISE(ABORT, 'injected mask lifecycle failure'); END",
+    )
+    .execute(persistence.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let lifecycle_host = Arc::new(FakeHost::with_capture("compact summary"));
+    let bus = EventBus::new(8);
+    let engine = RoutineEngine::start_with_host_and_store(
+        bus.subscribe(),
+        compact_state().await,
+        lifecycle_host.clone(),
+        store.clone(),
+    );
+    while !matches!(&*engine.health().borrow(), EngineHealth::Running) {
+        tokio::task::yield_now().await;
+    }
+    let invocation_id = engine
+        .manual_handle()
+        .start(compact_invocation("lifecycle-fails", None))
+        .await
+        .unwrap();
+    wait_for(|| lifecycle_host.pause_releases.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(lifecycle_host.mask_mutations.lock().unwrap().len(), 1);
+    let summary = store.get(&invocation_id).await.unwrap().unwrap();
+    assert_eq!(
+        summary.status,
+        crate::persistence::routine_invocation::RoutineInvocationStatus::Interrupted
+    );
+    assert_eq!(summary.terminal_error.unwrap().code, "persistence_failure");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn canceled_paused_invocation_uses_drop_fallback_to_release() {
+    let host = Arc::new(FakeHost::with_capture("compact summary"));
+    host.block_runs.store(true, Ordering::SeqCst);
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, host.clone());
+    let manual = engine.manual_handle();
+    let invocation = tokio::spawn(async move {
+        manual
+            .invoke_for_test(compact_invocation("cancel-paused", None))
+            .await
+    });
+    host.run_started.notified().await;
+
+    invocation.abort();
+    assert!(invocation.await.unwrap_err().is_cancelled());
+    wait_for(|| host.pause_releases.load(Ordering::SeqCst) == 1).await;
+    assert!(!host.paused.load(Ordering::SeqCst));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn canceled_explicit_release_retains_ownership_for_drop_fallback_retry() {
+    let host = Arc::new(FakeHost::default());
+    host.paused.store(true, Ordering::SeqCst);
+    host.block_release_once.store(true, Ordering::SeqCst);
+    let entered = host.release_entered.notified();
+    let routine_host: Arc<dyn RoutineHost> = host.clone();
+    let mut guard = RoutinePauseGuard::new(
+        RoutinePause::for_test(
+            SessionId::new("source-session"),
+            waltr_agent::TimelineCursor::new(4),
+        ),
+        routine_host,
+    );
+    let release = tokio::spawn(async move { guard.release().await });
+    entered.await;
+
+    release.abort();
+    assert!(release.await.unwrap_err().is_cancelled());
+    wait_for(|| host.pause_releases.load(Ordering::SeqCst) == 1).await;
+    assert!(!host.paused.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn shutdown_releases_pause_before_manual_worker_completion() {
+    let host = Arc::new(FakeHost::with_capture("compact summary"));
+    host.block_runs.store(true, Ordering::SeqCst);
+    let bus = EventBus::new(8);
+    let engine =
+        RoutineEngine::start_with_host(bus.subscribe(), compact_state().await, host.clone());
+    let manual = engine.manual_handle();
+    let invocation = tokio::spawn(async move {
+        manual
+            .invoke_for_test(compact_invocation("shutdown-paused", None))
+            .await
+    });
+    host.run_started.notified().await;
+
+    engine.shutdown().await;
+    assert_eq!(invocation.await.unwrap().unwrap_err().class, "shutdown");
+    assert_eq!(host.pause_releases.load(Ordering::SeqCst), 1);
+    assert!(!host.paused.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

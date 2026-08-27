@@ -7,8 +7,10 @@ use waltr_agent::{
     AgentDefinitionCatalog, AgentRunLimits, AgentSession, AgentSessionActiveRunState,
     AgentSessionRunError, AgentSessionRunSubmission, CompletedSessionCapture, CredentialStore,
     FilesystemSessionStore, MemorySessionStore, MetadataSetCondition, MetadataSetOutcome,
-    SessionCaptureError, SessionCoordinator, SessionCreateRequest, SessionEventSink, SessionId,
-    SessionListUpdate, SessionStore, SessionSummary,
+    SessionCaptureError, SessionCompletionCoordinationHandler, SessionCoordinationReason,
+    SessionCoordinator, SessionCreateRequest, SessionEventSink, SessionId, SessionListUpdate,
+    SessionMaskMutation, SessionMaskMutationOutcome, SessionPauseError, SessionPauseLease,
+    SessionStore, SessionSummary, TimelineCursor,
 };
 use std::{pin::Pin, sync::Arc};
 use tonic::service::RoutesBuilder;
@@ -29,6 +31,11 @@ use storage::SessionStorageConfig;
 /// Object-safe access to the coordinator owned by the registered gRPC session service.
 #[tonic::async_trait]
 pub trait SessionHost: Send + Sync {
+    /// Install or remove synchronous terminal-run admission.
+    fn set_completion_admission_handler(
+        &self,
+        handler: Option<Arc<dyn SessionCompletionCoordinationHandler>>,
+    );
     /// Create a durable session using server inference defaults and an optional agent selection.
     async fn create(&self, agent_name: Option<String>) -> Result<AgentSession, tonic::Status>;
     /// Create a durable session from an exact host-owned request.
@@ -41,6 +48,32 @@ pub trait SessionHost: Send + Sync {
         &self,
         id: &SessionId,
     ) -> Result<CompletedSessionCapture, SessionCaptureError>;
+    /// Acquire an exclusive process-local pause without waiting for active work.
+    async fn acquire_pause_reject_busy(
+        &self,
+        id: &SessionId,
+        reason: SessionCoordinationReason,
+    ) -> Result<SessionPauseLease, SessionPauseError>;
+    /// Capture mask-effective context through the boundary owned by `lease`.
+    async fn capture_paused_effective(
+        &self,
+        lease: &SessionPauseLease,
+    ) -> Result<CompletedSessionCapture, SessionPauseError>;
+    /// Apply one atomic mask mutation through the pause's pinned boundary.
+    async fn apply_paused_mask_mutation(
+        &self,
+        lease: &SessionPauseLease,
+        mutation: SessionMaskMutation,
+    ) -> Result<SessionMaskMutationOutcome, SessionPauseError>;
+    /// Arm a continuation from the mutation cursor committed by this pause.
+    async fn arm_paused_continuation(
+        &self,
+        lease: &SessionPauseLease,
+        mutation_cursor: TimelineCursor,
+        limits: AgentRunLimits,
+    ) -> Result<AgentSessionRunSubmission, SessionPauseError>;
+    /// Release an owned pause and drain its privileged and ordinary queues.
+    async fn release_pause(&self, lease: &SessionPauseLease) -> Result<(), SessionPauseError>;
     /// Start an already durable prompt with ordinary replay semantics.
     async fn start_durable_prompt(
         &self,

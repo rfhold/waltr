@@ -303,6 +303,17 @@ impl<S> super::SessionHost for SessionService<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
 {
+    fn set_completion_admission_handler(
+        &self,
+        handler: Option<Arc<dyn waltr_agent::SessionCompletionCoordinationHandler>>,
+    ) {
+        if let Some(handler) = handler {
+            self.sessions.set_completion_admission_handler(handler);
+        } else {
+            self.sessions.clear_completion_admission_handler();
+        }
+    }
+
     async fn create(&self, agent_name: Option<String>) -> Result<AgentSession, Status> {
         self.create_session_internal(None, agent_name.as_deref())
             .await
@@ -321,6 +332,49 @@ where
         id: &SessionId,
     ) -> Result<waltr_agent::CompletedSessionCapture, waltr_agent::SessionCaptureError> {
         self.sessions.capture_latest_completed(id).await
+    }
+
+    async fn acquire_pause_reject_busy(
+        &self,
+        id: &SessionId,
+        reason: waltr_agent::SessionCoordinationReason,
+    ) -> Result<waltr_agent::SessionPauseLease, waltr_agent::SessionPauseError> {
+        self.sessions.acquire_pause_reject_busy(id, reason).await
+    }
+
+    async fn capture_paused_effective(
+        &self,
+        lease: &waltr_agent::SessionPauseLease,
+    ) -> Result<waltr_agent::CompletedSessionCapture, waltr_agent::SessionPauseError> {
+        self.sessions.capture_paused_effective(lease).await
+    }
+
+    async fn apply_paused_mask_mutation(
+        &self,
+        lease: &waltr_agent::SessionPauseLease,
+        mutation: waltr_agent::SessionMaskMutation,
+    ) -> Result<waltr_agent::SessionMaskMutationOutcome, waltr_agent::SessionPauseError> {
+        self.sessions
+            .apply_paused_mask_mutation(lease, mutation)
+            .await
+    }
+
+    async fn arm_paused_continuation(
+        &self,
+        lease: &waltr_agent::SessionPauseLease,
+        mutation_cursor: waltr_agent::TimelineCursor,
+        limits: AgentRunLimits,
+    ) -> Result<AgentSessionRunSubmission, waltr_agent::SessionPauseError> {
+        self.sessions
+            .arm_paused_continuation(lease, mutation_cursor, limits)
+            .await
+    }
+
+    async fn release_pause(
+        &self,
+        lease: &waltr_agent::SessionPauseLease,
+    ) -> Result<(), waltr_agent::SessionPauseError> {
+        self.sessions.release_pause(lease).await
     }
 
     async fn start_durable_prompt(
