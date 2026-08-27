@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use crate::{
@@ -22,6 +23,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+use super::run::SessionRunInferenceIdentity;
 use super::{
     AgentRunLimits, AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
     AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
@@ -56,6 +58,7 @@ where
     next_run_id: Arc<AtomicU64>,
     next_pause_id: Arc<AtomicU64>,
     event_sink: Option<Arc<dyn crate::SessionEventSink>>,
+    completion_handler: Arc<StdMutex<Option<Arc<dyn super::SessionCompletionCoordinationHandler>>>>,
     shutdown_token: CancellationToken,
     #[cfg(test)]
     list_registration_barrier:
@@ -79,6 +82,7 @@ where
 struct ActiveSessionRun {
     id: u64,
     token: CancellationToken,
+    inference_identity: Option<SessionRunInferenceIdentity>,
 }
 
 #[derive(Debug, Default)]
@@ -91,9 +95,16 @@ struct RunCoordination {
 #[derive(Debug, Default)]
 struct SessionRunState {
     active: Option<ActiveSessionRun>,
+    completion_barrier: Option<CompletionBarrier>,
     pause: Option<OwnedSessionPause>,
     queued: VecDeque<QueuedSessionRun>,
     blocked: bool,
+}
+
+#[derive(Debug)]
+struct CompletionBarrier {
+    run_id: u64,
+    reason: SessionCoordinationReason,
 }
 
 #[derive(Debug)]
@@ -110,6 +121,11 @@ impl SessionRunState {
     fn coordination(&self) -> SessionCoordinationState {
         let (phase, reason) = if let Some(pause) = &self.pause {
             (SessionCoordinationPhase::Paused, Some(pause.reason.clone()))
+        } else if let Some(barrier) = &self.completion_barrier {
+            (
+                SessionCoordinationPhase::CompletionBarrier,
+                Some(barrier.reason.clone()),
+            )
         } else if self.active.is_some() {
             (SessionCoordinationPhase::Running, None)
         } else {
@@ -134,6 +150,7 @@ struct QueuedSessionRun {
     outcome_tx: RunOutcomeSender,
     limits: AgentRunLimits,
     runtime: Option<AgentRuntime>,
+    inference_identity: Option<SessionRunInferenceIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,9 +171,21 @@ struct SessionRunStart {
     id: u64,
     token: CancellationToken,
     runtime: Option<AgentRuntime>,
+    inference_identity: Option<SessionRunInferenceIdentity>,
     input: AgentSessionRunInput,
     outcome_txs: Vec<(u64, RunOutcomeSender)>,
     limits: AgentRunLimits,
+}
+
+struct PreparedCompletionAdmission {
+    source_cursor: crate::TimelineCursor,
+    terminal_cursor: crate::TimelineCursor,
+    preparation: super::SessionCompletionCoordinationPreparation,
+}
+
+struct AcceptedCompletionAdmission {
+    pause_id: SessionPauseId,
+    worker: crate::SessionCompletionWorkerFuture,
 }
 
 struct CapturedRuntimeRecord {
@@ -181,6 +210,7 @@ where
             next_run_id: Arc::new(AtomicU64::new(0)),
             next_pause_id: Arc::new(AtomicU64::new(0)),
             event_sink: None,
+            completion_handler: Arc::new(StdMutex::new(None)),
             shutdown_token: CancellationToken::new(),
             #[cfg(test)]
             list_registration_barrier: Arc::new(StdMutex::new(None)),
@@ -199,6 +229,25 @@ where
     pub fn with_session_event_sink(mut self, sink: Arc<dyn crate::SessionEventSink>) -> Self {
         self.event_sink = Some(sink);
         self
+    }
+
+    /// Install the single host-owned terminal-run coordination handler.
+    pub fn set_completion_admission_handler(
+        &self,
+        handler: Arc<dyn super::SessionCompletionCoordinationHandler>,
+    ) {
+        *self
+            .completion_handler
+            .lock()
+            .expect("completion handler lock poisoned") = Some(handler);
+    }
+
+    /// Remove the host-owned terminal-run admission handler.
+    pub fn clear_completion_admission_handler(&self) {
+        *self
+            .completion_handler
+            .lock()
+            .expect("completion handler lock poisoned") = None;
     }
 
     /// Create a durable session from complete structured input.
@@ -327,6 +376,7 @@ where
     /// Permanently stop new run admission and cancel process-local coordinated work.
     pub async fn shutdown(&self) {
         self.shutdown_token.cancel();
+        self.clear_completion_admission_handler();
         let mut coordination = self.active_runs.lock().await;
         coordination.shutdown = true;
         for (session_id, state) in &mut coordination.sessions {
@@ -449,6 +499,11 @@ where
                         session_id: id.clone(),
                     });
                 }
+                if state.completion_barrier.is_some() {
+                    return Err(SessionPauseError::Active {
+                        session_id: id.clone(),
+                    });
+                }
                 if state.pause.is_some() {
                     return Err(SessionPauseError::Paused {
                         session_id: id.clone(),
@@ -502,6 +557,11 @@ where
             });
         }
         if state.active.is_some() {
+            return Err(SessionPauseError::Active {
+                session_id: id.clone(),
+            });
+        }
+        if state.completion_barrier.is_some() {
             return Err(SessionPauseError::Active {
                 session_id: id.clone(),
             });
@@ -622,8 +682,8 @@ where
                 .map_err(SessionPauseError::Store)?;
             validate_pause_boundary(lease, &record)?;
         }
-        let runtime = self
-            .resolve_runtime(&lease.session_id)
+        let (runtime, inference_identity) = self
+            .resolve_runtime_with_identity(&lease.session_id)
             .await
             .map_err(SessionPauseError::Run)?;
         let _operation = self
@@ -659,6 +719,7 @@ where
             outcome_tx,
             limits,
             runtime: Some(runtime),
+            inference_identity: Some(inference_identity),
         });
         let projected = coordination.sessions[&lease.session_id].coordination();
         drop(coordination);
@@ -1305,7 +1366,7 @@ where
             if current.blocked {
                 return Err(AgentSessionRunError::Unavailable { session_id });
             }
-            if current.pause.is_some() {
+            if current.pause.is_some() || current.completion_barrier.is_some() {
                 match policy {
                     RunConflictPolicy::QueueIfActive => {
                         current.queued.push_back(QueuedSessionRun {
@@ -1314,13 +1375,17 @@ where
                             outcome_tx,
                             limits,
                             runtime: None,
+                            inference_identity: None,
                         });
                         disposition = AgentSessionRunDisposition::Queued {
                             position: current.queued.len(),
                         };
                     }
                     RunConflictPolicy::RejectIfActive | RunConflictPolicy::ReplaceActive => {
-                        return Err(AgentSessionRunError::Paused { session_id });
+                        if current.pause.is_some() {
+                            return Err(AgentSessionRunError::Paused { session_id });
+                        }
+                        return Err(AgentSessionRunError::AlreadyRunning { session_id });
                     }
                 }
             } else if let Some(active_run) = current.active.as_ref() {
@@ -1335,6 +1400,7 @@ where
                             outcome_tx,
                             limits,
                             runtime: None,
+                            inference_identity: None,
                         });
                         disposition = AgentSessionRunDisposition::Queued {
                             position: current.queued.len(),
@@ -1351,11 +1417,13 @@ where
                         current.active = Some(ActiveSessionRun {
                             id,
                             token: token.clone(),
+                            inference_identity: None,
                         });
                         start = Some(SessionRunStart {
                             id,
                             token,
                             runtime: None,
+                            inference_identity: None,
                             input,
                             outcome_txs: vec![(id, outcome_tx)],
                             limits,
@@ -1368,11 +1436,13 @@ where
                 current.active = Some(ActiveSessionRun {
                     id,
                     token: token.clone(),
+                    inference_identity: None,
                 });
                 start = Some(SessionRunStart {
                     id,
                     token,
                     runtime: None,
+                    inference_identity: None,
                     input,
                     outcome_txs: vec![(id, outcome_tx)],
                     limits,
@@ -1384,9 +1454,12 @@ where
         self.control.publish_coordination(&session_id, projected);
 
         if let Some(mut start) = start {
-            match self.resolve_runtime(&session_id).await {
-                Ok(runtime) => {
+            match self.resolve_runtime_with_identity(&session_id).await {
+                Ok((runtime, identity)) => {
                     start.runtime = Some(runtime);
+                    start.inference_identity = Some(identity.clone());
+                    self.set_active_inference_identity(&session_id, start.id, identity)
+                        .await;
                 }
                 Err(error) => {
                     let next = self.fail_active_start(&session_id, start.id).await;
@@ -1478,7 +1551,7 @@ where
                 let terminal_state = terminal_state(&outcome);
                 tracing::Span::current().record("terminal_state", terminal_state);
                 tracing::info!(session_id = %session_id.as_str(), run_id, terminal_state, "session run completed");
-                let next = coordinator.finish_active_run(&session_id, run_id).await;
+                let next = coordinator.complete_active_run(&session_id, run_id, &outcome).await;
                 send_run_outcome(start.outcome_txs, outcome);
                 if let Some(next) = next {
                     coordinator.spawn_run(session_id, next);
@@ -1517,6 +1590,325 @@ where
         drop(coordination);
         self.control.publish_coordination(session_id, projected);
         next
+    }
+
+    async fn complete_active_run(
+        &self,
+        session_id: &SessionId,
+        run_id: u64,
+        outcome: &RunResult,
+    ) -> Option<SessionRunStart> {
+        if !matches!(outcome, Ok(outcome) if outcome.status == SessionStatus::Finished) {
+            return self.finish_active_run(session_id, run_id).await;
+        }
+        let inference_identity = {
+            let mut coordination = self.active_runs.lock().await;
+            let Some(state) = coordination.sessions.get_mut(session_id) else {
+                return None;
+            };
+            if state.active.as_ref().map(|active| active.id) != Some(run_id) {
+                return None;
+            }
+            let inference_identity = state
+                .active
+                .as_ref()
+                .and_then(|active| active.inference_identity.clone());
+            state.active = None;
+            state.completion_barrier = Some(CompletionBarrier {
+                run_id,
+                reason: SessionCoordinationReason::post_run_automation(),
+            });
+            let projected = state.coordination();
+            drop(coordination);
+            self.control.publish_coordination(session_id, projected);
+            inference_identity
+        };
+
+        let Some(inference_identity) = inference_identity.as_ref() else {
+            return self
+                .finish_completion_barrier(session_id, run_id, None)
+                .await;
+        };
+        let admission = self
+            .run_completion_admission(session_id, run_id, inference_identity)
+            .await;
+        self.finish_completion_barrier(session_id, run_id, admission)
+            .await
+    }
+
+    async fn run_completion_admission(
+        &self,
+        session_id: &SessionId,
+        run_id: u64,
+        inference_identity: &SessionRunInferenceIdentity,
+    ) -> Option<AcceptedCompletionAdmission> {
+        const COMPLETION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+        let handler = self
+            .completion_handler
+            .lock()
+            .expect("completion handler lock poisoned")
+            .clone()?;
+        let store = self.store.clone();
+        let prepared_session_id = session_id.clone();
+        let inference_identity = inference_identity.clone();
+        let mut task = tokio::spawn(async move {
+            let record = store
+                .load(&prepared_session_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let effective = record.effective_journal_events();
+            let completed_boundary = effective
+                .iter()
+                .rposition(|event| matches!(event, super::SessionJournalEvent::TurnFinished { .. }))
+                .ok_or_else(|| "completed run has no completed turn boundary".to_owned())?;
+            let completed_turn = match effective[completed_boundary] {
+                super::SessionJournalEvent::TurnFinished { turn } => *turn,
+                _ => unreachable!("completed boundary selected by variant"),
+            };
+            let source_cursor = effective[..=completed_boundary]
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    super::SessionJournalEvent::Timeline(event) => Some(event.cursor),
+                    _ => None,
+                })
+                .ok_or_else(|| "completed run has no source cursor".to_owned())?;
+            let terminal_cursor = record
+                .timeline_events()
+                .last()
+                .map(|event| event.cursor)
+                .ok_or_else(|| "completed run has no terminal cursor".to_owned())?;
+            let context_tokens = effective[..=completed_boundary]
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    super::SessionJournalEvent::ProviderTurnMetadataRecorded { turn, metadata }
+                        if *turn == completed_turn =>
+                    {
+                        metadata.usage.map(crate::TokenUsage::context_tokens)
+                    }
+                    _ => None,
+                });
+            let snapshot = crate::SessionRunCompletionSnapshot {
+                session_id: prepared_session_id.clone(),
+                run_id: format!("session-run:{}:r{run_id}", prepared_session_id.as_str()),
+                terminal_cursor,
+                context_tokens,
+                purpose: record
+                    .metadata
+                    .values
+                    .get("waltr.session.purpose")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                provider_key: inference_identity.provider_key,
+                model_id: inference_identity.model_id,
+            };
+            let preparation = handler.prepare(snapshot).await?;
+            Ok::<_, String>(PreparedCompletionAdmission {
+                source_cursor,
+                terminal_cursor,
+                preparation,
+            })
+        });
+        let prepared = tokio::select! {
+            biased;
+            () = self.shutdown_token.cancelled() => {
+                task.abort();
+                return None;
+            }
+            result = tokio::time::timeout(COMPLETION_ADMISSION_TIMEOUT, &mut task) => match result {
+                Ok(Ok(Ok(prepared))) => prepared,
+                Ok(Ok(Err(message))) => {
+                    tracing::warn!(%message, "session completion preparation failed open");
+                    return None;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "session completion preparation task failed open");
+                    return None;
+                }
+                Err(_) => {
+                    task.abort();
+                    tracing::warn!(timeout_ms = COMPLETION_ADMISSION_TIMEOUT.as_millis(), "session completion preparation timed out");
+                    return None;
+                }
+            }
+        };
+        let super::SessionCompletionCoordinationPreparation::Claim { reason, finalizer } =
+            prepared.preparation
+        else {
+            return None;
+        };
+        let lease = match self
+            .claim_completion_pause(
+                session_id,
+                run_id,
+                prepared.source_cursor,
+                prepared.terminal_cursor,
+                reason,
+            )
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(%error, "session completion pause claim failed open");
+                return None;
+            }
+        };
+        let pause_id = lease.id;
+        let finalization = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finalizer.finalize(lease)
+        })) {
+            Ok(finalization) => finalization,
+            Err(_) => {
+                tracing::warn!(
+                    "session completion finalizer panicked during worker construction; failing open"
+                );
+                return None;
+            }
+        };
+        match tokio::spawn(finalization).await {
+            Ok(Ok(worker)) => Some(AcceptedCompletionAdmission { pause_id, worker }),
+            Ok(Err(message)) => {
+                tracing::warn!(%message, "session completion finalization failed open");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "session completion finalization panicked; failing open");
+                None
+            }
+        }
+    }
+
+    async fn finish_completion_barrier(
+        &self,
+        session_id: &SessionId,
+        run_id: u64,
+        admission: Option<AcceptedCompletionAdmission>,
+    ) -> Option<SessionRunStart> {
+        let mut coordination = self.active_runs.lock().await;
+        let lifecycle_blocked = coordination.shutdown || coordination.wiping;
+        let Some(state) = coordination.sessions.get_mut(session_id) else {
+            drop(coordination);
+            if !lifecycle_blocked
+                && let Some(AcceptedCompletionAdmission { worker, .. }) = admission
+            {
+                // A successful durable admission still receives terminal executor cleanup if an
+                // interrupt invalidated the process-local pause before acknowledgement.
+                drop(tokio::spawn(worker));
+            }
+            return None;
+        };
+        if state
+            .completion_barrier
+            .as_ref()
+            .map(|barrier| barrier.run_id)
+            != Some(run_id)
+        {
+            drop(coordination);
+            if !lifecycle_blocked
+                && let Some(AcceptedCompletionAdmission { worker, .. }) = admission
+            {
+                drop(tokio::spawn(worker));
+            }
+            return None;
+        }
+        state.completion_barrier = None;
+
+        if let Some(AcceptedCompletionAdmission { pause_id, worker }) = admission
+            && !lifecycle_blocked
+            && !state.blocked
+            && state
+                .pause
+                .as_ref()
+                .is_some_and(|pause| pause.id == pause_id)
+        {
+            let projected = state.coordination();
+            drop(coordination);
+            self.control.publish_coordination(session_id, projected);
+            drop(tokio::spawn(worker));
+            return None;
+        }
+
+        if let Some(pause) = state.pause.take() {
+            if let Some(continuation) = pause.continuation {
+                cancel_queued(
+                    session_id,
+                    VecDeque::from([continuation]),
+                    "completion admission failed open",
+                );
+            }
+        }
+        let next = if lifecycle_blocked || state.blocked {
+            cancel_queued(
+                session_id,
+                std::mem::take(&mut state.queued),
+                "session lifecycle canceled queued work",
+            );
+            None
+        } else {
+            pop_next_start(state)
+        };
+        if state.active.is_none() && state.queued.is_empty() && !state.blocked {
+            coordination.sessions.remove(session_id);
+        }
+        let projected = coordination.sessions.get(session_id).map_or_else(
+            SessionCoordinationState::default,
+            SessionRunState::coordination,
+        );
+        drop(coordination);
+        self.control.publish_coordination(session_id, projected);
+        next
+    }
+
+    async fn claim_completion_pause(
+        &self,
+        session_id: &SessionId,
+        run_id: u64,
+        source_cursor: crate::TimelineCursor,
+        terminal_cursor: crate::TimelineCursor,
+        reason: SessionCoordinationReason,
+    ) -> std::result::Result<SessionPauseLease, SessionPauseError> {
+        let pause_id = SessionPauseId::new(self.next_pause_id.fetch_add(1, Ordering::Relaxed));
+        let mut coordination = self.active_runs.lock().await;
+        if coordination.shutdown || coordination.wiping {
+            return Err(SessionPauseError::Unavailable {
+                session_id: session_id.clone(),
+            });
+        }
+        let state = coordination.sessions.get_mut(session_id).ok_or_else(|| {
+            SessionPauseError::OwnershipLost {
+                session_id: session_id.clone(),
+            }
+        })?;
+        if state
+            .completion_barrier
+            .as_ref()
+            .map(|barrier| barrier.run_id)
+            != Some(run_id)
+            || state.pause.is_some()
+        {
+            return Err(SessionPauseError::OwnershipLost {
+                session_id: session_id.clone(),
+            });
+        }
+        state.pause = Some(OwnedSessionPause {
+            id: pause_id,
+            source_cursor,
+            timeline_boundary: terminal_cursor,
+            mutation_cursor: None,
+            continuation: None,
+            reason,
+        });
+        let projected = state.coordination();
+        drop(coordination);
+        self.control.publish_coordination(session_id, projected);
+        Ok(SessionPauseLease::new(
+            session_id.clone(),
+            pause_id,
+            source_cursor,
+            terminal_cursor,
+        ))
     }
 
     async fn fail_active_start(
@@ -1651,13 +2043,24 @@ where
         &self,
         session_id: &SessionId,
     ) -> std::result::Result<AgentRuntime, AgentSessionRunError> {
+        self.resolve_runtime_with_identity(session_id)
+            .await
+            .map(|(runtime, _)| runtime)
+    }
+
+    async fn resolve_runtime_with_identity(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<(AgentRuntime, SessionRunInferenceIdentity), AgentSessionRunError>
+    {
         let captured = self.capture_runtime_record_for_cycle(session_id).await?;
         let record = &captured.record;
-        record.inference_settings.as_ref().ok_or_else(|| {
+        let inference_settings = record.inference_settings.as_ref().ok_or_else(|| {
             super::AgentSessionRuntimeError::FailedPrecondition(
                 "session runtime settings are required before prompting".to_owned(),
             )
         })?;
+        let inference_identity = SessionRunInferenceIdentity::from_settings(inference_settings);
         let factory = self.runtime_factory.as_ref().ok_or_else(|| {
             super::AgentSessionRuntimeError::Internal(
                 "session runtime factory is not configured".to_owned(),
@@ -1672,7 +2075,32 @@ where
         let _operation = self
             .validate_incarnation(session_id, captured.incarnation)
             .await?;
-        Ok(runtime?)
+        Ok((runtime?, inference_identity))
+    }
+
+    async fn set_active_inference_identity(
+        &self,
+        session_id: &SessionId,
+        run_id: u64,
+        identity: SessionRunInferenceIdentity,
+    ) {
+        let mut coordination = self.active_runs.lock().await;
+        if let Some(active) = coordination
+            .sessions
+            .get_mut(session_id)
+            .and_then(|state| state.active.as_mut())
+            .filter(|active| active.id == run_id)
+        {
+            active.inference_identity = Some(identity);
+        }
+        let projected = coordination
+            .sessions
+            .get(session_id)
+            .map(SessionRunState::coordination);
+        drop(coordination);
+        if let Some(projected) = projected {
+            self.control.publish_coordination(session_id, projected);
+        }
     }
 
     async fn capture_runtime_record(
@@ -2024,11 +2452,13 @@ fn start_queued(state: &mut SessionRunState, queued: QueuedSessionRun) -> Sessio
     state.active = Some(ActiveSessionRun {
         id,
         token: token.clone(),
+        inference_identity: queued.inference_identity.clone(),
     });
     SessionRunStart {
         id,
         token,
         runtime: queued.runtime,
+        inference_identity: queued.inference_identity,
         input: queued.input,
         outcome_txs: vec![(queued.id, queued.outcome_tx)],
         limits: queued.limits,
@@ -2042,6 +2472,7 @@ fn pop_next_start(state: &mut SessionRunState) -> Option<SessionRunStart> {
     let mut input = queued.input;
     let limits = queued.limits;
     let runtime = queued.runtime;
+    let inference_identity = queued.inference_identity;
     let mut outcome_txs = vec![(queued.id, queued.outcome_tx)];
     if let AgentSessionRunInput::Prompt(first) = input {
         let mut prompts = vec![first];
@@ -2068,11 +2499,13 @@ fn pop_next_start(state: &mut SessionRunState) -> Option<SessionRunStart> {
     state.active = Some(ActiveSessionRun {
         id,
         token: token.clone(),
+        inference_identity: inference_identity.clone(),
     });
     Some(SessionRunStart {
         id,
         token,
         runtime,
+        inference_identity,
         input,
         outcome_txs,
         limits,
@@ -2176,8 +2609,13 @@ where
     async {
         let runtime = match runtime {
             Some(runtime) => runtime,
-            None => match coordinator.resolve_runtime(&session_id).await {
-                Ok(runtime) => runtime,
+            None => match coordinator.resolve_runtime_with_identity(&session_id).await {
+                Ok((runtime, identity)) => {
+                    coordinator
+                        .set_active_inference_identity(&session_id, run_id, identity.clone())
+                        .await;
+                    runtime
+                }
                 Err(error) => {
                     if let Some(failure) = error.authentication_failure() {
                         coordinator
@@ -2329,7 +2767,6 @@ mod tests {
             Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         },
-        time::Duration,
     };
 
     use futures_util::{StreamExt as _, stream};
@@ -2341,8 +2778,10 @@ mod tests {
         BoxCompletionStream, BoxStreamFuture, CompletionEvent, CompletionReplayItem,
         CompletionRequest, ExternalRequestKind, LlmStream, ModelApi, ModelRef,
         PendingTimelineEvent, PermissionLevel, PermissionPattern, PermissionResponse, ProviderId,
-        Revision, SessionCopy, SessionJournalEvent, SessionRecord, SessionStart,
-        SessionStartMessage, SessionStatus, SessionTimelineEvent, TimelineCursor, ToolCall,
+        Revision, SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
+        SessionCompletionCoordinationPreparation, SessionCopy, SessionJournalEvent, SessionRecord,
+        SessionStart, SessionStartMessage, SessionStatus, SessionStoreResult, SessionTimelineEvent,
+        TimelineCursor, ToolCall,
         agent::session::{
             FileCredentialStore, InferenceProviderSettings, MemorySessionStore, SessionListEvent,
         },
@@ -2357,7 +2796,312 @@ mod tests {
         .unwrap()
     }
 
+    fn completion_reason() -> SessionCoordinationReason {
+        SessionCoordinationReason::new(
+            "context-compaction",
+            Some("compact-and-continue".to_owned()),
+            Some("run-completed".to_owned()),
+        )
+        .unwrap()
+    }
+
     struct TextOnlyProvider;
+
+    struct BlockingCompletionHandler {
+        calls: AtomicUsize,
+        entered: Notify,
+    }
+
+    impl SessionCompletionCoordinationHandler for BlockingCompletionHandler {
+        fn prepare(
+            &self,
+            _snapshot: crate::SessionRunCompletionSnapshot,
+        ) -> SessionCompletionCoordinationFuture {
+            let first = self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0;
+            self.entered.notify_one();
+            Box::pin(async move {
+                if first {
+                    std::future::pending().await
+                } else {
+                    Ok(SessionCompletionCoordinationPreparation::Continue)
+                }
+            })
+        }
+    }
+
+    enum TestFinalization {
+        Fail,
+        Delay {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        },
+        Panic,
+    }
+
+    struct FinalizingCompletionHandler(StdMutex<Option<TestFinalization>>);
+
+    struct TestCompletionFinalizer(TestFinalization);
+
+    impl crate::SessionCompletionAdmissionFinalizer for TestCompletionFinalizer {
+        fn finalize(
+            self: Box<Self>,
+            _lease: SessionPauseLease,
+        ) -> crate::SessionCompletionFinalizationFuture {
+            match self.0 {
+                TestFinalization::Fail => {
+                    Box::pin(async { Err("injected finalization failure".to_owned()) })
+                }
+                TestFinalization::Delay { entered, release } => Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Err("injected delayed finalization failure".to_owned())
+                }),
+                TestFinalization::Panic => panic!("injected worker construction panic"),
+            }
+        }
+    }
+
+    impl SessionCompletionCoordinationHandler for FinalizingCompletionHandler {
+        fn prepare(
+            &self,
+            _snapshot: crate::SessionRunCompletionSnapshot,
+        ) -> SessionCompletionCoordinationFuture {
+            let finalization = self.0.lock().expect("finalization lock").take();
+            Box::pin(async move {
+                Ok(finalization.map_or(
+                    SessionCompletionCoordinationPreparation::Continue,
+                    |behavior| SessionCompletionCoordinationPreparation::Claim {
+                        reason: completion_reason(),
+                        finalizer: Box::new(TestCompletionFinalizer(behavior)),
+                    },
+                ))
+            })
+        }
+    }
+
+    struct FailingCompletionHandler;
+
+    impl SessionCompletionCoordinationHandler for FailingCompletionHandler {
+        fn prepare(
+            &self,
+            _snapshot: crate::SessionRunCompletionSnapshot,
+        ) -> SessionCompletionCoordinationFuture {
+            Box::pin(async { Err("injected completion failure".to_owned()) })
+        }
+    }
+
+    struct SnapshotCompletionHandler(
+        StdMutex<Option<tokio::sync::oneshot::Sender<crate::SessionRunCompletionSnapshot>>>,
+    );
+
+    struct ControlledClaimHandler {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        lease_tx: StdMutex<Option<tokio::sync::oneshot::Sender<SessionPauseLease>>>,
+        reason: SessionCoordinationReason,
+    }
+
+    struct LeaseSendingFinalizer(tokio::sync::oneshot::Sender<SessionPauseLease>);
+
+    impl crate::SessionCompletionAdmissionFinalizer for LeaseSendingFinalizer {
+        fn finalize(
+            self: Box<Self>,
+            lease: SessionPauseLease,
+        ) -> crate::SessionCompletionFinalizationFuture {
+            Box::pin(async move {
+                let sender = self.0;
+                Ok(Box::pin(async move {
+                    drop(sender.send(lease));
+                }) as crate::SessionCompletionWorkerFuture)
+            })
+        }
+    }
+
+    impl SessionCompletionCoordinationHandler for ControlledClaimHandler {
+        fn prepare(
+            &self,
+            _snapshot: crate::SessionRunCompletionSnapshot,
+        ) -> SessionCompletionCoordinationFuture {
+            self.entered.notify_one();
+            let release = Arc::clone(&self.release);
+            let reason = self.reason.clone();
+            let sender = self.lease_tx.lock().expect("lease sender lock").take();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(match sender {
+                    Some(sender) => SessionCompletionCoordinationPreparation::Claim {
+                        reason,
+                        finalizer: Box::new(LeaseSendingFinalizer(sender)),
+                    },
+                    None => SessionCompletionCoordinationPreparation::Continue,
+                })
+            })
+        }
+    }
+
+    impl SessionCompletionCoordinationHandler for SnapshotCompletionHandler {
+        fn prepare(
+            &self,
+            snapshot: crate::SessionRunCompletionSnapshot,
+        ) -> SessionCompletionCoordinationFuture {
+            if let Some(sender) = self.0.lock().expect("snapshot sender lock").take() {
+                drop(sender.send(snapshot));
+            }
+            Box::pin(async { Ok(SessionCompletionCoordinationPreparation::Continue) })
+        }
+    }
+
+    struct UsageProvider;
+
+    #[derive(Clone)]
+    struct SlowLoadStore {
+        inner: MemorySessionStore,
+        delay_next_load: Arc<std::sync::atomic::AtomicBool>,
+        entered: Arc<Notify>,
+    }
+
+    impl SessionStore for SlowLoadStore {
+        fn create(
+            &self,
+            request: SessionCreateRequest,
+        ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+            self.inner.create(request)
+        }
+        fn load(
+            &self,
+            id: &SessionId,
+        ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+            let inner = self.inner.clone();
+            let id = id.clone();
+            let delay = Arc::clone(&self.delay_next_load);
+            let entered = Arc::clone(&self.entered);
+            async move {
+                if delay.swap(false, AtomicOrdering::SeqCst) {
+                    entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                inner.load(&id).await
+            }
+        }
+        fn delete(
+            &self,
+            id: &SessionId,
+        ) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+            self.inner.delete(id)
+        }
+        fn wipe(&self) -> impl std::future::Future<Output = SessionStoreResult<()>> + Send {
+            self.inner.wipe()
+        }
+        fn list(
+            &self,
+        ) -> impl std::future::Future<Output = SessionStoreResult<Vec<SessionSummary>>> + Send
+        {
+            self.inner.list()
+        }
+        fn append_timeline(
+            &self,
+            id: &SessionId,
+            revision: Revision,
+            events: Vec<PendingTimelineEvent>,
+        ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send
+        {
+            self.inner.append_timeline(id, revision, events)
+        }
+        fn append_journal(
+            &self,
+            id: &SessionId,
+            revision: Revision,
+            events: Vec<SessionJournalEvent>,
+        ) -> impl std::future::Future<Output = SessionStoreResult<Revision>> + Send {
+            self.inner.append_journal(id, revision, events)
+        }
+        fn mutate_masks(
+            &self,
+            id: &SessionId,
+            mutation: super::SessionMaskMutation,
+        ) -> impl std::future::Future<
+            Output = SessionStoreResult<super::SessionMaskMutationOutcome>,
+        > + Send {
+            self.inner.mutate_masks(id, mutation)
+        }
+        fn set_metadata_value_conditionally(
+            &self,
+            id: &SessionId,
+            key: String,
+            value: Value,
+            condition: super::MetadataSetCondition,
+        ) -> impl std::future::Future<Output = SessionStoreResult<super::MetadataSetOutcome>> + Send
+        {
+            self.inner
+                .set_metadata_value_conditionally(id, key, value, condition)
+        }
+        fn remove_metadata_value(
+            &self,
+            id: &SessionId,
+            key: String,
+        ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+            self.inner.remove_metadata_value(id, key)
+        }
+        fn set_inference_settings(
+            &self,
+            id: &SessionId,
+            settings: Option<InferenceSettings>,
+        ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+            self.inner.set_inference_settings(id, settings)
+        }
+        fn set_agent_definition(
+            &self,
+            id: &SessionId,
+            definition: Option<AgentDefinitionBundle>,
+        ) -> impl std::future::Future<Output = SessionStoreResult<SessionRecord>> + Send {
+            self.inner.set_agent_definition(id, definition)
+        }
+        fn timeline(
+            &self,
+            id: &SessionId,
+            query: TimelineQuery,
+        ) -> impl std::future::Future<Output = SessionStoreResult<Vec<AgentTimelineEvent>>> + Send
+        {
+            self.inner.timeline(id, query)
+        }
+        fn timeline_item_text(
+            &self,
+            id: &SessionId,
+            item_id: &TimelineItemId,
+        ) -> impl std::future::Future<Output = SessionStoreResult<crate::TimelineItemText>> + Send
+        {
+            self.inner.timeline_item_text(id, item_id)
+        }
+    }
+
+    impl LlmStream for UsageProvider {
+        fn name(&self) -> &'static str {
+            "usage_provider"
+        }
+
+        fn stream_request<'a>(&'a self, _request: CompletionRequest<'a>) -> BoxStreamFuture<'a> {
+            Box::pin(async move {
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(CompletionEvent::ProviderMetadata(
+                        crate::ProviderTurnMetadata {
+                            provider: "test".to_owned(),
+                            url: String::new(),
+                            model: "test-model".to_owned(),
+                            usage: Some(crate::TokenUsage {
+                                input_tokens: Some(120),
+                                output_tokens: Some(7),
+                                cache_read_tokens: Some(3),
+                                ..crate::TokenUsage::default()
+                            }),
+                            cost: None,
+                            resume: Value::Null,
+                        },
+                    )),
+                    Ok(CompletionEvent::Finished),
+                ])) as BoxCompletionStream)
+            })
+        }
+    }
 
     struct RecordingEventSink {
         events: StdMutex<Vec<crate::SessionEvent>>,
@@ -4667,6 +5411,128 @@ spec: {}"
     }
 
     #[tokio::test]
+    async fn completion_barrier_queues_simultaneous_submission_and_timeout_fails_open() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let id = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                Some(AgentDefinitionBundle::new("test", vec![
+                    "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n"
+                        .to_owned(),
+                ])),
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap()
+            .record
+            .id;
+        let handler = Arc::new(BlockingCompletionHandler {
+            calls: AtomicUsize::new(0),
+            entered: Notify::new(),
+        });
+        sessions.set_completion_admission_handler(handler.clone());
+
+        let first = sessions
+            .submit_prompt(id.clone(), "first", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        handler.entered.notified().await;
+        let second = sessions
+            .submit_prompt(id.clone(), "second", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        assert!(matches!(
+            second.disposition,
+            AgentSessionRunDisposition::Queued { position: 1 }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(3), first.handle.wait())
+            .await
+            .expect("completion timeout must fail open")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), second.handle.wait())
+            .await
+            .expect("queued run must drain after timeout")
+            .unwrap();
+        assert_eq!(provider.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn watch_and_list_project_running_barrier_claimed_pause_and_release() {
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        let id = completed_session(&sessions).await;
+        let mut watch = sessions.watch_sessions();
+        let (lease_tx, lease_rx) = tokio::sync::oneshot::channel();
+        let reason = SessionCoordinationReason::new(
+            "context-compaction",
+            Some("compact-and-continue".to_owned()),
+            Some("run-completed".to_owned()),
+        )
+        .unwrap();
+        let handler = Arc::new(ControlledClaimHandler {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            lease_tx: StdMutex::new(Some(lease_tx)),
+            reason: reason.clone(),
+        });
+        sessions.set_completion_admission_handler(handler.clone());
+
+        let run = sessions
+            .submit_prompt(id.clone(), "claim", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let running = next_coordination(&mut watch, SessionCoordinationPhase::Running).await;
+        handler.entered.notified().await;
+        let barrier =
+            next_coordination(&mut watch, SessionCoordinationPhase::CompletionBarrier).await;
+        assert_eq!(
+            barrier
+                .coordination
+                .reason
+                .as_ref()
+                .map(|reason| reason.code()),
+            Some("post-run-automation")
+        );
+
+        handler.release.notify_one();
+        let lease = lease_rx.await.unwrap();
+        let paused = next_coordination(&mut watch, SessionCoordinationPhase::Paused).await;
+        assert_eq!(paused.coordination.reason.as_ref(), Some(&reason));
+        assert_eq!(paused.revision, barrier.revision);
+        assert!(paused.revision >= running.revision);
+        assert_eq!(
+            sessions
+                .list()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|summary| summary.id == id)
+                .unwrap()
+                .coordination,
+            paused.coordination
+        );
+
+        sessions.clear_completion_admission_handler();
+        let queued = sessions
+            .submit_prompt(id.clone(), "after pause", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        let queued_pause = next_coordination_matching(&mut watch, |coordination| {
+            coordination.phase == SessionCoordinationPhase::Paused && coordination.queued_count == 1
+        })
+        .await;
+        assert_eq!(queued_pause.coordination.queued_count, 1);
+        sessions.release_pause(&lease).await.unwrap();
+        let resumed = next_coordination(&mut watch, SessionCoordinationPhase::Running).await;
+        assert_eq!(resumed.coordination.queued_count, 0);
+        queued.handle.wait().await.unwrap();
+        let ready = next_coordination(&mut watch, SessionCoordinationPhase::Ready).await;
+        assert_eq!(ready.coordination, SessionCoordinationState::default());
+        run.handle.wait().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn list_registration_seam_converges_with_pause_publication() {
         let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
         let id = completed_session(&sessions).await;
@@ -4866,5 +5732,213 @@ spec: {}"
         let shutdown =
             next_coordination(&mut shutdown_watch, SessionCoordinationPhase::Ready).await;
         assert_eq!(shutdown.coordination, SessionCoordinationState::default());
+    }
+
+    #[tokio::test]
+    async fn slow_completion_snapshot_load_is_bounded_before_pause_claim() {
+        let inner = MemorySessionStore::new();
+        let id = SessionId::new("slow-completion-load");
+        inner
+            .create(SessionCreateRequest::new(id.clone()))
+            .await
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let store = SlowLoadStore {
+            inner,
+            delay_next_load: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            entered: Arc::clone(&entered),
+        };
+        let sessions = SessionCoordinator::new(store);
+        sessions.set_completion_admission_handler(Arc::new(FailingCompletionHandler));
+        let started = std::time::Instant::now();
+        let inference_identity = SessionRunInferenceIdentity {
+            provider_key: "test".to_owned(),
+            model_id: "test-model".to_owned(),
+        };
+        let admission = sessions.run_completion_admission(&id, 1, &inference_identity);
+        let (_, result) = tokio::join!(entered.notified(), admission);
+
+        assert!(result.is_none());
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn completion_finalization_failure_releases_claimed_pause() {
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        sessions.set_completion_admission_handler(Arc::new(FinalizingCompletionHandler(
+            StdMutex::new(Some(TestFinalization::Fail)),
+        )));
+        let id = completed_session(&sessions).await;
+
+        assert!(sessions.active_state(&id).await.is_none());
+        let pause = sessions
+            .acquire_pause_reject_busy(&id, pause_reason())
+            .await
+            .unwrap();
+        sessions.release_pause(&pause).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_post_claim_finalization_keeps_queued_work_blocked_until_failure_resolves() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let id = completed_session(&sessions).await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        sessions.set_completion_admission_handler(Arc::new(FinalizingCompletionHandler(
+            StdMutex::new(Some(TestFinalization::Delay {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            })),
+        )));
+
+        let first = sessions
+            .submit_prompt(id.clone(), "claim", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        entered.notified().await;
+        let queued = sessions
+            .submit_prompt(id.clone(), "queued", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap();
+        assert!(matches!(
+            queued.disposition,
+            AgentSessionRunDisposition::Queued { .. }
+        ));
+        assert_eq!(provider.requests.lock().await.len(), 2);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), queued.handle.wait())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        first.handle.wait().await.unwrap();
+        // Submit another prompt because the timed-out wait consumed the queued handle.
+        sessions
+            .submit_prompt(id, "after", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap()
+            .handle
+            .wait()
+            .await
+            .unwrap();
+        assert!(provider.requests.lock().await.len() >= 3);
+    }
+
+    #[tokio::test]
+    async fn worker_construction_panic_fails_open_and_releases_claimed_pause() {
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        sessions.set_completion_admission_handler(Arc::new(FinalizingCompletionHandler(
+            StdMutex::new(Some(TestFinalization::Panic)),
+        )));
+        let id = completed_session(&sessions).await;
+
+        assert!(sessions.active_state(&id).await.is_none());
+        let pause = sessions
+            .acquire_pause_reject_busy(&id, pause_reason())
+            .await
+            .unwrap();
+        sessions.release_pause(&pause).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_snapshot_uses_latest_turn_usage_and_effective_inference_identity() {
+        let sessions = runtime_sessions(Arc::new(UsageProvider));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sessions.set_completion_admission_handler(Arc::new(SnapshotCompletionHandler(
+            StdMutex::new(Some(sender)),
+        )));
+        let mut metadata = BTreeMap::new();
+        metadata.insert("waltr.session.purpose".to_owned(), json!("interactive"));
+        let session = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                Some(AgentDefinitionBundle::new("test", vec![
+                    "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n"
+                        .to_owned(),
+                ])),
+                metadata,
+            ))
+            .await
+            .unwrap();
+        let submission = sessions
+            .submit_prompt(
+                session.record.id.clone(),
+                "measure",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        submission.handle.wait().await.unwrap();
+        let snapshot = receiver.await.unwrap();
+
+        assert_eq!(snapshot.context_tokens, Some(130));
+        assert_eq!(snapshot.purpose.as_deref(), Some("interactive"));
+        assert_eq!(snapshot.provider_key, "test");
+        assert_eq!(snapshot.model_id, "test-model");
+        assert_eq!(snapshot.session_id, session.record.id);
+        assert!(snapshot.run_id.contains(snapshot.session_id.as_str()));
+        assert!(snapshot.terminal_cursor.get() > 0);
+    }
+
+    #[tokio::test]
+    async fn completion_snapshot_keeps_inference_identity_captured_by_the_active_run() {
+        let provider = Arc::new(QueuedPromptProvider::new());
+        let sessions = runtime_sessions(Arc::clone(&provider));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sessions.set_completion_admission_handler(Arc::new(SnapshotCompletionHandler(
+            StdMutex::new(Some(sender)),
+        )));
+        let session = sessions
+            .create(create_request(
+                Some(test_inference_settings()),
+                Some(AgentDefinitionBundle::new("test", vec![
+                    "apiVersion: waltr.dev/v1alpha1\nkind: Agent\nmetadata: { name: test }\nspec: {}\n"
+                        .to_owned(),
+                ])),
+                BTreeMap::new(),
+            ))
+            .await
+            .unwrap();
+        let submission = sessions
+            .submit_prompt(
+                session.record.id.clone(),
+                "active",
+                RunConflictPolicy::QueueIfActive,
+            )
+            .await
+            .unwrap();
+        provider.wait_for_request_count(1).await;
+        let mut changed = test_inference_settings();
+        changed.provider.key = "changed-provider".to_owned();
+        changed.provider.model_id = "changed-model".to_owned();
+        sessions
+            .set_inference_settings(&session.record.id, Some(changed))
+            .await
+            .unwrap();
+        provider.release_active();
+        submission.handle.wait().await.unwrap();
+        let snapshot = receiver.await.unwrap();
+
+        assert_eq!(snapshot.provider_key, "test");
+        assert_eq!(snapshot.model_id, "test-model");
+    }
+
+    #[tokio::test]
+    async fn completion_handler_error_fails_open_without_stranding_the_session() {
+        let sessions = runtime_sessions(Arc::new(TextOnlyProvider));
+        sessions.set_completion_admission_handler(Arc::new(FailingCompletionHandler));
+        let id = completed_session(&sessions).await;
+
+        assert!(sessions.active_state(&id).await.is_none());
+        sessions
+            .submit_prompt(id, "after failure", RunConflictPolicy::QueueIfActive)
+            .await
+            .unwrap()
+            .handle
+            .wait()
+            .await
+            .unwrap();
     }
 }

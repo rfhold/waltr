@@ -3,7 +3,9 @@
 use std::{
     error::Error,
     fmt,
+    future::Future,
     num::NonZeroU64,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -33,11 +35,13 @@ pub enum SessionCoordinationPhase {
     Ready,
     /// A submitted run currently owns the session.
     Running,
+    /// A completed run is undergoing bounded host admission checks.
+    CompletionBarrier,
     /// A host operation owns a process-local pause.
     Paused,
 }
 
-/// Validated machine-readable reason for an owned pause.
+/// Validated machine-readable reason for a completion barrier or owned pause.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionCoordinationReason {
     code: String,
@@ -102,6 +106,14 @@ impl SessionCoordinationReason {
     #[must_use]
     pub fn trigger(&self) -> Option<&str> {
         self.trigger.as_deref()
+    }
+
+    pub(super) fn post_run_automation() -> Self {
+        Self {
+            code: "post-run-automation".to_owned(),
+            source: None,
+            trigger: None,
+        }
     }
 }
 
@@ -179,10 +191,68 @@ pub struct SessionCoordinationState {
     pub continuation_armed: bool,
 }
 
+/// Bounded future preparing host completion coordination before any pause is claimed.
+pub type SessionCompletionCoordinationFuture = Pin<
+    Box<
+        dyn Future<Output = std::result::Result<SessionCompletionCoordinationPreparation, String>>
+            + Send,
+    >,
+>;
+
+/// Host completion decision carrying the reason used if pause ownership is claimed.
+pub enum SessionCompletionCoordinationPreparation {
+    /// Continue ordinary queue draining.
+    Continue,
+    /// Atomically replace the completion barrier with a reasoned pause, then finalize admission.
+    Claim {
+        /// Descriptor installed when the pause claim becomes authoritative.
+        reason: SessionCoordinationReason,
+        /// Host finalizer invoked only after the pause is claimed.
+        finalizer: Box<dyn crate::SessionCompletionAdmissionFinalizer>,
+    },
+}
+
+impl fmt::Debug for SessionCompletionCoordinationPreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Continue => formatter.write_str("Continue"),
+            Self::Claim { reason, .. } => formatter
+                .debug_struct("Claim")
+                .field("reason", reason)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// Host callback consulted before queued work drains after a completed run.
+pub trait SessionCompletionCoordinationHandler: Send + Sync {
+    /// Prepare optional reasoned pause admission without claiming coordinator ownership.
+    fn prepare(
+        &self,
+        snapshot: crate::SessionRunCompletionSnapshot,
+    ) -> SessionCompletionCoordinationFuture;
+}
+
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) type RunResult = std::result::Result<AgentSessionRunOutcome, AgentSessionRunError>;
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) type RunOutcomeSender = oneshot::Sender<RunResult>;
+
+/// Immutable effective inference identity captured for one admitted run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionRunInferenceIdentity {
+    pub(super) provider_key: String,
+    pub(super) model_id: String,
+}
+
+impl SessionRunInferenceIdentity {
+    pub(super) fn from_settings(settings: &super::InferenceSettings) -> Self {
+        Self {
+            provider_key: settings.provider.key.clone(),
+            model_id: settings.provider.model_id.clone(),
+        }
+    }
+}
 
 /// Opaque process-local identity for one owned session pause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

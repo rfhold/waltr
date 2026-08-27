@@ -13,7 +13,12 @@ pub mod session;
 mod tool;
 
 pub use builder::AgentRuntimeBuilder;
-pub use event::{BoxAgentTimelineStream, SessionEvent, SessionEventSink, SessionEventSinkFuture};
+pub use event::{
+    BoxAgentTimelineStream, SessionCompletionAdmissionFinalizer, SessionCompletionAdmissionHandler,
+    SessionCompletionFinalizationFuture, SessionCompletionPreparation,
+    SessionCompletionPreparationFuture, SessionCompletionWorkerFuture, SessionEvent,
+    SessionEventSink, SessionEventSinkFuture, SessionRunCompletionSnapshot,
+};
 pub use retry::ProviderRetryConfig;
 pub use run::AgentRunBuilder;
 pub use session::{
@@ -35,7 +40,9 @@ pub use session::{
     OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, ReplacementUserContent,
     RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput,
     S3SessionStore, S3SessionWriteMode, ScyllaSessionStore, SessionCaptureError,
-    SessionCaptureLimits, SessionContextMode, SessionCoordinationPhase, SessionCoordinationReason,
+    SessionCaptureLimits, SessionCompletionCoordinationFuture,
+    SessionCompletionCoordinationHandler, SessionCompletionCoordinationPreparation,
+    SessionContextMode, SessionCoordinationPhase, SessionCoordinationReason,
     SessionCoordinationReasonError, SessionCoordinationState, SessionCoordinator, SessionCopy,
     SessionCopyError, SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent,
     SessionListSubscription, SessionListUpdate, SessionMask, SessionMaskAddition, SessionMaskError,
