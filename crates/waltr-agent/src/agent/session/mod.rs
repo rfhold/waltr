@@ -10,6 +10,7 @@ mod create;
 mod list;
 mod mask;
 mod materialize;
+mod progress;
 mod projection;
 mod run;
 mod runtime;
@@ -39,6 +40,10 @@ pub use mask::{
     SessionMaskMutationOutcome, SessionMaskSubtraction, ThroughCursor,
 };
 pub use materialize::{SessionContextMode, SessionMaterializedContext};
+pub use progress::{
+    SessionCapabilities, SessionProgress, SessionProgressPhase, SessionPromptDisposition,
+    SessionRunStage,
+};
 pub use projection::{
     SessionSyntheticTimelineEvent, SessionTimelineMode, SessionTimelinePage,
     SessionTimelinePresentation, SessionTimelineProjectedEvent, SessionTimelineProjectionEvent,

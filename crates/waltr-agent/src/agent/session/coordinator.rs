@@ -3379,6 +3379,7 @@ spec: {}
             if let SessionListEvent::Upsert(summary) = update.event
                 && summary.coordination.phase == phase
             {
+                assert_projection_is_atomic(&summary);
                 return summary;
             }
         }
@@ -3396,9 +3397,21 @@ spec: {}
             if let SessionListEvent::Upsert(summary) = update.event
                 && predicate(&summary.coordination)
             {
+                assert_projection_is_atomic(&summary);
                 return summary;
             }
         }
+    }
+
+    fn assert_projection_is_atomic(summary: &SessionSummary) {
+        assert_eq!(
+            summary.progress,
+            crate::SessionProgress::from_state(&summary.status, &summary.coordination)
+        );
+        assert_eq!(
+            summary.capabilities,
+            crate::SessionCapabilities::from_state(&summary.status, &summary.coordination)
+        );
     }
 
     async fn establish_incarnation(

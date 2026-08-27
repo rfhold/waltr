@@ -555,6 +555,77 @@ mod tests {
         );
         assert_eq!(summary.coordination.queued_count, 2);
         assert!(summary.coordination.continuation_armed);
+        assert_eq!(summary.progress.phase, crate::SessionProgressPhase::Paused);
+        assert_eq!(summary.progress.reason, summary.coordination.reason);
+        assert_eq!(summary.progress.queued_count, 2);
+        assert!(summary.progress.continuation_armed);
+        assert!(summary.progress.running);
+        assert_eq!(
+            summary.capabilities.prompt_disposition,
+            crate::SessionPromptDisposition::Queued
+        );
+        assert!(!summary.capabilities.can_respond_external_request);
+        assert!(!summary.capabilities.can_interrupt);
+    }
+
+    #[tokio::test]
+    async fn every_upsert_recomputes_the_complete_process_local_owner_group() {
+        let sessions = SessionListBroadcaster::new();
+        let mut watch = sessions.subscribe();
+        let mut inconsistent = summary("atomic-owner-group", "host");
+        inconsistent.progress = crate::SessionProgress::default();
+        inconsistent.capabilities.can_interrupt = true;
+
+        publish_created(&sessions, inconsistent);
+
+        let update = next_event(&mut watch).await;
+        let SessionListEvent::Upsert(summary) = update.event else {
+            panic!("owner-group upsert")
+        };
+        assert_eq!(
+            summary.progress,
+            crate::SessionProgress::from_state(&summary.status, &summary.coordination)
+        );
+        assert_eq!(
+            summary.capabilities,
+            crate::SessionCapabilities::from_state(&summary.status, &summary.coordination)
+        );
+    }
+
+    #[tokio::test]
+    async fn suspended_activity_is_preserved_across_coordination_publications() {
+        let sessions = SessionListBroadcaster::new();
+        let mut watch = sessions.subscribe();
+        let mut retained = summary("suspended-activity", "host");
+        retained.status = crate::SessionStatus::Suspended(crate::Suspension::AwaitingToolResults {
+            work: Vec::new(),
+        });
+        publish_created(&sessions, retained);
+        drop(next_event(&mut watch).await);
+
+        for (phase, running) in [
+            (crate::SessionCoordinationPhase::Running, false),
+            (crate::SessionCoordinationPhase::CompletionBarrier, true),
+            (crate::SessionCoordinationPhase::Paused, true),
+            (crate::SessionCoordinationPhase::Ready, false),
+        ] {
+            sessions.publish_coordination(
+                &SessionId::new("suspended-activity"),
+                crate::SessionCoordinationState {
+                    phase,
+                    ..Default::default()
+                },
+            );
+            let update = next_event(&mut watch).await;
+            let SessionListEvent::Upsert(summary) = update.event else {
+                panic!("suspended coordination upsert")
+            };
+            assert_eq!(summary.progress.running, running, "{phase:?}");
+            assert_eq!(
+                summary.capabilities.can_interrupt,
+                phase == crate::SessionCoordinationPhase::Running
+            );
+        }
     }
 
     #[test]
