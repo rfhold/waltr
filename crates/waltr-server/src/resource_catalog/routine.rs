@@ -16,6 +16,7 @@ const MAX_ROUTINE_PARAMS: usize = 64;
 const MAX_ROUTINE_TASKS: usize = 64;
 const MAX_ROUTINE_RESULTS: usize = 64;
 const MAX_ROUTINE_CONDITIONS: usize = 32;
+const MAX_ROUTINE_CONDITION_DEPTH: usize = 8;
 const MAX_ROUTINE_VALUES: usize = 32;
 const MAX_ROUTINE_LIST_ITEMS: usize = 128;
 const MAX_ROUTINE_MUTATIONS: usize = 1;
@@ -115,6 +116,8 @@ pub struct RoutineParam {
     #[serde(default)]
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<RoutineScalar>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<RoutineParamValidation>,
 }
 
@@ -128,15 +131,19 @@ pub struct RoutineParamValidation {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RoutineTrigger {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<RoutineEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual: Option<RoutineManualTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_lifecycle: Option<RoutineSessionLifecycleTrigger>,
     #[serde(default)]
     pub when: Vec<RoutineCondition>,
+    #[serde(default)]
+    pub params: Vec<RoutineTriggerParam>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -144,7 +151,15 @@ pub struct RoutineTrigger {
 pub struct RoutineManualTrigger {
     pub display_name: String,
     pub scope: RoutineManualScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_busy: Option<RoutineManualOnBusy>,
     pub inputs: Vec<RoutineManualInput>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutineManualOnBusy {
+    Reject,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -160,16 +175,51 @@ pub struct RoutineManualInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RoutineSessionLifecycleTrigger {
+    pub event: RoutineSessionLifecycleEvent,
+    pub scope: RoutineManualScope,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutineSessionLifecycleEvent {
+    RunCompleted,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineTriggerParam {
+    pub name: String,
+    pub value: RoutineScalar,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutineSourceSession {
     pub from: RoutineScalar,
-    pub snapshot: RoutineSourceSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<RoutineSourceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<RoutineSourcePause>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RoutineSourceSnapshot {
     pub through_cursor: RoutineScalar,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineSourcePause {
+    pub submissions: RoutinePausedSubmissions,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutinePausedSubmissions {
+    Queue,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -183,6 +233,13 @@ pub struct RoutineEvent {
 pub enum RoutineCondition {
     Input(RoutineInputCondition),
     Metadata(RoutineMetadataConditionEnvelope),
+    Any(RoutineAnyCondition),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineAnyCondition {
+    pub any: Vec<RoutineCondition>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -207,17 +264,19 @@ pub struct RoutineMetadataCondition {
     pub values: Vec<RoutineScalar>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum RoutineConditionOperator {
     In,
     NotIn,
+    GreaterThanOrEqual,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum RoutineScalar {
     String(String),
     Boolean(bool),
+    Integer(u64),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -323,6 +382,86 @@ pub struct RoutineAction {
     pub session_metadata: Option<RoutineSessionMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_create: Option<RoutineSessionCreate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mask: Option<RoutineSessionMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_continue: Option<RoutineSessionContinue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RoutineSessionMask {
+    pub session_id: RoutineScalar,
+    pub atomic: bool,
+    pub masks: RoutineSessionMasks,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineSessionMasks {
+    pub subtract: Vec<RoutineMaskSubtraction>,
+    pub add: Vec<RoutineReplacementMask>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineMaskSubtraction {
+    pub selector: RoutineMaskOverlapSelector,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineMaskOverlapSelector {
+    pub overlaps: RoutineMaskThroughCursor,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RoutineMaskThroughCursor {
+    pub through_cursor: RoutineScalar,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RoutineReplacementMask {
+    pub r#type: RoutineMaskType,
+    pub key: String,
+    pub selector: RoutineMaskThroughCursor,
+    pub on_overlap: RoutineMaskOverlapPolicy,
+    pub preserve_source_items: bool,
+    pub replacement: RoutineMaskReplacement,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutineMaskType {
+    Replacement,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutineMaskOverlapPolicy {
+    Reject,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutineMaskReplacement {
+    pub role: RoutineMaskReplacementRole,
+    pub text: RoutineScalar,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutineMaskReplacementRole {
+    User,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RoutineSessionContinue {
+    pub session_id: RoutineScalar,
+    pub from_cursor: RoutineScalar,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -407,12 +546,18 @@ pub(super) fn materialize_routine(
             format!("source exceeds {MAX_ROUTINE_SOURCE_BYTES} bytes"),
         ));
     }
-    let definition: RoutineDefinition = serde_yaml_ng::from_str(source).map_err(|source| {
+    let mut definition: RoutineDefinition = serde_yaml_ng::from_str(source).map_err(|source| {
         AgentDefinitionLoadError::ResourceYaml {
             path: path.to_owned(),
             source,
         }
     })?;
+    for task in &mut definition.spec.tasks {
+        if task.task_spec.session_template.is_some() {
+            task.task_spec.features.get_or_insert_with(Vec::new);
+            task.task_spec.permissions.get_or_insert_with(Vec::new);
+        }
+    }
     validate_routine(&definition, path)?;
     Ok(definition)
 }
@@ -467,6 +612,12 @@ fn validate_routine(
     for (index, param) in definition.spec.params.iter().enumerate() {
         let location = format!("spec.params[{index}]");
         insert_unique(path, &location, &param.name, &mut params)?;
+        if param.required && param.default.is_some() {
+            return Err(invalid(
+                path,
+                format!("{location} cannot be required and declare a default"),
+            ));
+        }
         match (param.r#type, &param.validation) {
             (RoutineResultType::Boolean, Some(_)) => {
                 return Err(invalid(
@@ -492,6 +643,9 @@ fn validate_routine(
             }
             (_, None) => {}
         }
+        if let Some(default) = &param.default {
+            validate_parameter_value(path, &format!("{location}.default"), param, default, false)?;
+        }
     }
 
     let mut trigger_names = BTreeMap::new();
@@ -505,8 +659,8 @@ fn validate_routine(
     for (index, trigger) in definition.spec.triggers.iter().enumerate() {
         let location = format!("spec.triggers[{index}]");
         insert_unique(path, &location, &trigger.name, &mut trigger_names)?;
-        match (&trigger.event, &trigger.manual) {
-            (Some(event), None) => {
+        match (&trigger.event, &trigger.manual, &trigger.session_lifecycle) {
+            (Some(event), None, None) => {
                 if definition.spec.source_session.is_some() {
                     return Err(invalid(
                         path,
@@ -523,7 +677,19 @@ fn validate_routine(
                     ));
                 }
             }
-            (None, Some(manual)) => {
+            (None, Some(manual), None) => {
+                if definition
+                    .spec
+                    .source_session
+                    .as_ref()
+                    .is_some_and(|source| source.pause.is_some())
+                    && manual.on_busy.is_none()
+                {
+                    return Err(invalid(
+                        path,
+                        format!("{location}.manual.onBusy must be `reject` for a paused source"),
+                    ));
+                }
                 validate_string(
                     path,
                     &format!("{location}.manual.displayName"),
@@ -558,23 +724,84 @@ fn validate_routine(
                     ));
                 }
             }
+            (None, None, Some(_)) => {}
             _ => {
                 return Err(invalid(
                     path,
-                    format!("{location} must declare exactly one of event or manual"),
+                    format!(
+                        "{location} must declare exactly one of event, manual, or sessionLifecycle"
+                    ),
                 ));
             }
+        }
+        bounded_count(
+            path,
+            &format!("{location}.params"),
+            trigger.params.len(),
+            MAX_ROUTINE_PARAMS,
+            true,
+        )?;
+        let mut assignments = BTreeMap::new();
+        for (param_index, assignment) in trigger.params.iter().enumerate() {
+            let assignment_location = format!("{location}.params[{param_index}]");
+            insert_unique(
+                path,
+                &assignment_location,
+                &assignment.name,
+                &mut assignments,
+            )?;
+            let parameter = params.get(assignment.name.as_str()).ok_or_else(|| {
+                invalid(
+                    path,
+                    format!(
+                        "{assignment_location}.name references undeclared parameter `{}`",
+                        assignment.name
+                    ),
+                )
+            })?;
+            validate_parameter_value(
+                path,
+                &format!("{assignment_location}.value"),
+                &definition.spec.params[*parameter],
+                &assignment.value,
+                true,
+            )?;
+        }
+        if trigger.session_lifecycle.is_none() && !trigger.params.is_empty() {
+            return Err(invalid(
+                path,
+                format!("{location}.params is supported only for sessionLifecycle triggers"),
+            ));
+        }
+        if trigger.session_lifecycle.is_some()
+            && let Some(missing) = required
+                .iter()
+                .find(|name| !assignments.contains_key(**name))
+        {
+            return Err(invalid(
+                path,
+                format!("{location}.params does not assign required parameter `{missing}`"),
+            ));
         }
         validate_conditions(path, &location, &trigger.when, trigger.event.is_some())?;
     }
 
     if let Some(source) = &definition.spec.source_session {
         validate_expression_scalar(path, "spec.sourceSession.from", &source.from)?;
-        validate_expression_scalar(
-            path,
-            "spec.sourceSession.snapshot.throughCursor",
-            &source.snapshot.through_cursor,
-        )?;
+        match (&source.snapshot, &source.pause) {
+            (Some(snapshot), None) => validate_expression_scalar(
+                path,
+                "spec.sourceSession.snapshot.throughCursor",
+                &snapshot.through_cursor,
+            )?,
+            (None, Some(_)) => {}
+            _ => {
+                return Err(invalid(
+                    path,
+                    "spec.sourceSession must declare exactly one of snapshot or pause".to_owned(),
+                ));
+            }
+        }
     }
 
     let mut tasks = BTreeMap::new();
@@ -622,8 +849,12 @@ fn validate_routine(
         let action_kind = task.task_spec.action.as_ref().map(|action| {
             if action.session_metadata.is_some() {
                 ActionKind::SessionMetadata
-            } else {
+            } else if action.session_create.is_some() {
                 ActionKind::SessionCreate
+            } else if action.session_mask.is_some() {
+                ActionKind::SessionMask
+            } else {
+                ActionKind::SessionContinue
             }
         });
         validate_results(
@@ -779,8 +1010,13 @@ fn validate_task(
                     format!("{location}.taskSpec action tasks cannot declare agent task fields"),
                 ));
             }
-            match (&action.session_metadata, &action.session_create) {
-                (Some(metadata), None) => {
+            match (
+                &action.session_metadata,
+                &action.session_create,
+                &action.session_mask,
+                &action.session_continue,
+            ) {
+                (Some(metadata), None, None, None) => {
                     validate_expression_scalar(
                         path,
                         &format!("{location}.taskSpec.action.sessionMetadata.sessionId"),
@@ -811,7 +1047,7 @@ fn validate_task(
                         }
                     }
                 }
-                (None, Some(create)) => {
+                (None, Some(create), None, None) => {
                     validate_expression_scalar(
                         path,
                         &format!("{location}.taskSpec.action.sessionCreate.inheritFrom.session"),
@@ -843,11 +1079,79 @@ fn validate_task(
                         &create.first_user_message.text,
                     )?;
                 }
+                (None, None, Some(mask), None) => {
+                    let base = format!("{location}.taskSpec.action.sessionMask");
+                    validate_expression_scalar(
+                        path,
+                        &format!("{base}.sessionId"),
+                        &mask.session_id,
+                    )?;
+                    if !mask.atomic {
+                        return Err(invalid(path, format!("{base}.atomic must be true")));
+                    }
+                    bounded_count(
+                        path,
+                        &format!("{base}.masks.subtract"),
+                        mask.masks.subtract.len(),
+                        1,
+                        false,
+                    )?;
+                    bounded_count(
+                        path,
+                        &format!("{base}.masks.add"),
+                        mask.masks.add.len(),
+                        1,
+                        false,
+                    )?;
+                    validate_expression_scalar(
+                        path,
+                        &format!("{base}.masks.subtract[0].selector.overlaps.throughCursor"),
+                        &mask.masks.subtract[0].selector.overlaps.through_cursor,
+                    )?;
+                    let addition = &mask.masks.add[0];
+                    validate_string(path, &format!("{base}.masks.add[0].key"), &addition.key)?;
+                    validate_expression_scalar(
+                        path,
+                        &format!("{base}.masks.add[0].selector.throughCursor"),
+                        &addition.selector.through_cursor,
+                    )?;
+                    if !addition.preserve_source_items {
+                        return Err(invalid(
+                            path,
+                            format!("{base}.masks.add[0].preserveSourceItems must be true"),
+                        ));
+                    }
+                    validate_expression_scalar(
+                        path,
+                        &format!("{base}.masks.add[0].replacement.text"),
+                        &addition.replacement.text,
+                    )?;
+                }
+                (None, None, None, Some(continuation)) => {
+                    validate_expression_scalar(
+                        path,
+                        &format!("{location}.taskSpec.action.sessionContinue.sessionId"),
+                        &continuation.session_id,
+                    )?;
+                    validate_expression_scalar(
+                        path,
+                        &format!("{location}.taskSpec.action.sessionContinue.fromCursor"),
+                        &continuation.from_cursor,
+                    )?;
+                    if !spec.results.is_empty() {
+                        return Err(invalid(
+                            path,
+                            format!(
+                                "{location}.taskSpec.action.sessionContinue has no result fields"
+                            ),
+                        ));
+                    }
+                }
                 _ => {
                     return Err(invalid(
                         path,
                         format!(
-                            "{location}.taskSpec.action must declare exactly one of sessionMetadata or sessionCreate"
+                            "{location}.taskSpec.action must declare exactly one supported action"
                         ),
                     ));
                 }
@@ -887,48 +1191,115 @@ fn validate_conditions(
     )?;
     for (index, condition) in conditions.iter().enumerate() {
         let location = format!("{parent}.when[{index}]");
-        let (values, values_location) = match condition {
-            RoutineCondition::Input(condition) => {
-                validate_expression_scalar(path, &format!("{location}.input"), &condition.input)?;
-                (&condition.values, format!("{location}.values"))
-            }
-            RoutineCondition::Metadata(condition) => {
-                if !metadata_allowed {
-                    return Err(invalid(
-                        path,
-                        format!(
-                            "{location}.metadata is only supported on event trigger conditions"
-                        ),
-                    ));
-                }
-                validate_string(
-                    path,
-                    &format!("{location}.metadata.key"),
-                    &condition.metadata.key,
-                )?;
-                (
-                    &condition.metadata.values,
-                    format!("{location}.metadata.values"),
-                )
-            }
-        };
-        bounded_count(
+        validate_condition(path, &location, condition, metadata_allowed, 1)?;
+    }
+    Ok(())
+}
+
+fn validate_condition(
+    path: &str,
+    location: &str,
+    condition: &RoutineCondition,
+    metadata_allowed: bool,
+    depth: usize,
+) -> Result<(), AgentDefinitionLoadError> {
+    if depth > MAX_ROUTINE_CONDITION_DEPTH {
+        return Err(invalid(
             path,
-            &values_location,
-            values.len(),
-            MAX_ROUTINE_VALUES,
-            false,
-        )?;
-        for (value_index, value) in values.iter().enumerate() {
-            validate_scalar(
+            format!("{location} exceeds condition nesting depth {MAX_ROUTINE_CONDITION_DEPTH}"),
+        ));
+    }
+    let (operator, values, values_location) = match condition {
+        RoutineCondition::Input(condition) => {
+            validate_expression_scalar(path, &format!("{location}.input"), &condition.input)?;
+            (
+                condition.operator,
+                &condition.values,
+                format!("{location}.values"),
+            )
+        }
+        RoutineCondition::Metadata(condition) => {
+            if !metadata_allowed {
+                return Err(invalid(
+                    path,
+                    format!("{location}.metadata is only supported on event trigger conditions"),
+                ));
+            }
+            validate_string(
                 path,
-                &format!("{values_location}[{value_index}]"),
-                value,
-                true,
+                &format!("{location}.metadata.key"),
+                &condition.metadata.key,
             )?;
+            (
+                condition.metadata.operator,
+                &condition.metadata.values,
+                format!("{location}.metadata.values"),
+            )
+        }
+        RoutineCondition::Any(condition) => {
+            bounded_count(
+                path,
+                &format!("{location}.any"),
+                condition.any.len(),
+                MAX_ROUTINE_CONDITIONS,
+                false,
+            )?;
+            for (index, child) in condition.any.iter().enumerate() {
+                validate_condition(
+                    path,
+                    &format!("{location}.any[{index}]"),
+                    child,
+                    metadata_allowed,
+                    depth + 1,
+                )?;
+            }
+            return Ok(());
+        }
+    };
+    bounded_count(
+        path,
+        &values_location,
+        values.len(),
+        if operator == RoutineConditionOperator::GreaterThanOrEqual {
+            1
+        } else {
+            MAX_ROUTINE_VALUES
+        },
+        false,
+    )?;
+    for (value_index, value) in values.iter().enumerate() {
+        let value_location = format!("{values_location}[{value_index}]");
+        validate_scalar(path, &value_location, value, true)?;
+        if operator == RoutineConditionOperator::GreaterThanOrEqual
+            && !numeric_literal_or_expression(value)
+        {
+            return Err(invalid(
+                path,
+                format!(
+                    "{value_location} must be a nonnegative integer or canonical decimal string"
+                ),
+            ));
         }
     }
     Ok(())
+}
+
+fn numeric_literal_or_expression(value: &RoutineScalar) -> bool {
+    match value {
+        RoutineScalar::Integer(_) => true,
+        RoutineScalar::String(value) if value.starts_with("$(") => true,
+        RoutineScalar::String(value) => canonical_decimal(value).is_some(),
+        RoutineScalar::Boolean(_) => false,
+    }
+}
+
+fn canonical_decimal(value: &str) -> Option<u64> {
+    if value == "0" || (!value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        value.parse().ok()
+    } else {
+        None
+    }
 }
 
 #[allow(
@@ -1002,33 +1373,24 @@ fn validate_static_references(
     for (trigger_index, trigger) in definition.spec.triggers.iter().enumerate() {
         for (condition_index, condition) in trigger.when.iter().enumerate() {
             let location = format!("spec.triggers[{trigger_index}].when[{condition_index}]");
-            let (values, values_location) = match condition {
-                RoutineCondition::Input(condition) => {
-                    validate_trigger_value_references(
-                        path,
-                        &format!("{location}.input"),
-                        &condition.input,
-                        task_results,
-                        definition,
-                        trigger,
-                    )?;
-                    (&condition.values, format!("{location}.values"))
-                }
-                RoutineCondition::Metadata(condition) => (
-                    &condition.metadata.values,
-                    format!("{location}.metadata.values"),
-                ),
-            };
-            for (value_index, value) in values.iter().enumerate() {
-                validate_trigger_value_references(
-                    path,
-                    &format!("{values_location}[{value_index}]"),
-                    value,
-                    task_results,
-                    definition,
-                    trigger,
-                )?;
-            }
+            validate_trigger_condition_references(
+                path,
+                &location,
+                condition,
+                task_results,
+                definition,
+                trigger,
+            )?;
+        }
+        for (param_index, assignment) in trigger.params.iter().enumerate() {
+            validate_trigger_value_references(
+                path,
+                &format!("spec.triggers[{trigger_index}].params[{param_index}].value"),
+                &assignment.value,
+                task_results,
+                definition,
+                trigger,
+            )?;
         }
     }
     if let Some(source) = &definition.spec.source_session {
@@ -1042,16 +1404,18 @@ fn validate_static_references(
             false,
             None,
         )?;
-        validate_value_references(
-            path,
-            "spec.sourceSession.snapshot.throughCursor",
-            &source.snapshot.through_cursor,
-            task_results,
-            definition,
-            None,
-            false,
-            None,
-        )?;
+        if let Some(snapshot) = &source.snapshot {
+            validate_value_references(
+                path,
+                "spec.sourceSession.snapshot.throughCursor",
+                &snapshot.through_cursor,
+                task_results,
+                definition,
+                None,
+                false,
+                None,
+            )?;
+        }
     }
     for (task_index, task) in definition.spec.tasks.iter().enumerate() {
         let location = format!("spec.tasks[{task_index}]");
@@ -1059,36 +1423,24 @@ fn validate_static_references(
         let action_kind = task.task_spec.action.as_ref().map(|action| {
             if action.session_metadata.is_some() {
                 ActionKind::SessionMetadata
-            } else {
+            } else if action.session_create.is_some() {
                 ActionKind::SessionCreate
+            } else if action.session_mask.is_some() {
+                ActionKind::SessionMask
+            } else {
+                ActionKind::SessionContinue
             }
         });
         for (condition_index, condition) in task.when.iter().enumerate() {
-            let RoutineCondition::Input(condition) = condition else {
-                continue;
-            };
-            validate_value_references(
+            validate_task_condition_references(
                 path,
-                &format!("{location}.when[{condition_index}].input"),
-                &condition.input,
+                &format!("{location}.when[{condition_index}]"),
+                condition,
                 task_results,
                 definition,
-                Some(&ancestors),
-                false,
+                &ancestors,
                 action_kind,
             )?;
-            for (value_index, value) in condition.values.iter().enumerate() {
-                validate_value_references(
-                    path,
-                    &format!("{location}.when[{condition_index}].values[{value_index}]"),
-                    value,
-                    task_results,
-                    definition,
-                    Some(&ancestors),
-                    false,
-                    action_kind,
-                )?;
-            }
         }
         if let Some(session) = &task.task_spec.session_template {
             if let Some(source) = &session.source {
@@ -1207,6 +1559,52 @@ fn validate_static_references(
                     Some(ActionKind::SessionCreate),
                 )?;
             }
+            if let Some(mask) = &action.session_mask {
+                let base = format!("{location}.taskSpec.action.sessionMask");
+                for (suffix, value) in [
+                    ("sessionId", &mask.session_id),
+                    (
+                        "masks.subtract[0].selector.overlaps.throughCursor",
+                        &mask.masks.subtract[0].selector.overlaps.through_cursor,
+                    ),
+                    (
+                        "masks.add[0].selector.throughCursor",
+                        &mask.masks.add[0].selector.through_cursor,
+                    ),
+                    (
+                        "masks.add[0].replacement.text",
+                        &mask.masks.add[0].replacement.text,
+                    ),
+                ] {
+                    validate_value_references(
+                        path,
+                        &format!("{base}.{suffix}"),
+                        value,
+                        task_results,
+                        definition,
+                        Some(&ancestors),
+                        false,
+                        Some(ActionKind::SessionMask),
+                    )?;
+                }
+            }
+            if let Some(continuation) = &action.session_continue {
+                for (suffix, value) in [
+                    ("sessionId", &continuation.session_id),
+                    ("fromCursor", &continuation.from_cursor),
+                ] {
+                    validate_value_references(
+                        path,
+                        &format!("{location}.taskSpec.action.sessionContinue.{suffix}"),
+                        value,
+                        task_results,
+                        definition,
+                        Some(&ancestors),
+                        false,
+                        Some(ActionKind::SessionContinue),
+                    )?;
+                }
+            }
         }
     }
     Ok(())
@@ -1216,6 +1614,117 @@ fn validate_static_references(
 enum ActionKind {
     SessionMetadata,
     SessionCreate,
+    SessionMask,
+    SessionContinue,
+}
+
+fn validate_trigger_condition_references(
+    path: &str,
+    location: &str,
+    condition: &RoutineCondition,
+    task_results: &BTreeMap<&str, BTreeMap<&str, RoutineResultType>>,
+    definition: &RoutineDefinition,
+    trigger: &RoutineTrigger,
+) -> Result<(), AgentDefinitionLoadError> {
+    match condition {
+        RoutineCondition::Input(condition) => {
+            validate_trigger_value_references(
+                path,
+                &format!("{location}.input"),
+                &condition.input,
+                task_results,
+                definition,
+                trigger,
+            )?;
+            for (index, value) in condition.values.iter().enumerate() {
+                validate_trigger_value_references(
+                    path,
+                    &format!("{location}.values[{index}]"),
+                    value,
+                    task_results,
+                    definition,
+                    trigger,
+                )?;
+            }
+        }
+        RoutineCondition::Metadata(condition) => {
+            for (index, value) in condition.metadata.values.iter().enumerate() {
+                validate_trigger_value_references(
+                    path,
+                    &format!("{location}.metadata.values[{index}]"),
+                    value,
+                    task_results,
+                    definition,
+                    trigger,
+                )?;
+            }
+        }
+        RoutineCondition::Any(condition) => {
+            for (index, child) in condition.any.iter().enumerate() {
+                validate_trigger_condition_references(
+                    path,
+                    &format!("{location}.any[{index}]"),
+                    child,
+                    task_results,
+                    definition,
+                    trigger,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_condition_references(
+    path: &str,
+    location: &str,
+    condition: &RoutineCondition,
+    task_results: &BTreeMap<&str, BTreeMap<&str, RoutineResultType>>,
+    definition: &RoutineDefinition,
+    ancestors: &BTreeSet<&str>,
+    action_kind: Option<ActionKind>,
+) -> Result<(), AgentDefinitionLoadError> {
+    match condition {
+        RoutineCondition::Input(condition) => {
+            validate_value_references(
+                path,
+                &format!("{location}.input"),
+                &condition.input,
+                task_results,
+                definition,
+                Some(ancestors),
+                false,
+                action_kind,
+            )?;
+            for (index, value) in condition.values.iter().enumerate() {
+                validate_value_references(
+                    path,
+                    &format!("{location}.values[{index}]"),
+                    value,
+                    task_results,
+                    definition,
+                    Some(ancestors),
+                    false,
+                    action_kind,
+                )?;
+            }
+        }
+        RoutineCondition::Metadata(_) => {}
+        RoutineCondition::Any(condition) => {
+            for (index, child) in condition.any.iter().enumerate() {
+                validate_task_condition_references(
+                    path,
+                    &format!("{location}.any[{index}]"),
+                    child,
+                    task_results,
+                    definition,
+                    ancestors,
+                    action_kind,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(
@@ -1380,11 +1889,26 @@ fn validate_static_reference_in_context(
                     .spec
                     .triggers
                     .iter()
-                    .all(|trigger| trigger.manual.is_some())
+                    .all(|trigger| trigger.manual.is_some() || trigger.session_lifecycle.is_some())
             },
-            |trigger| trigger.manual.is_some(),
+            |trigger| trigger.manual.is_some() || trigger.session_lifecycle.is_some(),
         )
     {
+        return Ok(());
+    }
+    if matches!(
+        expression,
+        "trigger.context.tokens" | "trigger.context.percent"
+    ) && active_trigger.map_or_else(
+        || {
+            definition
+                .spec
+                .triggers
+                .iter()
+                .all(|trigger| trigger.session_lifecycle.is_some())
+        },
+        |trigger| trigger.session_lifecycle.is_some(),
+    ) {
         return Ok(());
     }
     if let Some(name) = expression.strip_prefix("params.") {
@@ -1398,6 +1922,7 @@ fn validate_static_reference_in_context(
                 .manual
                 .as_ref()
                 .is_some_and(|manual| manual.inputs.iter().any(|input| input.name == name))
+                || trigger.params.iter().any(|param| param.name == name)
         };
         let exposed = active_trigger.map_or_else(
             || definition.spec.triggers.iter().all(exposed_by),
@@ -1407,12 +1932,17 @@ fn validate_static_reference_in_context(
             return Ok(());
         }
     }
-    if (expression == "sourceSession.session"
-        || expression.starts_with("sourceSession.session.")
-        || expression.starts_with("sourceSession.snapshot."))
-        && definition.spec.source_session.is_some()
-    {
-        return Ok(());
+    if let Some(source) = &definition.spec.source_session {
+        if expression == "sourceSession.session" || expression.starts_with("sourceSession.session.")
+        {
+            return Ok(());
+        }
+        if expression.starts_with("sourceSession.snapshot.") && source.snapshot.is_some() {
+            return Ok(());
+        }
+        if expression == "sourceSession.pause.cursor" && source.pause.is_some() {
+            return Ok(());
+        }
     }
     if expression == "output.text" && output_allowed {
         return Ok(());
@@ -1425,6 +1955,9 @@ fn validate_static_reference_in_context(
     if expression == "action.sessionCreate.session.id"
         && action_kind == Some(ActionKind::SessionCreate)
     {
+        return Ok(());
+    }
+    if expression == "action.sessionMask.cursor" && action_kind == Some(ActionKind::SessionMask) {
         return Ok(());
     }
     if let Some(reference) = expression.strip_prefix("tasks.") {
@@ -1606,6 +2139,58 @@ fn expression_string<'a>(
     };
     validate_reference_syntax(path, location, inner)?;
     Ok(inner)
+}
+
+fn validate_parameter_value(
+    path: &str,
+    location: &str,
+    parameter: &RoutineParam,
+    value: &RoutineScalar,
+    assignment: bool,
+) -> Result<(), AgentDefinitionLoadError> {
+    if !assignment && matches!(value, RoutineScalar::String(value) if value.contains("$(")) {
+        return Err(invalid(
+            path,
+            format!("{location} must be a literal typed value"),
+        ));
+    }
+    let compatible = match (parameter.r#type, value) {
+        (RoutineResultType::String, RoutineScalar::String(_)) => true,
+        (RoutineResultType::Boolean, RoutineScalar::Boolean(_)) => true,
+        (RoutineResultType::Boolean, RoutineScalar::String(value)) if assignment => {
+            matches!(value.as_str(), "true" | "false") || value.starts_with("$(")
+        }
+        _ => false,
+    };
+    if !compatible {
+        return Err(invalid(
+            path,
+            format!("{location} is incompatible with parameter type"),
+        ));
+    }
+    validate_scalar(path, location, value, true)?;
+    if let (RoutineScalar::String(value), Some(validation)) = (value, &parameter.validation)
+        && !value.contains("$(")
+    {
+        if validation
+            .min_length
+            .is_some_and(|minimum| value.chars().count() < minimum)
+        {
+            return Err(invalid(
+                path,
+                format!("{location} is shorter than validation.minLength"),
+            ));
+        }
+        if let Some(pattern) = &validation.pattern
+            && !pattern_matches(pattern, value)
+        {
+            return Err(invalid(
+                path,
+                format!("{location} does not match validation.pattern"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_scalar(

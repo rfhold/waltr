@@ -642,8 +642,14 @@ impl ManualRoutineHandle {
             let source_id = source_id
                 .as_str()
                 .or_else(|| source_id.get("id").and_then(Value::as_str));
+            let snapshot = source_spec.snapshot.as_ref().ok_or_else(|| {
+                InvocationError::new(
+                    "source_capture",
+                    "paused source execution is not supported",
+                )
+            })?;
             let cursor = super::expression::substitute_scalar(
-                &source_spec.snapshot.through_cursor,
+                &snapshot.through_cursor,
                 &provisional,
                 &BTreeMap::new(),
                 None,
@@ -725,7 +731,20 @@ fn validate_manual_inputs(
         if !exposed.contains(param.name.as_str()) {
             continue;
         }
-        let Some(value) = inputs.get(&param.name) else {
+        let value = inputs.get(&param.name).cloned().or_else(|| {
+            param.default.as_ref().map(|value| match value {
+                crate::resource_catalog::routine::RoutineScalar::String(value) => {
+                    RoutineValue::String(value.clone())
+                }
+                crate::resource_catalog::routine::RoutineScalar::Boolean(value) => {
+                    RoutineValue::Boolean(*value)
+                }
+                crate::resource_catalog::routine::RoutineScalar::Integer(_) => {
+                    unreachable!("Routine parameters admit only string and boolean defaults")
+                }
+            })
+        });
+        let Some(value) = value else {
             if param.required {
                 return Err(InvocationError::new(
                     "input",
@@ -735,7 +754,7 @@ fn validate_manual_inputs(
             continue;
         };
         let valid_type = matches!(
-            (&param.r#type, value),
+            (&param.r#type, &value),
             (
                 crate::resource_catalog::routine::RoutineResultType::String,
                 RoutineValue::String(_)
@@ -750,7 +769,7 @@ fn validate_manual_inputs(
                 format!("input `{}` has the wrong type", param.name),
             ));
         }
-        if let (RoutineValue::String(value), Some(validation)) = (value, &param.validation) {
+        if let (RoutineValue::String(value), Some(validation)) = (&value, &param.validation) {
             if validation
                 .min_length
                 .is_some_and(|minimum| value.chars().count() < minimum)
@@ -769,7 +788,7 @@ fn validate_manual_inputs(
                 ));
             }
         }
-        if let RoutineValue::String(value) = value
+        if let RoutineValue::String(value) = &value
             && value.len() > super::expression::MAX_EXPANDED_STRING_BYTES
         {
             return Err(InvocationError::new(
@@ -777,7 +796,7 @@ fn validate_manual_inputs(
                 format!("input `{}` exceeds the scalar size limit", param.name),
             ));
         }
-        values.insert(param.name.clone(), value.clone().into_json());
+        values.insert(param.name.clone(), value.into_json());
     }
     Ok(values)
 }

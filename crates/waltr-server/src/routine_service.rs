@@ -331,6 +331,21 @@ fn manual_definitions(
                             .validation
                             .as_ref()
                             .and_then(|validation| validation.pattern.clone()),
+                        default_value: parameter.default.as_ref().map(|value| ProtoRoutineValue {
+                            value: Some(match value {
+                                crate::resource_catalog::routine::RoutineScalar::String(value) => {
+                                    routine_value::Value::StringValue(value.clone())
+                                }
+                                crate::resource_catalog::routine::RoutineScalar::Boolean(value) => {
+                                    routine_value::Value::BooleanValue(*value)
+                                }
+                                crate::resource_catalog::routine::RoutineScalar::Integer(_) => {
+                                    unreachable!(
+                                        "validated Routine parameter defaults are string or boolean"
+                                    )
+                                }
+                            }),
+                        }),
                     }
                 })
                 .collect();
