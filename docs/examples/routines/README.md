@@ -1,11 +1,11 @@
 # Routine Examples
 
-These Tekton-inspired files are Waltr Routine resources, not Tekton resources. The server executes the [`title.yaml`](title.yaml) and [`fork.yaml`](fork.yaml) subsets. Every other fixture and all unsupported syntax remain proposals.
+These Tekton-inspired files are Waltr Routine resources, not Tekton resources. The server executes [`title.yaml`](title.yaml), [`compact-and-continue.yaml`](compact-and-continue.yaml), and [`fork.yaml`](fork.yaml). Every other fixture and all unsupported syntax remain proposals.
 
 | Fixture | Status | Purpose |
 | --- | --- | --- |
 | `title.yaml` | Implemented | Generate session title metadata from the first user message. |
-| `compact-and-continue.yaml` | Proposed | Replace a session prefix with a continuation summary. |
+| `compact-and-continue.yaml` | Implemented | Replace a session prefix with a continuation summary. |
 | `context-categorization.yaml` | Proposed | Incrementally assign timeline items to semantic categories. |
 | `context-management.yaml` | Proposed | Select category compaction changes in one agent turn. |
 | `fork.yaml` | Implemented | Compact a durable source boundary into a new ordinary session. |
@@ -30,19 +30,33 @@ These Tekton-inspired files are Waltr Routine resources, not Tekton resources. T
 
 The delivery limits above apply to the title event path. Manual invocation uses the generic service described below.
 
+## Implemented Compact-And-Continue Routine
+
+- The server bundles [`compact-and-continue.yaml`](../../../crates/waltr-server/resources/routines/compact-and-continue.yaml) byte-for-byte from this example.
+- Manual invocation rejects an active or already paused source before admission, creates no history on that rejection, and defaults omitted `continue` to `false`.
+- The pause pins the latest completed source boundary and queues later submissions in a process-local FIFO. A successful continuation runs before that queue.
+- The helper receives mask-effective completed-turn context through the pause cursor, uses no tools, and runs for at most one provider turn.
+- The atomic `sessionMask` action removes active replacement masks that overlap the selected prefix, then adds one persistent replacement under key `context.compaction-prefix` without rewriting source events.
+- Raw timeline APIs remain raw. Provider requests and Routine effective captures hide the selected prefix and insert the summary as one synthetic user message.
+- Explicit subtraction can remove a mask without rolling back conversation content. A conversation rollback before a mask mutation removes that mutation from effective history.
+- A successful mask remains committed if continuation or later Routine lifecycle work fails. The owned pause is still released.
+- Automatic admission runs after a durable source run completes at 80 percent of a known effective model context limit or 180,000 latest-turn context tokens, whichever matches first. With an unknown limit, only the absolute threshold can match; missing usage matches neither.
+- Automatic completion admission excludes `routine-task` helper sessions and fails open after two seconds or on callback, capture, shutdown, or durable-admission failure.
+- Pauses and queued submissions disappear on process crash. Durable masks and admitted invocation history remain, but interrupted Routines are not resumed and continuation is not retried after restart.
+
 ## Implemented Resource And Task Subset
 
 - Parameters use the closed string and boolean scalar types. A string parameter can require a value, set `minLength`, and use a bounded Rust regex pattern.
-- Each trigger declares exactly one event or manual form. Implemented manual triggers use session scope and declared inputs.
-- Top-level `spec.sourceSession` supports manual triggers only. Validation rejects a Routine that combines `sourceSession` with any event trigger.
+- Each trigger declares exactly one event, manual, or `sessionLifecycle.runCompleted` form. Implemented manual and lifecycle triggers use session scope and declared parameter assignments.
+- Top-level `spec.sourceSession` supports manual or `runCompleted` triggers. A paused source requires manual `onBusy: reject`; pause-backed lifecycle admission claims the completion barrier.
 - Inference-only event Routines remain supported, including the bundled title Routine.
-- Event types are exact strings. Trigger and task condition lists support only `In` and `NotIn` with AND semantics.
+- Event types are exact strings. Conditions support `In`, `NotIn`, numeric `GreaterThanOrEqual`, nested `any` OR groups, and top-level AND semantics.
 - `runAfter` defines an acyclic task graph. The current executor processes ready tasks sequentially.
-- A task contains either a generic agent template or one implemented action. The actions are `sessionMetadata` and the fork subset of `sessionCreate`.
+- A task contains either a generic agent template or one implemented action. The actions are `sessionMetadata`, the fork subset of `sessionCreate`, compaction-prefix `sessionMask`, and pause-owned `sessionContinue`.
 - Agent tasks require replacement prompts, explicit features, tools, permissions, `maxTurns`, and text output.
 - Each agent task creates a fresh durable auxiliary Routine session. Actions do not create an auxiliary agent session.
 - Every source-backed `sessionTemplate` atomically stores copied inference history followed by its task prompt. An inference-only template stores only its task prompt.
-- Scalar substitutions resolve event fields, task results, text output, and metadata action status within fixed size bounds.
+- Scalar substitutions resolve event, manual, lifecycle pressure, source pause, task result, text output, and implemented action fields within fixed size bounds.
 - Declared string and boolean results expose those scalar values to dependent tasks and routine results.
 
 ## Implemented Routine API
@@ -97,10 +111,10 @@ The bullets below describe fixture syntax beyond the implemented subset.
 
 - Event names beyond `waltr.session.user-message.created`, schedules, progress counters, and concurrency policies remain proposed.
 - Manual trigger scopes beyond session scope remain proposed.
-- The proposed compaction trigger rejects a busy source and defaults its `continue` input to false. Permission evaluation proposes global scope.
-- `sessionLifecycle` can run at lifecycle boundaries. Compaction evaluates a
-  `runCompleted` context snapshot, while categorization uses `idle` to flush
-  uncategorized items immediately after the source run becomes idle.
+- Permission evaluation proposes global scope.
+- Additional `sessionLifecycle` events remain proposed. Categorization uses the
+  proposed `idle` event to flush uncategorized items immediately after the source
+  run becomes idle.
 - `sessionProgress` evaluates counters since a named checkpoint. Categorization
   can therefore run during a long source run after 20 completed turns or two
   completed calls to the `task` delegation tool. The immediate idle flush handles
@@ -117,29 +131,21 @@ The bullets below describe fixture syntax beyond the implemented subset.
 - A routine exposed as a session tool blocks that tool call until completion.
   Its invocation cursor is a stable source snapshot boundary. Access to the
   generated tool is governed by the calling agent's effective permissions.
-- Trigger and task `when` entries use Tekton-style operators including `In`,
-  `NotIn`, `GreaterThanOrEqual`, and the session-aware `CursorBefore`. A null
-  cursor is before the first session item. Top-level entries are ANDed, while
-  entries inside `any` are ORed. Missing values and evaluation errors make that
-  condition false.
-- Automatic compaction runs at 80 percent of a known model context limit or at
-  180,000 context tokens, whichever happens first. If percentage is unavailable,
-  the absolute threshold remains active.
+- The session-aware `CursorBefore` operator remains proposed. A null cursor is
+  proposed to sort before the first session item. Missing values and evaluation
+  errors make implemented conditions false.
 
 ## Proposed Session Materialization And Categories
 
-- Snapshot selection beyond fork's latest completed provider turn remains proposed.
-- `sourceSession.pause` is stronger: it holds an exclusive source boundary and
-  queues new submissions. The manual compaction trigger cannot acquire it while
-  an agent run is active.
-- Outside the implemented fork subset, proposed `sessionTemplate.source` syntax can materialize source context with masks and provenance.
-- Existing active persistent source masks apply by default. A missing `masks`
-  block preserves that effective context. `masks.add` is additive;
-  `masks.subtract` can reveal material hidden by mask ID, mask key, item
-  selector, or all active masks before additions are applied.
-- Mask kinds are filter, replacement, truncation, and annotation. Safety policy
-  is separate and cannot be subtracted: safe access always removes Base64 and
-  opaque provider data.
+- Snapshot selection beyond fork's raw latest-completed capture and compaction's
+  effective paused-prefix capture remains proposed.
+- Category-oriented `sessionTemplate.source` mask overrides and provenance remain proposed.
+- The implemented persistent-mask subset is replacement masks selected by a
+  completed-turn prefix (`throughCursor`), stable keys and opaque IDs, overlap
+  subtraction, overlap rejection, effective replay, and explicit removal.
+- Filter, truncation, annotation, exact item-set selectors, category selectors,
+  and per-template additive/subtractive mask composition remain proposed. Safety
+  policy remains separate from persistent masks.
 - Timeline item IDs use Waltr's canonical `iX` form, such as `i1` or `i42`, and
   must match `i[1-9][0-9]*`. The number is the cursor of the item's first durable
   event. An item can span later events, so its item ID is stable identity while a
@@ -199,7 +205,7 @@ The bullets below describe fixture syntax beyond the implemented subset.
 - After successful atomic creation, caller cancellation or start failure retains the destination and its session ID.
 - The normal durable first-user-message event makes the destination eligible for the title Routine.
 
-## Proposed Context Management And Masks
+## Proposed Category Context Management
 
 - The `manage-context` tool is intended for phase, stage, and task transitions.
   Context management first waits for `context-categorization` to cover the
@@ -232,11 +238,6 @@ The bullets below describe fixture syntax beyond the implemented subset.
   item-ID set. It preserves source items. Persistent replacement-mask overlap is
   rejected. A same-key replacement requires the expected current mask identity.
   The replacement then atomically supersedes that mask.
-- The compaction prefix mask follows the same non-destructive model but selects
-  every source item through the pause cursor. Its atomic mutation first subtracts
-  masks that overlap that prefix, then installs the replacement under the same
-  reject-overlap policy. `sessionContinue` starts another source run from the
-  mask cursor only when `continue` is true.
 - Raw gRPC timeline APIs remain raw and are outside these fixtures. Hosted MCP
   currently has no timeline action. Future access options compile into
   request-local masks and default to effective safe context.
@@ -276,12 +277,8 @@ The bullets below describe fixture syntax beyond the implemented subset.
   limit in the routine task.
 - The routine returns the configuration agent's final assistant text directly.
 
-## Proposed Failure Detail
-
-- A failed continuation reports failure without removing an already applied
-  compaction mask.
-
 The proposed examples intentionally leave `PipelineRun`-style invocation resources,
 event deduplication, retries, approval presentation, category and metadata size
-limits, mask retention and deletion, schedule recovery, and durable routine-run
-recovery unspecified.
+limits, schedule recovery, and durable routine-run recovery unspecified. Compact-
+and-continue mask retention, explicit removal, rollback, and restart behavior are
+implemented as documented above.

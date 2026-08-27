@@ -9,7 +9,9 @@ use std::{
 };
 
 use waltr_agent::{
-    AgentDefinitionBundle, SessionCreateRequest, SessionId, SessionStart, SessionStartMessage,
+    AgentDefinitionBundle, ReplacementUserContent, SessionCreateRequest, SessionId,
+    SessionMaskAddition, SessionMaskMutation, SessionStart, SessionStartMessage, ThroughCursor,
+    TimelineCursor,
 };
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -93,6 +95,46 @@ impl Drop for ActiveChild {
     reason = "sequential DAG execution keeps task state transitions together"
 )]
 pub(super) async fn execute_invocation(
+    invocation: &mut AdmittedInvocation,
+    host: &Arc<dyn RoutineHost>,
+    active_children: &Arc<tokio::sync::Mutex<HashSet<SessionId>>>,
+    child_admission_closed: &Arc<AtomicBool>,
+    destination_tasks: &DestinationTaskTracker,
+    cancellation: &CancellationToken,
+    recorder: Option<&LifecycleRecorder>,
+) -> Result<Vec<RoutineInvocationResult>, InvocationError> {
+    let result = execute_invocation_inner(
+        invocation,
+        host,
+        active_children,
+        child_admission_closed,
+        destination_tasks,
+        cancellation,
+        recorder,
+    )
+    .await;
+    let release = if let Some(pause) = &mut invocation.pause {
+        pause.release().await.map_err(|error| {
+            InvocationError::new(
+                "pause_release",
+                format!("failed to release source pause: {error}"),
+            )
+        })
+    } else {
+        Ok(())
+    };
+    match (result, release) {
+        (Ok(results), Ok(())) => Ok(results),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(()) | Err(_)) => Err(error),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "sequential DAG execution keeps task state transitions together"
+)]
+async fn execute_invocation_inner(
     invocation: &AdmittedInvocation,
     host: &Arc<dyn RoutineHost>,
     active_children: &Arc<tokio::sync::Mutex<HashSet<SessionId>>>,
@@ -551,7 +593,139 @@ pub(super) async fn execute_task(
             .action
             .as_ref()
             .expect("validated task has one executor");
-        if let Some(metadata) = &action.session_metadata {
+        if let Some(mask) = &action.session_mask {
+            let pause = invocation
+                .pause
+                .as_ref()
+                .map(super::host::RoutinePauseGuard::pause)
+                .ok_or_else(|| {
+                    InvocationError::new("pause_ownership", "sessionMask requires an owned pause")
+                })?;
+            let session_id = session_id_value(
+                &substitute_scalar(
+                    &mask.session_id,
+                    &invocation.context,
+                    task_results,
+                    None,
+                    None,
+                )?,
+                "sessionMask session",
+            )?;
+            if &session_id != pause.session_id() {
+                return Err(InvocationError::new(
+                    "pause_ownership",
+                    "sessionMask does not identify the paused session",
+                ));
+            }
+            let mut mutation = SessionMaskMutation::new(None);
+            for subtraction in &mask.masks.subtract {
+                let cursor = timeline_cursor_value(substitute_scalar(
+                    &subtraction.selector.overlaps.through_cursor,
+                    &invocation.context,
+                    task_results,
+                    None,
+                    None,
+                )?)?;
+                if cursor != pause.source_cursor() {
+                    return Err(InvocationError::new(
+                        "pause_boundary",
+                        "sessionMask subtraction is not pinned to the pause cursor",
+                    ));
+                }
+                mutation.subtract.overlaps.push(ThroughCursor::new(cursor));
+            }
+            for addition in &mask.masks.add {
+                let cursor = timeline_cursor_value(substitute_scalar(
+                    &addition.selector.through_cursor,
+                    &invocation.context,
+                    task_results,
+                    None,
+                    None,
+                )?)?;
+                if cursor != pause.source_cursor() {
+                    return Err(InvocationError::new(
+                        "pause_boundary",
+                        "sessionMask addition is not pinned to the pause cursor",
+                    ));
+                }
+                let replacement = scalar_string(
+                    &substitute_scalar(
+                        &addition.replacement.text,
+                        &invocation.context,
+                        task_results,
+                        None,
+                        None,
+                    )?,
+                    "sessionMask replacement",
+                )?;
+                mutation.add.push(SessionMaskAddition::new(
+                    addition.key.clone(),
+                    ThroughCursor::new(cursor),
+                    ReplacementUserContent::new(replacement),
+                ));
+            }
+            let outcome = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(shutdown_error("mask action")),
+                outcome = host.apply_paused_mask(pause, mutation) => outcome
+                    .map_err(|error| InvocationError::new("mask_action", error.to_string()))?,
+            };
+            let values = collect_results(
+                &task.task_spec.results,
+                &invocation.context,
+                task_results,
+                None,
+                Some(&json!({"sessionMask": {"cursor": outcome.cursor.get().to_string()}})),
+            )?;
+            Ok(TaskExecution {
+                values,
+                session_references: BTreeMap::new(),
+            })
+        } else if let Some(continuation) = &action.session_continue {
+            let pause = invocation
+                .pause
+                .as_ref()
+                .map(super::host::RoutinePauseGuard::pause)
+                .ok_or_else(|| {
+                    InvocationError::new(
+                        "pause_ownership",
+                        "sessionContinue requires an owned pause",
+                    )
+                })?;
+            let session_id = session_id_value(
+                &substitute_scalar(
+                    &continuation.session_id,
+                    &invocation.context,
+                    task_results,
+                    None,
+                    None,
+                )?,
+                "sessionContinue session",
+            )?;
+            if &session_id != pause.session_id() {
+                return Err(InvocationError::new(
+                    "pause_ownership",
+                    "sessionContinue does not identify the paused session",
+                ));
+            }
+            let cursor = timeline_cursor_value(substitute_scalar(
+                &continuation.from_cursor,
+                &invocation.context,
+                task_results,
+                None,
+                None,
+            )?)?;
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(shutdown_error("continuation action")),
+                armed = host.arm_paused_continuation(pause, cursor) => armed
+                    .map_err(|error| InvocationError::new("continue_action", error.to_string()))?,
+            }
+            Ok(TaskExecution {
+                values: BTreeMap::new(),
+                session_references: BTreeMap::new(),
+            })
+        } else if let Some(metadata) = &action.session_metadata {
             if metadata.mutations.len() != 1 {
                 return Err(InvocationError::new(
                     "unsupported_action",
@@ -786,6 +960,20 @@ fn session_id_value(value: &Value, description: &str) -> Result<SessionId, Invoc
                 format!("{description} must be a session id or object with id"),
             )
         })
+}
+
+fn timeline_cursor_value(value: Value) -> Result<TimelineCursor, InvocationError> {
+    let cursor = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            InvocationError::new(
+                "substitution_type",
+                "session cursor must be a positive integer",
+            )
+        })?;
+    Ok(TimelineCursor::new(cursor))
 }
 
 fn collect_results(

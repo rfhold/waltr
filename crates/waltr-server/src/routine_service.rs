@@ -766,7 +766,12 @@ mod tests {
         let mut stream = manual_routine_stream(state.clone(), updates, "lag".to_owned());
         let initial = stream.next().await.unwrap().unwrap();
         assert_eq!(
-            initial.routines[0].description,
+            initial
+                .routines
+                .iter()
+                .find(|routine| routine.routine_name == "fork")
+                .unwrap()
+                .description,
             "Compact a durable session snapshot into a new ordinary session."
         );
 
@@ -790,7 +795,15 @@ mod tests {
         }
 
         let recovered = stream.next().await.unwrap().unwrap();
-        assert_eq!(recovered.routines[0].description, "Lag revision 39.");
+        assert_eq!(
+            recovered
+                .routines
+                .iter()
+                .find(|routine| routine.routine_name == "fork")
+                .unwrap()
+                .description,
+            "Lag revision 39."
+        );
         assert_ne!(recovered.digest, initial.digest);
     }
 

@@ -10,7 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use waltr_agent::{CompletedSessionCapture, SessionId};
+use waltr_agent::{
+    CompletedSessionCapture, SessionCompletionAdmissionFinalizer,
+    SessionCompletionCoordinationFuture, SessionCompletionCoordinationHandler,
+    SessionCompletionCoordinationPreparation, SessionCompletionFinalizationFuture,
+    SessionCoordinationReason, SessionId, SessionPauseLease, SessionRunCompletionSnapshot,
+};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, watch};
@@ -30,7 +35,7 @@ use super::{
     event::{EventEnvelope, EventSource},
     executor::execute_invocation,
     expression::conditions_match,
-    host::{CoordinatorRoutineHost, RoutineHost},
+    host::{CoordinatorRoutineHost, RoutineHost, RoutinePauseGuard},
     lifecycle::{LifecycleRecorder, now_ms},
 };
 
@@ -61,23 +66,27 @@ struct DestinationTaskGuard {
 }
 
 impl DestinationTaskTracker {
+    fn reserve(&self) -> Option<DestinationTaskGuard> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("destination tracker poisoned");
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        Some(DestinationTaskGuard {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+
     pub(super) fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        {
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .expect("destination tracker poisoned");
-            assert!(!state.closed, "destination tracker is closed");
-            state.active += 1;
-        }
-        let guard = DestinationTaskGuard {
-            inner: Arc::clone(&self.inner),
-        };
+        let guard = self.reserve().expect("destination tracker is closed");
         tokio::spawn(async move {
             let _guard = guard;
             future.await
@@ -134,6 +143,8 @@ pub struct RoutineEngine {
     task: tokio::task::JoinHandle<()>,
     health: watch::Receiver<EngineHealth>,
     manual: ManualRoutineHandle,
+    automatic: Arc<AutomaticRoutineAdmission>,
+    completion_host: Option<Arc<dyn SessionHost>>,
 }
 
 /// Cloneable process-local admission surface for session-scoped manual Routines.
@@ -164,6 +175,22 @@ struct EngineFailureControl {
     fail_closed_pending: Arc<AtomicBool>,
     #[cfg(test)]
     event_admission_waiters: Arc<AtomicUsize>,
+}
+
+struct AutomaticRoutineAdmission {
+    manual: ManualRoutineHandle,
+}
+
+struct WeakAutomaticRoutineAdmission {
+    inner: std::sync::Weak<AutomaticRoutineAdmission>,
+}
+
+struct AutomaticRoutineFinalizer {
+    manual: ManualRoutineHandle,
+    snapshot: SessionRunCompletionSnapshot,
+    routine: MaterializedRoutine,
+    trigger_name: String,
+    context: RoutineInvocationContext,
 }
 
 impl EngineFailureControl {
@@ -214,12 +241,20 @@ impl RoutineEngine {
         sessions: Arc<dyn SessionHost>,
         store: RoutineInvocationStore,
     ) -> Self {
-        Self::start_inner(
+        let completion_host = Arc::clone(&sessions);
+        let mut engine = Self::start_inner(
             source.subscribe(),
             catalog,
             Arc::new(CoordinatorRoutineHost::new(sessions)),
             Some(store),
-        )
+        );
+        let handler: Arc<dyn SessionCompletionCoordinationHandler> =
+            Arc::new(WeakAutomaticRoutineAdmission {
+                inner: Arc::downgrade(&engine.automatic),
+            });
+        completion_host.set_completion_admission_handler(Some(handler));
+        engine.completion_host = Some(completion_host);
+        engine
     }
 
     #[allow(
@@ -291,6 +326,9 @@ impl RoutineEngine {
             wakeups: wakeups.clone(),
             failure_control: failure_control.clone(),
         };
+        let automatic = Arc::new(AutomaticRoutineAdmission {
+            manual: manual.clone(),
+        });
         let task = tokio::spawn(async move {
             let mut workers = tokio::task::JoinSet::new();
             if let Some(store) = &store {
@@ -407,6 +445,8 @@ impl RoutineEngine {
             task,
             health,
             manual,
+            automatic,
+            completion_host: None,
         }
     }
 
@@ -422,6 +462,15 @@ impl RoutineEngine {
         self.manual.clone()
     }
 
+    #[cfg(test)]
+    pub(super) fn completion_handler_for_test(
+        &self,
+    ) -> Arc<dyn SessionCompletionCoordinationHandler> {
+        Arc::new(WeakAutomaticRoutineAdmission {
+            inner: Arc::downgrade(&self.automatic),
+        })
+    }
+
     /// Subscribe to durable lifecycle commit wakeups. SQL remains authoritative.
     pub(crate) fn lifecycle_wakeups(&self) -> broadcast::Receiver<()> {
         self.manual.wakeups.subscribe()
@@ -430,10 +479,286 @@ impl RoutineEngine {
     /// Stop admission, interrupt active child runs, and join all workers.
     pub async fn shutdown(self) {
         self.cancellation.cancel();
+        if let Some(host) = &self.completion_host {
+            host.set_completion_admission_handler(None);
+        }
         if let Err(error) = self.task.await {
             tracing::error!(%error, error_class = "engine_join", "routine engine failed to join");
         }
     }
+}
+
+impl SessionCompletionCoordinationHandler for WeakAutomaticRoutineAdmission {
+    fn prepare(
+        &self,
+        snapshot: SessionRunCompletionSnapshot,
+    ) -> SessionCompletionCoordinationFuture {
+        let inner = self.inner.upgrade();
+        Box::pin(async move {
+            let Some(inner) = inner else {
+                return Ok(SessionCompletionCoordinationPreparation::Continue);
+            };
+            inner.prepare(snapshot).await
+        })
+    }
+}
+
+impl AutomaticRoutineAdmission {
+    async fn prepare(
+        &self,
+        snapshot: SessionRunCompletionSnapshot,
+    ) -> Result<SessionCompletionCoordinationPreparation, String> {
+        let manual = &self.manual;
+        let _lifecycle = manual.lifecycle.read().await;
+        if manual.cancellation.is_cancelled()
+            || manual.child_admission_closed.load(Ordering::SeqCst)
+            || !manual.ready.load(Ordering::SeqCst)
+        {
+            return Ok(SessionCompletionCoordinationPreparation::Continue);
+        }
+        let catalog = manual.catalog.snapshot();
+        let Some((routine, trigger_name, context)) =
+            select_automatic_invocation(&catalog, &snapshot)?
+        else {
+            return Ok(SessionCompletionCoordinationPreparation::Continue);
+        };
+        Ok(SessionCompletionCoordinationPreparation::Claim {
+            reason: routine_pause_reason(routine.name(), "run-completed")?,
+            finalizer: Box::new(AutomaticRoutineFinalizer {
+                manual: manual.clone(),
+                snapshot,
+                routine,
+                trigger_name,
+                context,
+            }),
+        })
+    }
+}
+
+impl SessionCompletionAdmissionFinalizer for AutomaticRoutineFinalizer {
+    fn finalize(self: Box<Self>, lease: SessionPauseLease) -> SessionCompletionFinalizationFuture {
+        Box::pin(async move {
+            let Self {
+                manual,
+                snapshot,
+                routine,
+                trigger_name,
+                mut context,
+            } = *self;
+            let _lifecycle = manual.lifecycle.read().await;
+            let pause = super::host::RoutinePause::from_lease(lease);
+            let capture = manual
+                .host
+                .capture_paused_effective(&pause)
+                .await
+                .map_err(|error| error.to_string())?;
+            let lease = pause.into_lease();
+            context.source_values = json!({
+                "session": { "id": capture.source_id.as_str() },
+                "pause": { "cursor": capture.through_cursor.get() },
+            });
+            context.source = Some(capture.clone());
+            if manual.cancellation.is_cancelled()
+                || manual.child_admission_closed.load(Ordering::SeqCst)
+            {
+                return Err("routine engine is shutting down".to_owned());
+            }
+            let store = manual
+                .store
+                .clone()
+                .ok_or_else(|| "durable routine store is unavailable".to_owned())?;
+            let identity = invocation_identity(
+                routine.name(),
+                routine.source_etag(),
+                &trigger_name,
+                &snapshot.run_id,
+            );
+            let invocation_id = format!("rinv_{}", uuid::Uuid::new_v4().simple());
+            let admission = RoutineAdmission {
+                invocation_id: invocation_id.clone(),
+                execution_id: identity.clone(),
+                routine_name: routine.name().to_owned(),
+                routine_revision: routine.source_etag().to_owned(),
+                trigger_name: trigger_name.clone(),
+                trigger_kind: RoutineTriggerKind::Event,
+                correlation_id: snapshot.run_id.clone(),
+                metadata: BTreeMap::from([(
+                    SOURCE_SESSION_METADATA_KEY.to_owned(),
+                    snapshot.session_id.as_str().to_owned(),
+                )]),
+                source_cursor: Some(capture.through_cursor.get().to_string()),
+                declared_tasks: task_descriptors(&routine),
+                admitted_at_ms: now_ms(),
+            };
+            let reservation = manual
+                .invocation_tasks
+                .reserve()
+                .ok_or_else(|| "routine engine is shutting down".to_owned())?;
+            store
+                .admit(admission)
+                .await
+                .map_err(|_| "routine admission persistence failed".to_owned())?;
+            drop(manual.wakeups.send(()));
+
+            let recorder = LifecycleRecorder::new(store, invocation_id, manual.wakeups.clone());
+            let host = Arc::clone(&manual.host);
+            let active_children = Arc::clone(&manual.active_children);
+            let child_admission_closed = Arc::clone(&manual.child_admission_closed);
+            let destination_tasks = manual.destination_tasks.clone();
+            let cancellation = manual.cancellation.clone();
+            let failure_control = manual.failure_control.clone();
+            let mut invocation = AdmittedInvocation {
+                routine,
+                trigger: trigger_name,
+                context,
+                identity,
+                correlation_id: snapshot.run_id,
+                pause: None,
+            };
+            let worker = Box::pin(async move {
+                let _reservation = reservation;
+                invocation.pause = Some(RoutinePauseGuard::new(
+                    super::host::RoutinePause::from_lease(lease),
+                    Arc::clone(&host),
+                ));
+                drop(
+                    execute_and_finalize(
+                        &mut invocation,
+                        &host,
+                        &active_children,
+                        &child_admission_closed,
+                        &destination_tasks,
+                        &cancellation,
+                        Some(&recorder),
+                        &failure_control,
+                    )
+                    .await,
+                );
+            }) as waltr_agent::SessionCompletionWorkerFuture;
+            Ok(worker)
+        })
+    }
+}
+
+pub(super) fn select_automatic_invocation(
+    catalog: &crate::resource_catalog::AgentDefinitionSnapshot,
+    snapshot: &SessionRunCompletionSnapshot,
+) -> Result<Option<(MaterializedRoutine, String, RoutineInvocationContext)>, String> {
+    if snapshot.purpose.as_deref() == Some("routine-task") {
+        return Ok(None);
+    }
+    let context_limit = catalog
+        .configuration()
+        .providers
+        .get(&snapshot.provider_key)
+        .and_then(|provider| provider.models.get(&snapshot.model_id))
+        .and_then(|model| model.limits)
+        .and_then(|limits| limits.context)
+        .map(u64::from);
+    let percent = snapshot.context_tokens.and_then(|tokens| {
+        context_limit.filter(|limit| *limit != 0).map(|limit| {
+            u64::try_from((u128::from(tokens) * 100) / u128::from(limit)).unwrap_or(u64::MAX)
+        })
+    });
+    let trigger_values = json!({
+        "session": {
+            "id": snapshot.session_id.as_str(),
+            "latestCompletedCursor": snapshot.terminal_cursor.get(),
+        },
+        "run": { "id": snapshot.run_id },
+        "terminalCursor": snapshot.terminal_cursor.get(),
+        "context": {
+            "tokens": snapshot.context_tokens,
+            "percent": percent,
+        },
+    });
+
+    for routine in catalog.routines() {
+        for trigger in &routine.definition().spec.triggers {
+            let Some(lifecycle) = &trigger.session_lifecycle else {
+                continue;
+            };
+            if lifecycle.event
+                != crate::resource_catalog::routine::RoutineSessionLifecycleEvent::RunCompleted
+            {
+                continue;
+            }
+            let params = lifecycle_params(routine.definition(), trigger, &trigger_values)?;
+            let context = RoutineInvocationContext {
+                event: None,
+                trigger: trigger_values.clone(),
+                params,
+                source: None,
+                source_values: Value::Null,
+            };
+            if conditions_match(&trigger.when, &context, &BTreeMap::new()) {
+                return Ok(Some((routine.clone(), trigger.name.clone(), context)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn lifecycle_params(
+    definition: &crate::resource_catalog::routine::RoutineDefinition,
+    trigger: &crate::resource_catalog::routine::RoutineTrigger,
+    trigger_values: &Value,
+) -> Result<BTreeMap<String, Value>, String> {
+    let mut params = definition
+        .spec
+        .params
+        .iter()
+        .filter_map(|param| {
+            param.default.as_ref().map(|value| {
+                let value = match value {
+                    crate::resource_catalog::routine::RoutineScalar::String(value) => {
+                        Value::String(value.clone())
+                    }
+                    crate::resource_catalog::routine::RoutineScalar::Boolean(value) => {
+                        Value::Bool(*value)
+                    }
+                    crate::resource_catalog::routine::RoutineScalar::Integer(value) => {
+                        Value::Number((*value).into())
+                    }
+                };
+                (param.name.clone(), value)
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let provisional = RoutineInvocationContext {
+        event: None,
+        trigger: trigger_values.clone(),
+        params: params.clone(),
+        source: None,
+        source_values: Value::Null,
+    };
+    for assignment in &trigger.params {
+        let mut value = super::expression::substitute_scalar(
+            &assignment.value,
+            &provisional,
+            &BTreeMap::new(),
+            None,
+            None,
+        )
+        .map_err(|error| error.message)?;
+        if definition
+            .spec
+            .params
+            .iter()
+            .find(|param| param.name == assignment.name)
+            .is_some_and(|param| {
+                param.r#type == crate::resource_catalog::routine::RoutineResultType::Boolean
+            })
+        {
+            value = match value.as_str() {
+                Some("true") => Value::Bool(true),
+                Some("false") => Value::Bool(false),
+                _ => value,
+            };
+        }
+        params.insert(assignment.name.clone(), value);
+    }
+    Ok(params)
 }
 
 impl ManualRoutineHandle {
@@ -471,7 +796,7 @@ impl ManualRoutineHandle {
                 "durable routine store is unavailable",
             )
         })?;
-        let invocation = self.prepare(request).await?;
+        let mut invocation = self.prepare(request).await?;
         let invocation_id = format!("rinv_{}", uuid::Uuid::new_v4().simple());
         let admission = RoutineAdmission {
             invocation_id: invocation_id.clone(),
@@ -499,12 +824,13 @@ impl ManualRoutineHandle {
             declared_tasks: task_descriptors(&invocation.routine),
             admitted_at_ms: now_ms(),
         };
-        store.admit(admission).await.map_err(|_| {
-            InvocationError::new(
+        if store.admit(admission).await.is_err() {
+            invocation.release_pause().await;
+            return Err(InvocationError::new(
                 "routine_persistence",
                 "routine admission persistence failed",
-            )
-        })?;
+            ));
+        }
         drop(self.wakeups.send(()));
         let recorder = LifecycleRecorder::new(store, invocation_id.clone(), self.wakeups.clone());
         let host = Arc::clone(&self.host);
@@ -516,7 +842,7 @@ impl ManualRoutineHandle {
         self.invocation_tasks.spawn(async move {
             drop(
                 execute_and_finalize(
-                    &invocation,
+                    &mut invocation,
                     &host,
                     &active_children,
                     &child_admission_closed,
@@ -542,9 +868,9 @@ impl ManualRoutineHandle {
         request: ManualRoutineInvocation,
     ) -> Result<Vec<RoutineInvocationResult>, InvocationError> {
         let _lifecycle = self.lifecycle.read().await;
-        let invocation = self.prepare(request).await?;
+        let mut invocation = self.prepare(request).await?;
         execute_invocation(
-            &invocation,
+            &mut invocation,
             &self.host,
             &self.active_children,
             &self.child_admission_closed,
@@ -586,36 +912,98 @@ impl ManualRoutineHandle {
             InvocationError::new("trigger_not_found", "manual routine trigger was not found")
         })?;
         let params = validate_manual_inputs(routine.definition(), manual, &request.inputs)?;
-        let capture = if routine.definition().spec.source_session.is_some() {
-            Some(tokio::select! {
-                biased;
-                () = self.cancellation.cancelled() => return Err(InvocationError::new(
-                    "shutdown",
-                    "routine source capture canceled during shutdown",
-                )),
-                capture = self.host.capture_latest_completed(&request.session_id) => capture
-                    .map_err(|error| {
-                        let class = match &error {
-                            waltr_agent::SessionCaptureError::FailedPrecondition(_) => {
-                                "source_precondition"
-                            }
-                            waltr_agent::SessionCaptureError::ResourceExhausted(_) => {
-                                "source_exhausted"
-                            }
-                            waltr_agent::SessionCaptureError::Store(
-                                waltr_agent::SessionStoreError::NotFound { .. },
-                            ) => "source_not_found",
-                            waltr_agent::SessionCaptureError::Store(_) => "source_store",
-                        };
-                        InvocationError::new(class, error.to_string())
-                    })?,
-            })
+        let provisional = RoutineInvocationContext {
+            event: None,
+            trigger: json!({"session": {"id": request.session_id.as_str()}}),
+            params: params.clone(),
+            source: None,
+            source_values: Value::Null,
+        };
+        let source_id = if let Some(source) = &routine.definition().spec.source_session {
+            let value = super::expression::substitute_scalar(
+                &source.from,
+                &provisional,
+                &BTreeMap::new(),
+                None,
+                None,
+            )?;
+            let id = value
+                .as_str()
+                .or_else(|| value.get("id").and_then(Value::as_str))
+                .map(SessionId::new)
+                .ok_or_else(|| {
+                    InvocationError::new("source_capture", "sourceSession.from is not a session")
+                })?;
+            if id != request.session_id {
+                return Err(InvocationError::new(
+                    "source_capture",
+                    "sourceSession.from does not identify the invocation session",
+                ));
+            }
+            Some(id)
         } else {
             None
         };
-        let cursor = capture
+        let mut pause = if routine
+            .definition()
+            .spec
+            .source_session
             .as_ref()
-            .map(|capture| capture.through_cursor.get());
+            .is_some_and(|source| source.pause.is_some())
+        {
+            let acquired = tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => return Err(InvocationError::new(
+                    "shutdown", "routine pause acquisition canceled during shutdown"
+                )),
+                acquired = self.host.acquire_pause(
+                    source_id.as_ref().expect("source id"),
+                    routine_pause_reason(routine.name(), "manual")
+                        .map_err(|error| InvocationError::new("pause_reason", error))?,
+                ) => acquired,
+            }
+            .map_err(pause_admission_error)?;
+            Some(RoutinePauseGuard::new(acquired, Arc::clone(&self.host)))
+        } else {
+            None
+        };
+        let capture_result = if let Some(guard) = &pause {
+            tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => Err(InvocationError::new(
+                    "shutdown", "routine source capture canceled during shutdown"
+                )),
+                capture = self.host.capture_paused_effective(guard.pause()) => {
+                    capture
+                        .map(Some)
+                        .map_err(pause_admission_error)
+                },
+            }
+        } else if let Some(source_id) = &source_id {
+            tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => Err(InvocationError::new(
+                    "shutdown", "routine source capture canceled during shutdown"
+                )),
+                capture = self.host.capture_latest_completed(source_id) => {
+                    capture.map(Some).map_err(capture_admission_error)
+                },
+            }
+        } else {
+            Ok(None)
+        };
+        let capture = match capture_result {
+            Ok(capture) => capture,
+            Err(error) => {
+                if let Some(guard) = &mut pause {
+                    if let Err(release) = guard.release().await {
+                        tracing::warn!(%release, "failed to release Routine pause after capture failure");
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let cursor = capture.as_ref().map(|capture| capture.through_cursor.get());
         let trigger_values = json!({
             "session": {
                 "id": request.session_id.as_str(),
@@ -632,42 +1020,36 @@ impl ManualRoutineHandle {
         if let (Some(source_spec), Some(capture)) =
             (&routine.definition().spec.source_session, &capture)
         {
-            let source_id = super::expression::substitute_scalar(
-                &source_spec.from,
-                &provisional,
-                &BTreeMap::new(),
-                None,
-                None,
-            )?;
-            let source_id = source_id
-                .as_str()
-                .or_else(|| source_id.get("id").and_then(Value::as_str));
-            let snapshot = source_spec.snapshot.as_ref().ok_or_else(|| {
-                InvocationError::new(
-                    "source_capture",
-                    "paused source execution is not supported",
+            let cursor_matches = source_spec.snapshot.as_ref().is_none_or(|snapshot| {
+                super::expression::substitute_scalar(
+                    &snapshot.through_cursor,
+                    &provisional,
+                    &BTreeMap::new(),
+                    None,
+                    None,
                 )
-            })?;
-            let cursor = super::expression::substitute_scalar(
-                &snapshot.through_cursor,
-                &provisional,
-                &BTreeMap::new(),
-                None,
-                None,
-            )?;
-            if source_id != Some(capture.source_id.as_str())
-                || cursor.as_u64() != Some(capture.through_cursor.get())
-            {
+                .is_ok_and(|cursor| cursor.as_u64() == Some(capture.through_cursor.get()))
+            });
+            if source_id.as_ref() != Some(&capture.source_id) || !cursor_matches {
                 return Err(InvocationError::new(
                     "source_capture",
                     "sourceSession expressions do not identify the admitted capture",
                 ));
             }
         }
-        let source_values = capture.as_ref().map_or(Value::Null, |capture| json!({
-            "session": { "id": capture.source_id.as_str() },
-            "snapshot": { "cursor": capture.through_cursor.get() },
-        }));
+        let source_values = capture.as_ref().map_or(Value::Null, |capture| {
+            if pause.is_some() {
+                json!({
+                    "session": { "id": capture.source_id.as_str() },
+                    "pause": { "cursor": capture.through_cursor.get() },
+                })
+            } else {
+                json!({
+                    "session": { "id": capture.source_id.as_str() },
+                    "snapshot": { "cursor": capture.through_cursor.get() },
+                })
+            }
+        });
         let context = RoutineInvocationContext {
             event: None,
             trigger: trigger_values,
@@ -681,6 +1063,7 @@ impl ManualRoutineHandle {
             context,
             identity: format!("manual_{}", uuid::Uuid::new_v4()),
             correlation_id: request.request_id,
+            pause,
         })
     }
 }
@@ -702,6 +1085,20 @@ fn task_descriptors(routine: &MaterializedRoutine) -> Vec<RoutineTaskDescriptor>
                 .is_some_and(|action| action.session_create.is_some())
             {
                 "session_create"
+            } else if task
+                .task_spec
+                .action
+                .as_ref()
+                .is_some_and(|action| action.session_mask.is_some())
+            {
+                "session_mask"
+            } else if task
+                .task_spec
+                .action
+                .as_ref()
+                .is_some_and(|action| action.session_continue.is_some())
+            {
+                "session_continue"
             } else {
                 "session_metadata"
             }
@@ -883,12 +1280,13 @@ async fn admit_event(
                     .finish(&identity);
                 continue;
             }
-            let admitted = AdmittedInvocation {
+            let mut admitted = AdmittedInvocation {
                 routine: routine.clone(),
                 trigger: trigger.name.clone(),
                 context,
                 identity: identity.clone(),
                 correlation_id: event.id.clone(),
+                pause: None,
             };
             let recorder = if let Some(store) = store {
                 let invocation_id = format!("rinv_{}", uuid::Uuid::new_v4().simple());
@@ -946,7 +1344,7 @@ async fn admit_event(
             workers.spawn(async move {
                 let started = Instant::now();
                 let result = execute_and_finalize(
-                    &admitted,
+                    &mut admitted,
                     &host,
                     &active_children,
                     &child_admission_closed,
@@ -992,7 +1390,7 @@ async fn admit_event(
     reason = "the shared worker wrapper owns the canonical executor boundaries"
 )]
 async fn execute_and_finalize(
-    invocation: &AdmittedInvocation,
+    invocation: &mut AdmittedInvocation,
     host: &Arc<dyn RoutineHost>,
     active_children: &Arc<tokio::sync::Mutex<HashSet<SessionId>>>,
     child_admission_closed: &Arc<AtomicBool>,
@@ -1034,6 +1432,47 @@ pub(super) struct AdmittedInvocation {
     pub(super) context: RoutineInvocationContext,
     pub(super) identity: String,
     pub(super) correlation_id: String,
+    pub(super) pause: Option<RoutinePauseGuard>,
+}
+
+impl AdmittedInvocation {
+    async fn release_pause(&mut self) {
+        if let Some(guard) = &mut self.pause
+            && let Err(error) = guard.release().await
+        {
+            tracing::warn!(%error, "failed to release Routine pause");
+        }
+    }
+}
+
+fn capture_admission_error(error: waltr_agent::SessionCaptureError) -> InvocationError {
+    let class = match &error {
+        waltr_agent::SessionCaptureError::FailedPrecondition(_) => "source_precondition",
+        waltr_agent::SessionCaptureError::ResourceExhausted(_) => "source_exhausted",
+        waltr_agent::SessionCaptureError::Store(waltr_agent::SessionStoreError::NotFound {
+            ..
+        }) => "source_not_found",
+        waltr_agent::SessionCaptureError::Store(_) => "source_store",
+    };
+    InvocationError::new(class, error.to_string())
+}
+
+fn pause_admission_error(error: waltr_agent::SessionPauseError) -> InvocationError {
+    let class = match error {
+        waltr_agent::SessionPauseError::Active { .. }
+        | waltr_agent::SessionPauseError::Paused { .. }
+        | waltr_agent::SessionPauseError::LifecycleBusy { .. } => "source_precondition",
+        waltr_agent::SessionPauseError::Unavailable { .. } => "shutdown",
+        waltr_agent::SessionPauseError::CompletedBoundaryRequired { .. } => "source_precondition",
+        waltr_agent::SessionPauseError::Capture(
+            waltr_agent::SessionCaptureError::ResourceExhausted(_),
+        ) => "source_exhausted",
+        waltr_agent::SessionPauseError::Capture(waltr_agent::SessionCaptureError::Store(
+            waltr_agent::SessionStoreError::NotFound { .. },
+        )) => "source_not_found",
+        _ => "source_capture",
+    };
+    InvocationError::new(class, error.to_string())
 }
 
 fn invocation_identity(routine: &str, etag: &str, trigger: &str, event_id: &str) -> String {
@@ -1043,6 +1482,23 @@ fn invocation_identity(routine: &str, etag: &str, trigger: &str, event_id: &str)
         digest.update(value.as_bytes());
     }
     format!("routine_{}", hex_digest(&digest.finalize()))
+}
+
+pub(super) fn routine_pause_reason(
+    routine_name: &str,
+    trigger: &str,
+) -> Result<SessionCoordinationReason, String> {
+    let code = if routine_name == "compact-and-continue" {
+        "context-compaction"
+    } else {
+        "host-operation"
+    };
+    SessionCoordinationReason::new(
+        code,
+        Some(routine_name.to_owned()),
+        Some(trigger.to_owned()),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(super) fn short_digest(value: &str) -> String {

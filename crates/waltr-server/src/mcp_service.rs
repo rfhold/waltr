@@ -731,8 +731,90 @@ mod tests {
 
     #[tonic::async_trait]
     impl SessionHost for UnusedSessionHost {
+        fn set_completion_admission_handler(
+            &self,
+            _: Option<Arc<dyn waltr_agent::SessionCompletionCoordinationHandler>>,
+        ) {
+        }
+
         async fn create(&self, _: Option<String>) -> Result<AgentSession, Status> {
             unreachable!()
+        }
+
+        async fn create_exact(
+            &self,
+            _: waltr_agent::SessionCreateRequest,
+        ) -> Result<AgentSession, LlmError> {
+            Err(LlmError::api(
+                "unused-session-host",
+                "exact session creation is unsupported",
+            ))
+        }
+
+        async fn capture_latest_completed(
+            &self,
+            _: &SessionId,
+        ) -> Result<waltr_agent::CompletedSessionCapture, waltr_agent::SessionCaptureError> {
+            Err(waltr_agent::SessionCaptureError::FailedPrecondition(
+                "session capture is unsupported".to_owned(),
+            ))
+        }
+
+        async fn acquire_pause_reject_busy(
+            &self,
+            id: &SessionId,
+            _: waltr_agent::SessionCoordinationReason,
+        ) -> Result<waltr_agent::SessionPauseLease, waltr_agent::SessionPauseError> {
+            Err(waltr_agent::SessionPauseError::Unavailable {
+                session_id: id.clone(),
+            })
+        }
+
+        async fn capture_paused_effective(
+            &self,
+            lease: &waltr_agent::SessionPauseLease,
+        ) -> Result<waltr_agent::CompletedSessionCapture, waltr_agent::SessionPauseError> {
+            Err(waltr_agent::SessionPauseError::Unavailable {
+                session_id: lease.session_id().clone(),
+            })
+        }
+
+        async fn apply_paused_mask_mutation(
+            &self,
+            lease: &waltr_agent::SessionPauseLease,
+            _: waltr_agent::SessionMaskMutation,
+        ) -> Result<waltr_agent::SessionMaskMutationOutcome, waltr_agent::SessionPauseError> {
+            Err(waltr_agent::SessionPauseError::Unavailable {
+                session_id: lease.session_id().clone(),
+            })
+        }
+
+        async fn arm_paused_continuation(
+            &self,
+            lease: &waltr_agent::SessionPauseLease,
+            _: waltr_agent::TimelineCursor,
+            _: waltr_agent::AgentRunLimits,
+        ) -> Result<AgentSessionRunSubmission, waltr_agent::SessionPauseError> {
+            Err(waltr_agent::SessionPauseError::Unavailable {
+                session_id: lease.session_id().clone(),
+            })
+        }
+
+        async fn release_pause(
+            &self,
+            lease: &waltr_agent::SessionPauseLease,
+        ) -> Result<(), waltr_agent::SessionPauseError> {
+            Err(waltr_agent::SessionPauseError::Unavailable {
+                session_id: lease.session_id().clone(),
+            })
+        }
+
+        async fn start_durable_prompt(
+            &self,
+            id: SessionId,
+            _: waltr_agent::AgentRunLimits,
+        ) -> Result<AgentSessionRunSubmission, AgentSessionRunError> {
+            Err(AgentSessionRunError::Unavailable { session_id: id })
         }
 
         async fn list(&self) -> Result<Vec<SessionSummary>, LlmError> {
@@ -761,6 +843,19 @@ mod tests {
             _: String,
         ) -> Result<AgentSessionRunSubmission, AgentSessionRunError> {
             unreachable!()
+        }
+
+        async fn set_metadata_value_conditionally(
+            &self,
+            _: &SessionId,
+            _: String,
+            _: serde_json::Value,
+            _: waltr_agent::MetadataSetCondition,
+        ) -> Result<waltr_agent::MetadataSetOutcome, LlmError> {
+            Err(LlmError::api(
+                "unused-session-host",
+                "metadata mutation is unsupported",
+            ))
         }
 
         fn watch_sessions(&self) -> Pin<Box<dyn Stream<Item = SessionListUpdate> + Send>> {

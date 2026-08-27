@@ -17,6 +17,12 @@ pub(super) fn session_run_error_to_status(error: waltr_agent::AgentSessionRunErr
         waltr_agent::AgentSessionRunError::AlreadyRunning { .. } => {
             Status::failed_precondition("session already has an active run")
         }
+        waltr_agent::AgentSessionRunError::Paused { .. } => {
+            Status::failed_precondition("session is paused")
+        }
+        waltr_agent::AgentSessionRunError::Unavailable { .. } => {
+            Status::unavailable("session run admission is unavailable")
+        }
         waltr_agent::AgentSessionRunError::Canceled { .. } => Status::cancelled(error.to_string()),
         waltr_agent::AgentSessionRunError::OutcomeDropped { .. } => {
             Status::internal(error.to_string())
@@ -190,5 +196,19 @@ mod tests {
             AuthenticationFailureReason::try_from(failure.reason),
             Ok(AuthenticationFailureReason::NetworkFailed)
         );
+    }
+
+    #[test]
+    fn pause_and_shutdown_run_errors_have_precise_statuses() {
+        let paused = session_run_error_to_status(waltr_agent::AgentSessionRunError::Paused {
+            session_id: waltr_agent::SessionId::new("paused"),
+        });
+        let unavailable =
+            session_run_error_to_status(waltr_agent::AgentSessionRunError::Unavailable {
+                session_id: waltr_agent::SessionId::new("stopped"),
+            });
+
+        assert_eq!(paused.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(unavailable.code(), tonic::Code::Unavailable);
     }
 }

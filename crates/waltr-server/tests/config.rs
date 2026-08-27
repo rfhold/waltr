@@ -15,7 +15,7 @@ const PROVIDER_OVERRIDE: &str = "apiVersion: waltr.dev/v1alpha1\nkind: Provider\
 async fn read_returns_complete_seven_kind_catalog() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = resource_client(setup_server()).await?;
     let catalog = get_catalog(&mut client).await?;
-    assert_eq!(catalog.resources.len(), 14);
+    assert_eq!(catalog.resources.len(), 15);
     assert_eq!(
         catalog
             .resources

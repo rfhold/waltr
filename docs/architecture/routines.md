@@ -28,11 +28,13 @@ The server suppresses a projection when its digest equals the prior digest. Lag 
 
 Definitions include each Routine revision. An admitted invocation pins its immutable Routine revision, trigger, source capture, and ordered task descriptors.
 
+The bundled `compact-and-continue` Routine is the implemented compaction-prefix workflow. Its manual trigger exposes boolean `continue` with default `false`; its lifecycle trigger assigns `continue: true`.
+
 Later catalog changes affect future admissions only. History and detail remain interpretable after the current definition changes or disappears.
 
 ## Manual Admission
 
-`StartManualRoutine` validates the selected Routine, trigger, typed inputs, and any required source capture before durable admission. The request's `source_session_id` remains command input; admission records it as immutable string metadata under `waltr.routine.source_session_id`.
+`StartManualRoutine` validates the selected Routine, trigger, typed inputs, and any required source capture before durable admission. Omitted exposed inputs materialize their schema defaults before trigger conditions or tasks run; explicit request values take precedence. The request's `source_session_id` remains command input; admission records it as immutable string metadata under `waltr.routine.source_session_id`.
 
 The response has one outcome:
 
@@ -45,9 +47,29 @@ Request IDs provide correlation only. They provide no idempotency, deduplication
 
 After admission, execution detaches from the RPC. RPC completion means that durable admission succeeded, not that task execution finished.
 
+For a manual `sourceSession.pause`, admission first acquires an exclusive process-local pause with reject-on-busy behavior. The pause pins the source session and its latest completed cursor, queues new submissions, and captures mask-effective helper context through that cursor. Busy or capture failure occurs before durable admission and creates no invocation history. The durable admission stores the pinned source cursor; only after that commit does ownership move to the detached worker.
+
+An invocation-owned `sessionMask` must address that exact paused session and cursor. It atomically subtracts masks overlapping the selected prefix and adds the declared replacement mask. Its result cursor is the committed administrative mask cursor. A following `sessionContinue` may arm continuation only from that cursor. The pause is released after invocation lifecycle finalization: an armed continuation runs first, then queued submissions drain normally; without an armed continuation, queued submissions drain immediately.
+
+The worker explicitly attempts release after success, skip, helper or action failure, cancellation, shutdown, and lifecycle persistence failure. A non-blocking drop fallback covers an abruptly canceled worker. Once `sessionMask` commits, later continuation, lifecycle persistence, cancellation, or shutdown failure does not compensate or remove it.
+
+Raw timeline reads remain an immutable source-history view. Compact helpers and provider requests use effective materialization: active prefix replacements hide selected completed prompt/turn context and insert one synthetic user replacement at the earliest selected position. Mask mutations are durable administrative events, not timeline items. Explicit mask subtraction reveals preserved source content without rolling back conversation content; rolling the conversation back before a mask mutation removes that mutation from rollback-effective mask history.
+
 Manual and event admissions use the same executor and lifecycle recorder. Event invocations also receive durable public invocation IDs.
 
 Session-originated event adapters record the originating session ID under the same canonical metadata key. Generic events may omit that metadata, and Waltr does not backfill metadata onto existing invocations.
+
+## Automatic Completion Admission
+
+The Routine engine registers one agent-boundary callback for `sessionLifecycle.runCompleted`. This synchronous path does not use the bounded semantic event bus. It considers active catalog Routines in canonical name order and triggers in declaration order, selects at most one eligible invocation for each completed run, and excludes sessions whose `waltr.session.purpose` is `routine-task`.
+
+Runtime trigger values include the session and run identities, terminal cursor, latest completed provider turn's `context.tokens`, and `context.percent` when the completed run's effective configured provider/model resolves to a model with a nonzero context limit. Percent uses overflow-safe integer arithmetic. Unknown model limits produce a missing percent, so only an absolute-token condition can match; missing provider usage produces neither pressure value. The compact-and-continue trigger matches at 180,000 context tokens or 80 percent and materializes its lifecycle assignment as boolean `continue: true`.
+
+Bounded preparation evaluates eligibility without pause authority. For an eligible trigger, the coordinator atomically converts the completion barrier into the invocation pause and invokes the prepared finalizer with that lease. The finalizer captures mask-effective source context and commits durable admission with the exact source session and completed source cursor. This post-claim phase has authoritative completion and is never aborted by the preparation deadline. Persistence failure creates no executable worker and explicitly fails open. Only after a successful commit does finalization return an already-created detached worker that owns the lease. The detached path is the same executor used by manual admission, including helper creation, mask mutation, privileged continuation, lifecycle recording, and pause release.
+
+The coordinator bounds terminal snapshot loading, derivation, and pre-claim preparation to two seconds. No handler, no eligible trigger, pressure below threshold, preparation error or panic, timeout, or shutdown drains normally without ever claiming. Once claimed, delayed capture and durable admission keep queued work blocked until they resolve. Failed admission or finalizer panic removes the pause and drains; successful admission transfers the pause to detached execution. Automatic admission has no retry or persistent completion deduplication; a later completed run may trigger again. During shutdown the engine cancels automatic preparation and unregisters the handler before joining workers, so it starts no new automatic work. Existing admitted workers remain engine-owned and release their pauses through normal shutdown cleanup.
+
+The agent coordinator owns pause, barrier, queue, continuation, and publication lifecycle state. The server supplies only validated semantic reason descriptors across `SessionHost` and `RoutineHost`: compact-and-continue uses code `context-compaction`, the selected Routine name as `source`, and `manual` or `run-completed` as `trigger`; other Routine pauses use `host-operation`. Automatic preparation returns that descriptor in the atomic completion claim, while manual admission supplies it when acquiring the pause. The server does not derive lifecycle state from Routine execution or author final UI labels.
 
 ## Durable Lifecycle
 
@@ -84,9 +106,9 @@ The admission event contains enough immutable metadata and ordered task descript
 
 ## Restart And Coordination
 
-Startup reconciles every unfinished invocation before the Routine engine reports ready. It records unfinished tasks and invocations as interrupted with `server_restart`.
+Startup reconciles every unfinished invocation before the Routine engine reports ready. It records unfinished tasks and invocations as interrupted with `server_restart`. Pauses and queued submissions are process-local, so a crash drops both rather than recovering queued work. The durable mask and recorded source cursor remain.
 
-Waltr does not resume interrupted Routine execution. Graceful shutdown stops admission, interrupts active helper sessions, joins owned work, and records `server_shutdown` interruptions.
+Waltr does not resume interrupted Routine execution or retry an armed continuation after restart. Graceful shutdown stops admission, interrupts active helper sessions, joins owned work, and records `server_shutdown` interruptions.
 
 Waltr exposes no explicit Routine cancellation RPC. Interruption currently comes from shutdown or restart reconciliation.
 
@@ -134,6 +156,7 @@ Session Context panels show summaries from their server-filtered source-session 
 - A proposed nested `routineRef` task can still use `completion: wait`; that field belongs to child invocation semantics.
 - Waltr provides no resumption, pruning, global launch controls, or explicit cancellation RPC.
 - Event delivery before durable admission remains best-effort and process-local. Admitted event invocation history remains durable.
+- Automatic `sessionLifecycle.runCompleted` admission is process-local and fail-open; its durable invocation history begins only at successful SQL admission.
 
 ## References
 

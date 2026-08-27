@@ -56,7 +56,7 @@ A provider catalog selector names a models.dev provider and an `include` list. O
 
 `Defaults` exists only at `defaults/default.yaml`. Its `spec.inference` value selects a provider, model, and optional `reasoningEffort`.
 
-`Routine` defines a server-owned event or manual workflow. Each trigger declares exactly one event or manual form. Event conditions support `In` or `NotIn` with AND semantics.
+`Routine` defines a server-owned event, manual, or `sessionLifecycle.runCompleted` workflow. Each trigger declares exactly one form. Conditions support `In`, `NotIn`, numeric `GreaterThanOrEqual`, nested `any` OR groups, and top-level AND semantics.
 
 Parameters use closed string or boolean scalars. String parameters support required use, `minLength`, and bounded Rust regex patterns. Manual triggers expose declared parameters with session scope.
 
@@ -70,13 +70,13 @@ Provider requests derive only from durable helper state. The history persists ac
 
 The metadata action supports one scalar `set` mutation with `ifAbsent: true`. The implemented `sessionCreate` subset requires exact inference and agent-definition inheritance, metadata, one first prompt, and immediate start.
 
-Top-level `spec.sourceSession` supports manual triggers only. Catalog validation rejects any Routine that combines `sourceSession` with an event trigger. Inference-only event Routines remain supported.
+Top-level `spec.sourceSession` supports manual triggers and `runCompleted` lifecycle triggers. A paused source queues submissions; manual acquisition requires `onBusy: reject`, while lifecycle admission claims the source completion barrier. Inference-only event Routines remain supported.
 
-`sourceSession` admits the manual source through its latest completed cursor. The admitted capture fixes exact source inference, agent definition, and effective completed-turn history for that invocation.
+`sourceSession.snapshot` admits a manual raw latest-completed capture. `sourceSession.pause` admits a mask-effective completed-turn capture pinned to an exclusive process-local boundary. Implemented compaction actions atomically subtract overlapping prefix replacement masks, add one keyed prefix replacement, and optionally continue from the committed mask cursor.
 
-Unsupported fields, operators, actions, task types, and substitutions fail strict validation.
+The implemented mask subset is persistent replacement masks with completed-prefix selectors, opaque IDs, stable keys, overlap subtraction and rejection, explicit removal, and effective replay. Filter, truncation, annotation, exact item-set, and category-oriented masks remain unsupported. Other unsupported fields, operators, actions, task types, and substitutions fail strict validation.
 
-The server bundles [`title`](../../crates/waltr-server/resources/routines/title.yaml) and [`fork`](../../crates/waltr-server/resources/routines/fork.yaml). Their matching [documentation examples](../examples/routines/README.md) use identical source. The examples index separates the implemented subset from proposed fixture syntax.
+The server bundles [`title`](../../crates/waltr-server/resources/routines/title.yaml), [`compact-and-continue`](../../crates/waltr-server/resources/routines/compact-and-continue.yaml), and [`fork`](../../crates/waltr-server/resources/routines/fork.yaml). Their matching [documentation examples](../examples/routines/README.md) use identical source. The examples index separates the implemented subset from proposed fixture syntax.
 
 The catalog materializes providers, MCP servers, and defaults into `waltr.config.v1.Configuration`. Runtime, auth, catalog search, and clients use this projection. The server retains routines separately, so routine resources never enter agent-definition bundles.
 

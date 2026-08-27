@@ -2,14 +2,19 @@
 
 mod support;
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use waltr::grpc::waltr::routine::v1::{
     ListRoutineInvocationsRequest, RoutineInputValue, RoutineScope, RoutineValue, RoutineValueType,
     StartManualRoutineRequest, WatchManualRoutinesRequest, WatchRoutineInvocationsRequest,
     routine_value, start_manual_routine_response, watch_routine_invocations_response,
 };
-use waltr_server::test_support::setup_server;
+use waltr_agent::{
+    InferenceProviderSettings, InferenceSettings, MemorySessionStore, ModelApi,
+    PendingTimelineEvent, PendingTimelineItemId, SessionCoordinator, SessionCreateRequest,
+    SessionId, SessionJournalEvent, SessionStore,
+};
+use waltr_server::test_support::{setup_server, setup_server_with_seeded_sessions};
 use tokio_stream::StreamExt as _;
 use tonic::Code;
 
@@ -48,8 +53,20 @@ async fn definition_watch_starts_with_complete_global_snapshot()
 
     assert_eq!(response.request_id, "watch-definitions");
     assert!(!response.digest.is_empty());
-    assert_eq!(response.routines.len(), 1);
-    let routine = &response.routines[0];
+    assert_eq!(response.routines.len(), 2);
+    let compact = &response.routines[0];
+    assert_eq!(compact.routine_name, "compact-and-continue");
+    assert_eq!(compact.trigger_name, "manual");
+    assert_eq!(compact.inputs[0].name, "continue");
+    assert_eq!(compact.inputs[0].r#type, RoutineValueType::Boolean as i32);
+    assert_eq!(
+        compact.inputs[0]
+            .default_value
+            .as_ref()
+            .and_then(|value| value.value.as_ref()),
+        Some(&routine_value::Value::BooleanValue(false))
+    );
+    let routine = &response.routines[1];
     assert_eq!(routine.routine_name, "fork");
     assert_eq!(routine.trigger_name, "manual");
     assert_eq!(routine.scope, RoutineScope::Session as i32);
@@ -59,10 +76,88 @@ async fn definition_watch_starts_with_complete_global_snapshot()
     Ok(())
 }
 
+async fn paused_source() -> Result<
+    (
+        SessionCoordinator<MemorySessionStore>,
+        SessionId,
+        waltr_agent::SessionPauseLease,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let store = MemorySessionStore::new();
+    let source_id = SessionId::new("compact-busy-source");
+    let mut create = SessionCreateRequest::new(source_id.clone());
+    create.inference_settings = Some(InferenceSettings {
+        provider: InferenceProviderSettings {
+            key: "test".to_owned(),
+            api: ModelApi::OpenAiResponses,
+            url: "http://localhost".to_owned(),
+            model_id: "test-model".to_owned(),
+            model_cost: None,
+            headers: BTreeMap::new(),
+            oauth: None,
+            reasoning_effort: None,
+        },
+    });
+    create.agent_definition = Some(waltr_server::test_support::default_agent_definition().1);
+    let created = store.create(create).await?;
+    let revision = store
+        .append_journal(
+            &source_id,
+            created.revision,
+            vec![SessionJournalEvent::PromptAppended {
+                prompt: "source prompt".to_owned(),
+            }],
+        )
+        .await?;
+    store
+        .append_timeline(
+            &source_id,
+            revision,
+            vec![
+                PendingTimelineEvent::user_text_snapshot(
+                    source_id.clone(),
+                    0,
+                    PendingTimelineItemId::New,
+                    "source prompt",
+                ),
+                PendingTimelineEvent::assistant_text_snapshot(
+                    source_id.clone(),
+                    0,
+                    PendingTimelineItemId::New,
+                    "source answer",
+                ),
+            ],
+        )
+        .await?;
+    let revision = store.load(&source_id).await?.revision;
+    store
+        .append_journal(
+            &source_id,
+            revision,
+            vec![SessionJournalEvent::TurnFinished { turn: 0 }],
+        )
+        .await?;
+
+    let sessions = SessionCoordinator::new(store);
+    let pause = sessions
+        .acquire_pause_reject_busy(
+            &source_id,
+            waltr_agent::SessionCoordinationReason::new(
+                "context-compaction",
+                Some("compact-and-continue".to_owned()),
+                Some("manual".to_owned()),
+            )?,
+        )
+        .await?;
+    Ok((sessions, source_id, pause))
+}
+
 #[tokio::test]
 async fn pre_admission_validation_and_source_failure_create_no_history()
 -> Result<(), Box<dyn std::error::Error>> {
-    let server = setup_server();
+    let (sessions, paused_source_id, _pause) = paused_source().await?;
+    let server = setup_server_with_seeded_sessions(sessions);
     let mut client = routine_client(server).await?;
     let invalid = client
         .start_manual_routine(start_request("missing", " \n\t"))
@@ -83,6 +178,22 @@ async fn pre_admission_validation_and_source_failure_create_no_history()
         panic!("structured source validation expected")
     };
     assert_eq!(missing.violations[0].field_path, "source_session_id");
+
+    let compact = client
+        .start_manual_routine(StartManualRoutineRequest {
+            request_id: "compact-default-busy".to_owned(),
+            routine_name: "compact-and-continue".to_owned(),
+            trigger_name: "manual".to_owned(),
+            source_session_id: paused_source_id.as_str().to_owned(),
+            inputs: Vec::new(),
+        })
+        .await?
+        .into_inner();
+    let Some(start_manual_routine_response::Outcome::ValidationFailure(failure)) = compact.outcome
+    else {
+        panic!("an existing source pause must reject admission")
+    };
+    assert_eq!(failure.violations[0].field_path, "source_session_id");
 
     for (mut request, expected_field) in [
         (

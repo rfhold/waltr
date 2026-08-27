@@ -62,7 +62,7 @@ async fn unified_catalog_materializes_all_seven_kinds_and_runtime_indexes() {
         .map(|resource| resource.kind)
         .collect::<BTreeSet<_>>();
     assert_eq!(kinds.len(), 7);
-    assert_eq!(catalog.resources.len(), 14);
+    assert_eq!(catalog.resources.len(), 15);
     let config = catalog.effective_configuration.unwrap();
     assert_eq!(config.providers.len(), 4);
     assert_eq!(
@@ -83,7 +83,24 @@ async fn unified_catalog_materializes_all_seven_kinds_and_runtime_indexes() {
     };
     assert_eq!(condition.metadata.key, "waltr.session.ephemeral");
     assert_eq!(condition.metadata.operator, RoutineConditionOperator::NotIn);
-    assert_eq!(snapshot.routines().len(), 2);
+    let compact = snapshot.routine("compact-and-continue").unwrap();
+    assert_eq!(compact.source_path(), "routines/compact-and-continue.yaml");
+    assert_eq!(
+        compact.definition().spec.params[0].default,
+        Some(RoutineScalar::Boolean(false))
+    );
+    assert!(
+        compact.definition().spec.triggers[1]
+            .session_lifecycle
+            .is_some()
+    );
+    assert!(catalog.resources.iter().any(|resource| {
+        resource.path == "routines/compact-and-continue.yaml"
+            && resource.name == "compact-and-continue"
+            && resource.origin == resource_proto::ResourceOrigin::Bundled as i32
+            && resource.effective_value.is_some()
+    }));
+    assert_eq!(snapshot.routines().len(), 3);
     assert_eq!(snapshot.sources().len(), 6);
     assert!(
         snapshot
