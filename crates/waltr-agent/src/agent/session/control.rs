@@ -43,6 +43,26 @@ impl SessionControl {
         self.list.subscribe()
     }
 
+    pub(crate) fn publish_coordination(
+        &self,
+        id: &SessionId,
+        coordination: super::SessionCoordinationState,
+    ) {
+        self.list.publish_coordination(id, coordination);
+    }
+
+    pub(crate) fn register_listed_summary(&self, summary: SessionSummary) -> SessionIncarnation {
+        self.list.register_listed_summary(summary)
+    }
+
+    pub(crate) fn reconcile_listed_summary(
+        &self,
+        incarnation: SessionIncarnation,
+        summary: SessionSummary,
+    ) -> Option<SessionSummary> {
+        self.list.reconcile_listed_summary(incarnation, summary)
+    }
+
     pub(crate) async fn exclusive(&self) -> SessionLifecycleGuard {
         SessionLifecycleGuard {
             control: self.clone(),
@@ -81,11 +101,13 @@ impl SessionControl {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn test_claim(&self, id: &SessionId) -> SessionPublicationClaim {
         self.list.claim(id)
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn test_publish_run_summary(
         &self,
         incarnation: SessionIncarnation,
@@ -95,6 +117,7 @@ impl SessionControl {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn lifecycle_count(&self) -> usize {
         self.list.lifecycle_count()
     }
@@ -107,6 +130,20 @@ pub(crate) struct SessionHandle {
 }
 
 impl SessionHandle {
+    pub(crate) fn try_operation(&self) -> Option<SessionOperation> {
+        let lifecycle = Arc::clone(&self.control.lifecycle).try_read_owned().ok()?;
+        let lease = self.control.register_mutation_gate(&self.id);
+        let mutation = Arc::clone(lease.gate()).try_lock_owned().ok()?;
+        let claim = self.control.list.claim(&self.id);
+        Some(SessionOperation {
+            session: self.clone(),
+            lifecycle: Some(lifecycle),
+            mutation: Some(mutation),
+            claim: Some(claim),
+            lease: Some(lease),
+        })
+    }
+
     pub(crate) async fn operation(&self) -> SessionOperation {
         let lifecycle = Arc::clone(&self.control.lifecycle).read_owned().await;
         let lease = self.control.register_mutation_gate(&self.id);

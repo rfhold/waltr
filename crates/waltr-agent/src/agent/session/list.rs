@@ -171,8 +171,9 @@ impl SessionListBroadcaster {
     pub(crate) fn register_loaded_summary(
         &self,
         incarnation: SessionIncarnation,
-        summary: SessionSummary,
+        mut summary: SessionSummary,
     ) {
+        summary.set_coordination(summary.coordination.clone());
         let mut state = self.state.lock().expect("session list state lock poisoned");
         if let Some(entry) = state.sessions.get_mut(&summary.id)
             && entry.incarnation == incarnation
@@ -182,7 +183,42 @@ impl SessionListBroadcaster {
         }
     }
 
-    pub(crate) fn publish_created(&self, incarnation: SessionIncarnation, summary: SessionSummary) {
+    pub(crate) fn register_listed_summary(&self, summary: SessionSummary) -> SessionIncarnation {
+        let claim = self.claim(&summary.id);
+        let incarnation = claim.incarnation();
+        self.register_loaded_summary(incarnation, summary);
+        incarnation
+    }
+
+    pub(crate) fn reconcile_listed_summary(
+        &self,
+        incarnation: SessionIncarnation,
+        mut summary: SessionSummary,
+    ) -> Option<SessionSummary> {
+        let mut state = self.state.lock().expect("session list state lock poisoned");
+        let entry = state.sessions.get_mut(&summary.id)?;
+        if entry.incarnation != incarnation {
+            return None;
+        }
+        let coordination = summary.coordination.clone();
+        let current = entry.summary.as_ref()?;
+        if summary.revision <= current.revision {
+            summary = current.as_ref().clone();
+        } else {
+            summary.updated_at = summary.updated_at.max(current.updated_at);
+            summary.last_activity_at = summary.last_activity_at.max(current.last_activity_at);
+        }
+        summary.set_coordination(coordination);
+        entry.summary = Some(Box::new(summary.clone()));
+        Some(summary)
+    }
+
+    pub(crate) fn publish_created(
+        &self,
+        incarnation: SessionIncarnation,
+        mut summary: SessionSummary,
+    ) {
+        summary.set_coordination(summary.coordination.clone());
         let mut state = self.state.lock().expect("session list state lock poisoned");
         let Some(entry) = state.sessions.get_mut(&summary.id) else {
             return;
@@ -197,8 +233,9 @@ impl SessionListBroadcaster {
     pub(crate) fn publish_host_summary(
         &self,
         incarnation: SessionIncarnation,
-        summary: SessionSummary,
+        mut summary: SessionSummary,
     ) {
+        summary.set_coordination(summary.coordination.clone());
         let mut state = self.state.lock().expect("session list state lock poisoned");
         let Some(entry) = state.sessions.get_mut(&summary.id) else {
             return;
@@ -219,6 +256,7 @@ impl SessionListBroadcaster {
                     .inference_settings
                     .clone_from(&summary.inference_settings);
                 merged.agent_name.clone_from(&summary.agent_name);
+                merged.set_coordination(current.coordination.clone());
                 merged.updated_at = merged.updated_at.max(summary.updated_at);
                 merged.last_activity_at = merged.last_activity_at.max(summary.last_activity_at);
                 merged
@@ -260,7 +298,25 @@ impl SessionListBroadcaster {
             .inference_settings
             .clone_from(&retained.inference_settings);
         summary.agent_name.clone_from(&retained.agent_name);
+        summary.set_coordination(retained.coordination.clone());
         retained.as_mut().clone_from(&summary);
+        self.publish_update(&mut state, SessionListEvent::Upsert(summary));
+    }
+
+    pub(crate) fn publish_coordination(
+        &self,
+        id: &SessionId,
+        coordination: super::SessionCoordinationState,
+    ) {
+        let mut state = self.state.lock().expect("session list state lock poisoned");
+        let Some(entry) = state.sessions.get_mut(id) else {
+            return;
+        };
+        let Some(retained) = entry.summary.as_mut() else {
+            return;
+        };
+        retained.set_coordination(coordination);
+        let summary = retained.as_ref().clone();
         self.publish_update(&mut state, SessionListEvent::Upsert(summary));
     }
 
@@ -296,6 +352,7 @@ impl SessionListBroadcaster {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn lifecycle_count(&self) -> usize {
         self.state
             .lock()
@@ -326,11 +383,9 @@ mod tests {
     use crate::{Revision, SessionId, SessionRecord};
 
     fn summary(id: &str, value: &str) -> crate::SessionSummary {
-        SessionRecord::with_metadata_values(
-            SessionId::new(id),
-            BTreeMap::from([("host.key".to_owned(), json!(value))]),
-        )
-        .summary()
+        let mut record = SessionRecord::new(SessionId::new(id));
+        record.metadata.values = BTreeMap::from([("host.key".to_owned(), json!(value))]);
+        record.summary()
     }
 
     fn publish_created(
@@ -460,6 +515,71 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(25), watch.next())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn coordination_only_upsert_publishes_at_the_same_durable_revision() {
+        let sessions = SessionListBroadcaster::new();
+        let mut watch = sessions.subscribe();
+        let retained = summary("coordination", "host");
+        let revision = retained.revision;
+        publish_created(&sessions, retained);
+        drop(next_event(&mut watch).await);
+
+        sessions.publish_coordination(
+            &SessionId::new("coordination"),
+            crate::SessionCoordinationState {
+                phase: crate::SessionCoordinationPhase::Paused,
+                reason: Some(
+                    crate::SessionCoordinationReason::new(
+                        "host-operation",
+                        None,
+                        Some("manual".to_owned()),
+                    )
+                    .unwrap(),
+                ),
+                queued_count: 2,
+                continuation_armed: true,
+            },
+        );
+
+        let update = next_event(&mut watch).await;
+        let SessionListEvent::Upsert(summary) = update.event else {
+            panic!("coordination upsert")
+        };
+        assert_eq!(summary.revision, revision);
+        assert_eq!(
+            summary.coordination.phase,
+            crate::SessionCoordinationPhase::Paused
+        );
+        assert_eq!(summary.coordination.queued_count, 2);
+        assert!(summary.coordination.continuation_armed);
+    }
+
+    #[test]
+    fn listed_reconciliation_cannot_cross_a_recreated_incarnation() {
+        let sessions = SessionListBroadcaster::new();
+        let old = summary("reconciled", "old");
+        let old_incarnation = sessions.register_listed_summary(old.clone());
+        sessions.publish_deleted(old.id.clone());
+
+        let new = summary("reconciled", "new");
+        let new_incarnation = sessions.register_listed_summary(new.clone());
+        assert_ne!(old_incarnation, new_incarnation);
+
+        let mut stale = old;
+        stale.coordination.phase = crate::SessionCoordinationPhase::Paused;
+        assert!(
+            sessions
+                .reconcile_listed_summary(old_incarnation, stale)
+                .is_none()
+        );
+        assert_eq!(
+            sessions
+                .reconcile_listed_summary(new_incarnation, new.clone())
+                .unwrap(),
+            new
         );
     }
 

@@ -17,31 +17,32 @@ pub use event::{BoxAgentTimelineStream, SessionEvent, SessionEventSink, SessionE
 pub use retry::ProviderRetryConfig;
 pub use run::AgentRunBuilder;
 pub use session::{
-    ActiveSessionMask, AgentRunLimits, AgentRuntimeProvider, AgentSession, AgentSessionActiveRunState,
-    AgentSessionRunDisposition, AgentSessionRunError, AgentSessionRunHandle, AgentSessionRunInput,
-    AgentSessionRunOutcome, AgentSessionRunSubmission, AgentSessionRuntime,
-    AgentSessionRuntimeError, AgentSessionRuntimeFactory, CancelReason, CompletedSessionCapture,
-    CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore, ExternalRequest,
-    ExternalRequestId, ExternalRequestKind,
-    ExternalRequestStatus, ExternalResponse, FileCredentialStore, FilesystemSessionStore,
-    InferenceProviderSettings, InferenceSettings, MAX_ACTIVE_SESSION_MASKS,
-    MAX_SESSION_MASK_KEY_BYTES, MAX_SESSION_MASK_MUTATION_ITEMS,
-    MAX_SESSION_MASK_REPLACEMENT_BYTES, McpConnectionKind, McpConnectionResolveFuture,
-    McpConnectionResolveRequest, McpOAuthContext, McpOAuthEndpoints, McpOAuthRegistration,
-    McpOAuthRegistrationMethod, McpResolvedConnection, MemorySessionStore, MetadataSetCondition,
-    MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION, OAuthCredential, OAuthCredentialContext,
-    OAuthCredentialRecord,
-    OAuthCredentialStore, OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult,
-    OAuthTokenSet, OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode,
-    ReplacementUserContent, RequestId,
-    RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput, S3SessionStore,
-    S3SessionWriteMode, ScyllaSessionStore, SessionCaptureError, SessionCaptureLimits,
-    SessionContextMode, SessionCoordinator, SessionCopy, SessionCopyError, SessionCreateRequest,
-    SessionId, SessionJournalEvent, SessionListEvent, SessionListSubscription, SessionListUpdate,
-    SessionMask, SessionMaskAddition, SessionMaskError, SessionMaskId, SessionMaskMutation,
-    SessionMaskMutationOutcome, SessionMaskSubtraction, SessionMaterializedContext, SessionMetrics,
-    SessionOAuthJwtMetadata, SessionOAuthJwtToken, SessionOAuthProviderSettings,
-    SessionOAuthTokenField, SessionOAuthTokenFieldTarget, SessionOAuthTokenRequestStyle,
+    ActiveSessionMask, AgentRunLimits, AgentRuntimeProvider, AgentSession,
+    AgentSessionActiveRunState, AgentSessionRunDisposition, AgentSessionRunError,
+    AgentSessionRunHandle, AgentSessionRunInput, AgentSessionRunOutcome, AgentSessionRunSubmission,
+    AgentSessionRuntime, AgentSessionRuntimeError, AgentSessionRuntimeFactory, CancelReason,
+    CompletedSessionCapture, CredentialRefreshCoordinator, CredentialRefreshError, CredentialStore,
+    ExternalRequest, ExternalRequestId, ExternalRequestKind, ExternalRequestStatus,
+    ExternalResponse, FileCredentialStore, FilesystemSessionStore, InferenceProviderSettings,
+    InferenceSettings, MAX_ACTIVE_SESSION_MASKS, MAX_SESSION_COORDINATION_REASON_ATTRIBUTE_BYTES,
+    MAX_SESSION_COORDINATION_REASON_CODE_BYTES, MAX_SESSION_MASK_KEY_BYTES,
+    MAX_SESSION_MASK_MUTATION_ITEMS, MAX_SESSION_MASK_REPLACEMENT_BYTES, McpConnectionKind,
+    McpConnectionResolveFuture, McpConnectionResolveRequest, McpOAuthContext, McpOAuthEndpoints,
+    McpOAuthRegistration, McpOAuthRegistrationMethod, McpResolvedConnection, MemorySessionStore,
+    MetadataSetCondition, MetadataSetOutcome, OAUTH_CREDENTIAL_VERSION, OAuthCredential,
+    OAuthCredentialContext, OAuthCredentialRecord, OAuthCredentialStore,
+    OAuthCredentialStoreFuture, OAuthRefreshClaim, OAuthRefreshClaimResult, OAuthTokenSet,
+    OpenDalSessionStore, PendingWork, PendingWorkStatus, RefreshMode, ReplacementUserContent,
+    RequestId, RequestRecord, ResumeInput, Revision, RunConflictPolicy, RuntimeResumeOutput,
+    S3SessionStore, S3SessionWriteMode, ScyllaSessionStore, SessionCaptureError,
+    SessionCaptureLimits, SessionContextMode, SessionCoordinationPhase, SessionCoordinationReason,
+    SessionCoordinationReasonError, SessionCoordinationState, SessionCoordinator, SessionCopy,
+    SessionCopyError, SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent,
+    SessionListSubscription, SessionListUpdate, SessionMask, SessionMaskAddition, SessionMaskError,
+    SessionMaskId, SessionMaskMutation, SessionMaskMutationOutcome, SessionMaskSubtraction,
+    SessionMaterializedContext, SessionMetrics, SessionOAuthJwtMetadata, SessionOAuthJwtToken,
+    SessionOAuthProviderSettings, SessionOAuthTokenField, SessionOAuthTokenFieldTarget,
+    SessionOAuthTokenRequestStyle, SessionPauseError, SessionPauseId, SessionPauseLease,
     SessionRecord, SessionSnapshot, SessionStart, SessionStartMessage, SessionStartMessageError,
     SessionStatus, SessionStore, SessionStoreError, SessionStoreResult, SessionSummary,
     SessionSyntheticTimelineEvent, SessionTimelineEvent, SessionTimelineMode, SessionTimelinePage,
@@ -129,9 +130,8 @@ mod tests {
         CHANNEL_USER_TEXT, CompletionEvent, CompletionRequest, ExternalRequestId, ExternalResponse,
         MemorySessionStore, ModelApi, ModelRef, ProviderId, ResumeInput, Revision,
         SessionCreateRequest, SessionId, SessionJournalEvent, SessionListEvent, SessionRecord,
-        SessionStatus, SessionStore,
-        SessionTimelineEvent, TimelineChannel, TimelineContent, TimelineEventKind, TimelineQuery,
-        ToolCall,
+        SessionStatus, SessionStore, SessionTimelineEvent, TimelineChannel, TimelineContent,
+        TimelineEventKind, TimelineQuery, ToolCall,
         middleware::{
             AgentMiddleware, HookOutcome,
             chain::MiddlewareChain,
@@ -150,7 +150,7 @@ mod tests {
 
     use super::{
         AgentRuntime, SessionCoordinator,
-        session::{SessionListBroadcaster, SessionTimelineBroadcaster},
+        session::{SessionControl, SessionRunContext, SessionTimelineBroadcaster},
     };
 
     struct RecordingEventSink {
@@ -550,15 +550,15 @@ mod tests {
         let agent = AgentRuntime::builder(model, provider).build();
         let store = MemorySessionStore::new();
         let session_id = SessionId::new("automatic-publication");
-        let sessions = SessionListBroadcaster::new();
+        let control = SessionControl::new();
         let timeline = SessionTimelineBroadcaster::new();
-        let mut session_updates = sessions.subscribe();
+        let mut session_updates = control.subscribe();
         let mut timeline_updates = timeline.subscribe(session_id.clone());
+        let context = SessionRunContext::new(control.session(session_id.clone()), timeline, None);
         let mut stream = agent
             .prompt("hello")
             .with_session_store(store, session_id.clone())
-            .with_session_broadcaster(sessions)
-            .with_timeline_broadcaster(timeline)
+            .with_session_run_context(context)
             .stream();
 
         let output = stream
