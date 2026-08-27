@@ -116,6 +116,8 @@ The deployment contract assumes one active Routine engine for each Waltr databas
 
 Waltr does not implement clustered leases or cross-engine execution ownership. Multiple active engines against one database remain unsupported.
 
+Session list/watch gRPC responses and MCP session output consume the same agent `SessionSummary` progress and capabilities projection. MCP uses `progress.running` for activity and `sessions.wait`, and includes structured progress and capabilities without recombining durable status with legacy coordination. Durable status and coordination remain present for diagnostics and older consumers. These capabilities do not authorize Routine admission or determine Routine command availability.
+
 ## Shared Client
 
 `waltr-client` owns an interest-counted definition watch, one singleton global invocation history, and independently keyed source-session histories. It preserves interests across recoverable access loss and reconnects interested watches after readiness.

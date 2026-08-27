@@ -454,6 +454,15 @@ mod tests {
                 failed_message: String::new(),
                 authentication_failure: None,
             },
+            coordination: Default::default(),
+            progress: waltr_client::SessionProgressView {
+                phase: waltr_client::SessionProgressPhaseView::Idle,
+                ..Default::default()
+            },
+            capabilities: waltr_client::SessionCapabilitiesView {
+                prompt_disposition: waltr_client::SessionPromptDispositionView::Immediate,
+                ..Default::default()
+            },
             current_prompt: None,
             created_at: None,
             updated_at: None,

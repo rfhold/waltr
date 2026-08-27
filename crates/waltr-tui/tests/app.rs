@@ -18,8 +18,10 @@ use waltr_client::{
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OAuthJwtMetadataView,
     OAuthProviderView, OAuthTokenFieldView, OAuthTokenRequestStyleView, OAuthUrlParamView,
     OperationSnapshot, ProviderKindView, ProviderView, RollbackTargetView, RoutineDetailSnapshot,
-    RoutineStartOperationView, SessionPhaseView, SessionSuspensionKindView, SessionTimelineView,
-    TimelineContentView, TimelineEventKindView, TimelineEventView, TimelineStatusView,
+    RoutineStartOperationView, SessionCoordinationReasonView, SessionPhaseView,
+    SessionProgressPhaseView, SessionPromptDispositionView, SessionRunStageView,
+    SessionSuspensionKindView, SessionTimelineView, TimelineContentView, TimelineEventKindView,
+    TimelineEventView, TimelineStatusView,
 };
 use waltr_tui::{
     app::{App, AppAction, AppScreen},

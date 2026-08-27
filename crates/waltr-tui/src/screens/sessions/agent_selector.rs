@@ -11,7 +11,7 @@ use ratatui::{
 
 use crate::{theme::THEME, ui};
 
-use super::{SessionsSection, session_active};
+use super::SessionsSection;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AgentSelector {
@@ -125,7 +125,7 @@ pub(super) fn render_agent_selector(
                     .find(|session| session.id == *session_id),
                 AgentSelectorPurpose::Create => None,
             })
-            .is_some_and(|session| session_active(session.status.phase));
+            .is_some_and(|session| session.progress.running);
         if active {
             "Active work continues with the current agent. The switch applies next cycle."
         } else {

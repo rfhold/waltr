@@ -34,7 +34,6 @@ import type {
   ProviderView,
   SelectableAgentView,
   SessionTemplateOptionView,
-  SessionStatusView,
   SessionTimelineView,
   SessionView,
   TimestampView,
@@ -296,7 +295,7 @@ export function SessionsListRoute() {
                         <strong>{sessionDisplayLabel(session)}</strong>
                         <small>{formatTimestamp(session.updatedAt) ?? "No updates"}</small>
                       </span>
-                      <StatusChit phase={session.status.phase} />
+                      <StatusChit session={session} />
                     </button>
                     <SessionDeleteAction session={session} compact />
                   </div>
@@ -492,7 +491,7 @@ function SessionDetail(props: { session: SessionView }) {
   let clearHistoryShiftFrame: number | undefined;
 
   const timeline = createMemo(() => app.snapshot()?.sessions.timelines?.[props.session.id]);
-  const active = createMemo(() => sessionActive(props.session));
+  const interruptible = createMemo(() => props.session.capabilities.canInterrupt);
   const items = createMemo(() => timelineItems(timeline()));
   const lastTurn = createMemo(() => items().reduce<bigint | undefined>((last, item) => last === undefined || item.turn > last ? item.turn : last, undefined));
   const turnFooterItemIds = createMemo(() => {
@@ -508,7 +507,7 @@ function SessionDetail(props: { session: SessionView }) {
   const subtasks = createMemo(() => sessions.sessions().filter((session) => session.associations?.taskParentSessionId === props.session.id));
   const routineInvocations = createMemo(() => app.snapshot()?.routines.sessionHistories?.[props.session.id]?.recent ?? []);
   const testKeepMountedIndexes = createMemo(() => import.meta.env.MODE === "test" ? items().map((_, index) => index) : undefined);
-  const working = createMemo(() => active() && !hasOpenExternalPrompt(items()));
+  const working = createMemo(() => props.session.progress.running);
   const importantStatus = createMemo(() => sessionImportantStatus(props.session, working(), timeline()?.watch.error));
   const activeResourceToken = createMemo(() => {
     const text = draft();
@@ -809,7 +808,7 @@ function SessionDetail(props: { session: SessionView }) {
 
   const submit = async () => {
     const text = draft().trim();
-    if (!text || !timelineReady()) {
+    if (!text || !timelineReady() || !canSubmitPrompt(props.session)) {
       return;
     }
 
@@ -955,6 +954,10 @@ function SessionDetail(props: { session: SessionView }) {
   };
 
   const respond = async (requestId: string, response: unknown) => {
+    if (!props.session.capabilities.canRespondExternalRequest) {
+      return;
+    }
+
     setCommandError(undefined);
     try {
       await app.dispatchRespondExternalRequest(props.session.id, requestId, JSON.stringify(response));
@@ -1082,6 +1085,7 @@ function SessionDetail(props: { session: SessionView }) {
                   onSetShellOutputExpanded={(id, expanded) => setExpandedShellOutputs((current) => ({ ...current, [id]: expanded }))}
                   onRespond={respond}
                   onInterrupt={interrupt}
+                  canRespondExternalRequest={props.session.capabilities.canRespondExternalRequest}
                   showTurnActions={turnFooterItemIds().has(item.id)}
                   canRollbackTurn={lastTurn() !== undefined && item.turn < lastTurn()!}
                   onRollbackTurn={rollbackTurn}
@@ -1169,15 +1173,15 @@ function SessionDetail(props: { session: SessionView }) {
         <div class="sessions__composer-actions">
           <button
             type="button"
-            class={`sessions__composer-stop${active() ? "" : " sessions__composer-stop--hidden"}`}
-            disabled={!active()}
-            aria-hidden={!active()}
-            tabIndex={active() ? 0 : -1}
+            class={`sessions__composer-stop${interruptible() ? "" : " sessions__composer-stop--hidden"}`}
+            disabled={!interruptible()}
+            aria-hidden={!interruptible()}
+            tabIndex={interruptible() ? 0 : -1}
             onClick={() => void interrupt()}
           >
             Stop
           </button>
-          <button type="submit" disabled={!draft().trim() || !timelineReady()}>
+          <button type="submit" disabled={!draft().trim() || !timelineReady() || !canSubmitPrompt(props.session)}>
             Send
           </button>
         </div>
@@ -1201,7 +1205,7 @@ function SessionDetail(props: { session: SessionView }) {
         <SessionInferenceSettingsDialog session={props.session} onClose={() => setEditingInferenceSettings(false)} />
       </Show>
       <Show when={editingAgent()}>
-        <SessionAgentDialog session={props.session} active={active()} onClose={() => setEditingAgent(false)} />
+        <SessionAgentDialog session={props.session} active={props.session.progress.running} onClose={() => setEditingAgent(false)} />
       </Show>
     </div>
   );
@@ -1613,6 +1617,7 @@ function TimelineItem(props: {
   onSetShellOutputExpanded: (id: string, expanded: boolean) => void;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
   onInterrupt: () => Promise<void>;
+  canRespondExternalRequest: boolean;
   showTurnActions: boolean;
   canRollbackTurn: boolean;
   onRollbackTurn: (turn: bigint) => Promise<void>;
@@ -1642,13 +1647,13 @@ function TimelineItem(props: {
           {(metricsItem) => <TurnMetricsTimelineItemView item={metricsItem()} />}
         </Match>
         <Match when={permissionTimelineItem(item())}>
-          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespondExternalRequest} />}
         </Match>
         <Match when={questionTimelineItem(item())}>
-          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespondExternalRequest} />}
         </Match>
         <Match when={externalTimelineItem(item())}>
-          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />}
+          {(promptItem) => <ExternalRequestTimelineItem item={promptItem()} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespondExternalRequest} />}
         </Match>
       </Switch>
       <TimelineItemActions
@@ -1983,15 +1988,16 @@ function ExternalRequestTimelineItem(props: {
   item: Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }>;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
   onInterrupt: () => Promise<void>;
+  canRespond: boolean;
 }) {
   return (
     <Show when={!props.item.resolved} fallback={<ExternalRequestResult item={props.item} />}>
       <Switch>
         <Match when={props.item.kind === "permission"}>
-          <PermissionPrompt request={props.item.request} onRespond={props.onRespond} onInterrupt={props.onInterrupt} />
+          <PermissionPrompt request={props.item.request} onRespond={props.onRespond} onInterrupt={props.onInterrupt} canRespond={props.canRespond} />
         </Match>
         <Match when={props.item.kind === "question"}>
-          <QuestionPrompt request={props.item.request} onRespond={props.onRespond} />
+          <QuestionPrompt request={props.item.request} onRespond={props.onRespond} canRespond={props.canRespond} />
         </Match>
         <Match when={props.item.kind === "prompt"}>
           <ExternalPrompt request={props.item.request} />
@@ -2013,6 +2019,7 @@ function PermissionPrompt(props: {
   request: ExternalRequestView;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
   onInterrupt: () => Promise<void>;
+  canRespond: boolean;
 }) {
   const [message, setMessage] = createSignal("");
   const [confirmingAlways, setConfirmingAlways] = createSignal(false);
@@ -2058,13 +2065,13 @@ function PermissionPrompt(props: {
       </div>
 
       <div class="sessions__prompt-actions sessions__prompt-actions--primary">
-        <button class="sessions__prompt-button--primary" type="button" onClick={() => void props.onRespond(props.request.id, { decision: "allow_once" })}>
+        <button class="sessions__prompt-button--primary" type="button" disabled={!props.canRespond} onClick={() => void props.onRespond(props.request.id, { decision: "allow_once" })}>
           Allow once
         </button>
         <Show
           when={confirmingAlways()}
           fallback={
-            <button class="sessions__prompt-button--secondary" type="button" disabled={patterns().length === 0} onClick={() => setConfirmingAlways(true)}>
+            <button class="sessions__prompt-button--secondary" type="button" disabled={!props.canRespond || patterns().length === 0} onClick={() => setConfirmingAlways(true)}>
               Allow always
             </button>
           }
@@ -2072,7 +2079,7 @@ function PermissionPrompt(props: {
           <button
             class="sessions__prompt-button--primary"
             type="button"
-            disabled={patterns().length === 0}
+            disabled={!props.canRespond || patterns().length === 0}
             onClick={() => void props.onRespond(props.request.id, { decision: "allow_always", patterns: patterns() })}
           >
             Confirm always
@@ -2086,12 +2093,13 @@ function PermissionPrompt(props: {
           <textarea value={message()} onInput={(event) => setMessage(event.currentTarget.value)} />
         </label>
         <div class="sessions__prompt-actions">
-          <button class="sessions__prompt-button--danger" type="button" onClick={() => void props.onRespond(props.request.id, deny("return_tool_result"))}>
+          <button class="sessions__prompt-button--danger" type="button" disabled={!props.canRespond} onClick={() => void props.onRespond(props.request.id, deny("return_tool_result"))}>
             Deny and resume
           </button>
           <button
             class="sessions__prompt-button--danger"
             type="button"
+            disabled={!props.canRespond}
             onClick={() => {
               void props.onRespond(props.request.id, deny("cancel_work")).then(() => props.onInterrupt());
             }}
@@ -2107,6 +2115,7 @@ function PermissionPrompt(props: {
 function QuestionPrompt(props: {
   request: ExternalRequestView;
   onRespond: (requestId: string, response: unknown) => Promise<void>;
+  canRespond: boolean;
 }) {
   const payload = createMemo(() => parseJsonRecord(props.request.payloadJson));
   const questions = createMemo(() => asArray(payload().questions).map(normalizeQuestion));
@@ -2188,7 +2197,7 @@ function QuestionPrompt(props: {
         )}
       </For>
       <div class="sessions__prompt-actions sessions__prompt-actions--primary">
-        <button class="sessions__prompt-button--primary" type="button" onClick={() => void props.onRespond(props.request.id, submit())}>
+        <button class="sessions__prompt-button--primary" type="button" disabled={!props.canRespond} onClick={() => void props.onRespond(props.request.id, submit())}>
           Resume session
         </button>
       </div>
@@ -2513,10 +2522,6 @@ function upsertExternalRequestItem(
   items.push(item);
 }
 
-function hasOpenExternalPrompt(items: TimelineItemModel[]) {
-  return items.some((item) => isExternalPromptItem(item) && !item.resolved);
-}
-
 function isExternalPromptItem(item: TimelineItemModel): item is Extract<TimelineItemModel, { kind: "permission" | "question" | "prompt" }> {
   return item.kind === "permission" || item.kind === "question" || item.kind === "prompt";
 }
@@ -2814,10 +2819,6 @@ function diffLineParts(text: string, kind: "add" | "remove" | "file" | "meta" | 
   return { prefix: "", code: text };
 }
 
-function sessionActive(session: SessionView) {
-  return !["idle", "suspended", "finished", "failed", "unknown", "unspecified"].includes(session.status.phase);
-}
-
 function AuthenticationFailureAlert(props: { failure: AuthenticationFailureSnapshot; message: string }) {
   const targetName = () => props.failure.target.kind === "mcpServer" ? "MCP server" : "provider";
   const configHref = () => props.failure.target.kind === "mcpServer"
@@ -2893,14 +2894,43 @@ function sessionImportantStatus(session: SessionView, working: boolean, watchErr
     };
   }
 
-  if (session.status.phase === "failed") {
+  if (session.progress.phase === "failed") {
     return {
       tone: "error",
       message: session.status.failedMessage || "Session failed.",
     };
   }
 
+  const progress = sessionProgressStatus(session);
+  if (progress) {
+    return { tone: "working", message: progress };
+  }
+
   return working ? { tone: "working", message: "Working..." } : undefined;
+}
+
+function sessionProgressStatus(session: SessionView) {
+  const progress = session.progress;
+  let message: string | undefined;
+
+  if (progress.phase === "paused") {
+    const reason = progress.reason;
+    if (reason?.code === "context-compaction") {
+      message = "Paused: compacting context";
+    } else if (reason?.source) {
+      message = `Paused by Routine: ${reason.source}`;
+    } else {
+      message = `Paused: ${reason?.source || reason?.code || "unknown"}`;
+    }
+  } else if (progress.phase === "completionBarrier") {
+    message = "Checking post-run automation";
+  }
+
+  if (!message || progress.queuedCount <= 0n) {
+    return message;
+  }
+
+  return `${message} · ${progress.queuedCount} message${progress.queuedCount === 1n ? "" : "s"} queued`;
 }
 
 function isNearScrollBottom(element: HTMLElement) {
@@ -3006,7 +3036,7 @@ function SessionContextSidebar(props: {
             <For each={props.subtasks}>{(session) => (
               <li>
                 <A href={`/sessions/${encodeURIComponent(session.id)}`}>{session.associations?.taskDescription || sessionDisplayLabel(session)}</A>
-                <ContextStatus tone={sessionStatusTone(session.status)} label={sessionStatusLabel(session.status)} />
+                <ContextStatus tone={sessionDisplayStatusTone(session)} label={sessionDisplayStatusLabel(session)} />
               </li>
             )}</For>
           </ul>
@@ -3038,25 +3068,30 @@ function ContextStatus(props: { tone: "green" | "red" | "grey"; label: string })
   );
 }
 
-function sessionStatusTone(status: SessionStatusView): "green" | "red" | "grey" {
-  if (status.phase === "failed" || (status.phase === "suspended" && status.suspensionKind === "interrupted")) {
+function sessionDisplayStatusTone(session: SessionView): "green" | "red" | "grey" {
+  if (session.progress.phase === "failed" || session.progress.phase === "interrupted") {
     return "red";
   }
-  if (["buildingRequest", "streamingProvider", "retryingProvider", "evaluatingToolCall", "runningTool"].includes(status.phase)
-    || (status.phase === "suspended" && ["awaitingToolResults", "awaitingExternalInput"].includes(status.suspensionKind ?? ""))) {
+  if (["running", "completionBarrier", "paused", "awaitingToolResults", "awaitingExternalInput"].includes(session.progress.phase)) {
     return "green";
   }
   return "grey";
 }
 
-function sessionStatusLabel(status: SessionStatusView) {
-  if (status.phase === "suspended" && status.suspensionKind) {
-    if (status.suspensionKind === "unspecified" || status.suspensionKind === "unknown") {
-      return `Suspended (${status.suspensionKind})`;
-    }
-    return humanizeStatus(status.suspensionKind);
-  }
-  return humanizeStatus(status.phase);
+function sessionDisplayStatusLabel(session: SessionView) {
+  return sessionProgressStatus(session) ?? humanizeStatus(session.progress.phase === "running"
+    ? session.progress.runStage ?? "running"
+    : session.progress.phase);
+}
+
+function sessionStatusChit(session: SessionView) {
+  return sessionProgressStatus(session) ?? (session.progress.phase === "running"
+    ? session.progress.runStage ?? "running"
+    : session.progress.phase);
+}
+
+function canSubmitPrompt(session: SessionView) {
+  return ["immediate", "queued", "supersedeSuspension"].includes(session.capabilities.promptDisposition);
 }
 
 function routineStatusTone(status: string): "green" | "red" | "grey" {
@@ -3523,8 +3558,8 @@ function SessionDeleteAction(props: { session: SessionView; compact?: boolean })
   );
 }
 
-function StatusChit(props: { phase: string }) {
-  return <span class="session-status">{props.phase}</span>;
+function StatusChit(props: { session: SessionView }) {
+  return <span class="session-status">{sessionStatusChit(props.session)}</span>;
 }
 
 function useSessionsRoute() {

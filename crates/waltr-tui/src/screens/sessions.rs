@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 use waltr_client::{
     AuthenticationFailureSnapshot, ClientCommand, ClientOperationView, ClientSessionTemplateKind,
     ClientSessionTemplateSearchTarget, ClientSnapshot, ClientTimelineDirection,
-    InferenceSettingsMatchView, SessionPhaseView, SessionTemplateSearchSnapshot,
-    SessionTimelineView, SessionView,
+    InferenceSettingsMatchView, SessionProgressPhaseView, SessionPromptDispositionView,
+    SessionRunStageView, SessionTemplateSearchSnapshot, SessionTimelineView, SessionView,
 };
 use ratatui::{
     Frame,
@@ -290,7 +290,7 @@ impl SessionsSection {
     ) -> Option<SessionDetailFooterStatus> {
         let session = self.current_detail_session(snapshot)?;
         let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(&session.id));
-        let prompt = current_external_prompt(snapshot, Some(session.id.as_str()));
+        let prompt = current_respondable_external_prompt(snapshot, Some(session.id.as_str()));
 
         if let Some(status) = session_important_status(&session, timeline, prompt.as_ref()) {
             let error = timeline
@@ -302,11 +302,11 @@ impl SessionsSection {
                         .or(timeline.load.error.as_ref())
                 })
                 .is_some()
-                || session.status.phase == SessionPhaseView::Failed;
+                || session.progress.phase == SessionProgressPhaseView::Failed;
             return Some(SessionDetailFooterStatus {
                 text: status,
                 error,
-                interruptible: session_active(session.status.phase) && prompt.is_none(),
+                interruptible: session.capabilities.can_interrupt,
             });
         }
 
@@ -867,7 +867,7 @@ impl SessionsSection {
             return self.handle_rollback_modal_key(key);
         }
 
-        if current_external_prompt(snapshot, self.detail_session_id()).is_some() {
+        if current_respondable_external_prompt(snapshot, self.detail_session_id()).is_some() {
             return self.handle_prompt_key(key, snapshot);
         }
 
@@ -965,7 +965,23 @@ impl SessionsSection {
         let Some(session_id) = self.detail_session_id().map(str::to_owned) else {
             return SectionAction::Continue;
         };
-        if text.is_empty() || !timeline_ready(snapshot, &session_id) {
+        let can_submit = snapshot
+            .and_then(|snapshot| {
+                snapshot
+                    .sessions
+                    .current
+                    .iter()
+                    .find(|session| session.id == session_id)
+            })
+            .is_some_and(|session| {
+                matches!(
+                    session.capabilities.prompt_disposition,
+                    SessionPromptDispositionView::Immediate
+                        | SessionPromptDispositionView::Queued
+                        | SessionPromptDispositionView::SupersedeSuspension
+                )
+            });
+        if text.is_empty() || !timeline_ready(snapshot, &session_id) || !can_submit {
             return SectionAction::Continue;
         }
 
@@ -1196,7 +1212,7 @@ impl SessionsSection {
         let Some(session) = self.current_detail_session(snapshot) else {
             return SectionAction::Continue;
         };
-        if !session_active(session.status.phase) {
+        if !session.capabilities.can_interrupt {
             return SectionAction::Continue;
         }
 
@@ -1563,7 +1579,7 @@ impl SessionsSection {
                 Constraint::Length(status_height(snapshot, self)),
             ])
             .areas(area);
-        let prompt = current_external_prompt(snapshot, Some(id));
+        let prompt = current_respondable_external_prompt(snapshot, Some(id));
         Some(self.detail_areas(main_area, prompt.as_ref()).timeline)
     }
 
@@ -1749,7 +1765,7 @@ impl SessionsSection {
         };
 
         let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(id));
-        let prompt = current_external_prompt(snapshot, Some(id));
+        let prompt = current_respondable_external_prompt(snapshot, Some(id));
         let detail_areas = self.detail_areas(main_area, prompt.as_ref());
         let timeline_area = detail_areas.timeline;
         let response_area = detail_areas.response;
@@ -2206,7 +2222,7 @@ fn session_line(section: &SessionsSection, session: &SessionView, selected: bool
         Span::styled(" ", session_option_style(selected)),
         session_option_title(session.display_label().to_owned(), selected),
         Span::styled("  ", session_option_style(selected)),
-        phase_span_with_bg(session.status.phase, selected),
+        session_status_span_with_bg(session, selected),
         Span::styled("  ", session_option_style(selected)),
         Span::styled(
             format_timestamp(session),
@@ -2245,13 +2261,15 @@ fn detail_widget(
     let timeline = snapshot.and_then(|snapshot| snapshot.sessions.timelines.get(id));
     let mut lines = vec![Line::from(vec![
         Span::styled("Session ", THEME.muted_text_style()),
-        Span::raw(session.id),
+        Span::raw(session.id.clone()),
         Span::raw("  "),
         Span::styled("status ", THEME.muted_text_style()),
-        phase_span(session.status.phase),
+        session_status_span(&session),
     ])];
 
-    if !session.status.failed_message.is_empty() {
+    if session.progress.phase == SessionProgressPhaseView::Failed
+        && !session.status.failed_message.is_empty()
+    {
         lines.push(ui::error_line(&session.status.failed_message));
     }
 
@@ -2351,11 +2369,12 @@ fn session_delete_prompt_span(text: impl Into<String>, selected: bool) -> Span<'
     )
 }
 
-fn phase_span_with_bg(phase: SessionPhaseView, selected: bool) -> Span<'static> {
+fn session_status_span_with_bg(session: &SessionView, selected: bool) -> Span<'static> {
+    let (text, role) = progress_status(session);
     Span::styled(
-        phase_name(phase),
+        text,
         THEME
-            .status_style(phase_role(phase))
+            .status_style(role)
             .bg(session_option_bg(selected))
             .add_modifier(Modifier::BOLD),
     )
@@ -2536,39 +2555,9 @@ fn auth_failure_reason(reason: &str) -> &'static str {
     }
 }
 
-fn phase_span(phase: SessionPhaseView) -> Span<'static> {
-    Span::styled(
-        phase_name(phase),
-        THEME
-            .status_style(phase_role(phase))
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
-const fn phase_role(phase: SessionPhaseView) -> StatusRole {
-    match phase {
-        SessionPhaseView::Failed => StatusRole::Error,
-        SessionPhaseView::Finished | SessionPhaseView::Idle | SessionPhaseView::Suspended => {
-            StatusRole::Ready
-        }
-        _ => StatusRole::Loading,
-    }
-}
-
-const fn phase_name(phase: SessionPhaseView) -> &'static str {
-    match phase {
-        SessionPhaseView::Unspecified => "unspecified",
-        SessionPhaseView::Idle => "idle",
-        SessionPhaseView::BuildingRequest => "building request",
-        SessionPhaseView::StreamingProvider => "streaming provider",
-        SessionPhaseView::RetryingProvider => "retrying provider",
-        SessionPhaseView::EvaluatingToolCall => "evaluating tool call",
-        SessionPhaseView::RunningTool => "running tool",
-        SessionPhaseView::Suspended => "suspended",
-        SessionPhaseView::Finished => "finished",
-        SessionPhaseView::Failed => "failed",
-        SessionPhaseView::Unknown => "unknown",
-    }
+fn session_status_span(session: &SessionView) -> Span<'static> {
+    let (text, role) = progress_status(session);
+    Span::styled(text, THEME.status_style(role).add_modifier(Modifier::BOLD))
 }
 
 fn format_timestamp(session: &SessionView) -> String {
@@ -2603,7 +2592,7 @@ fn session_important_status(
         return Some(error.clone());
     }
 
-    if session.status.phase == SessionPhaseView::Failed {
+    if session.progress.phase == SessionProgressPhaseView::Failed {
         return Some(session.status.authentication_failure.as_ref().map_or_else(
             || {
                 if session.status.failed_message.is_empty() {
@@ -2616,23 +2605,98 @@ fn session_important_status(
         ));
     }
 
-    if session_active(session.status.phase) && prompt.is_none() {
+    if let Some(status) = progress_coordination_status(session) {
+        return Some(status);
+    }
+
+    if session.progress.phase == SessionProgressPhaseView::Running && prompt.is_none() {
         return Some("Working...".to_owned());
     }
 
     None
 }
 
-const fn session_active(phase: SessionPhaseView) -> bool {
-    !matches!(
-        phase,
-        SessionPhaseView::Unspecified
-            | SessionPhaseView::Idle
-            | SessionPhaseView::Suspended
-            | SessionPhaseView::Finished
-            | SessionPhaseView::Failed
-            | SessionPhaseView::Unknown
-    )
+pub(super) fn progress_coordination_status(session: &SessionView) -> Option<String> {
+    let reason = session.progress.reason.as_ref();
+    let status = match session.progress.phase {
+        SessionProgressPhaseView::Paused => match reason {
+            Some(reason) if reason.code == "context-compaction" => {
+                "Paused: compacting context".to_owned()
+            }
+            Some(reason) if reason.source.is_some() => format!(
+                "Paused by Routine: {}",
+                reason.source.as_deref().unwrap_or_default()
+            ),
+            Some(reason) => format!("Paused: {}", reason.code),
+            None => "Paused: unknown".to_owned(),
+        },
+        SessionProgressPhaseView::CompletionBarrier => "Checking post-run automation".to_owned(),
+        _ => return None,
+    };
+    Some(append_queue_count(status, session.progress.queued_count))
+}
+
+fn append_queue_count(mut status: String, queued_count: u64) -> String {
+    if queued_count > 0 {
+        let noun = if queued_count == 1 {
+            "message"
+        } else {
+            "messages"
+        };
+        status.push_str(&format!(" · {queued_count} {noun} queued"));
+    }
+    status
+}
+
+pub(super) fn progress_status(session: &SessionView) -> (String, StatusRole) {
+    if let Some(status) = progress_coordination_status(session) {
+        return (status, StatusRole::Loading);
+    }
+    let (text, role) = match session.progress.phase {
+        SessionProgressPhaseView::Unknown => ("unknown", StatusRole::Loading),
+        SessionProgressPhaseView::Idle => ("idle", StatusRole::Ready),
+        SessionProgressPhaseView::Running => (
+            match session.progress.run_stage {
+                Some(SessionRunStageView::BuildingRequest) => "building request",
+                Some(SessionRunStageView::StreamingProvider) => "streaming provider",
+                Some(SessionRunStageView::RetryingProvider) => "retrying provider",
+                Some(SessionRunStageView::EvaluatingToolCall) => "evaluating tool call",
+                Some(SessionRunStageView::RunningTool) => "running tool",
+                Some(SessionRunStageView::Unknown) | None => "running",
+            },
+            StatusRole::Loading,
+        ),
+        SessionProgressPhaseView::AwaitingToolResults => {
+            ("awaiting tool results", StatusRole::Ready)
+        }
+        SessionProgressPhaseView::AwaitingExternalInput => {
+            ("awaiting external input", StatusRole::Ready)
+        }
+        SessionProgressPhaseView::Interrupted => ("interrupted", StatusRole::Error),
+        SessionProgressPhaseView::Finished => ("finished", StatusRole::Ready),
+        SessionProgressPhaseView::Failed => ("failed", StatusRole::Error),
+        SessionProgressPhaseView::CompletionBarrier | SessionProgressPhaseView::Paused => {
+            unreachable!("coordination progress handled above")
+        }
+    };
+    (text.to_owned(), role)
+}
+
+fn current_respondable_external_prompt(
+    snapshot: Option<&ClientSnapshot>,
+    session_id: Option<&str>,
+) -> Option<ExternalPromptModel> {
+    let session_id = session_id?;
+    let snapshot = snapshot?;
+    let session = snapshot
+        .sessions
+        .current
+        .iter()
+        .find(|session| session.id == session_id)?;
+    if !session.capabilities.can_respond_external_request {
+        return None;
+    }
+    current_external_prompt(Some(snapshot), Some(session_id))
 }
 
 fn timeline_ready(snapshot: Option<&ClientSnapshot>, session_id: &str) -> bool {

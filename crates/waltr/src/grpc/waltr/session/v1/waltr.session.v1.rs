@@ -503,6 +503,56 @@ pub struct SessionSummary {
     pub agent_name: ::prost::alloc::string::String,
     #[prost(message, optional, tag="11")]
     pub metadata: ::core::option::Option<::prost_types::Struct>,
+    #[prost(message, optional, tag="12")]
+    pub coordination: ::core::option::Option<SessionCoordinationState>,
+    #[prost(message, optional, tag="13")]
+    pub progress: ::core::option::Option<SessionProgress>,
+    #[prost(message, optional, tag="14")]
+    pub capabilities: ::core::option::Option<SessionCapabilities>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionCoordinationState {
+    #[prost(enumeration="SessionCoordinationPhase", tag="1")]
+    pub phase: i32,
+    #[prost(message, optional, tag="2")]
+    pub reason: ::core::option::Option<SessionCoordinationReason>,
+    #[prost(uint32, tag="3")]
+    pub queued_count: u32,
+    #[prost(bool, tag="4")]
+    pub continuation_armed: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionCoordinationReason {
+    #[prost(string, tag="1")]
+    pub code: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="2")]
+    pub source: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub trigger: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionProgress {
+    #[prost(enumeration="SessionProgressPhase", tag="1")]
+    pub phase: i32,
+    #[prost(enumeration="SessionRunStage", optional, tag="2")]
+    pub run_stage: ::core::option::Option<i32>,
+    #[prost(message, optional, tag="3")]
+    pub reason: ::core::option::Option<SessionCoordinationReason>,
+    #[prost(uint64, tag="4")]
+    pub queued_count: u64,
+    #[prost(bool, tag="5")]
+    pub continuation_armed: bool,
+    #[prost(bool, tag="6")]
+    pub running: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SessionCapabilities {
+    #[prost(enumeration="SessionPromptDisposition", tag="1")]
+    pub prompt_disposition: i32,
+    #[prost(bool, tag="2")]
+    pub can_respond_external_request: bool,
+    #[prost(bool, tag="3")]
+    pub can_interrupt: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SessionMetrics {
@@ -861,6 +911,161 @@ impl TimelineStatus {
             "TIMELINE_STATUS_FAILED" => Some(Self::Failed),
             "TIMELINE_STATUS_CANCELED" => Some(Self::Canceled),
             "TIMELINE_STATUS_RETRYING_PROVIDER" => Some(Self::RetryingProvider),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionCoordinationPhase {
+    Unspecified = 0,
+    Ready = 1,
+    Running = 2,
+    CompletionBarrier = 3,
+    Paused = 4,
+}
+impl SessionCoordinationPhase {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SESSION_COORDINATION_PHASE_UNSPECIFIED",
+            Self::Ready => "SESSION_COORDINATION_PHASE_READY",
+            Self::Running => "SESSION_COORDINATION_PHASE_RUNNING",
+            Self::CompletionBarrier => "SESSION_COORDINATION_PHASE_COMPLETION_BARRIER",
+            Self::Paused => "SESSION_COORDINATION_PHASE_PAUSED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SESSION_COORDINATION_PHASE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SESSION_COORDINATION_PHASE_READY" => Some(Self::Ready),
+            "SESSION_COORDINATION_PHASE_RUNNING" => Some(Self::Running),
+            "SESSION_COORDINATION_PHASE_COMPLETION_BARRIER" => Some(Self::CompletionBarrier),
+            "SESSION_COORDINATION_PHASE_PAUSED" => Some(Self::Paused),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionProgressPhase {
+    Unspecified = 0,
+    Idle = 1,
+    Running = 2,
+    CompletionBarrier = 3,
+    Paused = 4,
+    AwaitingToolResults = 5,
+    AwaitingExternalInput = 6,
+    Interrupted = 7,
+    Finished = 8,
+    Failed = 9,
+}
+impl SessionProgressPhase {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SESSION_PROGRESS_PHASE_UNSPECIFIED",
+            Self::Idle => "SESSION_PROGRESS_PHASE_IDLE",
+            Self::Running => "SESSION_PROGRESS_PHASE_RUNNING",
+            Self::CompletionBarrier => "SESSION_PROGRESS_PHASE_COMPLETION_BARRIER",
+            Self::Paused => "SESSION_PROGRESS_PHASE_PAUSED",
+            Self::AwaitingToolResults => "SESSION_PROGRESS_PHASE_AWAITING_TOOL_RESULTS",
+            Self::AwaitingExternalInput => "SESSION_PROGRESS_PHASE_AWAITING_EXTERNAL_INPUT",
+            Self::Interrupted => "SESSION_PROGRESS_PHASE_INTERRUPTED",
+            Self::Finished => "SESSION_PROGRESS_PHASE_FINISHED",
+            Self::Failed => "SESSION_PROGRESS_PHASE_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SESSION_PROGRESS_PHASE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SESSION_PROGRESS_PHASE_IDLE" => Some(Self::Idle),
+            "SESSION_PROGRESS_PHASE_RUNNING" => Some(Self::Running),
+            "SESSION_PROGRESS_PHASE_COMPLETION_BARRIER" => Some(Self::CompletionBarrier),
+            "SESSION_PROGRESS_PHASE_PAUSED" => Some(Self::Paused),
+            "SESSION_PROGRESS_PHASE_AWAITING_TOOL_RESULTS" => Some(Self::AwaitingToolResults),
+            "SESSION_PROGRESS_PHASE_AWAITING_EXTERNAL_INPUT" => Some(Self::AwaitingExternalInput),
+            "SESSION_PROGRESS_PHASE_INTERRUPTED" => Some(Self::Interrupted),
+            "SESSION_PROGRESS_PHASE_FINISHED" => Some(Self::Finished),
+            "SESSION_PROGRESS_PHASE_FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionRunStage {
+    Unspecified = 0,
+    BuildingRequest = 1,
+    StreamingProvider = 2,
+    RetryingProvider = 3,
+    EvaluatingToolCall = 4,
+    RunningTool = 5,
+}
+impl SessionRunStage {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SESSION_RUN_STAGE_UNSPECIFIED",
+            Self::BuildingRequest => "SESSION_RUN_STAGE_BUILDING_REQUEST",
+            Self::StreamingProvider => "SESSION_RUN_STAGE_STREAMING_PROVIDER",
+            Self::RetryingProvider => "SESSION_RUN_STAGE_RETRYING_PROVIDER",
+            Self::EvaluatingToolCall => "SESSION_RUN_STAGE_EVALUATING_TOOL_CALL",
+            Self::RunningTool => "SESSION_RUN_STAGE_RUNNING_TOOL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SESSION_RUN_STAGE_UNSPECIFIED" => Some(Self::Unspecified),
+            "SESSION_RUN_STAGE_BUILDING_REQUEST" => Some(Self::BuildingRequest),
+            "SESSION_RUN_STAGE_STREAMING_PROVIDER" => Some(Self::StreamingProvider),
+            "SESSION_RUN_STAGE_RETRYING_PROVIDER" => Some(Self::RetryingProvider),
+            "SESSION_RUN_STAGE_EVALUATING_TOOL_CALL" => Some(Self::EvaluatingToolCall),
+            "SESSION_RUN_STAGE_RUNNING_TOOL" => Some(Self::RunningTool),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionPromptDisposition {
+    Unspecified = 0,
+    Immediate = 1,
+    Queued = 2,
+    SupersedeSuspension = 3,
+}
+impl SessionPromptDisposition {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SESSION_PROMPT_DISPOSITION_UNSPECIFIED",
+            Self::Immediate => "SESSION_PROMPT_DISPOSITION_IMMEDIATE",
+            Self::Queued => "SESSION_PROMPT_DISPOSITION_QUEUED",
+            Self::SupersedeSuspension => "SESSION_PROMPT_DISPOSITION_SUPERSEDE_SUSPENSION",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SESSION_PROMPT_DISPOSITION_UNSPECIFIED" => Some(Self::Unspecified),
+            "SESSION_PROMPT_DISPOSITION_IMMEDIATE" => Some(Self::Immediate),
+            "SESSION_PROMPT_DISPOSITION_QUEUED" => Some(Self::Queued),
+            "SESSION_PROMPT_DISPOSITION_SUPERSEDE_SUSPENSION" => Some(Self::SupersedeSuspension),
             _ => None,
         }
     }

@@ -17,10 +17,11 @@ use waltr_client::{
     ModelLimitsView, ModelOptionsView, ModelTypeView, ModelView, OperationCollectionSnapshot,
     OperationSnapshot, ProjectedTimelineEntryView, ProviderKindView, ProviderView,
     ResourceEditBaselineView, RoutineDefinitionSnapshot, RoutineHistorySnapshot, RoutineSnapshot,
-    SelectableAgentView, SessionAgentCatalogSnapshot, SessionPhaseView, SessionSnapshot,
-    SessionStatusView, SessionTimelineView, SessionView, StatusSnapshot, TimelineContentView,
-    TimelineEventKindView, TimelineEventView, TimelinePresentationView, TimelineStatusView,
-    TimestampView,
+    SelectableAgentView, SessionAgentCatalogSnapshot, SessionCapabilitiesView, SessionPhaseView,
+    SessionProgressPhaseView, SessionProgressView, SessionPromptDispositionView,
+    SessionRunStageView, SessionSnapshot, SessionStatusView, SessionTimelineView, SessionView,
+    StatusSnapshot, TimelineContentView, TimelineEventKindView, TimelineEventView,
+    TimelinePresentationView, TimelineStatusView, TimestampView,
 };
 use waltr_tui::{
     app::{App, AppAction},
@@ -756,6 +757,36 @@ pub(crate) fn session_with_phase(
     phase: SessionPhaseView,
     failed_message: &str,
 ) -> SessionView {
+    let (progress_phase, run_stage) = match phase {
+        SessionPhaseView::Unspecified | SessionPhaseView::Unknown => {
+            (SessionProgressPhaseView::Unknown, None)
+        }
+        SessionPhaseView::Idle => (SessionProgressPhaseView::Idle, None),
+        SessionPhaseView::BuildingRequest => (
+            SessionProgressPhaseView::Running,
+            Some(SessionRunStageView::BuildingRequest),
+        ),
+        SessionPhaseView::StreamingProvider => (
+            SessionProgressPhaseView::Running,
+            Some(SessionRunStageView::StreamingProvider),
+        ),
+        SessionPhaseView::RetryingProvider => (
+            SessionProgressPhaseView::Running,
+            Some(SessionRunStageView::RetryingProvider),
+        ),
+        SessionPhaseView::EvaluatingToolCall => (
+            SessionProgressPhaseView::Running,
+            Some(SessionRunStageView::EvaluatingToolCall),
+        ),
+        SessionPhaseView::RunningTool => (
+            SessionProgressPhaseView::Running,
+            Some(SessionRunStageView::RunningTool),
+        ),
+        SessionPhaseView::Suspended => (SessionProgressPhaseView::Unknown, None),
+        SessionPhaseView::Finished => (SessionProgressPhaseView::Finished, None),
+        SessionPhaseView::Failed => (SessionProgressPhaseView::Failed, None),
+    };
+    let can_interrupt = progress_phase == SessionProgressPhaseView::Running;
     SessionView {
         id: id.to_owned(),
         agent_name: "default".to_owned(),
@@ -765,6 +796,20 @@ pub(crate) fn session_with_phase(
             suspension_kind: None,
             failed_message: failed_message.to_owned(),
             authentication_failure: None,
+        },
+        coordination: Default::default(),
+        progress: SessionProgressView {
+            phase: progress_phase,
+            run_stage,
+            reason: None,
+            queued_count: 0,
+            continuation_armed: false,
+            running: can_interrupt,
+        },
+        capabilities: SessionCapabilitiesView {
+            prompt_disposition: SessionPromptDispositionView::Immediate,
+            can_respond_external_request: false,
+            can_interrupt,
         },
         current_prompt: None,
         created_at: Some(TimestampView { seconds, nanos: 0 }),

@@ -1866,15 +1866,11 @@ fn sessions_detail_context_is_right_on_wide_and_capped_above_composer_on_narrow(
         session,
         vec![timeline_metrics_event(1, "parent", 1_200, 34)],
     );
-    let mut child = session_with_phase(
-        "child",
-        1,
-        SessionPhaseView::Suspended,
-        "",
-    );
+    let mut child = session_with_phase("child", 1, SessionPhaseView::Suspended, "");
     child.associations.task_parent_session_id = Some("parent".to_owned());
     child.associations.task_description = Some("Wait for review".to_owned());
     child.status.suspension_kind = Some(SessionSuspensionKindView::AwaitingExternalInput);
+    child.progress.phase = SessionProgressPhaseView::AwaitingExternalInput;
     snapshot.sessions.current.push(child);
 
     let mut app = open_sessions_app_with(snapshot);
@@ -2559,7 +2555,7 @@ fn sessions_failed_status_renders_mcp_context_and_all_reason_guidance() {
 fn sessions_respond_and_continue_auth_failures_stay_inline() {
     let now = Instant::now();
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
-    let base = watched_session_with_timeline(
+    let base = respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 1, payload,
@@ -2705,6 +2701,153 @@ fn sessions_detail_stop_dispatches_only_for_active_sessions() {
 }
 
 #[test]
+fn sessions_progress_status_copy_queue_precedence_and_clear() {
+    let now = Instant::now();
+    let cases = [
+        (
+            SessionProgressPhaseView::CompletionBarrier,
+            None,
+            0,
+            "Checking post-run automation",
+        ),
+        (
+            SessionProgressPhaseView::Paused,
+            Some(SessionCoordinationReasonView {
+                code: "context-compaction".to_owned(),
+                source: Some("compact-and-continue".to_owned()),
+                trigger: None,
+            }),
+            1,
+            "Paused: compacting context · 1 message queued",
+        ),
+        (
+            SessionProgressPhaseView::Paused,
+            Some(SessionCoordinationReasonView {
+                code: "host-operation".to_owned(),
+                source: Some("review-and-continue".to_owned()),
+                trigger: None,
+            }),
+            3,
+            "Paused by Routine: review-and-continue · 3 messages queued",
+        ),
+        (
+            SessionProgressPhaseView::Paused,
+            Some(SessionCoordinationReasonView {
+                code: "future-reason".to_owned(),
+                source: None,
+                trigger: None,
+            }),
+            0,
+            "Paused: future-reason",
+        ),
+    ];
+
+    for (phase, reason, queued_count, expected) in cases {
+        let mut session = session_with_phase("chat", 1, SessionPhaseView::Finished, "");
+        session.progress.phase = phase;
+        session.progress.reason = reason;
+        session.progress.queued_count = queued_count;
+        let mut app = open_sessions_app_with(watched_session_with_timeline(session, Vec::new()));
+        let list = render_app_with_size(&app, 120, 24);
+        assert!(list.contains(expected), "{list}");
+        drop(app.handle_event(&right_press(), now));
+        let detail = render_app_with_size(&app, 120, 24);
+        assert!(detail.contains(expected), "{detail}");
+        assert!(!detail.contains("Esc Esc interrupt"), "{detail}");
+    }
+
+    let mut active_pause = session_with_phase("chat", 1, SessionPhaseView::StreamingProvider, "");
+    active_pause.progress.phase = SessionProgressPhaseView::Paused;
+    active_pause.progress.reason = Some(SessionCoordinationReasonView {
+        code: "host-operation".to_owned(),
+        source: Some("review".to_owned()),
+        trigger: None,
+    });
+    let mut app = open_sessions_app_with(watched_session_with_timeline(active_pause, Vec::new()));
+    drop(app.handle_event(&right_press(), now));
+    assert!(render_app_with_size(&app, 120, 24).contains("Esc Esc interrupt"));
+    drop(app.handle_event(&ctrl_x_press(), now));
+    assert!(matches!(
+        app.handle_event(&char_press('s'), now),
+        AppAction::ClientCommand(ClientCommand::InterruptSession { session_id })
+            if session_id == "chat"
+    ));
+
+    let mut failed = session_with_phase("chat", 1, SessionPhaseView::Failed, "durable failure");
+    failed.progress.phase = SessionProgressPhaseView::Failed;
+    failed.progress.reason = Some(SessionCoordinationReasonView {
+        code: "context-compaction".to_owned(),
+        source: None,
+        trigger: None,
+    });
+    let failed = open_sessions_app_with(watched_session_with_timeline(failed, Vec::new()));
+    let rendered = render_app_with_size(&failed, 120, 24);
+    assert!(rendered.contains("failed"), "{rendered}");
+    assert!(!rendered.contains("Paused:"), "{rendered}");
+
+    let mut paused = session_with_phase("chat", 1, SessionPhaseView::Finished, "");
+    paused.progress.phase = SessionProgressPhaseView::Paused;
+    paused.progress.reason = Some(SessionCoordinationReasonView {
+        code: "context-compaction".to_owned(),
+        source: None,
+        trigger: None,
+    });
+    paused.progress.queued_count = 2;
+    let mut snapshot = watched_session_with_timeline(paused, Vec::new());
+    snapshot
+        .sessions
+        .timelines
+        .get_mut("chat")
+        .expect("timeline")
+        .watch
+        .error = Some("timeline disconnected".to_owned());
+    let mut app = open_sessions_app_with(snapshot);
+    drop(app.handle_event(&right_press(), now));
+    let rendered = render_app_with_size(&app, 120, 24);
+    assert!(rendered.contains("timeline disconnected"), "{rendered}");
+
+    let ready = watched_session_with_timeline(
+        session_with_phase("chat", 2, SessionPhaseView::Finished, ""),
+        Vec::new(),
+    );
+    drop(app.handle_event(&AppEvent::Client(Box::new(ready)), now));
+    let rendered = render_app_with_size(&app, 120, 24);
+    assert!(!rendered.contains("Paused:"), "{rendered}");
+    assert!(!rendered.contains("queued"), "{rendered}");
+}
+
+#[test]
+fn sessions_progress_status_preserves_reason_at_narrow_width_and_in_subtasks() {
+    let mut parent = session_view("parent", 2);
+    parent
+        .metadata
+        .insert("title".to_owned(), serde_json::json!("Parent"));
+    let mut child = session_with_phase("child", 1, SessionPhaseView::Finished, "");
+    child.associations.task_parent_session_id = Some("parent".to_owned());
+    child.associations.task_description = Some("Child task".to_owned());
+    child.progress.phase = SessionProgressPhaseView::Paused;
+    child.progress.reason = Some(SessionCoordinationReasonView {
+        code: "context-compaction".to_owned(),
+        source: None,
+        trigger: None,
+    });
+    child.progress.queued_count = 22;
+    let mut snapshot = watched_session_with_timeline(parent, Vec::new());
+    snapshot.sessions.current.push(child);
+    let mut app = open_sessions_app_with(snapshot);
+    drop(app.handle_event(&right_press(), Instant::now()));
+
+    let wide = render_app_with_size(&app, 140, 30);
+    assert!(wide.contains("Paused:"), "{wide}");
+    assert!(wide.contains("compacting context · 22"), "{wide}");
+    assert!(wide.contains("messages queued"), "{wide}");
+    let narrow = render_app_with_size(&app, 48, 24);
+    assert!(narrow.contains("Paused:"), "{narrow}");
+    let status = "Paused: compacting context · 22 messages queued";
+    assert!(status.find("compacting context") < status.find("messages queued"));
+}
+
+#[test]
 fn sessions_detail_escape_interrupts_active_session_on_second_press() {
     let active = session_with_phase("active", 1, SessionPhaseView::StreamingProvider, "");
     let mut app = open_sessions_app_with(watched_session_with_timeline(active, Vec::new()));
@@ -2729,6 +2872,72 @@ fn sessions_detail_escape_interrupts_active_session_on_second_press() {
             session_id: "active".to_owned(),
         })
     );
+}
+
+#[test]
+fn sessions_progress_remains_authoritative_when_durable_status_disagrees() {
+    let mut session = session_view("chat", 1);
+    session.progress.phase = SessionProgressPhaseView::Running;
+    session.progress.run_stage = Some(SessionRunStageView::RunningTool);
+    session.progress.running = true;
+    session.capabilities.can_interrupt = false;
+    let mut app = open_sessions_app_with(watched_session_with_timeline(session, Vec::new()));
+    let now = Instant::now();
+    drop(app.handle_event(&right_press(), now));
+
+    let rendered = render_app_with_size(&app, 120, 24);
+    assert!(rendered.contains("Working..."), "{rendered}");
+    assert!(!rendered.contains("Esc Esc interrupt"), "{rendered}");
+    drop(app.handle_event(&ctrl_x_press(), now));
+    assert_eq!(app.handle_event(&char_press('s'), now), AppAction::Continue);
+}
+
+#[test]
+fn sessions_unknown_capabilities_conservatively_disable_controls() {
+    let dispositions = [
+        SessionPromptDispositionView::Immediate,
+        SessionPromptDispositionView::Queued,
+        SessionPromptDispositionView::SupersedeSuspension,
+        SessionPromptDispositionView::Unknown,
+    ];
+    for disposition in dispositions {
+        let mut session = session_with_phase("chat", 1, SessionPhaseView::RunningTool, "");
+        session.progress = Default::default();
+        session.capabilities.prompt_disposition = disposition;
+        session.capabilities.can_interrupt = false;
+        let mut app = open_sessions_app_with(watched_session_with_timeline(session, Vec::new()));
+        let now = Instant::now();
+        drop(app.handle_event(&right_press(), now));
+        drop(app.handle_event(&char_press('h'), now));
+        drop(app.handle_event(&char_press('i'), now));
+        let action = app.handle_event(&enter_press(), now);
+        if disposition == SessionPromptDispositionView::Unknown {
+            assert_eq!(action, AppAction::Continue);
+            let rendered = render_app_with_size(&app, 120, 24);
+            assert!(!rendered.contains("Working..."), "{rendered}");
+            assert!(!rendered.contains("Esc Esc interrupt"), "{rendered}");
+        } else {
+            assert!(matches!(
+                action,
+                AppAction::ClientCommand(ClientCommand::SubmitUserMessage { text, .. })
+                    if text == "hi"
+            ));
+        }
+    }
+
+    let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
+    let mut session = session_view("chat", 1);
+    session.progress.phase = SessionProgressPhaseView::AwaitingExternalInput;
+    let mut app = open_sessions_app_with(watched_session_with_timeline(
+        session,
+        vec![external_request_event(
+            1, "chat", "req-item", "req-1", 1, payload,
+        )],
+    ));
+    drop(app.handle_event(&right_press(), Instant::now()));
+    let rendered = render_app(&app);
+    assert!(!rendered.contains("Permission required"), "{rendered}");
+    assert!(!rendered.contains("Deny and interrupt"), "{rendered}");
 }
 
 #[test]
@@ -2963,6 +3172,10 @@ fn inference_editor_snapshot() -> ClientSnapshot {
 fn active_inference_editor_snapshot() -> ClientSnapshot {
     let mut snapshot = inference_editor_snapshot();
     snapshot.sessions.current[0].status.phase = SessionPhaseView::RunningTool;
+    snapshot.sessions.current[0].progress.phase = SessionProgressPhaseView::Running;
+    snapshot.sessions.current[0].progress.run_stage = Some(SessionRunStageView::RunningTool);
+    snapshot.sessions.current[0].progress.running = true;
+    snapshot.sessions.current[0].capabilities.can_interrupt = true;
     snapshot
 }
 
@@ -3085,10 +3298,25 @@ fn render_sessions_section(
     terminal.backend().to_string()
 }
 
+fn respondable_session_with_timeline(
+    session: waltr_client::SessionView,
+    events: Vec<TimelineEventView>,
+) -> ClientSnapshot {
+    let mut snapshot = watched_session_with_timeline(session, events);
+    let session = &mut snapshot.sessions.current[0];
+    session.progress.phase = SessionProgressPhaseView::AwaitingExternalInput;
+    session.progress.run_stage = None;
+    session.progress.running = false;
+    session.capabilities.prompt_disposition = SessionPromptDispositionView::SupersedeSuspension;
+    session.capabilities.can_respond_external_request = true;
+    session.capabilities.can_interrupt = false;
+    snapshot
+}
+
 #[test]
 fn sessions_detail_permission_prompt_allows_once() {
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 1, payload,
@@ -3120,7 +3348,7 @@ fn sessions_detail_permission_prompt_allows_once() {
 #[test]
 fn sessions_detail_permission_prompt_selectable_deny_resume_includes_message() {
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"rm -rf target"}}}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 1, payload,
@@ -3158,7 +3386,7 @@ fn sessions_detail_permission_prompt_selectable_deny_resume_includes_message() {
 #[test]
 fn explicit_logout_clears_prompt_draft_and_focus() {
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"rm -rf target"}}}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 1, payload,
@@ -3189,7 +3417,7 @@ fn explicit_logout_clears_prompt_draft_and_focus() {
 #[test]
 fn sessions_detail_permission_prompt_deny_interrupts_without_standalone_capability() {
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 1, payload,
@@ -3223,7 +3451,7 @@ fn sessions_detail_permission_prompt_deny_interrupts_without_standalone_capabili
 #[test]
 fn sessions_detail_permission_prompt_deny_interrupt_enter_works_without_standalone_capability() {
     let payload = r#"{"tool_call":{"name":"shell","arguments":{"command":"pwd"}}}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 1, payload,
@@ -3264,7 +3492,7 @@ fn sessions_detail_permission_prompt_deny_interrupt_enter_works_without_standalo
 #[test]
 fn sessions_detail_question_prompt_submits_selected_answer() {
     let payload = r#"{"questions":[{"header":"Direction","question":"Pick one","options":[{"label":"North","description":"Up"}],"multiple":false,"custom":false}]}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 2, payload,
@@ -3291,7 +3519,7 @@ fn sessions_detail_question_prompt_submits_selected_answer() {
 #[test]
 fn sessions_detail_question_prompt_switches_multi_question_tabs() {
     let payload = r#"{"questions":[{"header":"Direction","question":"Pick one","options":["North"],"multiple":false,"custom":false},{"header":"Speed","question":"How fast?","options":["Slow","Fast"],"multiple":false,"custom":false}]}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 2, payload,
@@ -3324,7 +3552,7 @@ fn sessions_detail_question_prompt_switches_multi_question_tabs() {
 #[test]
 fn sessions_detail_question_prompt_custom_response_supports_cursor_editing() {
     let payload = r#"{"questions":[{"header":"Details","question":"Anything else?","options":[],"multiple":false,"custom":true}]}"#;
-    let mut app = open_sessions_app_with(watched_session_with_timeline(
+    let mut app = open_sessions_app_with(respondable_session_with_timeline(
         session_view("chat", 1),
         vec![external_request_event(
             1, "chat", "req-item", "req-1", 2, payload,

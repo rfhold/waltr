@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use waltr::grpc::waltr::session::v1::{
-    ProjectedTimelineEvent, SyntheticTimelineEvent, TimelinePresentation, projected_timeline_event,
-    timeline_content,
+    ProjectedTimelineEvent, SessionCapabilities, SessionCoordinationPhase,
+    SessionCoordinationReason, SessionCoordinationState, SessionProgress, SessionProgressPhase,
+    SessionPromptDisposition, SessionRunStage, SyntheticTimelineEvent, TimelinePresentation,
+    projected_timeline_event, timeline_content,
 };
 
 use crate::{
@@ -46,6 +48,12 @@ pub struct SessionView {
     pub revision: u64,
     /// Current session status.
     pub status: SessionStatusView,
+    /// Ephemeral process-local coordination reported by the server.
+    pub coordination: SessionCoordinationView,
+    /// Agent-owned unified lifecycle projection.
+    pub progress: SessionProgressView,
+    /// Agent-owned action availability projection.
+    pub capabilities: SessionCapabilitiesView,
     /// Current prompt, when the session has one.
     pub current_prompt: Option<String>,
     /// Creation timestamp, when supplied by the server.
@@ -193,6 +201,120 @@ pub struct SessionStatusView {
     pub failed_message: String,
     /// Structured outbound authentication failure, when present.
     pub authentication_failure: Option<AuthenticationFailureSnapshot>,
+}
+
+/// Stable shell-neutral session coordination state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCoordinationView {
+    /// Current process-local coordination phase.
+    pub phase: SessionCoordinationPhaseView,
+    /// Machine-readable reason descriptor, when supplied.
+    pub reason: Option<SessionCoordinationReasonView>,
+    /// Number of queued user submissions.
+    pub queued_count: u32,
+    /// Whether continuation is armed after the current pause.
+    pub continuation_armed: bool,
+}
+
+/// Stable shell-neutral coordination phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionCoordinationPhaseView {
+    /// No process-local coordination blocks progress.
+    #[default]
+    Ready,
+    /// A run is active.
+    Running,
+    /// Post-run coordination is selecting or preparing follow-up work.
+    CompletionBarrier,
+    /// A host or Routine owns a pause.
+    Paused,
+    /// Phase is unknown to this client version.
+    Unknown,
+}
+
+/// Stable machine-readable coordination reason descriptor.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCoordinationReasonView {
+    pub code: String,
+    pub source: Option<String>,
+    pub trigger: Option<String>,
+}
+
+/// Stable shell-neutral unified session progress.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProgressView {
+    /// Current unified lifecycle phase.
+    pub phase: SessionProgressPhaseView,
+    /// Detailed durable active stage, when supplied.
+    pub run_stage: Option<SessionRunStageView>,
+    /// Machine-readable barrier or pause reason, when supplied.
+    pub reason: Option<SessionCoordinationReasonView>,
+    /// Number of queued logical submissions.
+    pub queued_count: u64,
+    /// Whether a continuation is armed ahead of queued work.
+    pub continuation_armed: bool,
+    /// Agent-owned activity projection used by hosted MCP.
+    pub running: bool,
+}
+
+/// Stable unified session lifecycle phase.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionProgressPhaseView {
+    #[default]
+    Unknown,
+    Idle,
+    Running,
+    CompletionBarrier,
+    Paused,
+    AwaitingToolResults,
+    AwaitingExternalInput,
+    Interrupted,
+    Finished,
+    Failed,
+}
+
+/// Stable detailed stage for active durable work.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionRunStageView {
+    Unknown,
+    BuildingRequest,
+    StreamingProvider,
+    RetryingProvider,
+    EvaluatingToolCall,
+    RunningTool,
+}
+
+/// Stable agent-owned session action availability.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCapabilitiesView {
+    /// How a newly submitted prompt will be handled.
+    pub prompt_disposition: SessionPromptDispositionView,
+    /// Whether the pending external request can be answered now.
+    pub can_respond_external_request: bool,
+    /// Whether a real process-local active run can be interrupted.
+    pub can_interrupt: bool,
+}
+
+/// Stable prompt submission disposition.
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionPromptDispositionView {
+    #[default]
+    Unknown,
+    Immediate,
+    Queued,
+    SupersedeSuspension,
 }
 
 /// Stable session suspension reason shared by Waltr shells.
@@ -468,6 +590,15 @@ impl From<SessionSummary> for SessionView {
             status: session
                 .status
                 .map_or_else(SessionStatusView::default, Into::into),
+            coordination: session
+                .coordination
+                .map_or_else(SessionCoordinationView::default, Into::into),
+            progress: session
+                .progress
+                .map_or_else(SessionProgressView::default, Into::into),
+            capabilities: session
+                .capabilities
+                .map_or_else(SessionCapabilitiesView::default, Into::into),
             current_prompt: session.current_prompt,
             created_at: session.created_at.map(Into::into),
             updated_at: session.updated_at.map(Into::into),
@@ -478,6 +609,105 @@ impl From<SessionSummary> for SessionView {
                 .map_or_else(SessionMetricsView::default, Into::into),
             associations: SessionAssociationsView::from(&metadata),
             metadata,
+        }
+    }
+}
+
+impl From<SessionCoordinationState> for SessionCoordinationView {
+    fn from(coordination: SessionCoordinationState) -> Self {
+        Self {
+            phase: coordination.phase.into(),
+            reason: coordination.reason.map(Into::into),
+            queued_count: coordination.queued_count,
+            continuation_armed: coordination.continuation_armed,
+        }
+    }
+}
+
+impl From<i32> for SessionCoordinationPhaseView {
+    fn from(value: i32) -> Self {
+        match SessionCoordinationPhase::try_from(value) {
+            Ok(SessionCoordinationPhase::Unspecified | SessionCoordinationPhase::Ready) => {
+                Self::Ready
+            }
+            Ok(SessionCoordinationPhase::Running) => Self::Running,
+            Ok(SessionCoordinationPhase::CompletionBarrier) => Self::CompletionBarrier,
+            Ok(SessionCoordinationPhase::Paused) => Self::Paused,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<SessionCoordinationReason> for SessionCoordinationReasonView {
+    fn from(reason: SessionCoordinationReason) -> Self {
+        Self {
+            code: reason.code,
+            source: reason.source,
+            trigger: reason.trigger,
+        }
+    }
+}
+
+impl From<SessionProgress> for SessionProgressView {
+    fn from(progress: SessionProgress) -> Self {
+        Self {
+            phase: progress.phase.into(),
+            run_stage: progress.run_stage.map(Into::into),
+            reason: progress.reason.map(Into::into),
+            queued_count: progress.queued_count,
+            continuation_armed: progress.continuation_armed,
+            running: progress.running,
+        }
+    }
+}
+
+impl From<i32> for SessionProgressPhaseView {
+    fn from(value: i32) -> Self {
+        match SessionProgressPhase::try_from(value) {
+            Ok(SessionProgressPhase::Unspecified) | Err(_) => Self::Unknown,
+            Ok(SessionProgressPhase::Idle) => Self::Idle,
+            Ok(SessionProgressPhase::Running) => Self::Running,
+            Ok(SessionProgressPhase::CompletionBarrier) => Self::CompletionBarrier,
+            Ok(SessionProgressPhase::Paused) => Self::Paused,
+            Ok(SessionProgressPhase::AwaitingToolResults) => Self::AwaitingToolResults,
+            Ok(SessionProgressPhase::AwaitingExternalInput) => Self::AwaitingExternalInput,
+            Ok(SessionProgressPhase::Interrupted) => Self::Interrupted,
+            Ok(SessionProgressPhase::Finished) => Self::Finished,
+            Ok(SessionProgressPhase::Failed) => Self::Failed,
+        }
+    }
+}
+
+impl From<i32> for SessionRunStageView {
+    fn from(value: i32) -> Self {
+        match SessionRunStage::try_from(value) {
+            Ok(SessionRunStage::Unspecified) | Err(_) => Self::Unknown,
+            Ok(SessionRunStage::BuildingRequest) => Self::BuildingRequest,
+            Ok(SessionRunStage::StreamingProvider) => Self::StreamingProvider,
+            Ok(SessionRunStage::RetryingProvider) => Self::RetryingProvider,
+            Ok(SessionRunStage::EvaluatingToolCall) => Self::EvaluatingToolCall,
+            Ok(SessionRunStage::RunningTool) => Self::RunningTool,
+        }
+    }
+}
+
+impl From<SessionCapabilities> for SessionCapabilitiesView {
+    fn from(capabilities: SessionCapabilities) -> Self {
+        Self {
+            prompt_disposition: capabilities.prompt_disposition.into(),
+            can_respond_external_request: capabilities.can_respond_external_request,
+            can_interrupt: capabilities.can_interrupt,
+        }
+    }
+}
+
+impl From<i32> for SessionPromptDispositionView {
+    fn from(value: i32) -> Self {
+        match SessionPromptDisposition::try_from(value) {
+            Ok(SessionPromptDisposition::Unspecified) | Err(_) => Self::Unknown,
+            Ok(SessionPromptDisposition::Immediate) => Self::Immediate,
+            Ok(SessionPromptDisposition::Queued) => Self::Queued,
+            Ok(SessionPromptDisposition::SupersedeSuspension) => Self::SupersedeSuspension,
         }
     }
 }
@@ -950,6 +1180,227 @@ mod tests {
 
         assert_eq!(idle.suspension_kind, None);
         assert_eq!(suspended_without_detail.suspension_kind, None);
+    }
+
+    #[test]
+    fn coordination_view_maps_every_phase_and_fallback() {
+        for (phase, expected) in [
+            (
+                SessionCoordinationPhase::Unspecified as i32,
+                SessionCoordinationPhaseView::Ready,
+            ),
+            (
+                SessionCoordinationPhase::Ready as i32,
+                SessionCoordinationPhaseView::Ready,
+            ),
+            (
+                SessionCoordinationPhase::Running as i32,
+                SessionCoordinationPhaseView::Running,
+            ),
+            (
+                SessionCoordinationPhase::CompletionBarrier as i32,
+                SessionCoordinationPhaseView::CompletionBarrier,
+            ),
+            (
+                SessionCoordinationPhase::Paused as i32,
+                SessionCoordinationPhaseView::Paused,
+            ),
+            (i32::MAX, SessionCoordinationPhaseView::Unknown),
+        ] {
+            let view = SessionCoordinationView::from(SessionCoordinationState {
+                phase,
+                reason: Some(SessionCoordinationReason {
+                    code: "future-reason".to_owned(),
+                    source: Some("routine".to_owned()),
+                    trigger: Some("manual".to_owned()),
+                }),
+                queued_count: 3,
+                continuation_armed: true,
+            });
+            assert_eq!(view.phase, expected);
+            assert_eq!(view.reason.as_ref().unwrap().code, "future-reason");
+            assert_eq!(view.queued_count, 3);
+            assert!(view.continuation_armed);
+        }
+
+        assert_eq!(
+            SessionView::from(SessionSummary::default())
+                .coordination
+                .phase,
+            SessionCoordinationPhaseView::Ready
+        );
+    }
+
+    #[test]
+    fn progress_and_capability_views_map_all_values_and_preserve_fields() {
+        for (phase, expected) in [
+            (
+                SessionProgressPhase::Unspecified,
+                SessionProgressPhaseView::Unknown,
+            ),
+            (SessionProgressPhase::Idle, SessionProgressPhaseView::Idle),
+            (
+                SessionProgressPhase::Running,
+                SessionProgressPhaseView::Running,
+            ),
+            (
+                SessionProgressPhase::CompletionBarrier,
+                SessionProgressPhaseView::CompletionBarrier,
+            ),
+            (
+                SessionProgressPhase::Paused,
+                SessionProgressPhaseView::Paused,
+            ),
+            (
+                SessionProgressPhase::AwaitingToolResults,
+                SessionProgressPhaseView::AwaitingToolResults,
+            ),
+            (
+                SessionProgressPhase::AwaitingExternalInput,
+                SessionProgressPhaseView::AwaitingExternalInput,
+            ),
+            (
+                SessionProgressPhase::Interrupted,
+                SessionProgressPhaseView::Interrupted,
+            ),
+            (
+                SessionProgressPhase::Finished,
+                SessionProgressPhaseView::Finished,
+            ),
+            (
+                SessionProgressPhase::Failed,
+                SessionProgressPhaseView::Failed,
+            ),
+        ] {
+            assert_eq!(SessionProgressPhaseView::from(phase as i32), expected);
+        }
+        assert_eq!(
+            SessionProgressPhaseView::from(i32::MAX),
+            SessionProgressPhaseView::Unknown
+        );
+
+        for (stage, expected) in [
+            (SessionRunStage::Unspecified, SessionRunStageView::Unknown),
+            (
+                SessionRunStage::BuildingRequest,
+                SessionRunStageView::BuildingRequest,
+            ),
+            (
+                SessionRunStage::StreamingProvider,
+                SessionRunStageView::StreamingProvider,
+            ),
+            (
+                SessionRunStage::RetryingProvider,
+                SessionRunStageView::RetryingProvider,
+            ),
+            (
+                SessionRunStage::EvaluatingToolCall,
+                SessionRunStageView::EvaluatingToolCall,
+            ),
+            (
+                SessionRunStage::RunningTool,
+                SessionRunStageView::RunningTool,
+            ),
+        ] {
+            assert_eq!(SessionRunStageView::from(stage as i32), expected);
+        }
+        assert_eq!(
+            SessionRunStageView::from(i32::MAX),
+            SessionRunStageView::Unknown
+        );
+
+        for (disposition, expected) in [
+            (
+                SessionPromptDisposition::Unspecified,
+                SessionPromptDispositionView::Unknown,
+            ),
+            (
+                SessionPromptDisposition::Immediate,
+                SessionPromptDispositionView::Immediate,
+            ),
+            (
+                SessionPromptDisposition::Queued,
+                SessionPromptDispositionView::Queued,
+            ),
+            (
+                SessionPromptDisposition::SupersedeSuspension,
+                SessionPromptDispositionView::SupersedeSuspension,
+            ),
+        ] {
+            assert_eq!(
+                SessionPromptDispositionView::from(disposition as i32),
+                expected
+            );
+        }
+        assert_eq!(
+            SessionPromptDispositionView::from(i32::MAX),
+            SessionPromptDispositionView::Unknown
+        );
+
+        let view = SessionView::from(SessionSummary {
+            progress: Some(SessionProgress {
+                phase: SessionProgressPhase::Paused as i32,
+                run_stage: Some(SessionRunStage::RunningTool as i32),
+                reason: Some(SessionCoordinationReason {
+                    code: "host-operation".to_owned(),
+                    source: Some("routine".to_owned()),
+                    trigger: Some("manual".to_owned()),
+                }),
+                queued_count: 3,
+                continuation_armed: true,
+                running: true,
+            }),
+            capabilities: Some(SessionCapabilities {
+                prompt_disposition: SessionPromptDisposition::Queued as i32,
+                can_respond_external_request: true,
+                can_interrupt: true,
+            }),
+            ..SessionSummary::default()
+        });
+        assert_eq!(view.progress.phase, SessionProgressPhaseView::Paused);
+        assert_eq!(
+            view.progress.run_stage,
+            Some(SessionRunStageView::RunningTool)
+        );
+        assert_eq!(
+            view.progress.reason.as_ref().unwrap().code,
+            "host-operation"
+        );
+        assert_eq!(view.progress.queued_count, 3);
+        assert!(view.progress.continuation_armed);
+        assert!(view.progress.running);
+        assert_eq!(
+            view.capabilities.prompt_disposition,
+            SessionPromptDispositionView::Queued
+        );
+        assert!(view.capabilities.can_respond_external_request);
+        assert!(view.capabilities.can_interrupt);
+    }
+
+    #[test]
+    fn absent_progress_and_capabilities_are_conservative_without_status_inference() {
+        let view = SessionView::from(SessionSummary {
+            status: Some(SessionStatus {
+                phase: SessionPhase::StreamingProvider as i32,
+                ..SessionStatus::default()
+            }),
+            coordination: Some(SessionCoordinationState {
+                phase: SessionCoordinationPhase::Running as i32,
+                ..SessionCoordinationState::default()
+            }),
+            ..SessionSummary::default()
+        });
+
+        assert_eq!(view.progress, SessionProgressView::default());
+        assert_eq!(view.progress.phase, SessionProgressPhaseView::Unknown);
+        assert!(!view.progress.running);
+        assert_eq!(view.capabilities, SessionCapabilitiesView::default());
+        assert_eq!(
+            view.capabilities.prompt_disposition,
+            SessionPromptDispositionView::Unknown
+        );
+        assert!(!view.capabilities.can_respond_external_request);
+        assert!(!view.capabilities.can_interrupt);
     }
 
     #[test]

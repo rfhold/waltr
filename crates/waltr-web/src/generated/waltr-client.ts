@@ -528,6 +528,74 @@ failedMessage: string,
  */
 authenticationFailure: AuthenticationFailureSnapshot | null, };
 
+export type SessionCoordinationPhaseView = "ready" | "running" | "completionBarrier" | "paused" | "unknown";
+
+export type SessionCoordinationReasonView = { code: string, source: string | null, trigger: string | null, };
+
+export type SessionCoordinationView = {
+/**
+ * Current process-local coordination phase.
+ */
+phase: SessionCoordinationPhaseView,
+/**
+ * Machine-readable reason descriptor, when supplied.
+ */
+reason: SessionCoordinationReasonView | null,
+/**
+ * Number of queued user submissions.
+ */
+queuedCount: number,
+/**
+ * Whether continuation is armed after the current pause.
+ */
+continuationArmed: boolean, };
+
+export type SessionProgressPhaseView = "unknown" | "idle" | "running" | "completionBarrier" | "paused" | "awaitingToolResults" | "awaitingExternalInput" | "interrupted" | "finished" | "failed";
+
+export type SessionRunStageView = "unknown" | "buildingRequest" | "streamingProvider" | "retryingProvider" | "evaluatingToolCall" | "runningTool";
+
+export type SessionProgressView = {
+/**
+ * Current unified lifecycle phase.
+ */
+phase: SessionProgressPhaseView,
+/**
+ * Detailed durable active stage, when supplied.
+ */
+runStage: SessionRunStageView | null,
+/**
+ * Machine-readable barrier or pause reason, when supplied.
+ */
+reason: SessionCoordinationReasonView | null,
+/**
+ * Number of queued logical submissions.
+ */
+queuedCount: bigint,
+/**
+ * Whether a continuation is armed ahead of queued work.
+ */
+continuationArmed: boolean,
+/**
+ * Agent-owned activity projection used by hosted MCP.
+ */
+running: boolean, };
+
+export type SessionPromptDispositionView = "unknown" | "immediate" | "queued" | "supersedeSuspension";
+
+export type SessionCapabilitiesView = {
+/**
+ * How a newly submitted prompt will be handled.
+ */
+promptDisposition: SessionPromptDispositionView,
+/**
+ * Whether the pending external request can be answered now.
+ */
+canRespondExternalRequest: boolean,
+/**
+ * Whether a real process-local active run can be interrupted.
+ */
+canInterrupt: boolean, };
+
 export type InferenceSettingsMatchView = "unspecified" | "configured" | "missing" | "changed" | "unknown";
 
 export type InferenceProviderSettingsView = {
@@ -649,6 +717,18 @@ revision: bigint,
  * Current session status.
  */
 status: SessionStatusView,
+/**
+ * Ephemeral process-local coordination reported by the server.
+ */
+coordination: SessionCoordinationView,
+/**
+ * Agent-owned unified lifecycle projection.
+ */
+progress: SessionProgressView,
+/**
+ * Agent-owned action availability projection.
+ */
+capabilities: SessionCapabilitiesView,
 /**
  * Current prompt, when the session has one.
  */

@@ -298,7 +298,7 @@ async fn effective_timeline_projects_synthetic_identity_and_explicit_pagination(
                 limit: 1,
                 channels: Vec::new(),
             }),
-        })
+    })
         .await?
         .into_inner();
     assert!(first.events.is_empty());

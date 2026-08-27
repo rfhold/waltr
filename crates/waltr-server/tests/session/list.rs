@@ -1,5 +1,8 @@
 use crate::support::grpc::session_client;
-use waltr::grpc::waltr::session::v1::{CreateSessionRequest, ListSessionsRequest, SessionPhase};
+use waltr::grpc::waltr::session::v1::{
+    CreateSessionRequest, ListSessionsRequest, SessionPhase, SessionProgressPhase,
+    SessionPromptDisposition,
+};
 use waltr_server::test_support::setup_server;
 
 #[tokio::test]
@@ -42,6 +45,22 @@ async fn session_service_list_returns_created_sessions() -> Result<(), Box<dyn s
                 .phase,
             SessionPhase::Idle as i32
         );
+        let progress = session
+            .progress
+            .as_ref()
+            .expect("progress should be present");
+        assert_eq!(progress.phase, SessionProgressPhase::Idle as i32);
+        assert!(!progress.running);
+        let capabilities = session
+            .capabilities
+            .as_ref()
+            .expect("capabilities should be present");
+        assert_eq!(
+            capabilities.prompt_disposition,
+            SessionPromptDisposition::Immediate as i32
+        );
+        assert!(!capabilities.can_respond_external_request);
+        assert!(!capabilities.can_interrupt);
     }
 
     Ok(())

@@ -420,6 +420,74 @@ message SessionSummary {
   // Effective selected agent name. Legacy records use the current server default.
   string agent_name = 10;
   google.protobuf.Struct metadata = 11;
+  SessionCoordinationState coordination = 12;
+  SessionProgress progress = 13;
+  SessionCapabilities capabilities = 14;
+}
+
+message SessionCoordinationState {
+  SessionCoordinationPhase phase = 1;
+  SessionCoordinationReason reason = 2;
+  uint32 queued_count = 3;
+  bool continuation_armed = 4;
+}
+
+enum SessionCoordinationPhase {
+  SESSION_COORDINATION_PHASE_UNSPECIFIED = 0;
+  SESSION_COORDINATION_PHASE_READY = 1;
+  SESSION_COORDINATION_PHASE_RUNNING = 2;
+  SESSION_COORDINATION_PHASE_COMPLETION_BARRIER = 3;
+  SESSION_COORDINATION_PHASE_PAUSED = 4;
+}
+
+message SessionCoordinationReason {
+  string code = 1;
+  optional string source = 2;
+  optional string trigger = 3;
+}
+
+message SessionProgress {
+  SessionProgressPhase phase = 1;
+  optional SessionRunStage run_stage = 2;
+  SessionCoordinationReason reason = 3;
+  uint64 queued_count = 4;
+  bool continuation_armed = 5;
+  bool running = 6;
+}
+
+enum SessionProgressPhase {
+  SESSION_PROGRESS_PHASE_UNSPECIFIED = 0;
+  SESSION_PROGRESS_PHASE_IDLE = 1;
+  SESSION_PROGRESS_PHASE_RUNNING = 2;
+  SESSION_PROGRESS_PHASE_COMPLETION_BARRIER = 3;
+  SESSION_PROGRESS_PHASE_PAUSED = 4;
+  SESSION_PROGRESS_PHASE_AWAITING_TOOL_RESULTS = 5;
+  SESSION_PROGRESS_PHASE_AWAITING_EXTERNAL_INPUT = 6;
+  SESSION_PROGRESS_PHASE_INTERRUPTED = 7;
+  SESSION_PROGRESS_PHASE_FINISHED = 8;
+  SESSION_PROGRESS_PHASE_FAILED = 9;
+}
+
+enum SessionRunStage {
+  SESSION_RUN_STAGE_UNSPECIFIED = 0;
+  SESSION_RUN_STAGE_BUILDING_REQUEST = 1;
+  SESSION_RUN_STAGE_STREAMING_PROVIDER = 2;
+  SESSION_RUN_STAGE_RETRYING_PROVIDER = 3;
+  SESSION_RUN_STAGE_EVALUATING_TOOL_CALL = 4;
+  SESSION_RUN_STAGE_RUNNING_TOOL = 5;
+}
+
+message SessionCapabilities {
+  SessionPromptDisposition prompt_disposition = 1;
+  bool can_respond_external_request = 2;
+  bool can_interrupt = 3;
+}
+
+enum SessionPromptDisposition {
+  SESSION_PROMPT_DISPOSITION_UNSPECIFIED = 0;
+  SESSION_PROMPT_DISPOSITION_IMMEDIATE = 1;
+  SESSION_PROMPT_DISPOSITION_QUEUED = 2;
+  SESSION_PROMPT_DISPOSITION_SUPERSEDE_SUSPENSION = 3;
 }
 
 message SessionMetrics {
