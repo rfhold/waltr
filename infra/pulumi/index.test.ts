@@ -22,6 +22,7 @@ before(async () => {
     "waltr:slug": "waltr-test",
     "waltr:image": "registry.example.test/waltr:test",
     "waltr:authentikBaseUrl": "https://auth.example.test",
+    "waltr:androidNativeRedirectUri": "dev.waltr.app:/oauth2redirect",
     "waltr:protectData": "false",
     "waltr:storageClass": "test",
     "waltr:bucketStorageClass": "test-bucket",
@@ -137,6 +138,10 @@ describe("hosted MCP OAuth deployment", () => {
       {
         matching_mode: "regex",
         url: "^http://127\\.0\\.0\\.1:[0-9]+/callback$",
+      },
+      {
+        matching_mode: "strict",
+        url: "dev.waltr.app:/oauth2redirect",
       },
     ]);
 
@@ -459,6 +464,14 @@ describe("hosted MCP OAuth deployment", () => {
     }
     assert.match(preview, /^\s*waltr:protectData: false$/m);
     assert.match(production, /^\s*waltr:protectData: true$/m);
+    assert.match(
+      preview,
+      /^\s*waltr:androidNativeRedirectUri: dev\.rfhold\.waltr:\/oauth2redirect$/m,
+    );
+    assert.match(
+      production,
+      /^\s*waltr:androidNativeRedirectUri: dev\.rfhold\.waltr:\/oauth2redirect$/m,
+    );
     assert.match(
       preview,
       /^\s*waltr:mcpOAuthAccessTokenTtl: "259200"$/m,

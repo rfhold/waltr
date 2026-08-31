@@ -42,6 +42,7 @@ const activeWrappingKeyVersion = config.require(
   "mcpOAuthActiveWrappingKeyVersion",
 );
 const protectData = config.requireBoolean("protectData");
+const androidNativeRedirectUri = config.require("androidNativeRedirectUri");
 
 const authentikUrl = new URL(authentikBaseUrl);
 if (
@@ -87,6 +88,13 @@ const postgresTrustMountPath = "/var/run/secrets/waltr/postgres";
 const postgresCaFile = `${postgresTrustMountPath}/ca.crt`;
 const browserCallback = `https://${hostname}/oidc/callback`;
 const nativeRedirectPattern = "^http://127\\.0\\.0\\.1:[0-9]+/callback$";
+const nativeRedirectUris: Array<{
+  matching_mode: "strict" | "regex";
+  url: string;
+}> = [
+  { matching_mode: "regex", url: nativeRedirectPattern },
+  { matching_mode: "strict", url: androidNativeRedirectUri },
+];
 
 const namespace = new k8s.core.v1.Namespace("waltr-namespace", {
   metadata: { name: namespaceName, labels },
@@ -281,7 +289,7 @@ const nativeApp = new OAuthApplication("waltr-native", {
   slug: `${slug}-native`,
   issuerBaseUrl: authentikBaseUrl,
   clientType: "public",
-  redirectUris: [{ matching_mode: "regex", url: nativeRedirectPattern }],
+  redirectUris: nativeRedirectUris,
   signingKeyId: signingKey.id,
   propertyMappings: nativeMappings,
 });

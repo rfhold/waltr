@@ -5,6 +5,7 @@ config:
   waltr:displayName: Waltr
   waltr:slug: waltr
   waltr:authentikBaseUrl: https://auth.holdenitdown.net
+  waltr:androidNativeRedirectUri: dev.waltr.app:/oauth2redirect
   waltr:protectData: true
   waltr:dataStorageSize: 10Gi
   waltr:databaseStorageSize: 20Gi
