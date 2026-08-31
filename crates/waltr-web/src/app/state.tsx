@@ -9,11 +9,11 @@ import {
 
 import { AppStateContextProvider, type AppPhase } from "./context";
 import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../generated/waltr-client";
-import type { WasmClientLoader } from "../wasm/client";
+import type { AccessProgress, ClientAdapter, ClientAdapterLoader } from "../platform/client";
 import { FixtureAppStateProvider, fixtureSnapshotForPath } from "./fixtures";
 
 type AppStateProviderProps = ParentProps<{
-  loadWasmClient: WasmClientLoader;
+  loadClientAdapter: ClientAdapterLoader;
 }>;
 
 export function AppStateProvider(props: AppStateProviderProps) {
@@ -25,10 +25,11 @@ export function AppStateProvider(props: AppStateProviderProps) {
 
   const [snapshot, setSnapshot] = createSignal<ClientSnapshot>();
   const [clientError, setClientError] = createSignal<unknown>();
+  const [accessProgress, setAccessProgress] = createSignal<AccessProgress>();
   const [explicitAuthTarget, setExplicitAuthTarget] = createSignal<Extract<ClientCommand, { type: "beginAuth" }>["target"]>();
   const [ignoredTerminalAttemptId, setIgnoredTerminalAttemptId] = createSignal<string>();
   const operationWaiters = new Set<OperationWaiter>();
-  const [wasmClient] = createResource(() => props.loadWasmClient());
+  const [clientAdapter] = createResource(() => props.loadClientAdapter());
   const [minimumSplashElapsed] = createResource(async () => {
     await sleep(300);
     return true;
@@ -47,7 +48,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
   });
 
   createEffect(() => {
-    const client = wasmClient();
+    const client = clientAdapter();
 
     if (!client) {
       return;
@@ -61,6 +62,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
     const unsubscribe = client.subscribe((snapshot) => {
       publishSnapshot(snapshot, setSnapshot, operationWaiters);
     });
+    const unsubscribeAccess = client.access?.subscribe(setAccessProgress);
     let cancelled = false;
 
     void client.start().catch((error) => {
@@ -72,11 +74,33 @@ export function AppStateProvider(props: AppStateProviderProps) {
     onCleanup(() => {
       cancelled = true;
       unsubscribe();
+      unsubscribeAccess?.();
+      void client.dispose();
+    });
+  });
+
+  createEffect(() => {
+    const client = clientAdapter();
+    if (!client) return;
+    const dispose = () => { void client.dispose(); };
+    const pagehide = (event: PageTransitionEvent) => {
+      if (!event.persisted) dispose();
+    };
+    const pageshow = (event: PageTransitionEvent) => {
+      if (event.persisted) void client.start().catch(setClientError);
+    };
+    window.addEventListener("pagehide", pagehide);
+    window.addEventListener("pageshow", pageshow);
+    window.addEventListener("beforeunload", dispose);
+    onCleanup(() => {
+      window.removeEventListener("pagehide", pagehide);
+      window.removeEventListener("pageshow", pageshow);
+      window.removeEventListener("beforeunload", dispose);
     });
   });
 
   const phase = createMemo<AppPhase>(() => {
-    if (wasmClient.error || clientError()) {
+    if (clientAdapter.error || clientError()) {
       return "splash";
     }
 
@@ -84,7 +108,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
   });
 
   const dispatch = async (command: ClientCommand) => {
-    return getLoadedClient(wasmClient()).dispatch(command);
+    return getLoadedClient(clientAdapter()).dispatch(command);
   };
 
   const dispatchConfigPatch = async (command: ClientCommand) => {
@@ -282,7 +306,7 @@ export function AppStateProvider(props: AppStateProviderProps) {
     missingKeyMessage: string;
     failureMessage: string;
   }) {
-    const immediate = await getLoadedClient(wasmClient()).dispatch(options.command);
+    const immediate = await getLoadedClient(clientAdapter()).dispatch(options.command);
     const key = options.key(immediate);
 
     if (!key) {
@@ -318,10 +342,13 @@ export function AppStateProvider(props: AppStateProviderProps) {
         minimumSplashElapsed,
         snapshot,
         clientError,
-        clientLoadError: () => wasmClient.error,
-        clientLoaded: () => Boolean(wasmClient()),
+        clientLoadError: () => clientAdapter.error,
+        clientLoaded: () => Boolean(clientAdapter()),
         systemReady,
         explicitAuthTarget,
+        nativeAccess: () => clientAdapter()?.access,
+        accessProgress,
+        openExternalUrl: () => clientAdapter()?.openExternalUrl,
         dispatch,
         dispatchBeginExplicitAuth,
         dispatchCompleteAuth,
@@ -356,8 +383,6 @@ type OperationWaiter = {
   resolve: (snapshot: ClientSnapshot) => void;
   reject: (error: Error) => void;
 };
-
-type LoadedWasmClient = NonNullable<ReturnType<WasmClientLoader> extends Promise<infer Client> ? Client : never>;
 
 function publishSnapshot(
   snapshot: ClientSnapshot,
@@ -405,7 +430,7 @@ function sameAuthTarget(
   return Boolean(left && right && left.kind === right.kind && left.key === right.key);
 }
 
-function getLoadedClient(client: LoadedWasmClient | undefined) {
+function getLoadedClient(client: ClientAdapter | undefined) {
   if (!client) {
     throw new Error("client is not loaded");
   }

@@ -30,6 +30,7 @@ pub struct WaltrClient {
     commands: mpsc::UnboundedSender<ClientCommandRequest>,
     latest_snapshot: Rc<RefCell<String>>,
     snapshots: Rc<Mutex<mpsc::UnboundedReceiver<String>>>,
+    stop: Rc<RefCell<Option<oneshot::Sender<()>>>>,
 }
 
 #[wasm_bindgen]
@@ -50,12 +51,14 @@ impl WaltrClient {
         ));
         let (commands, command_receiver) = mpsc::unbounded();
         let (snapshots, snapshot_receiver) = mpsc::unbounded();
+        let (stop, stop_receiver) = oneshot::channel();
 
         spawn_client_loop(
             runtime,
             command_receiver,
             snapshots,
             Rc::clone(&latest_snapshot),
+            stop_receiver,
         );
 
         Self {
@@ -63,6 +66,7 @@ impl WaltrClient {
             commands,
             latest_snapshot,
             snapshots: Rc::new(Mutex::new(snapshot_receiver)),
+            stop: Rc::new(RefCell::new(Some(stop))),
         }
     }
 
@@ -101,6 +105,15 @@ impl WaltrClient {
         serde_json::to_string(&snapshot).map_err(js_error)
     }
 
+    /// Close the command source and stop the shared runtime.
+    #[wasm_bindgen(js_name = dispose)]
+    pub fn dispose(&self) {
+        self.commands.close_channel();
+        if let Some(stop) = self.stop.borrow_mut().take() {
+            let _ = stop.send(());
+        }
+    }
+
     /// Advance the shared state stream and return the next JSON snapshot.
     #[wasm_bindgen(js_name = nextStateJson)]
     pub async fn next_state_json(&self) -> Result<String, JsValue> {
@@ -135,23 +148,29 @@ fn spawn_client_loop(
     mut commands: mpsc::UnboundedReceiver<ClientCommandRequest>,
     snapshots: mpsc::UnboundedSender<String>,
     latest_snapshot: Rc<RefCell<String>>,
+    stop: oneshot::Receiver<()>,
 ) {
     spawn_local(async move {
-        loop {
-            let event = runtime.next_or_dispatch(commands.next()).await;
-            let ClientStateStreamEvent::Snapshot(snapshot) = event else {
-                return;
-            };
+        let run = async move {
+            loop {
+                let event = runtime.next_or_dispatch(commands.next()).await;
+                let ClientStateStreamEvent::Snapshot(snapshot) = event else {
+                    return;
+                };
 
-            let Ok(snapshot_json) = serde_json::to_string(snapshot.as_ref()) else {
-                return;
-            };
+                let Ok(snapshot_json) = serde_json::to_string(snapshot.as_ref()) else {
+                    return;
+                };
 
-            latest_snapshot.replace(snapshot_json.clone());
-            if snapshots.unbounded_send(snapshot_json).is_err() {
-                return;
+                latest_snapshot.replace(snapshot_json.clone());
+                if snapshots.unbounded_send(snapshot_json).is_err() {
+                    return;
+                }
             }
-        }
+        };
+        pin_mut!(run);
+        pin_mut!(stop);
+        drop(select(stop, run).await);
     });
 }
 

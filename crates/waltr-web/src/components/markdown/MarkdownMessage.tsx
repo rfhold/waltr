@@ -7,6 +7,7 @@ import { unified } from "unified";
 
 import { languageFromFilePath } from "../../web-lib/language";
 import { CodeBlock } from "./CodeBlock";
+import { useAppState } from "../../app/context";
 
 type HastNode = {
   type?: string;
@@ -32,6 +33,7 @@ const markdownProcessor = unified()
   });
 
 export function MarkdownMessage(props: { text: string; tone: "user" | "assistant" | "thinking" }) {
+  const app = useAppState();
   const tree = createMemo(() => {
     const parsed = markdownProcessor.runSync(markdownProcessor.parse(props.text)) as HastNode;
     return props.tone === "thinking" ? annotateThinkingStrong(parsed) : parsed;
@@ -39,17 +41,17 @@ export function MarkdownMessage(props: { text: string; tone: "user" | "assistant
 
   return (
     <div class={`sessions__markdown sessions__markdown--${props.tone}`}>
-      <For each={tree().children ?? []}>{renderNode}</For>
+      <For each={tree().children ?? []}>{(node) => renderNode(node, app.openExternalUrl())}</For>
     </div>
   );
 }
 
-function renderNode(node: HastNode): JSX.Element {
+function renderNode(node: HastNode, openExternalUrl?: (url: string) => Promise<void>): JSX.Element {
   if (node.type === "text") {
     return node.value ?? "";
   }
   if (node.type !== "element") {
-    return <For each={node.children ?? []}>{renderNode}</For>;
+    return <For each={node.children ?? []}>{(child) => renderNode(child, openExternalUrl)}</For>;
   }
 
   if (node.tagName === "pre") {
@@ -59,10 +61,15 @@ function renderNode(node: HastNode): JSX.Element {
     }
   }
 
-  const children = () => <For each={node.children ?? []}>{renderNode}</For>;
+  const children = () => <For each={node.children ?? []}>{(child) => renderNode(child, openExternalUrl)}</For>;
   switch (node.tagName) {
     case "a":
-      return <a href={stringProperty(node, "href")} rel="noreferrer" target="_blank">{children()}</a>;
+      return <a href={stringProperty(node, "href")} rel="noreferrer" target="_blank" onClick={(event) => {
+        const href = stringProperty(node, "href");
+        if (!href || !openExternalUrl) return;
+        event.preventDefault();
+        void openExternalUrl(href);
+      }}>{children()}</a>;
     case "blockquote":
       return <blockquote>{children()}</blockquote>;
     case "br":

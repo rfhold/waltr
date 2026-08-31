@@ -22,6 +22,12 @@ Run TUI without starting the server:
 
 `cargo run -p waltr-tui`
 
+Run the Linux Tauri app with its packaged local web assets:
+
+`pnpm --filter @rfhold/waltr-app dev`
+
+The Tauri app is fixed to the preview endpoint and supports desktop and Android native login. See [docs/deployment.md](docs/deployment.md#tauri-application) for platform/build boundaries and [docs/testing.md](docs/testing.md) for deterministic versus installed-device and live-provider validation.
+
 Install and run the bundled TUI with an embedded server and web assets:
 
 `pnpm install:bundled`
@@ -49,6 +55,16 @@ Build the TUI:
 Build the web client:
 
 `pnpm --filter @rfhold/waltr-web build`
+
+Build the no-WASM web assets selected by Tauri:
+
+`pnpm build:tauri`
+
+Build the Linux Tauri packages:
+
+`pnpm --filter @rfhold/waltr-app build`
+
+Application prereleases are produced only from signed annotated tags exactly matching `vX.Y.Z-rc.N` whose commit is reachable from `origin/main`. Stable `vX.Y.Z` tags remain reserved for the production server pipeline. See [docs/deployment.md](docs/deployment.md#release-pipelines) for release artifacts, versionCode bounds, signing, secret, and rerun behavior.
 
 # Protocol Buffers
 

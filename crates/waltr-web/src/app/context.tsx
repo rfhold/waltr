@@ -6,6 +6,7 @@ import {
 } from "solid-js";
 
 import type { ClientAuthTarget, ClientCommand, ClientSnapshot } from "../generated/waltr-client";
+import type { AccessProgress, NativeAccessOperations } from "../platform/client";
 
 export type AppPhase = "splash" | "ready";
 
@@ -18,6 +19,9 @@ export type AppState = {
   clientLoaded: Accessor<boolean>;
   systemReady: Accessor<boolean>;
   explicitAuthTarget: Accessor<ClientAuthTarget | undefined>;
+  nativeAccess: Accessor<NativeAccessOperations | undefined>;
+  accessProgress: Accessor<AccessProgress | undefined>;
+  openExternalUrl: Accessor<((url: string) => Promise<void>) | undefined>;
   dispatch: (command: ClientCommand) => Promise<ClientSnapshot>;
   dispatchBeginExplicitAuth: (target: ClientAuthTarget) => Promise<ClientSnapshot>;
   dispatchCompleteAuth: (attemptId: string, input: string) => Promise<ClientSnapshot>;

@@ -145,6 +145,15 @@ export function OAuthDialog() {
       app.clearExplicitAuthTarget();
     }
   };
+  const openAuthorization = (url: string, event: MouseEvent) => {
+    const openExternalUrl = app.openExternalUrl();
+    if (!openExternalUrl) return;
+    event.preventDefault();
+    setLocalError(undefined);
+    void openExternalUrl(url).catch((error) => {
+      setLocalError(displayText(error instanceof Error ? error.message : "Authorization URL could not be opened."));
+    });
+  };
 
   return (
     <Show when={target()}>
@@ -209,7 +218,7 @@ export function OAuthDialog() {
 
             <div class="config__form-actions oauth-dialog__actions">
               <Show when={!terminal() ? authorizationUrl() : undefined}>
-                {(url) => <a class="ui-button oauth-dialog__open" href={url()} target="_blank" rel="noopener noreferrer">Open authorization URL</a>}
+                {(url) => <a class="ui-button oauth-dialog__open" href={url()} target="_blank" rel="noopener noreferrer" onClick={(event) => openAuthorization(url(), event)}>Open authorization URL</a>}
               </Show>
               <Show when={manualInput()}>
                 <button type="button" class="ui-button oauth-dialog__primary" disabled={busy()} onClick={complete}>Complete OAuth</button>

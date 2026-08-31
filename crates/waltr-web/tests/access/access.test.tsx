@@ -2,6 +2,7 @@ import { fireEvent, screen, waitFor } from "@solidjs/testing-library";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { AuthAttemptSnapshot, ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
+import type { NativeAccessOperations } from "../../src/platform/client";
 import { AccessRoute, waltrLoginUrl, safeLocalReturnPath } from "../../src/routes/access/AccessRoute";
 import { renderWithAppState } from "../support/render";
 import { ShellRouteWithChildren, testHistory } from "../support/routes";
@@ -117,6 +118,32 @@ describe("Waltr access", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel login" }));
 
     await waitFor(() => expect(commands).toContainEqual({ type: "cancelWaltrLogin", attemptId: "attempt-cancel" }));
+  });
+
+  test("native login and cancel use access IPC without browser navigation", async () => {
+    const nativeAccess = nativeAccessMock();
+    const navigate = vi.fn();
+    const commands: ClientCommand[] = [];
+    const view = renderWithAppState(() => <AccessRoute navigate={navigate} />, {
+      snapshot: accessSnapshot("loginRequired"),
+      commands,
+      nativeAccess,
+    });
+
+    fireEvent.click(screen.getByRole("link", { name: "Sign in" }));
+    await waitFor(() => expect(nativeAccess.start).toHaveBeenCalledOnce());
+    expect(navigate).not.toHaveBeenCalled();
+    expect(commands).toEqual([]);
+
+    view.unmount();
+    renderWithAppState(() => <AccessRoute navigate={navigate} />, {
+      snapshot: accessSnapshot("loginInProgress", "native-attempt"),
+      commands,
+      nativeAccess,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel login" }));
+    await waitFor(() => expect(nativeAccess.cancel).toHaveBeenCalledOnce());
+    expect(commands).toEqual([]);
   });
 
   test("validates encoded return paths through bounded decoding", () => {
@@ -291,6 +318,20 @@ describe("Waltr access", () => {
     expect(renderedFailure!.length).toBe(500);
   });
 
+  test("native OAuth opening prevents WebView navigation and uses the narrow opener", () => {
+    const openExternalUrl = vi.fn().mockResolvedValue(undefined);
+    renderWithAppState(() => <ShellRouteWithChildren />, {
+      routePath: "/config/provider",
+      snapshot: outboundAuthSnapshot(),
+      explicitAuthTarget: { kind: "mcpServer", key: "remote" },
+      openExternalUrl,
+    });
+
+    const link = screen.getByRole("link", { name: "Open authorization URL" });
+    expect(fireEvent.click(link)).toBe(false);
+    expect(openExternalUrl).toHaveBeenCalledWith("https://auth.example/authorize");
+  });
+
   test("does not flash the protected shell while access is unresolved", () => {
     renderWithAppState(() => <ShellRouteWithChildren />, {
       routePath: "/sessions",
@@ -365,6 +406,30 @@ describe("Waltr access", () => {
     await waitFor(() => expect(screen.queryByLabelText("Primary navigation")).toBeNull());
   });
 
+  test("native logout uses access IPC without fetch, reducer dispatch, or reload", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const reload = vi.fn();
+    const commands: ClientCommand[] = [];
+    let completeLogout!: () => void;
+    const logout = new Promise<void>((resolve) => { completeLogout = resolve; });
+    const nativeAccess = { ...nativeAccessMock(), logout: vi.fn(() => logout) };
+    renderWithAppState(() => <ShellRouteWithChildren reload={reload} />, {
+      snapshot: accessSnapshot("authenticated"),
+      commands,
+      nativeAccess,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await waitFor(() => expect(nativeAccess.logout).toHaveBeenCalledOnce());
+    expect(screen.getByRole("button", { name: "Signing out..." })).toHaveProperty("disabled", true);
+    completeLogout();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Sign out" })).toBeTruthy());
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(commands.some((command) => command.type === "logoutWaltr")).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
   test("reloads after local logout fails behind successful server logout", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true }));
     const reload = vi.fn();
@@ -425,4 +490,14 @@ function outboundAuthSnapshot(overrides: Partial<AuthAttemptSnapshot> = {}) {
     ...overrides,
   };
   return snapshot;
+}
+
+function nativeAccessMock(): NativeAccessOperations {
+  return {
+    progress: () => undefined,
+    subscribe: () => () => undefined,
+    start: vi.fn().mockResolvedValue(undefined),
+    cancel: vi.fn().mockResolvedValue(undefined),
+    logout: vi.fn().mockResolvedValue(undefined),
+  };
 }

@@ -204,7 +204,7 @@ The callback and every HTTP OIDC endpoint must then be loopback. These flags are
 
 ## Native Client Registration
 
-Register a separate public native client at the effective API authorization server. It must allow Authorization Code with PKCE S256 and the selected loopback redirects. The TUI always sends `client_id` and PKCE without a client secret or HTTP Basic authentication. Discovery may advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. Do not reuse or distribute the browser confidential-client secret.
+Register a separate public native client at the effective API authorization server. It must allow Authorization Code with PKCE S256 and the selected native redirects. Desktop and Android use the same public native client within a deployment: desktop needs the loopback redirect pattern, while Android needs the strict URI `dev.waltr.app:/oauth2redirect`. The shared native protocol always sends `client_id` and PKCE without a client secret or HTTP Basic authentication. Discovery may advertise only confidential token methods because some providers publish endpoint-wide capabilities that omit `none`. Do not create an app secret or reuse or distribute the browser confidential-client secret.
 
 Configure the TUI process with:
 
@@ -220,6 +220,35 @@ Only the native client ID is required at login. The TUI discovers only the API-r
 
 Native tokens and refresh tokens are process-memory only. Restarting the TUI requires login again. The TUI refreshes before expiry when a refresh token is returned and returns to login-required state when refresh fails or no refresh token remains after expiry.
 
+## Tauri Application
+
+`crates/waltr-app/` packages local `crates/waltr-web/` assets and runs the shared client and native access coordinator in Rust. Its Tauri configuration defines Linux and macOS desktop bundles plus Android packaging. It does not bundle a Waltr server or change server and protobuf contracts. Its fixed configuration is:
+
+| Setting | Value |
+| --- | --- |
+| Application identifier | `dev.waltr.app` |
+| Waltr endpoint | `https://preview-waltr.holdenitdown.net` |
+| Native client ID | `waltr-preview-native` |
+| Audience | `waltr-preview-api` |
+| Desktop callback | Ephemeral `http://127.0.0.1:<port>/callback` |
+| Android callback | Exact `dev.waltr.app:/oauth2redirect` |
+
+The app has no endpoint selector, updater, persistent credential store, or broad shell, filesystem, or HTTP capability. Its main WebView loads only packaged local assets. Remote navigation and new windows are denied; credential-free HTTPS URLs are validated in Rust and opened by the operating system. Native OAuth and bearer/refresh credentials remain in Rust and never cross IPC.
+
+Run these commands from the repository root. They map to current workspace scripts and manifests:
+
+| Target | Command | Purpose |
+| --- | --- | --- |
+| Tauri web | `pnpm build:tauri` | Type-check and build relative local assets with Vite `tauri` mode and no WASM build. |
+| Linux desktop | `pnpm --filter @rfhold/waltr-app dev` | Build the Tauri web assets and start the desktop app. |
+| Linux packages | `pnpm --filter @rfhold/waltr-app build` | Build the configured Linux Tauri bundles. |
+| Android package | `pnpm --filter @rfhold/waltr-app android:build` | Build through the generated Android project under `crates/waltr-app/gen/android/`. |
+| Android app | `pnpm --filter @rfhold/waltr-app exec cargo tauri android dev` | Build, install, and start on a configured emulator or device. |
+
+Focused deterministic checks are listed in [Testing](testing.md). Linux desktop and Android build/start checks require the corresponding host display, emulator, or device. An Android package build proves compilation and generated packaging, not operating-system intent delivery or successful provider authorization. Preview login, protected requests, refresh, suspension, process-death, and logout smoke tests require an installed app, explicit authority to access the preview deployment, and a live provider registration; they are not part of normal local validation.
+
+Android login uses an external system browser and an explicit private-scheme `Intent` filter on `MainActivity`. Kotlin passes cold and warm `Intent` objects opaquely to JNI after the superclass callback. Rust reads and validates the URI. No callback enters a Tauri event, WebView API, capability, or IPC command. Callback URL, code, state, verifier, and tokens remain Rust-only. Private schemes are not cryptographically bound to one Android application: another installed app can claim or intercept the callback. PKCE prevents code redemption without the verifier, and state prevents forged completion. An interceptor can still deny service by withholding the callback. Verified HTTPS App Links remain a possible future mitigation. No live provider action, Android installation, or device test occurred. macOS and iOS require macOS and remain unverified.
+
 ## Authentik And Pulumi Deployment
 
 The repository's supported infrastructure/workload definition is Pulumi under `infra/pulumi/`; there is no Kustomize deployment. Each `preview` and `prod` stack is defined to provision the Kubernetes workload, PostgreSQL, S3-compatible session/backup bucket, and two Authentik providers:
@@ -227,8 +256,10 @@ The repository's supported infrastructure/workload definition is Pulumi under `i
 | Provider | Type | Use |
 | --- | --- | --- |
 | Browser | Confidential | Server-side browser Authorization Code flow and `/oidc/callback`. |
-| Native API | Public | TUI Authorization Code with PKCE and loopback redirects; issues the API audience/scope. |
+| Native API | Public | TUI and Tauri desktop/Android Authorization Code with PKCE; issues the API audience/scope. |
 Authentik has no MCP provider, application, audience, scope mapping, callback, or token-issuance role. Waltr hosts MCP authorization, supports DCR and CIMD according to explicit stack policy, and retains `WALTR_MCP_REQUIRED_SCOPES` as local policy.
+
+Both `Pulumi.preview.yaml` and `Pulumi.prod.yaml` set `waltr:androidNativeRedirectUri` to exactly `dev.waltr.app:/oauth2redirect`. Pulumi validates that exact value and adds it in strict matching mode to each stack's existing public native client alongside the desktop regex `^http://127\.0\.0\.1:[0-9]+/callback$`. These committed stack sources define the registration that a future `pulumi up` would reconcile. They do not prove that either provider currently has the redirect registered. No live provider registration, `pulumi up`, deployment, Android installation, or authorized login smoke test was performed for this implementation.
 
 This is a clean cutover. Do not add `WALTR_MCP_OIDC_*`, `WALTR_MCP_SELF_OAUTH_*`, an Authentik MCP audience, a second advertised issuer, or a fallback validator. Existing native API tokens remain Authentik-issued but are not accepted at `/mcp`.
 
@@ -242,7 +273,15 @@ The egress NetworkPolicy permits DNS, HTTPS discovery, OTLP on TCP `4318`, profi
 
 CloudNativePG writes compressed WAL and data backups under the generated S3 bucket's `database/` prefix, retains backups for 30 days, and runs a daily scheduled backup. Treat the MCP database and the matching wrapping-key Secret version as one recovery unit. A restored database without every wrapping key referenced by encrypted signing rows cannot issue or rotate credentials. See [MCP OAuth Key Rotation And Recovery](runbooks/mcp-oauth-key-rotation-recovery.md).
 
-Pipelines as Code definitions under `.tekton/` are configured to build the Dockerfile's multi-architecture `runtime` target and deploy only through Pulumi. A push to `main` targets the `preview` stack with an image tagged by the full commit SHA. The production definition accepts only a tag that strictly matches `vX.Y.Z`; it builds and deploys that exact tag and publishes the multi-architecture tag as `latest`. A tag matching the broad trigger but not the strict version expression fails before production provisioning or deployment. These definitions and their static checks do not establish that either stack has been deployed successfully.
+### Release Pipelines
+
+Pipelines as Code definitions under `.tekton/` separate server deployment from application prereleases. A push to `main` targets only the `preview` server stack with an image tagged by the full commit SHA; it publishes no Tauri application release. The production server definition is triggered only by an exact stable `vX.Y.Z` tag, retains signed annotated-tag validation, builds and deploys that tag, and publishes the multi-architecture container tag as `latest`. RC tags cannot trigger this stable pipeline.
+
+The Tauri prerelease definition is triggered only by an exact `vX.Y.Z-rc.N` tag. Before any build it requires the tag to be annotated, signed by a key in `waltr-release-trusted-signers`, resolved to the full webhook commit SHA, and reachable from `origin/main`. It strips the tag signature from the annotated message and uses the remaining message as the Forgejo release body. Version components have no leading zeros. The build additionally requires `X <= 20`, `Y <= 99`, `Z <= 999`, and `1 <= N <= 999`, and computes Android versionCode as `X*100000000 + Y*1000000 + Z*1000 + N` with an explicit signed 32-bit check.
+
+The shared build Task publishes exactly `waltr-X.Y.Z-rc.N-android-universal.apk` and `waltr-X.Y.Z-rc.N-linux-amd64.AppImage`. It verifies the APK certificate against the PAC repository setting `WALTR_ANDROID_SIGNING_CERT_SHA256`. The release is reconciled as `prerelease=true` and `draft=false`; rerunning the same tag updates its metadata and replaces assets with those same names. Build and publication use separate `waltr-tauri-build-v1` and `waltr-forgejo-release-v1` ServiceAccounts and OpenBao policies. Their KV v2 paths are `kv/data/ci/waltr/android-signing` and `kv/data/ci/waltr/forgejo-release`, respectively.
+
+The prerelease PipelineRun references the shared homelab Tasks from the homelab `main` branch so each run uses the current Task definitions. Deploy those Tasks and their ServiceAccounts, OpenBao roles/policies, and secret payloads before pushing an RC tag. Review homelab Task changes as part of release readiness because later changes apply to future Waltr release runs without a Waltr repository update. These definitions and their static checks do not establish that a stack or application release has been deployed successfully.
 
 ## Startup And Operation
 

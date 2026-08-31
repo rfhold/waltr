@@ -23,6 +23,8 @@ Client interactivity should use reducer-style state transitions so TUI and web c
 
 Native bearer credentials are process-memory leases over verified TLS. Preserve generation checks so stale login or refresh tasks cannot overwrite newer credentials. Explicit logout performs an anonymous status reprobe so disabled-auth servers recover.
 
+Keep loopback and external native callback policies separate. External callback data is opaque outside the native access coordinator; exact redirect, state, code/error, duplicate-parameter, and PKCE validation remain in Rust. Deliver queued external callbacks serially into the bounded attempt lane so invalid input cannot drop a later valid callback. Callback delivery must stay bounded and stale-safe so stale input cannot displace current credentials or complete another attempt.
+
 Keep one cancellation-safe in-flight effect across command preemption and park denied streams after work drains. Provider/MCP catalog state and commands belong to this reducer; web and TUI must not bypass it with direct RPC transports.
 
 Outbound OAuth snapshots may expose opaque attempt/lifecycle, completion mode, registration method, URL, and sanitized failures. Tokens, PKCE verifiers, callback state, refresh claims, and registration credentials must remain behind server/agent boundaries.

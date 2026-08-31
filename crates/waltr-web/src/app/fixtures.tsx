@@ -28,6 +28,9 @@ export function FixtureAppStateProvider(props: ParentProps<{ snapshot: ClientSna
     clientLoaded: () => true,
     systemReady: () => true,
     explicitAuthTarget,
+    nativeAccess: () => undefined,
+    accessProgress: () => undefined,
+    openExternalUrl: () => undefined,
     dispatch: async (_command: ClientCommand) => props.snapshot,
     dispatchBeginExplicitAuth: async (target) => {
       setExplicitAuthTarget(target);

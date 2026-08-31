@@ -19,17 +19,20 @@ Waltr uses layered feature coverage. A feature should be tested at each layer it
 | `crates/waltr-client/tests/` | UI-like tests for the shared client state machine over the server contract. |
 | `crates/waltr-client/tests/live.rs` and `crates/waltr-client/tests/live/session.rs` | Ignored client state-machine tests that run session commands through live providers. |
 | `crates/waltr-web/tests/` | Browser UI state, routing, forms, transitions, and component-level behavior. |
+| `crates/waltr-web/tests/platform/` | Hosted WASM and Tauri adapter selection, lifecycle, stale-event handling, disposal, and external-navigation behavior. |
+| `crates/waltr-app/src/bridge.rs` tests | Tauri generation ordering, bounded coalescing, FIFO dispatch, disposal, logout ordering, Android callback routing/handoff lifecycle, and secret-free serialization. |
+| `crates/waltr-app/src/policy.rs` tests | Packaged-only WebView navigation and credential-free external HTTPS URL validation. |
 | `tests/web/k6/` | Browser-level server-backed end-to-end web flows. |
 | `crates/waltr-tui/tests/app.rs` and `crates/waltr-tui/tests/snapshots/` | Non-server-backed TUI routing, input, rendering, and golden paths. |
 | `crates/waltr-tui/tests/server_backed.rs` and `crates/waltr-tui/tests/server-backed/` | TUI flows against a real server, kept in parity with web k6 flows. |
 
-Access-auth coverage is intentionally layered. Generic MCP tests own hosted OAuth parsing, DCR/CIMD, atomic token and key state, and authorization leases. Server tests own route partitioning, Authentik-to-Waltr browser resumption, Waltr consent, independent API/MCP issuers, direct-upstream rejection, persistence, and fail-closed startup. Agent/server tests own outbound discovery, registration selection, durable callback/refresh claims, and dynamic bearer replacement. Shared client tests own typed domain classification and sanitized attempt state. Web/TUI tests own callback polling/manual completion presentation without token access.
+Access-auth coverage is intentionally layered. Generic MCP tests own hosted OAuth parsing, DCR/CIMD, atomic token and key state, and authorization leases. Server tests own route partitioning, Authentik-to-Waltr browser resumption, Waltr consent, independent API/MCP issuers, direct-upstream rejection, persistence, and fail-closed startup. Agent/server tests own outbound discovery, registration selection, durable callback/refresh claims, and dynamic bearer replacement. Shared client tests own typed domain classification, native discovery/PKCE/callback/refresh behavior, and sanitized state. Browser, TUI, and Tauri tests own their host adapters and presentation without token access.
 
 # Layering
 
 Do not remove higher-layer coverage just because lower-layer coverage exists.
 
-Generic protocol/library tests validate reusable crates such as `mcp`. Agent tests validate the agent library as a normal library boundary on top of generic dependencies. Server tests validate the server-facing contract. Client tests validate the shared state machine on top of that contract. Web and TUI tests validate user-facing behavior through their platform-specific UI layers.
+Generic protocol/library tests validate reusable crates such as `mcp`. Agent tests validate the agent library as a normal library boundary on top of generic dependencies. Server tests validate the server-facing contract. Client tests validate the shared state machine and native access protocol on top of that contract. Browser, TUI, and Tauri tests validate user-facing behavior and lifecycle through their platform-specific adapters.
 
 # Commands
 
@@ -87,6 +90,12 @@ Run client unit tests:
 
 This includes shared Waltr access state transitions, protected-state clearing, status-watch epoch rejection, and native bearer credential lease coverage.
 
+Run shared native access protocol tests:
+
+`cargo test -p waltr-client --features native-access --lib native_access`
+
+This layer owns callback-policy separation, exact redirect/state/code/error validation, wrong-state or otherwise invalid callback followed by a valid callback, timeout/cancellation, PKCE exchange, credential leases, protected bearer delivery, refresh/expiry, and logout cleanup. It does not prove Android intent delivery.
+
 Run client integration tests:
 
 `cargo test -p waltr-client --tests`
@@ -103,7 +112,7 @@ Run all TUI integration tests:
 
 `cargo test -p waltr-tui --tests`
 
-Run native OIDC discovery, PKCE, loopback callback, token refresh/expiry, and redaction unit tests:
+Run TUI environment, loopback-policy, and terminal-effect adapter tests:
 
 `cargo test -p waltr-tui --lib native_auth`
 
@@ -115,11 +124,33 @@ Run only TUI server-backed tests:
 
 `cargo test -p waltr-tui --test server_backed`
 
-Run web tests:
+Run hosted browser and Tauri web-adapter tests:
 
 `pnpm --filter @rfhold/waltr-web test`
 
-The web suite includes `tests/access/` coverage for generated access bindings, safe browser return paths, login states, expiry, provider-OAuth separation, and same-origin logout. It uses mocked browser/client boundaries; server cookie and OIDC validation belong to server access-auth tests.
+The web suite includes `tests/access/` coverage for generated access bindings, safe browser return paths, login states, expiry, provider-OAuth separation, and same-origin logout. `tests/platform/` covers hosted WASM disposal and Tauri generation/sequence handling, recovery, disposal, and external URL delegation. It uses mocked browser/client boundaries; server cookie and OIDC validation belong to server access-auth tests.
+
+Run Tauri shell unit and policy tests:
+
+`cargo test -p waltr-app`
+
+This layer checks the explicit manifest callback shape, opaque Kotlin-to-JNI `Intent` transport, and absence of a callback Tauri event or WebView capability. Tests cover one-entry latest replacement, invalid-then-valid routing, generation fences, handoff-before-open order, one-shot pause preservation, callback release on resume, suspended terminal teardown, process-memory cleanup, and secret-free IPC. Cold and warm callback tests exercise Rust routing and source contracts, not Android's installed-app intent resolver.
+
+Build the no-WASM Tauri web target:
+
+`pnpm build:tauri`
+
+Build the Android package through the generated project:
+
+`pnpm --filter @rfhold/waltr-app android:build`
+
+Validate the Pulumi source registration and deployment shape without applying a stack:
+
+`bun run --cwd infra/pulumi build && bun run --cwd infra/pulumi test`
+
+The client and app tests prove protocol behavior, Rust ownership, bounded routing, and source/manifest configuration. The Pulumi test proves both stack files declare the exact private URI and the program retains strict Android plus regex desktop registration. The Android package command proves the generated project builds. None proves that Authentik has been reconciled, that an emulator/device routes cold or warm intents to Waltr, or that a live provider accepts the redirect.
+
+Installed-app testing belongs at the Android host layer. Exercise warm and cold intents, browser pause/resume, cancel and five-minute timeout while suspended, ordinary and authenticated backgrounding, callback after process death, and private-scheme contention. A cold callback after process death must fail closed and a new login must be required. Authorized live-provider smoke testing additionally covers login, a protected request, refresh or expiry, logout, and subsequent credential rejection. These checks require explicit deployment authority and must not be folded into routine tests that mutate preview. Android app start and Linux desktop commands are documented once in [Deployment](deployment.md#tauri-application). macOS and iOS require macOS and were not verified.
 
 Run web server-backed k6 tests:
 
@@ -237,10 +268,6 @@ MCP and server PostgreSQL store tests require Docker because they start `postgre
 The commands above are the implemented focused gates. Deterministic and SQLite suites, container-backed PostgreSQL conformance, aggregate workspace checks, complete hosted browser OAuth verification, Pulumi shape/policy tests, and static pipeline-definition checks have passed. Live Pulumi/Tekton deployment, multi-replica revocation/rotation, database failover, backup restoration, Authentik-outage, independent third-party client hosted-OAuth interoperability, and performance/load exercises were not run and remain workstream 07/08 gaps. Do not infer production deployment or successful restoration from deterministic, container-backed, browser, Pulumi-mock, or pipeline-definition checks.
 
 Web server-backed integration tests require Docker Compose. Every test Waltr service uses tmpfs `/data`; test services communicate on an internal-only network and publish no host port. Long-running dependencies have health checks and startup uses `docker compose up --wait`. The runner preserves the first failure exit code, captures diagnostics, and treats failed teardown as a test failure while retrying cleanup. Caddy terminates HTTPS for the browser and OIDC issuer, and its ephemeral CA is trusted only inside the test stack.
-
-Run the Pulumi deployment shape and secret-projection policy tests:
-
-`bun --cwd infra/pulumi run build && bun --cwd infra/pulumi run test`
 
 Run the static Compose deployment contract without starting services:
 

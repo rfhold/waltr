@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { AppStateProvider } from "../../src/app/state";
 import type { ClientCommand, ClientSnapshot, ConfigView } from "../../src/generated/waltr-client";
-import type { ClientSnapshotListener, WasmClient } from "../../src/wasm/client";
+import type { ClientAdapter, ClientSnapshotListener } from "../../src/platform/client";
 import { ConfigRouteWithChildren, resetTestHistory } from "../support/routes";
 import { claudeConfig, mcpServerView, snapshotWithConfig } from "../support/snapshots";
 
@@ -89,8 +89,7 @@ function renderResetRoute() {
     current = snapshot;
     listener?.(snapshot);
   };
-  const client: WasmClient = {
-    endpoint: "https://waltr.example",
+  const client: ClientAdapter = {
     snapshot: () => current,
     start: async () => undefined,
     subscribe: (next) => {
@@ -105,10 +104,11 @@ function renderResetRoute() {
       }
       return current;
     },
+    dispose: () => undefined,
   };
 
   render(() => (
-    <AppStateProvider loadWasmClient={async () => client}>
+    <AppStateProvider loadClientAdapter={async () => client}>
       <ConfigRouteWithChildren />
     </AppStateProvider>
   ));

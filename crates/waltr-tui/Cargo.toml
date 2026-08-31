@@ -17,16 +17,12 @@ bundled-server = ["server", "default-server"]
 bundled = ["web", "default-server"]
 
 [dependencies]
-base64.workspace = true
-waltr-client.workspace = true
+waltr-client = { workspace = true, features = ["native-access"] }
 waltr-server = { workspace = true, optional = true }
 pulldown-cmark.workspace = true
-rand.workspace = true
 ratatui = { workspace = true, features = ["palette", "scrolling-regions", "unstable-rendered-line-info"] }
-reqwest = { workspace = true, features = ["form", "rustls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sha2.workspace = true
 syntect.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = { workspace = true, optional = true }

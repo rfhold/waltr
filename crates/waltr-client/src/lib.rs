@@ -9,6 +9,8 @@ mod client;
 mod coordination;
 mod error;
 mod executor;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-access"))]
+mod native_access;
 mod resource;
 mod routine;
 mod transport;
@@ -81,6 +83,11 @@ pub use waltr::grpc::waltr::session::v1::{
     search_session_templates_response,
 };
 pub use waltr::grpc::waltr::status::v1::SystemStatus;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-access"))]
+pub use native_access::{
+    NativeAccessAction, NativeAccessConfig, NativeAccessCoordinator, NativeAccessOutput,
+    NativeAccessProgress, NativeAuthorizationCallback, NativeCallbackPolicy, NativeLoopbackPolicy,
+};
 pub use routine::{
     ClientManualRoutineDefinition, ClientRoutineAdmission, ClientRoutineDefinitionSnapshot,
     ClientRoutineEventKind, ClientRoutineFailure, ClientRoutineFieldViolation,
@@ -128,5 +135,14 @@ mod direct_transport_tests {
         let forbidden = concat!("Default", "GrpcTransport");
 
         assert!(!source.contains(forbidden));
+    }
+
+    #[test]
+    fn wasm_binding_dispose_closes_the_runtime_command_source() {
+        let source = include_str!("wasm.rs");
+
+        assert!(source.contains("pub fn dispose(&self)"));
+        assert!(source.contains("self.commands.close_channel()"));
+        assert!(source.contains("stop.send(())"));
     }
 }
