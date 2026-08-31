@@ -34,7 +34,6 @@ spec:
         type: string
     workspaces:
       - name: source
-      - name: output
     tasks:
       - name: fetch-repository
         retries: 1
@@ -148,7 +147,7 @@ spec:
 
                 release_dir=.waltr-release
                 rm -rf -- "$release_dir"
-                install -d -m 700 "$release_dir"
+                install -d -m 700 "$release_dir" "$release_dir/output"
                 git cat-file tag "refs/tags/$tag" | awk '
                   in_body && /^-----BEGIN (PGP|SSH) SIGNATURE-----$/ { exit }
                   in_body { print; next }
@@ -196,7 +195,8 @@ spec:
           - name: source
             workspace: source
           - name: output
-            workspace: output
+            workspace: source
+            subPath: .waltr-release/output
 
       - name: prepare-release-input
         runAfter: [build-release-assets]
@@ -225,7 +225,8 @@ spec:
           - name: source
             workspace: source
           - name: output
-            workspace: output
+            workspace: source
+            subPath: .waltr-release/output
 
       - name: publish-prerelease
         runAfter: [prepare-release-input]
@@ -265,7 +266,8 @@ spec:
             value: kv/data/ci/waltr/forgejo-release
         workspaces:
           - name: input
-            workspace: output
+            workspace: source
+            subPath: .waltr-release/output
   workspaces:
     - name: source
       volumeClaimTemplate:
@@ -274,12 +276,4 @@ spec:
           storageClassName: shared-fs
           resources:
             requests:
-              storage: 20Gi
-    - name: output
-      volumeClaimTemplate:
-        spec:
-          accessModes: [ReadWriteMany]
-          storageClassName: shared-fs
-          resources:
-            requests:
-              storage: 10Gi
+              storage: 30Gi
