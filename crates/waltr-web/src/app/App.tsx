@@ -1,14 +1,15 @@
 import { AppStateProvider } from "./state";
 import { AppRouter } from "../routes";
-import { loadWasmClient, type WasmClientLoader } from "../wasm/client";
+import { loadClientAdapter } from "virtual:waltr-platform";
+import type { ClientAdapterLoader } from "../platform/client";
 
 export type AppProps = {
-  loadWasmClient?: WasmClientLoader;
+  loadClientAdapter?: ClientAdapterLoader;
 };
 
 export function App(props: AppProps) {
   return (
-    <AppStateProvider loadWasmClient={props.loadWasmClient ?? loadWasmClient}>
+    <AppStateProvider loadClientAdapter={props.loadClientAdapter ?? loadClientAdapter}>
       <AppRouter />
     </AppStateProvider>
   );

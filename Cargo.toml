@@ -2,6 +2,7 @@
 members = [
     "crates/waltr",
     "crates/waltr-agent",
+    "crates/waltr-app",
     "crates/waltr-client",
     "crates/waltr-server",
     "crates/waltr-tui",
@@ -18,6 +19,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 aes-gcm = "0.10.3"
+arc-swap = "1.9.1"
 axum = { version = "0.8.9", features = ["http2"] }
 aws-config = "1.8.12"
 aws-sdk-s3 = "1.115.0"
@@ -40,6 +42,7 @@ jaq-std = "1.6.0"
 jsonwebtoken = "9.3.1"
 waltr = { version = "0.1.0", path = "crates/waltr" }
 waltr-agent = { version = "0.1.0", path = "crates/waltr-agent" }
+waltr-app = { version = "0.1.0", path = "crates/waltr-app" }
 waltr-client = { version = "0.1.0", path = "crates/waltr-client" }
 waltr-server = { version = "0.1.0", path = "crates/waltr-server" }
 mcp = { version = "0.1.0", path = "crates/mcp" }

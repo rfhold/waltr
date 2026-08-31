@@ -1,0 +1,11 @@
+{
+  "name": "@rfhold/waltr-app",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "cargo tauri build",
+    "dev": "cargo tauri dev",
+    "android:init": "cargo tauri android init",
+    "android:build": "cargo tauri android build"
+  }
+}

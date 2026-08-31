@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
+native-access = ["dep:base64", "dep:rand", "dep:reqwest", "dep:sha2", "dep:tokio"]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 
 [dependencies]
@@ -28,7 +29,12 @@ wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+base64 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+reqwest = { workspace = true, features = ["form", "rustls"], optional = true }
 rustls.workspace = true
+sha2 = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"], optional = true }
 tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-ring"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

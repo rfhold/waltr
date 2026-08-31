@@ -53,12 +53,22 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
   const app = useAppState();
   const [localError, setLocalError] = createSignal<string>();
   const access = () => app.snapshot()?.access;
+  const accessProgressError = () => {
+    const progress = app.accessProgress();
+    return progress?.type === "unavailable" ? progress.message : undefined;
+  };
   const loginUrl = () => waltrLoginUrl(window.location);
   const login = async (event: MouseEvent) => {
     event.preventDefault();
     setLocalError(undefined);
 
     try {
+      const nativeAccess = app.nativeAccess();
+      if (nativeAccess) {
+        await nativeAccess.start();
+        return;
+      }
+
       const started = await app.dispatch({ type: "startWaltrLogin" });
       const attemptId = started.access.activeAttemptId;
       if (!attemptId) {
@@ -85,7 +95,9 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
 
     setLocalError(undefined);
     try {
-      await app.dispatch({ type: "cancelWaltrLogin", attemptId });
+      const nativeAccess = app.nativeAccess();
+      if (nativeAccess) await nativeAccess.cancel();
+      else await app.dispatch({ type: "cancelWaltrLogin", attemptId });
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : "Unable to cancel login.");
     }
@@ -105,6 +117,10 @@ export function AccessRoute(props: { navigate?: (url: string) => void | Promise<
         </p>
 
         <Show when={access()?.error ?? localError()}>
+          {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
+        </Show>
+
+        <Show when={accessProgressError()}>
           {(message) => <InlineAlert tone="danger">{message()}</InlineAlert>}
         </Show>
 

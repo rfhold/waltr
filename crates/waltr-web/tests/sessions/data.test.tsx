@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 
 import { AppStateProvider } from "../../src/app/state";
 import type { ClientCommand, ClientSnapshot } from "../../src/generated/waltr-client";
-import type { ClientSnapshotListener, WasmClient } from "../../src/wasm/client";
+import type { ClientAdapter, ClientSnapshotListener } from "../../src/platform/client";
 import { renderWithAppState } from "../support/render";
 import { SessionsRouteWithRouter, ShellRouteWithChildren, resetTestHistory, testHistory } from "../support/routes";
 import { sessionView, snapshotWithSessions } from "../support/snapshots";
@@ -123,8 +123,7 @@ function renderWipeRoute() {
     current = snapshot;
     listener?.(snapshot);
   };
-  const client: WasmClient = {
-    endpoint: "https://waltr.example",
+  const client: ClientAdapter = {
     snapshot: () => current,
     start: async () => undefined,
     subscribe: (next) => {
@@ -139,10 +138,11 @@ function renderWipeRoute() {
       }
       return current;
     },
+    dispose: () => undefined,
   };
 
   render(() => (
-    <AppStateProvider loadWasmClient={async () => client}>
+    <AppStateProvider loadClientAdapter={async () => client}>
       <SessionsRouteWithRouter />
     </AppStateProvider>
   ));

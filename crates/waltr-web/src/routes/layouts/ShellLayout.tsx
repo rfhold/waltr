@@ -14,6 +14,18 @@ export function ShellLayout(props: ParentProps<{ reload?: () => void }>) {
     setLoggingOut(true);
     setLogoutError(undefined);
 
+    const nativeAccess = app.nativeAccess();
+    if (nativeAccess) {
+      try {
+        await nativeAccess.logout();
+      } catch {
+        setLogoutError("Waltr could not sign you out. Try again.");
+      } finally {
+        setLoggingOut(false);
+      }
+      return;
+    }
+
     let response: Response;
     try {
       response = await fetch("/oidc/logout", { method: "POST", credentials: "same-origin" });

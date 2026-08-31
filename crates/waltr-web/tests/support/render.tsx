@@ -4,6 +4,7 @@ import { afterEach } from "vitest";
 
 import { AppStateContextProvider } from "../../src/app/context";
 import type { AuthenticationFailureSnapshot, ClientAuthTarget, ClientCommand, ClientOperationView, ClientSnapshot, ConfigView, SessionView } from "../../src/generated/waltr-client";
+import type { AccessProgress, NativeAccessOperations } from "../../src/platform/client";
 import { resetTestHistory } from "./routes";
 import { emptyConfig, snapshotWithConfig } from "./snapshots";
 
@@ -22,6 +23,9 @@ export function renderWithAppState(
     minimumSplashElapsed?: boolean;
     routePath?: string;
     explicitAuthTarget?: ClientAuthTarget;
+    nativeAccess?: NativeAccessOperations;
+    accessProgress?: AccessProgress;
+    openExternalUrl?: (url: string) => Promise<void>;
     configPatchError?: string;
     sessionCreateError?: string;
     sessionDeleteError?: string;
@@ -432,6 +436,9 @@ export function renderWithAppState(
           clientLoaded: () => options.clientLoaded ?? true,
           systemReady,
           explicitAuthTarget,
+          nativeAccess: () => options.nativeAccess,
+          accessProgress: () => options.accessProgress,
+          openExternalUrl: () => options.openExternalUrl,
           dispatch,
           dispatchBeginExplicitAuth: async (target) => {
             setExplicitAuthTarget(target);

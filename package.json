@@ -6,6 +6,7 @@
     "dev": "node scripts/dev.mjs",
     "dev:web": "node scripts/dev-web.mjs",
     "build": "pnpm --filter @rfhold/waltr-web build",
+    "build:tauri": "pnpm --filter @rfhold/waltr-web build:tauri",
     "install:bundled": "cargo install --path crates/waltr-tui --bin waltr --features bundled --locked",
     "test": "pnpm --filter @rfhold/waltr-web test",
     "test:web:integration": "node scripts/test-web-integration.mjs --mode compose --access both",

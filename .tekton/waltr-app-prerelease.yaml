@@ -1,0 +1,285 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: waltr-app-prerelease
+  annotations:
+    pipelinesascode.tekton.dev/on-cel-expression: 'event == "push" && target_branch.matches("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-rc\\.([1-9][0-9]*)$")'
+    pipelinesascode.tekton.dev/max-keep-runs: "10"
+    pipelinesascode.tekton.dev/task: "[https://git.holdenitdown.net/rfhold/homelab/raw/branch/main/src/components/tekton-tasks/tauri-release-build.yaml, https://git.holdenitdown.net/rfhold/homelab/raw/branch/main/src/components/tekton-tasks/forgejo-release-upsert.yaml]"
+spec:
+  taskRunSpecs:
+    - pipelineTaskName: build-release-assets
+      serviceAccountName: waltr-tauri-build-v1
+      podTemplate:
+        nodeSelector:
+          kubernetes.io/arch: amd64
+    - pipelineTaskName: publish-prerelease
+      serviceAccountName: waltr-forgejo-release-v1
+  timeouts:
+    pipeline: 3h0m0s
+  params:
+    - name: repo-url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+    - name: source-branch
+      value: "{{ source_branch }}"
+  pipelineSpec:
+    params:
+      - name: repo-url
+        type: string
+      - name: revision
+        type: string
+      - name: source-branch
+        type: string
+    workspaces:
+      - name: source
+      - name: output
+    tasks:
+      - name: fetch-repository
+        retries: 1
+        taskSpec:
+          params:
+            - name: repo-url
+              type: string
+            - name: revision
+              type: string
+          workspaces:
+            - name: output
+          volumes:
+            - name: git-auth
+              secret:
+                secretName: "{{ git_auth_secret }}"
+          steps:
+            - name: clone
+              image: docker.io/alpine/git:2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+              workingDir: $(workspaces.output.path)
+              volumeMounts:
+                - name: git-auth
+                  mountPath: /etc/git-auth
+                  readOnly: true
+              script: |
+                #!/bin/sh
+                set -eu
+                cp /etc/git-auth/.gitconfig /root/.gitconfig
+                cp /etc/git-auth/.git-credentials /root/.git-credentials
+                git clone "$(params.repo-url)" .
+                git checkout --detach "$(params.revision)"
+                test "`git rev-parse HEAD`" = "$(params.revision)"
+        params:
+          - name: repo-url
+            value: $(params.repo-url)
+          - name: revision
+            value: $(params.revision)
+        workspaces:
+          - name: output
+            workspace: source
+
+      - name: validate-prerelease
+        runAfter: [fetch-repository]
+        taskSpec:
+          params:
+            - name: revision
+              type: string
+            - name: source-branch
+              type: string
+          results:
+            - name: tag
+              type: string
+            - name: version
+              type: string
+            - name: android-version-code
+              type: string
+          workspaces:
+            - name: source
+          volumes:
+            - name: trusted-signers
+              secret:
+                secretName: waltr-release-trusted-signers
+          steps:
+            - name: policy
+              image: docker.io/alpine/git:2.49.1@sha256:c0280cf9572316299b08544065d3bf35db65043d5e3963982ec50647d2746e26
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: SOURCE_BRANCH
+                  value: $(params.source-branch)
+              volumeMounts:
+                - name: trusted-signers
+                  mountPath: /etc/release-signers
+                  readOnly: true
+              script: |
+                #!/bin/sh
+                set -eu
+
+                fail() {
+                  printf '%s\n' "$1" >&2
+                  exit 1
+                }
+
+                case "$SOURCE_BRANCH" in refs/tags/*) tag=${SOURCE_BRANCH#refs/tags/} ;; *) fail 'source branch is not a tag ref' ;; esac
+                printf '%s\n' "$tag" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.([1-9][0-9]*)$' || fail 'tag is not an RC release tag'
+                printf '%s\n' "$(params.revision)" | grep -Eq '^[0-9a-f]{40}$' || fail 'revision is not a full commit SHA'
+                test "`git cat-file -t "refs/tags/$tag"`" = tag || fail 'release tag is not annotated'
+
+                export GNUPGHOME=/tmp/release-gnupg
+                install -d -m 700 "$GNUPGHOME"
+                gpg --batch --import /etc/release-signers/signing-key.asc
+                git verify-tag "$tag"
+                test "`git rev-parse "refs/tags/$tag^{commit}"`" = "$(params.revision)" || fail 'tag does not resolve to the webhook revision'
+                git merge-base --is-ancestor "$(params.revision)" refs/remotes/origin/main || fail 'release revision is not reachable from origin/main'
+
+                version=${tag#v}
+                numeric=${version%-rc.*}
+                rc_number=${version##*-rc.}
+                old_ifs=$IFS
+                IFS=.
+                set -- $numeric
+                IFS=$old_ifs
+                test "$#" -eq 3 || fail 'release version could not be parsed'
+                major=$1
+                minor=$2
+                patch=$3
+                test "$major" -le 20 || fail 'major version exceeds 20'
+                test "$minor" -le 99 || fail 'minor version exceeds 99'
+                test "$patch" -le 999 || fail 'patch version exceeds 999'
+                test "$rc_number" -ge 1 && test "$rc_number" -le 999 || fail 'RC number must be between 1 and 999'
+                android_version_code=$((major * 100000000 + minor * 1000000 + patch * 1000 + rc_number))
+                test "$android_version_code" -ge 1 && test "$android_version_code" -le 2147483647 || fail 'Android versionCode exceeds the signed 32-bit bound'
+
+                release_dir=.waltr-release
+                rm -rf -- "$release_dir"
+                install -d -m 700 "$release_dir"
+                git cat-file tag "refs/tags/$tag" | awk '
+                  in_body && /^-----BEGIN (PGP|SSH) SIGNATURE-----$/ { exit }
+                  in_body { print; next }
+                  /^$/ { in_body = 1 }
+                ' > "$release_dir/body.md"
+                grep -Eq '^-----BEGIN (PGP|SSH) SIGNATURE-----$' "$release_dir/body.md" && fail 'release body contains signature material'
+
+                printf '%s' "$tag" > "$(results.tag.path)"
+                printf '%s' "$version" > "$(results.version.path)"
+                printf '%s' "$android_version_code" > "$(results.android-version-code.path)"
+        params:
+          - name: revision
+            value: $(params.revision)
+          - name: source-branch
+            value: $(params.source-branch)
+        workspaces:
+          - name: source
+            workspace: source
+
+      - name: build-release-assets
+        runAfter: [validate-prerelease]
+        retries: 1
+        taskRef:
+          apiVersion: tekton.dev/v1
+          kind: Task
+          name: tauri-release-build
+        params:
+          - name: app-path
+            value: crates/waltr-app
+          - name: version
+            value: $(tasks.validate-prerelease.results.version)
+          - name: android-version-code
+            value: $(tasks.validate-prerelease.results.android-version-code)
+          - name: builder-image
+            value: cr.holdenitdown.net/rfhold/tauri-release-ci:rust1.96.0-tauri2.10.1-pnpm11.5.0-android36
+          - name: expected-signing-cert-sha256
+            value: "{{ WALTR_ANDROID_SIGNING_CERT_SHA256 }}"
+          - name: openbao-role
+            value: waltr-tauri-build-v1
+          - name: openbao-policy
+            value: waltr-tauri-build-v1
+          - name: openbao-signing-secret-path
+            value: kv/data/ci/waltr/android-signing
+        workspaces:
+          - name: source
+            workspace: source
+          - name: output
+            workspace: output
+
+      - name: prepare-release-input
+        runAfter: [build-release-assets]
+        taskSpec:
+          params:
+            - name: version
+              type: string
+          workspaces:
+            - name: source
+            - name: output
+          steps:
+            - name: prepare
+              image: docker.io/library/alpine:3.22.1@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+              script: |
+                #!/bin/sh
+                set -eu
+                version=$(params.version)
+                test -f "$(workspaces.source.path)/.waltr-release/body.md"
+                test -f "$(workspaces.output.path)/waltr-${version}-android-universal.apk"
+                test -f "$(workspaces.output.path)/waltr-${version}-linux-amd64.AppImage"
+                install -m 0600 "$(workspaces.source.path)/.waltr-release/body.md" "$(workspaces.output.path)/release-body.md"
+        params:
+          - name: version
+            value: $(tasks.validate-prerelease.results.version)
+        workspaces:
+          - name: source
+            workspace: source
+          - name: output
+            workspace: output
+
+      - name: publish-prerelease
+        runAfter: [prepare-release-input]
+        retries: 1
+        taskRef:
+          apiVersion: tekton.dev/v1
+          kind: Task
+          name: forgejo-release-upsert
+        params:
+          - name: git-url
+            value: "{{ GIT_URL }}"
+          - name: repo-owner
+            value: "{{ repo_owner }}"
+          - name: repo-name
+            value: "{{ repo_name }}"
+          - name: tag
+            value: $(tasks.validate-prerelease.results.tag)
+          - name: target-commitish
+            value: $(params.revision)
+          - name: title
+            value: "Waltr $(tasks.validate-prerelease.results.tag)"
+          - name: body-file
+            value: release-body.md
+          - name: prerelease
+            value: "true"
+          - name: draft
+            value: "false"
+          - name: asset-relative-paths
+            value:
+              - waltr-$(tasks.validate-prerelease.results.version)-android-universal.apk
+              - waltr-$(tasks.validate-prerelease.results.version)-linux-amd64.AppImage
+          - name: openbao-role
+            value: waltr-forgejo-release-v1
+          - name: openbao-policy
+            value: waltr-forgejo-release-v1
+          - name: openbao-token-secret-path
+            value: kv/data/ci/waltr/forgejo-release
+        workspaces:
+          - name: input
+            workspace: output
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteMany]
+          storageClassName: shared-fs
+          resources:
+            requests:
+              storage: 20Gi
+    - name: output
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteMany]
+          storageClassName: shared-fs
+          resources:
+            requests:
+              storage: 10Gi

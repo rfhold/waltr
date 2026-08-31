@@ -14,6 +14,8 @@ Web behavior should stay feature-equivalent with TUI while keeping browser-speci
 
 Waltr access login navigates to server-owned `/oidc/login` with a safe local return path; the browser never handles provider tokens or the HttpOnly Waltr session cookie. Logout is same-origin POST before dispatching shared protected-state clearing. Keep this UI separate from provider/upstream-MCP `OAuthDialog`; server-callback MCP attempts poll shared lifecycle state and never expose token or PKCE material.
 
+Non-persisted unload disposes the active adapter. Persisted `pagehide` keeps it alive for BFCache restoration on `pageshow`.
+
 # Hints
 
 Use the web-modification skill when modifying this crate.

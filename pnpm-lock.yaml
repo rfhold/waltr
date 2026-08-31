@@ -8,6 +8,8 @@ importers:
 
   .: {}
 
+  crates/waltr-app: {}
+
   crates/waltr-web:
     dependencies:
       '@shikijs/core':
@@ -25,6 +27,9 @@ importers:
       '@solidjs/router':
         specifier: 0.16.1
         version: 0.16.1(solid-js@1.9.13)
+      '@tauri-apps/api':
+        specifier: ^2.8.0
+        version: 2.11.1
       rehype-sanitize:
         specifier: ^6.0.0
         version: 6.0.0
@@ -517,6 +522,9 @@ packages:
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
+
+  '@tauri-apps/api@2.11.1':
+    resolution: {integrity: sha512-M2FPuYND2m+wh5hfW9ZpSdxMPdEJovPBWwoHJmwUpysTYNHaOkVFN419m/K0LIgjb/7KU2vBgsUepJWugQCvAA==}
 
   '@testing-library/dom@10.4.1':
     resolution: {integrity: sha512-o4PXJQidqJl82ckFaXUeoAW+XysPLauYI43Abki5hABd853iMhitooc6znOnczgbTYmEP6U6/y1ZyKAIsvMKGg==}
@@ -1587,6 +1595,8 @@ snapshots:
       '@solidjs/router': 0.16.1(solid-js@1.9.13)
 
   '@standard-schema/spec@1.1.0': {}
+
+  '@tauri-apps/api@2.11.1': {}
 
   '@testing-library/dom@10.4.1':
     dependencies:

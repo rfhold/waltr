@@ -1,29 +1,37 @@
 # Clients
 
-Waltr client architecture keeps server data coordination in `crates/waltr-client/` so web and TUI clients can share behavior while keeping platform-specific routing, forms, rendering, and transient UI state local.
+Waltr client architecture keeps server data coordination in `crates/waltr-client/` so hosted browser, TUI, and Tauri clients can share behavior while keeping platform-specific routing, rendering, effects, and transient UI state local.
 
 ## Responsibilities
 
 | Layer | Owns |
 | --- | --- |
 | `crates/waltr-server/` | Shared server state, RPC services, persistence, watches, validation, and concurrency checks. |
-| `crates/waltr-client/` | Shell-neutral reducer state, server-facing commands, effect intents, transport adapters, stable view models, and runtime orchestration. |
-| `crates/waltr-web/` | Browser routes, forms, transitions, DOM state, and browser-specific command dispatch. |
-| `crates/waltr-tui/` | Terminal routes, input handling, rendering, snapshots, and terminal-specific command dispatch. |
+| `crates/waltr-client/` | Shell-neutral reducer state, server-facing commands, effect intents, transport adapters, stable view models, runtime orchestration, and the feature-gated shared native access protocol. |
+| `crates/waltr-web/` | Shared Solid routes, forms, transitions, and DOM state; build-time platform selection between hosted browser WASM and Tauri IPC adapters. |
+| `crates/waltr-tui/` | Terminal routes, input handling, rendering, snapshots, environment configuration, and terminal effects around shared native access. |
+| `crates/waltr-app/` | Tauri lifecycle, fixed native configuration, Rust client and credential runtime, ordered IPC bridge, local navigation policy, external URL opening, and desktop/Android packaging. |
 
-Web and TUI should not duplicate server data state machines. They should consume `waltr-client` snapshots and dispatch `waltr-client` commands, then adapt the resulting state to their UI surfaces.
+Client shells should not duplicate server data state machines. They consume `waltr-client` snapshots and dispatch `waltr-client` commands, then adapt the resulting state to their UI surfaces.
 
 ```mermaid
 flowchart LR
+    Browser[Hosted browser<br/>WASM adapter and cookies]
     Web[crates/waltr-web<br/>routes, forms, DOM state]
     Tui[crates/waltr-tui<br/>routing, input, rendering]
+    App[crates/waltr-app<br/>Tauri IPC and native host]
     Client[crates/waltr-client<br/>reducer, runtime, view models]
-    Transport[WaltrTransport<br/>tonic or gRPC-web]
+    Transport[WaltrTransport<br/>gRPC-web or tonic]
     Server[crates/waltr-server<br/>RPC, state, watches]
 
-    Web -->|ClientCommand| Client
+    Browser --> Web
+    Web -->|hosted build| Client
+    Client -->|hosted ClientSnapshot| Web
+    Web -->|Tauri IPC commands| App
+    App -->|Tauri IPC snapshots| Web
+    App -->|ClientCommand| Client
+    Client -->|ClientSnapshot| App
     Tui -->|ClientCommand| Client
-    Client -->|ClientSnapshot| Web
     Client -->|ClientSnapshot| Tui
     Client -->|ClientEffect| Transport
     Transport -->|RPC requests and streams| Server
@@ -61,8 +69,8 @@ Status traffic uses the status service to watch system readiness. Catalog watch 
 
 | Runtime | Transport |
 | --- | --- |
-| Native | `NativeGrpcTransport`, backed by tonic channels. |
-| Browser/WASM | `WasmGrpcTransport`, backed by gRPC-web over `fetch`. |
+| TUI and Tauri native hosts | `NativeGrpcTransport`, backed by rustls-verified tonic channels and an in-memory credential provider. |
+| Hosted browser/WASM | `WasmGrpcTransport`, backed by same-origin gRPC-web over `fetch`. |
 
 Transport code converts RPC messages into `ResourceCatalog`, effective `Configuration`, and `SystemStatus` values. UI code uses shared client commands instead of generated clients.
 
@@ -132,6 +140,17 @@ The runtime loop:
 
 The stream form coordinates startup and long-lived watches. It waits for status readiness, maintains watch streams, applies watch events as they arrive, and dispatches shell commands into the same reducer-owned state.
 
+The hosted browser build compiles `waltr-client` to WASM and owns a deterministic adapter disposal path. Vite `tauri` mode instead selects `crates/waltr-web/src/platform/tauri.ts`, emits relative local assets, and does not build or import WASM. `crates/waltr-app` hosts one Rust `ClientStateStream` and native access coordinator for that UI.
+
+The Tauri bridge preserves these lifecycle invariants:
+
+- Exactly one active generation-stamped runtime exists. Starting another runtime synchronously disposes the prior generation.
+- The uncoalesced initial snapshot is delivered before later updates. Eligible later snapshots use bounded latest-value coalescing; logout barriers and their resulting cleared snapshots use a bounded uncoalesced control lane.
+- Commands enter one bounded FIFO and are dispatched in order. Events have monotonic sequences, gaps recover through current state, and stale-generation output is rejected in Rust and TypeScript.
+- Disposal invalidates publication, stops and joins the runtime, clears credentials, removes listeners, and rejects later native output. Rust performs this teardown on document reload, main-window destruction, process exit, and ordinary or authenticated Android suspension; Android resume starts a fresh generation.
+- Android retains the current generation only across the first browser-away pause for a pending unauthenticated login. Rust marks the handoff before it opens the browser. The first resume consumes the exception and releases any held callback. A later pause, authenticated pause, or suspended terminal result invalidates the generation and clears credentials.
+- The hosted WASM adapter also stops polling, frees its Rust client, clears listeners, and rejects work after disposal.
+
 Effective timeline watches append and identity-dedupe projected events. A projection reset is authoritative and replaces stale projected entries plus projection metadata. Raw descriptors continue to process legacy durable event and truncation updates. Projection mode is part of the watch identity, so reconnect/open-generation guards cannot attach a stale raw stream to an effective detail watch.
 
 Agent discovery follows session watch interest and status readiness. The reducer tracks a request generation, ignores stale completions, sorts returned entries, and keeps failed discovery explicit rather than substituting the current or default agent. Create waits for a ready catalog and selected name. Agent switching is an independent keyed operation, so its success or failure does not reuse create state.
@@ -150,7 +169,7 @@ The runtime keeps one cancellation-safe in-flight effect slot. Command preemptio
 
 ## Session Context
 
-Each open session detail owns a read-only Context panel. Web and TUI derive the same content from shared session and timeline snapshots and the selected entry in `session_histories`.
+Each open session detail owns a read-only Context panel. Hosted browser, Tauri web, and TUI surfaces derive the same content from shared session and timeline snapshots and the selected entry in `session_histories`.
 
 Usage metrics have two scopes. Context tokens come from the latest turn's timeline metrics. Cache read and write rates use aggregate session cache tokens over aggregate total input tokens. Cost uses the aggregate session total and currency.
 
@@ -176,7 +195,7 @@ Session Context remains a presentation projection over shared-client state. Rout
 
 Waltr access authentication is separate from provider and upstream-MCP credential management. `AccessStatus` is `UnknownChecking`, `LoginRequired`, `LoginInProgress`, `Authenticated`, or `LoginFailed`. Outbound authentication failures remain ordinary operation or failed-session results with structured `AuthenticationFailure` data; they do not change access state or create pending authorization state.
 
-Shared access commands are `StartWaltrLogin`, `CompleteWaltrLogin`, `FailWaltrLogin`, `CancelWaltrLogin`, `LogoutWaltr`, and `WaltrAccessExpired`. `AccessEvent` applies the corresponding facts to deterministic reducer state while browser navigation, OIDC exchange, loopback listeners, token refresh, and cookie logout stay in platform runtimes.
+Shared access commands are `StartWaltrLogin`, `CompleteWaltrLogin`, `FailWaltrLogin`, `CancelWaltrLogin`, `LogoutWaltr`, and `WaltrAccessExpired`. `AccessEvent` applies the corresponding facts to deterministic reducer state. Browser navigation and cookie logout stay in the hosted browser runtime. Native discovery, PKCE, callback-policy selection and validation, token exchange, refresh, expiry, and generation-safe credential replacement live in `waltr-client` behind `native-access`; native hosts provide configuration, bounded callback delivery, and presentation effects.
 
 The transport decodes version-1 `AuthenticationFailure` protobuf status details. A valid outbound-provider or outbound-MCP failure preserves its domain, reason, nonempty `AuthTarget`, safe message, and sanitized MCP context on the ordinary operation error. Failed session status carries the same optional structure for asynchronous and queued failures. Only an `Unauthenticated` response explicitly classified as the `WALTR_ACCESS` domain becomes Waltr login required and clears the current native bearer lease. Missing, malformed, unknown-version, or otherwise unmatched details remain ordinary errors rather than guessing an authentication domain.
 
@@ -186,13 +205,17 @@ Native transports attach the current in-memory bearer credential to each unary r
 
 Native HTTPS uses rustls-backed tonic channels with normal certificate and hostname verification. Explicit logout clears the credential and performs an anonymous status reprobe so access-disabled servers can return to `Authenticated`; credential generations prevent results from the prior lease from mutating the new state.
 
-The web route sends the browser to `/oidc/login` with a validated local return path and calls `/oidc/logout` with same-origin credentials. The TUI owns protected-resource discovery, public-client PKCE, loopback callback handling, and in-memory refresh/expiry. See [Access Authentication](access-authentication.md).
+The hosted browser route sends the browser to `/oidc/login` with a validated local return path and calls `/oidc/logout` with same-origin credentials. The TUI supplies environment-derived native configuration, browser launching, copyable URL behavior, and terminal events. The Tauri host supplies fixed preview configuration, system HTTPS opening, secret-free IPC progress, desktop/Android runtime ownership, and Android callback delivery. See [Access Authentication](access-authentication.md).
 
-Outbound provider/MCP authorization remains separate from Waltr access and begins only through an explicit Config action. One generic target-scoped command family lists and reads sanitized status, begins and completes authorization, inspects or cancels attempts, forces refresh, and resets credentials for either target kind. The shared reducer exports statuses and keyed operation results alongside only an opaque attempt ID, authorization URL, expiry, completion mode, registration method, lifecycle, and sanitized failure reason. For server-callback attempts the shared runtime polls `PollAuthAttempt`; shells render snapshots and may cancel the explicit attempt. Manual attempts submit the final redirect URL or code. Web and TUI never receive provider or MCP access tokens, refresh tokens, PKCE verifiers, registration responses, or callback state. Session surfaces render outbound failures with Config navigation and require an explicit resend or rerun after authentication; they never begin OAuth or replay work automatically.
+The Tauri app uses identifier `dev.waltr.app`, endpoint `https://preview-waltr.holdenitdown.net`, public client ID `waltr-preview-native`, and audience `waltr-preview-api`. Desktop selects an ephemeral `http://127.0.0.1:<port>/callback` policy; Android selects the external policy with exact callback `dev.waltr.app:/oauth2redirect`. Both are public Authorization Code with PKCE flows and send no app secret.
+
+On Android, `MainActivity` passes cold and warm `Intent` objects opaquely to JNI after the superclass callback. Kotlin does not read, retain, parse, or log callback content. Rust calls `Intent.getDataString()`, immediately wraps the value as a redacted callback, and routes no callback through Tauri events or IPC. The host keeps one latest callback for the active generation; a newer input replaces an unprocessed value. A callback received during preserved suspension remains held until resume. The coordinator validates each forwarded callback in order and accepts a valid callback after invalid input. Process death clears attempt state, so a cold callback fails closed.
+
+Outbound provider/MCP authorization remains separate from Waltr access and begins only through an explicit Config action. One generic target-scoped command family lists and reads sanitized status, begins and completes authorization, inspects or cancels attempts, forces refresh, and resets credentials for either target kind. The shared reducer exports statuses and keyed operation results alongside only an opaque attempt ID, authorization URL, expiry, completion mode, registration method, lifecycle, and sanitized failure reason. For server-callback attempts the shared runtime polls `PollAuthAttempt`; shells render snapshots and may cancel the explicit attempt. Manual attempts submit the final redirect URL or code. Browser, Tauri, and TUI surfaces never receive provider or MCP access tokens, refresh tokens, PKCE verifiers, registration responses, or callback state. Session surfaces render outbound failures with Config navigation and require an explicit resend or rerun after authentication; they never begin OAuth or replay work automatically.
 
 ```mermaid
 sequenceDiagram
-    participant Shell as Web or TUI
+    participant Shell as Browser, TUI, or Tauri host
     participant Stream as ClientStateStream
     participant Runtime as ClientRuntime
     participant Executor as GrpcEffectExecutor
@@ -212,7 +235,7 @@ sequenceDiagram
 
 ## Client Implementation Contract
 
-Web and TUI implementations should follow these rules:
+Browser, TUI, and Tauri implementations should follow these rules:
 
 - Use `ClientRuntime`, `ClientStateStream`, `ClientCommand`, `ClientSnapshot`, and stable view models from `waltr-client` for server-backed state.
 - Keep form drafts, focus, route params, modal state, animation state, and terminal/browser rendering concerns local to the implementation.
@@ -220,8 +243,10 @@ Web and TUI implementations should follow these rules:
 - Treat snapshots as the source of truth for the catalog, effective configuration, watches, readiness, and operation errors.
 - For async command completion, capture the operation key from the immediate command snapshot and observe `snapshot.operations.current[key]` until it reaches `ready` or `failed`.
 - Register catalog watch interest while a UI surface needs live resource updates. Release interest when that surface no longer needs them.
-- Preserve feature parity between web and TUI by changing shared reducer behavior in `waltr-client` when behavior is not platform-specific.
+- Preserve feature parity across browser, TUI, and Tauri paths by changing shared reducer behavior in `waltr-client` when behavior is not platform-specific.
 - Keep Waltr access state distinct from provider/upstream-MCP `AuthTarget` state, and ignore stale login attempts, credential leases, and watch epochs.
+- Keep native OAuth and bearer/refresh credentials in Rust. IPC may expose only shared snapshots, commands, opaque lifecycle data, safe errors, and secret-free access progress.
+- Keep remote content out of privileged WebViews. Tauri main-WebView navigation is restricted to packaged local content, new windows are denied, and Rust opens only credential-free HTTPS URLs that pass its external URL policy.
 - Keep provider and MCP catalog loading, mutation commands, operation keys, and snapshots in the shared reducer; browser bindings must not construct direct catalog transports.
 - Keep outbound OAuth attempt state in shared commands/snapshots while credentials, refresh claims, callback validation, discovery, and registration remain server/agent concerns.
 - Render provider and MCP credential status from the shared auth snapshot and reconcile authorize, refresh, and reset through their keyed operation results.
@@ -257,7 +282,11 @@ The TUI opens create selection with `C-x s` and switches the open session with `
 | [../../crates/waltr-client/src/coordination/state.rs](../../crates/waltr-client/src/coordination/state.rs) | Shared client state and operation statuses. |
 | [../../crates/waltr-client/src/coordination/event.rs](../../crates/waltr-client/src/coordination/event.rs) | Client events, effects, and resource-write intents. |
 | [../../crates/waltr-client/src/coordination/runtime.rs](../../crates/waltr-client/src/coordination/runtime.rs) | Runtime and state-stream orchestration. |
+| [../../crates/waltr-client/src/native_access.rs](../../crates/waltr-client/src/native_access.rs) | Shared native OIDC protocol and in-memory credential lifecycle. |
 | [../../crates/waltr-client/src/transport/mod.rs](../../crates/waltr-client/src/transport/mod.rs) | RPC transport boundary. |
+| [../../crates/waltr-app/src/bridge.rs](../../crates/waltr-app/src/bridge.rs) | Tauri runtime generation, ordered IPC, and bounded publication. |
+| [../../crates/waltr-app/src/policy.rs](../../crates/waltr-app/src/policy.rs) | Packaged navigation and external HTTPS URL policies. |
+| [../../crates/waltr-web/src/platform/tauri.ts](../../crates/waltr-web/src/platform/tauri.ts) | Tauri frontend adapter and stale-output recovery. |
 | [../../crates/waltr-client/src/view/mod.rs](../../crates/waltr-client/src/view/mod.rs) | Stable shell-facing view models. |
 | [../../proto/waltr/resource/v1/resource_service.proto](../../proto/waltr/resource/v1/resource_service.proto) | Resource RPC contract. |
 | [../../proto/waltr/routine/v1/routine_service.proto](../../proto/waltr/routine/v1/routine_service.proto) | Manual Routine RPC contract. |

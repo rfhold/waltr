@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { useAppState, type AppState } from "../../src/app/context";
 import { AppStateProvider } from "../../src/app/state";
 import type { ClientCommand, ClientOperationView, ClientSnapshot } from "../../src/generated/waltr-client";
-import type { ClientSnapshotListener, WasmClient } from "../../src/wasm/client";
+import type { ClientAdapter, ClientSnapshotListener } from "../../src/platform/client";
 import { claudeConfig, snapshotWithConfig } from "../support/snapshots";
 
 type AuthOperationCase = {
@@ -125,8 +125,7 @@ function renderOperation(operation: AuthOperationCase, initial = snapshotWithCon
     current = snapshot;
     listener?.(snapshot);
   };
-  const client: WasmClient = {
-    endpoint: "https://waltr.example",
+  const client: ClientAdapter = {
     snapshot: () => current,
     start: async () => undefined,
     subscribe: (next) => {
@@ -139,10 +138,11 @@ function renderOperation(operation: AuthOperationCase, initial = snapshotWithCon
       }
       return current;
     },
+    dispose: () => undefined,
   };
 
   render(() => (
-    <AppStateProvider loadWasmClient={async () => client}>
+    <AppStateProvider loadClientAdapter={async () => client}>
       <OperationHarness operation={operation} />
     </AppStateProvider>
   ));
