@@ -5,10 +5,10 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 const read = (path) => readFile(new URL(path, root), "utf8");
 
-test("Tauri and browser scripts keep their build boundaries", async () => {
+test("Tauri and browser scripts include their build prerequisites", async () => {
   const pkg = JSON.parse(await read("package.json"));
   assert.match(pkg.scripts.build, /wasm:build/);
-  assert.doesNotMatch(pkg.scripts["build:tauri"], /wasm/);
+  assert.match(pkg.scripts["build:tauri"], /^pnpm wasm:build && /);
   assert.match(pkg.scripts["build:tauri"], /--mode tauri/);
   assert.match(pkg.scripts["build:tauri"], /tauri-output\.contract\.mjs/);
 });

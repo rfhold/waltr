@@ -110,7 +110,7 @@ spec:
                 printf '%s\n' "$(params.revision)" | grep -Eq '^[0-9a-f]{40}$'
                 export GNUPGHOME=/tmp/release-gnupg
                 install -d -m 700 "$GNUPGHOME"
-                gpg --batch --import /etc/release-signers/signing-key.asc
+                gpg --batch --no-autostart --import /etc/release-signers/signing-key.asc
                 test "`git rev-parse "refs/tags/$tag^{commit}"`" = "$(params.revision)"
                 git merge-base --is-ancestor "$(params.revision)" refs/remotes/origin/main
                 git verify-tag "$tag"
