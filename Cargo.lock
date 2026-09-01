@@ -4244,6 +4244,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "reqwest",
+ "rustls 0.23.40",
  "serde",
  "serde_json",
  "tauri",
@@ -4254,6 +4255,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -4293,6 +4295,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -9291,7 +9294,6 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "rustls-native-certs",
  "socket2 0.6.4",
  "sync_wrapper",
  "tokio",
@@ -9301,6 +9303,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

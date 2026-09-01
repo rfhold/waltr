@@ -1,6 +1,10 @@
 //! Native application observability with bounded, fail-open OTLP exporters.
 
-use std::{panic::PanicHookInfo, sync::Once, time::Duration};
+use std::{
+    panic::PanicHookInfo,
+    sync::{Arc, Once},
+    time::Duration,
+};
 
 use opentelemetry::{KeyValue, metrics::MeterProvider as _, trace::TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -237,13 +241,31 @@ fn shutdown_meter(provider: &SdkMeterProvider) {
 struct PrivacyHttpClient(reqwest::blocking::Client);
 
 impl PrivacyHttpClient {
-    fn new() -> Result<Self, reqwest::Error> {
+    fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let tls = tls_client_config()?;
         reqwest::blocking::Client::builder()
             .timeout(EXPORT_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
+            .tls_backend_preconfigured(tls)
             .build()
             .map(Self)
+            .map_err(Into::into)
     }
+}
+
+fn mozilla_root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+fn tls_client_config() -> Result<rustls::ClientConfig, rustls::Error> {
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+    .with_root_certificates(mozilla_root_store())
+    .with_no_client_auth())
 }
 
 #[async_trait::async_trait]
@@ -402,6 +424,7 @@ mod tests {
         future::Future,
         io::{Read, Write},
         net::TcpListener,
+        process::Command,
         task::{Context, Poll, Waker},
         thread,
         time::Instant,
@@ -628,6 +651,22 @@ mod tests {
     }
 
     #[test]
+    fn native_tls_uses_complete_mozilla_store_with_isrg_root_x1() {
+        const ISRG_ROOT_X1_SUBJECT: &[u8] = b"1\x0b0\t\x06\x03U\x04\x06\x13\x02US1)0'\x06\x03U\x04\n\x13 Internet Security Research Group1\x150\x13\x06\x03U\x04\x03\x13\x0cISRG Root X1";
+
+        let roots = mozilla_root_store();
+        assert!(!roots.is_empty());
+        assert_eq!(roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        assert!(
+            roots
+                .roots
+                .iter()
+                .any(|anchor| anchor.subject.as_ref() == ISRG_ROOT_X1_SUBJECT)
+        );
+        tls_client_config().unwrap();
+    }
+
+    #[test]
     fn privacy_http_client_does_not_follow_redirects() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -670,6 +709,62 @@ mod tests {
     }
 
     #[test]
+    fn privacy_http_client_rejects_controlled_environment_root() {
+        const CHILD_ENDPOINT_ENV: &str = "WALTR_APP_TLS_CHILD_ENDPOINT";
+        if let Ok(endpoint) = std::env::var(CHILD_ENDPOINT_ENV) {
+            let request = opentelemetry_http::Request::post(endpoint)
+                .body(opentelemetry_http::Bytes::new())
+                .unwrap();
+            let error = poll_blocking_client(opentelemetry_http::HttpClient::send_bytes(
+                &PrivacyHttpClient::new().unwrap(),
+                request,
+            ))
+            .expect_err("a certificate trusted only through SSL_CERT_FILE must be rejected");
+            let diagnostic = error_chain(error.as_ref()).to_ascii_lowercase();
+            assert!(
+                diagnostic.contains("certificate")
+                    && (diagnostic.contains("unknownissuer")
+                        || diagnostic.contains("unknown issuer")
+                        || diagnostic.contains("unknown ca")),
+                "expected an untrusted-certificate rejection, got: {diagnostic}"
+            );
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_controlled_tls(listener, 2);
+        let endpoint = format!("https://localhost:{}/v1/traces", address.port());
+
+        let response = controlled_root_http_client()
+            .post(&endpoint)
+            .body(Vec::new())
+            .send()
+            .expect("the positive-control client must trust the controlled CA");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let ca_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../waltr-client/tests/fixtures/native-tls-ca.pem");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("observability::tests::privacy_http_client_rejects_controlled_environment_root")
+            .arg("--nocapture")
+            .env(CHILD_ENDPOINT_ENV, endpoint)
+            .env("SSL_CERT_FILE", ca_path)
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("TLS child test should start");
+
+        server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "TLS child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
     fn shutdown_bounds_match_sdk_behavior() {
         assert_eq!(TRACE_LOG_SHUTDOWN_TIMEOUT, Duration::from_secs(2));
         let production_source = include_str!("observability.rs")
@@ -709,6 +804,91 @@ mod tests {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("blocking HTTP client future unexpectedly yielded"),
         }
+    }
+
+    fn controlled_root_http_client() -> reqwest::blocking::Client {
+        use rustls::pki_types::{CertificateDer, pem::PemObject as _};
+
+        let ca = CertificateDer::from_pem_slice(include_bytes!(
+            "../../waltr-client/tests/fixtures/native-tls-ca.pem"
+        ))
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        reqwest::blocking::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .build()
+            .unwrap()
+    }
+
+    fn serve_controlled_tls(listener: TcpListener, connections: usize) -> thread::JoinHandle<()> {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
+
+        let certificates = CertificateDer::pem_slice_iter(include_bytes!(
+            "../../waltr-client/tests/fixtures/native-tls-server.pem"
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(include_bytes!(
+            "../../waltr-client/tests/fixtures/native-tls-server-key.pem"
+        ))
+        .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .unwrap();
+
+        thread::spawn(move || {
+            for _ in 0..connections {
+                let (connection, _) = listener.accept().unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                connection
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let server = rustls::ServerConnection::new(Arc::new(config.clone())).unwrap();
+                let mut stream = rustls::StreamOwned::new(server, connection);
+                let mut request = [0_u8; 4096];
+                match stream.read(&mut request) {
+                    Ok(_) => stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        )
+                        .unwrap(),
+                    Err(error) => assert!(
+                        error
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("certificate")
+                            || error.to_string().to_ascii_lowercase().contains("alert"),
+                        "expected the rejected client handshake to fail: {error}"
+                    ),
+                }
+            }
+        })
+    }
+
+    fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+        let mut diagnostic = error.to_string();
+        let mut source = error.source();
+        while let Some(error) = source {
+            diagnostic.push_str(": ");
+            diagnostic.push_str(&error.to_string());
+            source = error.source();
+        }
+        diagnostic
     }
 
     #[derive(Clone, Debug, Default)]

@@ -27,9 +27,10 @@ waltr-client = { workspace = true, features = ["native-access", "native-tracing"
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-http = "0.32.0"
-opentelemetry-otlp = { workspace = true, features = ["reqwest-rustls"] }
+opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
-reqwest = { workspace = true, features = ["blocking", "rustls"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tauri = { version = "=2.10.1", features = [] }
@@ -39,6 +40,7 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
